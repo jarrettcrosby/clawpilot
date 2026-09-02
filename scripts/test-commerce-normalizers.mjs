@@ -246,7 +246,36 @@ const shopifySource = {
         countryCodeV2: 'US',
         phone: '+15555550100',
       },
-      requestedDeliveryAt: '2026-08-01T15:00:00Z',
+      fulfillmentOrders: {
+        nodes: [
+          {
+            id: 'gid://shopify/FulfillmentOrder/201',
+            status: 'OPEN',
+            deliveryMethod: {
+              minDeliveryDateTime: '2026-07-30T15:00:00Z',
+              maxDeliveryDateTime: '2026-07-31T15:00:00Z',
+            },
+          },
+          {
+            id: 'gid://shopify/FulfillmentOrder/202',
+            status: 'OPEN',
+            deliveryMethod: {
+              minDeliveryDateTime: '2026-07-31T15:00:00Z',
+              maxDeliveryDateTime: '2026-08-01T15:00:00Z',
+            },
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+      clawPilotFulfillmentOrderReadCoverage: {
+        complete: true,
+        effectiveScopes: [
+          'read_assigned_fulfillment_orders',
+          'read_marketplace_fulfillment_orders',
+          'read_merchant_managed_fulfillment_orders',
+          'read_third_party_fulfillment_orders',
+        ],
+      },
       lineItems: {
         nodes: [{
           id: 'gid://shopify/LineItem/201',
@@ -429,6 +458,66 @@ const faireNormalized = faire.normalizeFaireCommerce(
     externalAccountId: 'brand-1',
     apiVersion: 'external-api-v2',
   },
+)
+
+assert.equal(
+  textValue(shopifyNormalized.orders[0].requestedDeliveryAt),
+  '2026-08-01T15:00:00.000Z',
+  'Shopify uses the latest complete fulfillment-order delivery window',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    shopifyNormalized.orders[0].providerFacts.deliveryPromise,
+  )),
+  {
+    source: 'fulfillment_order.deliveryMethod',
+    observedMaxDeliveryAt: '2026-08-01T15:00:00.000Z',
+    coverage: 'complete',
+    effectiveScopes: [
+      'read_assigned_fulfillment_orders',
+      'read_marketplace_fulfillment_orders',
+      'read_merchant_managed_fulfillment_orders',
+      'read_third_party_fulfillment_orders',
+    ],
+    connectionComplete: true,
+    eligibleNodeCount: 2,
+    datedNodeCount: 2,
+  },
+  'Shopify retains exact delivery-promise coverage evidence',
+)
+
+const partialDeliveryCoverageSource = clone(shopifySource)
+partialDeliveryCoverageSource.orders.nodes[0]
+  .clawPilotFulfillmentOrderReadCoverage = {
+    complete: false,
+    effectiveScopes: ['read_merchant_managed_fulfillment_orders'],
+  }
+const partialDeliveryCoverage = shopify.normalizeShopifyCommerce(
+  partialDeliveryCoverageSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  partialDeliveryCoverage.orders[0].requestedDeliveryAt.state,
+  'unavailable',
+  'A scope-filtered fulfillment-order subset must not become an authoritative planning promise',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    partialDeliveryCoverage.orders[0].providerFacts.deliveryPromise,
+  )),
+  {
+    source: 'fulfillment_order.deliveryMethod',
+    observedMaxDeliveryAt: '2026-08-01T15:00:00.000Z',
+    coverage: 'partial',
+    effectiveScopes: ['read_merchant_managed_fulfillment_orders'],
+    connectionComplete: true,
+    eligibleNodeCount: 2,
+    datedNodeCount: 2,
+  },
+  'A partial Shopify delivery window remains available for truthful UI display',
 )
 
 const maximumVariantTitle = 'V'.repeat(512)
@@ -1429,7 +1518,7 @@ assert.equal(
 )
 
 const missingRequestedDeliverySource = clone(shopifySource)
-delete missingRequestedDeliverySource.orders.nodes[0].requestedDeliveryAt
+delete missingRequestedDeliverySource.orders.nodes[0].fulfillmentOrders
 const missingRequestedDelivery = shopify.normalizeShopifyCommerce(
   missingRequestedDeliverySource,
   {
@@ -1453,8 +1542,9 @@ assert.equal(
   'A provider-absent requested delivery date must not create an exception',
 )
 const malformedRequestedDeliverySource = clone(shopifySource)
-malformedRequestedDeliverySource.orders.nodes[0].requestedDeliveryAt =
-  'not-a-provider-date'
+malformedRequestedDeliverySource.orders.nodes[0]
+  .fulfillmentOrders.nodes[1].deliveryMethod.maxDeliveryDateTime =
+    'not-a-provider-date'
 const malformedRequestedDelivery = shopify.normalizeShopifyCommerce(
   malformedRequestedDeliverySource,
   {
@@ -1471,6 +1561,31 @@ assert.equal(
   malformedDeliveryFacts.get('delivery_decision_required')?.blocking,
   true,
   'A malformed nonempty provider delivery date must remain blocking',
+)
+const truncatedRequestedDeliverySource = clone(shopifySource)
+truncatedRequestedDeliverySource.orders.nodes[0]
+  .fulfillmentOrders.pageInfo.hasNextPage = true
+const truncatedRequestedDelivery = shopify.normalizeShopifyCommerce(
+  truncatedRequestedDeliverySource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.equal(
+  truncatedRequestedDelivery.orders[0].requestedDeliveryAt.state,
+  'unavailable',
+  'a truncated fulfillment-order set must not invent a delivery promise',
+)
+assert.equal(
+  truncatedRequestedDelivery.orders[0].requestedDeliveryAt.reason,
+  'not_provided',
+  'an incomplete observed promise remains non-authoritative',
+)
+assert.equal(
+  truncatedRequestedDelivery.orders[0].providerFacts.deliveryPromise.coverage,
+  'partial',
+  'a truncated fulfillment-order connection retains partial coverage evidence',
 )
 assert.equal(
   malformedDeliveryFacts.has('delivery_not_supplied'),

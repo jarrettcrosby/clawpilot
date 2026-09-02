@@ -6,6 +6,7 @@ import {
   operationsOrderSavedViewCounts,
   operationsOrderWorkbenchRows,
 } from '../../lib/operations/orderWorkbenchView.ts'
+import { currentExactProviderOrderMoney } from '../../lib/operations/providerOrderMoney.ts'
 import type {
   OperationsImportedOrderWorkingCopy,
   OperationsOrderListItem,
@@ -25,8 +26,14 @@ function canonical(
     status: 'imported',
     externallyFulfilled: false,
     warehouseName: null,
+    warehouseProvenance: null,
     promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
+    providerPromisedDeliveryAt: null,
+    providerDeliveryCoverage: null,
+    providerDeliverySource: null,
     lineCount: 1,
+    providerLineCount: null,
     exceptionCount: 0,
     orderValueMinor: '1000',
     expectedCostMinor: null,
@@ -61,6 +68,7 @@ function imported(
     needsInfo: false,
     blockerCodes: [],
     customerName: 'Customer',
+    warehouseName: null,
     lineCount: 1,
     sourceUpdatedAt: '2026-09-01T13:00:00.000Z',
     updatedAt: '2026-09-01T13:00:00.000Z',
@@ -88,6 +96,8 @@ function imported(
     lines: [],
     providerHistory: {
       observedAt: null,
+      currency: null,
+      providerTotalMinor: null,
       currentLines: [],
       events: [],
       providerWrites: 0,
@@ -112,6 +122,27 @@ function imported(
     ...overrides,
   }
 }
+
+test('provider header money projects only from a current exact-read anchor', () => {
+  assert.deepEqual(currentExactProviderOrderMoney({
+    currentProviderObservationKind: 'manual_exact_read',
+    currency: 'USD',
+    providerTotalMinor: '12345',
+  }), {
+    currency: 'USD',
+    totalMinor: '12345',
+  })
+  assert.equal(currentExactProviderOrderMoney({
+    currentProviderObservationKind: 'scheduled_poll',
+    currency: 'USD',
+    providerTotalMinor: '99999',
+  }), null, 'a non-exact current provider revision cannot override the header')
+  assert.equal(currentExactProviderOrderMoney({
+    currentProviderObservationKind: 'webhook_exact_read',
+    currency: 'USD',
+    providerTotalMinor: null,
+  }), null, 'incomplete exact provider money remains unavailable')
+})
 
 test('saved views separate attention from terminal provider history', () => {
   const rows = operationsOrderWorkbenchRows({
@@ -313,4 +344,50 @@ test('provider, tracking, warehouse, and date filters compose', () => {
     now,
   })
   assert.deepEqual(filtered.map((row) => row.order.orderNumber), ['#1001'])
+})
+
+test('canonical provider windows and requested delivery facts remain usable', () => {
+  const rows = operationsOrderWorkbenchRows({
+    canonical: [
+      canonical({
+        orderNumber: '#1001',
+        requestedDeliveryAt: '2026-09-04T12:00:00.000Z',
+      }),
+      canonical({
+        globalId: 'gor0000003',
+        orderNumber: '#1003',
+        providerPromisedDeliveryAt: '2026-09-02T12:00:00.000Z',
+        providerDeliveryCoverage: 'partial',
+        providerDeliverySource: 'fulfillment_order.deliveryMethod',
+      }),
+    ],
+    imported: [imported({
+      orderNumber: '#1002',
+      warehouseName: 'AG Alchemy HQ',
+      delivery: {
+        status: 'provider',
+        providerRequestedDeliveryAt: '2026-09-03T12:00:00.000Z',
+        selectedDeliveryAt: null,
+        draftDeliveryAt: '2026-09-03T12:00:00.000Z',
+      },
+    })],
+  })
+  assert.deepEqual(filterAndSortOperationsOrderRows({
+    rows,
+    view: 'all',
+    sort: 'promise_asc',
+    provider: '',
+    tracking: 'all',
+    date: 'all',
+    warehouse: 'AG Alchemy HQ',
+  }).map((row) => row.order.orderNumber), ['#1002'])
+  assert.deepEqual(filterAndSortOperationsOrderRows({
+    rows,
+    view: 'all',
+    sort: 'promise_asc',
+    provider: '',
+    tracking: 'all',
+    date: 'all',
+    warehouse: '',
+  }).map((row) => row.order.orderNumber), ['#1003', '#1002', '#1001'])
 })

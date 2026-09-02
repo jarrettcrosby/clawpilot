@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
 import {
+  exactFaireOrderHistoryProviderReads,
   exactShopifyOrderHistoryProviderReads,
+  readExactFaireOrderHistoryObservation,
   readExactShopifyOrderHistoryObservation,
 } from '@/lib/integrations/commerceOrderHistory'
 import {
@@ -9,6 +11,7 @@ import {
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
+import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -67,10 +70,12 @@ const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const MAX_PAGE_SIZE = 250
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
-const DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES = new Set([
+const DEGRADABLE_EXACT_HISTORY_CODES = new Set([
   'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
+  'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
   'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
   'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+  'FAIRE_READ_ORDERS_REQUIRED',
   'SHOPIFY_READ_ORDERS_REQUIRED',
 ])
 const REFRESH_FIELDS = new Set<string>([
@@ -113,13 +118,25 @@ function requestError(code: string, message: string, status = 400): never {
   throw new CommerceOrderWorkbenchApiError(code, message, status)
 }
 
-function exactShopifyHistoryUnavailableCode(error: unknown) {
-  if (error instanceof ShopifyCommerceClientError) return error.code
+function exactHistoryUnavailableCode(error: unknown) {
+  if (
+    error instanceof ShopifyCommerceClientError
+    || error instanceof FaireCommerceClientError
+  ) return error.code
   if (
     error instanceof CommerceOrderSyncError
-    && DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES.has(error.code)
+    && DEGRADABLE_EXACT_HISTORY_CODES.has(error.code)
   ) return error.code
   return null
+}
+
+function exactHistoryProviderReads(
+  provider: 'shopify' | 'faire',
+  error: unknown,
+) {
+  return provider === 'shopify'
+    ? exactShopifyOrderHistoryProviderReads(error)
+    : exactFaireOrderHistoryProviderReads(error)
 }
 
 function requirePostgres() {
@@ -694,7 +711,7 @@ export async function POST(req: NextRequest) {
         }),
         candidateGlobalId,
       })
-      if (target.provider === 'shopify') {
+      if (target.provider === 'shopify' || target.provider === 'faire') {
         const historyIntentKey = [
           'order-workbench-history',
           requestKey,
@@ -704,6 +721,7 @@ export async function POST(req: NextRequest) {
           await readCommerceOrderWorkbenchExactReadReplayInPostgres({
             organizationId,
             integrationAccountId: target.integrationAccountId,
+            provider: target.provider,
             externalOrderId: target.externalOrderId,
             intentKey: historyIntentKey,
           })
@@ -724,30 +742,39 @@ export async function POST(req: NextRequest) {
             acquiredBy: actor.email,
             read: async (providerReadLease) => {
               try {
-                const exact = await readExactShopifyOrderHistoryObservation({
-                  organizationId,
-                  accountGlobalId: target.accountGlobalId,
-                  expectedCredentialGeneration: target.credentialGeneration,
-                  externalOrderId: target.externalOrderId,
-                  observationKind: 'manual_exact_read',
-                })
+                const exact = target.provider === 'shopify'
+                  ? await readExactShopifyOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
+                  : await readExactFaireOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
                 return appendCommerceOrderWorkbenchExactReadInPostgres({
                   organizationId,
                   integrationAccountId: target.integrationAccountId,
                   accountGlobalId: target.accountGlobalId,
+                  provider: target.provider,
                   credentialGeneration: target.credentialGeneration,
                   externalOrderId: target.externalOrderId,
                   providerReadLease,
                   observation: exact.observation,
                 })
               } catch (error) {
-                const code = exactShopifyHistoryUnavailableCode(error)
+                const code = exactHistoryUnavailableCode(error)
                 if (!code) throw error
                 return {
                   status: 'unavailable' as const,
                   code,
                   providerReads:
-                    exactShopifyOrderHistoryProviderReads(error),
+                    exactHistoryProviderReads(target.provider, error),
                   providerWrites: 0 as const,
                 }
               }

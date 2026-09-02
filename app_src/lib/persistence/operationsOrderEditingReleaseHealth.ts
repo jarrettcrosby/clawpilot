@@ -30,6 +30,12 @@ export const OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM =
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM =
   '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e'
 
+export const OPERATIONS_FAIRE_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM =
+  '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1'
+
+export const OPERATIONS_ORDER_HISTORY_LINE_FIDELITY_MIGRATION_CHECKSUM =
+  '5d292963a5a8e4b117ff8a5388a660ed87e090d6e0239b3288bed9e506e8cc8d'
+
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL = String.raw`
   artifacts(kind, identity, definition) AS (
     SELECT 'column'::text,
@@ -59,6 +65,50 @@ export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL = String.raw
       (
         'operations_commerce_order_observation_lines',
         'returned_quantity'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'title_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'variant_title_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'vendor_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'unit_price_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'unit_price_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'subtotal_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'subtotal_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'discount_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'discount_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'tax_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'tax_minor'
       )
     ) required_column(table_name, column_name)
     JOIN pg_catalog.pg_class installed_table
@@ -113,6 +163,14 @@ export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL = String.raw
       (
         'operations_commerce_order_observation_lines',
         'commerce_order_observation_line_returned_quantity_valid'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'commerce_order_observation_line_snapshots_valid'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'commerce_order_observation_line_money_valid'
       )
     ) required_constraint(table_name, constraint_name)
     JOIN pg_catalog.pg_class installed_table
@@ -236,9 +294,9 @@ export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL =
   FROM artifacts
 `
 
-export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH =
-  'c9a6a9a9a29fe4feea20572ada59bb054b07fa8eb80a0d787b4bda492d747017'
+  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9'
 
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL = String.raw`
   EXISTS (
@@ -246,6 +304,20 @@ export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL = String.raw`
     WHERE filename = '0340_operations_order_workbench_exact_history.sql'
       AND checksum =
         '${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM}'
+  )
+  AND EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0341_operations_faire_order_workbench_exact_history.sql'
+      AND checksum =
+        '${OPERATIONS_FAIRE_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM}'
+  )
+  AND EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0342_operations_order_history_line_fidelity.sql'
+      AND checksum =
+        '${OPERATIONS_ORDER_HISTORY_LINE_FIDELITY_MIGRATION_CHECKSUM}'
   )
   AND (
     WITH ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL}

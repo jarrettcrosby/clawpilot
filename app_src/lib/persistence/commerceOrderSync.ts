@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { hasEffectiveShopifyScope } from '@/lib/integrations/commerceCapabilities'
@@ -271,6 +271,26 @@ function optionalMinor(value: unknown, label: string) {
   return Number(value)
 }
 
+function observationLineMoney(
+  currencyValue: unknown,
+  amountValue: unknown,
+  label: string,
+) {
+  const currency = optionalText(currencyValue, `${label} currency`, 3)
+  const amountMinor = optionalMinor(amountValue, label)
+  if (
+    (currency === null) !== (amountMinor === null)
+    || (currency !== null && !/^[A-Z]{3}$/u.test(currency))
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      `${label} is incomplete`,
+      400,
+    )
+  }
+  return { currency, amountMinor }
+}
+
 export function normalizeCommerceOrderQuantity(
   value: unknown,
   label: string,
@@ -351,12 +371,23 @@ export type CommerceOrderObservationLineInput = {
   externalProductId?: string | null
   externalVariantId?: string | null
   sku?: string | null
+  titleSnapshot?: string | null
+  variantTitleSnapshot?: string | null
+  vendorSnapshot?: string | null
   originalQuantity: number
   currentQuantity?: number | null
   unfulfilledQuantity?: number | null
   fulfilledQuantity?: number | null
   returnedQuantity?: number | null
   requiresShipping?: boolean | null
+  unitPriceCurrency?: string | null
+  unitPriceMinor?: number | null
+  subtotalCurrency?: string | null
+  subtotalMinor?: number | null
+  discountCurrency?: string | null
+  discountMinor?: number | null
+  taxCurrency?: string | null
+  taxMinor?: number | null
 }
 
 export type CommerceOrderEventObservationInput = {
@@ -499,44 +530,81 @@ export function normalizeCommerceOrderObservationInput(
     )
   }
   const lines = input.lines.map(
-    (line) => ({
-      externalLineId: text(line.externalLineId, 'External line ID', 512),
-      externalProductId: optionalText(
-        line.externalProductId,
-        'External product ID',
-        512,
-      ),
-      externalVariantId: optionalText(
-        line.externalVariantId,
-        'External variant ID',
-        512,
-      ),
-      sku: optionalText(line.sku, 'SKU', 512),
-      originalQuantity: quantity(line.originalQuantity, 'Original quantity'),
-      currentQuantity: quantity(
-        line.currentQuantity,
-        'Current quantity',
-        true,
-      ),
-      unfulfilledQuantity: quantity(
-        line.unfulfilledQuantity,
-        'Unfulfilled quantity',
-        true,
-      ),
-      fulfilledQuantity: quantity(
-        line.fulfilledQuantity,
-        'Fulfilled quantity',
-        true,
-      ),
-      returnedQuantity: quantity(
-        line.returnedQuantity,
-        'Returned quantity',
-        true,
-      ),
-      requiresShipping: typeof line.requiresShipping === 'boolean'
-        ? line.requiresShipping
-        : null,
-    }),
+    (line) => {
+      const unitPrice = observationLineMoney(
+        line.unitPriceCurrency,
+        line.unitPriceMinor,
+        'Provider line unit price',
+      )
+      const subtotal = observationLineMoney(
+        line.subtotalCurrency,
+        line.subtotalMinor,
+        'Provider line subtotal',
+      )
+      const discount = observationLineMoney(
+        line.discountCurrency,
+        line.discountMinor,
+        'Provider line discount',
+      )
+      const tax = observationLineMoney(
+        line.taxCurrency,
+        line.taxMinor,
+        'Provider line tax',
+      )
+      return {
+        externalLineId: text(line.externalLineId, 'External line ID', 512),
+        externalProductId: optionalText(
+          line.externalProductId,
+          'External product ID',
+          512,
+        ),
+        externalVariantId: optionalText(
+          line.externalVariantId,
+          'External variant ID',
+          512,
+        ),
+        sku: optionalText(line.sku, 'SKU', 512),
+        titleSnapshot: optionalText(line.titleSnapshot, 'Line title', 512),
+        variantTitleSnapshot: optionalText(
+          line.variantTitleSnapshot,
+          'Line variant title',
+          512,
+        ),
+        vendorSnapshot: optionalText(line.vendorSnapshot, 'Line vendor', 512),
+        originalQuantity: quantity(line.originalQuantity, 'Original quantity'),
+        currentQuantity: quantity(
+          line.currentQuantity,
+          'Current quantity',
+          true,
+        ),
+        unfulfilledQuantity: quantity(
+          line.unfulfilledQuantity,
+          'Unfulfilled quantity',
+          true,
+        ),
+        fulfilledQuantity: quantity(
+          line.fulfilledQuantity,
+          'Fulfilled quantity',
+          true,
+        ),
+        returnedQuantity: quantity(
+          line.returnedQuantity,
+          'Returned quantity',
+          true,
+        ),
+        requiresShipping: typeof line.requiresShipping === 'boolean'
+          ? line.requiresShipping
+          : null,
+        unitPriceCurrency: unitPrice.currency,
+        unitPriceMinor: unitPrice.amountMinor,
+        subtotalCurrency: subtotal.currency,
+        subtotalMinor: subtotal.amountMinor,
+        discountCurrency: discount.currency,
+        discountMinor: discount.amountMinor,
+        taxCurrency: tax.currency,
+        taxMinor: tax.amountMinor,
+      }
+    },
   )
   if (new Set(lines.map((line) => line.externalLineId)).size !== lines.length) {
     throw new CommerceOrderSyncError(
@@ -1118,10 +1186,16 @@ async function appendObservationsWithClient(
         `INSERT INTO operations_commerce_order_observation_lines (
            organization_id, observation_id, external_line_id,
            external_product_id, external_variant_id, sku,
+           title_snapshot, variant_title_snapshot, vendor_snapshot,
            original_quantity, current_quantity, unfulfilled_quantity,
-           fulfilled_quantity, returned_quantity, requires_shipping
+           fulfilled_quantity, returned_quantity, requires_shipping,
+           unit_price_currency, unit_price_minor,
+           subtotal_currency, subtotal_minor,
+           discount_currency, discount_minor, tax_currency, tax_minor
          ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
+           $10, $11, $12, $13, $14, $15,
+           $16, $17, $18, $19, $20, $21, $22, $23
          )
          ON CONFLICT (
            organization_id, observation_id, external_line_id
@@ -1133,12 +1207,23 @@ async function appendObservationsWithClient(
           line.externalProductId,
           line.externalVariantId,
           line.sku,
+          line.titleSnapshot,
+          line.variantTitleSnapshot,
+          line.vendorSnapshot,
           line.originalQuantity,
           line.currentQuantity,
           line.unfulfilledQuantity,
           line.fulfilledQuantity,
           line.returnedQuantity,
           line.requiresShipping,
+          line.unitPriceCurrency,
+          line.unitPriceMinor,
+          line.subtotalCurrency,
+          line.subtotalMinor,
+          line.discountCurrency,
+          line.discountMinor,
+          line.taxCurrency,
+          line.taxMinor,
         ],
       )
       linesAppended += Number(lineResult.rowCount || 0)
@@ -1218,7 +1303,7 @@ async function appendObservationsWithClient(
 }
 
 /**
- * Persists one manager-requested, exact Shopify order read in the same
+ * Persists one manager-requested exact provider order read in the same
  * append-only evidence ledger used by webhook hydration and scheduled order
  * history. The provider read is fenced separately by the caller; this method
  * only accepts the exact account, credential generation, and order identity
@@ -1228,6 +1313,7 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
   organizationId: string
   integrationAccountId: string
   accountGlobalId: string
+  provider: CommerceProvider
   credentialGeneration: number
   externalOrderId: string
   providerReadLease: CommerceStoreSyncProviderReadLease
@@ -1246,10 +1332,11 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
     )
   }
   const observation = normalizeObservation(input.observation)
+  const expectedProviderReadCount = input.provider === 'shopify' ? 3 : 2
   if (
     observation.observationKind !== 'manual_exact_read'
     || observation.externalOrderId !== input.externalOrderId
-    || observation.providerReadCount !== 3
+    || observation.providerReadCount !== expectedProviderReadCount
   ) {
     throw new CommerceOrderSyncError(
       'COMMERCE_ORDER_SYNC_INPUT_INVALID',
@@ -1273,13 +1360,18 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
         AND credential.integration_account_id = account.id
         AND credential.credential_version = $4
         AND credential.external_account_id = account.external_account_id
-        AND credential.auth_mode = 'shopify_client_credentials'
+        AND (
+          (account.provider = 'shopify'
+            AND credential.auth_mode = 'shopify_client_credentials')
+          OR (account.provider = 'faire'
+            AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth'))
+        )
         AND credential.verification_status = 'verified'
        WHERE account.organization_id = $1::uuid
          AND account.id = $2::uuid
          AND account.global_id = $3
          AND account.integration_type = 'commerce'
-         AND account.provider = 'shopify'
+         AND account.provider = $5
          AND account.status = 'active'
          AND account.commerce_credential_generation = $4
        LIMIT 1
@@ -1289,6 +1381,7 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
         input.integrationAccountId,
         input.accountGlobalId,
         input.credentialGeneration,
+        input.provider,
       ],
     )
     if (!account.rows[0]) {
@@ -1300,14 +1393,14 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
     const persisted = await appendObservationsWithClient(client, {
       organizationId: input.organizationId,
       integrationAccountId: input.integrationAccountId,
-      provider: 'shopify',
+      provider: input.provider,
       credentialGeneration: input.credentialGeneration,
       backfillSessionId: null,
       manualProviderReadLeaseId: input.providerReadLease.id,
     }, [observation])
     return Object.freeze({
       ...persisted,
-      providerReads: 3 as const,
+      providerReads: expectedProviderReadCount,
       providerWrites: 0 as const,
     })
   })
@@ -1329,6 +1422,7 @@ export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
   input: {
     organizationId: string
     integrationAccountId: string
+    provider: CommerceProvider
     externalOrderId: string
     intentKey: string
   },
@@ -1367,7 +1461,7 @@ export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
        ON observation.organization_id = lease.organization_id
       AND observation.integration_account_id = lease.integration_account_id
       AND observation.manual_provider_read_lease_id = lease.id
-      AND observation.provider = 'shopify'
+      AND observation.provider = $4
       AND observation.observation_kind = 'manual_exact_read'
      WHERE lease.organization_id = $1::uuid
        AND lease.integration_account_id = $2::uuid
@@ -1381,6 +1475,7 @@ export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
       input.organizationId,
       input.integrationAccountId,
       fingerprint,
+      input.provider,
     ],
   )
   const retained = result.rows[0]
@@ -1442,6 +1537,7 @@ type AccountRow = {
   credential_version: number
   activation_state: string | null
   store_sync_running: boolean
+  runtime_readable: boolean
 }
 
 async function lockAccount(
@@ -1460,7 +1556,8 @@ async function lockAccount(
             credential.webhook_verification_status,
             credential.credential_version,
             activation.state AS activation_state,
-            ${STORE_SYNC_RUNNING_SQL} AS store_sync_running
+            ${STORE_SYNC_RUNNING_SQL} AS store_sync_running,
+            ${ORDER_READ_ACCOUNT_SQL} AS runtime_readable
      FROM operations_integration_accounts account
      LEFT JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
@@ -1770,6 +1867,794 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
   })
 }
 
+export type CommerceOrderHistoryScheduleAllResult = Readonly<{
+  totalEligibleAccounts: number
+  scheduledAccounts: number
+  alreadyScheduledAccounts: number
+  deferredAccounts: number
+  newSessions: number
+  resumedSessions: number
+  newDeferredRefreshes: number
+  alreadyDeferredRefreshes: number
+  providerWrites: 0
+}>
+
+type CommerceOrderHistoryScheduleReceiptRow = {
+  request_hash: string
+  status: 'processing' | 'succeeded' | 'failed'
+  result_payload: unknown
+}
+
+function nonnegativeSafeInteger(value: unknown) {
+  return Number.isSafeInteger(value) && Number(value) >= 0
+}
+
+function validatedCommerceOrderHistoryScheduleAllResult(
+  value: unknown,
+): CommerceOrderHistoryScheduleAllResult {
+  const record = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+  const legacyDeferredShape = Boolean(record)
+    && record?.deferredAccounts === undefined
+    && record?.newDeferredRefreshes === undefined
+    && record?.alreadyDeferredRefreshes === undefined
+  const deferredAccounts = legacyDeferredShape ? 0 : record?.deferredAccounts
+  const newDeferredRefreshes = legacyDeferredShape
+    ? 0
+    : record?.newDeferredRefreshes
+  const alreadyDeferredRefreshes = legacyDeferredShape
+    ? 0
+    : record?.alreadyDeferredRefreshes
+  if (
+    !record
+    || !nonnegativeSafeInteger(record.totalEligibleAccounts)
+    || !nonnegativeSafeInteger(record.scheduledAccounts)
+    || !nonnegativeSafeInteger(record.alreadyScheduledAccounts)
+    || !nonnegativeSafeInteger(deferredAccounts)
+    || !nonnegativeSafeInteger(record.newSessions)
+    || !nonnegativeSafeInteger(record.resumedSessions)
+    || !nonnegativeSafeInteger(newDeferredRefreshes)
+    || !nonnegativeSafeInteger(alreadyDeferredRefreshes)
+    || Number(record.totalEligibleAccounts)
+      !== Number(record.scheduledAccounts)
+        + Number(record.alreadyScheduledAccounts)
+        + Number(deferredAccounts)
+    || Number(record.scheduledAccounts)
+      !== Number(record.newSessions) + Number(record.resumedSessions)
+    || Number(deferredAccounts)
+      !== Number(newDeferredRefreshes)
+        + Number(alreadyDeferredRefreshes)
+    || record.providerWrites !== 0
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_RESULT_INVALID',
+      'The retained provider-history refresh schedule is invalid',
+      500,
+    )
+  }
+  return Object.freeze({
+    totalEligibleAccounts: Number(record.totalEligibleAccounts),
+    scheduledAccounts: Number(record.scheduledAccounts),
+    alreadyScheduledAccounts: Number(record.alreadyScheduledAccounts),
+    deferredAccounts: Number(deferredAccounts),
+    newSessions: Number(record.newSessions),
+    resumedSessions: Number(record.resumedSessions),
+    newDeferredRefreshes: Number(newDeferredRefreshes),
+    alreadyDeferredRefreshes: Number(alreadyDeferredRefreshes),
+    providerWrites: 0,
+  })
+}
+
+type CommerceOrderHistorySchedulePolicyRow = {
+  revision: number
+  authority: string
+  historical_observation_enabled: boolean
+  continuous_observation_enabled: boolean
+  historical_refresh_requested_at: Date | null
+  historical_refresh_requested_by: string | null
+  historical_refresh_idempotency_key: string | null
+}
+
+type CommerceOrderHistoryActiveSessionRow = {
+  id: string
+  provider: CommerceProvider
+  session_kind: 'historical_backfill' | 'continuous_poll'
+  credential_generation: number
+  policy_revision: number
+  status: 'pending' | 'processing' | 'failed'
+  attempt_count: number
+  max_attempts: number
+  page_count: number
+  max_pages: number
+  available_now: boolean
+  lease_current: boolean
+}
+
+function commerceOrderHistoryAccountEligible(account: AccountRow) {
+  const readiness = commerceOrderHistoryReadiness({
+    provider: account.provider,
+    authMode: account.auth_mode,
+    grantedScopes: stringArray(account.configuration.grantedScopes),
+    requestedScopes: stringArray(account.configuration.requestedScopes),
+  })
+  return {
+    eligible: account.runtime_readable
+      && account.status === 'active'
+      && account.external_account_id !== null
+      && account.credential_external_account_id === account.external_account_id
+      && account.verification_status === 'verified'
+      && account.credential_version === account.commerce_credential_generation
+      && account.store_sync_running
+      && readiness.currentOrdersReadable,
+    readiness,
+  }
+}
+
+function commerceOrderHistorySessionLineageCurrent(input: {
+  active: CommerceOrderHistoryActiveSessionRow
+  account: AccountRow
+  policy: CommerceOrderHistorySchedulePolicyRow | null
+}) {
+  const { active, account, policy } = input
+  return Boolean(policy)
+    && policy?.authority === 'provider'
+    && active.provider === account.provider
+    && active.credential_generation === account.commerce_credential_generation
+    && active.policy_revision === policy?.revision
+    && (
+      active.session_kind === 'historical_backfill'
+        ? policy?.historical_observation_enabled
+        : policy?.continuous_observation_enabled
+    )
+}
+
+function commerceOrderHistorySessionExhausted(
+  active: CommerceOrderHistoryActiveSessionRow,
+) {
+  // attempt_count includes the currently leased attempt. It is exhausted only
+  // after that final lease is no longer valid; otherwise the provider result
+  // must be allowed to commit against its existing token.
+  return active.page_count >= active.max_pages
+    || (
+      active.attempt_count >= active.max_attempts
+      && !(active.status === 'processing' && active.lease_current)
+    )
+}
+
+async function terminalizeUnusableCommerceOrderHistorySessionWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    active: CommerceOrderHistoryActiveSessionRow
+    staleAuthority: boolean
+  },
+) {
+  const errorCode = input.staleAuthority
+    ? 'COMMERCE_ORDER_SYNC_AUTHORITY_STALE'
+    : input.active.page_count >= input.active.max_pages
+      ? 'COMMERCE_ORDER_SYNC_PAGE_LIMIT'
+      : 'COMMERCE_ORDER_SYNC_RETRY_EXHAUSTED'
+  const status = input.staleAuthority ? 'blocked' : 'dead'
+  const result = await client.query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = $3,
+         last_error_code = $4,
+         cursor_ciphertext = NULL,
+         cursor_iv = NULL,
+         cursor_tag = NULL,
+         cursor_key_id = NULL,
+         cursor_hash = NULL,
+         cursor_encryption_version = NULL,
+         cursor_aad_version = NULL,
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp(),
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND status IN ('pending', 'processing', 'failed')`,
+    [input.organizationId, input.active.id, status, errorCode],
+  )
+  if (result.rowCount !== 1) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_SESSION_CHANGED',
+      'A provider-history session changed while it was being replaced',
+    )
+  }
+}
+
+async function createCommerceOrderHistoricalRefreshWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    accountGlobalId: string
+    account: AccountRow
+    policy: CommerceOrderHistorySchedulePolicyRow | null
+    actorEmail: string
+    idempotencyKey: string
+    clock: Date
+  },
+) {
+  const readiness = commerceOrderHistoryReadiness({
+    provider: input.account.provider,
+    authMode: input.account.auth_mode,
+    grantedScopes: stringArray(input.account.configuration.grantedScopes),
+    requestedScopes: stringArray(input.account.configuration.requestedScopes),
+  })
+  const policyRevision = input.policy
+    ? (
+        await client.query<{ revision: number }>(
+          `UPDATE operations_commerce_order_sync_policies
+           SET historical_observation_enabled = true,
+               continuous_observation_enabled = true,
+               continuous_next_poll_at = LEAST(
+                 continuous_next_poll_at,
+                 now()
+               ),
+               historical_refresh_requested_at = NULL,
+               historical_refresh_requested_by = NULL,
+               historical_refresh_idempotency_key = NULL,
+               revision = revision + 1,
+               updated_by = $3,
+               updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND authority = 'provider'
+           RETURNING revision`,
+          [
+            input.organizationId,
+            input.account.integration_account_id,
+            input.actorEmail,
+          ],
+        )
+      ).rows[0]?.revision
+    : (
+        await client.query<{ revision: number }>(
+          `INSERT INTO operations_commerce_order_sync_policies (
+             organization_id, integration_account_id,
+             historical_observation_enabled,
+             continuous_observation_enabled, continuous_transport,
+             provider_event_processor_state, revision,
+             continuous_next_poll_at, created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, true, true, 'scheduled_poll', $3,
+             1, now(), $4, $4
+           )
+           RETURNING revision`,
+          [
+            input.organizationId,
+            input.account.integration_account_id,
+            readiness.providerEventProcessorState,
+            input.actorEmail,
+          ],
+        )
+      ).rows[0]?.revision
+  if (!Number.isSafeInteger(policyRevision) || Number(policyRevision) < 1) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_POLICY_LOST',
+      'Provider-history refresh authority changed while it was being scheduled',
+    )
+  }
+  const requestedThrough = input.clock.toISOString()
+  const requestedFrom = input.account.provider === 'shopify'
+    ? new Date(
+        input.clock.getTime() - 60 * 24 * 60 * 60 * 1_000,
+      ).toISOString()
+    : null
+  const sessionIdempotencyKey =
+    `refresh-all:${input.idempotencyKey}:${input.accountGlobalId}`
+  const requestHash = hash({
+    policyVersion: POLICY_VERSION,
+    action: 'schedule_all_commerce_order_history_refreshes',
+    accountGlobalId: input.accountGlobalId,
+    provider: input.account.provider,
+    credentialGeneration: input.account.commerce_credential_generation,
+    requestedWindowDays: input.account.provider === 'shopify' ? 60 : null,
+    authority: 'provider',
+    providerWrites: 0,
+  })
+  const queryHash = hash({
+    policyVersion: POLICY_VERSION,
+    provider: input.account.provider,
+    credentialGeneration: input.account.commerce_credential_generation,
+    coverageBasis: readiness.coverageBasis,
+    readAllOrdersConfigured:
+      'readAllOrdersGranted' in readiness
+        ? readiness.readAllOrdersGranted
+        : false,
+    requestedFrom,
+    requestedThrough,
+    includeTerminalOrders: true,
+    providerWrites: 0,
+  })
+  const inserted = await client.query(
+    `INSERT INTO operations_commerce_order_backfill_sessions (
+       organization_id, integration_account_id, provider,
+       credential_generation, policy_revision, coverage_basis,
+       read_all_orders_scope_observed, return_history_state, status,
+       requested_from, requested_through, idempotency_key, request_hash,
+       query_hash, requested_by, reason
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, $4, $5, $6, NULL, 'unknown', 'pending',
+       $7::timestamptz, $8::timestamptz, $9, $10, $11, $12,
+       'Refresh all provider-authoritative order history'
+     )`,
+    [
+      input.organizationId,
+      input.account.integration_account_id,
+      input.account.provider,
+      input.account.commerce_credential_generation,
+      policyRevision,
+      readiness.coverageBasis,
+      requestedFrom,
+      requestedThrough,
+      sessionIdempotencyKey,
+      requestHash,
+      queryHash,
+      input.actorEmail,
+    ],
+  )
+  if (inserted.rowCount !== 1) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_NOT_QUEUED',
+      'A provider-history refresh session was not queued',
+      500,
+    )
+  }
+}
+
+/**
+ * Enqueues a bounded provider-authoritative history pass for every currently
+ * readable commerce account in one organization. Existing claimable sessions
+ * remain authoritative and are resumed when retry backoff delayed them; a new
+ * historical session is created only when the account has no active session.
+ *
+ * This is scheduling only. Provider reads remain in the existing history
+ * worker and every provider-write count remains zero.
+ */
+export async function scheduleAllCommerceOrderHistoryRefreshesInPostgres(
+  input: {
+    organizationId: string
+    actorEmail: string
+    idempotencyKey: string
+  },
+): Promise<CommerceOrderHistoryScheduleAllResult> {
+  const organizationId = text(input.organizationId, 'Organization ID', 64)
+  if (!UUID_PATTERN.test(organizationId)) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_INVALID',
+      'Provider-history refresh schedule input is invalid',
+      400,
+    )
+  }
+  const actorEmail = text(input.actorEmail, 'Actor email', 320).toLowerCase()
+  const idempotencyKey = text(
+    input.idempotencyKey,
+    'Idempotency key',
+    120,
+    8,
+  )
+  const requestHash = hash({
+    action: 'schedule_all_commerce_order_history_refreshes',
+    organizationId,
+    actorEmail,
+    providerWrites: 0,
+  })
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-order-history-schedule-all:${organizationId}`,
+    )
+    const existing = await client.query<CommerceOrderHistoryScheduleReceiptRow>(
+      `SELECT request_hash, status, result_payload
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'operations.commerce_order_history.schedule_all'
+         AND idempotency_key = $2
+       FOR UPDATE`,
+      [organizationId, idempotencyKey],
+    )
+    const receipt = existing.rows[0] || null
+    if (receipt && receipt.request_hash !== requestHash) {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_IDEMPOTENCY_CONFLICT',
+        'This Idempotency-Key was already used for a different provider-history refresh schedule',
+      )
+    }
+    if (receipt?.status === 'succeeded') {
+      return validatedCommerceOrderHistoryScheduleAllResult(
+        receipt.result_payload,
+      )
+    }
+    if (receipt?.status === 'processing') {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_IN_PROGRESS',
+        'This exact provider-history refresh schedule is already in progress',
+      )
+    }
+    if (receipt?.status === 'failed') {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_PREVIOUSLY_FAILED',
+        'This provider-history refresh schedule previously failed. Retry with a new Idempotency-Key.',
+      )
+    }
+
+    const candidateAccounts = await client.query<{ account_global_id: string }>(
+      `SELECT account.global_id AS account_global_id
+       FROM operations_integration_accounts account
+       WHERE account.organization_id = $1::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider IN ('shopify', 'faire')
+       ORDER BY account.global_id`,
+      [organizationId],
+    )
+    const clock = (
+      await client.query<{ now: Date }>(
+        `SELECT date_trunc('milliseconds', clock_timestamp()) AS now`,
+      )
+    ).rows[0].now
+    let totalEligibleAccounts = 0
+    let newSessions = 0
+    let resumedSessions = 0
+    let alreadyScheduledAccounts = 0
+    let newDeferredRefreshes = 0
+    let alreadyDeferredRefreshes = 0
+
+    for (const candidate of candidateAccounts.rows) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        commerceOrderSyncAccountLockKey({
+          organizationId,
+          accountGlobalId: candidate.account_global_id,
+        }),
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `commerce-order-backfill-request:${organizationId}:${candidate.account_global_id}`,
+      )
+      const account = await lockAccount(
+        client,
+        organizationId,
+        candidate.account_global_id,
+      )
+      const eligibility = commerceOrderHistoryAccountEligible(account)
+      if (!eligibility.eligible) continue
+      totalEligibleAccounts += 1
+
+      const policy = (
+        await client.query<CommerceOrderHistorySchedulePolicyRow>(
+          `SELECT revision, authority, historical_observation_enabled,
+                  continuous_observation_enabled,
+                  historical_refresh_requested_at,
+                  historical_refresh_requested_by,
+                  historical_refresh_idempotency_key
+           FROM operations_commerce_order_sync_policies
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [organizationId, account.integration_account_id],
+        )
+      ).rows[0] || null
+      let active: CommerceOrderHistoryActiveSessionRow | null = (
+        await client.query<CommerceOrderHistoryActiveSessionRow>(
+          `SELECT id::text, provider, session_kind,
+                  credential_generation, policy_revision, status,
+                  attempt_count, max_attempts, page_count, max_pages,
+                  available_at <= clock_timestamp() AS available_now,
+                  COALESCE(lease_expires_at > clock_timestamp(), false)
+                    AS lease_current
+           FROM operations_commerce_order_backfill_sessions
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND status IN ('pending', 'processing', 'failed')
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, account.integration_account_id],
+        )
+      ).rows[0] || null
+
+      if (active) {
+        const lineageCurrent = commerceOrderHistorySessionLineageCurrent({
+          active,
+          account,
+          policy,
+        })
+        const exhausted = commerceOrderHistorySessionExhausted(active)
+        if (!lineageCurrent || exhausted) {
+          await terminalizeUnusableCommerceOrderHistorySessionWithClient(
+            client,
+            {
+              organizationId,
+              active,
+              staleAuthority: !lineageCurrent,
+            },
+          )
+          active = null
+        }
+      }
+
+      if (active?.session_kind === 'continuous_poll') {
+        if (policy?.historical_refresh_requested_at) {
+          alreadyDeferredRefreshes += 1
+        } else {
+          const deferred = await client.query(
+            `UPDATE operations_commerce_order_sync_policies
+             SET historical_refresh_requested_at = $3::timestamptz,
+                 historical_refresh_requested_by = $4,
+                 historical_refresh_idempotency_key = $5,
+                 updated_by = $4,
+                 updated_at = now()
+             WHERE organization_id = $1::uuid
+               AND integration_account_id = $2::uuid
+               AND authority = 'provider'
+               AND historical_refresh_requested_at IS NULL`,
+            [
+              organizationId,
+              account.integration_account_id,
+              clock.toISOString(),
+              actorEmail,
+              idempotencyKey,
+            ],
+          )
+          if (deferred.rowCount !== 1) {
+            throw new CommerceOrderSyncError(
+              'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_DEFER_LOST',
+              'A provider-history follow-up changed while it was being retained',
+            )
+          }
+          newDeferredRefreshes += 1
+        }
+        continue
+      }
+
+      if (active) {
+        if (
+          (active.status === 'processing' && active.lease_current)
+          || (active.status !== 'processing' && active.available_now)
+        ) {
+          alreadyScheduledAccounts += 1
+          continue
+        }
+        const resumed = active.status === 'processing'
+          ? await client.query(
+              `UPDATE operations_commerce_order_backfill_sessions
+               SET status = 'failed',
+                   last_error_code = 'COMMERCE_ORDER_SYNC_LEASE_EXPIRED',
+                   available_at = now(),
+                   locked_at = NULL,
+                   locked_by = NULL,
+                   lock_token = NULL,
+                   lease_expires_at = NULL,
+                   completed_at = NULL,
+                   updated_at = now()
+               WHERE organization_id = $1::uuid
+                 AND id = $2::uuid
+                 AND status = 'processing'
+                 AND lease_expires_at <= clock_timestamp()
+                 AND attempt_count < max_attempts
+                 AND page_count < max_pages`,
+              [organizationId, active.id],
+            )
+          : await client.query(
+              `UPDATE operations_commerce_order_backfill_sessions
+               SET available_at = now(), updated_at = now()
+               WHERE organization_id = $1::uuid
+                 AND id = $2::uuid
+                 AND status IN ('pending', 'failed')
+                 AND attempt_count < max_attempts
+                 AND page_count < max_pages`,
+              [organizationId, active.id],
+            )
+        if (resumed.rowCount !== 1) {
+          throw new CommerceOrderSyncError(
+            'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_RESUME_LOST',
+            'A provider-history session changed while it was being resumed',
+          )
+        }
+        resumedSessions += 1
+        continue
+      }
+
+      await createCommerceOrderHistoricalRefreshWithClient(client, {
+        organizationId,
+        accountGlobalId: candidate.account_global_id,
+        account,
+        policy,
+        actorEmail: policy?.historical_refresh_requested_by || actorEmail,
+        idempotencyKey:
+          policy?.historical_refresh_idempotency_key || idempotencyKey,
+        clock,
+      })
+      newSessions += 1
+    }
+
+    const scheduledAccounts = newSessions + resumedSessions
+    const deferredAccounts =
+      newDeferredRefreshes + alreadyDeferredRefreshes
+    const result = validatedCommerceOrderHistoryScheduleAllResult({
+      totalEligibleAccounts,
+      scheduledAccounts,
+      alreadyScheduledAccounts,
+      deferredAccounts,
+      newSessions,
+      resumedSessions,
+      newDeferredRefreshes,
+      alreadyDeferredRefreshes,
+      providerWrites: 0,
+    })
+    const retained = await client.query(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id, result_payload, completed_at
+       ) VALUES (
+         $1::uuid, 'operations.commerce_order_history.schedule_all', $2, $3,
+         $4, 'succeeded', $5::uuid, $6::jsonb, now()
+       )`,
+      [
+        organizationId,
+        idempotencyKey,
+        requestHash,
+        actorEmail,
+        randomUUID(),
+        JSON.stringify(result),
+      ],
+    )
+    if (retained.rowCount !== 1) {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_NOT_RETAINED',
+        'The provider-history refresh schedule was not retained',
+        500,
+      )
+    }
+    return result
+  })
+}
+
+export async function materializeDeferredCommerceOrderHistoryRefreshesInPostgres(
+  input: { limit?: number } = {},
+) {
+  const limit = Math.max(1, Math.min(Number(input.limit || 1), 5))
+  return withTransaction(async (client) => {
+    const candidates = await client.query<{
+      organization_id: string
+      account_global_id: string
+    }>(
+      `SELECT policy.organization_id::text,
+              account.global_id AS account_global_id
+       FROM operations_commerce_order_sync_policies policy
+       JOIN operations_integration_accounts account
+         ON account.organization_id = policy.organization_id
+        AND account.id = policy.integration_account_id
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version
+            = account.commerce_credential_generation
+        AND credential.external_account_id = account.external_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = policy.organization_id
+       WHERE policy.historical_refresh_requested_at IS NOT NULL
+         AND policy.authority = 'provider'
+         AND ${ORDER_READ_ACCOUNT_SQL}
+         AND credential.verification_status = 'verified'
+         AND (
+           (account.provider = 'shopify'
+             AND credential.auth_mode = 'shopify_client_credentials'
+             AND (
+               COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
+                 ? 'read_orders'
+               OR COALESCE(
+                 account.configuration->'grantedScopes', '[]'::jsonb
+               ) ? 'write_orders'
+             ))
+           OR (account.provider = 'faire'
+             AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth')
+             AND (
+               credential.auth_mode = 'faire_brand_token'
+               OR COALESCE(
+                 account.configuration->'requestedScopes', '[]'::jsonb
+               ) ? 'READ_ORDERS'
+             ))
+         )
+         AND ${STORE_SYNC_RUNNING_SQL}
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_backfill_sessions active
+           WHERE active.organization_id = policy.organization_id
+             AND active.integration_account_id = policy.integration_account_id
+             AND active.status IN ('pending', 'processing', 'failed')
+         )
+       ORDER BY policy.historical_refresh_requested_at,
+                policy.organization_id,
+                policy.integration_account_id
+       LIMIT $1`,
+      [limit],
+    )
+    let materialized = 0
+    let skipped = 0
+    for (const candidate of candidates.rows) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        commerceOrderSyncAccountLockKey({
+          organizationId: candidate.organization_id,
+          accountGlobalId: candidate.account_global_id,
+        }),
+      )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `commerce-order-backfill-request:${candidate.organization_id}:${candidate.account_global_id}`,
+      )
+      const account = await lockAccount(
+        client,
+        candidate.organization_id,
+        candidate.account_global_id,
+      )
+      const eligibility = commerceOrderHistoryAccountEligible(account)
+      const policy = (
+        await client.query<CommerceOrderHistorySchedulePolicyRow>(
+          `SELECT revision, authority, historical_observation_enabled,
+                  continuous_observation_enabled,
+                  historical_refresh_requested_at,
+                  historical_refresh_requested_by,
+                  historical_refresh_idempotency_key
+           FROM operations_commerce_order_sync_policies
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [candidate.organization_id, account.integration_account_id],
+        )
+      ).rows[0] || null
+      if (
+        !eligibility.eligible
+        || !policy?.historical_refresh_requested_at
+        || !policy.historical_refresh_requested_by
+        || !policy.historical_refresh_idempotency_key
+      ) {
+        skipped += 1
+        continue
+      }
+      const active = await client.query(
+        `SELECT 1
+         FROM operations_commerce_order_backfill_sessions
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND status IN ('pending', 'processing', 'failed')
+         LIMIT 1
+         FOR UPDATE`,
+        [candidate.organization_id, account.integration_account_id],
+      )
+      if (active.rows[0]) {
+        skipped += 1
+        continue
+      }
+      const clock = (
+        await client.query<{ now: Date }>(
+          `SELECT date_trunc('milliseconds', clock_timestamp()) AS now`,
+        )
+      ).rows[0].now
+      await createCommerceOrderHistoricalRefreshWithClient(client, {
+        organizationId: candidate.organization_id,
+        accountGlobalId: candidate.account_global_id,
+        account,
+        policy,
+        actorEmail: policy.historical_refresh_requested_by,
+        idempotencyKey: policy.historical_refresh_idempotency_key,
+        clock,
+      })
+      materialized += 1
+    }
+    return {
+      materialized,
+      skipped,
+      providerWrites: 0 as const,
+    }
+  })
+}
+
 export type CommerceOrderBackfillJob = {
   id: string
   globalId: string
@@ -1832,6 +2717,7 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
          ON activation.organization_id = policy.organization_id
        WHERE policy.authority = 'provider'
          AND policy.continuous_observation_enabled
+         AND policy.historical_refresh_requested_at IS NULL
          AND policy.continuous_high_watermark IS NOT NULL
          AND policy.continuous_next_poll_at <= now()
          AND COALESCE(policy.updated_by, policy.created_by) IS NOT NULL
@@ -2546,7 +3432,8 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       || session.policy_revision !== input.job.policyRevision
       || session.query_hash !== input.job.queryHash
       || session.page_count + 1 !== pageNumber
-      || session.requested_from?.toISOString() !== input.job.requestedFrom
+      || (session.requested_from?.toISOString() || null)
+        !== input.job.requestedFrom
       || session.requested_through.toISOString() !== input.job.requestedThrough
       || (
         session.read_all_orders_scope_observed !== null
@@ -3034,7 +3921,9 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
     stale_processing: number
     failed: number
     dead: number
+    historical_dead: number
     blocked: number
+    historical_blocked: number
     overdue_polls: number
     scheduled_poll_policies: number
     webhook_signal_plus_poll_policies: number
@@ -3042,51 +3931,131 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
     expired_sensitive_evidence: number
     last_completed_at: Date | null
   }>(
-    `SELECT
-       count(*) FILTER (
-         WHERE session.status = 'pending'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer AS pending,
-       count(*) FILTER (
-         WHERE session.status = 'processing'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer
-         AS processing,
-       count(*) FILTER (
-         WHERE session.status = 'processing'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-           AND session.lease_expires_at <= now()
-       )::integer AS stale_processing,
-       count(*) FILTER (
-         WHERE session.status = 'failed'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer AS failed,
-       count(*) FILTER (
-         WHERE session.status = 'dead'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer AS dead,
-       count(*) FILTER (
-         WHERE session.status = 'blocked'
-           AND operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer AS blocked,
-       count(*) FILTER (
-         WHERE session.status IN ('pending', 'processing', 'failed')
-           AND NOT operations_commerce_store_sync_is_running(
-             session.organization_id, session.integration_account_id
-           )
-       )::integer AS paused_retained_sessions,
+    `WITH active_sessions AS (
+       SELECT session.*,
+              operations_commerce_store_sync_is_running(
+                session.organization_id,
+                session.integration_account_id
+              ) AS store_sync_running
+       FROM operations_commerce_order_backfill_sessions session
+       WHERE session.status IN ('pending', 'processing', 'failed')
+     ), active_health AS (
+       SELECT
+         count(*) FILTER (
+           WHERE session.status = 'pending' AND session.store_sync_running
+         )::integer AS pending,
+         count(*) FILTER (
+           WHERE session.status = 'processing' AND session.store_sync_running
+         )::integer AS processing,
+         count(*) FILTER (
+           WHERE session.status = 'processing'
+             AND session.store_sync_running
+             AND session.lease_expires_at <= now()
+         )::integer AS stale_processing,
+         count(*) FILTER (
+           WHERE session.status = 'failed' AND session.store_sync_running
+         )::integer AS failed,
+         count(*) FILTER (
+           WHERE NOT session.store_sync_running
+         )::integer AS paused_retained_sessions
+       FROM active_sessions session
+     ), terminal_totals AS (
+       SELECT
+         count(*) FILTER (WHERE session.status = 'dead')::integer
+           AS total_dead,
+         count(*) FILTER (WHERE session.status = 'blocked')::integer
+           AS total_blocked,
+         max(session.completed_at) AS last_completed_at
+       FROM operations_commerce_order_backfill_sessions session
+     ), latest_stream_sessions AS (
+       SELECT DISTINCT ON (
+         session.organization_id,
+         session.integration_account_id,
+         session.session_kind
+       )
+         session.organization_id,
+         session.integration_account_id,
+         session.provider,
+         session.session_kind,
+         session.credential_generation,
+         session.policy_revision,
+         session.status
+       FROM operations_commerce_order_backfill_sessions session
+       ORDER BY session.organization_id,
+                session.integration_account_id,
+                session.session_kind,
+                session.created_at DESC,
+                session.id DESC
+     ), terminal_heads AS (
+       SELECT session.*,
+              operations_commerce_provider_read_authority_is_current(
+                session.organization_id,
+                session.integration_account_id,
+                'automatic'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM operations_integration_accounts account
+                JOIN operations_commerce_credentials credential
+                  ON credential.organization_id = account.organization_id
+                 AND credential.integration_account_id = account.id
+                 AND credential.credential_version =
+                       session.credential_generation
+                 AND credential.external_account_id =
+                       account.external_account_id
+                JOIN operations_commerce_order_sync_policies policy
+                  ON policy.organization_id = account.organization_id
+                 AND policy.integration_account_id = account.id
+                WHERE account.organization_id = session.organization_id
+                  AND account.id = session.integration_account_id
+                  AND account.integration_type = 'commerce'
+                  AND account.provider = session.provider
+                  AND ${ORDER_READ_ACCOUNT_SQL}
+                  AND account.commerce_credential_generation =
+                        session.credential_generation
+                  AND credential.verification_status = 'verified'
+                  AND (
+                    (account.provider = 'shopify'
+                      AND credential.auth_mode =
+                            'shopify_client_credentials')
+                    OR (account.provider = 'faire'
+                      AND credential.auth_mode IN (
+                        'faire_brand_token', 'faire_oauth'
+                      ))
+                  )
+                  AND policy.authority = 'provider'
+                  AND policy.revision = session.policy_revision
+                  AND (
+                    (session.session_kind = 'historical_backfill'
+                      AND policy.historical_observation_enabled)
+                    OR (session.session_kind = 'continuous_poll'
+                      AND policy.continuous_observation_enabled)
+                  )
+              ) AS current_authority
+       FROM latest_stream_sessions session
+       WHERE session.status IN ('dead', 'blocked')
+     ), terminal_health AS (
+       SELECT
+         count(*) FILTER (
+           WHERE session.status = 'dead' AND session.current_authority
+         )::integer AS dead,
+         count(*) FILTER (
+           WHERE session.status = 'blocked' AND session.current_authority
+         )::integer AS blocked
+       FROM terminal_heads session
+     )
+     SELECT
+       active.pending,
+       active.processing,
+       active.stale_processing,
+       active.failed,
+       terminal.dead,
+       GREATEST(totals.total_dead - terminal.dead, 0)::integer
+         AS historical_dead,
+       terminal.blocked,
+       GREATEST(totals.total_blocked - terminal.blocked, 0)::integer
+         AS historical_blocked,
+       active.paused_retained_sessions,
        (SELECT count(*)::integer
         FROM operations_commerce_order_sync_policies policy
         WHERE policy.continuous_observation_enabled
@@ -3120,8 +4089,10 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
             OR event.tracking_number IS NOT NULL
             OR event.tracking_url IS NOT NULL
           )) AS expired_sensitive_evidence,
-       max(session.completed_at) AS last_completed_at
-     FROM operations_commerce_order_backfill_sessions session`,
+       totals.last_completed_at
+     FROM active_health active
+     CROSS JOIN terminal_totals totals
+     CROSS JOIN terminal_health terminal`,
   )
   const row = result.rows[0]
   const scheduledPollPolicies = Number(row?.scheduled_poll_policies || 0)
@@ -3141,7 +4112,9 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
     staleProcessing: Number(row?.stale_processing || 0),
     failed: Number(row?.failed || 0),
     dead: Number(row?.dead || 0),
+    historicalDead: Number(row?.historical_dead || 0),
     blocked: Number(row?.blocked || 0),
+    historicalBlocked: Number(row?.historical_blocked || 0),
     pausedRetainedSessions: Number(row?.paused_retained_sessions || 0),
     overduePolls: Number(row?.overdue_polls || 0),
     continuousTransportCounts: {
@@ -3743,12 +4716,23 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
                 'externalProductId', line.external_product_id,
                 'externalVariantId', line.external_variant_id,
                 'sku', line.sku,
+                'titleSnapshot', line.title_snapshot,
+                'variantTitleSnapshot', line.variant_title_snapshot,
+                'vendorSnapshot', line.vendor_snapshot,
                 'originalQuantity', line.original_quantity,
                 'currentQuantity', line.current_quantity,
                 'unfulfilledQuantity', line.unfulfilled_quantity,
                 'fulfilledQuantity', line.fulfilled_quantity,
                 'returnedQuantity', line.returned_quantity,
-                'requiresShipping', line.requires_shipping
+                'requiresShipping', line.requires_shipping,
+                'unitPriceCurrency', line.unit_price_currency,
+                'unitPriceMinor', line.unit_price_minor::text,
+                'subtotalCurrency', line.subtotal_currency,
+                'subtotalMinor', line.subtotal_minor::text,
+                'discountCurrency', line.discount_currency,
+                'discountMinor', line.discount_minor::text,
+                'taxCurrency', line.tax_currency,
+                'taxMinor', line.tax_minor::text
               )) ORDER BY line.external_line_id) AS payload
        FROM operations_commerce_order_observation_lines line
        WHERE line.organization_id = latest.organization_id

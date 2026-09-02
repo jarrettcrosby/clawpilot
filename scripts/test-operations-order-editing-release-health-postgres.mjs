@@ -269,6 +269,26 @@ async function verifyExactHistoryNegativeCases(client) {
       `,
     },
     {
+      name: 'weakened provider-line money constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          DROP CONSTRAINT commerce_order_observation_line_money_valid;
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          ADD CONSTRAINT commerce_order_observation_line_money_valid
+          CHECK (true)
+      `,
+    },
+    {
+      name: 'weakened provider-line snapshot constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          DROP CONSTRAINT commerce_order_observation_line_snapshots_valid;
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          ADD CONSTRAINT commerce_order_observation_line_snapshots_valid
+          CHECK (true)
+      `,
+    },
+    {
       name: 'weakened tracking-URL constraint',
       sql: `
         ALTER TABLE public.operations_commerce_order_event_observations
@@ -338,6 +358,38 @@ async function verifyExactHistoryNegativeCases(client) {
       'Wrong 0340 checksum must fail exact-history health',
     )
   })
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0341_operations_faire_order_workbench_exact_history.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await exactHistoryHealth(client),
+      false,
+      'Wrong 0341 checksum must fail exact-history health',
+    )
+  })
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0342_operations_order_history_line_fidelity.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await exactHistoryHealth(client),
+      false,
+      'Wrong 0342 checksum must fail exact-history health',
+    )
+  })
 }
 
 async function main() {
@@ -383,14 +435,15 @@ async function main() {
       for (const file of files.slice(workbenchIndex)) {
         await applyMigration(client, file)
         exactHistoryInstalled ||= (
-          file === '0340_operations_order_workbench_exact_history.sql'
+          file ===
+            '0342_operations_order_history_line_fidelity.sql'
         )
         if (!process.argv.includes('--print-fingerprints')) {
           assert.equal(
             await exactHistoryHealth(client),
             exactHistoryInstalled,
             exactHistoryInstalled
-              ? `${file} must preserve exact-history health after 0340`
+              ? `${file} must preserve exact-history health after 0342`
               : `${file} must not prematurely satisfy exact-history health`,
           )
         }
@@ -474,7 +527,7 @@ async function main() {
             OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT,
           artifact_hash: OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH,
         },
-        'Fresh 0340 artifacts must match the reviewed exact fingerprint',
+        'Fresh 0342 artifacts must match the reviewed exact fingerprint',
       )
       assert.equal(
         await exactHistoryHealth(client),

@@ -1027,6 +1027,12 @@ function loadOperationalWarehouseServices(pool) {
   const orderListQuery = loadTypeScriptModule(
     'app_src/lib/operations/orderListQuery.ts',
   )
+  const providerOrderMoney = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderMoney.ts',
+  )
+  const providerOrderHistory = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderHistory.ts',
+  )
   const operations = loadTypeScriptModule(
     'app_src/lib/persistence/operations.ts',
     {
@@ -1109,9 +1115,34 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/packingSlip': packingSlip,
       '@/lib/operations/orderListQuery': orderListQuery,
       '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/operations/providerOrderMoney': providerOrderMoney,
+      '@/lib/operations/providerOrderHistory': providerOrderHistory,
+      '@/lib/persistence/commerceOrderSync': {
+        async readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres() {
+          return {
+            items: [],
+            truncated: false,
+            limit: 500,
+            providerWrites: 0,
+          }
+        },
+      },
       '@/lib/persistence/commerceOrderWorkbench': {
         async readCommerceOrderWorkbenchFromPostgres() {
           return []
+        },
+        async readCommerceOrderWorkbenchPageFromPostgres() {
+          return {
+            orders: [],
+            page: {
+              total: 0,
+              returned: 0,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          }
         },
       },
       '@/lib/persistence/commerceProviderWrites': {

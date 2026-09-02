@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import type { PoolClient } from 'pg'
+import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   decryptCommerceCandidateSnapshot,
@@ -30,6 +30,15 @@ import {
   type OperationsOrderSortDirection,
   type OperationsOrderTrackingFilter,
 } from '@/lib/operations/orderListQuery'
+import { currentExactProviderOrderMoney } from '@/lib/operations/providerOrderMoney'
+import {
+  emptyOperationsProviderOrderHistory,
+  operationsProviderHistoryFromTimeline,
+} from '@/lib/operations/providerOrderHistory'
+import type {
+  OperationsOrderProviderIdentity,
+  OperationsOrderSourceEvidence,
+} from '@/lib/operations/unifiedOrderPage'
 import type {
   OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderPage,
@@ -38,6 +47,7 @@ import type {
   OperationsImportedOrderShipToUpdateResult,
   OperationsImportedOrderResolutionDraft,
   OperationsImportedOrderWorkingCopy,
+  OperationsOrderStatus,
 } from '@/lib/operations/types'
 import {
   assertCommerceOrderProviderNonterminalWithClient,
@@ -63,6 +73,8 @@ import {
 
 const COMMAND_TYPE = 'operations.commerce_order_workbench.update_ship_to'
 const REFRESH_COMMAND_TYPE = 'operations.commerce_order_workbench.refresh'
+const EMPTY_RESULT_SET_REVISION = 'd41d8cd98f00b204e9800998ecf8427e'
+const RESULT_SET_REVISION = /^[0-9a-f]{32}$/u
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u
 const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
@@ -76,6 +88,28 @@ const WORKBENCH_CURSOR = new RegExp(
 )
 const MAX_WORKBENCH_PAGE_SIZE = 250
 const MAX_WORKBENCH_COLLECTION_PAGES = 20
+
+type WorkbenchOrderPageStatus =
+  | OperationsOrderStatus
+  | 'fulfilled_externally'
+  | 'closed_externally'
+
+const WORKBENCH_ORDER_PAGE_STATUSES = new Set<WorkbenchOrderPageStatus>([
+  'fulfilled_externally',
+  'closed_externally',
+  'imported',
+  'validated',
+  'held',
+  'promised',
+  'reserved',
+  'planned',
+  'released',
+  'picking',
+  'packed',
+  'shipped',
+  'cancelled',
+  'exception',
+])
 
 const ADDRESS_BLOCKERS = new Set([
   'ship_to_confirmation_required',
@@ -93,6 +127,14 @@ function workbenchLinePackFactsRequired(input: Readonly<{
       !Number.isSafeInteger(input.unitMultiplier)
       || input.unitMultiplier !== 1
     )
+}
+
+function queryWorkbenchPage<T extends QueryResultRow>(
+  client: PoolClient | undefined,
+  text: string,
+  values: unknown[],
+) {
+  return client ? client.query<T>(text, values) : query<T>(text, values)
 }
 
 type WorkbenchReadRow = {
@@ -135,6 +177,7 @@ type WorkbenchReadRow = {
   requested_delivery_at: Date | null
   canonical_order_global_id: string | null
   customer_name: string | null
+  warehouse_name: string | null
   line_count: string
   pack_facts_still_required: boolean
   party_snapshot_state: 'missing' | 'redacted' | 'protected'
@@ -177,11 +220,15 @@ type WorkbenchReadRow = {
   provider_fulfillment_status: string
   provider_status_observed_at: Date
   provider_status_source: 'operational' | 'history' | 'retained'
+  current_provider_observation_kind: string | null
+  current_provider_currency: string | null
+  current_provider_total_minor: string | null
   latest_exact_history_observed_at: Date | null
   activity_at: Date
   tracking_number: string | null
   cursor_sort_value: Date | string
   matching_total_count: string
+  result_set_revision: string
 }
 
 type WorkbenchPageCursor = {
@@ -370,11 +417,13 @@ function workbenchPageScopeHash(input: Readonly<{
   organizationId: string
   candidateGlobalId: string | null
   search: string
+  status: WorkbenchOrderPageStatus | null
   sort: OperationsOrderSort
   direction: OperationsOrderSortDirection
   provider: string | null
   tracking: OperationsOrderTrackingFilter | null
   updatedAfter: string | null
+  stableTextCollation: boolean
 }>) {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex')
 }
@@ -512,6 +561,20 @@ function workbenchOrderProviderFilter(value: string | null | undefined) {
   return provider || null
 }
 
+function workbenchOrderStatusFilter(
+  value: WorkbenchOrderPageStatus | null | undefined,
+) {
+  const status = value || null
+  if (status && !WORKBENCH_ORDER_PAGE_STATUSES.has(status)) {
+    requestError(
+      'OPERATIONS_STATUS_INVALID',
+      'Order status is invalid',
+      400,
+    )
+  }
+  return status
+}
+
 function workbenchOrderTrackingFilter(
   value: OperationsOrderTrackingFilter | null | undefined,
 ) {
@@ -538,7 +601,14 @@ function workbenchOrderUpdatedAfter(value: string | null | undefined) {
   return updatedAfter || null
 }
 
-function workbenchOrderSortSql(sort: OperationsOrderSort) {
+function stableTextSortExpression(expression: string, enabled: boolean) {
+  return enabled ? `(${expression}) COLLATE "C"` : expression
+}
+
+function workbenchOrderSortSql(
+  sort: OperationsOrderSort,
+  stableTextCollation: boolean,
+) {
   if (sort === 'updated') {
     return {
       expression: 'candidate_context.activity_at',
@@ -547,30 +617,45 @@ function workbenchOrderSortSql(sort: OperationsOrderSort) {
   }
   if (sort === 'order_number') {
     return {
-      expression: `lower(left(candidate_context.order_number_snapshot, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      expression: stableTextSortExpression(
+        `lower(left(candidate_context.order_number_snapshot, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+        stableTextCollation,
+      ),
       cursorCast: 'text',
     }
   }
   if (sort === 'customer') {
     return {
-      expression: `lower(left(COALESCE(candidate_context.customer_name, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      expression: stableTextSortExpression(
+        `lower(left(COALESCE(candidate_context.customer_name, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+        stableTextCollation,
+      ),
       cursorCast: 'text',
     }
   }
   if (sort === 'status') {
     return {
-      expression: `lower(left(candidate_context.display_status, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      expression: stableTextSortExpression(
+        `lower(left(candidate_context.display_status, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+        stableTextCollation,
+      ),
       cursorCast: 'text',
     }
   }
   if (sort === 'provider') {
     return {
-      expression: `lower(left(candidate_context.provider, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      expression: stableTextSortExpression(
+        `lower(left(candidate_context.provider, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+        stableTextCollation,
+      ),
       cursorCast: 'text',
     }
   }
   return {
-    expression: `lower(left(COALESCE(candidate_context.tracking_number, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+    expression: stableTextSortExpression(
+      `lower(left(COALESCE(candidate_context.tracking_number, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      stableTextCollation,
+    ),
     cursorCast: 'text',
   }
 }
@@ -998,94 +1083,28 @@ function providerFulfillmentStatus(value: string) {
     : 'unknown' as const
 }
 
-function optionalTimelineText(value: unknown) {
-  return typeof value === 'string' && value.trim() ? value : null
-}
-
-function optionalTimelineInteger(value: unknown) {
-  return typeof value === 'number' && Number.isSafeInteger(value)
-    ? value
-    : null
-}
-
-function providerHistoryFromTimeline(
-  timeline: Awaited<ReturnType<
-    typeof readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres
-  >>,
-): OperationsImportedOrderWorkingCopy['providerHistory'] {
-  const providerEvents = timeline.items.filter((event) => (
-    event.evidenceSource === 'provider'
-  ))
-  const lineSnapshot = providerEvents.find((event) => (
-    event.eventKind === 'order_lines_snapshot'
-  )) || null
-  const rawLines = Array.isArray(lineSnapshot?.payload.lines)
-    ? lineSnapshot.payload.lines
-    : []
-  const currentLines = rawLines.flatMap((value) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return []
-    const line = value as Record<string, unknown>
-    const externalLineId = optionalTimelineText(line.externalLineId)
-    const orderedQuantity = optionalTimelineInteger(line.originalQuantity)
-    if (!externalLineId || orderedQuantity === null) return []
-    return [{
-      externalLineId,
-      externalProductId: optionalTimelineText(line.externalProductId),
-      externalVariantId: optionalTimelineText(line.externalVariantId),
-      sku: optionalTimelineText(line.sku),
-      orderedQuantity,
-      currentQuantity: optionalTimelineInteger(line.currentQuantity),
-      fulfilledQuantity: optionalTimelineInteger(line.fulfilledQuantity),
-      unfulfilledQuantity: optionalTimelineInteger(line.unfulfilledQuantity),
-      returnedQuantity: optionalTimelineInteger(line.returnedQuantity),
-      requiresShipping: typeof line.requiresShipping === 'boolean'
-        ? line.requiresShipping
-        : null,
-    }]
-  })
-  return {
-    observedAt: optionalTimelineText(lineSnapshot?.payload.observedAt),
-    currentLines,
-    events: providerEvents.flatMap((event) => {
-      if (event.eventKind === 'order_lines_snapshot') return []
-      const trackingNumber = optionalTimelineText(event.payload.trackingNumber)
-      const trackingUrl = optionalTimelineText(event.payload.trackingUrl)
-      return [{
-        globalId: event.evidenceGlobalId,
-        kind: event.eventKind,
-        status: event.eventStatus,
-        occurredAt: event.occurredAt,
-        externalSubjectId: optionalTimelineText(
-          event.payload.externalSubjectId,
-        ),
-        quantity: optionalTimelineInteger(event.payload.quantity),
-        amountMinor: optionalTimelineInteger(event.payload.amountMinor),
-        currency: optionalTimelineText(event.payload.currency),
-        trackingCarrier: optionalTimelineText(event.payload.trackingCarrier),
-        trackingNumber,
-        trackingUrl,
-        trackingRedacted: event.eventKind === 'tracking_updated'
-          && trackingNumber === null
-          && trackingUrl === null
-          && optionalTimelineText(
-            event.payload.sensitiveEvidenceRedactedAt,
-          ) !== null,
-      }]
-    }),
-    providerWrites: 0,
-  }
-}
-
 function mappedWorkingCopy(
   row: WorkbenchReadRow,
   details: WorkbenchResolutionDetails | null,
-  providerHistory: OperationsImportedOrderWorkingCopy['providerHistory'] = {
-    observedAt: null,
-    currentLines: [],
-    events: [],
-    providerWrites: 0,
-  },
+  providerHistory: OperationsImportedOrderWorkingCopy['providerHistory'] =
+    emptyOperationsProviderOrderHistory(),
 ): OperationsImportedOrderWorkingCopy {
+  const currentProviderHistoryIsExact = [
+    'manual_exact_read',
+    'webhook_exact_read',
+  ].includes(row.current_provider_observation_kind || '')
+  const currentExactMoney = currentExactProviderOrderMoney({
+    currentProviderObservationKind: row.current_provider_observation_kind,
+    currency: row.current_provider_currency,
+    providerTotalMinor: row.current_provider_total_minor,
+  })
+  const currentProviderHistory = currentProviderHistoryIsExact
+    ? {
+        ...providerHistory,
+        currency: currentExactMoney?.currency || null,
+        providerTotalMinor: currentExactMoney?.totalMinor || null,
+      }
+    : emptyOperationsProviderOrderHistory()
   const providerTerminal = (
     ['cancelled', 'closed'].includes(row.provider_lifecycle_status)
     || ['fulfilled', 'cancelled'].includes(row.provider_fulfillment_status)
@@ -1212,8 +1231,10 @@ function mappedWorkingCopy(
   const candidateLinesByExternalId = new Map(candidateLines.map((line) => (
     [line.externalLineId, line]
   )))
-  const displayLines = providerTerminal && providerHistory.currentLines.length
-    ? providerHistory.currentLines.map((historyLine) => {
+  const displayLines = providerTerminal
+    && currentProviderHistoryIsExact
+    && currentProviderHistory.currentLines.length
+    ? currentProviderHistory.currentLines.map((historyLine) => {
         const candidateLine = candidateLinesByExternalId.get(
           historyLine.externalLineId,
         )
@@ -1240,11 +1261,19 @@ function mappedWorkingCopy(
               : currentQuantity === 0
                 ? 'cancelled' as const
                 : 'unknown' as const
+        const providerUnitPriceMinor = historyLine.unitPriceMinor === null
+          ? null
+          : Number(historyLine.unitPriceMinor)
+        const providerUnitPriceAvailable = Boolean(
+          historyLine.unitPriceCurrency
+          && Number.isSafeInteger(providerUnitPriceMinor),
+        )
         return {
           globalId: candidateLine?.globalId
             || `history:${historyLine.externalLineId}`,
           externalLineId: historyLine.externalLineId,
-          title: candidateLine?.title
+          title: historyLine.titleSnapshot
+            || candidateLine?.title
             || historyLine.sku
             || historyLine.externalVariantId
             || historyLine.externalProductId
@@ -1263,11 +1292,17 @@ function mappedWorkingCopy(
             ?? candidateLine?.requiresShipping
             ?? false,
           mappingStatus: candidateLine?.mappingStatus || 'unresolved',
-          priceStatus: candidateLine?.priceStatus || 'unsupported',
+          priceStatus: providerUnitPriceAvailable
+            ? 'provider' as const
+            : candidateLine?.priceStatus || 'unsupported',
           packageStatus: candidateLine?.packageStatus || 'not_required',
           productGlobalId: candidateLine?.productGlobalId || null,
-          unitPriceMinor: candidateLine?.unitPriceMinor ?? null,
-          currency: candidateLine?.currency || row.currency_code,
+          unitPriceMinor: providerUnitPriceAvailable
+            ? providerUnitPriceMinor
+            : candidateLine?.unitPriceMinor ?? null,
+          currency: providerUnitPriceAvailable
+            ? historyLine.unitPriceCurrency as string
+            : candidateLine?.currency || row.currency_code,
           packageProfileGlobalId:
             candidateLine?.packageProfileGlobalId || null,
           blockerCodes: [],
@@ -1296,7 +1331,10 @@ function mappedWorkingCopy(
     needsInfo: !providerTerminal && (issues.length > 0 || otherMissingFacts),
     blockerCodes: effectiveBlockerCodes,
     customerName: customerSnapshotName(row),
-    lineCount: providerTerminal && providerHistory.currentLines.length
+    warehouseName: row.warehouse_name,
+    lineCount: providerTerminal
+      && currentProviderHistoryIsExact
+      && currentProviderHistory.currentLines.length
       ? displayLines.length
       : Number(row.line_count),
     sourceUpdatedAt: (
@@ -1304,10 +1342,9 @@ function mappedWorkingCopy(
     ).toISOString(),
     updatedAt: row.activity_at.toISOString(),
     trackingNumber: row.tracking_number,
-    orderValueMinor: row.header_money_state === 'complete'
-      ? row.total_minor
-      : null,
-    currency: row.currency_code,
+    orderValueMinor: currentProviderHistory.providerTotalMinor
+      || (row.header_money_state === 'complete' ? row.total_minor : null),
+    currency: currentProviderHistory.currency || row.currency_code,
     candidateRowVersion: Number(row.candidate_row_version),
     workflowState: row.workflow_state,
     actionAvailable: row.action_available,
@@ -1346,7 +1383,7 @@ function mappedWorkingCopy(
           || null,
     },
     lines: displayLines,
-    providerHistory,
+    providerHistory: currentProviderHistory,
     productOptions: [...productOptions.values()],
     shipTo: {
       value: shipTo,
@@ -1366,6 +1403,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   search?: string | null
   candidateGlobalId?: string | null
   includeResolutionDetails?: boolean
+  status?: WorkbenchOrderPageStatus | null
   sort?: OperationsOrderSort | null
   direction?: OperationsOrderSortDirection | null
   provider?: string | null
@@ -1373,20 +1411,33 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   updatedAfter?: string | null
   cursor?: string | null
   pageSize?: number | null
+  /** Server-only merge mode; scopes cursors to deterministic byte ordering. */
+  stableTextCollation?: boolean
+  /** Server-only: keep a unified multi-source read on one database snapshot. */
+  queryClient?: PoolClient
 }): Promise<{
   orders: OperationsImportedOrderWorkingCopy[]
   page: OperationsImportedOrderPage
+  internal: {
+    rowCursors: string[]
+    sortValues: string[]
+    providerIdentities: OperationsOrderProviderIdentity[]
+    sourceEvidence: OperationsOrderSourceEvidence[]
+    resultSetRevision: string | null
+  }
 }> {
   const organizationId = requireOrganizationId(input.organizationId)
   const candidateGlobalId = input.candidateGlobalId
     ? requireCandidateGlobalId(input.candidateGlobalId)
     : null
   const search = String(input.search || '').trim()
+  const status = workbenchOrderStatusFilter(input.status)
   const sort = workbenchOrderSort(input.sort)
   const direction = workbenchOrderSortDirection(input.direction)
   const provider = workbenchOrderProviderFilter(input.provider)
   const tracking = workbenchOrderTrackingFilter(input.tracking)
   const updatedAfter = workbenchOrderUpdatedAfter(input.updatedAfter)
+  const stableTextCollation = input.stableTextCollation === true
   const searchPattern = search
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
@@ -1395,17 +1446,20 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     organizationId,
     candidateGlobalId,
     search,
+    status,
     sort,
     direction,
     provider,
     tracking,
     updatedAfter,
+    stableTextCollation,
   })
   const cursor = decodeWorkbenchPageCursor(input.cursor, scopeHash, sort)
-  const sortSql = workbenchOrderSortSql(sort)
+  const sortSql = workbenchOrderSortSql(sort, stableTextCollation)
   const comparison = direction === 'asc' ? '>' : '<'
   const orderDirection = direction === 'asc' ? 'ASC' : 'DESC'
-  const result = await query<WorkbenchReadRow>(
+  const result = await queryWorkbenchPage<WorkbenchReadRow>(
+    input.queryClient,
     `WITH latest_live_candidates AS (
        SELECT DISTINCT ON (
          candidate.integration_account_id,
@@ -1636,25 +1690,66 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          LIMIT 1
        ) latest_observation ON true
        LEFT JOIN LATERAL (
-         SELECT event.tracking_number,
-                date_trunc('milliseconds', GREATEST(
-                  event.occurred_at,
-                  event.observed_at,
-                  event.created_at
-                )) AS activity_at
-         FROM operations_commerce_order_event_observations event
-         WHERE event.organization_id = candidate.organization_id
-           AND event.integration_account_id = candidate.integration_account_id
-           AND event.provider = candidate.provider
-           AND event.external_order_id = candidate.external_order_id
-           AND event.event_kind = 'tracking_updated'
-           AND event.sensitive_evidence_redacted_at IS NULL
-           AND event.sensitive_evidence_expires_at > now()
-         ORDER BY event.occurred_at DESC,
-                  (event.tracking_number IS NOT NULL) DESC,
-                  event.external_event_id DESC NULLS LAST,
-                  event.id DESC
-         LIMIT 1
+         SELECT (
+                  array_remove(
+                    array_agg(
+                      subject_state.tracking_number
+                      ORDER BY subject_state.activity_at DESC,
+                               subject_state.subject_key,
+                               subject_state.event_id DESC
+                    ),
+                    NULL
+                  )
+                )[1] AS tracking_number,
+                max(subject_state.activity_at) AS activity_at
+         FROM (
+           SELECT ranked.subject_key,
+                  ranked.event_id,
+                  ranked.tracking_number,
+                  ranked.activity_at
+           FROM (
+             SELECT COALESCE(
+                      NULLIF(btrim(event.external_subject_id), ''),
+                      '__order__'
+                    ) AS subject_key,
+                    event.id AS event_id,
+                    CASE
+                      WHEN event.sensitive_evidence_redacted_at IS NULL
+                           AND event.sensitive_evidence_expires_at > now()
+                        THEN NULLIF(btrim(event.tracking_number), '')
+                      ELSE NULL
+                    END AS tracking_number,
+                    date_trunc('milliseconds', GREATEST(
+                      event.occurred_at,
+                      event.observed_at,
+                      event.created_at
+                    )) AS activity_at,
+                    row_number() OVER (
+                      PARTITION BY COALESCE(
+                        NULLIF(btrim(event.external_subject_id), ''),
+                        '__order__'
+                      )
+                      ORDER BY GREATEST(
+                                 event.occurred_at,
+                                 event.observed_at,
+                                 event.created_at
+                               ) DESC,
+                               (
+                                 NULLIF(btrim(event.tracking_number), '')
+                                   IS NOT NULL
+                               ) DESC,
+                               event.external_event_id DESC NULLS LAST,
+                               event.id DESC
+                    ) AS subject_rank
+             FROM operations_commerce_order_event_observations event
+             WHERE event.organization_id = candidate.organization_id
+               AND event.integration_account_id = candidate.integration_account_id
+               AND event.provider = candidate.provider
+               AND event.external_order_id = candidate.external_order_id
+               AND event.event_kind = 'tracking_updated'
+           ) ranked
+           WHERE ranked.subject_rank = 1
+         ) subject_state
        ) latest_tracking ON true
      ), matching_candidate_ids AS (
        SELECT candidate_context.candidate_id,
@@ -1663,7 +1758,17 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
               candidate_context.activity_at,
               candidate_context.tracking_number,
               ${sortSql.expression} AS cursor_sort_value,
-              count(*) OVER ()::text AS matching_total_count
+              count(*) OVER ()::text AS matching_total_count,
+              md5(string_agg(
+                jsonb_build_array(
+                  candidate_context.candidate_id::text,
+                  (${sortSql.expression})::text
+                )::text,
+                E'\n'
+              ) OVER (
+                ORDER BY candidate_context.candidate_id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+              )) AS result_set_revision
        FROM candidate_context
        WHERE (
            $2::text IS NULL
@@ -1735,6 +1840,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
            $6::timestamptz IS NULL
            OR candidate_context.activity_at > $6::timestamptz
          )
+         AND (
+           $11::text IS NULL
+           OR candidate_context.display_status = $11::text
+         )
      ), page_candidate_ids AS (
        SELECT matching.candidate_id,
               matching.provider_updated_at,
@@ -1742,7 +1851,8 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
               matching.activity_at,
               matching.tracking_number,
               matching.cursor_sort_value,
-              matching.matching_total_count
+              matching.matching_total_count,
+              matching.result_set_revision
        FROM matching_candidate_ids matching
        WHERE NOT $7::boolean
           OR matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}
@@ -1798,6 +1908,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        display_snapshot.requested_delivery_at,
        canonical_order.global_id AS canonical_order_global_id,
        display_customer.name AS customer_name,
+       provider_warehouse.warehouse_name,
        line_count.line_count,
        line_count.pack_facts_still_required,
        display_snapshot.party_snapshot_state,
@@ -1843,11 +1954,17 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          provider_status.source,
          'retained'::text
        ) AS provider_status_source,
+       provider_status.observation_kind
+         AS current_provider_observation_kind,
+       provider_status.currency AS current_provider_currency,
+       provider_status.provider_total_minor::text
+         AS current_provider_total_minor,
        exact_history.observed_at AS latest_exact_history_observed_at,
        selected.activity_at,
        selected.tracking_number,
        selected.cursor_sort_value,
-       selected.matching_total_count
+       selected.matching_total_count,
+       selected.result_set_revision
      FROM page_candidate_ids selected
      JOIN operations_commerce_order_candidates candidate
        ON candidate.organization_id = $1::uuid
@@ -1857,6 +1974,59 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       AND account.id = candidate.integration_account_id
       AND account.integration_type = 'commerce'
       AND account.provider IN ('shopify', 'faire')
+     LEFT JOIN LATERAL (
+       SELECT min(current_subject.provider_location_id)
+                AS provider_location_id
+       FROM (
+         SELECT DISTINCT ON (
+                  COALESCE(
+                    NULLIF(btrim(event.external_subject_id), ''),
+                    NULLIF(btrim(event.external_event_id), ''),
+                    '__order__'
+                  )
+                )
+                NULLIF(btrim(event.provider_location_id), '')
+                  AS provider_location_id
+         FROM operations_commerce_order_event_observations event
+         WHERE event.organization_id = candidate.organization_id
+           AND event.integration_account_id = candidate.integration_account_id
+           AND event.provider = candidate.provider
+           AND event.external_order_id = candidate.external_order_id
+           AND NULLIF(btrim(event.provider_location_id), '') IS NOT NULL
+         ORDER BY COALESCE(
+                    NULLIF(btrim(event.external_subject_id), ''),
+                    NULLIF(btrim(event.external_event_id), ''),
+                    '__order__'
+                  ),
+                  GREATEST(
+                    event.occurred_at,
+                    event.observed_at,
+                    event.created_at
+                  ) DESC,
+                  event.id DESC
+       ) current_subject
+       HAVING count(DISTINCT current_subject.provider_location_id) = 1
+     ) latest_provider_location ON true
+     LEFT JOIN LATERAL (
+       SELECT warehouse.name AS warehouse_name
+       FROM operations_commerce_inventory_location_mappings mapping
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = mapping.organization_id
+        AND warehouse.id = mapping.warehouse_id
+       JOIN operations_locations location
+         ON location.organization_id = mapping.organization_id
+        AND location.id = mapping.location_id
+        AND location.warehouse_id = warehouse.id
+        AND location.active = true
+       WHERE mapping.organization_id = candidate.organization_id
+         AND mapping.integration_account_id = candidate.integration_account_id
+         AND mapping.active = true
+         AND mapping.external_location_id
+               = latest_provider_location.provider_location_id
+         AND warehouse.status = 'active'
+       ORDER BY mapping.updated_at DESC, mapping.id DESC
+       LIMIT 1
+     ) provider_warehouse ON true
      LEFT JOIN operations_commerce_order_workbench workbench
        ON workbench.organization_id = candidate.organization_id
       AND workbench.integration_account_id = candidate.integration_account_id
@@ -1888,7 +2058,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        SELECT status_evidence.lifecycle_status,
               status_evidence.fulfillment_status,
               status_evidence.observed_at,
-              status_evidence.source
+              status_evidence.source,
+              status_evidence.observation_kind,
+              status_evidence.currency,
+              status_evidence.provider_total_minor
        FROM (
          SELECT provider_candidate.normalized_order_status
                   AS lifecycle_status,
@@ -1897,6 +2070,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
                 provider_candidate.provider_updated_at,
                 provider_candidate.observed_at,
                 'operational'::text AS source,
+                NULL::text AS observation_kind,
+                NULL::text AS currency,
+                NULL::bigint AS provider_total_minor,
                 0::integer AS source_priority,
                 provider_candidate.id AS evidence_id
          FROM operations_commerce_order_candidates provider_candidate
@@ -1912,6 +2088,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
                 observation.provider_updated_at,
                 observation.observed_at,
                 'history'::text AS source,
+                observation.observation_kind::text,
+                observation.currency,
+                observation.provider_total_minor,
                 1::integer AS source_priority,
                 observation.id AS evidence_id
          FROM operations_commerce_order_observations observation
@@ -1937,7 +2116,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        WHERE observation.organization_id = candidate.organization_id
          AND observation.integration_account_id
            = candidate.integration_account_id
-         AND observation.provider = 'shopify'
+         AND observation.provider = candidate.provider
          AND observation.external_order_id = candidate.external_order_id
          AND observation.observation_kind IN (
            'manual_exact_read', 'webhook_exact_read'
@@ -1999,6 +2178,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       cursor?.sortValue ?? null,
       cursor?.candidateId ?? null,
       pageSize + 1,
+      status,
     ],
   )
   const hasNextPage = result.rows.length > pageSize
@@ -2097,6 +2277,8 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   const total = pageRows.length
     ? Number(pageRows[0].matching_total_count)
     : cursor?.total || 0
+  const resultSetRevision = pageRows[0]?.result_set_revision
+    || (total === 0 ? EMPTY_RESULT_SET_REVISION : null)
   if (!Number.isSafeInteger(total) || total < pageRows.length) {
     requestError(
       'OPERATIONS_PAGE_EVIDENCE_INVALID',
@@ -2104,10 +2286,27 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       500,
     )
   }
+  if (resultSetRevision !== null && !RESULT_SET_REVISION.test(resultSetRevision)) {
+    requestError(
+      'OPERATIONS_PAGE_EVIDENCE_INVALID',
+      'Imported-order pagination returned invalid revision evidence',
+      500,
+    )
+  }
   const lastRow = pageRows.at(-1) || null
   const nextCursor = hasNextPage && lastRow
     ? encodeWorkbenchPageCursor(lastRow, total, scopeHash, sort)
     : null
+  const sourceEvidence = pageRows.map((row): OperationsOrderSourceEvidence => ({
+    rowCursor: encodeWorkbenchPageCursor(row, total, scopeHash, sort),
+    sortValue: sort === 'updated'
+      ? (row.cursor_sort_value as Date).toISOString()
+      : String(row.cursor_sort_value),
+    providerIdentity: {
+      integrationAccountGlobalId: row.integration_account_global_id,
+      externalOrderId: row.external_order_id,
+    },
+  }))
   const providerHistoryByCandidate = new Map<
     string,
     OperationsImportedOrderWorkingCopy['providerHistory']
@@ -2131,7 +2330,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     providerHistoryByCandidate.set(
       row.candidate_id,
       {
-        ...providerHistoryFromTimeline(timeline),
+        ...operationsProviderHistoryFromTimeline(timeline),
         observedAt:
           row.latest_exact_history_observed_at?.toISOString() || null,
       },
@@ -2141,13 +2340,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     orders: pageRows.map((row) => mappedWorkingCopy(
       row,
       detailsByCandidate.get(row.candidate_id) || null,
-      providerHistoryByCandidate.get(row.candidate_id) || {
-        observedAt:
+      providerHistoryByCandidate.get(row.candidate_id)
+        || emptyOperationsProviderOrderHistory(
           row.latest_exact_history_observed_at?.toISOString() || null,
-        currentLines: [],
-        events: [],
-        providerWrites: 0,
-      },
+        ),
     )),
     page: {
       total,
@@ -2156,6 +2352,15 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       nextCursor,
       complete: nextCursor === null,
       truncated: nextCursor !== null,
+    },
+    internal: {
+      rowCursors: sourceEvidence.map((evidence) => evidence.rowCursor),
+      sortValues: sourceEvidence.map((evidence) => evidence.sortValue),
+      providerIdentities: sourceEvidence.map((evidence) => (
+        evidence.providerIdentity as OperationsOrderProviderIdentity
+      )),
+      sourceEvidence,
+      resultSetRevision,
     },
   }
 }

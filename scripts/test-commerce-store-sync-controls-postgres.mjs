@@ -2256,6 +2256,59 @@ async function verify(databaseUrl, fixtures) {
       checksumTamperClient.release()
     }
     assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
+
+    const post0341Client = await pool.connect()
+    try {
+      await applyMigration(
+        post0341Client,
+        '0341_operations_faire_order_workbench_exact_history.sql',
+      )
+    } finally {
+      post0341Client.release()
+    }
+    const post0341Catalog = await readStoreSyncHealthCatalog(pool)
+    if (process.argv.includes('--print-fingerprints')) {
+      console.log(JSON.stringify(post0341Catalog, null, 2))
+    }
+    assert.equal(
+      post0341Catalog.rewrittenHash,
+      '354a02eca72636fc7f298f7a7438bbd043340072507503a11dd12e949185304e',
+      'Faire exact-history migration must produce the reviewed function hash',
+    )
+    assert.equal(
+      await storeSyncRewrittenFunctionHealth(pool),
+      true,
+      'Faire exact-history migration must preserve rewritten-function health',
+    )
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+      'Faire exact-history migration must preserve Store sync authority',
+    )
+    await assertRewrittenFunctionTamperDetected(
+      pool,
+      `ALTER FUNCTION commerce_order_observation_accepts_children(uuid, uuid)
+       RESET ALL`,
+    )
+    const faireChecksumTamperClient = await pool.connect()
+    try {
+      await faireChecksumTamperClient.query('BEGIN')
+      await faireChecksumTamperClient.query(
+        `UPDATE public.schema_migrations
+         SET checksum = repeat('0', 64)
+         WHERE filename =
+           '0341_operations_faire_order_workbench_exact_history.sql'`,
+      )
+      assert.equal(
+        await storeSyncRewrittenFunctionHealth(faireChecksumTamperClient),
+        false,
+        'Faire exact-history migration checksum drift must fail health',
+      )
+    } finally {
+      await faireChecksumTamperClient.query('ROLLBACK').catch(() => {})
+      faireChecksumTamperClient.release()
+    }
+    assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
   } finally {
     await pool.end()
   }
@@ -2296,6 +2349,16 @@ async function main() {
   )
   const exactHistoryMigrationChecksum = createHash('sha256')
     .update(exactHistoryMigrationSource)
+    .digest('hex')
+  const faireExactHistoryMigrationSource = readFileSync(
+    resolve(
+      root,
+      'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+    ),
+    'utf8',
+  )
+  const faireExactHistoryMigrationChecksum = createHash('sha256')
+    .update(faireExactHistoryMigrationSource)
     .digest('hex')
   const healthRouteSource = readFileSync(
     resolve(root, 'app_src/app/api/health/route.ts'),
@@ -2344,6 +2407,10 @@ async function main() {
   assert.ok(
     storeSyncHealthSource.includes(`'${exactHistoryMigrationChecksum}'`),
     'Store sync health must pin the exact 0340 migration bytes',
+  )
+  assert.ok(
+    storeSyncHealthSource.includes(`'${faireExactHistoryMigrationChecksum}'`),
+    'Store sync health must pin the exact 0341 migration bytes',
   )
   for (const contract of [
     'legacy-writer-compatible',

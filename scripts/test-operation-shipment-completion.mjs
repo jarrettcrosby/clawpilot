@@ -1346,6 +1346,12 @@ async function verifyShipmentCompletion(databaseUrl) {
     const orderListQuery = loadTypeScriptModule(
       'app_src/lib/operations/orderListQuery.ts',
     )
+    const providerOrderMoney = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderMoney.ts',
+    )
+    const providerOrderHistory = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderHistory.ts',
+    )
     const carrierSandboxRate = loadTypeScriptModule(
       'app_src/lib/integrations/carrierSandboxRate.ts',
       {
@@ -1412,6 +1418,17 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
         '@/lib/operations/orderListQuery': orderListQuery,
         '@/lib/operations/orderShipTo': orderShipTo,
+        '@/lib/operations/providerOrderMoney': providerOrderMoney,
+        '@/lib/operations/providerOrderHistory': providerOrderHistory,
+        '@/lib/persistence/commerceOrderSync': {
+          readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres:
+            async () => ({
+              items: [],
+              truncated: false,
+              limit: 500,
+              providerWrites: 0,
+            }),
+        },
         '@/lib/persistence/operationsOrderShipmentAddress':
           operationsOrderShipmentAddress,
         '@/lib/integrations/carrierCheckoutRate': {

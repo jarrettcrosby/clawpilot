@@ -23,12 +23,163 @@ function plain(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
+function providerTimelineReaderFor(pool) {
+  return async (input) => {
+    const observation = (await pool.query(
+      `SELECT observation.id::text, observation.global_id,
+              observation.observed_at, observation.provider_updated_at
+       FROM operations_commerce_order_observations observation
+       JOIN operations_integration_accounts account
+         ON account.organization_id = observation.organization_id
+        AND account.id = observation.integration_account_id
+        AND account.provider = observation.provider
+       WHERE observation.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND observation.external_order_id = $3
+         AND observation.observation_kind = ANY($4::text[])
+       ORDER BY (
+                  COALESCE(
+                    observation.provider_updated_at,
+                    observation.observed_at
+                  ),
+                  observation.observed_at,
+                  observation.id
+                ) DESC
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.accountGlobalId,
+        input.externalOrderId,
+        input.providerObservationKinds || [
+          'manual_exact_read',
+          'webhook_exact_read',
+        ],
+      ],
+    )).rows[0]
+    if (!observation) {
+      return { items: [], truncated: false, limit: 500, providerWrites: 0 }
+    }
+    const [lines, events] = await Promise.all([
+      pool.query(
+        `SELECT external_line_id, external_product_id, external_variant_id,
+                sku, title_snapshot, variant_title_snapshot, vendor_snapshot,
+                original_quantity::text, current_quantity::text,
+                unfulfilled_quantity::text, fulfilled_quantity::text,
+                returned_quantity::text, requires_shipping
+                , unit_price_currency, unit_price_minor::text
+                , subtotal_currency, subtotal_minor::text
+                , discount_currency, discount_minor::text
+                , tax_currency, tax_minor::text
+         FROM operations_commerce_order_observation_lines
+         WHERE organization_id = $1::uuid
+           AND observation_id = $2::uuid
+         ORDER BY external_line_id`,
+        [input.organizationId, observation.id],
+      ),
+      pool.query(
+        `SELECT global_id, event_kind, event_status, occurred_at,
+                external_subject_id, quantity::text, amount_minor::text,
+                currency, tracking_carrier,
+                CASE WHEN sensitive_evidence_expires_at > now()
+                  THEN tracking_number ELSE NULL END AS tracking_number,
+                CASE WHEN sensitive_evidence_expires_at > now()
+                  THEN tracking_url ELSE NULL END AS tracking_url,
+                sensitive_evidence_redacted_at, provider_location_id
+         FROM operations_commerce_order_event_observations
+         WHERE organization_id = $1::uuid
+           AND observation_id = $2::uuid
+         ORDER BY occurred_at, id`,
+        [input.organizationId, observation.id],
+      ),
+    ])
+    const optionalNumber = (value) => value === null ? null : Number(value)
+    return {
+      items: [
+        ...events.rows.map((event) => ({
+          evidenceSource: 'provider',
+          evidenceGlobalId: event.global_id,
+          eventKind: event.event_kind,
+          eventStatus: event.event_status,
+          occurredAt: event.occurred_at.toISOString(),
+          attributionSource: 'provider_system',
+          actorEmail: null,
+          providerActorFingerprint: null,
+          locationReference: event.provider_location_id,
+          payload: {
+            externalSubjectId: event.external_subject_id,
+            quantity: optionalNumber(event.quantity),
+            amountMinor: optionalNumber(event.amount_minor),
+            currency: event.currency,
+            trackingCarrier: event.tracking_carrier,
+            trackingNumber: event.tracking_number,
+            trackingUrl: event.tracking_url,
+            sensitiveEvidenceRedactedAt:
+              event.sensitive_evidence_redacted_at?.toISOString() || null,
+          },
+        })),
+        {
+          evidenceSource: 'provider',
+          evidenceGlobalId: observation.global_id,
+          eventKind: 'order_lines_snapshot',
+          eventStatus: null,
+          occurredAt: (
+            observation.provider_updated_at || observation.observed_at
+          ).toISOString(),
+          attributionSource: 'provider_system',
+          actorEmail: null,
+          providerActorFingerprint: null,
+          locationReference: null,
+          payload: {
+            observationGlobalId: observation.global_id,
+            observedAt: observation.observed_at
+              .toISOString()
+              .replace('Z', '+00:00'),
+            inventorySemantics: 'order_demand',
+            lines: lines.rows.map((line) => ({
+              externalLineId: line.external_line_id,
+              externalProductId: line.external_product_id,
+              externalVariantId: line.external_variant_id,
+              sku: line.sku,
+              titleSnapshot: line.title_snapshot,
+              variantTitleSnapshot: line.variant_title_snapshot,
+              vendorSnapshot: line.vendor_snapshot,
+              originalQuantity: Number(line.original_quantity),
+              currentQuantity: optionalNumber(line.current_quantity),
+              unfulfilledQuantity: optionalNumber(line.unfulfilled_quantity),
+              fulfilledQuantity: optionalNumber(line.fulfilled_quantity),
+              returnedQuantity: optionalNumber(line.returned_quantity),
+              requiresShipping: line.requires_shipping,
+              unitPriceCurrency: line.unit_price_currency,
+              unitPriceMinor: line.unit_price_minor,
+              subtotalCurrency: line.subtotal_currency,
+              subtotalMinor: line.subtotal_minor,
+              discountCurrency: line.discount_currency,
+              discountMinor: line.discount_minor,
+              taxCurrency: line.tax_currency,
+              taxMinor: line.tax_minor,
+            })),
+          },
+        },
+      ],
+      truncated: false,
+      limit: 500,
+      providerWrites: 0,
+    }
+  }
+}
+
 function operationsPersistenceFor(pool) {
   const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts', {
     '@/lib/operations/types': {},
   })
   const orderShipTo = loadTypeScriptModule(
     'app_src/lib/operations/orderShipTo.ts',
+  )
+  const providerOrderHistory = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderHistory.ts',
+  )
+  const providerOrderMoney = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderMoney.ts',
   )
   class NamedBoundaryError extends Error {}
   class RevisionGateError extends Error {}
@@ -59,6 +210,8 @@ function operationsPersistenceFor(pool) {
     '@/lib/operations/adapters': {},
     '@/lib/operations/domain': domain,
     '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/operations/providerOrderHistory': providerOrderHistory,
+    '@/lib/operations/providerOrderMoney': providerOrderMoney,
     '@/lib/operations/packingSlip': {
       PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION: 'test-pack-work-v1',
       PACKING_SLIP_TEMPLATE_VERSION: 'test-packing-slip-v1',
@@ -87,6 +240,10 @@ function operationsPersistenceFor(pool) {
           truncated: false,
         },
       }),
+    },
+    '@/lib/persistence/commerceOrderSync': {
+      readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres:
+        providerTimelineReaderFor(pool),
     },
     '@/lib/persistence/commerceProviderWrites': {
       CommerceProviderWriteControlError: NamedBoundaryError,
@@ -154,6 +311,7 @@ function fixtureIds() {
     customer: randomUUID(),
     longCustomer: randomUUID(),
     product: randomUUID(),
+    fulfilledProduct: randomUUID(),
     fulfilledOrder: randomUUID(),
     dueOrder: randomUUID(),
     openOrder: randomUUID(),
@@ -163,11 +321,22 @@ function fixtureIds() {
     observation: randomUUID(),
     read: randomUUID(),
     providerObservation: randomUUID(),
+    newerProviderObservation: randomUUID(),
+    newerProviderBackfillSession: randomUUID(),
+    providerCandidate: randomUUID(),
+    providerRun: randomUUID(),
     providerEvent: randomUUID(),
+    unrelatedBlankTrackingEvent: randomUUID(),
+    fulfilledLine: randomUUID(),
+    warehouse: randomUUID(),
+    location: randomUUID(),
+    inventoryPool: randomUUID(),
+    locationMapping: randomUUID(),
     removalObservation: randomUUID(),
     retainedTrackingEvent: randomUUID(),
     removedTrackingEvent: randomUUID(),
     reconciliation: randomUUID(),
+    unrelatedBlankReconciliation: randomUUID(),
   }
 }
 
@@ -259,6 +428,22 @@ async function seedFixture(pool) {
          'synced', $4, $4
        )`,
       [ids.product, ids.pipeline, '9'.repeat(64), actorEmail],
+    )
+    await client.query(
+      `INSERT INTO crm_products (
+         id, pipeline_id, source_key, name, sku, source_hash,
+         sync_status, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'projection-fulfilled-product',
+         'Immutable fulfilled product', 'LOCAL-SKU-9701', $3,
+         'synced', $4, $4
+       )`,
+      [
+        ids.fulfilledProduct,
+        ids.pipeline,
+        '5'.repeat(64),
+        actorEmail,
+      ],
     )
     await client.query(
       `INSERT INTO crm_organizations (
@@ -359,6 +544,20 @@ async function seedFixture(pool) {
       )
     }
     await client.query(
+      `UPDATE operations_orders
+       SET requested_delivery_at = '2026-08-05T15:00:00.000Z'::timestamptz
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.openOrder],
+    )
+    await client.query(
+      `UPDATE operations_orders
+       SET requested_delivery_at = '2026-08-06T16:30:00.000Z'::timestamptz
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.fulfilledOrder],
+    )
+    await client.query(
       `INSERT INTO operations_orders (
          id, global_id, organization_id, pipeline_id, customer_id,
          integration_account_id, source_provider, external_order_id,
@@ -395,6 +594,72 @@ async function seedFixture(pool) {
          1000, 250, '{"length":200,"width":150,"height":100}'::jsonb
        )`,
       [ids.organization, ids.dueOrder, ids.pipeline, ids.product],
+    )
+    await client.query(
+      `INSERT INTO operations_order_lines (
+         id, organization_id, order_id, pipeline_id, product_id,
+         external_line_id, channel_sku, description, quantity,
+         unit_price_minor, weight_grams, dimensions_mm
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         'gid://shopify/LineItem/9701-clawpilot', 'LOCAL-SKU-9701',
+         'Immutable ClawPilot fulfillment demand', 4,
+         1000, 250, '{"length":200,"width":150,"height":100}'::jsonb
+       )`,
+      [
+        ids.fulfilledLine,
+        ids.organization,
+        ids.fulfilledOrder,
+        ids.pipeline,
+        ids.fulfilledProduct,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_warehouses (
+         id, global_id, organization_id, code, name, status
+       ) VALUES (
+         $1::uuid, 'gwh0009701', $2::uuid,
+         'PROVIDER-9701', 'Provider mapped warehouse', 'active'
+       )`,
+      [ids.warehouse, ids.organization],
+    )
+    await client.query(
+      `INSERT INTO operations_locations (
+         id, global_id, organization_id, warehouse_id, code, active
+       ) VALUES (
+         $1::uuid, 'gwl0009701', $2::uuid, $3::uuid,
+         'PROVIDER-9701-PICK', true
+       )`,
+      [ids.location, ids.organization, ids.warehouse],
+    )
+    await client.query(
+      `INSERT INTO operations_inventory_pools (
+         id, global_id, organization_id, pipeline_id, name, pool_type
+       ) VALUES (
+         $1::uuid, 'gip0009701', $2::uuid, $3::uuid,
+         'Provider mapping inventory', 'shared'
+       )`,
+      [ids.inventoryPool, ids.organization, ids.pipeline],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_inventory_location_mappings (
+         id, global_id, organization_id, integration_account_id,
+         external_location_id, external_location_name,
+         warehouse_id, location_id, inventory_pool_id,
+         mapping_method, active
+       ) VALUES (
+         $1::uuid, 'gilm0009701', $2::uuid, $3::uuid,
+         'gid://shopify/Location/9701', 'Provider location 9701',
+         $4::uuid, $5::uuid, $6::uuid, 'manual', true
+       )`,
+      [
+        ids.locationMapping,
+        ids.organization,
+        ids.integration,
+        ids.warehouse,
+        ids.location,
+        ids.inventoryPool,
+      ],
     )
     await client.query(
       `INSERT INTO operations_orders (
@@ -478,6 +743,18 @@ async function seedFixture(pool) {
         JSON.stringify({
           version: 'shopify-canonical-order-revision-v1',
           order: {
+            requestedDeliveryAt: null,
+            deliveryPromise: {
+              source: 'fulfillment_order.deliveryMethod',
+              observedMaxDeliveryAt: '2026-08-08T17:45:00.000Z',
+              coverage: 'partial',
+              effectiveScopes: [
+                'read_merchant_managed_fulfillment_orders',
+              ],
+              connectionComplete: true,
+              eligibleNodeCount: 1,
+              datedNodeCount: 1,
+            },
             canonicalStates: {
               lifecycle: 'closed',
               payment: 'paid',
@@ -556,13 +833,46 @@ async function seedFixture(pool) {
         randomUUID(),
       ],
     )
+    const providerRevision = (await client.query(
+      `SELECT provider_updated_at, observed_at
+       FROM operations_commerce_order_observations
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [ids.organization, ids.providerObservation],
+    )).rows[0]
+    await client.query(
+      `INSERT INTO operations_commerce_order_observation_lines (
+         organization_id, observation_id, external_line_id,
+         external_product_id, external_variant_id, sku,
+         title_snapshot, variant_title_snapshot, vendor_snapshot,
+         original_quantity, current_quantity, unfulfilled_quantity,
+         fulfilled_quantity, returned_quantity, requires_shipping,
+         unit_price_currency, unit_price_minor,
+         subtotal_currency, subtotal_minor,
+         discount_currency, discount_minor, tax_currency, tax_minor
+       ) VALUES
+         ($1::uuid, $2::uuid, 'gid://shopify/LineItem/9701-provider-a',
+          'gid://shopify/Product/9701-a',
+          'gid://shopify/ProductVariant/9701-a', 'PROVIDER-A-9701',
+          'Provider Banana Bread 20lb', 'Case of 5', 'AG Alchemy',
+          5, 3, 0, 3, 1, true,
+          'USD', 2500, 'USD', 12500, 'USD', 500, 'USD', 1000),
+         ($1::uuid, $2::uuid, 'gid://shopify/LineItem/9701-provider-b',
+          'gid://shopify/Product/9701-b',
+          'gid://shopify/ProductVariant/9701-b', NULL,
+          'Replacement Chicken Bones 20lb', NULL, 'AG Alchemy',
+          2, 1, 0, 1, 1, true,
+          'USD', 4200, 'USD', 8400, 'USD', 0, 'USD', 672)`,
+      [ids.organization, ids.providerObservation],
+    )
     await client.query(
       `INSERT INTO operations_commerce_order_event_observations (
          id, global_id, organization_id, integration_account_id,
          observation_id, order_id, provider, external_order_id,
          external_event_id, external_subject_id, event_hash,
-         event_kind, event_status, attribution_source,
+         event_kind, event_status, quantity, amount_minor, currency,
+         attribution_source,
          tracking_carrier, tracking_number,
+         provider_location_id,
          sensitive_evidence_expires_at,
          occurred_at, observed_at, provider_write_count, created_at
        ) VALUES (
@@ -570,8 +880,10 @@ async function seedFixture(pool) {
          $4::uuid, $5::uuid, 'shopify', 'gid://shopify/Order/9701',
          'projection-tracking-event-9701',
          'projection-fulfillment-9701', $6,
-         'tracking_updated', 'delivered', 'provider_system',
+         'tracking_updated', 'delivered', 3, 1250, 'USD',
+         'provider_system',
          'UPS', '1ZPROJECTION9701',
+         'gid://shopify/Location/9701',
          statement_timestamp() + interval '30 days',
          date_trunc('milliseconds', statement_timestamp() - interval '2 hours'),
          date_trunc('milliseconds', statement_timestamp() - interval '2 hours'),
@@ -585,6 +897,79 @@ async function seedFixture(pool) {
         ids.providerObservation,
         ids.fulfilledOrder,
         '4'.repeat(64),
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_event_observations (
+         id, global_id, organization_id, integration_account_id,
+         observation_id, order_id, provider, external_order_id,
+         external_event_id, external_subject_id, event_hash,
+         event_kind, event_status, attribution_source,
+         tracking_carrier, tracking_number,
+         provider_location_id,
+         sensitive_evidence_expires_at,
+         occurred_at, observed_at, provider_write_count, created_at
+       ) VALUES (
+         $1::uuid, 'gcoe0009706', $2::uuid, $3::uuid,
+         $4::uuid, $5::uuid, 'shopify', 'gid://shopify/Order/9701',
+         'projection-tracking-event-9701-untracked-sibling',
+         'projection-fulfillment-9701-untracked-sibling', $6,
+         'tracking_updated', 'success', 'provider_system',
+         NULL, NULL, 'gid://shopify/Location/9701',
+         statement_timestamp() + interval '30 days',
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         0,
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes')
+       )`,
+      [
+        ids.unrelatedBlankTrackingEvent,
+        ids.organization,
+        ids.integration,
+        ids.providerObservation,
+        ids.fulfilledOrder,
+        '6'.repeat(64),
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_candidates (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         run_id, provider, external_order_id, order_number_snapshot,
+         provider_order_status_raw, provider_financial_status_raw,
+         provider_fulfillment_status_raw, provider_return_status_raw,
+         normalized_order_status, normalized_payment_status,
+         normalized_fulfillment_status, normalized_return_status,
+         requires_shipping, currency_code, subtotal_minor, discount_minor,
+         brand_discount_minor, shipping_minor, tax_minor,
+         other_adjustment_minor, total_minor, party_snapshot_state,
+         customer_resolution_state, ship_to_snapshot_state,
+         ship_to_snapshot_source, delivery_resolution_state,
+         provider_requested_delivery_at, observed_at, provider_updated_at,
+         source_revision, source_hash, provider_api_version,
+         normalizer_version, workflow_state, blocking_codes, row_version,
+         created_by, updated_by, expires_at
+       ) VALUES (
+         $1::uuid, 'gcoc0009701', $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', 'gid://shopify/Order/9701', '#9701',
+         'CLOSED', 'PAID', 'FULFILLED', 'PARTIALLY_RETURNED',
+         'closed', 'paid', 'fulfilled', 'partial',
+         true, 'USD', 12345, 0, 0, 0, 0, 0, 12345, 'missing',
+         'unresolved', 'missing', 'none', 'unresolved', NULL,
+         $6::timestamptz - interval '1 minute', $7::timestamptz,
+         'projection-current-candidate-v1', $8, '2026-07',
+         'external-fulfillment-projection-v1', 'held', '{}'::text[], 0,
+         $9, $9, now() + interval '7 days'
+       )`,
+      [
+        ids.providerCandidate,
+        ids.organization,
+        ids.integration,
+        ids.pipeline,
+        ids.providerRun,
+        providerRevision.observed_at,
+        providerRevision.provider_updated_at,
+        '0'.repeat(64),
+        actorEmail,
       ],
     )
     await client.query(
@@ -718,12 +1103,172 @@ async function seedFixture(pool) {
         actorEmail,
       ],
     )
+    await client.query(
+      `INSERT INTO operations_shopify_external_fulfillment_reconciliations (
+         id, global_id, organization_id, command_receipt_id, order_id,
+         integration_account_id, plan_id, wave_id,
+         external_order_id, provider_order_name,
+         provider_order_updated_at, provider_order_closed_at,
+         provider_fulfillment_id, provider_fulfillment_name,
+         provider_fulfillment_created_at,
+         provider_fulfillment_updated_at, provider_location_id,
+         provider_fulfillment_order_ids, evidence_hash,
+         evidence_snapshot, provider_read_count, provider_write_count,
+         reason, reconciled_by, reconciled_at
+       ) VALUES (
+         $1::uuid, 'gsfr0009702', $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, $6::uuid, $7::uuid,
+         'gid://shopify/Order/9701', '#9701',
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         'gid://shopify/Fulfillment/9701-sibling', '#9701.2',
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes'),
+         'gid://shopify/Location/9701', ARRAY['9701-fo-sibling'], $8,
+         $9::jsonb, 2, 0,
+         'Retain exact sibling fulfillment evidence', $10,
+         date_trunc('milliseconds', statement_timestamp() - interval '90 minutes')
+       )`,
+      [
+        ids.unrelatedBlankReconciliation,
+        ids.organization,
+        randomUUID(),
+        ids.fulfilledOrder,
+        ids.integration,
+        randomUUID(),
+        randomUUID(),
+        '6'.repeat(64),
+        JSON.stringify({ fulfillment: { tracking: [] } }),
+        actorEmail,
+      ],
+    )
   } finally {
     await client.query('SET session_replication_role = origin')
       .catch(() => undefined)
     client.release()
   }
   return ids
+}
+
+async function advanceCandidatePastExactObservation(pool, ids) {
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `UPDATE operations_commerce_order_candidates candidate
+       SET observed_at = observation.observed_at + interval '1 minute',
+           provider_updated_at = observation.provider_updated_at,
+           provider_requested_delivery_at = NULL,
+           source_revision = 'projection-newer-observed-candidate-v2',
+           updated_at = now()
+       FROM operations_commerce_order_observations observation
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.id = $2::uuid
+         AND observation.organization_id = candidate.organization_id
+         AND observation.id = $3::uuid`,
+      [ids.organization, ids.providerCandidate, ids.providerObservation],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+      .catch(() => undefined)
+    client.release()
+  }
+}
+
+async function appendNewerScheduledPollPastExactObservation(pool, ids) {
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO operations_commerce_order_backfill_sessions (
+         id, global_id, organization_id, integration_account_id,
+         provider, session_kind, credential_generation, policy_revision,
+         coverage_basis, status, requested_from, requested_through,
+         idempotency_key, request_hash, query_hash, requested_by, reason,
+         completed_at
+       ) VALUES (
+         $1::uuid, 'gcob0009709', $2::uuid, $3::uuid,
+         'shopify', 'continuous_poll', 1, 1,
+         'shopify_updated_at_overlap', 'succeeded',
+         statement_timestamp() - interval '1 day', statement_timestamp(),
+         'projection-newer-scheduled-poll-9709', $4, $5, $6,
+         'Projection currentness regression scheduled poll',
+         statement_timestamp()
+       )`,
+      [
+        ids.newerProviderBackfillSession,
+        ids.organization,
+        ids.integration,
+        '1'.repeat(64),
+        '2'.repeat(64),
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_observations (
+         id, global_id, organization_id, integration_account_id,
+         backfill_session_id, order_id,
+         provider, credential_generation, observation_kind,
+         external_order_id, order_number, source_revision, source_hash,
+         canonical_lifecycle_state, canonical_payment_state,
+         canonical_fulfillment_state, canonical_return_state,
+         currency, provider_total_minor, provider_updated_at,
+         observed_at, provider_read_count, provider_write_count, created_at
+       )
+       SELECT
+         $1::uuid, 'gcoo0009709', observation.organization_id,
+         observation.integration_account_id, $2::uuid, observation.order_id,
+         observation.provider, observation.credential_generation,
+         'scheduled_poll', observation.external_order_id,
+         observation.order_number,
+         'projection-newer-scheduled-poll-v2', $3,
+         observation.canonical_lifecycle_state,
+         observation.canonical_payment_state,
+         observation.canonical_fulfillment_state,
+         observation.canonical_return_state,
+         observation.currency, observation.provider_total_minor,
+         observation.provider_updated_at,
+         observation.observed_at + interval '30 seconds',
+         1, 0, observation.created_at + interval '30 seconds'
+       FROM operations_commerce_order_observations observation
+       WHERE observation.organization_id = $4::uuid
+         AND observation.id = $5::uuid`,
+      [
+        ids.newerProviderObservation,
+        ids.newerProviderBackfillSession,
+        'e'.repeat(64),
+        ids.organization,
+        ids.providerObservation,
+      ],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+      .catch(() => undefined)
+    client.release()
+  }
+}
+
+async function removeNewerScheduledPoll(pool, ids) {
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `DELETE FROM operations_commerce_order_observations
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.newerProviderObservation],
+    )
+    await client.query(
+      `DELETE FROM operations_commerce_order_backfill_sessions
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ids.organization, ids.newerProviderBackfillSession],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+      .catch(() => undefined)
+    client.release()
+  }
 }
 
 async function durableState(pool, organizationId) {
@@ -811,6 +1356,37 @@ async function verifyProjection(databaseUrl) {
     assert.equal(projected?.status, 'imported')
     assert.equal(projected?.externallyFulfilled, true)
     assert.equal(
+      projected?.lineCount,
+      1,
+      'canonical list rows retain immutable ClawPilot fulfillment demand',
+    )
+    assert.equal(
+      projected?.providerLineCount,
+      2,
+      'canonical list rows expose the separate current provider line count',
+    )
+    assert.equal(projected?.warehouseName, 'Provider mapped warehouse')
+    assert.equal(
+      projected?.warehouseProvenance,
+      'provider_location_mapping',
+      'an unplanned canonical order may show only an active exact location mapping',
+    )
+    assert.equal(
+      projected?.requestedDeliveryAt,
+      null,
+      'scope-filtered fulfillment-order dates are not promoted to a customer requested date',
+    )
+    assert.equal(
+      projected?.providerPromisedDeliveryAt,
+      '2026-08-08T17:45:00.000Z',
+      'the latest exact provider revision exposes its observed provider delivery window separately',
+    )
+    assert.equal(projected?.providerDeliveryCoverage, 'partial')
+    assert.equal(
+      projected?.providerDeliverySource,
+      'fulfillment_order.deliveryMethod',
+    )
+    assert.equal(
       projected?.orderValueMinor,
       '12345',
       'an unplanned promoted order retains its exact provider header total',
@@ -821,6 +1397,15 @@ async function verifyProjection(databaseUrl) {
       'provider order value must remain separate from fulfillment-plan revenue',
     )
     assert.equal(projected?.trackingNumber, '1ZPROJECTION9701')
+    const requestedOnly = workspace.orders.find(
+      (order) => order.globalId === 'gor0009703',
+    )
+    assert.equal(requestedOnly?.promisedDeliveryAt, null)
+    assert.equal(
+      requestedOnly?.requestedDeliveryAt,
+      '2026-08-05T15:00:00.000Z',
+      'canonical order rows retain requested delivery when no promise exists',
+    )
     const native = workspace.orders.find(
       (order) => order.globalId === 'gor0009705',
     )
@@ -832,21 +1417,275 @@ async function verifyProjection(databaseUrl) {
     assert.equal(workspace.selectedOrder?.globalId, 'gor0009701')
     assert.equal(workspace.selectedOrder?.status, 'imported')
     assert.equal(workspace.selectedOrder?.externallyFulfilled, true)
+    assert.equal(workspace.selectedOrder?.lineCount, 1)
+    assert.equal(workspace.selectedOrder?.providerLineCount, 2)
+    assert.equal(
+      workspace.selectedOrder?.warehouseProvenance,
+      'provider_location_mapping',
+    )
+    assert.equal(
+      workspace.selectedOrder?.requestedDeliveryAt,
+      null,
+      'canonical detail does not relabel a scope-filtered provider window as requested delivery',
+    )
+    assert.equal(
+      workspace.selectedOrder?.providerPromisedDeliveryAt,
+      '2026-08-08T17:45:00.000Z',
+      'canonical detail uses the same provider delivery observation as the list',
+    )
+    const clearedPromiseObservationId = randomUUID()
+    const clearedPromiseClient = await pool.connect()
+    try {
+      await clearedPromiseClient.query('SET session_replication_role = replica')
+      await clearedPromiseClient.query(
+        `INSERT INTO operations_commerce_order_revision_observations (
+           id, global_id, organization_id, integration_account_id, target_id,
+           order_id, provider, credential_generation, external_order_id,
+           source_revision, source_hash, revision_hash, normalized_snapshot,
+           canonical_row_version, provider_read_count, provider_write_count,
+           observed_at, created_at
+         ) VALUES (
+           $1::uuid, 'gcor0009799', $2::uuid, $3::uuid, $4::uuid,
+           $5::uuid, 'shopify', 1, 'gid://shopify/Order/9701',
+           'projection-fulfilled-v2', $6, $7, $8::jsonb,
+           0, 1, 0,
+           date_trunc('milliseconds', statement_timestamp() - interval '2 hours'),
+           date_trunc('milliseconds', statement_timestamp() - interval '2 hours')
+         )`,
+        [
+          clearedPromiseObservationId,
+          ids.organization,
+          ids.integration,
+          ids.target,
+          ids.fulfilledOrder,
+          'd'.repeat(64),
+          'e'.repeat(64),
+          JSON.stringify({
+            version: 'shopify-canonical-order-revision-v1',
+            order: {
+              requestedDeliveryAt: null,
+              deliveryPromise: {
+                source: 'fulfillment_order.deliveryMethod',
+                observedMaxDeliveryAt: null,
+                coverage: 'partial',
+                effectiveScopes: [
+                  'read_merchant_managed_fulfillment_orders',
+                ],
+                connectionComplete: true,
+                eligibleNodeCount: 1,
+                datedNodeCount: 0,
+              },
+              canonicalStates: {
+                lifecycle: 'closed',
+                payment: 'paid',
+                fulfillment: 'fulfilled',
+                returns: 'none',
+              },
+            },
+          }),
+        ],
+      )
+      await clearedPromiseClient.query('SET session_replication_role = origin')
+      const clearedPromisePage = plain(
+        await persistence.readOperationsOrderPageFromPostgres({
+          organizationId: ids.organization,
+          search: '#9701',
+        }),
+      )
+      assert.equal(
+        clearedPromisePage.orders[0]?.providerPromisedDeliveryAt,
+        null,
+        'a newer exact provider observation can clear an obsolete delivery window',
+      )
+      assert.equal(clearedPromisePage.orders[0]?.requestedDeliveryAt, null)
+    } finally {
+      await clearedPromiseClient.query('SET session_replication_role = replica')
+        .catch(() => undefined)
+      await clearedPromiseClient.query(
+        `DELETE FROM operations_commerce_order_revision_observations
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [ids.organization, clearedPromiseObservationId],
+      ).catch(() => undefined)
+      await clearedPromiseClient.query('SET session_replication_role = origin')
+        .catch(() => undefined)
+      clearedPromiseClient.release()
+    }
+    assert.deepEqual(
+      workspace.selectedOrder?.lines.map((line) => ({
+        channelSku: line.channelSku,
+        quantity: line.quantity,
+      })),
+      [{ channelSku: 'LOCAL-SKU-9701', quantity: 4 }],
+      'provider adjustments must not rewrite ClawPilot fulfillment lines',
+    )
+    assert.deepEqual(
+      workspace.selectedOrder?.providerHistory?.currentLines.map((line) => ({
+        sku: line.sku,
+        title: line.titleSnapshot,
+        variant: line.variantTitleSnapshot,
+        vendor: line.vendorSnapshot,
+        ordered: line.orderedQuantity,
+        current: line.currentQuantity,
+        fulfilled: line.fulfilledQuantity,
+        unfulfilled: line.unfulfilledQuantity,
+        returned: line.returnedQuantity,
+        removed: line.orderedQuantity - Number(line.currentQuantity),
+        unit: [line.unitPriceCurrency, line.unitPriceMinor],
+        subtotal: [line.subtotalCurrency, line.subtotalMinor],
+        discount: [line.discountCurrency, line.discountMinor],
+        tax: [line.taxCurrency, line.taxMinor],
+      })),
+      [
+        {
+          sku: 'PROVIDER-A-9701',
+          title: 'Provider Banana Bread 20lb',
+          variant: 'Case of 5',
+          vendor: 'AG Alchemy',
+          ordered: 5,
+          current: 3,
+          fulfilled: 3,
+          unfulfilled: 0,
+          returned: 1,
+          removed: 2,
+          unit: ['USD', '2500'],
+          subtotal: ['USD', '12500'],
+          discount: ['USD', '500'],
+          tax: ['USD', '1000'],
+        },
+        {
+          sku: null,
+          title: 'Replacement Chicken Bones 20lb',
+          variant: null,
+          vendor: 'AG Alchemy',
+          ordered: 2,
+          current: 1,
+          fulfilled: 1,
+          unfulfilled: 0,
+          returned: 1,
+          removed: 1,
+          unit: ['USD', '4200'],
+          subtotal: ['USD', '8400'],
+          discount: ['USD', '0'],
+          tax: ['USD', '672'],
+        },
+      ],
+      'canonical detail exposes exact current sales-channel adjustments separately',
+    )
+    assert.equal(workspace.selectedOrder?.providerHistory?.currency, 'USD')
+    assert.equal(
+      workspace.selectedOrder?.providerHistory?.providerTotalMinor,
+      '12345',
+    )
+    assert.equal(workspace.selectedOrder?.providerHistory?.providerWrites, 0)
+    assert.deepEqual(
+      workspace.selectedOrder?.providerHistory?.events.map((event) => ({
+        kind: event.kind,
+        externalSubjectId: event.externalSubjectId,
+        quantity: event.quantity,
+        amountMinor: event.amountMinor,
+        currency: event.currency,
+        trackingNumber: event.trackingNumber,
+      })),
+      [
+        {
+          kind: 'tracking_updated',
+          externalSubjectId: 'projection-fulfillment-9701',
+          quantity: 3,
+          amountMinor: 1250,
+          currency: 'USD',
+          trackingNumber: '1ZPROJECTION9701',
+        },
+        {
+          kind: 'tracking_updated',
+          externalSubjectId: 'projection-fulfillment-9701-untracked-sibling',
+          quantity: null,
+          amountMinor: null,
+          currency: null,
+          trackingNumber: null,
+        },
+      ],
+      'canonical detail retains provider event subject, quantity, and money evidence',
+    )
     assert.equal(
       workspace.selectedOrder?.trackingNumber,
       '1ZPROJECTION9701',
-      'selected-order detail uses the same provider tracking projection',
+      'a newer untracked sibling fulfillment must not mask valid tracking',
     )
-    assert.equal(
-      workspace.selectedOrder?.externalFulfillment,
-      null,
-      'provider status evidence must not invent a reconciliation record',
+    assert.deepEqual(
+      workspace.selectedOrder?.externalFulfillment?.tracking,
+      [],
+      'a blank sibling reconciliation remains visible without hiding valid provider tracking',
     )
     assert.deepEqual(workspace.selectedOrder?.shipments, [])
     assert.deepEqual(workspace.selectedOrder?.printArtifacts, [])
     assert.deepEqual(workspace.selectedOrder?.labelPrintJobs, [])
     assert.equal(workspace.summary.openOrders, 2)
     assert.equal(workspace.summary.dueSoon, 1)
+
+    await appendNewerScheduledPollPastExactObservation(pool, ids)
+    const staleAfterPollList = plain(
+      await persistence.readOperationsOrderPageFromPostgres({
+        organizationId: ids.organization,
+        search: '#9701',
+      }),
+    )
+    assert.equal(
+      staleAfterPollList.orders[0]?.providerLineCount,
+      null,
+      'a newer scheduled poll suppresses an older exact line snapshot',
+    )
+    const staleAfterPollDetail = plain(
+      await persistence.readOperationsWorkspaceFromPostgres({
+        organizationId: ids.organization,
+        capabilities,
+        selectedOrderGlobalId: 'gor0009701',
+      }),
+    )
+    assert.equal(
+      staleAfterPollDetail.selectedOrder?.providerHistory,
+      null,
+      'a newer scheduled poll suppresses older exact provider history',
+    )
+
+    await removeNewerScheduledPoll(pool, ids)
+    await advanceCandidatePastExactObservation(pool, ids)
+    const staleProviderList = plain(
+      await persistence.readOperationsOrderPageFromPostgres({
+        organizationId: ids.organization,
+        search: '#9701',
+      }),
+    )
+    assert.equal(staleProviderList.orders[0]?.providerLineCount, null)
+    assert.equal(staleProviderList.orders[0]?.lineCount, 1)
+    assert.equal(
+      staleProviderList.orders[0]?.requestedDeliveryAt,
+      null,
+      'a partial provider window remains separate from requested delivery',
+    )
+    assert.equal(
+      staleProviderList.orders[0]?.providerPromisedDeliveryAt,
+      '2026-08-08T17:45:00.000Z',
+      'an exact revision provider window remains visible after candidate history advances',
+    )
+    const staleProviderDetail = plain(
+      await persistence.readOperationsWorkspaceFromPostgres({
+        organizationId: ids.organization,
+        capabilities,
+        selectedOrderGlobalId: 'gor0009701',
+      }),
+    )
+    assert.equal(
+      staleProviderDetail.selectedOrder?.providerHistory,
+      null,
+      'the same provider timestamp with a later-observed candidate suppresses stale exact history',
+    )
+    assert.equal(staleProviderDetail.selectedOrder?.lineCount, 1)
+    assert.equal(staleProviderDetail.selectedOrder?.lines.length, 1)
+    assert.equal(
+      staleProviderDetail.selectedOrder?.warehouseProvenance,
+      'provider_location_mapping',
+    )
     const reconciliationDetail = plain(
       await persistence.readOperationsWorkspaceFromPostgres({
         organizationId: ids.organization,
@@ -857,7 +1696,7 @@ async function verifyProjection(databaseUrl) {
     assert.equal(
       reconciliationDetail.selectedOrder?.trackingNumber,
       '9400RECONCILIATION9704',
-      'selected-order detail projects reconciliation tracking evidence',
+      'a newer blank sibling reconciliation cannot mask valid tracking evidence',
     )
 
     const cancelledOrders = []
@@ -1218,7 +2057,7 @@ async function verifyProjection(databaseUrl) {
       shipments: '0',
       labels: '0',
       artifacts: '0',
-      reconciliations: '1',
+      reconciliations: '2',
     })
   } finally {
     await pool.end()

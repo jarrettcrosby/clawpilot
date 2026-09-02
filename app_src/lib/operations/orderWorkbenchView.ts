@@ -88,7 +88,7 @@ export function operationsOrderRowTracking(row: OperationsOrderWorkbenchRow) {
 }
 
 export function operationsOrderRowWarehouse(row: OperationsOrderWorkbenchRow) {
-  return row.kind === 'canonical' ? row.order.warehouseName : null
+  return row.order.warehouseName
 }
 
 export function operationsOrderRowStatus(row: OperationsOrderWorkbenchRow) {
@@ -199,8 +199,15 @@ function rowCustomer(row: OperationsOrderWorkbenchRow) {
 
 function rowPromise(row: OperationsOrderWorkbenchRow) {
   return row.kind === 'canonical'
-    ? milliseconds(row.order.promisedDeliveryAt)
-    : milliseconds(row.order.delivery.selectedDeliveryAt)
+    ? milliseconds(
+        row.order.promisedDeliveryAt
+        || row.order.requestedDeliveryAt
+        || row.order.providerPromisedDeliveryAt,
+      )
+    : milliseconds(
+        row.order.delivery.selectedDeliveryAt
+        || row.order.delivery.providerRequestedDeliveryAt,
+      )
 }
 
 function rowValue(row: OperationsOrderWorkbenchRow) {

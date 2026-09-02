@@ -47,7 +47,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const SHOPIFY_COMMERCE_NORMALIZER_VERSION =
-  'shopify-commerce-normalizer-v5' as const
+  'shopify-commerce-normalizer-v6' as const
 
 type ShopifySource = Readonly<Record<string, unknown>>
 
@@ -900,23 +900,115 @@ function normalizeLine(
   })
 }
 
+const SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES = new Set([
+  'read_assigned_fulfillment_orders',
+  'read_marketplace_fulfillment_orders',
+  'read_merchant_managed_fulfillment_orders',
+  'read_third_party_fulfillment_orders',
+])
+
 function requestedDelivery(
   order: Record<string, unknown>,
-): CommerceDataField<string> {
-  const value = [
+): Readonly<{
+  field: CommerceDataField<string>
+  facts: Extract<
+    CommerceNormalizedOrder['providerFacts'],
+    { provider: 'shopify' }
+  >['deliveryPromise']
+}> {
+  const directValue = [
     order.requestedDeliveryAt,
     nestedText(order.deliveryMethod, ['requestedDeliveryAt']),
   ].find((candidate) => (
     candidate !== null && candidate !== undefined && candidate !== ''
   ))
-  const timestamp = optionalCommerceTimestamp(value)
-  return timestamp
-    ? availableCommerceField(timestamp)
-    : unavailableCommerceField(
-        value === null || value === undefined || value === ''
-          ? 'not_requested'
-          : 'not_provided',
-      )
+  const directTimestamp = optionalCommerceTimestamp(directValue)
+  const coverage = asCommerceRecord(
+    order.clawPilotFulfillmentOrderReadCoverage,
+  )
+  const effectiveScopes = Array.isArray(coverage?.effectiveScopes)
+    ? [...new Set(coverage.effectiveScopes.filter((scope): scope is string => (
+        typeof scope === 'string'
+        && SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES.has(scope)
+      )))].sort()
+    : []
+  const fulfillmentOrders = asCommerceRecord(order.fulfillmentOrders)
+  const connectionComplete = !(
+    asCommerceRecord(fulfillmentOrders?.pageInfo)?.hasNextPage === true
+    || order.fulfillmentOrdersTruncated === true
+  )
+  const eligibleFulfillmentOrders = commerceConnectionValues(
+    order.fulfillmentOrders,
+  ).filter((fulfillmentOrder) => !['CANCELLED', 'INCOMPLETE'].includes(
+    String(asCommerceRecord(fulfillmentOrder)?.status || '').toUpperCase(),
+  ))
+  const fulfillmentDeliveryValues = eligibleFulfillmentOrders
+    .map((fulfillmentOrder) => nestedText(
+      fulfillmentOrder,
+      ['deliveryMethod', 'maxDeliveryDateTime'],
+    ))
+    .filter((candidate) => (
+      candidate !== null && candidate !== undefined && candidate !== ''
+    ))
+  const fulfillmentDeliveryTimestamps = fulfillmentDeliveryValues
+    .map(optionalCommerceTimestamp)
+  const malformedFulfillmentDelivery = fulfillmentDeliveryValues.length > 0
+    && fulfillmentDeliveryTimestamps.some((timestamp) => timestamp === null)
+  const validFulfillmentDeliveryTimestamps = fulfillmentDeliveryTimestamps
+    .filter((timestamp): timestamp is string => timestamp !== null)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))
+  const observedMaxDeliveryAt = validFulfillmentDeliveryTimestamps[0] || null
+  const fullScopeCoverage = coverage?.complete === true
+    && effectiveScopes.length === SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES.size
+  const completeFulfillmentPromise = (
+    fullScopeCoverage
+    && connectionComplete
+    && !malformedFulfillmentDelivery
+    && eligibleFulfillmentOrders.length > 0
+    && fulfillmentDeliveryValues.length === eligibleFulfillmentOrders.length
+    && validFulfillmentDeliveryTimestamps.length
+      === eligibleFulfillmentOrders.length
+  )
+  const authoritativeTimestamp = directTimestamp
+    ?? (completeFulfillmentPromise ? observedMaxDeliveryAt : null)
+  const malformedDirect = directValue !== undefined
+    && directValue !== null
+    && directValue !== ''
+    && directTimestamp === null
+  const hasObservedProviderEvidence = Boolean(
+    directValue !== undefined
+    || fulfillmentOrders
+    || effectiveScopes.length > 0,
+  )
+  const facts = Object.freeze({
+    source: directTimestamp
+      ? 'order.requestedDeliveryAt' as const
+      : observedMaxDeliveryAt
+        ? 'fulfillment_order.deliveryMethod' as const
+        : 'unavailable' as const,
+    observedMaxDeliveryAt: directTimestamp ?? observedMaxDeliveryAt,
+    coverage: directTimestamp || completeFulfillmentPromise
+      ? 'complete' as const
+      : hasObservedProviderEvidence
+        ? 'partial' as const
+        : 'unavailable' as const,
+    effectiveScopes: Object.freeze(effectiveScopes),
+    connectionComplete,
+    eligibleNodeCount: eligibleFulfillmentOrders.length,
+    datedNodeCount: validFulfillmentDeliveryTimestamps.length,
+  })
+  return Object.freeze({
+    field: authoritativeTimestamp
+      ? availableCommerceField(authoritativeTimestamp)
+      : unavailableCommerceField(
+          malformedDirect
+          || malformedFulfillmentDelivery
+          || observedMaxDeliveryAt
+            ? 'not_provided'
+            : 'not_requested',
+        ),
+    facts,
+  })
 }
 
 function ambiguousVariantSkus(
@@ -973,7 +1065,7 @@ function normalizeOrder(
     lines,
     party,
     shipTo,
-    requestedDeliveryAt: delivery,
+    requestedDeliveryAt: delivery.field,
     lineItemsTruncated,
     sourceStale,
     ambiguousSkus,
@@ -1031,7 +1123,7 @@ function normalizeOrder(
     headerMoney,
     party,
     shipTo,
-    requestedDeliveryAt: delivery,
+    requestedDeliveryAt: delivery.field,
     lines: Object.freeze(lines),
     lineItemsTruncated,
     sourceStale,
@@ -1041,6 +1133,7 @@ function normalizeOrder(
       shopDomain,
       sourceName: optionalCommerceText(order.sourceName, 120),
       testOrder: order.test === true,
+      deliveryPromise: delivery.facts,
       shippingService: asCommerceRecord(order.shippingLine)
         ? Object.freeze({
             code: optionalCommerceText(

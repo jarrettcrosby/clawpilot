@@ -1168,6 +1168,18 @@ export async function GET(req: NextRequest) {
         'Order updated-after value is invalid',
       )
     }
+    const includeOrderSummariesValue = String(
+      req.nextUrl.searchParams.get('includeOrderSummaries') || '',
+    ).trim()
+    if (
+      includeOrderSummariesValue
+      && !['true', 'false'].includes(includeOrderSummariesValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_SUMMARY_MODE_INVALID',
+        'Order summary mode is invalid',
+      )
+    }
     const operations = await readOperationsWorkspaceFromPostgres({
       organizationId,
       actorEmail: actor.email,
@@ -1187,6 +1199,7 @@ export async function GET(req: NextRequest) {
       provider: providerValue || null,
       tracking,
       updatedAfter: updatedAfterValue || null,
+      includeOrderSummaries: includeOrderSummariesValue !== 'false',
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })

@@ -72,8 +72,11 @@ const selectedOrder = {
     },
   ],
   warehouseName: 'Primary Warehouse',
+  warehouseProvenance: 'fulfillment_plan' as const,
   promisedDeliveryAt: '2026-08-04T21:00:00.000Z',
+  requestedDeliveryAt: '2026-08-04T18:00:00.000Z',
   lineCount: 2,
+  providerLineCount: null,
   exceptionCount: 1,
   orderValueMinor: '1335',
   expectedCostMinor: '1066',
@@ -122,6 +125,7 @@ const selectedOrder = {
     editBlockedReason: 'Address is sealed after planning.',
     providerWrites: 0,
   },
+  providerHistory: null,
   lines: [{
     globalId: 'gol1234567',
     productGlobalId: 'gp1234567',
@@ -320,6 +324,119 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
   }
 }
 
+type UnifiedCanonicalOrderFixture = {
+  globalId: string
+  orderNumber: string
+  customerName?: string | null
+  sourceProvider: string
+  status: string
+  externallyFulfilled?: boolean
+  trackingNumber?: string | null
+  updatedAt: string
+}
+
+async function installUnifiedOrdersRoute(
+  page: Page,
+  rows: () => {
+    canonical: UnifiedCanonicalOrderFixture[]
+    imported: OperationsImportedOrderWorkingCopy[]
+  },
+  onRequest?: (requestUrl: URL) => void,
+) {
+  await page.route(
+    (url) => url.pathname === '/api/operations/orders/unified',
+    async (route) => {
+      const requestUrl = new URL(route.request().url())
+      onRequest?.(requestUrl)
+      const pageSize = Number(requestUrl.searchParams.get('pageSize') || 50)
+      const cursor = requestUrl.searchParams.get('cursor') || ''
+      const offset = cursor ? Number(cursor.replace(/^page-/u, '')) : 0
+      const provider = requestUrl.searchParams.get('provider') || ''
+      const tracking = requestUrl.searchParams.get('tracking') || 'all'
+      const status = requestUrl.searchParams.get('status') || ''
+      const search = (requestUrl.searchParams.get('search') || '').toLowerCase()
+      const sort = requestUrl.searchParams.get('sort') || 'updated'
+      const direction = requestUrl.searchParams.get('direction') || 'desc'
+      const source = rows()
+      const unified = [
+        ...source.imported.map((order) => ({
+          kind: 'imported' as const,
+          key: `imported:${order.candidateGlobalId}`,
+          order,
+        })),
+        ...source.canonical.map((order) => ({
+          kind: 'canonical' as const,
+          key: `canonical:${order.globalId}`,
+          order,
+        })),
+      ].filter((row) => {
+        const rowProvider = row.kind === 'imported'
+          ? row.order.provider
+          : row.order.sourceProvider.toLowerCase()
+        if (provider && rowProvider !== provider) return false
+        const trackingNumber = row.order.trackingNumber || ''
+        if (tracking === 'present' && !trackingNumber) return false
+        if (tracking === 'missing' && trackingNumber) return false
+        if (status) {
+          if (row.kind === 'canonical') {
+            if (
+              status === 'fulfilled_externally'
+                ? !row.order.externallyFulfilled
+                : row.order.status !== status
+            ) return false
+          } else {
+            const externallyFulfilled = row.order.providerState.fulfillment === 'fulfilled'
+            const externallyClosed = row.order.providerState.lifecycle === 'closed'
+            const cancelled = row.order.providerState.lifecycle === 'cancelled'
+            const matches = status === 'fulfilled_externally'
+              ? externallyFulfilled
+              : status === 'closed_externally'
+                ? externallyClosed && !externallyFulfilled
+                : status === 'cancelled'
+                  ? cancelled
+                  : status === 'imported' && !externallyFulfilled && !externallyClosed && !cancelled
+            if (!matches) return false
+          }
+        }
+        if (!search) return true
+        return [
+          row.kind === 'imported' ? row.order.orderNumber : row.order.orderNumber,
+          row.order.customerName || '',
+          trackingNumber,
+        ].some((value) => value.toLowerCase().includes(search))
+      })
+      unified.sort((left, right) => {
+        const value = (row: (typeof unified)[number]) => sort === 'order_number'
+          ? row.order.orderNumber.toLowerCase()
+          : sort === 'customer'
+            ? (row.order.customerName || '').toLowerCase()
+            : row.order.updatedAt
+        const comparison = value(left).localeCompare(value(right))
+          || left.key.localeCompare(right.key)
+        return direction === 'asc' ? comparison : -comparison
+      })
+      const pageRows = unified.slice(offset, offset + pageSize)
+      const nextOffset = offset + pageRows.length
+      const nextCursor = nextOffset < unified.length ? `page-${nextOffset}` : null
+      await route.fulfill({
+        json: {
+          ok: true,
+          rows: pageRows,
+          page: {
+            total: unified.length,
+            returned: pageRows.length,
+            pageSize,
+            offset,
+            nextCursor,
+            complete: nextCursor === null,
+            truncated: nextCursor !== null,
+          },
+        },
+      })
+    },
+  )
+}
+
 async function installOperationsRoutes(page: Page) {
   let exceptionStatus: OperationsExceptionStatus = 'open'
   let lifecycle: OrderLifecycle = 'planned'
@@ -389,6 +506,10 @@ async function installOperationsRoutes(page: Page) {
     }
     return route.fulfill({ json: { ok: true, operations: workspace(exceptionStatus, lifecycle) } })
   })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = workspace(exceptionStatus, lifecycle)
+    return { canonical: current.orders, imported: current.importedOrders }
+  })
 }
 
 async function installOrderStatusSyncRoutes(
@@ -401,6 +522,9 @@ async function installOrderStatusSyncRoutes(
     discoveryRunningResponses?: number
     releasedReconciliation?: boolean
     eligibleOrderCount?: number
+    failedStatusOrderGlobalIds?: string[]
+    providerHistoryScheduleEvidence?: 'valid' | 'invalid_counts' | 'invalid_writes'
+    providerHistoryDeferredAccounts?: number
     canManage?: boolean
     importedHistoryOutcomes?: Array<'captured' | 'unavailable' | 'hard_failure'>
     currentImportedHistoryIndexes?: number[]
@@ -418,8 +542,19 @@ async function installOrderStatusSyncRoutes(
   let providerFulfilled = releasedReconciliation
   const syncRequests: Array<{
     idempotencyKey: string
-    body: { excludeOrderGlobalIds: string[] }
+    body: {
+      excludeOrderGlobalIds: string[]
+      orderGlobalIds?: string[]
+    }
     search: string
+  }> = []
+  const reconciliationScheduleRequests: Array<{
+    idempotencyKey: string
+    body: { excludeOrderGlobalIds?: string[] }
+  }> = []
+  const orderHistorySyncRequests: Array<{
+    idempotencyKey: string
+    body: { orderKeys?: string[] }
   }> = []
   const discoveryRequests: Array<{
     idempotencyKey: string
@@ -434,6 +569,8 @@ async function installOrderStatusSyncRoutes(
     }
   }> = []
   const operationsStatusFilters: Array<string | null> = []
+  const unifiedStatusFilters: Array<string | null> = []
+  const refreshRequestOrder: string[] = []
   let markSecondBatchStarted: () => void = () => undefined
   let releaseSecondBatch: () => void = () => undefined
   let markFinalWorkspaceStarted: () => void = () => undefined
@@ -461,8 +598,20 @@ async function installOrderStatusSyncRoutes(
     externalOrderId: 'gid://shopify/Order/1005',
     status: releasedReconciliation ? 'released' : 'imported',
     externallyFulfilled: providerFulfilled,
-    warehouseName: null,
+    warehouseName: providerFulfilled ? 'Current mapped warehouse' : null,
+    warehouseProvenance: providerFulfilled
+      ? 'provider_location_mapping' as const
+      : null,
     promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
+    providerPromisedDeliveryAt: providerFulfilled
+      ? '2026-09-04T17:00:00.000Z'
+      : null,
+    providerDeliveryCoverage: providerFulfilled ? 'partial' as const : null,
+    providerDeliverySource: providerFulfilled
+      ? 'fulfillment_order.deliveryMethod' as const
+      : null,
+    providerLineCount: providerFulfilled ? 1 : null,
     planStatus: releasedReconciliation ? 'released' : null,
     waveStatus: releasedReconciliation ? 'released' : null,
     packageCount: 0,
@@ -501,6 +650,49 @@ async function installOrderStatusSyncRoutes(
     labelPrintJobs: [],
     planningPreparation: null,
     sandboxCommerceE2eAuthorization: null,
+    providerHistory: providerFulfilled ? {
+      observedAt: '2026-09-01T12:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/1005-provider',
+        externalProductId: 'gid://shopify/Product/1005-provider',
+        externalVariantId: 'gid://shopify/ProductVariant/1005-provider',
+        sku: 'PROVIDER-1005',
+        titleSnapshot: 'Bakery Bites Variety Case',
+        variantTitleSnapshot: '20 lb case',
+        vendorSnapshot: 'AG Alchemy',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        returnedQuantity: 1,
+        requiresShipping: true,
+        unitPriceCurrency: 'USD',
+        unitPriceMinor: '1000',
+        subtotalCurrency: 'USD',
+        subtotalMinor: '3000',
+        discountCurrency: 'USD',
+        discountMinor: '500',
+        taxCurrency: 'USD',
+        taxMinor: '0',
+      }],
+      events: [{
+        globalId: 'gcoe1005refund',
+        kind: 'refund_created',
+        status: 'succeeded',
+        occurredAt: '2026-09-01T11:45:00.000Z',
+        externalSubjectId: 'gid://shopify/Refund/1005',
+        quantity: 1,
+        amountMinor: 1250,
+        currency: 'USD',
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }],
+      providerWrites: 0 as const,
+    } : null,
   })
   const currentWorkspace = (
     selected = false,
@@ -568,6 +760,8 @@ async function installOrderStatusSyncRoutes(
           observedAt: options.currentImportedHistoryIndexes?.includes(index)
             ? sourceUpdatedAt
             : null,
+          currency: null,
+          providerTotalMinor: null,
           currentLines: [],
           events: [],
           providerWrites: 0 as const,
@@ -590,6 +784,8 @@ async function installOrderStatusSyncRoutes(
         ? {
             observedAt: options.importedHistoryRefreshedAt
               || new Date().toISOString(),
+            currency: 'USD',
+            providerTotalMinor: '2500',
             currentLines: [{
               externalLineId: details.lines[0].externalLineId,
               externalProductId: 'gid://shopify/Product/66821',
@@ -685,54 +881,157 @@ async function installOrderStatusSyncRoutes(
   )
 
   await page.route(
+    (url) => url.pathname === '/api/operations/order-reconciliation-schedule',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        excludeOrderGlobalIds?: string[]
+      }
+      refreshRequestOrder.push('background-schedule')
+      reconciliationScheduleRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+      })
+      const invalidProviderHistoryCounts =
+        options.providerHistoryScheduleEvidence === 'invalid_counts'
+      const invalidProviderHistoryWrites =
+        options.providerHistoryScheduleEvidence === 'invalid_writes'
+      const deferredAccounts = options.providerHistoryDeferredAccounts || 0
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            totalEligible: 111,
+            scheduled: 110,
+            alreadyScheduled: 1,
+            providerWrites: 0,
+            providerHistory: {
+              totalEligibleAccounts: 2 + deferredAccounts,
+              scheduledAccounts: invalidProviderHistoryCounts ? 2 : 1,
+              alreadyScheduledAccounts: 1,
+              deferredAccounts,
+              newSessions: 1,
+              resumedSessions: 0,
+              newDeferredRefreshes: deferredAccounts,
+              alreadyDeferredRefreshes: 0,
+              providerWrites: invalidProviderHistoryWrites ? 1 : 0,
+            },
+          },
+        },
+      })
+    },
+  )
+  await page.route(
     (url) => url.pathname === '/api/operations/order-status-sync',
     async (route) => {
       const request = route.request()
       expect(request.method()).toBe('POST')
       const body = request.postDataJSON() as {
         excludeOrderGlobalIds: string[]
+        orderGlobalIds?: string[]
       }
+      refreshRequestOrder.push('visible-canonical-status')
       syncRequests.push({
         idempotencyKey: request.headers()['idempotency-key'] || '',
         body,
         search: new URL(request.url()).search,
       })
-      if (options.delaySecondBatch && syncRequests.length === 2) {
+      if (options.delaySecondBatch && syncRequests.length === 1) {
         markSecondBatchStarted()
         await secondBatchRelease
       }
       const excluded = new Set(body.excludeOrderGlobalIds)
+      const targets = body.orderGlobalIds
+        ? new Set(body.orderGlobalIds)
+        : null
       const remaining = eligibleOrderGlobalIds.filter((globalId) => (
-        !excluded.has(globalId)
+        !excluded.has(globalId) && (!targets || targets.has(globalId))
       ))
       const batch = remaining.slice(0, 10)
-      providerFulfilled = true
+      const failedStatusOrderGlobalIds = new Set(
+        options.failedStatusOrderGlobalIds || [],
+      )
+      const successfulBatch = batch.filter((orderGlobalId) => (
+        !failedStatusOrderGlobalIds.has(orderGlobalId)
+      ))
+      const failedBatch = batch.filter((orderGlobalId) => (
+        failedStatusOrderGlobalIds.has(orderGlobalId)
+      ))
+      if (successfulBatch.length > 0) providerFulfilled = true
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            status: failedBatch.length === 0
+              ? 'succeeded'
+              : successfulBatch.length > 0
+                ? 'partial'
+                : 'failed',
+            batchLimit: 10,
+            totalEligible: remaining.length,
+            counts: {
+              selected: batch.length,
+              attempted: batch.length,
+              refreshed: successfulBatch.length,
+              changed: successfulBatch.length,
+              current: 0,
+              providerFulfilled: successfulBatch.length,
+              providerCancelled: 0,
+              reviewRequired: 0,
+              failed: failedBatch.length,
+              providerReads: batch.length,
+            },
+            failedByCode: failedBatch.length > 0
+              ? { SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED: failedBatch.length }
+              : {},
+            outcomes: batch.map((orderGlobalId) => ({
+              orderGlobalId,
+              provider: 'shopify',
+              outcome: failedStatusOrderGlobalIds.has(orderGlobalId)
+                ? 'failed'
+                : 'provider_fulfilled',
+              code: failedStatusOrderGlobalIds.has(orderGlobalId)
+                ? 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED'
+                : null,
+            })),
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+          },
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-history-sync',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      refreshRequestOrder.push('visible-history')
+      orderHistorySyncRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body: request.postDataJSON() as { orderKeys?: string[] },
+      })
       return route.fulfill({
         json: {
           ok: true,
           result: {
             status: 'succeeded',
             batchLimit: 10,
-            totalEligible: remaining.length,
+            totalEligible: 0,
+            remaining: 0,
+            hasMore: false,
+            continuation: null,
             counts: {
-              selected: batch.length,
-              attempted: batch.length,
-              refreshed: batch.length,
-              changed: batch.length,
-              current: 0,
-              providerFulfilled: batch.length,
-              providerCancelled: 0,
-              reviewRequired: 0,
-              failed: 0,
-              providerReads: batch.length,
+              selected: 0,
+              attempted: 0,
+              refreshed: 0,
+              changed: 0,
+              unavailable: 0,
+              providerReads: 0,
             },
             failedByCode: {},
-            outcomes: batch.map((orderGlobalId) => ({
-              orderGlobalId,
-              provider: 'shopify',
-              outcome: 'provider_fulfilled',
-              code: null,
-            })),
+            outcomes: [],
             providerWrites: 0,
             canonicalOrderWrites: 0,
           },
@@ -921,15 +1220,39 @@ async function installOrderStatusSyncRoutes(
       json: { ok: true, operations: responseWorkspace },
     })
   })
+  await installUnifiedOrdersRoute(
+    page,
+    () => {
+      const current = currentWorkspace(false, importedHistoryOrders)
+      const canonical = options.delayFinalWorkspace
+        && unifiedStatusFilters.at(-1) === 'fulfilled_externally'
+        ? current.orders.map((item) => ({
+            ...item,
+            orderNumber: '#FILTERED',
+          }))
+        : current.orders
+      return {
+        canonical,
+        imported: current.importedOrders,
+      }
+    },
+    (requestUrl) => {
+      unifiedStatusFilters.push(requestUrl.searchParams.get('status'))
+    },
+  )
 
   return {
     operationsStatusFilters,
+    refreshRequestOrder,
+    unifiedStatusFilters,
     finalWorkspaceStarted,
     releaseFinalWorkspace,
     releaseSecondBatch,
     secondBatchStarted,
     discoveryRequests,
     importedHistoryRefreshRequests,
+    orderHistorySyncRequests,
+    reconciliationScheduleRequests,
     syncRequests,
   }
 }
@@ -1128,6 +1451,13 @@ async function installOrderLabelPrintRoutes(
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
     await route.fulfill({ json: { ok: true, operations: response() } })
   })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = response()
+    return {
+      canonical: current.orders,
+      imported: current.importedOrders,
+    }
+  })
   return {
     requests,
     sourceLabelGlobalId,
@@ -1189,6 +1519,7 @@ function importedWorkbenchOrder(
       'ship_to_postal_code_required',
     ],
     customerName: 'Northstar Receiving',
+    warehouseName: null,
     lineCount: 1,
     sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
     updatedAt: '2026-08-21T18:00:00.000Z',
@@ -1246,6 +1577,8 @@ function importedWorkbenchOrder(
     }] : [],
     providerHistory: {
       observedAt: null,
+      currency: null,
+      providerTotalMinor: null,
       currentLines: [],
       events: [],
       providerWrites: 0,
@@ -1293,6 +1626,7 @@ function promotedWorkbenchOrder() {
     availableActions: [],
     warehouseName: null,
     promisedDeliveryAt: '2026-08-30T15:30:00.000Z',
+    requestedDeliveryAt: '2026-08-30T15:30:00.000Z',
     lineCount: 1,
     orderValueMinor: '2500',
     expectedCostMinor: '0',
@@ -1357,6 +1691,7 @@ async function installImportedWorkbenchRoutes(
     canManage?: boolean
     workflowState?: OperationsImportedOrderWorkingCopy['workflowState']
     actionAvailable?: boolean
+    omitImportedFromWorkspace?: boolean
   } = {},
 ) {
   const capture = {
@@ -1367,6 +1702,7 @@ async function installImportedWorkbenchRoutes(
     refreshRequests: [] as ImportedWorkbenchRouteRequest[],
     providerMutationRequests: [] as string[],
     canonicalWorkspaceReads: 0,
+    detailReads: 0,
   }
   let promoted = false
   let detailedOrder = importedWorkbenchOrder(true)
@@ -1471,6 +1807,7 @@ async function installImportedWorkbenchRoutes(
     async (route) => {
       const request = route.request()
       if (request.method() === 'GET') {
+        capture.detailReads += 1
         expect(new URL(request.url()).searchParams.get('candidate'))
           .toBe(detailedOrder.candidateGlobalId)
         return route.fulfill({ json: { ok: true, orders: [detailedOrder] } })
@@ -1697,7 +2034,7 @@ async function installImportedWorkbenchRoutes(
             openOrders: 1,
             exceptions: 0,
           },
-          importedOrders: promoted ? [] : [{
+          importedOrders: promoted || options.omitImportedFromWorkspace ? [] : [{
             ...detailedOrder,
             resolutionDetailsLoaded: false,
             customer: { ...detailedOrder.customer, options: [] },
@@ -1706,7 +2043,7 @@ async function installImportedWorkbenchRoutes(
           }],
           importedOrderPage: {
             total: promoted ? 0 : 1,
-            returned: promoted ? 0 : 1,
+            returned: promoted || options.omitImportedFromWorkspace ? 0 : 1,
             pageSize: 250,
             nextCursor: null,
             complete: true,
@@ -1728,6 +2065,18 @@ async function installImportedWorkbenchRoutes(
       },
     })
   })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: promoted
+      ? [promotedWorkbenchOrder()]
+      : [],
+    imported: promoted ? [] : [{
+      ...detailedOrder,
+      resolutionDetailsLoaded: false,
+      customer: { ...detailedOrder.customer, options: [] },
+      lines: [],
+      productOptions: [],
+    }],
+  }))
 
   return capture
 }
@@ -1758,6 +2107,7 @@ async function installImportedOrderPreparationRoutes(
     planStatus: null,
     waveStatus: null,
     promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
     packageCount: 0,
     plannedPackageCount: 0,
     packedPackageCount: 0,
@@ -2242,6 +2592,10 @@ async function installImportedOrderPreparationRoutes(
       },
     })
   })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: [importedOrder],
+    imported: [],
+  }))
   return { unitWeightRequests }
 }
 
@@ -2263,6 +2617,10 @@ async function installOperationsNavigationRoute(page: Page) {
         },
       },
     })
+  })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = workspace()
+    return { canonical: current.orders, imported: current.importedOrders }
   })
 }
 
@@ -2627,6 +2985,23 @@ async function installReplayRoutes(page: Page) {
   })
 }
 
+test('direct imported-order link hydrates drawer details beyond the bounded workspace list', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    omitImportedFromWorkspace: true,
+  })
+
+  await gotoApp(
+    page,
+    `/?operationsOrder=${workbenchCandidateGlobalId}#operations`,
+  )
+
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  expect(capture.detailReads).toBe(1)
+})
+
 test('incomplete imported order saves locally before explicit acceptance into canonical Orders', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const capture = await installImportedWorkbenchRoutes(page)
@@ -2797,6 +3172,8 @@ test('provider-terminal candidates remain visible with current external status a
     }],
     providerHistory: {
       observedAt: '2026-08-31T18:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
       currentLines: [{
         externalLineId: 'gid://shopify/LineItem/77101',
         externalProductId: 'gid://shopify/Product/77101',
@@ -2953,6 +3330,8 @@ test('opening another stale externally fulfilled order refreshes exact Shopify h
     }],
     providerHistory: {
       observedAt: '2026-08-31T17:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
       currentLines: [{
         externalLineId: 'gid://shopify/LineItem/77101',
         externalProductId: 'gid://shopify/Product/77101',
@@ -3023,6 +3402,8 @@ test('opening stale external history stays read-only for a viewer without manage
     },
     providerHistory: {
       observedAt: '2026-08-31T17:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
       currentLines: [],
       events: [],
       providerWrites: 0,
@@ -3130,7 +3511,7 @@ test('imported order provider refresh reuses its UUID after a lost response', as
     .toBe(capture.refreshRequests[0].idempotencyKey)
 })
 
-test('orders workbench globally sorts both order sources and exposes operational saved views', async ({ page }) => {
+test('orders workbench globally filters and sorts both order sources', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const base = workspace()
   const readyOrder = {
@@ -3162,9 +3543,14 @@ test('orders workbench globally sorts both order sources and exposes operational
     updatedAt: '2026-08-23T12:00:00.000Z',
     trackingNumber: '1Z7003',
   }
-  const operationQueries: URLSearchParams[] = []
+  const unifiedQueries: URLSearchParams[] = []
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (url.pathname === '/api/operations/orders/unified') {
+      unifiedQueries.push(url.searchParams)
+    }
+  })
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
-    operationQueries.push(new URL(route.request().url()).searchParams)
     return route.fulfill({
       json: {
         ok: true,
@@ -3194,43 +3580,47 @@ test('orders workbench globally sorts both order sources and exposes operational
       },
     })
   })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: [readyOrder],
+    imported: [attentionOrder, fulfilledOrder],
+  }))
 
   await gotoApp(page, '/#operations')
-  await expect(page.getByRole('button', { name: 'All orders (3)' })).toHaveAttribute(
-    'aria-pressed',
-    'true',
-  )
-  await expect(page.getByRole('button', { name: 'Needs attention (1)' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Ready to fulfill (1)' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'External history (1)' })).toBeVisible()
   await expect(page.getByRole('combobox', { name: 'Filter orders by status' }))
     .toHaveText('All statuses')
   await expect(page.getByRole('combobox', { name: 'Filter orders by sales channel' }))
     .toHaveText('All sales channels')
   await expect(page.getByRole('combobox', { name: 'Filter orders by warehouse' }))
-    .toHaveText('All warehouses')
+    .toHaveCount(0)
+  await expect(page.getByRole('button', { name: /All orders/u })).toHaveCount(0)
   await expect(page.locator('tbody tr')).toHaveCount(3)
   await expect(page.locator('tbody tr').nth(0)).toContainText('#7003')
   await expect(page.locator('tbody tr').nth(1)).toContainText('#7002')
   await expect(page.locator('tbody tr').nth(2)).toContainText('#7001')
 
-  await page.getByRole('button', { name: 'Ready to fulfill (1)' }).click()
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
   await expect(page.locator('tbody tr')).toHaveCount(1)
-  await expect(page.locator('tbody tr')).toContainText('#7001')
+  await expect(page.locator('tbody tr')).toContainText('#7003')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('status'))
+    .toBe('fulfilled_externally')
 
-  await page.getByRole('button', { name: 'All orders (3)' }).click()
+  await page.getByRole('button', { name: 'Clear filters' }).click()
+  await page.getByRole('combobox', { name: 'Filter orders by sales channel' }).click()
+  await page.getByRole('option', { name: 'Shopify' }).click()
+  await expect.poll(() => unifiedQueries.at(-1)?.get('provider')).toBe('shopify')
   await page.getByRole('combobox', { name: 'Filter orders by tracking state' }).click()
   await page.getByRole('option', { name: 'Has tracking' }).click()
   await expect(page.locator('tbody tr')).toHaveCount(1)
   await expect(page.locator('tbody tr')).toContainText('#7003')
-  await expect.poll(() => operationQueries.at(-1)?.get('tracking')).toBe('present')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('tracking')).toBe('present')
 
   await page.getByRole('button', { name: 'Clear filters' }).click()
   await page.getByRole('combobox', { name: 'Sort operations orders' }).click()
   await page.getByRole('option', { name: 'Order number: lowest' }).click()
   await expect(page.locator('tbody tr').nth(0)).toContainText('#7001')
-  await expect.poll(() => operationQueries.at(-1)?.get('sort')).toBe('order_number')
-  await expect.poll(() => operationQueries.at(-1)?.get('direction')).toBe('asc')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('sort')).toBe('order_number')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('direction')).toBe('asc')
 })
 
 test('orders refresh reads Shopify status and projects external fulfillment without local shipment evidence', async ({ page }) => {
@@ -3243,15 +3633,24 @@ test('orders refresh reads Shopify status and projects external fulfillment with
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Checked 1 existing sales-channel order. 1 provider status change was detected.',
+    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Visible provider history: no orders were stale enough for an exact detail refresh. Visible canonical status: checked 1 sales-channel order. 1 provider status change was detected. Connected-store provider history: scheduled background scans for 1 of 2 eligible stores. 1 store was already queued or in progress. Background canonical status: queued 110 active ClawPilot orders for an exact background status check. 1 order was already queued or in progress.',
   )).toBeVisible()
   await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText(
+    'Provider window · scope-filtered',
+  )
   await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
   await page.getByRole('option', { name: 'Fulfilled externally' }).click()
-  await expect.poll(() => capture.operationsStatusFilters.at(-1))
+  await expect.poll(() => capture.unifiedStatusFilters.at(-1))
     .toBe('fulfilled_externally')
   await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
   expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toEqual([{
+    idempotencyKey: expect.stringMatching(
+      /^operations-order-reconciliation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: { excludeOrderGlobalIds: ['gor7654321'] },
+  }])
   expect(capture.discoveryRequests).toEqual([{
     idempotencyKey: expect.stringMatching(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -3262,12 +3661,26 @@ test('orders refresh reads Shopify status and projects external fulfillment with
     idempotencyKey: expect.stringMatching(
       /^operations-order-status-sync:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     ),
-    body: { excludeOrderGlobalIds: [] },
+    body: {
+      excludeOrderGlobalIds: [],
+      orderGlobalIds: ['gor7654321'],
+    },
     search: '',
   })
+  expect(capture.orderHistorySyncRequests).toHaveLength(1)
+  expect(capture.orderHistorySyncRequests[0].body.orderKeys).toEqual([
+    'canonical:gor7654321',
+  ])
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
 
   await page.getByRole('row', { name: /#1005/ }).click()
   await expect(page.getByRole('heading', { name: 'Order #1005' })).toBeVisible()
+  await expect(page.getByText('Provider delivery window', { exact: true }))
+    .toBeVisible()
   await expect(page.getByTestId('order-derived-fulfillment-status'))
     .toHaveText('Fulfilled externally')
   await expect(page.getByText(
@@ -3276,16 +3689,32 @@ test('orders refresh reads Shopify status and projects external fulfillment with
   await expect(page.getByText(
     'Shopify reports this order fulfilled outside ClawPilot. Its provider status is shown here; local fulfillment actions are unavailable.',
   )).toBeVisible()
+  await expect(page.getByTestId('canonical-provider-history')).toContainText(
+    'Ordered 3 · Current 2 · Fulfilled 2 · Unfulfilled 0 · Returned 1 · Removed 1',
+  )
+  await expect(page.getByText('ClawPilot fulfillment lines (2)')).toBeVisible()
+  await expect(page.getByText('Current location mapping').last()).toBeVisible()
   await expect(page.getByText(/Use Reconcile external fulfillment/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Release to warehouse' })).toHaveCount(0)
 })
 
-test('orders refresh hydrates multiple stale Shopify orders and continues unavailable history', async ({ page }) => {
-  test.slow()
+test('orders refresh explains a durable full-history follow-up behind an active provider poll', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
-  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
-  await page.clock.setFixedTime(refreshNow)
+  await installOrderStatusSyncRoutes(page, {
+    providerHistoryDeferredAccounts: 1,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /1 store will begin its full-history scan automatically after the current provider poll finishes\./,
+  )).toBeVisible()
+})
+
+test('orders refresh leaves imported history reads on demand', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     importedHistoryOutcomes: ['captured', 'unavailable'],
   })
@@ -3293,33 +3722,11 @@ test('orders refresh hydrates multiple stale Shopify orders and continues unavai
 
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
-  await expect(page.getByText(/Updated Shopify details for 1 order/))
-    .toBeVisible()
   await expect(page.getByText(
-    /1 Shopify order could not be loaded and can be retried/,
-  )).toBeVisible()
-  expect(capture.importedHistoryRefreshRequests).toHaveLength(2)
-  expect(capture.importedHistoryRefreshRequests.map((request) => request.body))
-    .toEqual([{
-      action: 'refresh',
-      candidateGlobalId: 'gcoc6662001',
-      expectedRowVersion: 2,
-    }, {
-      action: 'refresh',
-      candidateGlobalId: 'gcoc6682001',
-      expectedRowVersion: 3,
-    }])
-  const sourceRevision = Date.parse('2026-08-31T18:00:00.000Z')
-  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
-  expect(capture.importedHistoryRefreshRequests.map((request) => (
-    request.idempotencyKey
-  ))).toEqual([
-    `operations-imported-history:gcoc6662001:2:${sourceRevision}:${refreshEpoch}:0`,
-    `operations-imported-history:gcoc6682001:3:${sourceRevision}:${refreshEpoch}:0`,
-  ])
-  expect(new Set(
-    capture.importedHistoryRefreshRequests.map((request) => request.idempotencyKey),
-  ).size).toBe(2)
+    /Visible provider history: no orders were stale enough for an exact detail refresh/,
+  ))
+    .toBeVisible()
+  expect(capture.importedHistoryRefreshRequests).toEqual([])
 })
 
 test('opening another stale terminal Shopify order refreshes its exact history once per mount', async ({ page }) => {
@@ -3382,144 +3789,7 @@ test('opening terminal Shopify history as a view-only user keeps stored details 
   expect(capture.importedHistoryRefreshRequests).toEqual([])
 })
 
-test('orders refresh skips imported Shopify histories already current with the provider revision', async ({ page }) => {
-  await page.setViewportSize({ width: 1366, height: 900 })
-  const sourceUpdatedAt = new Date().toISOString()
-  const capture = await installOrderStatusSyncRoutes(page, {
-    importedHistoryOutcomes: ['captured', 'captured', 'captured'],
-    currentImportedHistoryIndexes: [0, 2],
-    importedHistorySourceUpdatedAt: sourceUpdatedAt,
-  })
-  await gotoApp(page, '/#operations')
-
-  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
-
-  await expect(page.getByText(/Updated Shopify details for 1 order/))
-    .toBeVisible()
-  expect(capture.importedHistoryRefreshRequests.map((request) => (
-    request.body.candidateGlobalId
-  ))).toEqual(['gcoc6682001'])
-})
-
-test('orders refresh uses a new command in a later TTL epoch when nested activity leaves the parent revision unchanged', async ({ page }) => {
-  await page.setViewportSize({ width: 1366, height: 900 })
-  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
-  await page.clock.setFixedTime(refreshNow)
-  const unchangedParentRevision = new Date(
-    refreshNow - (31 * 60 * 1000),
-  ).toISOString()
-  const capture = await installOrderStatusSyncRoutes(page, {
-    importedHistoryOutcomes: ['captured'],
-    currentImportedHistoryIndexes: [0],
-    importedHistorySourceUpdatedAt: unchangedParentRevision,
-  })
-  await gotoApp(page, '/#operations')
-
-  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
-
-  await expect(page.getByText(/Updated Shopify details for 1 order/))
-    .toBeVisible()
-  expect(capture.importedHistoryRefreshRequests).toHaveLength(1)
-  expect(capture.importedHistoryRefreshRequests[0].body).toEqual({
-    action: 'refresh',
-    candidateGlobalId: 'gcoc6662001',
-    expectedRowVersion: 2,
-  })
-  const firstKey = capture.importedHistoryRefreshRequests[0].idempotencyKey
-  const firstEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
-  expect(firstKey).toBe(
-    `operations-imported-history:gcoc6662001:2:${
-      Date.parse(unchangedParentRevision)
-    }:${firstEpoch}:0`,
-  )
-
-  await page.clock.setFixedTime(refreshNow + (31 * 60 * 1000))
-  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
-  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(2)
-  const laterKey = capture.importedHistoryRefreshRequests[1].idempotencyKey
-  expect(laterKey).toBe(
-    `operations-imported-history:gcoc6662001:2:${
-      Date.parse(unchangedParentRevision)
-    }:${firstEpoch + 1}:0`,
-  )
-  expect(laterKey).not.toBe(firstKey)
-})
-
-test('orders refresh surfaces a local history failure and continues the remaining exact refreshes', async ({ page }) => {
-  test.slow()
-  await page.setViewportSize({ width: 1366, height: 900 })
-  const capture = await installOrderStatusSyncRoutes(page, {
-    importedHistoryOutcomes: ['hard_failure', 'captured'],
-  })
-  await gotoApp(page, '/#operations')
-
-  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
-
-  await expect(page.getByText(/Updated Shopify details for 1 order/))
-    .toBeVisible()
-  await expect(page.getByText(/1 order could not be updated/)).toBeVisible()
-  await expect(page.getByText(
-    /#6662: Imported order could not be loaded or saved \[OPERATIONS_IMPORTED_ORDER_REQUEST_FAILED\]/,
-  )).toBeVisible()
-  expect(capture.importedHistoryRefreshRequests.map((request) => (
-    request.body.candidateGlobalId
-  ))).toEqual(['gcoc6662001', 'gcoc6682001'])
-
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
-  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(3)
-  expect(capture.importedHistoryRefreshRequests[2].idempotencyKey)
-    .toBe(capture.importedHistoryRefreshRequests[0].idempotencyKey)
-})
-
-test('orders refresh caps unavailable Shopify reads and resumes fairly after a remount', async ({ page }) => {
-  test.slow()
-  await page.setViewportSize({ width: 1366, height: 900 })
-  await page.clock.setFixedTime('2026-09-01T12:05:00.000Z')
-  const capture = await installOrderStatusSyncRoutes(page, {
-    importedHistoryOutcomes: Array.from({ length: 12 }, () => 'unavailable'),
-  })
-  await gotoApp(page, '/#operations')
-  const refresh = page.getByRole('button', { name: 'Refresh connected-store orders' })
-
-  await refresh.click()
-  await expect(page.getByText(/No Shopify order details were updated/))
-    .toBeVisible()
-  await expect(page.getByText(/10 Shopify orders could not be loaded and can be retried/))
-    .toBeVisible()
-  await expect(page.getByText(/2 more orders remain; refresh again to continue/))
-    .toBeVisible()
-  expect(capture.importedHistoryRefreshRequests).toHaveLength(10)
-
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await expect(refresh).toBeVisible()
-  await refresh.click()
-  await expect(page.getByText(/2 Shopify orders could not be loaded and can be retried/))
-    .toBeVisible()
-  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(12)
-  expect(new Set(capture.importedHistoryRefreshRequests.map((request) => (
-    request.body.candidateGlobalId
-  ))).size).toBe(12)
-
-  const firstCycleKeys = new Map(
-    capture.importedHistoryRefreshRequests.map((request) => [
-      request.body.candidateGlobalId,
-      request.idempotencyKey,
-    ]),
-  )
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await expect(refresh).toBeVisible()
-  await refresh.click()
-  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(22)
-  for (const request of capture.importedHistoryRefreshRequests.slice(12)) {
-    expect(request.idempotencyKey).not.toBe(
-      firstCycleKeys.get(request.body.candidateGlobalId),
-    )
-    expect(request.idempotencyKey).toMatch(/:1$/)
-  }
-})
-
-test('orders refresh continues bounded provider batches from one manager action', async ({ page }) => {
+test('orders refresh scopes provider status reads to visible canonical rows', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     eligibleOrderCount: 15,
@@ -3529,17 +3799,28 @@ test('orders refresh continues bounded provider batches from one manager action'
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Checked 15 existing sales-channel orders. 15 provider status changes were detected.',
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
   expect(capture.discoveryRequests).toHaveLength(1)
-  expect(capture.syncRequests).toHaveLength(2)
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.syncRequests[0].body.orderGlobalIds).toEqual(['gor7654321'])
   expect(capture.syncRequests[0].body.excludeOrderGlobalIds).toEqual([])
-  expect(capture.syncRequests[1].body.excludeOrderGlobalIds).toHaveLength(10)
-  expect(new Set(capture.syncRequests[1].body.excludeOrderGlobalIds).size).toBe(10)
+  expect(capture.orderHistorySyncRequests).toHaveLength(1)
+  expect(capture.orderHistorySyncRequests[0].body.orderKeys).toEqual([
+    'canonical:gor7654321',
+  ])
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: ['gor7654321'],
+  })
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
 })
 
-test('orders refresh checks more than the former 100-order status ceiling in one click', async ({ page }) => {
-  test.slow()
+test('orders refresh never starts an unscoped synchronous status scan', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     eligibleOrderCount: 111,
@@ -3549,14 +3830,74 @@ test('orders refresh checks more than the former 100-order status ceiling in one
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Checked 111 existing sales-channel orders. 111 provider status changes were detected.',
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
-  expect(capture.syncRequests).toHaveLength(12)
-  expect(capture.syncRequests.at(-1)?.body.excludeOrderGlobalIds).toHaveLength(110)
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.syncRequests.every((request) => (
+    request.body.orderGlobalIds?.length === 1
+    && request.body.orderGlobalIds[0] === 'gor7654321'
+  ))).toBe(true)
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: ['gor7654321'],
+  })
 })
 
-test('Orders pane loads more than 100 canonical orders across each keyset page exactly once', async ({ page }) => {
-  test.slow()
+test('orders refresh excludes only successful visible canonical checks from background scheduling', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    eligibleOrderCount: 111,
+    failedStatusOrderGlobalIds: ['gor7654321'],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Visible canonical status: checked 1 sales-channel order\. No provider status changes were detected\./,
+  )).toBeVisible()
+  await expect(page.getByText(
+    /1 existing sales-channel order could not be checked/,
+  )).toBeVisible()
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: [],
+  })
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
+})
+
+for (const evidence of ['invalid_counts', 'invalid_writes'] as const) {
+  test(`orders refresh rejects provider-history schedule ${evidence.replace('_', ' ')}`, async ({ page }) => {
+    await page.setViewportSize({ width: 1366, height: 900 })
+    const capture = await installOrderStatusSyncRoutes(page, {
+      providerHistoryScheduleEvidence: evidence,
+    })
+    await gotoApp(page, '/#operations')
+
+    await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+    await expect(page.getByText(
+      'Historical sales-channel order refresh returned invalid evidence',
+    )).toBeVisible()
+    await expect(page.getByText(
+      /Connected-store provider history: background refresh was not scheduled\./,
+    )).toBeVisible()
+    expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+      excludeOrderGlobalIds: ['gor7654321'],
+    })
+    expect(capture.refreshRequestOrder).toEqual([
+      'visible-history',
+      'visible-canonical-status',
+      'background-schedule',
+    ])
+  })
+}
+
+test('Orders pane requests bounded unified pages only after user navigation', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const orders = Array.from({ length: 111 }, (_, index) => ({
     id: `canonical-order-${index + 1}`,
@@ -3570,6 +3911,7 @@ test('Orders pane loads more than 100 canonical orders across each keyset page e
     externallyFulfilled: false,
     warehouseName: null,
     promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
     lineCount: 1,
     exceptionCount: 0,
     orderValueMinor: '1000',
@@ -3579,41 +3921,87 @@ test('Orders pane loads more than 100 canonical orders across each keyset page e
     trackingNumber: null,
     updatedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
   }))
-  const canonicalPageRequests: string[] = []
-  await page.route((url) => url.pathname === '/api/operations/orders', async (route) => {
-    const params = new URL(route.request().url()).searchParams
-    canonicalPageRequests.push(params.get('cursor') || '')
-    expect(params.get('limit')).toBe('250')
-    return route.fulfill({
-      json: {
-        ok: true,
-        orders: orders.slice(100),
-        page: {
-          total: orders.length,
-          returned: 11,
-          pageSize: 250,
-          nextCursor: null,
-          complete: true,
-          truncated: false,
+  const unifiedPageRequests: Array<string | null> = []
+  let failLastPageOnce = true
+  let conflictSecondPageOnce = false
+  await page.route(
+    (url) => url.pathname === '/api/operations/orders/unified',
+    async (route) => {
+      const params = new URL(route.request().url()).searchParams
+      expect(params.get('pageSize')).toBe('50')
+      const cursor = params.get('cursor')
+      unifiedPageRequests.push(cursor)
+      if (cursor === 'page-50' && conflictSecondPageOnce) {
+        conflictSecondPageOnce = false
+        await route.fulfill({
+          status: 409,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED',
+            error: 'The order result set changed while pages were being read; restart from page one',
+          },
+        })
+        return
+      }
+      if (cursor === 'page-100' && failLastPageOnce) {
+        failLastPageOnce = false
+        await route.fulfill({
+          status: 503,
+          json: { ok: false, error: 'Temporary unified-page failure' },
+        })
+        return
+      }
+      const offset = cursor ? Number(cursor.replace('page-', '')) : 0
+      const rows = orders.slice(offset, offset + 50).map((order) => ({
+        kind: 'canonical',
+        key: `canonical:${order.globalId}`,
+        order,
+      }))
+      const nextOffset = offset + rows.length
+      const nextCursor = nextOffset < orders.length ? `page-${nextOffset}` : null
+      await route.fulfill({
+        json: {
+          ok: true,
+          rows,
+          page: {
+            total: orders.length,
+            returned: rows.length,
+            pageSize: 50,
+            offset,
+            nextCursor,
+            complete: nextCursor === null,
+            truncated: nextCursor !== null,
+          },
         },
-      },
-    })
-  })
+      })
+    },
+  )
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    const params = new URL(route.request().url()).searchParams
+    expect(params.get('includeOrderSummaries')).toBe('false')
     const base = workspace()
-    return route.fulfill({
+    await route.fulfill({
       json: {
         ok: true,
         operations: {
           ...base,
-          orders: orders.slice(0, 100),
+          orders: [],
           orderPage: {
-            total: orders.length,
-            returned: 100,
-            pageSize: 100,
-            nextCursor: 'canonical-page-2',
-            complete: false,
-            truncated: true,
+            total: 0,
+            returned: 0,
+            pageSize: 1,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          importedOrders: [],
+          importedOrderPage: {
+            total: 0,
+            returned: 0,
+            pageSize: 1,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
           },
           selectedOrder: null,
           exceptions: [],
@@ -3624,13 +4012,57 @@ test('Orders pane loads more than 100 canonical orders across each keyset page e
 
   await gotoApp(page, '/#operations')
 
-  await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(111)
-  await expect(page.getByRole('row', { name: /#7000/ })).toBeVisible()
-  await expect(page.getByRole('row', { name: /#7110/ })).toBeVisible()
-  expect(canonicalPageRequests).toEqual(['canonical-page-2'])
-})
+  await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(50)
+  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
+  expect(unifiedPageRequests).toEqual([null])
 
-test('orders refresh drains provider continuation beyond one five-page worker invocation', async ({ page }) => {
+  await page.getByRole('button', { name: 'Next' }).click()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7050/u })).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7000/u })).toHaveCount(0)
+  expect(unifiedPageRequests).toEqual([null, 'page-50'])
+
+  await page.getByRole('button', { name: 'Next' }).click()
+  await expect.poll(() => [...unifiedPageRequests]).toEqual([
+    null,
+    'page-50',
+    'page-100',
+    'page-50',
+  ])
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByText('Page 2', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Previous' }).click()
+  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7000/u })).toBeVisible()
+  expect(unifiedPageRequests).toEqual([
+    null,
+    'page-50',
+    'page-100',
+    'page-50',
+    null,
+  ])
+
+  conflictSecondPageOnce = true
+  await page.getByRole('button', { name: 'Next' }).click()
+  await expect(page.getByText(
+    'Orders changed while you were paging. Returned to the first page.',
+  )).toBeVisible()
+  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
+  await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(50)
+  await expect(page.getByRole('row', { name: /#7000/u })).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7050/u })).toHaveCount(0)
+  expect(unifiedPageRequests).toEqual([
+    null,
+    'page-50',
+    'page-100',
+    'page-50',
+    null,
+    'page-50',
+    null,
+  ])
+})
+test('orders refresh leaves provider continuation for the next manager action', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     discoveryContinuationBatches: 1,
@@ -3641,21 +4073,17 @@ test('orders refresh drains provider continuation beyond one five-page worker in
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 150 eligible provider orders. Checked 1 existing sales-channel order. 1 provider status change was detected.',
+    /Checked 0 of 1 connected store for new orders and found 125 eligible provider orders\. 1 store still has provider pages after this bounded refresh\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
-  expect(capture.discoveryRequests).toHaveLength(2)
-  expect(capture.discoveryRequests.map((request) => request.body)).toEqual([
-    { accountGlobalId: 'gia9286799' },
-    { accountGlobalId: 'gia9286799' },
-  ])
-  expect(new Set(
-    capture.discoveryRequests.map((request) => request.idempotencyKey),
-  ).size).toBe(2)
-  for (const request of capture.discoveryRequests) {
-    expect(request.idempotencyKey).toMatch(
+  await expect(page.getByText(
+    'Pro Bakery Bites still has provider pages after the safe per-click limit; refresh again to continue.',
+  )).toBeVisible()
+  expect(capture.discoveryRequests).toEqual([{
+    idempotencyKey: expect.stringMatching(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-    )
-  }
+    ),
+    body: { accountGlobalId: 'gia9286799' },
+  }])
   await expect.poll(() => capture.operationsStatusFilters.length)
     .toBeGreaterThan(workspaceReadsBeforeRefresh)
 })
@@ -3664,7 +4092,6 @@ test('orders refresh reloads the current filter after a delayed provider batch',
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     delaySecondBatch: true,
-    eligibleOrderCount: 15,
   })
   await gotoApp(page, '/#operations')
 
@@ -3672,18 +4099,18 @@ test('orders refresh reloads the current filter after a delayed provider batch',
   await capture.secondBatchStarted
   await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
   await page.getByRole('option', { name: 'Fulfilled externally' }).click()
-  await expect.poll(() => capture.operationsStatusFilters.at(-1))
+  await expect.poll(() => capture.unifiedStatusFilters.at(-1))
     .toBe('fulfilled_externally')
-  const requestsBeforeFinalReload = capture.operationsStatusFilters.length
+  const requestsBeforeFinalReload = capture.unifiedStatusFilters.length
 
   capture.releaseSecondBatch()
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Checked 15 existing sales-channel orders. 15 provider status changes were detected.',
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
-  await expect.poll(() => capture.operationsStatusFilters.length)
+  await expect.poll(() => capture.unifiedStatusFilters.length)
     .toBeGreaterThan(requestsBeforeFinalReload)
   expect(
-    capture.operationsStatusFilters
+    capture.unifiedStatusFilters
       .slice(requestsBeforeFinalReload)
       .every((value) => value === 'fulfilled_externally'),
   ).toBe(true)
@@ -3718,16 +4145,16 @@ test('orders refresh reports an already-running provider scan without claiming c
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 0 of 1 connected store for new orders and found 0 eligible provider orders. 1 store is still refreshing after the bounded wait. Checked 1 existing sales-channel order. 1 provider status change was detected.',
+    /Checked 0 of 1 connected store for new orders and found 0 eligible provider orders\. 1 store is already refreshing\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
   await expect(page.getByText(
-    'Pro Bakery Bites is still refreshing after the bounded wait. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.',
+    'Pro Bakery Bites is already refreshing. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.',
   )).toBeVisible()
-  expect(capture.discoveryRequests).toHaveLength(6)
+  expect(capture.discoveryRequests).toHaveLength(1)
   expect(capture.syncRequests).toHaveLength(1)
 })
 
-test('orders refresh waits for an already-running provider scan to finish', async ({ page }) => {
+test('orders refresh does not poll an already-running provider scan', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderStatusSyncRoutes(page, {
     discoveryRunningResponses: 2,
@@ -3737,9 +4164,9 @@ test('orders refresh waits for an already-running provider scan to finish', asyn
   await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
 
   await expect(page.getByText(
-    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Checked 1 existing sales-channel order. 1 provider status change was detected.',
+    /Checked 0 of 1 connected store for new orders and found 0 eligible provider orders\. 1 store is already refreshing\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
   )).toBeVisible()
-  expect(capture.discoveryRequests).toHaveLength(3)
+  expect(capture.discoveryRequests).toHaveLength(1)
   expect(capture.syncRequests).toHaveLength(1)
 })
 
@@ -3751,6 +4178,24 @@ test('released Shopify fulfillment keeps the required reconciliation action ahea
   await page.getByRole('row', { name: /#1005/ }).click()
   await expect(page.getByTestId('order-derived-fulfillment-status'))
     .toHaveText('Fulfilled externally')
+  await expect(page.getByTestId('canonical-provider-total')).toContainText(
+    'Latest sales-channel total',
+  )
+  await expect(page.getByTestId('canonical-provider-total')).toContainText('$25.00')
+  const providerLineId = 'gid://shopify/LineItem/1005-provider'
+  await expect(page.getByTestId(`canonical-provider-line-title-${providerLineId}`))
+    .toHaveText('Bakery Bites Variety Case')
+  await expect(page.getByTestId(`canonical-provider-line-metadata-${providerLineId}`))
+    .toHaveText('SKU PROVIDER-1005 · Variant 20 lb case · Vendor AG Alchemy')
+  await expect(page.getByTestId(`canonical-provider-line-financials-${providerLineId}`))
+    .toHaveText(
+      'Unit price $10.00 · Subtotal $30.00 · Discount $5.00 · Tax $0.00',
+    )
+  await page.getByText('Sales-channel activity (1)').click()
+  await expect(page.getByTestId('canonical-provider-event-details-gcoe1005refund'))
+    .toContainText(
+      'Provider reference gid://shopify/Refund/1005 · Quantity 1 · Amount $12.50',
+    )
   await expect(page.getByText(
     'Shopify reports external fulfillment. Use Reconcile external fulfillment instead of updating this order.',
   )).toBeVisible()

@@ -96,6 +96,21 @@ const orderWorkbenchExactHistoryMigration = [
   '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e',
 ]
 
+const faireOrderWorkbenchExactHistoryMigration = [
+  'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+  '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1',
+]
+
+const orderHistoryLineFidelityMigration = [
+  'db/migrations/0342_operations_order_history_line_fidelity.sql',
+  '5d292963a5a8e4b117ff8a5388a660ed87e090d6e0239b3288bed9e506e8cc8d',
+]
+
+const commerceOrderHistoryFollowupsMigration = [
+  'db/migrations/0343_operations_commerce_order_history_followups.sql',
+  '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -167,8 +182,8 @@ for (const requiredFragment of [
   '729f134cd49c97aae0d155d8d49cdc44b16b9eebde242cce016987b257ff75ad',
   'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT = 14',
   '88e112da61f9894dbf031952f1c11bc7dce8b3c0398089e35c79adaeb91b1eae',
-  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17',
-  'c9a6a9a9a29fe4feea20572ada59bb054b07fa8eb80a0d787b4bda492d747017',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
+  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
   'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
@@ -330,6 +345,59 @@ if (
   fail('Order workbench exact-history migration checksum drifted')
 }
 
+const [faireOrderWorkbenchExactHistoryMigrationPath,
+  faireOrderWorkbenchExactHistoryMigrationChecksum] =
+  faireOrderWorkbenchExactHistoryMigration
+if (!existsSync(resolve(root, faireOrderWorkbenchExactHistoryMigrationPath))) {
+  fail(
+    `missing Faire order workbench exact-history migration: ${faireOrderWorkbenchExactHistoryMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, faireOrderWorkbenchExactHistoryMigrationPath),
+    ))
+    .digest('hex') !== faireOrderWorkbenchExactHistoryMigrationChecksum
+) {
+  fail('Faire order workbench exact-history migration checksum drifted')
+}
+
+const [orderHistoryLineFidelityMigrationPath,
+  orderHistoryLineFidelityMigrationChecksum] = orderHistoryLineFidelityMigration
+if (!existsSync(resolve(root, orderHistoryLineFidelityMigrationPath))) {
+  fail(
+    `missing order-history line-fidelity migration: ${orderHistoryLineFidelityMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, orderHistoryLineFidelityMigrationPath),
+    ))
+    .digest('hex') !== orderHistoryLineFidelityMigrationChecksum
+) {
+  fail('Order-history line-fidelity migration checksum drifted')
+}
+
+const [commerceOrderHistoryFollowupsMigrationPath,
+  commerceOrderHistoryFollowupsMigrationChecksum] =
+  commerceOrderHistoryFollowupsMigration
+if (!existsSync(resolve(root, commerceOrderHistoryFollowupsMigrationPath))) {
+  fail(
+    `missing commerce-order history-followups migration: ${commerceOrderHistoryFollowupsMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, commerceOrderHistoryFollowupsMigrationPath),
+    ))
+    .digest('hex') !== commerceOrderHistoryFollowupsMigrationChecksum
+) {
+  fail('Commerce-order history-followups migration checksum drifted')
+}
+
 const healthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
@@ -340,8 +408,11 @@ for (const requiredFragment of [
   '${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}',
   'AS operations_order_editing_release_applied',
   'AS operations_order_workbench_exact_history_applied',
+  'AS operations_commerce_order_history_followups_applied',
   '&& row?.operations_order_editing_release_applied',
+  '&& row?.operations_commerce_order_history_followups_applied',
   '|| !row?.operations_order_editing_release_applied',
+  '|| !row?.operations_commerce_order_history_followups_applied',
 ]) {
   if (!healthRoute.includes(requiredFragment)) {
     fail(`runtime health is missing order-editing gate ${requiredFragment}`)
@@ -878,6 +949,9 @@ for (const requiredPath of [
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
   'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
   'db/migrations/0340_operations_order_workbench_exact_history.sql',
+  'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+  'db/migrations/0342_operations_order_history_line_fidelity.sql',
+  'db/migrations/0343_operations_commerce_order_history_followups.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
@@ -943,6 +1017,11 @@ for (const requiredPath of [
   'scripts/test-commerce-order-sync-foundation.mjs',
   'scripts/test-commerce-order-history-worker-drain.mjs',
   'scripts/test-commerce-order-sync-postgres.mjs',
+  'app_src/app/api/operations/order-history-sync/route.ts',
+  'app_src/app/api/operations/order-reconciliation-schedule/route.ts',
+  'app_src/lib/persistence/commerceOrderHistoryBatch.ts',
+  'scripts/test-commerce-order-history-batch.mjs',
+  'scripts/test-commerce-order-history-batch-postgres.mjs',
   'scripts/test-commerce-authority-policies-postgres.mjs',
   'scripts/test-commerce-order-history-ui.mjs',
   'scripts/test-shopify-order-webhook-signals.mjs',
@@ -1613,6 +1692,24 @@ if (
     .includes('scripts/test-career-site-migration-verifier.mjs')
 ) {
   fail('career-site submission tests must run the PostgreSQL 16/18 migration verifier')
+}
+
+const orderHistoryBatchGate = String(
+  rootPackage?.scripts?.['test:commerce-order-history-batch'] || '',
+)
+for (const requiredTest of [
+  'scripts/test-commerce-order-history-batch.mjs',
+  'scripts/test-commerce-order-history-batch-postgres.mjs',
+]) {
+  if (!orderHistoryBatchGate.includes(requiredTest)) {
+    fail(`commerce order-history batch gate is missing ${requiredTest}`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:commerce-order-workbench'] || '')
+    .includes('npm run test:commerce-order-history-batch')
+) {
+  fail('commerce order workbench tests must run the bounded history batch gate')
 }
 
 const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))

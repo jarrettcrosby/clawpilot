@@ -355,6 +355,164 @@ for (const malformed of [null, false, '', '0']) {
     'one malformed member must prevent a partial quantity sum',
   )
 }
+
+const unavailableMoney = {
+  state: 'unavailable',
+  value: null,
+  reason: 'not_provided',
+}
+const availableMoney = (amountMinor) => ({
+  state: 'available',
+  value: {
+    primary: { amountMinor: BigInt(amountMinor), currency: 'USD' },
+    shop: unavailableMoney,
+    presentment: unavailableMoney,
+  },
+})
+const historyLine = (provider, input) => ({
+  identity: {
+    provider,
+    resourceType: 'order_line',
+    value: input.externalLineId,
+  },
+  productIdentity: {
+    state: 'available',
+    value: {
+      provider,
+      resourceType: 'product',
+      value: `${input.externalLineId}-product`,
+    },
+  },
+  variantIdentity: {
+    state: 'unavailable',
+    value: null,
+    reason: 'not_provided',
+  },
+  sku: input.sku,
+  titleSnapshot: input.title,
+  variantTitleSnapshot: input.variantTitle || null,
+  vendorSnapshot: input.vendor || null,
+  orderedQuantity: input.quantity,
+  currentQuantity: input.quantity,
+  unfulfilledQuantity: 0,
+  fulfilledQuantity: input.quantity,
+  returnedQuantity: 0,
+  requiresShipping: true,
+  unitPrice: availableMoney(input.unitPriceMinor),
+  lineSubtotal: availableMoney(input.subtotalMinor),
+  lineDiscount: availableMoney(input.discountMinor),
+  lineTax: availableMoney(input.taxMinor),
+})
+const historyOrder = (provider, lines) => ({
+  identity: { provider, resourceType: 'order', value: `${provider}-order-1` },
+  orderNumber: `${provider}-order-1`,
+  providerCreatedAt: null,
+  providerProcessedAt: null,
+  providerUpdatedAt: '2026-08-13T00:00:00.000Z',
+  providerCancelledAt: null,
+  providerClosedAt: null,
+  rawStates: {
+    lifecycle: 'OPEN',
+    payment: 'PAID',
+    fulfillment: 'FULFILLED',
+    returns: 'NONE',
+  },
+  canonicalStates: {
+    lifecycle: 'open',
+    payment: 'paid',
+    fulfillment: 'fulfilled',
+    returns: 'none',
+  },
+  total: availableMoney(12_500),
+  lines,
+})
+const observedAt = '2026-08-13T00:00:01.000Z'
+const shopifyHistoryLine = historyLine('shopify', {
+  externalLineId: 'gid://shopify/LineItem/line-1',
+  sku: 'SHOP-ONE',
+  title: 'Original Shopify item',
+  variantTitle: 'Large',
+  vendor: 'Provider vendor',
+  quantity: 2,
+  unitPriceMinor: 5_000,
+  subtotalMinor: 10_000,
+  discountMinor: 500,
+  taxMinor: 800,
+})
+const shopifyObservation = historyRuntime.commerceOrderHistoryObservation(
+  'shopify',
+  historyOrder('shopify', [shopifyHistoryLine]),
+  { fulfillments: [], refunds: [] },
+  observedAt,
+  3,
+  'manual_exact_read',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(shopifyObservation.lines[0])),
+  {
+    externalLineId: 'gid://shopify/LineItem/line-1',
+    externalProductId: 'gid://shopify/LineItem/line-1-product',
+    externalVariantId: null,
+    sku: 'SHOP-ONE',
+    titleSnapshot: 'Original Shopify item',
+    variantTitleSnapshot: 'Large',
+    vendorSnapshot: 'Provider vendor',
+    originalQuantity: 2,
+    currentQuantity: 2,
+    unfulfilledQuantity: 0,
+    fulfilledQuantity: 2,
+    returnedQuantity: 0,
+    requiresShipping: true,
+    unitPriceCurrency: 'USD',
+    unitPriceMinor: 5_000,
+    subtotalCurrency: 'USD',
+    subtotalMinor: 10_000,
+    discountCurrency: 'USD',
+    discountMinor: 500,
+    taxCurrency: 'USD',
+    taxMinor: 800,
+  },
+  'Shopify history retains exact item descriptions and money',
+)
+const changedShopifyObservation = historyRuntime.commerceOrderHistoryObservation(
+  'shopify',
+  historyOrder('shopify', [{
+    ...shopifyHistoryLine,
+    titleSnapshot: 'Replacement Shopify item',
+    lineSubtotal: availableMoney(9_500),
+  }]),
+  { fulfillments: [], refunds: [] },
+  observedAt,
+  3,
+  'manual_exact_read',
+)
+assert.notEqual(
+  changedShopifyObservation.sourceHash,
+  shopifyObservation.sourceHash,
+  'provider title and price changes must change the retained revision hash',
+)
+const faireObservation = historyRuntime.commerceOrderHistoryObservation(
+  'faire',
+  historyOrder('faire', [historyLine('faire', {
+    externalLineId: 'faire-line-1',
+    sku: null,
+    title: 'Added Faire item without SKU',
+    vendor: 'Faire brand',
+    quantity: 1,
+    unitPriceMinor: 4_200,
+    subtotalMinor: 4_200,
+    discountMinor: 0,
+    taxMinor: 210,
+  })]),
+  {},
+  observedAt,
+  2,
+  'manual_exact_read',
+)
+assert.equal(faireObservation.lines[0].sku, null)
+assert.equal(faireObservation.lines[0].titleSnapshot, 'Added Faire item without SKU')
+assert.equal(faireObservation.lines[0].unitPriceMinor, 4_200)
+assert.equal(faireObservation.lines[0].taxMinor, 210)
 const privacyObservationBase = {
   observationKind: 'historical_backfill',
   externalOrderId: 'provider-order-privacy-1',
@@ -639,6 +797,10 @@ assert.match(
 )
 assert.match(
   historyRuntime.shopifyOrderHistoryDetailQuery(true),
+  /fulfillments\(first: 101\)/u,
+)
+assert.match(
+  historyRuntime.shopifyOrderHistoryDetailQuery(true),
   /returnLineItems\(first: 51\)/u,
 )
 assert.match(
@@ -883,6 +1045,16 @@ for (const invalid of [
       trackingInfo: [{ number: '1Z' }, null],
     }],
   },
+  {
+    ...validShopifyDetail,
+    fulfillments: Array.from({ length: 101 }, (_value, index) => ({
+      id: `gid://shopify/Fulfillment/${index}`,
+      createdAt: '2026-08-12T01:00:00.000Z',
+      updatedAt: '2026-08-12T01:01:00.000Z',
+      status: 'SUCCESS',
+      trackingInfo: [],
+    })),
+  },
   { ...validShopifyDetail, refunds: [null] },
   {
     ...validShopifyDetail,
@@ -1013,6 +1185,7 @@ let shopifyAdapterNextCursor = null
 let shopifyAdapterReadReturns = false
 let shopifyAdapterFailureStage = null
 let faireAdapterOrder = null
+let faireAdapterFailureStage = null
 const normalizedAdapterOrder = (provider, source) => ({
   provider,
   identity: { value: String(source.id ?? source.order_id) },
@@ -1084,10 +1257,21 @@ const adapterHistoryRuntime = loadTypeScript(
           },
     },
     '@/lib/integrations/faireCommerceClient': {
+      getFaireOrder: async () => {
+        if (faireAdapterFailureStage === 'detail') {
+          throw new Error('Faire detail read failed')
+        }
+        return faireAdapterOrder
+      },
       listFaireOrders: async () => ({
         orders: [faireAdapterOrder], has_more: false, next_cursor: null,
       }),
-      probeFaireBrandProfile: async () => ({ id: 'brand-adapter' }),
+      probeFaireBrandProfile: async () => {
+        if (faireAdapterFailureStage === 'probe') {
+          throw new Error('Faire probe read failed')
+        }
+        return { id: 'brand-adapter' }
+      },
     },
     '@/lib/integrations/faireCommerceNormalizer': {
       normalizeFaireCommerce: (value) => ({
@@ -1686,6 +1870,59 @@ const faireAdapterTrackingCleared = await readFaireAdapter({
     carrier: 'UPS',
   }],
 })
+adapterProvider = 'faire'
+faireAdapterOrder = faireTrackingOrder(
+  'FAIRE-EXACT-TRACKING',
+  '2026-08-13T00:02:00.000Z',
+  'DELIVERED',
+)
+const exactFaireRead = await adapterHistoryRuntime
+  .readExactFaireOrderHistoryObservation({
+    organizationId: '00000000-0000-4000-8000-000000000001',
+    accountGlobalId: 'gia0000001',
+    expectedCredentialGeneration: 1,
+    externalOrderId: faireAdapterOrder.id,
+    observedAt: '2026-08-13T00:03:00.000Z',
+    observationKind: 'manual_exact_read',
+  })
+assert.equal(exactFaireRead.provider, 'faire')
+assert.equal(exactFaireRead.providerReads, 2)
+assert.equal(exactFaireRead.providerWrites, 0)
+assert.equal(exactFaireRead.observation.providerReadCount, 2)
+assert.equal(
+  exactFaireRead.observation.events.find(
+    (event) => event.eventKind === 'tracking_updated'
+      && event.trackingNumber,
+  )?.trackingNumber,
+  'FAIRE-EXACT-TRACKING',
+  'an exact Faire refresh must retain current embedded shipment tracking',
+)
+for (const [failureStage, expectedProviderReads] of [
+  ['probe', 1],
+  ['detail', 2],
+]) {
+  faireAdapterFailureStage = failureStage
+  let exactReadError = null
+  try {
+    await adapterHistoryRuntime.readExactFaireOrderHistoryObservation({
+      organizationId: '00000000-0000-4000-8000-000000000001',
+      accountGlobalId: 'gia0000001',
+      expectedCredentialGeneration: 1,
+      externalOrderId: faireAdapterOrder.id,
+      observedAt: '2026-08-13T00:03:00.000Z',
+      observationKind: 'manual_exact_read',
+    })
+  } catch (error) {
+    exactReadError = error
+  }
+  assert.ok(exactReadError, `${failureStage} must reject the exact Faire read`)
+  assert.equal(
+    adapterHistoryRuntime.exactFaireOrderHistoryProviderReads(exactReadError),
+    expectedProviderReads,
+    `${failureStage} must retain attempted Faire provider-read volume`,
+  )
+}
+faireAdapterFailureStage = null
 const normalizedFaireOne = persistenceRuntime
   .normalizeCommerceOrderObservationInput(faireAdapterOne.observations[0])
 const normalizedFaireSame = persistenceRuntime
@@ -1864,6 +2101,9 @@ const workerRuntime = loadTypeScript(
     '@/lib/persistence/commerceOrderSync': {
       async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
         return { redacted: 0, providerWrites: 0 }
+      },
+      async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+        return { materialized: 0, skipped: 0, providerWrites: 0 }
       },
       async ensureContinuousCommerceOrderPollsInPostgres() {
         return { scheduled: 1, providerWrites: 0 }

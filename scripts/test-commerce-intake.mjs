@@ -981,6 +981,10 @@ includes(shopifyQuerySource, [
   'phone',
   'shippingAddress',
   'shippingLine',
+  'fulfillmentOrders(first: ${SHOPIFY_ORDER_FULFILLMENT_PAGE_SIZE}, displayable: true)',
+  'deliveryMethod {',
+  'minDeliveryDateTime',
+  'maxDeliveryDateTime',
   'customer {',
   'purchasingEntity {',
   'taxable',
@@ -1026,9 +1030,20 @@ assert.doesNotMatch(
 includes(serviceSource, [
   "hasEffectiveShopifyScope(\n    grant.grantedScopes,\n    'read_customers'",
   "hasEffectiveShopifyScope(\n    probe.grantedScopes,\n    'read_customers'",
-  'shopifyOrderQuery(includeCustomerIdentity)',
-  'shopifyOrdersQuery(includeCustomerIdentity)',
+  'includeFulfillmentDeliveryPromise',
+  'shopifyOrderQuery(',
+  'shopifyOrdersQuery(',
+  'effectiveShopifyFulfillmentOrderReadScopes(',
+  "'read_merchant_managed_fulfillment_orders'",
+  "'read_third_party_fulfillment_orders'",
+  "'read_assigned_fulfillment_orders'",
+  "'read_marketplace_fulfillment_orders'",
 ], 'Shopify protected customer-data query gating')
+assert.match(
+  serviceSource,
+  /SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES\.filter\(\(scope\) =>/,
+  'Shopify delivery windows retain the exact mutually partitioned fulfillment-order scopes that are effective',
+)
 includes(serviceSource, [
   "hasEffectiveShopifyScope(grant.grantedScopes, 'read_products')",
   "hasEffectiveShopifyScope(probe.grantedScopes, 'read_products')",
@@ -2986,7 +3001,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
         SHOPIFY_COMMERCE_NORMALIZER_VERSION:
-          'shopify-commerce-normalizer-v5',
+          'shopify-commerce-normalizer-v6',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
@@ -3050,6 +3065,7 @@ const service = loadTypeScriptModule(
               'read_all_orders',
               'read_orders',
               'read_products',
+              'read_merchant_managed_fulfillment_orders',
             ],
           }
         },
@@ -3061,6 +3077,7 @@ const service = loadTypeScriptModule(
               'read_all_orders',
               'read_orders',
               'read_products',
+              'read_merchant_managed_fulfillment_orders',
             ],
           }
         },
@@ -3068,6 +3085,11 @@ const service = loadTypeScriptModule(
           providerReads.shopifyGraphql += 1
           assert.doesNotMatch(request.query, /\bmutation\b/i)
           if (request.operationName === 'ClawPilotCommerceOrders') {
+            assert.match(
+              request.query,
+              /fulfillmentOrders\(first: 20, displayable: true\)/,
+            )
+            assert.match(request.query, /maxDeliveryDateTime/)
             assert.match(request.variables.query, /^status:any/)
             assert.doesNotMatch(request.variables.query, /\btest:false\b/)
             if (!request.variables.after) {
@@ -3109,6 +3131,10 @@ const service = loadTypeScriptModule(
             }
           }
           if (request.operationName === 'ClawPilotCommerceOrder') {
+            assert.match(
+              request.query,
+              /fulfillmentOrders\(first: 20, displayable: true\)/,
+            )
             return {
               order: {
                 id: request.variables.id,
@@ -4994,7 +5020,7 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'shopify'
-      && reservation.adapterVersion === 'shopify-commerce-normalizer-v5'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v6'
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )

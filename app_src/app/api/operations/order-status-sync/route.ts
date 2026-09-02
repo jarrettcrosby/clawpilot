@@ -25,6 +25,7 @@ const BATCH_LIMIT = 10
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,120}$/u
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u
 const MAX_EXCLUDED_ORDERS = 500
+const MAX_TARGETED_ORDERS = 100
 const MAX_REQUEST_BYTES = 16 * 1024
 
 function response(payload: Record<string, unknown>, status = 200) {
@@ -109,14 +110,29 @@ export async function POST(req: NextRequest) {
     const bodyRecord = body as Record<string, unknown>
     const bodyKeys = Object.keys(bodyRecord)
     const excluded = bodyRecord.excludeOrderGlobalIds ?? []
+    const targeted = bodyRecord.orderGlobalIds
     if (
-      bodyKeys.some((key) => key !== 'excludeOrderGlobalIds')
+      bodyKeys.some((key) => ![
+        'excludeOrderGlobalIds',
+        'orderGlobalIds',
+      ].includes(key))
       || !Array.isArray(excluded)
       || excluded.length > MAX_EXCLUDED_ORDERS
       || new Set(excluded).size !== excluded.length
       || excluded.some((globalId) => (
         typeof globalId !== 'string' || !ORDER_GLOBAL_ID.test(globalId)
       ))
+      || (
+        targeted !== undefined
+        && (
+          !Array.isArray(targeted)
+          || targeted.length > MAX_TARGETED_ORDERS
+          || new Set(targeted).size !== targeted.length
+          || targeted.some((globalId) => (
+            typeof globalId !== 'string' || !ORDER_GLOBAL_ID.test(globalId)
+          ))
+        )
+      )
     ) {
       return response({
         ok: false,
@@ -125,6 +141,7 @@ export async function POST(req: NextRequest) {
       }, 400)
     }
     const excludeOrderGlobalIds = excluded as string[]
+    const orderGlobalIds = targeted as string[] | undefined
 
     const organizationId = activeOperationsOrganizationId(actor)
     const selectedCandidates =
@@ -132,6 +149,7 @@ export async function POST(req: NextRequest) {
         organizationId,
         limit: BATCH_LIMIT,
         excludeOrderGlobalIds,
+        orderGlobalIds,
       })
     const batch = await prepareCommerceOrderStatusSyncBatchInPostgres({
       organizationId,
@@ -140,6 +158,7 @@ export async function POST(req: NextRequest) {
       batchLimit: BATCH_LIMIT,
       candidates: selectedCandidates,
       excludeOrderGlobalIds,
+      orderGlobalIds,
     })
     if (batch.replayedResult) {
       return response({ ok: true, result: batch.replayedResult })

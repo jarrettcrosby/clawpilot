@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -162,17 +162,12 @@ import {
   OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH,
 } from '@/lib/operations/orderListQuery'
 import {
-  filterAndSortOperationsOrderRows,
-  OPERATIONS_ORDER_SAVED_VIEWS,
   operationsOrderRowNeedsAttention,
-  operationsOrderRowMatchesSavedView,
   operationsOrderRowUpdatedAt,
-  operationsOrderSavedViewCounts,
-  operationsOrderWorkbenchRows,
   type OperationsOrderDateFilter,
-  type OperationsOrderSavedView,
   type OperationsOrderSort,
   type OperationsOrderTrackingFilter,
+  type OperationsOrderWorkbenchRow,
 } from '@/lib/operations/orderWorkbenchView'
 
 type SandboxCommerceE2eAuthorizationResult = {
@@ -298,52 +293,172 @@ type OrderStatusSyncPayload = {
   }
 }
 
+type OrderStatusSyncResult = NonNullable<OrderStatusSyncPayload['result']>
+
+type OrderProviderHistoryScheduleResult = {
+  totalEligibleAccounts: number
+  scheduledAccounts: number
+  alreadyScheduledAccounts: number
+  deferredAccounts: number
+  newSessions: number
+  resumedSessions: number
+  newDeferredRefreshes: number
+  alreadyDeferredRefreshes: number
+  providerWrites: 0
+}
+
+type OrderReconciliationScheduleResult = {
+  totalEligible: number
+  scheduled: number
+  alreadyScheduled: number
+  providerWrites: 0
+  providerHistory: OrderProviderHistoryScheduleResult
+}
+
+type OrderReconciliationSchedulePayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  result?: OrderReconciliationScheduleResult
+}
+
+function validOrderReconciliationScheduleResult(
+  result: OrderReconciliationScheduleResult | undefined,
+) {
+  if (!result || !result.providerHistory) return false
+  const providerHistory = result.providerHistory
+  const counts = [
+    result.totalEligible,
+    result.scheduled,
+    result.alreadyScheduled,
+    providerHistory.totalEligibleAccounts,
+    providerHistory.scheduledAccounts,
+    providerHistory.alreadyScheduledAccounts,
+    providerHistory.deferredAccounts,
+    providerHistory.newSessions,
+    providerHistory.resumedSessions,
+    providerHistory.newDeferredRefreshes,
+    providerHistory.alreadyDeferredRefreshes,
+  ]
+  return result.providerWrites === 0
+    && providerHistory.providerWrites === 0
+    && counts.every((count) => Number.isSafeInteger(count) && count >= 0)
+    && result.totalEligible === result.scheduled + result.alreadyScheduled
+    && providerHistory.totalEligibleAccounts
+      === providerHistory.scheduledAccounts
+        + providerHistory.alreadyScheduledAccounts
+        + providerHistory.deferredAccounts
+    && providerHistory.scheduledAccounts
+      === providerHistory.newSessions + providerHistory.resumedSessions
+    && providerHistory.deferredAccounts
+      === providerHistory.newDeferredRefreshes
+        + providerHistory.alreadyDeferredRefreshes
+}
+
+type OrderHistorySyncResult = {
+  status: 'succeeded' | 'partial' | 'failed'
+  batchLimit: number
+  totalEligible: number
+  remaining: number
+  hasMore: boolean
+  continuation: {
+    mode: 'refresh_again'
+    remaining: number
+  } | null
+  counts: {
+    selected: number
+    attempted: number
+    refreshed: number
+    changed: number
+    unavailable: number
+    providerReads: number
+  }
+  failedByCode: Record<string, number>
+  outcomes: Array<{
+    candidateGlobalId: string
+    accountGlobalId: string
+    provider: 'shopify' | 'faire'
+    outcome: 'captured' | 'unavailable'
+    changed: boolean
+    code: string | null
+    terminalUnsupported: boolean
+    providerReads: number
+  }>
+  providerWrites: 0
+  canonicalOrderWrites: 0
+}
+
+type OrderHistorySyncPayload = {
+  ok?: boolean
+  replayed?: boolean
+  error?: string
+  code?: string
+  result?: OrderHistorySyncResult
+}
+
+function validOrderHistorySyncResult(
+  result: OrderHistorySyncResult | undefined,
+) {
+  if (!result) return false
+  const counts = [
+    result.batchLimit,
+    result.totalEligible,
+    result.remaining,
+    result.counts.selected,
+    result.counts.attempted,
+    result.counts.refreshed,
+    result.counts.changed,
+    result.counts.unavailable,
+    result.counts.providerReads,
+  ]
+  if (
+    result.providerWrites !== 0
+    || result.canonicalOrderWrites !== 0
+    || !['succeeded', 'partial', 'failed'].includes(result.status)
+    || counts.some((count) => !Number.isSafeInteger(count) || count < 0)
+    || result.batchLimit < 1
+    || result.batchLimit > 10
+    || result.counts.selected > result.batchLimit
+    || result.counts.attempted !== result.counts.selected
+    || result.counts.refreshed + result.counts.unavailable
+      !== result.counts.attempted
+    || result.counts.changed > result.counts.refreshed
+    || result.outcomes.length !== result.counts.selected
+    || result.hasMore !== (result.remaining > 0)
+    || (
+      result.remaining === 0
+        ? result.continuation !== null
+        : result.continuation?.mode !== 'refresh_again'
+          || result.continuation.remaining !== result.remaining
+    )
+  ) return false
+  const candidateIds = new Set<string>()
+  for (const outcome of result.outcomes) {
+    if (
+      candidateIds.has(outcome.candidateGlobalId)
+      || !['shopify', 'faire'].includes(outcome.provider)
+      || !['captured', 'unavailable'].includes(outcome.outcome)
+      || typeof outcome.changed !== 'boolean'
+      || typeof outcome.terminalUnsupported !== 'boolean'
+      || (outcome.outcome === 'captured' && outcome.terminalUnsupported)
+      || (outcome.outcome === 'unavailable' && outcome.changed)
+      || !Number.isSafeInteger(outcome.providerReads)
+      || outcome.providerReads < 0
+    ) return false
+    candidateIds.add(outcome.candidateGlobalId)
+  }
+  return true
+}
+
 const IMPORTED_ORDER_PAGE_SIZE = 250
-const MAX_IMPORTED_ORDER_PAGES = 20
 const CANONICAL_ORDER_PAGE_SIZE = 250
-const MAX_CANONICAL_ORDER_PAGES = 20
-const MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 20
-const ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS = [250, 500, 1_000, 2_000, 3_000]
-const MAX_ORDER_STATUS_SYNC_ORDERS = 500
-const MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK = 10
+const UNIFIED_ORDER_PAGE_SIZE_DEFAULT = 50
+const UNIFIED_ORDER_PAGE_SIZE_MAX = 100
+const UNIFIED_ORDER_CURSOR_MAX_LENGTH = 16_384
+const MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 1
+const ORDER_HISTORY_BATCH_LIMIT = 10
 const IMPORTED_HISTORY_REFRESH_TTL_MS = 30 * 60 * 1000
 const IMPORTED_HISTORY_ROTATION_WINDOW_MS = 5 * 60 * 1000
-const IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS = 24 * 60 * 60 * 1000
-const IMPORTED_HISTORY_PROGRESS_STORAGE_PREFIX =
-  'clawpilot:operations:shopify-history-progress:v2:'
-const MAX_IMPORTED_HISTORY_REFRESH_CYCLE = 1_000_000_000
-
-type ImportedOrderHistoryRefreshBatchResult = {
-  eligible: number
-  captured: number
-  unavailable: number
-  conflicts: number
-  failed: number
-  remaining: number
-  progressCycle: number
-  progressRevisionKeys: string[]
-  failureMessages: string[]
-}
-
-type ImportedHistoryRefreshProgress = {
-  version: 2
-  updatedAt: number
-  refreshEpoch: number
-  cycle: number
-  attemptedRevisionKeys: string[]
-}
-
-function waitForOrderDiscoveryPoll(pollNumber: number) {
-  const delay = ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS[
-    Math.min(
-      pollNumber,
-      ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS.length - 1,
-    )
-  ]
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, delay)
-  })
-}
 
 type OrderDiscoveryPayload = {
   ok?: boolean
@@ -400,12 +515,47 @@ type ImportedOrderWorkbenchPayload = {
   lineConflicts?: OperationsImportedOrderLineRefreshConflict[]
 }
 
-type CanonicalOrderListPayload = {
+type UnifiedOrderPage = {
+  total: number
+  returned: number
+  pageSize: number
+  offset: number
+  nextCursor: string | null
+  complete: boolean
+  truncated: boolean
+}
+
+type UnifiedOrderPagePayload = {
   ok?: boolean
   error?: string
   code?: string
-  orders?: OperationsOrderListItem[]
-  page?: OperationsOrderPage
+  rows?: OperationsOrderWorkbenchRow[]
+  page?: UnifiedOrderPage
+}
+
+function validUnifiedOrderPage(value: unknown): value is UnifiedOrderPage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const page = value as Partial<UnifiedOrderPage>
+  const cursorIsValid = page.nextCursor === null
+    || (
+      typeof page.nextCursor === 'string'
+      && page.nextCursor.length > 0
+      && page.nextCursor.length <= UNIFIED_ORDER_CURSOR_MAX_LENGTH
+      && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
+    )
+  return Number.isSafeInteger(page.total)
+    && Number(page.total) >= 0
+    && Number.isSafeInteger(page.returned)
+    && Number(page.returned) >= 0
+    && Number.isSafeInteger(page.pageSize)
+    && Number(page.pageSize) >= 1
+    && Number(page.pageSize) <= UNIFIED_ORDER_PAGE_SIZE_MAX
+    && Number.isSafeInteger(page.offset)
+    && Number(page.offset) >= 0
+    && Number(page.offset) + Number(page.returned) <= Number(page.total)
+    && cursorIsValid
+    && page.complete === (page.nextCursor === null)
+    && page.truncated === (page.nextCursor !== null)
 }
 
 function validImportedOrderPage(
@@ -432,118 +582,14 @@ function validImportedOrderPage(
     && page.truncated === (page.nextCursor !== null)
 }
 
-function importedHistoryRevisionKey(
-  order: OperationsImportedOrderWorkingCopy,
-) {
-  const sourceRevision = Date.parse(order.sourceUpdatedAt)
-  return `${order.candidateGlobalId}:${order.rowVersion}:${
-    Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
-  }`
-}
-
-function importedHistoryProgressStorageKey(organizationId: string) {
-  return `${IMPORTED_HISTORY_PROGRESS_STORAGE_PREFIX}${organizationId}`
-}
-
 function importedHistoryRefreshEpoch(now: number) {
   return Math.floor(now / IMPORTED_HISTORY_REFRESH_TTL_MS)
 }
 
-function readImportedHistoryRefreshProgress(
-  organizationId: string,
-  now: number,
-): ImportedHistoryRefreshProgress | null {
-  try {
-    const raw = window.localStorage.getItem(
-      importedHistoryProgressStorageKey(organizationId),
-    )
-    if (!raw) return null
-    const value = JSON.parse(raw) as Partial<ImportedHistoryRefreshProgress>
-    if (
-      value.version !== 2
-      || !Number.isSafeInteger(value.updatedAt)
-      || Number(value.updatedAt) < 0
-      || Number(value.updatedAt) > now + IMPORTED_HISTORY_ROTATION_WINDOW_MS
-      || now - Number(value.updatedAt) > IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS
-      || !Number.isSafeInteger(value.refreshEpoch)
-      || Number(value.refreshEpoch) < 0
-      || Number(value.refreshEpoch) !== importedHistoryRefreshEpoch(
-        Number(value.updatedAt),
-      )
-      || !Number.isSafeInteger(value.cycle)
-      || Number(value.cycle) < 0
-      || Number(value.cycle) > MAX_IMPORTED_HISTORY_REFRESH_CYCLE
-      || !Array.isArray(value.attemptedRevisionKeys)
-      || value.attemptedRevisionKeys.length > (
-        IMPORTED_ORDER_PAGE_SIZE * MAX_IMPORTED_ORDER_PAGES
-      )
-      || value.attemptedRevisionKeys.some((key) => (
-        typeof key !== 'string'
-        || !/^gcoc(?:[0-9]{7}|[0-9a-v]{12}):\d+:(?:\d+|unknown)$/u.test(key)
-      ))
-    ) {
-      return null
-    }
-    return {
-      version: 2,
-      updatedAt: Number(value.updatedAt),
-      refreshEpoch: Number(value.refreshEpoch),
-      cycle: Number(value.cycle),
-      attemptedRevisionKeys: [...new Set(value.attemptedRevisionKeys)],
-    }
-  } catch {
-    return null
-  }
-}
-
-function writeImportedHistoryRefreshProgress(
-  organizationId: string,
-  progress: ImportedHistoryRefreshProgress,
-) {
-  try {
-    window.localStorage.setItem(
-      importedHistoryProgressStorageKey(organizationId),
-      JSON.stringify(progress),
-    )
-  } catch {
-    // The in-memory tenant map remains available when browser storage is blocked.
-  }
-}
-
-function importedHistoryRotationOffset(input: {
-  organizationId: string
-  className: 'terminal' | 'open'
-  length: number
-  now: number
-}) {
-  if (input.length <= 1) return 0
-  let hash = 2_166_136_261
-  const seed = `${input.organizationId}:${input.className}`
-  for (let index = 0; index < seed.length; index += 1) {
-    hash = Math.imul(hash ^ seed.charCodeAt(index), 16_777_619)
-  }
-  const timeWindow = Math.floor(
-    input.now / IMPORTED_HISTORY_ROTATION_WINDOW_MS,
-  )
-  return (
-    (hash >>> 0)
-    + timeWindow * MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK
-  ) % input.length
-}
-
-function rotateImportedHistoryTargets(
-  targets: OperationsImportedOrderWorkingCopy[],
-  offset: number,
-) {
-  if (offset <= 0) return targets
-  return [...targets.slice(offset), ...targets.slice(0, offset)]
-}
-
-function importedOrderNeedsShopifyHistoryRefresh(
+function importedOrderNeedsProviderHistoryRefresh(
   order: OperationsImportedOrderWorkingCopy,
   now: number,
 ) {
-  if (order.provider !== 'shopify') return false
   if (!order.providerHistory.observedAt) return true
   const sourceUpdatedAt = Date.parse(order.sourceUpdatedAt)
   const historyObservedAt = Date.parse(order.providerHistory.observedAt)
@@ -559,7 +605,7 @@ function importedOrderCanAutoRefreshDrawerHistory(
   now: number,
 ) {
   return importedOrderIsTerminal(order)
-    && importedOrderNeedsShopifyHistoryRefresh(order, now)
+    && importedOrderNeedsProviderHistoryRefresh(order, now)
 }
 
 function importedDrawerHistoryIdempotencyKey(
@@ -572,231 +618,6 @@ function importedDrawerHistoryIdempotencyKey(
   }:${order.rowVersion}:${
     Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
   }:${importedHistoryRefreshEpoch(now)}`
-}
-
-async function refreshImportedShopifyHistoryBatch(
-  input: {
-    organizationId: string
-    attemptedRevisionKeys: ReadonlySet<string>
-    cycle: number
-    now: number
-  },
-): Promise<ImportedOrderHistoryRefreshBatchResult> {
-  const result: ImportedOrderHistoryRefreshBatchResult = {
-    eligible: 0,
-    captured: 0,
-    unavailable: 0,
-    conflicts: 0,
-    failed: 0,
-    remaining: 0,
-    progressCycle: input.cycle,
-    progressRevisionKeys: [],
-    failureMessages: [],
-  }
-  const targets: OperationsImportedOrderWorkingCopy[] = []
-  const seenCandidateGlobalIds = new Set<string>()
-  const seenCursors = new Set<string>()
-  let cursor: string | null = null
-  let pageNumber = 0
-
-  while (pageNumber < MAX_IMPORTED_ORDER_PAGES) {
-    const params = new URLSearchParams({
-      limit: String(IMPORTED_ORDER_PAGE_SIZE),
-    })
-    if (cursor) params.set('cursor', cursor)
-    const response = await fetch(
-      `/api/operations/order-workbench?${params.toString()}`,
-      { cache: 'no-store' },
-    )
-    const payload = await response.json().catch(() => ({})) as
-      ImportedOrderWorkbenchPayload
-    if (
-      !response.ok
-      || !payload.ok
-      || !Array.isArray(payload.orders)
-      || !validImportedOrderPage(payload.page)
-    ) {
-      throw new Error(
-        `${payload.error || 'Imported Shopify orders could not be loaded for history refresh'}${
-          payload.code ? ` [${payload.code}]` : ''
-        }`,
-      )
-    }
-    if (payload.page.returned !== payload.orders.length) {
-      throw new Error('Imported-order history pagination returned inconsistent evidence')
-    }
-    for (const order of payload.orders) {
-      if (seenCandidateGlobalIds.has(order.candidateGlobalId)) {
-        throw new Error('Imported-order history pagination returned a duplicate order')
-      }
-      seenCandidateGlobalIds.add(order.candidateGlobalId)
-      if (importedOrderNeedsShopifyHistoryRefresh(order, input.now)) {
-        targets.push(order)
-      }
-    }
-    pageNumber += 1
-    if (!payload.page.nextCursor) {
-      cursor = null
-      break
-    }
-    if (seenCursors.has(payload.page.nextCursor)) {
-      throw new Error('Imported-order history pagination did not advance')
-    }
-    seenCursors.add(payload.page.nextCursor)
-    cursor = payload.page.nextCursor
-  }
-  if (cursor) {
-    throw new Error(
-      `Imported Shopify history refresh exceeded the safe ${
-        IMPORTED_ORDER_PAGE_SIZE * MAX_IMPORTED_ORDER_PAGES
-      }-order page limit`,
-    )
-  }
-
-  targets.sort((left, right) => {
-    const terminalPriority = Number(importedOrderIsTerminal(right))
-      - Number(importedOrderIsTerminal(left))
-    if (terminalPriority !== 0) return terminalPriority
-    const sourcePriority = Date.parse(right.sourceUpdatedAt)
-      - Date.parse(left.sourceUpdatedAt)
-    if (Number.isFinite(sourcePriority) && sourcePriority !== 0) {
-      return sourcePriority
-    }
-    return left.candidateGlobalId.localeCompare(right.candidateGlobalId)
-  })
-  const targetRevisionKeys = new Set(targets.map((order) => (
-    importedHistoryRevisionKey(order)
-  )))
-  const progressRevisionKeys = new Set(
-    [...input.attemptedRevisionKeys].filter((key) => (
-      targetRevisionKeys.has(key)
-    )),
-  )
-  let pendingTargets = targets.filter((order) => (
-    !progressRevisionKeys.has(importedHistoryRevisionKey(order))
-  ))
-  if (pendingTargets.length === 0 && targets.length > 0) {
-    progressRevisionKeys.clear()
-    pendingTargets = targets
-    result.progressCycle = input.cycle >= MAX_IMPORTED_HISTORY_REFRESH_CYCLE
-      ? 0
-      : input.cycle + 1
-  }
-  const terminalTargets = pendingTargets.filter(importedOrderIsTerminal)
-  const openTargets = pendingTargets.filter((order) => (
-    !importedOrderIsTerminal(order)
-  ))
-  const orderedPendingTargets = [
-    ...rotateImportedHistoryTargets(
-      terminalTargets,
-      importedHistoryRotationOffset({
-        organizationId: input.organizationId,
-        className: 'terminal',
-        length: terminalTargets.length,
-        now: input.now,
-      }),
-    ),
-    ...rotateImportedHistoryTargets(
-      openTargets,
-      importedHistoryRotationOffset({
-        organizationId: input.organizationId,
-        className: 'open',
-        length: openTargets.length,
-        now: input.now,
-      }),
-    ),
-  ]
-  const selectedTargets = orderedPendingTargets.slice(
-    0,
-    MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK,
-  )
-  result.eligible = selectedTargets.length
-  const refreshEpoch = importedHistoryRefreshEpoch(input.now)
-  for (const order of selectedTargets) {
-    const revisionKey = importedHistoryRevisionKey(order)
-    try {
-      const sourceRevision = Date.parse(order.sourceUpdatedAt)
-      const response = await fetch('/api/operations/order-workbench', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Idempotency-Key': `operations-imported-history:${
-            order.candidateGlobalId
-          }:${order.rowVersion}:${
-            Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
-          }:${refreshEpoch}:${result.progressCycle}`,
-        },
-        body: JSON.stringify({
-          action: 'refresh',
-          candidateGlobalId: order.candidateGlobalId,
-          expectedRowVersion: order.rowVersion,
-        }),
-      })
-      const payload = await response.json().catch(() => ({})) as
-        ImportedOrderWorkbenchPayload
-      if (
-        response.status === 409
-        && payload.code === 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT'
-      ) {
-        progressRevisionKeys.add(revisionKey)
-        result.conflicts += 1
-        continue
-      }
-      if (
-        !response.ok
-        || !payload.ok
-        || !payload.order
-        || !payload.refreshResult
-      ) {
-        throw new Error(
-          `${payload.error || 'Imported Shopify history could not be refreshed'}${
-            payload.code ? ` [${payload.code}]` : ''
-          }`,
-        )
-      }
-      const historyRefresh = payload.historyRefresh
-      if (
-        !historyRefresh
-        || historyRefresh.providerWrites !== 0
-        || (
-          historyRefresh.status === 'captured'
-          && historyRefresh.providerReads === null
-        )
-        || (
-          historyRefresh.providerReads !== null
-          && (
-            !Number.isSafeInteger(historyRefresh.providerReads)
-            || historyRefresh.providerReads < 0
-          )
-        )
-      ) {
-        throw new Error('Imported Shopify history refresh returned invalid evidence')
-      }
-      if (historyRefresh.status === 'captured') {
-        progressRevisionKeys.add(revisionKey)
-        result.captured += 1
-        continue
-      }
-      if (historyRefresh.status === 'unavailable') {
-        progressRevisionKeys.add(revisionKey)
-        result.unavailable += 1
-        continue
-      }
-      throw new Error('Shopify order history refresh was not applicable')
-    } catch (caught) {
-      result.failed += 1
-      result.failureMessages.push(
-        `${order.orderNumber}: ${caught instanceof Error
-          ? caught.message
-          : 'Imported Shopify history could not be refreshed'}`,
-      )
-    }
-  }
-  result.remaining = targets.filter((order) => (
-    !progressRevisionKeys.has(importedHistoryRevisionKey(order))
-  )).length
-  result.progressRevisionKeys = [...progressRevisionKeys].sort()
-  return result
 }
 
 function validCanonicalOrderPage(
@@ -999,15 +820,11 @@ const ORDER_STATUSES: Array<{ value: OperationsOrderFilter; label: string }> = [
 ]
 
 const ORDER_SORTS: Array<{ value: OperationsOrderSort; label: string }> = [
-  { value: 'priority', label: 'Operational priority' },
   { value: 'updated_desc', label: 'Last activity: newest' },
   { value: 'updated_asc', label: 'Last activity: oldest' },
   { value: 'order_desc', label: 'Order number: highest' },
   { value: 'order_asc', label: 'Order number: lowest' },
   { value: 'customer_asc', label: 'Customer: A–Z' },
-  { value: 'promise_asc', label: 'Promise date: earliest' },
-  { value: 'value_desc', label: 'Currency, then order total' },
-  { value: 'lines_desc', label: 'Item lines: most' },
 ]
 
 const ORDER_DATE_FILTERS: Array<{
@@ -1420,7 +1237,16 @@ function money(minor: string | null | undefined, currency = 'USD') {
 }
 
 function importedOrderMoney(order: OperationsImportedOrderWorkingCopy) {
+  if (order.orderValueMinor === null || order.orderValueMinor === '') {
+    return 'Unavailable'
+  }
   return money(order.orderValueMinor, order.currency)
+}
+
+function importedOrderWarehouseName(
+  order: OperationsImportedOrderWorkingCopy,
+) {
+  return order.warehouseName || 'Unassigned'
 }
 
 function orderListQuerySort(sort: OperationsOrderSort) {
@@ -2136,6 +1962,19 @@ function OrderDetailDrawer({
   const preparingFulfillment = primaryAction?.action === 'prepare_fulfillment'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
   const shipments = order?.shipments || []
+  const deliveryAt = order?.promisedDeliveryAt
+    || order?.requestedDeliveryAt
+    || order?.providerPromisedDeliveryAt
+    || null
+  const deliveryIsRequested = Boolean(
+    order && !order.promisedDeliveryAt && order.requestedDeliveryAt,
+  )
+  const deliveryIsProviderWindow = Boolean(
+    order
+    && !order.promisedDeliveryAt
+    && !order.requestedDeliveryAt
+    && order.providerPromisedDeliveryAt,
+  )
   const externalFulfillment = order?.externalFulfillment || null
   const providerOnlyExternalFulfillment = Boolean(
     order?.externallyFulfilled && !externalFulfillment,
@@ -2308,8 +2147,29 @@ function OrderDetailDrawer({
             <DetailSection title="Overview">
               <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 1.5 }}>
                 <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{order.customerName}</Typography><Typography variant="caption" color="#A8C7FA">{order.customerGlobalId}</Typography></Box>
-                <Box><Typography variant="caption" color="text.secondary">Warehouse</Typography><Typography>{order.warehouseName || 'Unassigned'}</Typography></Box>
-                <Box><Typography variant="caption" color="text.secondary">Promise</Typography><Typography>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: 'Not promised' })}</Typography></Box>
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Warehouse</Typography>
+                  <Typography>{order.warehouseName || 'Unassigned'}</Typography>
+                  {order.warehouseProvenance === 'provider_location_mapping' && (
+                    <Typography variant="caption" color="text.secondary">
+                      Current location mapping
+                    </Typography>
+                  )}
+                </Box>
+                <Box>
+                  <Typography variant="caption" color="text.secondary">
+                    {deliveryIsRequested
+                      ? 'Requested delivery'
+                      : deliveryIsProviderWindow
+                        ? 'Provider delivery window'
+                        : 'Promise'}
+                  </Typography>
+                  <Typography>
+                    {formatUserDateTime(deliveryAt, dateTime, {
+                      year: 'numeric', month: 'short', day: 'numeric', fallback: 'Not supplied',
+                    })}
+                  </Typography>
+                </Box>
                 <Box><Typography variant="caption" color="text.secondary">Tracking</Typography><Typography sx={{ overflowWrap: 'anywhere' }}>{order.trackingNumber || 'Not shipped'}</Typography></Box>
               </Box>
             </DetailSection>
@@ -2484,21 +2344,220 @@ function OrderDetailDrawer({
               )}
             </DetailSection>
 
-            <DetailSection title={`Lines (${order.lines.length})`}>
-              <Stack divider={<Divider flexItem />}>
-                {order.lines.map((line) => (
-                  <Box key={line.globalId} sx={{ py: 1.25, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1 }}>
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography fontWeight={600}>{line.productName}</Typography>
-                      <Typography variant="caption" color="text.secondary">{line.productGlobalId} · {line.channelSku}</Typography>
+            {order.providerHistory && (
+              <DetailSection
+                title={`Latest sales-channel items (${order.providerHistory.currentLines.length})`}
+              >
+                <Stack spacing={1.25} data-testid="canonical-provider-history">
+                  <Typography variant="body2" color="text.secondary">
+                    Read-only current {displayStatus(order.sourceProvider)} snapshot
+                    {' · observed '}{formatUserDateTime(
+                      order.providerHistory.observedAt,
+                      dateTime,
+                      {
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        fallback: 'Unknown',
+                      },
+                    )}. Sales-channel adjustments do not rewrite ClawPilot fulfillment demand.
+                  </Typography>
+                  {order.providerHistory.providerTotalMinor !== null
+                    && order.providerHistory.currency && (
+                    <Stack
+                      direction="row"
+                      justifyContent="space-between"
+                      alignItems="center"
+                      gap={2}
+                      data-testid="canonical-provider-total"
+                    >
+                      <Typography variant="body2" color="text.secondary">
+                        Latest sales-channel total
+                      </Typography>
+                      <Typography fontWeight={700}>
+                        {money(
+                          order.providerHistory.providerTotalMinor,
+                          order.providerHistory.currency,
+                        )}
+                      </Typography>
+                    </Stack>
+                  )}
+                  {order.providerHistory.currentLines.length > 0 ? (
+                    <Stack divider={<Divider flexItem />}>
+                      {order.providerHistory.currentLines.map((line) => {
+                        const currentQuantity = line.currentQuantity
+                        const removedQuantity = currentQuantity === null
+                          ? null
+                          : Math.max(0, line.orderedQuantity - currentQuantity)
+                        const itemName = line.titleSnapshot
+                          || line.sku
+                          || line.externalVariantId
+                          || line.externalProductId
+                          || line.externalLineId
+                        const itemMetadata = [
+                          line.titleSnapshot && line.sku
+                            ? `SKU ${line.sku}`
+                            : null,
+                          line.variantTitleSnapshot
+                            ? `Variant ${line.variantTitleSnapshot}`
+                            : null,
+                          line.vendorSnapshot
+                            ? `Vendor ${line.vendorSnapshot}`
+                            : null,
+                        ].filter((value): value is string => Boolean(value))
+                        const financialFacts = [
+                          line.unitPriceMinor !== null && line.unitPriceCurrency
+                            ? `Unit price ${money(line.unitPriceMinor, line.unitPriceCurrency)}`
+                            : null,
+                          line.subtotalMinor !== null && line.subtotalCurrency
+                            ? `Subtotal ${money(line.subtotalMinor, line.subtotalCurrency)}`
+                            : null,
+                          line.discountMinor !== null && line.discountCurrency
+                            ? `Discount ${money(line.discountMinor, line.discountCurrency)}`
+                            : null,
+                          line.taxMinor !== null && line.taxCurrency
+                            ? `Tax ${money(line.taxMinor, line.taxCurrency)}`
+                            : null,
+                        ].filter((value): value is string => Boolean(value))
+                        return (
+                          <Box
+                            key={line.externalLineId}
+                            data-testid={`canonical-provider-line-${line.externalLineId}`}
+                            sx={{ py: 1.25, minWidth: 0 }}
+                          >
+                            <Typography
+                              fontWeight={600}
+                              data-testid={`canonical-provider-line-title-${line.externalLineId}`}
+                              sx={{ overflowWrap: 'anywhere' }}
+                            >
+                              {itemName}
+                            </Typography>
+                            {itemMetadata.length > 0 && (
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                                data-testid={`canonical-provider-line-metadata-${line.externalLineId}`}
+                                sx={{ overflowWrap: 'anywhere' }}
+                              >
+                                {itemMetadata.join(' · ')}
+                              </Typography>
+                            )}
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ overflowWrap: 'anywhere' }}
+                            >
+                              {line.externalLineId}
+                            </Typography>
+                            <Typography variant="body2" sx={{ mt: 0.5 }}>
+                              Ordered {line.orderedQuantity}
+                              {' · Current '}{currentQuantity ?? 'Not supplied'}
+                              {' · Fulfilled '}{line.fulfilledQuantity ?? 'Not supplied'}
+                              {' · Unfulfilled '}{line.unfulfilledQuantity ?? 'Not supplied'}
+                              {' · Returned '}{line.returnedQuantity ?? 'Not supplied'}
+                              {' · Removed '}{removedQuantity ?? 'Not supplied'}
+                            </Typography>
+                            {financialFacts.length > 0 && (
+                              <Typography
+                                variant="body2"
+                                color="text.secondary"
+                                data-testid={`canonical-provider-line-financials-${line.externalLineId}`}
+                                sx={{ mt: 0.5, overflowWrap: 'anywhere' }}
+                              >
+                                {financialFacts.join(' · ')}
+                              </Typography>
+                            )}
+                          </Box>
+                        )
+                      })}
+                    </Stack>
+                  ) : (
+                    <Typography variant="body2" color="text.secondary">
+                      The current sales-channel snapshot contains no items.
+                    </Typography>
+                  )}
+                  {order.providerHistory.events.length > 0 && (
+                    <Box component="details" data-testid="canonical-provider-events">
+                      <Typography component="summary" variant="body2" fontWeight={600} sx={{ cursor: 'pointer' }}>
+                        Sales-channel activity ({order.providerHistory.events.length})
+                      </Typography>
+                      <Stack divider={<Divider flexItem />} sx={{ mt: 0.75 }}>
+                        {order.providerHistory.events.map((event) => {
+                          const eventDetails = [
+                            event.externalSubjectId
+                              ? `Provider reference ${event.externalSubjectId}`
+                              : null,
+                            event.quantity !== null
+                              ? `Quantity ${event.quantity}`
+                              : null,
+                            event.amountMinor !== null && event.currency
+                              ? `Amount ${money(String(event.amountMinor), event.currency)}`
+                              : null,
+                          ].filter((value): value is string => Boolean(value))
+                          return (
+                            <Box key={event.globalId} sx={{ py: 0.75 }}>
+                              <Typography variant="body2" fontWeight={600}>
+                                {displayStatus(event.kind)}
+                                {event.status ? ` · ${displayStatus(event.status)}` : ''}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary" display="block">
+                                {formatUserDateTime(event.occurredAt, dateTime, {
+                                  year: 'numeric',
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                  fallback: 'Unknown',
+                                })}
+                                {event.trackingCarrier ? ` · ${event.trackingCarrier}` : ''}
+                                {event.trackingNumber ? ` · ${event.trackingNumber}` : ''}
+                              </Typography>
+                              {eventDetails.length > 0 && (
+                                <Typography
+                                  variant="caption"
+                                  color="text.secondary"
+                                  display="block"
+                                  data-testid={`canonical-provider-event-details-${event.globalId}`}
+                                  sx={{ overflowWrap: 'anywhere' }}
+                                >
+                                  {eventDetails.join(' · ')}
+                                </Typography>
+                              )}
+                            </Box>
+                          )
+                        })}
+                      </Stack>
                     </Box>
-                    <Box sx={{ textAlign: 'right' }}>
-                      <Typography>{line.quantity} units</Typography>
-                      <Typography variant="caption" color="text.secondary">{line.reservedQuantity} reserved · {displayStatus(line.pickStatus || 'not started')}</Typography>
+                  )}
+                </Stack>
+              </DetailSection>
+            )}
+
+            <DetailSection title={`ClawPilot fulfillment lines (${order.lines.length})`}>
+              {order.lines.length > 0 ? (
+                <Stack divider={<Divider flexItem />}>
+                  {order.lines.map((line) => (
+                    <Box key={line.globalId} sx={{ py: 1.25, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1 }}>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography fontWeight={600}>{line.productName}</Typography>
+                        <Typography variant="caption" color="text.secondary">{line.productGlobalId} · {line.channelSku}</Typography>
+                      </Box>
+                      <Box sx={{ textAlign: 'right' }}>
+                        <Typography>{line.quantity} units</Typography>
+                        <Typography variant="caption" color="text.secondary">{line.reservedQuantity} reserved · {displayStatus(line.pickStatus || 'not started')}</Typography>
+                      </Box>
                     </Box>
-                  </Box>
-                ))}
-              </Stack>
+                  ))}
+                </Stack>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  No ClawPilot fulfillment lines were created for this order.
+                </Typography>
+              )}
             </DetailSection>
 
             <DetailSection title={`Packages (${order.packages.length})`}>
@@ -3895,14 +3954,25 @@ export default function OperationsSection({
   const [view, setView] = useState<OperationsView>(initialView)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<OperationsOrderFilter>('')
-  const [orderSavedView, setOrderSavedView] =
-    useState<OperationsOrderSavedView>('all')
   const [orderSort, setOrderSort] = useState<OperationsOrderSort>('updated_desc')
   const [orderProvider, setOrderProvider] = useState('')
   const [orderTracking, setOrderTracking] =
     useState<OperationsOrderTrackingFilter>('all')
   const [orderDate, setOrderDate] = useState<OperationsOrderDateFilter>('all')
-  const [orderWarehouse, setOrderWarehouse] = useState('')
+  const [orderPageSize, setOrderPageSize] = useState(
+    UNIFIED_ORDER_PAGE_SIZE_DEFAULT,
+  )
+  const [orderPageRows, setOrderPageRows] = useState<
+    OperationsOrderWorkbenchRow[]
+  >([])
+  const [orderPage, setOrderPage] = useState<UnifiedOrderPage | null>(null)
+  const [orderPageLoading, setOrderPageLoading] = useState(false)
+  const [orderPageError, setOrderPageError] = useState('')
+  const [orderPageRefreshRevision, setOrderPageRefreshRevision] = useState(0)
+  const [orderPageNavigation, setOrderPageNavigation] = useState<{
+    queryKey: string
+    cursors: Array<string | null>
+  }>({ queryKey: '', cursors: [null] })
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -3919,10 +3989,12 @@ export default function OperationsSection({
     useRef<PendingImportedOrderSave | null>(null)
   const attemptedImportedDrawerHistoryRefreshes = useRef(new Set<string>())
   const pendingOrderStatusSyncReload = useRef(false)
-  const importedHistoryProgressByOrganization = useRef(
-    new Map<string, ImportedHistoryRefreshProgress>(),
-  )
   const workspaceLoadGeneration = useRef(0)
+  const orderPageLoadGeneration = useRef(0)
+  const orderPageNavigationRollback = useRef<{
+    queryKey: string
+    cursors: Array<string | null>
+  } | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -4153,6 +4225,50 @@ export default function OperationsSection({
     setExceptionDrawerOpen(false)
   }, [initialView])
 
+  const workspaceSearch = view === 'exceptions' ? search.trim() : ''
+
+  const synchronizeImportedOrder = useCallback((
+    previousCandidateGlobalId: string,
+    updated: OperationsImportedOrderWorkingCopy,
+  ) => {
+    setWorkspace((current) => {
+      if (!current) return current
+      let inserted = false
+      const importedOrders = current.importedOrders.flatMap((candidate) => {
+        if (
+          candidate.candidateGlobalId !== previousCandidateGlobalId
+          && candidate.candidateGlobalId !== updated.candidateGlobalId
+        ) return [candidate]
+        if (inserted) return []
+        inserted = true
+        return [updated]
+      })
+      if (!inserted) importedOrders.unshift(updated)
+      return { ...current, importedOrders }
+    })
+    setOrderPageRows((current) => {
+      let replaced = false
+      const rows = current.flatMap((row) => {
+        if (
+          row.kind !== 'imported'
+          || (
+            row.order.candidateGlobalId !== previousCandidateGlobalId
+            && row.order.candidateGlobalId !== updated.candidateGlobalId
+          )
+        ) return [row]
+        if (replaced) return []
+        replaced = true
+        return [{
+          kind: 'imported' as const,
+          key: `imported:${updated.candidateGlobalId}`,
+          order: updated,
+        }]
+      })
+      return replaced ? rows : current
+    })
+    setOrderPageRefreshRevision((current) => current + 1)
+  }, [])
+
   const loadWorkspace = useCallback(async (
     orderGlobalId?: string | null,
     signal?: AbortSignal,
@@ -4162,19 +4278,9 @@ export default function OperationsSection({
     workspaceLoadGeneration.current = loadGeneration
     setLoading(true)
     if (!options?.preserveFeedback) setError('')
-    const workspaceWarnings: string[] = []
-    const orderQuery = {
-      sort: orderSort,
-      provider: orderProvider,
-      tracking: orderTracking,
-      updatedAfter: orderListUpdatedAfter(orderDate),
-    }
     const params = new URLSearchParams()
-    if (search.trim()) params.set('search', search.trim())
-    if (view === 'orders' && status && status !== 'closed_externally') {
-      params.set('status', status)
-    }
-    if (view === 'orders') appendOrderListQuery(params, orderQuery)
+    params.set('includeOrderSummaries', 'false')
+    if (workspaceSearch) params.set('search', workspaceSearch)
     if (view === 'exceptions' && exceptionStatus) params.set('exceptionStatus', exceptionStatus)
     if (orderGlobalId) params.set('order', orderGlobalId)
     try {
@@ -4187,156 +4293,16 @@ export default function OperationsSection({
       if (!validCanonicalOrderPage(payload.operations.orderPage)) {
         throw new Error('Order pagination returned invalid evidence')
       }
-      let operations = payload.operations
-      const importedOrders = [...operations.importedOrders]
-      let importedOrderPage = operations.importedOrderPage
-      if (importedOrderPage.returned !== importedOrders.length) {
+      const operations = payload.operations
+      if (operations.importedOrderPage.returned !== operations.importedOrders.length) {
         throw new Error('Imported-order pagination returned inconsistent evidence')
       }
-      const seenCandidateGlobalIds = new Set(
-        importedOrders.map((order) => order.candidateGlobalId),
-      )
-      const seenCursors = new Set<string>()
-      let pagesLoaded = 1
-      while (
-        view === 'orders'
-        && importedOrderPage.nextCursor
-        && pagesLoaded < MAX_IMPORTED_ORDER_PAGES
-      ) {
-        const cursor = importedOrderPage.nextCursor
-        if (seenCursors.has(cursor)) {
-          throw new Error('Imported-order pagination did not advance')
-        }
-        seenCursors.add(cursor)
-        const workbenchParams = new URLSearchParams({
-          cursor,
-          limit: String(IMPORTED_ORDER_PAGE_SIZE),
-        })
-        if (search.trim()) workbenchParams.set('search', search.trim())
-        appendOrderListQuery(workbenchParams, orderQuery)
-        const pageResponse = await fetch(
-          `/api/operations/order-workbench?${workbenchParams.toString()}`,
-          { cache: 'no-store', signal },
-        )
-        const pagePayload = await pageResponse.json().catch(() => ({})) as
-          ImportedOrderWorkbenchPayload
-        if (
-          !pageResponse.ok
-          || !pagePayload.ok
-          || !Array.isArray(pagePayload.orders)
-          || !validImportedOrderPage(pagePayload.page)
-        ) {
-          throw new Error(
-            pagePayload.error || 'The next imported-order page is unavailable',
-          )
-        }
-        if (pagePayload.page.returned !== pagePayload.orders.length) {
-          throw new Error('Imported-order pagination returned inconsistent evidence')
-        }
-        for (const order of pagePayload.orders) {
-          if (seenCandidateGlobalIds.has(order.candidateGlobalId)) {
-            throw new Error('Imported-order pagination returned a duplicate order')
-          }
-          seenCandidateGlobalIds.add(order.candidateGlobalId)
-          importedOrders.push(order)
-        }
-        importedOrderPage = pagePayload.page
-        pagesLoaded += 1
-      }
-      operations = {
-        ...operations,
-        importedOrders,
-        importedOrderPage: {
-          ...importedOrderPage,
-          total: Math.max(importedOrderPage.total, importedOrders.length),
-          returned: importedOrders.length,
-          complete: importedOrderPage.nextCursor === null,
-          truncated: importedOrderPage.nextCursor !== null,
-        },
-      }
-      if (importedOrderPage.nextCursor) {
-        workspaceWarnings.push(`Loaded ${importedOrders.length} of ${Math.max(
-          importedOrderPage.total,
-          importedOrders.length,
-        )} current provider orders. Refine the order search to load the remaining results safely.`)
-      }
-      const canonicalOrders = [...operations.orders]
-      let orderPage = operations.orderPage
-      if (orderPage.returned !== canonicalOrders.length) {
+      if (operations.orderPage.returned !== operations.orders.length) {
         throw new Error('Order pagination returned inconsistent evidence')
-      }
-      const seenOrderGlobalIds = new Set(
-        canonicalOrders.map((order) => order.globalId),
-      )
-      const seenOrderCursors = new Set<string>()
-      let orderPagesLoaded = 1
-      while (
-        view === 'orders'
-        && orderPage.nextCursor
-        && orderPagesLoaded < MAX_CANONICAL_ORDER_PAGES
-      ) {
-        const cursor = orderPage.nextCursor
-        if (seenOrderCursors.has(cursor)) {
-          throw new Error('Order pagination did not advance')
-        }
-        seenOrderCursors.add(cursor)
-        const orderParams = new URLSearchParams({
-          cursor,
-          limit: String(CANONICAL_ORDER_PAGE_SIZE),
-        })
-        if (search.trim()) orderParams.set('search', search.trim())
-        if (status && status !== 'closed_externally') {
-          orderParams.set('status', status)
-        }
-        appendOrderListQuery(orderParams, orderQuery)
-        const orderResponse = await fetch(
-          `/api/operations/orders?${orderParams.toString()}`,
-          { cache: 'no-store', signal },
-        )
-        const orderPayload = await orderResponse.json().catch(() => ({})) as
-          CanonicalOrderListPayload
-        if (
-          !orderResponse.ok
-          || !orderPayload.ok
-          || !Array.isArray(orderPayload.orders)
-          || !validCanonicalOrderPage(orderPayload.page)
-        ) {
-          throw new Error(orderPayload.error || 'The next order page is unavailable')
-        }
-        if (orderPayload.page.returned !== orderPayload.orders.length) {
-          throw new Error('Order pagination returned inconsistent evidence')
-        }
-        for (const order of orderPayload.orders) {
-          if (seenOrderGlobalIds.has(order.globalId)) {
-            throw new Error('Order pagination returned a duplicate order')
-          }
-          seenOrderGlobalIds.add(order.globalId)
-          canonicalOrders.push(order)
-        }
-        orderPage = orderPayload.page
-        orderPagesLoaded += 1
-      }
-      operations = {
-        ...operations,
-        orders: canonicalOrders,
-        orderPage: {
-          ...orderPage,
-          total: Math.max(orderPage.total, canonicalOrders.length),
-          returned: canonicalOrders.length,
-          complete: orderPage.nextCursor === null,
-          truncated: orderPage.nextCursor !== null,
-        },
-      }
-      if (orderPage.nextCursor) {
-        workspaceWarnings.push(`Loaded ${canonicalOrders.length} of ${Math.max(
-          orderPage.total,
-          canonicalOrders.length,
-        )} canonical orders. Refine the order search to load the remaining results safely.`)
       }
       if (signal?.aborted || loadGeneration !== workspaceLoadGeneration.current) {
         return null
       }
-      if (workspaceWarnings.length) setError(workspaceWarnings.join(' '))
       setWorkspace(operations)
       setCommerceFulfillmentRecoveryEnabled(
         payload.runtime?.commerceFulfillmentRecoveryEnabled === true,
@@ -4352,13 +4318,155 @@ export default function OperationsSection({
     }
   }, [
     exceptionStatus,
+    view,
+    workspaceSearch,
+  ])
+
+  const orderPageUpdatedAfter = orderListUpdatedAfter(orderDate)
+  const orderPageQueryKey = JSON.stringify({
+    organizationId: workspace?.organizationId || '',
+    search: search.trim(),
+    status,
+    sort: orderSort,
+    provider: orderProvider,
+    tracking: orderTracking,
+    updatedAfter: orderPageUpdatedAfter,
+    pageSize: orderPageSize,
+  })
+  const activeOrderPageNavigation = orderPageNavigation.queryKey
+    === orderPageQueryKey
+    ? orderPageNavigation
+    : { queryKey: orderPageQueryKey, cursors: [null] }
+  const activeOrderPageCursor = activeOrderPageNavigation.cursors.at(-1) || null
+  const orderPageOrganizationId = workspace?.organizationId || ''
+
+  useEffect(() => {
+    orderPageNavigationRollback.current = null
+    setOrderPageNavigation({
+      queryKey: orderPageQueryKey,
+      cursors: [null],
+    })
+    setOrderPageRows([])
+    setOrderPage(null)
+    setOrderPageError('')
+  }, [orderPageQueryKey])
+
+  useEffect(() => {
+    if (
+      view !== 'orders'
+      || !orderPageOrganizationId
+      || orderPageNavigation.queryKey !== orderPageQueryKey
+    ) return
+    const requestGeneration = orderPageLoadGeneration.current + 1
+    orderPageLoadGeneration.current = requestGeneration
+    const controller = new AbortController()
+    const timer = window.setTimeout(async () => {
+      setOrderPageLoading(true)
+      setOrderPageError('')
+      try {
+        const params = new URLSearchParams({
+          organizationId: orderPageOrganizationId,
+          pageSize: String(orderPageSize),
+        })
+        if (search.trim()) params.set('search', search.trim())
+        if (status) params.set('status', status)
+        appendOrderListQuery(params, {
+          sort: orderSort,
+          provider: orderProvider,
+          tracking: orderTracking,
+          updatedAfter: orderPageUpdatedAfter,
+        })
+        if (activeOrderPageCursor) params.set('cursor', activeOrderPageCursor)
+        const response = await fetch(
+          `/api/operations/orders/unified?${params.toString()}`,
+          { cache: 'no-store', signal: controller.signal },
+        )
+        const payload = await response.json().catch(() => ({})) as
+          UnifiedOrderPagePayload
+        if (
+          response.status === 409
+          && payload.code === 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED'
+        ) {
+          if (
+            controller.signal.aborted
+            || requestGeneration !== orderPageLoadGeneration.current
+          ) return
+          orderPageNavigationRollback.current = null
+          setOrderPageNavigation({
+            queryKey: orderPageQueryKey,
+            cursors: [null],
+          })
+          setOrderPageRows([])
+          setOrderPage(null)
+          setOrderPageError('')
+          setNotice(
+            'Orders changed while you were paging. Returned to the first page.',
+          )
+          return
+        }
+        if (
+          !response.ok
+          || !payload.ok
+          || !Array.isArray(payload.rows)
+          || !validUnifiedOrderPage(payload.page)
+        ) {
+          throw new Error(
+            `${payload.error || 'The requested order page is unavailable'}${
+              payload.code ? ` [${payload.code}]` : ''
+            }`,
+          )
+        }
+        if (payload.page.returned !== payload.rows.length) {
+          throw new Error('Order pagination returned inconsistent evidence')
+        }
+        const rowKeys = new Set(payload.rows.map((row) => row.key))
+        if (rowKeys.size !== payload.rows.length) {
+          throw new Error('Order pagination returned a duplicate order')
+        }
+        if (
+          controller.signal.aborted
+          || requestGeneration !== orderPageLoadGeneration.current
+        ) return
+        orderPageNavigationRollback.current = null
+        setOrderPageRows(payload.rows)
+        setOrderPage(payload.page)
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === 'AbortError') return
+        if (requestGeneration !== orderPageLoadGeneration.current) return
+        const rollback = orderPageNavigationRollback.current
+        if (rollback?.queryKey === orderPageQueryKey) {
+          orderPageNavigationRollback.current = null
+          setOrderPageNavigation(rollback)
+        }
+        setOrderPageError(caught instanceof Error
+          ? caught.message
+          : 'The requested order page is unavailable')
+      } finally {
+        if (requestGeneration === orderPageLoadGeneration.current) {
+          setOrderPageLoading(false)
+        }
+      }
+    }, search.trim() ? 250 : 0)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [
+    activeOrderPageCursor,
     orderDate,
+    orderPageQueryKey,
+    orderPageOrganizationId,
+    orderPageNavigation.queryKey,
+    orderPageRefreshRevision,
+    orderPageSize,
+    orderPageUpdatedAfter,
     orderProvider,
     orderSort,
     orderTracking,
     search,
     status,
     view,
+    workspace?.generatedAt,
   ])
 
   const refreshOrders = useCallback(async () => {
@@ -4383,15 +4491,74 @@ export default function OperationsSection({
       canonicalOrdersCreated: 0,
     }
     const discoveryFailures: string[] = []
-    const importedHistoryFailures: string[] = []
-    let importedHistoryBatch: ImportedOrderHistoryRefreshBatchResult | null = null
     const checkedOrderGlobalIds = new Set<string>()
-    let remainingEligible = 0
+    const successfullyCheckedOrderGlobalIds = new Set<string>()
     const totals = {
       attempted: 0,
       refreshed: 0,
       changed: 0,
       failed: 0,
+    }
+    const historyResults: OrderHistorySyncResult[] = []
+    const historyFailures: string[] = []
+    let reconciliationSchedule:
+      | NonNullable<OrderReconciliationSchedulePayload['result']>
+      | null = null
+    const reconciliationScheduleFailures: string[] = []
+    const visibleOrderKeys = [...new Set(orderPageRows.map((row) => row.key))]
+      .slice(0, UNIFIED_ORDER_PAGE_SIZE_MAX)
+    const visibleCanonicalOrderGlobalIds = [...new Set(orderPageRows.flatMap(
+      (row) => row.kind === 'canonical' ? [row.order.globalId] : [],
+    ))].slice(0, UNIFIED_ORDER_PAGE_SIZE_MAX)
+    const runOrderStatusSyncBatch = async (
+      orderGlobalIds: readonly string[],
+    ): Promise<OrderStatusSyncResult> => {
+      const response = await fetch('/api/operations/order-status-sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-order-status-sync:${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          excludeOrderGlobalIds: [...checkedOrderGlobalIds],
+          orderGlobalIds,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        OrderStatusSyncPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        throw new Error(
+          `${payload.error || 'Sales-channel order status could not be synchronized'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      const result = payload.result
+      if (
+        result.providerWrites !== 0
+        || result.canonicalOrderWrites !== 0
+        || result.counts.selected !== result.outcomes.length
+      ) {
+        throw new Error('Sales-channel order status sync returned invalid evidence')
+      }
+      const priorChecked = checkedOrderGlobalIds.size
+      for (const outcome of result.outcomes) {
+        checkedOrderGlobalIds.add(outcome.orderGlobalId)
+        if (outcome.outcome !== 'failed') {
+          successfullyCheckedOrderGlobalIds.add(outcome.orderGlobalId)
+        }
+      }
+      if (
+        result.counts.selected > 0
+        && checkedOrderGlobalIds.size === priorChecked
+      ) {
+        throw new Error('Sales-channel order status sync did not advance')
+      }
+      totals.attempted += result.counts.attempted
+      totals.refreshed += result.counts.refreshed
+      totals.changed += result.counts.changed
+      totals.failed += result.counts.failed
+      return result
     }
     try {
       for (const account of discoveryAccounts) {
@@ -4399,7 +4566,6 @@ export default function OperationsSection({
         try {
           let accountComplete = false
           let accountPollTimedOut = false
-          let runningPolls = 0
           for (
             let invocation = 0;
             invocation < MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT;
@@ -4465,18 +4631,9 @@ export default function OperationsSection({
               result.refresh.claimed === 0
               && result.refresh.status === 'running'
             ) {
-              if (
-                runningPolls
-                >= ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS.length
-              ) {
-                accountPollTimedOut = true
-                break
-              }
-              await waitForOrderDiscoveryPoll(runningPolls)
-              runningPolls += 1
-              continue
+              accountPollTimedOut = true
+              break
             }
-            runningPolls = 0
             discoveryTotals.providerRowsSeen += result.counts.providerRowsSeen
             discoveryTotals.eligibleOrdersSeen += result.counts.eligibleOrdersSeen
             discoveryTotals.ordersStaged += result.counts.ordersStaged
@@ -4496,7 +4653,7 @@ export default function OperationsSection({
           } else if (accountPollTimedOut) {
             discoveryTotals.accountsInProgress += 1
             discoveryFailures.push(
-              `${account.displayName} is still refreshing after the bounded wait. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.`,
+              `${account.displayName} is already refreshing. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.`,
             )
           } else {
             discoveryTotals.accountsContinuing += 1
@@ -4513,128 +4670,109 @@ export default function OperationsSection({
       if (discoveryTotals.accountsAttempted > 0) {
         pendingOrderStatusSyncReload.current = true
       }
-      while (checkedOrderGlobalIds.size < MAX_ORDER_STATUS_SYNC_ORDERS) {
-        const response = await fetch('/api/operations/order-status-sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Idempotency-Key': `operations-order-status-sync:${crypto.randomUUID()}`,
+      if (visibleOrderKeys.length > 0) {
+        try {
+          const historyRounds = Math.ceil(
+            visibleOrderKeys.length / ORDER_HISTORY_BATCH_LIMIT,
+          )
+          for (let round = 0; round < historyRounds; round += 1) {
+            const response = await fetch('/api/operations/order-history-sync', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': `operations-order-history-sync:${crypto.randomUUID()}`,
+              },
+              body: JSON.stringify({ orderKeys: visibleOrderKeys }),
+            })
+            const payload = await response.json().catch(() => ({})) as
+              OrderHistorySyncPayload
+            if (!response.ok || !payload.ok || !payload.result) {
+              throw new Error(
+                `${payload.error || 'Current sales-channel order details could not be refreshed'}${
+                  payload.code ? ` [${payload.code}]` : ''
+                }`,
+              )
+            }
+            if (!validOrderHistorySyncResult(payload.result)) {
+              throw new Error(
+                'Current sales-channel order detail refresh returned invalid evidence',
+              )
+            }
+            historyResults.push(payload.result)
+            if (payload.result.counts.attempted > 0) {
+              pendingOrderStatusSyncReload.current = true
+            }
+            if (
+              payload.result.counts.selected === 0
+              || payload.result.remaining === 0
+            ) break
+          }
+        } catch (caught) {
+          historyFailures.push(caught instanceof Error
+            ? caught.message
+            : 'Current sales-channel order details could not be refreshed')
+        }
+      }
+      if (visibleCanonicalOrderGlobalIds.length > 0) {
+        const visibleStatusRounds = Math.ceil(
+          visibleCanonicalOrderGlobalIds.length / ORDER_HISTORY_BATCH_LIMIT,
+        )
+        for (let round = 0; round < visibleStatusRounds; round += 1) {
+          const result = await runOrderStatusSyncBatch(
+            visibleCanonicalOrderGlobalIds,
+          )
+          const targetedRemaining = Math.max(
+            0,
+            result.totalEligible - result.counts.selected,
+          )
+          if (result.counts.selected === 0 || targetedRemaining === 0) break
+        }
+      }
+      // Finish the visible exact checks before making the remaining durable
+      // targets due. Otherwise an automatic worker can lease a visible target
+      // between scheduling and this click's manager-authorized exact refresh.
+      const successfullyCheckedVisibleCanonicalOrderGlobalIds =
+        visibleCanonicalOrderGlobalIds.filter((orderGlobalId) => (
+          successfullyCheckedOrderGlobalIds.has(orderGlobalId)
+        ))
+      try {
+        const response = await fetch(
+          '/api/operations/order-reconciliation-schedule',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key':
+                `operations-order-reconciliation:${crypto.randomUUID()}`,
+            },
+            body: JSON.stringify({
+              excludeOrderGlobalIds:
+                successfullyCheckedVisibleCanonicalOrderGlobalIds,
+            }),
           },
-          body: JSON.stringify({
-            excludeOrderGlobalIds: [...checkedOrderGlobalIds],
-          }),
-        })
+        )
         const payload = await response.json().catch(() => ({})) as
-          OrderStatusSyncPayload
-        if (!response.ok || !payload.ok || !payload.result) {
+          OrderReconciliationSchedulePayload
+        const result = payload.result
+        if (!response.ok || !payload.ok || !result) {
           throw new Error(
-            `${payload.error || 'Sales-channel order status could not be synchronized'}${
+            `${payload.error || 'Historical sales-channel orders could not be queued for refresh'}${
               payload.code ? ` [${payload.code}]` : ''
             }`,
           )
         }
-        const result = payload.result
-        if (
-          result.providerWrites !== 0
-          || result.canonicalOrderWrites !== 0
-          || result.counts.selected !== result.outcomes.length
-        ) {
-          throw new Error('Sales-channel order status sync returned invalid evidence')
+        if (!validOrderReconciliationScheduleResult(result)) {
+          throw new Error(
+            'Historical sales-channel order refresh returned invalid evidence',
+          )
         }
-        const priorChecked = checkedOrderGlobalIds.size
-        for (const outcome of result.outcomes) {
-          checkedOrderGlobalIds.add(outcome.orderGlobalId)
-        }
-        if (
-          result.counts.selected > 0
-          && checkedOrderGlobalIds.size === priorChecked
-        ) {
-          throw new Error('Sales-channel order status sync did not advance')
-        }
-        totals.attempted += result.counts.attempted
-        totals.refreshed += result.counts.refreshed
-        totals.changed += result.counts.changed
-        totals.failed += result.counts.failed
-        remainingEligible = Math.max(
-          0,
-          result.totalEligible - result.counts.selected,
-        )
-        if (result.counts.selected === 0 || remainingEligible === 0) break
+        reconciliationSchedule = result
+      } catch (caught) {
+        reconciliationScheduleFailures.push(caught instanceof Error
+          ? caught.message
+          : 'Historical sales-channel orders could not be queued for refresh')
       }
       if (totals.attempted > 0) pendingOrderStatusSyncReload.current = true
-      try {
-        const organizationId = workspace?.organizationId
-        if (!organizationId) {
-          throw new Error('Shopify order details could not be refreshed')
-        }
-        const now = Date.now()
-        const storedProgress = readImportedHistoryRefreshProgress(
-          organizationId,
-          now,
-        )
-        const memoryProgress = importedHistoryProgressByOrganization.current
-          .get(organizationId)
-        const availableProgress = storedProgress || (
-          memoryProgress
-          && now - memoryProgress.updatedAt
-            <= IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS
-            ? memoryProgress
-            : null
-        )
-        const refreshEpoch = importedHistoryRefreshEpoch(now)
-        const progress = availableProgress?.refreshEpoch === refreshEpoch
-          ? availableProgress
-          : null
-        importedHistoryBatch = await refreshImportedShopifyHistoryBatch({
-          organizationId,
-          attemptedRevisionKeys: new Set(
-            progress?.attemptedRevisionKeys || [],
-          ),
-          cycle: progress?.cycle || 0,
-          now,
-        })
-        const nextProgress: ImportedHistoryRefreshProgress = {
-          version: 2,
-          updatedAt: now,
-          refreshEpoch,
-          cycle: importedHistoryBatch.progressCycle,
-          attemptedRevisionKeys: importedHistoryBatch.progressRevisionKeys,
-        }
-        importedHistoryProgressByOrganization.current.set(
-          organizationId,
-          nextProgress,
-        )
-        writeImportedHistoryRefreshProgress(organizationId, nextProgress)
-        if (importedHistoryBatch.eligible > 0) {
-          pendingOrderStatusSyncReload.current = true
-        }
-        if (importedHistoryBatch.conflicts > 0) {
-          importedHistoryFailures.push(
-            `${importedHistoryBatch.conflicts} imported Shopify ${
-              importedHistoryBatch.conflicts === 1 ? 'order needs' : 'orders need'
-            } review because provider and saved order details changed together.`,
-          )
-        }
-        if (importedHistoryBatch.failed > 0) {
-          importedHistoryFailures.push(
-            `${importedHistoryBatch.failed} Shopify ${
-              importedHistoryBatch.failed === 1
-                ? 'order could not be updated'
-                : 'orders could not be updated'
-            }. ${importedHistoryBatch.failureMessages.slice(0, 3).join('; ')}${
-              importedHistoryBatch.failureMessages.length > 3
-                ? `; and ${importedHistoryBatch.failureMessages.length - 3} more`
-                : ''
-            }`,
-          )
-        }
-      } catch (caught) {
-        importedHistoryFailures.push(
-          caught instanceof Error
-            ? caught.message
-            : 'Imported Shopify orders could not be loaded for history refresh',
-        )
-      }
       const discoverySummary = discoveryTotals.accountsAttempted > 0
         ? `Checked ${discoveryTotals.accountsCompleted} of ${
             discoveryTotals.accountsAttempted
@@ -4645,7 +4783,7 @@ export default function OperationsSection({
           }.${discoveryTotals.accountsInProgress > 0
             ? ` ${discoveryTotals.accountsInProgress} ${
                 discoveryTotals.accountsInProgress === 1 ? 'store is' : 'stores are'
-              } still refreshing after the bounded wait.`
+              } already refreshing.`
             : ''}${discoveryTotals.accountsContinuing > 0
             ? ` ${discoveryTotals.accountsContinuing} ${
                 discoveryTotals.accountsContinuing === 1
@@ -4655,8 +4793,8 @@ export default function OperationsSection({
             : ''}`
         : 'No running connected stores were available for order discovery.'
       const statusSummary = totals.attempted === 0
-        ? 'No existing orders were ready for an exact status check.'
-        : `Checked ${totals.attempted} existing sales-channel ${
+        ? 'Visible canonical status: no orders were ready for an exact check.'
+        : `Visible canonical status: checked ${totals.attempted} sales-channel ${
             totals.attempted === 1 ? 'order' : 'orders'
           }. ${
             totals.changed === 0
@@ -4664,45 +4802,111 @@ export default function OperationsSection({
               : `${totals.changed} provider status ${
                   totals.changed === 1 ? 'change was' : 'changes were'
                 } detected.`
-          }${remainingEligible > 0
-            ? ` ${remainingEligible} eligible ${
-                remainingEligible === 1 ? 'order remains' : 'orders remain'
-              }; refresh again to check the next group.`
-            : ''}`
-      const importedHistorySummary = importedHistoryBatch
-        && importedHistoryBatch.eligible > 0
-        ? ` ${importedHistoryBatch.captured > 0
-            ? `Updated Shopify details for ${importedHistoryBatch.captured} ${
-                importedHistoryBatch.captured === 1 ? 'order' : 'orders'
-              }.`
-            : 'No Shopify order details were updated.'}${
-            importedHistoryBatch.unavailable > 0
-            ? ` ${importedHistoryBatch.unavailable} Shopify ${
-                importedHistoryBatch.unavailable === 1
-                  ? 'order could not be loaded and can be retried'
-                  : 'orders could not be loaded and can be retried'
-              }.`
-            : ''}${importedHistoryBatch.conflicts > 0
-            ? ` ${importedHistoryBatch.conflicts} ${
-                importedHistoryBatch.conflicts === 1 ? 'order needs' : 'orders need'
-              } conflict review.`
-            : ''}${importedHistoryBatch.failed > 0
-            ? ` ${importedHistoryBatch.failed} ${
-                importedHistoryBatch.failed === 1
-                  ? 'order could not be updated'
-                  : 'orders could not be updated'
-              }.`
-            : ''}${importedHistoryBatch.remaining > 0
-            ? ` ${importedHistoryBatch.remaining} more ${
-                importedHistoryBatch.remaining === 1 ? 'order remains' : 'orders remain'
-              }; refresh again to continue.`
-            : ''}`
-        : ''
-      setNotice(`${discoverySummary} ${statusSummary}${importedHistorySummary}`)
+          }`
+      const historyTotals = historyResults.reduce((total, result) => ({
+        attempted: total.attempted + result.counts.attempted,
+        refreshed: total.refreshed + result.counts.refreshed,
+        changed: total.changed + result.counts.changed,
+        unavailable: total.unavailable + result.counts.unavailable,
+      }), { attempted: 0, refreshed: 0, changed: 0, unavailable: 0 })
+      const historyRemaining = historyResults.at(-1)?.remaining || 0
+      const historySummary = historyResults.length === 0
+        ? 'Visible provider history: current line and tracking details were not refreshed.'
+        : historyTotals.attempted === 0
+          ? 'Visible provider history: no orders were stale enough for an exact detail refresh.'
+          : `Visible provider history: refreshed current line, tracking, and fulfillment evidence for ${
+              historyTotals.refreshed
+            } of ${historyTotals.attempted} visible sales-channel ${
+              historyTotals.attempted === 1 ? 'order' : 'orders'
+            }. ${historyTotals.changed === 0
+              ? 'No detail changes were detected.'
+              : `${historyTotals.changed} ${
+                  historyTotals.changed === 1 ? 'order had' : 'orders had'
+                } updated evidence.`
+            }${historyRemaining > 0
+              ? ` ${historyRemaining} visible ${
+                  historyRemaining === 1
+                    ? 'order history remains'
+                    : 'order histories remain'
+                }; refresh again to continue.`
+              : ''}`
+      const providerHistoryScheduleSummary = !reconciliationSchedule
+        ? 'Connected-store provider history: background refresh was not scheduled.'
+        : reconciliationSchedule.providerHistory.totalEligibleAccounts === 0
+          ? 'Connected-store provider history: no eligible stores needed a background scan.'
+          : `Connected-store provider history: scheduled background scans for ${
+              reconciliationSchedule.providerHistory.scheduledAccounts
+            } of ${
+              reconciliationSchedule.providerHistory.totalEligibleAccounts
+            } eligible ${
+              reconciliationSchedule.providerHistory.totalEligibleAccounts === 1
+                ? 'store'
+                : 'stores'
+            }.${
+              reconciliationSchedule.providerHistory.alreadyScheduledAccounts > 0
+                ? ` ${
+                    reconciliationSchedule.providerHistory.alreadyScheduledAccounts
+                  } ${
+                    reconciliationSchedule.providerHistory.alreadyScheduledAccounts === 1
+                      ? 'store was'
+                      : 'stores were'
+                  } already queued or in progress.`
+                : ''
+            }${
+              reconciliationSchedule.providerHistory.deferredAccounts > 0
+                ? ` ${
+                    reconciliationSchedule.providerHistory.deferredAccounts
+                  } ${
+                    reconciliationSchedule.providerHistory.deferredAccounts === 1
+                      ? 'store will begin its full-history scan'
+                      : 'stores will begin their full-history scans'
+                  } automatically after the current provider poll finishes.`
+                : ''
+            }`
+      const reconciliationSummary = !reconciliationSchedule
+        ? 'Background canonical status: exact checks were not queued.'
+        : reconciliationSchedule.totalEligible === 0
+          ? 'Background canonical status: no additional orders were eligible for refresh.'
+          : `Background canonical status: queued ${reconciliationSchedule.scheduled} active ClawPilot ${
+              reconciliationSchedule.scheduled === 1 ? 'order' : 'orders'
+            } for an exact background status check.${
+              reconciliationSchedule.alreadyScheduled > 0
+                ? ` ${reconciliationSchedule.alreadyScheduled} ${
+                    reconciliationSchedule.alreadyScheduled === 1
+                      ? 'order was'
+                      : 'orders were'
+                  } already queued or in progress.`
+                : ''
+            }`
+      setNotice(
+        `${discoverySummary} ${historySummary} ${statusSummary} ${providerHistoryScheduleSummary} ${reconciliationSummary}`,
+      )
       const failureMessages = [
         ...discoveryFailures,
-        ...importedHistoryFailures,
+        ...historyFailures,
+        ...reconciliationScheduleFailures,
       ]
+      if (historyTotals.unavailable > 0) {
+        const historyOutcomes = historyResults.flatMap((result) => result.outcomes)
+        const terminalUnsupported = historyOutcomes.filter((outcome) => (
+          outcome.terminalUnsupported
+        )).length
+        const retryable = historyTotals.unavailable - terminalUnsupported
+        if (retryable > 0) {
+          failureMessages.push(
+            `${retryable} existing sales-channel ${
+              retryable === 1 ? 'order' : 'orders'
+            } could not return current line and tracking details. Refresh again to retry later.`,
+          )
+        }
+        if (terminalUnsupported > 0) {
+          failureMessages.push(
+            `${terminalUnsupported} terminal sales-channel ${
+              terminalUnsupported === 1 ? 'order is' : 'orders are'
+            } no longer exposed by the provider; ClawPilot retained the evidence already on file.`,
+          )
+        }
+      }
       if (totals.failed > 0) {
         failureMessages.push(
           `${totals.failed} existing sales-channel ${
@@ -4723,11 +4927,12 @@ export default function OperationsSection({
     } finally {
       setSyncingOrderStatus(false)
     }
-  }, [workspace?.organizationId, workspace?.storeSync])
+  }, [orderPageRows, workspace?.storeSync])
 
   useEffect(() => {
     if (syncingOrderStatus || !pendingOrderStatusSyncReload.current) return
     pendingOrderStatusSyncReload.current = false
+    setOrderPageRefreshRevision((current) => current + 1)
     void loadWorkspace(selectedGlobalId, undefined, { preserveFeedback: true })
   }, [loadWorkspace, selectedGlobalId, syncingOrderStatus])
 
@@ -4766,21 +4971,29 @@ export default function OperationsSection({
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       void loadWorkspace(selectedGlobalId, controller.signal)
-    }, search ? 250 : 0)
+    }, workspaceSearch ? 250 : 0)
     return () => {
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [loadWorkspace, search, selectedGlobalId])
+  }, [loadWorkspace, selectedGlobalId, workspaceSearch])
+
+  const importedDrawerOrders = workspace?.importedOrders
+  const importedDrawerCanManage = workspace?.capabilities.canManage === true
 
   useEffect(() => {
-    if (!importedDrawerOpen || !selectedImportedGlobalId) return
-    const selected = workspace?.importedOrders.find((order) => (
+    if (
+      !importedDrawerOpen
+      || !selectedImportedGlobalId
+      || !importedDrawerOrders
+    ) return
+    const selected = importedDrawerOrders.find((order) => (
       order.candidateGlobalId === selectedImportedGlobalId
     ))
-    if (!selected || savingImportedOrder || refreshingImportedOrder) return
+    if (savingImportedOrder || refreshingImportedOrder) return
     const now = Date.now()
-    const automaticHistoryKey = workspace?.capabilities.canManage === true
+    const automaticHistoryKey = selected
+      && importedDrawerCanManage
       && importedOrderCanAutoRefreshDrawerHistory(selected, now)
       ? importedDrawerHistoryIdempotencyKey(selected, now)
       : null
@@ -4790,13 +5003,22 @@ export default function OperationsSection({
         automaticHistoryKey,
       ),
     )
-    if (!shouldAutoRefreshHistory && selected.resolutionDetailsLoaded) return
+    if (
+      selected
+      && !shouldAutoRefreshHistory
+      && selected.resolutionDetailsLoaded
+    ) return
+    const originalCandidateGlobalId = selected?.candidateGlobalId
+      || selectedImportedGlobalId
+    const providerLabel = selected
+      ? displayStatus(selected.provider)
+      : 'sales-channel'
     const controller = new AbortController()
     const loadDetails = async () => {
       let detailed: OperationsImportedOrderWorkingCopy | null = null
       let automaticHistoryError = ''
       try {
-        if (shouldAutoRefreshHistory && automaticHistoryKey) {
+        if (selected && shouldAutoRefreshHistory && automaticHistoryKey) {
           attemptedImportedDrawerHistoryRefreshes.current.add(
             automaticHistoryKey,
           )
@@ -4841,7 +5063,7 @@ export default function OperationsSection({
               )
             ) {
               throw new Error(
-                `${refreshPayload.error || 'Shopify order details could not be refreshed'}${
+                `${refreshPayload.error || `${providerLabel} order details could not be refreshed`}${
                   refreshPayload.code ? ` [${refreshPayload.code}]` : ''
                 }`,
               )
@@ -4849,7 +5071,7 @@ export default function OperationsSection({
             detailed = refreshPayload.order
             if (historyRefresh.status === 'unavailable') {
               automaticHistoryError =
-                `Stored order details are shown. Current Shopify history could not be loaded${
+                `Stored order details are shown. Current ${providerLabel} history could not be loaded${
                   historyRefresh.code ? ` [${historyRefresh.code}]` : ''
                 }.`
             }
@@ -4859,13 +5081,13 @@ export default function OperationsSection({
             }
             automaticHistoryError = caught instanceof Error
               ? caught.message
-              : 'Shopify order details could not be refreshed'
+              : `${providerLabel} order details could not be refreshed`
           }
         }
         if (!detailed || !detailed.resolutionDetailsLoaded) {
           const params = new URLSearchParams({
             candidate: detailed?.candidateGlobalId
-              || selected.candidateGlobalId,
+              || originalCandidateGlobalId,
           })
           const response = await fetch(
             `/api/operations/order-workbench?${params.toString()}`,
@@ -4881,27 +5103,8 @@ export default function OperationsSection({
           }
         }
         const refreshedCandidateGlobalId = detailed.candidateGlobalId
-        setWorkspace((current) => {
-          if (!current) return current
-          let inserted = false
-          const importedOrders = current.importedOrders.flatMap((order) => {
-            if (
-              order.candidateGlobalId !== selected.candidateGlobalId
-              && order.candidateGlobalId !== refreshedCandidateGlobalId
-            ) {
-              return [order]
-            }
-            if (inserted) return []
-            inserted = true
-            return [detailed!]
-          })
-          if (!inserted) importedOrders.unshift(detailed!)
-          return {
-            ...current,
-            importedOrders,
-          }
-        })
-        if (refreshedCandidateGlobalId !== selected.candidateGlobalId) {
+        synchronizeImportedOrder(originalCandidateGlobalId, detailed)
+        if (refreshedCandidateGlobalId !== originalCandidateGlobalId) {
           setSelectedImportedGlobalId(refreshedCandidateGlobalId)
           const nextUrl = new URL(window.location.href)
           nextUrl.searchParams.set(
@@ -4932,8 +5135,9 @@ export default function OperationsSection({
     refreshingImportedOrder,
     savingImportedOrder,
     selectedImportedGlobalId,
-    workspace?.capabilities.canManage,
-    workspace?.importedOrders,
+    importedDrawerCanManage,
+    importedDrawerOrders,
+    synchronizeImportedOrder,
   ])
 
   const chooseOrder = (order: OperationsOrderListItem) => {
@@ -4945,8 +5149,15 @@ export default function OperationsSection({
   }
 
   const chooseImportedOrder = (order: OperationsImportedOrderWorkingCopy) => {
-    setSearch('')
-    setStatus('')
+    setWorkspace((current) => current ? {
+      ...current,
+      importedOrders: [
+        order,
+        ...current.importedOrders.filter((candidate) => (
+          candidate.candidateGlobalId !== order.candidateGlobalId
+        )),
+      ],
+    } : current)
     setSelectedGlobalId(null)
     setDrawerOpen(false)
     setSelectedImportedGlobalId(order.candidateGlobalId)
@@ -4990,8 +5201,6 @@ export default function OperationsSection({
     setImportedDrawerOpen(false)
     setSelectedImportedGlobalId(null)
     setImportedOrderError('')
-    setSearch('')
-    setStatus('')
     const nextUrl = new URL(window.location.href)
     nextUrl.searchParams.set(
       OPERATIONS_ORDER_QUERY,
@@ -5060,14 +5269,7 @@ export default function OperationsSection({
         throw new Error('Saved order could not be reloaded')
       }
       const savedOrder = payload.order
-      setWorkspace((current) => current ? {
-        ...current,
-        importedOrders: current.importedOrders.map((candidate) => (
-          candidate.candidateGlobalId === savedOrder.candidateGlobalId
-            ? savedOrder
-            : candidate
-        )),
-      } : current)
+      synchronizeImportedOrder(order.candidateGlobalId, savedOrder)
       setNotice(`Order ${savedOrder.orderNumber} saved locally`)
     } catch (caught) {
       setImportedOrderError(caught instanceof Error
@@ -5130,14 +5332,7 @@ export default function OperationsSection({
         throw new Error('Imported order result could not be reloaded')
       }
       const retainedOrder = payload.order
-      setWorkspace((current) => current ? {
-        ...current,
-        importedOrders: current.importedOrders.map((candidate) => (
-          candidate.candidateGlobalId === retainedOrder.candidateGlobalId
-            ? retainedOrder
-            : candidate
-        )),
-      } : current)
+      synchronizeImportedOrder(order.candidateGlobalId, retainedOrder)
       setNotice(`Order ${retainedOrder.orderNumber} still needs information`)
     } catch (caught) {
       setImportedOrderError(caught instanceof Error
@@ -5232,21 +5427,7 @@ export default function OperationsSection({
       }
       pendingRef.current = null
       const refreshed = payload.order
-      setWorkspace((current) => {
-        if (!current) return current
-        let inserted = false
-        const importedOrders = current.importedOrders.flatMap((candidate) => {
-          if (
-            candidate.candidateGlobalId !== order.candidateGlobalId
-            && candidate.candidateGlobalId !== refreshed.candidateGlobalId
-          ) return [candidate]
-          if (inserted) return []
-          inserted = true
-          return [refreshed]
-        })
-        if (!inserted) importedOrders.unshift(refreshed)
-        return { ...current, importedOrders }
-      })
+      synchronizeImportedOrder(order.candidateGlobalId, refreshed)
       setSelectedImportedGlobalId(refreshed.candidateGlobalId)
       const nextUrl = new URL(window.location.href)
       nextUrl.searchParams.set(
@@ -5256,9 +5437,9 @@ export default function OperationsSection({
       window.history.replaceState(window.history.state, '', nextUrl)
       setNotice(
         payload.historyRefresh?.status === 'unavailable'
-          ? `Order ${refreshed.orderNumber} refreshed; Shopify details could not be loaded and can be retried`
+          ? `Order ${refreshed.orderNumber} refreshed; ${displayStatus(refreshed.provider)} details could not be loaded and can be retried`
           : payload.historyRefresh?.status === 'captured'
-            ? `Order ${refreshed.orderNumber} refreshed from Shopify`
+            ? `Order ${refreshed.orderNumber} refreshed from ${displayStatus(refreshed.provider)}`
             : payload.refreshResult.status === 'rebased'
           ? payload.refreshResult.preservedLineDrafts.length
             ? `Order ${refreshed.orderNumber} refreshed; saved item matches were preserved`
@@ -5357,7 +5538,6 @@ export default function OperationsSection({
     window.history.replaceState(window.history.state, '', nextUrl)
     if (view === 'orders') {
       setSearch('')
-      setStatus('')
       setSelectedGlobalId(orderGlobalId)
       setDrawerOpen(true)
       return
@@ -5369,12 +5549,10 @@ export default function OperationsSection({
     setView('orders')
     setSearch('')
     setStatus('')
-    setOrderSavedView('all')
     setOrderSort('updated_desc')
     setOrderProvider('')
     setOrderTracking('all')
     setOrderDate('all')
-    setOrderWarehouse('')
     closeDrawer()
     closeExceptionDrawer()
     setImportedDrawerOpen(false)
@@ -8173,7 +8351,6 @@ export default function OperationsSection({
   }) => {
     setView('orders')
     setSearch('')
-    setStatus('')
     setImportedDrawerOpen(false)
     setSelectedImportedGlobalId(null)
     setImportedOrderError('')
@@ -8198,45 +8375,7 @@ export default function OperationsSection({
   const importedDetail = workspace?.importedOrders.find(
     (order) => order.candidateGlobalId === selectedImportedGlobalId,
   ) || null
-  const orderRows = useMemo(() => operationsOrderWorkbenchRows({
-    imported: workspace?.importedOrders || [],
-    canonical: workspace?.orders || [],
-  }), [workspace])
-  const orderWarehouses = useMemo(() => Array.from(new Set([
-    ...orderRows
-      .filter((row) => row.kind === 'canonical' && row.order.warehouseName)
-      .map((row) => row.kind === 'canonical' ? row.order.warehouseName || '' : '')
-      .filter(Boolean),
-    ...(orderWarehouse ? [orderWarehouse] : []),
-  ])).sort((left, right) => left.localeCompare(right)), [
-    orderRows,
-    orderWarehouse,
-  ])
-  const filteredOrderRows = useMemo(() => filterAndSortOperationsOrderRows({
-    rows: orderRows,
-    view: 'all',
-    sort: orderSort,
-    provider: orderProvider,
-    tracking: orderTracking,
-    date: orderDate,
-    warehouse: orderWarehouse,
-    status,
-  }), [
-    orderDate,
-    orderProvider,
-    orderRows,
-    orderSort,
-    orderTracking,
-    orderWarehouse,
-    status,
-  ])
-  const orderSavedViewCounts = useMemo(
-    () => operationsOrderSavedViewCounts(filteredOrderRows),
-    [filteredOrderRows],
-  )
-  const visibleOrderRows = useMemo(() => filteredOrderRows.filter((row) => (
-    operationsOrderRowMatchesSavedView(row, orderSavedView)
-  )), [filteredOrderRows, orderSavedView])
+  const visibleOrderRows = orderPageRows
   const visibleOrderCount = visibleOrderRows.length
   const orderFiltersActive = Boolean(
     search
@@ -8244,10 +8383,39 @@ export default function OperationsSection({
     || orderProvider
     || orderTracking !== 'all'
     || orderDate !== 'all'
-    || orderWarehouse
-    || orderSavedView !== 'all'
     || orderSort !== 'updated_desc',
   )
+  const orderPageStart = orderPage && orderPage.total > 0
+    ? orderPage.offset + 1
+    : 0
+  const orderPageEnd = orderPage
+    ? orderPage.offset + orderPage.returned
+    : 0
+  const orderPageNumber = activeOrderPageNavigation.cursors.length
+  const canShowPreviousOrderPage = orderPageNumber > 1
+
+  const showNextOrderPage = () => {
+    const nextCursor = orderPage?.nextCursor
+    if (!nextCursor || orderPageLoading) return
+    if (activeOrderPageNavigation.cursors.includes(nextCursor)) {
+      setOrderPageError('Order pagination did not advance')
+      return
+    }
+    orderPageNavigationRollback.current = activeOrderPageNavigation
+    setOrderPageNavigation({
+      queryKey: orderPageQueryKey,
+      cursors: [...activeOrderPageNavigation.cursors, nextCursor],
+    })
+  }
+
+  const showPreviousOrderPage = () => {
+    if (!canShowPreviousOrderPage || orderPageLoading) return
+    orderPageNavigationRollback.current = activeOrderPageNavigation
+    setOrderPageNavigation({
+      queryKey: orderPageQueryKey,
+      cursors: activeOrderPageNavigation.cursors.slice(0, -1),
+    })
+  }
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
@@ -8436,7 +8604,7 @@ export default function OperationsSection({
   const summary = workspace?.summary
   const empty = !loading && (
     view === 'orders'
-      ? visibleOrderCount === 0
+      ? !orderPageLoading && orderPage !== null && visibleOrderCount === 0
       : view === 'exceptions'
         ? workspace?.exceptions.length === 0
         : false
@@ -8827,7 +8995,7 @@ export default function OperationsSection({
               },
             }}
           >
-            <Tab value="orders" label={`Orders${workspace ? ` (${orderSavedViewCounts.all})` : ''}`} />
+            <Tab value="orders" label={`Orders${orderPage ? ` (${orderPage.total})` : ''}`} />
             <Tab
               value="picking"
               icon={<AssignmentIndRounded fontSize="small" />}
@@ -8864,30 +9032,6 @@ export default function OperationsSection({
         <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, flexShrink: 0 }}>
           {view === 'orders' ? (
             <Stack spacing={1.25}>
-              <Box
-                role="group"
-                aria-label="Order views"
-                sx={{
-                  display: 'flex',
-                  gap: 0.75,
-                  overflowX: 'auto',
-                  pb: 0.25,
-                  WebkitOverflowScrolling: 'touch',
-                }}
-              >
-                {OPERATIONS_ORDER_SAVED_VIEWS.map((savedView) => (
-                  <Button
-                    key={savedView.value}
-                    size="small"
-                    variant={orderSavedView === savedView.value ? 'contained' : 'outlined'}
-                    aria-pressed={orderSavedView === savedView.value}
-                    onClick={() => setOrderSavedView(savedView.value)}
-                    sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
-                  >
-                    {savedView.label} ({orderSavedViewCounts[savedView.value]})
-                  </Button>
-                ))}
-              </Box>
               <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.25 }}>
                 <TextField
                   size="small"
@@ -8907,7 +9051,11 @@ export default function OperationsSection({
                   SelectProps={{ displayEmpty: true }}
                   sx={{ ...controlSx, flex: '0 1 180px', minWidth: 160 }}
                 >
-                  {ORDER_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
+                  {ORDER_STATUSES.map((option) => (
+                    <MenuItem key={option.value || 'all'} value={option.value}>
+                      {option.label}
+                    </MenuItem>
+                  ))}
                 </TextField>
                 <TextField
                   select
@@ -8945,20 +9093,6 @@ export default function OperationsSection({
                 <TextField
                   select
                   size="small"
-                  value={orderWarehouse}
-                  onChange={(event) => setOrderWarehouse(event.target.value)}
-                  inputProps={{ 'aria-label': 'Filter orders by warehouse' }}
-                  SelectProps={{ displayEmpty: true }}
-                  sx={{ ...controlSx, flex: '0 1 190px', minWidth: 165 }}
-                >
-                  <MenuItem value="">All warehouses</MenuItem>
-                  {orderWarehouses.map((warehouse) => (
-                    <MenuItem key={warehouse} value={warehouse}>{warehouse}</MenuItem>
-                  ))}
-                </TextField>
-                <TextField
-                  select
-                  size="small"
                   value={orderSort}
                   onChange={(event) => setOrderSort(event.target.value as OperationsOrderSort)}
                   inputProps={{ 'aria-label': 'Sort operations orders' }}
@@ -8972,21 +9106,62 @@ export default function OperationsSection({
                     onClick={() => {
                       setSearch('')
                       setStatus('')
-                      setOrderSavedView('all')
                       setOrderSort('updated_desc')
                       setOrderProvider('')
                       setOrderTracking('all')
                       setOrderDate('all')
-                      setOrderWarehouse('')
                     }}
                   >
                     Clear filters
                   </Button>
                 )}
               </Box>
-              <Typography variant="caption" color="text.secondary">
-                Showing {visibleOrderCount} of {orderSavedViewCounts.all} loaded orders
-              </Typography>
+              <Stack
+                direction={{ xs: 'column', sm: 'row' }}
+                alignItems={{ xs: 'stretch', sm: 'center' }}
+                justifyContent="space-between"
+                gap={1}
+              >
+                <Typography variant="caption" color="text.secondary">
+                  {orderPageLoading && !orderPage
+                    ? 'Loading orders…'
+                    : `${orderPageStart}–${orderPageEnd} of ${orderPage?.total || 0} orders`}
+                </Typography>
+                <Stack direction="row" alignItems="center" spacing={1}>
+                  {orderPageLoading && <CircularProgress size={18} aria-label="Loading order page" />}
+                  <TextField
+                    select
+                    size="small"
+                    value={orderPageSize}
+                    onChange={(event) => setOrderPageSize(Number(event.target.value))}
+                    inputProps={{ 'aria-label': 'Orders per page' }}
+                    sx={{ ...controlSx, minWidth: 110 }}
+                  >
+                    {[25, 50, 100].map((pageSize) => (
+                      <MenuItem key={pageSize} value={pageSize}>{pageSize} / page</MenuItem>
+                    ))}
+                  </TextField>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={!canShowPreviousOrderPage || orderPageLoading}
+                    onClick={showPreviousOrderPage}
+                  >
+                    Previous
+                  </Button>
+                  <Typography variant="caption" color="text.secondary">
+                    Page {orderPageNumber}
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={!orderPage?.nextCursor || orderPageLoading}
+                    onClick={showNextOrderPage}
+                  >
+                    Next
+                  </Button>
+                </Stack>
+              </Stack>
             </Stack>
           ) : (
             <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.25 }}>
@@ -9015,6 +9190,7 @@ export default function OperationsSection({
       )}
 
       {mainWorkspaceView && error && <Alert severity="error" onClose={() => setError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{error}</Alert>}
+      {view === 'orders' && orderPageError && <Alert severity="error" onClose={() => setOrderPageError('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{orderPageError}</Alert>}
       {mainWorkspaceView && notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>{notice}</Alert>}
       {mainWorkspaceView && !loading && workspace && !workspace.configured && (
         <Alert severity="info" sx={{ mx: { xs: 2, md: 3 }, mb: 1.5 }}>Connect an approved commerce provider and configure an active warehouse to begin importing orders.</Alert>
@@ -9078,6 +9254,8 @@ export default function OperationsSection({
         ) : view === 'printing' ? (
           <PrinterConfigurationPanel />
         ) : loading && !workspace ? (
+          <Box sx={{ height: '100%', display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
+        ) : view === 'orders' && orderPageLoading && !orderPage ? (
           <Box sx={{ height: '100%', display: 'grid', placeItems: 'center' }}><CircularProgress size={30} /></Box>
         ) : empty ? (
           <Box sx={{ py: 10, px: 3, textAlign: 'center' }}>
@@ -9162,7 +9340,7 @@ export default function OperationsSection({
                       <Box sx={{ minWidth: 0 }}>
                         <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
                         <Typography variant="body2" color="text.secondary" noWrap>
-                          {order.customerName || 'Customer not provided'}
+                          {order.customerName || 'Customer not supplied'}
                         </Typography>
                       </Box>
                       <Chip size="small" label={importedOrderDisplayStatus(order)} color={importedOrderStatusColor(order)} />
@@ -9170,7 +9348,7 @@ export default function OperationsSection({
                     <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                       <Box sx={{ minWidth: 0 }}>
                         <Typography variant="caption" color="#A8C7FA">
-                          {displayStatus(order.provider)} · {order.integrationAccountName}
+                          {displayStatus(order.provider)} · {importedOrderWarehouseName(order)}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" display="block" noWrap>
                           {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Updated{' '}
@@ -9178,11 +9356,9 @@ export default function OperationsSection({
                             month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
                           })}
                         </Typography>
-                        {order.trackingNumber && (
-                          <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                            Tracking {order.trackingNumber}
-                          </Typography>
-                        )}
+                        <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                          Tracking {order.trackingNumber || 'not supplied'}
+                        </Typography>
                       </Box>
                       <Stack alignItems="flex-end" spacing={0.5}>
                         <Typography fontWeight={700}>
@@ -9223,16 +9399,17 @@ export default function OperationsSection({
                         {displayStatus(order.sourceProvider)} · {order.warehouseName || 'Unassigned'}
                       </Typography>
                       <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                        {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Updated{' '}
+                        {order.externallyFulfilled && order.providerLineCount !== null
+                          ? `${order.providerLineCount} sales-channel ${order.providerLineCount === 1 ? 'line' : 'lines'} · ${order.lineCount} ClawPilot`
+                          : `${order.lineCount} ${order.lineCount === 1 ? 'line' : 'lines'}`}
+                        {' · Updated '}
                         {formatUserDateTime(order.updatedAt, dateTime, {
                           month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
                         })}
                       </Typography>
-                      {order.trackingNumber && (
-                        <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                          Tracking {order.trackingNumber}
-                        </Typography>
-                      )}
+                      <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                        Tracking {order.trackingNumber || 'not supplied'}
+                      </Typography>
                     </Box>
                     <Stack alignItems="flex-end" spacing={0.5}>
                       <Typography fontWeight={700}>
@@ -9273,33 +9450,9 @@ export default function OperationsSection({
                   <TableCell>Status</TableCell>
                   <TableCell>Attention</TableCell>
                   <TableCell>Warehouse</TableCell>
-                  <TableCell sortDirection={orderSort === 'promise_asc' ? 'asc' : false}>
-                    <TableSortLabel
-                      active={orderSort === 'promise_asc'}
-                      direction="asc"
-                      onClick={() => setOrderSort('promise_asc')}
-                    >
-                      Promise
-                    </TableSortLabel>
-                  </TableCell>
-                  <TableCell align="right" sortDirection={orderSort === 'lines_desc' ? 'desc' : false}>
-                    <TableSortLabel
-                      active={orderSort === 'lines_desc'}
-                      direction="desc"
-                      onClick={() => setOrderSort('lines_desc')}
-                    >
-                      Lines
-                    </TableSortLabel>
-                  </TableCell>
-                  <TableCell align="right" sortDirection={orderSort === 'value_desc' ? 'desc' : false}>
-                    <TableSortLabel
-                      active={orderSort === 'value_desc'}
-                      direction="desc"
-                      onClick={() => setOrderSort('value_desc')}
-                    >
-                      Order total
-                    </TableSortLabel>
-                  </TableCell>
+                  <TableCell>Delivery</TableCell>
+                  <TableCell align="right">Lines</TableCell>
+                  <TableCell align="right">Order total</TableCell>
                   <TableCell>Tracking</TableCell>
                   <TableCell sortDirection={orderSort === 'updated_asc' ? 'asc' : orderSort === 'updated_desc' ? 'desc' : false}>
                     <TableSortLabel
@@ -9317,6 +9470,9 @@ export default function OperationsSection({
                 {visibleOrderRows.map((row) => {
                   if (row.kind === 'imported') {
                     const order = row.order
+                    const promiseAt = order.delivery.selectedDeliveryAt
+                      || order.delivery.providerRequestedDeliveryAt
+                    const promiseIsRequested = Boolean(promiseAt)
                     return (
                       <TableRow
                         key={row.key}
@@ -9332,7 +9488,7 @@ export default function OperationsSection({
                           </Typography>
                         </TableCell>
                         <TableCell>
-                          <Typography>{order.customerName || '—'}</Typography>
+                          <Typography>{order.customerName || 'Not supplied'}</Typography>
                           <Typography variant="caption" color="text.secondary">
                             {order.integrationAccountName}
                           </Typography>
@@ -9351,16 +9507,32 @@ export default function OperationsSection({
                               />
                             : '—'}
                         </TableCell>
-                        <TableCell>—</TableCell>
                         <TableCell>
-                          {formatUserDateTime(order.delivery.selectedDeliveryAt, dateTime, {
-                            year: 'numeric', month: 'short', day: 'numeric', fallback: '—',
-                          })}
+                          <Typography variant="body2">
+                            {importedOrderWarehouseName(order)}
+                          </Typography>
+                          {order.warehouseName && (
+                            <Typography variant="caption" color="text.secondary">
+                              Current location mapping
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <Typography variant="body2">
+                            {formatUserDateTime(promiseAt, dateTime, {
+                              year: 'numeric', month: 'short', day: 'numeric', fallback: 'Not supplied',
+                            })}
+                          </Typography>
+                          {promiseIsRequested && (
+                            <Typography variant="caption" color="text.secondary">
+                              Requested
+                            </Typography>
+                          )}
                         </TableCell>
                         <TableCell align="right">{order.lineCount}</TableCell>
                         <TableCell align="right">{importedOrderMoney(order)}</TableCell>
                         <TableCell sx={{ maxWidth: 160 }}>
-                          <Typography variant="body2" noWrap>{order.trackingNumber || '—'}</Typography>
+                          <Typography variant="body2" noWrap>{order.trackingNumber || 'Not supplied'}</Typography>
                         </TableCell>
                         <TableCell>
                           {formatUserDateTime(order.updatedAt, dateTime, {
@@ -9378,6 +9550,14 @@ export default function OperationsSection({
                     )
                   }
                   const order = row.order
+                  const deliveryAt = order.promisedDeliveryAt
+                    || order.requestedDeliveryAt
+                    || order.providerPromisedDeliveryAt
+                  const deliveryIsRequested = !order.promisedDeliveryAt
+                    && Boolean(order.requestedDeliveryAt)
+                  const deliveryIsProviderWindow = !order.promisedDeliveryAt
+                    && !order.requestedDeliveryAt
+                    && Boolean(order.providerPromisedDeliveryAt)
                   return (
                     <TableRow
                       key={row.key}
@@ -9408,13 +9588,52 @@ export default function OperationsSection({
                             />
                           : '—'}
                       </TableCell>
-                      <TableCell>{order.warehouseName || '—'}</TableCell>
-                      <TableCell>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: '—' })}</TableCell>
-                      <TableCell align="right">{order.lineCount}</TableCell>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {order.warehouseName || 'Not assigned'}
+                        </Typography>
+                        {order.warehouseProvenance === 'provider_location_mapping' && (
+                          <Typography variant="caption" color="text.secondary">
+                            Current location mapping
+                          </Typography>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">
+                          {formatUserDateTime(deliveryAt, dateTime, {
+                            year: 'numeric', month: 'short', day: 'numeric', fallback: 'Not supplied',
+                          })}
+                        </Typography>
+                        {deliveryIsRequested && (
+                          <Typography variant="caption" color="text.secondary">
+                            Requested
+                          </Typography>
+                        )}
+                        {deliveryIsProviderWindow && (
+                          <Typography variant="caption" color="text.secondary">
+                            Provider window{order.providerDeliveryCoverage === 'partial'
+                              ? ' · scope-filtered'
+                              : ''}
+                          </Typography>
+                        )}
+                      </TableCell>
+                      <TableCell align="right">
+                        {order.externallyFulfilled && order.providerLineCount !== null ? (
+                          <Box data-testid={`canonical-provider-line-count-${order.globalId}`}>
+                            <Typography variant="body2">{order.providerLineCount}</Typography>
+                            <Typography variant="caption" color="text.secondary" display="block">
+                              Sales channel
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" display="block">
+                              ClawPilot {order.lineCount}
+                            </Typography>
+                          </Box>
+                        ) : order.lineCount}
+                      </TableCell>
                       <TableCell align="right">
                         {money(order.orderValueMinor, order.currency)}
                       </TableCell>
-                      <TableCell sx={{ maxWidth: 160 }}><Typography variant="body2" noWrap>{order.trackingNumber || '—'}</Typography></TableCell>
+                      <TableCell sx={{ maxWidth: 160 }}><Typography variant="body2" noWrap>{order.trackingNumber || 'Not supplied'}</Typography></TableCell>
                       <TableCell>
                         {formatUserDateTime(operationsOrderRowUpdatedAt(row), dateTime, {
                           month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
