@@ -121,6 +121,7 @@ const activeRoute = loadTypeScriptModule(
             nextCursor: null,
             complete: true,
             truncated: false,
+            snapshot: 'snapshot-token',
           },
         }
       },
@@ -133,12 +134,13 @@ const activeRoute = loadTypeScriptModule(
 
 const directPageResult = await activeRoute.GET({
   nextUrl: new URL(
-    'http://localhost/api/operations/orders/unified?page=7&pageSize=25',
+    'http://localhost/api/operations/orders/unified?page=7&pageSize=25&snapshot=prior-token',
   ),
 })
 assert.equal(directPageResult.status, 200)
 assert.equal(capturedInput.page, 7)
 assert.equal(capturedInput.cursor, null)
+assert.equal(capturedInput.snapshot, 'prior-token')
 assert.equal(capturedInput.pageSize, 25)
 
 capturedInput = null
@@ -164,6 +166,19 @@ for (const page of ['', '0', '-1', '1.5', '9007199254740992']) {
   assert.equal(
     invalidPageResult.payload.code,
     'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+  )
+}
+
+for (const snapshot of ['bad token', 'bad.token']) {
+  const invalidSnapshotResult = await activeRoute.GET({
+    nextUrl: new URL(
+      `http://localhost/api/operations/orders/unified?page=2&snapshot=${encodeURIComponent(snapshot)}`,
+    ),
+  })
+  assert.equal(invalidSnapshotResult.status, 400)
+  assert.equal(
+    invalidSnapshotResult.payload.code,
+    'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
   )
 }
 

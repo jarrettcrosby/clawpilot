@@ -524,6 +524,7 @@ type UnifiedOrderPage = {
   nextCursor: string | null
   complete: boolean
   truncated: boolean
+  snapshot: string
 }
 
 type UnifiedOrderPagePayload = {
@@ -544,6 +545,10 @@ function validUnifiedOrderPage(value: unknown): value is UnifiedOrderPage {
       && page.nextCursor.length <= UNIFIED_ORDER_CURSOR_MAX_LENGTH
       && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
     )
+  const snapshotIsValid = typeof page.snapshot === 'string'
+    && page.snapshot.length > 0
+    && page.snapshot.length <= UNIFIED_ORDER_CURSOR_MAX_LENGTH
+    && /^[A-Za-z0-9_-]+$/u.test(page.snapshot)
   return Number.isSafeInteger(page.total)
     && Number(page.total) >= 0
     && Number.isSafeInteger(page.returned)
@@ -555,8 +560,11 @@ function validUnifiedOrderPage(value: unknown): value is UnifiedOrderPage {
     && Number(page.offset) >= 0
     && Number(page.offset) + Number(page.returned) <= Number(page.total)
     && cursorIsValid
-    && page.complete === (page.nextCursor === null)
-    && page.truncated === (page.nextCursor !== null)
+    && snapshotIsValid
+    && page.complete === (
+      Number(page.offset) + Number(page.returned) >= Number(page.total)
+    )
+    && page.truncated === !page.complete
 }
 
 function validImportedOrderPage(
@@ -825,8 +833,8 @@ const ORDER_SORTS: Array<{ value: OperationsOrderSort; label: string }> = [
   { value: 'order_date_asc', label: 'Order date: oldest' },
   { value: 'updated_desc', label: 'Last activity: newest' },
   { value: 'updated_asc', label: 'Last activity: oldest' },
-  { value: 'order_desc', label: 'Order ID: Z–A' },
-  { value: 'order_asc', label: 'Order ID: A–Z' },
+  { value: 'order_desc', label: 'Order number: highest by channel' },
+  { value: 'order_asc', label: 'Order number: lowest by channel' },
   { value: 'customer_asc', label: 'Customer: A–Z' },
 ]
 
@@ -901,6 +909,7 @@ const OPERATIONS_ORDER_TRACKING_QUERY = 'orderTracking'
 const OPERATIONS_ORDER_DATE_QUERY = 'orderDate'
 const OPERATIONS_ORDER_PAGE_SIZE_QUERY = 'orderPageSize'
 const OPERATIONS_ORDER_PAGE_QUERY = 'orderPage'
+const OPERATIONS_ORDER_SNAPSHOT_QUERY = 'orderSnapshot'
 // The legacy organization-wide activation workflow remains available to the
 // server while per-connection Provider writes replaces it in the product UI.
 // Do not expose this migration-era profile in the daily Orders workbench.
@@ -1316,6 +1325,9 @@ function operationsOrderUrlState(url: URL) {
     params.get(OPERATIONS_ORDER_PAGE_SIZE_QUERY) || '',
   )
   const pageValue = Number(params.get(OPERATIONS_ORDER_PAGE_QUERY) || '')
+  const snapshotValue = String(
+    params.get(OPERATIONS_ORDER_SNAPSHOT_QUERY) || '',
+  ).trim()
   return {
     search,
     status: ORDER_STATUSES.some((option) => option.value === statusValue)
@@ -1341,6 +1353,9 @@ function operationsOrderUrlState(url: URL) {
     page: Number.isSafeInteger(pageValue) && pageValue > 0
       ? pageValue
       : 1,
+    snapshot: /^[A-Za-z0-9_-]{1,16384}$/u.test(snapshotValue)
+      ? snapshotValue
+      : '',
     selectedOrderGlobalId: String(
       params.get(OPERATIONS_ORDER_QUERY) || '',
     ).trim(),
@@ -4049,6 +4064,7 @@ export default function OperationsSection({
   const [orderUrlStateHydrated, setOrderUrlStateHydrated] = useState(false)
   const [orderPageNumber, setOrderPageNumber] = useState(1)
   const [orderPageInput, setOrderPageInput] = useState('1')
+  const [orderPageSnapshot, setOrderPageSnapshot] = useState('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -4068,6 +4084,17 @@ export default function OperationsSection({
   const workspaceLoadGeneration = useRef(0)
   const orderPageLoadGeneration = useRef(0)
   const orderPageOrganizationIdRef = useRef('')
+  const orderPageSnapshotRef = useRef('')
+  const committedOrderPageRef = useRef({
+    pageNumber: 1,
+    snapshot: '',
+    controlsKey: '',
+  })
+  const skipCommittedOrderPageReloadRef = useRef('')
+  const updateOrderPageSnapshot = useCallback((snapshot: string) => {
+    orderPageSnapshotRef.current = snapshot
+    setOrderPageSnapshot(snapshot)
+  }, [])
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -4281,6 +4308,7 @@ export default function OperationsSection({
         setOrderDate(urlState.date)
         setOrderPageSize(urlState.pageSize)
         setOrderPageNumber(urlState.page)
+        updateOrderPageSnapshot(urlState.snapshot)
       } else {
         setSearch('')
       }
@@ -4313,7 +4341,7 @@ export default function OperationsSection({
     applyUrlState()
     window.addEventListener('popstate', applyUrlState)
     return () => window.removeEventListener('popstate', applyUrlState)
-  }, [initialView])
+  }, [initialView, updateOrderPageSnapshot])
 
   const workspaceSearch = view === 'exceptions' ? search.trim() : ''
 
@@ -4432,7 +4460,14 @@ export default function OperationsSection({
     setOrderPageRows([])
     setOrderPage(null)
     setOrderPageError('')
-  }, [orderPageOrganizationId])
+    skipCommittedOrderPageReloadRef.current = ''
+    updateOrderPageSnapshot('')
+    committedOrderPageRef.current = {
+      pageNumber: 1,
+      snapshot: '',
+      controlsKey: '',
+    }
+  }, [orderPageOrganizationId, updateOrderPageSnapshot])
 
   useEffect(() => {
     if (
@@ -4440,6 +4475,15 @@ export default function OperationsSection({
       || !orderPageOrganizationId
       || !orderUrlStateHydrated
     ) return
+    const pageStateKey = JSON.stringify({
+      controlsKey: orderPageControlsKey,
+      pageNumber: orderPageNumber,
+      snapshot: orderPageSnapshotRef.current,
+    })
+    if (skipCommittedOrderPageReloadRef.current === pageStateKey) {
+      skipCommittedOrderPageReloadRef.current = ''
+      return
+    }
     const requestGeneration = orderPageLoadGeneration.current + 1
     orderPageLoadGeneration.current = requestGeneration
     const controller = new AbortController()
@@ -4452,6 +4496,9 @@ export default function OperationsSection({
           pageSize: String(orderPageSize),
           page: String(orderPageNumber),
         })
+        if (orderPageSnapshotRef.current) {
+          params.set('snapshot', orderPageSnapshotRef.current)
+        }
         if (search.trim()) params.set('search', search.trim())
         if (status) params.set('status', status)
         appendOrderListQuery(params, {
@@ -4466,6 +4513,22 @@ export default function OperationsSection({
         )
         const payload = await response.json().catch(() => ({})) as
           UnifiedOrderPagePayload
+        if (
+          response.status === 409
+          && payload.code === 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED'
+        ) {
+          if (
+            controller.signal.aborted
+            || requestGeneration !== orderPageLoadGeneration.current
+          ) return
+          updateOrderPageSnapshot('')
+          setOrderPageNumber(1)
+          setOrderPageInput('1')
+          setOrderPageRefreshRevision((current) => current + 1)
+          setOrderPageError('')
+          setNotice('Orders changed while you were paging. Returned to the first page.')
+          return
+        }
         if (
           !response.ok
           || !payload.ok
@@ -4491,9 +4554,15 @@ export default function OperationsSection({
         ) return
         setOrderPageRows(payload.rows)
         setOrderPage(payload.page)
+        updateOrderPageSnapshot(payload.page.snapshot)
         const actualPage = payload.page.total === 0
           ? 1
           : Math.floor(payload.page.offset / payload.page.pageSize) + 1
+        committedOrderPageRef.current = {
+          pageNumber: actualPage,
+          snapshot: payload.page.snapshot,
+          controlsKey: orderPageControlsKey,
+        }
         if (actualPage !== orderPageNumber) {
           setOrderPageNumber(actualPage)
           setNotice(`Page ${orderPageNumber} is no longer available. Showing page ${actualPage}.`)
@@ -4501,6 +4570,20 @@ export default function OperationsSection({
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') return
         if (requestGeneration !== orderPageLoadGeneration.current) return
+        const committed = committedOrderPageRef.current
+        if (
+          committed.controlsKey === orderPageControlsKey
+          && committed.pageNumber !== orderPageNumber
+        ) {
+          skipCommittedOrderPageReloadRef.current = JSON.stringify({
+            controlsKey: orderPageControlsKey,
+            pageNumber: committed.pageNumber,
+            snapshot: committed.snapshot,
+          })
+          updateOrderPageSnapshot(committed.snapshot)
+          setOrderPageNumber(committed.pageNumber)
+          setOrderPageInput(String(committed.pageNumber))
+        }
         setOrderPageError(caught instanceof Error
           ? caught.message
           : 'The requested order page is unavailable')
@@ -4530,6 +4613,7 @@ export default function OperationsSection({
     view,
     orderUrlStateHydrated,
     workspace?.generatedAt,
+    updateOrderPageSnapshot,
   ])
 
   useEffect(() => {
@@ -4584,11 +4668,17 @@ export default function OperationsSection({
       String(orderPageNumber),
       '1',
     )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_SNAPSHOT_QUERY,
+      orderPageSnapshot,
+    )
     window.history.replaceState(window.history.state, '', nextUrl)
   }, [
     initialView,
     orderDate,
     orderPageNumber,
+    orderPageSnapshot,
     orderPageSize,
     orderProvider,
     orderSort,
@@ -8529,6 +8619,13 @@ export default function OperationsSection({
     Math.ceil((orderPage?.total || 0) / orderPageSize),
   )
 
+  const resetOrderPaging = () => {
+    skipCommittedOrderPageReloadRef.current = ''
+    updateOrderPageSnapshot('')
+    setOrderPageNumber(1)
+    setOrderPageInput('1')
+  }
+
   const goToOrderPage = () => {
     const requested = Number(orderPageInput)
     if (!Number.isSafeInteger(requested) || requested < 1) {
@@ -8539,6 +8636,7 @@ export default function OperationsSection({
     setOrderPageError('')
     const target = Math.min(orderPageCount, requested)
     if (target === orderPageNumber) {
+      updateOrderPageSnapshot('')
       setOrderPageRefreshRevision((current) => current + 1)
     } else {
       setOrderPageNumber(target)
@@ -8835,9 +8933,12 @@ export default function OperationsSection({
                       ? 'Refresh connected-store orders'
                       : 'Refresh operations'}
                     disabled={loading || syncingOrderStatus}
-                    onClick={() => void (orderStatusSyncAvailable
-                      ? refreshOrders()
-                      : loadWorkspace(selectedGlobalId))}
+                    onClick={() => {
+                      resetOrderPaging()
+                      void (orderStatusSyncAvailable
+                        ? refreshOrders()
+                        : loadWorkspace(selectedGlobalId))
+                    }}
                   >
                     {syncingOrderStatus
                       ? <CircularProgress size={20} />
@@ -9166,7 +9267,7 @@ export default function OperationsSection({
                   value={search}
                   onChange={(event) => {
                     setSearch(event.target.value)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   placeholder="Order, customer, SKU, or tracking"
                   inputProps={{ 'aria-label': 'Search operations orders' }}
@@ -9179,7 +9280,7 @@ export default function OperationsSection({
                   value={status}
                   onChange={(event) => {
                     setStatus(event.target.value as OperationsOrderFilter)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   inputProps={{ 'aria-label': 'Filter orders by status' }}
                   SelectProps={{ displayEmpty: true }}
@@ -9197,7 +9298,7 @@ export default function OperationsSection({
                   value={orderProvider}
                   onChange={(event) => {
                     setOrderProvider(event.target.value)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   inputProps={{ 'aria-label': 'Filter orders by sales channel' }}
                   SelectProps={{ displayEmpty: true }}
@@ -9213,7 +9314,7 @@ export default function OperationsSection({
                   value={orderDate}
                   onChange={(event) => {
                     setOrderDate(event.target.value as OperationsOrderDateFilter)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   inputProps={{ 'aria-label': 'Filter orders by last activity' }}
                   sx={{ ...controlSx, flex: '0 1 205px', minWidth: 180 }}
@@ -9226,7 +9327,7 @@ export default function OperationsSection({
                   value={orderTracking}
                   onChange={(event) => {
                     setOrderTracking(event.target.value as OperationsOrderTrackingFilter)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   inputProps={{ 'aria-label': 'Filter orders by tracking state' }}
                   sx={{ ...controlSx, flex: '0 1 185px', minWidth: 165 }}
@@ -9239,7 +9340,7 @@ export default function OperationsSection({
                   value={orderSort}
                   onChange={(event) => {
                     setOrderSort(event.target.value as OperationsOrderSort)
-                    setOrderPageNumber(1)
+                    resetOrderPaging()
                   }}
                   inputProps={{ 'aria-label': 'Sort operations orders' }}
                   sx={{ ...controlSx, flex: '0 1 210px', minWidth: 185 }}
@@ -9256,7 +9357,7 @@ export default function OperationsSection({
                       setOrderProvider('')
                       setOrderTracking('all')
                       setOrderDate('all')
-                      setOrderPageNumber(1)
+                      resetOrderPaging()
                     }}
                   >
                     Clear filters
@@ -9274,7 +9375,15 @@ export default function OperationsSection({
                     ? 'Loading orders…'
                     : `${orderPageStart}–${orderPageEnd} of ${orderPage?.total || 0} orders`}
                 </Typography>
-                <Stack direction="row" alignItems="center" spacing={1}>
+                <Stack
+                  data-testid="order-pagination-controls"
+                  direction="row"
+                  alignItems="center"
+                  justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}
+                  spacing={1}
+                  useFlexGap
+                  sx={{ width: { xs: '100%', sm: 'auto' }, flexWrap: 'wrap' }}
+                >
                   {orderPageLoading && <CircularProgress size={18} aria-label="Loading order page" />}
                   <TextField
                     select
@@ -9282,7 +9391,7 @@ export default function OperationsSection({
                     value={orderPageSize}
                     onChange={(event) => {
                       setOrderPageSize(Number(event.target.value))
-                      setOrderPageNumber(1)
+                      resetOrderPaging()
                     }}
                     inputProps={{ 'aria-label': 'Orders per page' }}
                     sx={{ ...controlSx, minWidth: 110 }}
@@ -9296,12 +9405,13 @@ export default function OperationsSection({
                     page={Math.min(orderPageNumber, orderPageCount)}
                     onChange={(_event, page) => setOrderPageNumber(page)}
                     disabled={orderPageLoading}
-                    showFirstButton
-                    showLastButton
+                    showFirstButton={!mobile}
+                    showLastButton={!mobile}
                     siblingCount={mobile ? 0 : 1}
-                    boundaryCount={1}
+                    boundaryCount={mobile ? 0 : 1}
                     size="small"
                     aria-label="Order pages"
+                    sx={{ maxWidth: '100%' }}
                   />
                   <TextField
                     size="small"
@@ -9611,7 +9721,7 @@ export default function OperationsSection({
                       direction={orderSort === 'order_asc' ? 'asc' : 'desc'}
                       onClick={() => {
                         setOrderSort(orderSort === 'order_asc' ? 'order_desc' : 'order_asc')
-                        setOrderPageNumber(1)
+                        resetOrderPaging()
                       }}
                     >
                       Order
@@ -9623,7 +9733,7 @@ export default function OperationsSection({
                       direction={orderSort === 'order_date_asc' ? 'asc' : 'desc'}
                       onClick={() => {
                         setOrderSort(orderSort === 'order_date_desc' ? 'order_date_asc' : 'order_date_desc')
-                        setOrderPageNumber(1)
+                        resetOrderPaging()
                       }}
                     >
                       Order date
@@ -9635,7 +9745,7 @@ export default function OperationsSection({
                       direction="asc"
                       onClick={() => {
                         setOrderSort('customer_asc')
-                        setOrderPageNumber(1)
+                        resetOrderPaging()
                       }}
                     >
                       Customer
@@ -9654,7 +9764,7 @@ export default function OperationsSection({
                       direction={orderSort === 'updated_asc' ? 'asc' : 'desc'}
                       onClick={() => {
                         setOrderSort(orderSort === 'updated_desc' ? 'updated_asc' : 'updated_desc')
-                        setOrderPageNumber(1)
+                        resetOrderPaging()
                       }}
                     >
                       Last activity

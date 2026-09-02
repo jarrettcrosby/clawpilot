@@ -213,7 +213,7 @@ type ProductRow = QueryResultRow & {
  * the canonical Operations status remains Imported. Keep those two facts
  * separate: this predicate never manufactures a local shipment or label.
  */
-function externallyFulfilledOrderSql(orderAlias: string) {
+export function externallyFulfilledOrderSql(orderAlias: string) {
   return `(
     EXISTS (
       SELECT 1
@@ -451,7 +451,7 @@ function latestProviderRevisionDeliverySql(orderAlias: string) {
           LIMIT 1`
 }
 
-function latestProviderTrackingSql(orderAlias: string) {
+export function latestProviderTrackingSql(orderAlias: string) {
   return `SELECT current_subject.tracking_number,
                  current_subject.activity_at
           FROM (
@@ -512,7 +512,7 @@ function latestProviderTrackingSql(orderAlias: string) {
           LIMIT 1`
 }
 
-function latestExternalReconciliationTrackingSql(orderAlias: string) {
+export function latestExternalReconciliationTrackingSql(orderAlias: string) {
   return `SELECT current_subject.tracking_number,
                  current_subject.activity_at
           FROM (
@@ -5229,6 +5229,8 @@ export async function readOperationsOrderPageFromPostgres(input: {
   offset?: number
   /** Server-only: keep a unified multi-source read on one database snapshot. */
   queryClient?: PoolClient
+  /** Server-only batch hydration for IDs selected by the unified page index. */
+  selectedIds?: readonly string[]
 }): Promise<{
   orders: OperationsOrderListItem[]
   page: OperationsOrderPage
@@ -5238,6 +5240,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
     providerIdentities: Array<OperationsOrderProviderIdentity | null>
     sourceEvidence: OperationsOrderSourceEvidence[]
     resultSetRevision: string | null
+    databaseIds: string[]
   }
 }> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -5254,6 +5257,22 @@ export async function readOperationsOrderPageFromPostgres(input: {
     : null
   const pageSize = operationsOrderPageSize(input.pageSize)
   const offset = input.offset ?? 0
+  const selectedIds = input.selectedIds === undefined
+    ? null
+    : [...new Set(input.selectedIds.map((value) => String(value).trim()))]
+  if (
+    selectedIds
+    && (
+      selectedIds.length > MAX_OPERATIONS_ORDER_PAGE_SIZE
+      || selectedIds.some((value) => !OPERATIONS_ORDER_PAGE_UUID.test(value))
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_BATCH_INVALID',
+      'Order hydration batch is invalid',
+      500,
+    )
+  }
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_PAGE_OFFSET_INVALID',
@@ -5431,6 +5450,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
        ) order_activity
        WHERE orders.organization_id = $1::uuid
          AND orders.archived_at IS NULL
+         AND ($12::uuid[] IS NULL OR orders.id = ANY($12::uuid[]))
          AND (
            $2::text IS NULL
            OR orders.order_number ILIKE $2 ESCAPE '!'
@@ -5601,6 +5621,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
       cursor?.orderId ?? null,
       pageSize + 1,
       offset,
+      selectedIds,
     ],
   )
   const hasNextPage = result.rows.length > pageSize
@@ -5642,6 +5663,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
           externalOrderId: row.external_order_id,
         }
       : null,
+    provider: row.source_provider,
   }))
   return {
     orders: pageRows.map(operationsOrderListItem),
@@ -5659,6 +5681,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
       providerIdentities: sourceEvidence.map((evidence) => evidence.providerIdentity),
       sourceEvidence,
       resultSetRevision,
+      databaseIds: pageRows.map((row) => row.id),
     },
   }
 }

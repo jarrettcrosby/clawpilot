@@ -181,6 +181,15 @@ export async function GET(req: NextRequest) {
     const cursor = String(
       req.nextUrl.searchParams.get('cursor') || '',
     ).trim()
+    const snapshot = String(
+      req.nextUrl.searchParams.get('snapshot') || '',
+    ).trim()
+    if (snapshot && !/^[A-Za-z0-9_-]{1,16384}$/u.test(snapshot)) {
+      requestError(
+        'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+        'The order page snapshot is invalid',
+      )
+    }
     const pageValue = req.nextUrl.searchParams.get('page')
     let page: number | null = null
     if (pageValue !== null) {
@@ -239,6 +248,7 @@ export async function GET(req: NextRequest) {
       updatedAfter: updatedAfterValue || null,
       cursor: cursor || null,
       page,
+      snapshot: snapshot || null,
       pageSize,
     })
     return response({ ok: true, rows: result.rows, page: result.page })

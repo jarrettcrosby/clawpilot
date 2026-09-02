@@ -1428,6 +1428,8 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   offset?: number
   /** Server-only: keep a unified multi-source read on one database snapshot. */
   queryClient?: PoolClient
+  /** Server-only batch hydration for IDs selected by the unified page index. */
+  selectedIds?: readonly string[]
 }): Promise<{
   orders: OperationsImportedOrderWorkingCopy[]
   page: OperationsImportedOrderPage
@@ -1437,6 +1439,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     providerIdentities: OperationsOrderProviderIdentity[]
     sourceEvidence: OperationsOrderSourceEvidence[]
     resultSetRevision: string | null
+    databaseIds: string[]
   }
 }> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -1456,6 +1459,22 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     : null
   const pageSize = workbenchPageSize(input.pageSize)
   const offset = input.offset ?? 0
+  const selectedIds = input.selectedIds === undefined
+    ? null
+    : [...new Set(input.selectedIds.map((value) => String(value).trim()))]
+  if (
+    selectedIds
+    && (
+      selectedIds.length > MAX_WORKBENCH_PAGE_SIZE
+      || selectedIds.some((value) => !UUID.test(value))
+    )
+  ) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_BATCH_INVALID',
+      'Imported-order hydration batch is invalid',
+      500,
+    )
+  }
   if (!Number.isSafeInteger(offset) || offset < 0) {
     requestError(
       'OPERATIONS_PAGE_OFFSET_INVALID',
@@ -1504,6 +1523,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
         AND run.pipeline_id = candidate.pipeline_id
         AND run.id = candidate.run_id
        WHERE candidate.organization_id = $1::uuid
+         AND ($13::uuid[] IS NULL OR candidate.id = ANY($13::uuid[]))
          AND candidate.canonical_order_id IS NULL
          AND candidate.workflow_state IN ('held', 'resolving', 'ready')
          AND candidate.expires_at > now()
@@ -1543,6 +1563,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
           = retained.integration_account_id
         AND retained_candidate.id = retained.candidate_id
        WHERE retained.organization_id = $1::uuid
+         AND ($13::uuid[] IS NULL OR retained.candidate_id = ANY($13::uuid[]))
          AND retained.canonical_order_id IS NULL
          AND retained_candidate.canonical_order_id IS NULL
          AND NOT EXISTS (
@@ -1874,6 +1895,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          AND (
            $11::text IS NULL
            OR candidate_context.display_status = $11::text
+         )
+         AND (
+           $13::uuid[] IS NULL
+           OR candidate_context.candidate_id = ANY($13::uuid[])
          )
      ), matching_candidate_evidence AS MATERIALIZED (
        SELECT count(*)::text AS matching_total_count,
@@ -2225,6 +2250,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       pageSize + 1,
       status,
       offset,
+      selectedIds,
     ],
   )
   const hasNextPage = result.rows.length > pageSize
@@ -2352,6 +2378,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       integrationAccountGlobalId: row.integration_account_global_id,
       externalOrderId: row.external_order_id,
     },
+    provider: row.provider,
   }))
   const providerHistoryByCandidate = new Map<
     string,
@@ -2407,6 +2434,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       )),
       sourceEvidence,
       resultSetRevision,
+      databaseIds: pageRows.map((row) => row.candidate_id),
     },
   }
 }

@@ -38,6 +38,7 @@ export type OperationsOrderSourceEvidence = {
   rowCursor: string
   sortValue: string
   providerIdentity: OperationsOrderProviderIdentity | null
+  provider?: string
 }
 
 export type UnifiedOperationsOrderRow =
@@ -60,6 +61,8 @@ export type UnifiedOperationsOrderPage = {
   nextCursor: string | null
   complete: boolean
   truncated: boolean
+  /** Opaque result-set fence for direct numbered-page navigation. */
+  snapshot: string | null
 }
 
 export type UnifiedOperationsOrderPageInput = {
@@ -74,6 +77,8 @@ export type UnifiedOperationsOrderPageInput = {
   cursor?: string | null
   /** One-based direct page request. Mutually exclusive with cursor. */
   page?: number | null
+  /** Opaque result-set fence returned by the first direct page read. */
+  snapshot?: string | null
   pageSize?: number | null
 }
 
@@ -96,13 +101,6 @@ export type UnifiedOperationsOrderMergeResult = {
   importedConsumed: number
 }
 
-export type UnifiedOperationsOrderSeekResult = {
-  canonicalOffset: number
-  importedOffset: number
-  canonicalBefore: OperationsOrderSourceEvidence | null
-  importedBefore: OperationsOrderSourceEvidence | null
-}
-
 export class UnifiedOperationsOrderPageError extends Error {
   code: string
 
@@ -123,11 +121,52 @@ function compareUtf8(left: string, right: string) {
   return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
 }
 
+function orderProviderRank(value: string | null | undefined) {
+  const provider = String(value || '').trim().toLowerCase()
+  if (provider === 'shopify') return 0
+  if (provider === 'faire') return 1
+  return 2
+}
+
+function normalizedShopifyOrderNumber(value: string) {
+  const normalized = value.trim().replace(/^#/u, '')
+  return /^\d+$/u.test(normalized)
+    ? normalized.replace(/^0+(?=\d)/u, '')
+    : null
+}
+
+function compareNaturalOrderNumber(input: {
+  left: string
+  right: string
+  leftProvider?: string | null
+  rightProvider?: string | null
+}) {
+  const providerComparison = orderProviderRank(input.leftProvider)
+    - orderProviderRank(input.rightProvider)
+  if (providerComparison) return providerComparison
+  if (orderProviderRank(input.leftProvider) === 0) {
+    const leftNumber = normalizedShopifyOrderNumber(input.left)
+    const rightNumber = normalizedShopifyOrderNumber(input.right)
+    if (leftNumber && rightNumber) {
+      if (leftNumber.length !== rightNumber.length) {
+        return leftNumber.length < rightNumber.length ? -1 : 1
+      }
+      const numericComparison = compareUtf8(leftNumber, rightNumber)
+      if (numericComparison) return numericComparison
+    } else if (leftNumber || rightNumber) {
+      return leftNumber ? -1 : 1
+    }
+  }
+  return compareUtf8(input.left.toLowerCase(), input.right.toLowerCase())
+}
+
 export function compareUnifiedOperationsOrderSortValues(input: {
   left: string
   right: string
   sort: UnifiedOperationsOrderSort
   direction: OperationsOrderSortDirection
+  leftProvider?: string | null
+  rightProvider?: string | null
 }) {
   let comparison: number
   if (input.sort === 'updated' || input.sort === 'order_date') {
@@ -140,6 +179,16 @@ export function compareUnifiedOperationsOrderSortValues(input: {
       )
     }
     comparison = left === right ? 0 : left < right ? -1 : 1
+  } else if (input.sort === 'order_number') {
+    comparison = compareNaturalOrderNumber({
+      left: input.left,
+      right: input.right,
+      leftProvider: input.leftProvider,
+      rightProvider: input.rightProvider,
+    })
+    const providerComparison = orderProviderRank(input.leftProvider)
+      - orderProviderRank(input.rightProvider)
+    if (providerComparison) return providerComparison
   } else {
     comparison = compareUtf8(input.left, input.right)
   }
@@ -159,140 +208,13 @@ function compareUnifiedOperationsOrderSourceEvidence(input: {
     right: input.right.sortValue,
     sort: input.sort,
     direction: input.direction,
+    leftProvider: input.left.provider,
+    rightProvider: input.right.provider,
   })
   if (primaryComparison || input.leftSource === input.rightSource) {
     return primaryComparison
   }
-  const firstSource = input.direction === 'asc' ? 'canonical' : 'imported'
-  return input.leftSource === firstSource ? -1 : 1
-}
-
-/**
- * Finds how many rows from each sorted source precede a unified offset.
- * At most a constant number of source probes are made per binary-search step.
- */
-export async function seekUnifiedOperationsOrderPartition(input: {
-  canonicalTotal: number
-  importedTotal: number
-  offset: number
-  sort: UnifiedOperationsOrderSort
-  direction: OperationsOrderSortDirection
-  canonicalAt: (offset: number) => Promise<OperationsOrderSourceEvidence>
-  importedAt: (offset: number) => Promise<OperationsOrderSourceEvidence>
-}): Promise<UnifiedOperationsOrderSeekResult> {
-  const total = input.canonicalTotal + input.importedTotal
-  if (
-    !Number.isSafeInteger(input.canonicalTotal)
-    || input.canonicalTotal < 0
-    || !Number.isSafeInteger(input.importedTotal)
-    || input.importedTotal < 0
-    || !Number.isSafeInteger(total)
-    || !Number.isSafeInteger(input.offset)
-    || input.offset < 0
-    || input.offset > total
-  ) {
-    throw new UnifiedOperationsOrderPageError(
-      'OPERATIONS_UNIFIED_ORDER_OFFSET_INVALID',
-      'Unified order pagination received an invalid direct-page offset',
-    )
-  }
-
-  const canonicalCache = new Map<number, OperationsOrderSourceEvidence>()
-  const importedCache = new Map<number, OperationsOrderSourceEvidence>()
-  const probe = async (
-    source: 'canonical' | 'imported',
-    offset: number,
-  ) => {
-    const total = source === 'canonical'
-      ? input.canonicalTotal
-      : input.importedTotal
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset >= total) {
-      throw new UnifiedOperationsOrderPageError(
-        'OPERATIONS_UNIFIED_ORDER_OFFSET_INVALID',
-        'Unified order pagination attempted an invalid source offset probe',
-      )
-    }
-    const cache = source === 'canonical' ? canonicalCache : importedCache
-    const cached = cache.get(offset)
-    if (cached) return cached
-    const evidence = await (source === 'canonical'
-      ? input.canonicalAt(offset)
-      : input.importedAt(offset))
-    if (
-      !evidence
-      || typeof evidence.rowCursor !== 'string'
-      || evidence.rowCursor.length === 0
-      || typeof evidence.sortValue !== 'string'
-    ) {
-      throw new UnifiedOperationsOrderPageError(
-        'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
-        'Unified order pagination received invalid offset-probe evidence',
-      )
-    }
-    compareUnifiedOperationsOrderSortValues({
-      left: evidence.sortValue,
-      right: evidence.sortValue,
-      sort: input.sort,
-      direction: input.direction,
-    })
-    cache.set(offset, evidence)
-    return evidence
-  }
-
-  let low = Math.max(0, input.offset - input.importedTotal)
-  let high = Math.min(input.offset, input.canonicalTotal)
-  while (low <= high) {
-    const canonicalOffset = low + Math.floor((high - low) / 2)
-    const importedOffset = input.offset - canonicalOffset
-
-    if (canonicalOffset > 0 && importedOffset < input.importedTotal) {
-      const canonicalBefore = await probe('canonical', canonicalOffset - 1)
-      const importedAt = await probe('imported', importedOffset)
-      if (compareUnifiedOperationsOrderSourceEvidence({
-        left: canonicalBefore,
-        leftSource: 'canonical',
-        right: importedAt,
-        rightSource: 'imported',
-        sort: input.sort,
-        direction: input.direction,
-      }) > 0) {
-        high = canonicalOffset - 1
-        continue
-      }
-    }
-
-    if (importedOffset > 0 && canonicalOffset < input.canonicalTotal) {
-      const canonicalAt = await probe('canonical', canonicalOffset)
-      const importedBefore = await probe('imported', importedOffset - 1)
-      if (compareUnifiedOperationsOrderSourceEvidence({
-        left: canonicalAt,
-        leftSource: 'canonical',
-        right: importedBefore,
-        rightSource: 'imported',
-        sort: input.sort,
-        direction: input.direction,
-      }) < 0) {
-        low = canonicalOffset + 1
-        continue
-      }
-    }
-
-    return {
-      canonicalOffset,
-      importedOffset,
-      canonicalBefore: canonicalOffset > 0
-        ? await probe('canonical', canonicalOffset - 1)
-        : null,
-      importedBefore: importedOffset > 0
-        ? await probe('imported', importedOffset - 1)
-        : null,
-    }
-  }
-
-  throw new UnifiedOperationsOrderPageError(
-    'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
-    'Unified order pagination could not partition the requested page',
-  )
+  return input.leftSource === 'canonical' ? -1 : 1
 }
 
 function identityKey(identity: OperationsOrderProviderIdentity) {
