@@ -4,8 +4,10 @@ import { matonFetch } from '@/lib/maton'
 import {
   deleteOrganizationCommunicationBindingInPostgres,
   listOrganizationCommunicationBindingsInPostgres,
+  resolvePipelineCommunicationScopeInPostgres,
   upsertOrganizationCommunicationBindingInPostgres,
   type OrganizationCommunicationApp,
+  type PipelineCommunicationSnapshot,
 } from '@/lib/persistence/organizationCommunications'
 import { normalizeUserEmail } from '@/lib/users'
 
@@ -14,6 +16,22 @@ export const ORGANIZATION_COMMUNICATION_APPS = ['google-mail', 'google-calendar'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MAX_RESPONSE_BYTES = 1024 * 1024
+const MAX_CALENDAR_LIST_PAGES = 4
+const MAX_CALENDAR_OPTIONS = 1000
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/
+
+type GmailSendAsIdentity = {
+  email: string
+  verificationStatus: string
+  isDefault: boolean
+}
+
+type AccessibleGoogleCalendar = {
+  id: string
+  summary: string
+  primary: boolean
+  accessRole: 'owner' | 'writer'
+}
 
 export class OrganizationCommunicationRequestError extends Error {
   status: number
@@ -53,6 +71,22 @@ function connectionId(value: unknown): string {
     throw new OrganizationCommunicationRequestError('A valid active Maton connection is required')
   }
   return normalized
+}
+
+function calendarId(value: unknown, fallback = ''): string {
+  const normalized = typeof value === 'string' ? value.trim() : fallback
+  if (!normalized || normalized.length > 1024 || CONTROL_CHARACTER_PATTERN.test(normalized)) {
+    throw new OrganizationCommunicationRequestError('A valid accessible Google Calendar is required')
+  }
+  return normalized
+}
+
+function providerObjectList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => (
+        Boolean(item) && typeof item === 'object' && !Array.isArray(item)
+      ))
+    : []
 }
 
 export function normalizeCommunicationIdentityEmail(value: unknown, fallback?: string | null): string {
@@ -129,6 +163,88 @@ async function providerJson(input: {
   return responseJson(response, input.label)
 }
 
+async function listGmailSendAsIdentities(input: {
+  ownerEmail: string
+  connectionId: string
+}): Promise<GmailSendAsIdentity[]> {
+  const response = await providerJson({
+    ownerEmail: input.ownerEmail,
+    app: 'google-mail',
+    connectionId: input.connectionId,
+    pathname: '/google-mail/gmail/v1/users/me/settings/sendAs',
+    label: 'Gmail sender list',
+  })
+  return providerObjectList(response.sendAs)
+    .flatMap((item) => {
+      try {
+        const email = normalizeCommunicationIdentityEmail(item.sendAsEmail)
+        const verificationStatus = String(item.verificationStatus || '').trim().toLowerCase()
+        return [{
+          email,
+          verificationStatus,
+          isDefault: item.isDefault === true,
+        }]
+      } catch {
+        return []
+      }
+    })
+    .sort((left, right) => Number(right.isDefault) - Number(left.isDefault) || left.email.localeCompare(right.email))
+}
+
+async function listAccessibleGoogleCalendars(input: {
+  ownerEmail: string
+  connectionId: string
+}): Promise<AccessibleGoogleCalendar[]> {
+  const calendars: AccessibleGoogleCalendar[] = []
+  const seen = new Set<string>()
+  let pageToken = ''
+  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && calendars.length < MAX_CALENDAR_OPTIONS; page += 1) {
+    const parameters = new URLSearchParams({
+      maxResults: '250',
+      minAccessRole: 'writer',
+      showHidden: 'false',
+    })
+    if (pageToken) parameters.set('pageToken', pageToken)
+    const response = await providerJson({
+      ownerEmail: input.ownerEmail,
+      app: 'google-calendar',
+      connectionId: input.connectionId,
+      pathname: `/google-calendar/calendar/v3/users/me/calendarList?${parameters.toString()}`,
+      label: 'Google Calendar list',
+    })
+    for (const item of providerObjectList(response.items)) {
+      const accessRole = String(item.accessRole || '').trim().toLowerCase()
+      if (accessRole !== 'owner' && accessRole !== 'writer') continue
+      let id: string
+      try {
+        id = calendarId(item.id)
+      } catch {
+        continue
+      }
+      if (seen.has(id)) continue
+      seen.add(id)
+      calendars.push({
+        id,
+        summary: String(item.summaryOverride || item.summary || id).trim().slice(0, 300) || id,
+        primary: item.primary === true,
+        accessRole,
+      })
+      if (calendars.length >= MAX_CALENDAR_OPTIONS) break
+    }
+    const nextPageToken = String(response.nextPageToken || '').trim()
+    if (!nextPageToken) break
+    if (nextPageToken.length > 2048 || CONTROL_CHARACTER_PATTERN.test(nextPageToken)) {
+      throw new OrganizationCommunicationRequestError(
+        'Google Calendar list returned an invalid response',
+        502,
+        'ORGANIZATION_COMMUNICATION_PROVIDER_INVALID',
+      )
+    }
+    pageToken = nextPageToken
+  }
+  return calendars.sort((left, right) => Number(right.primary) - Number(left.primary) || left.summary.localeCompare(right.summary))
+}
+
 async function verifiedGmailIdentity(input: {
   ownerEmail: string
   connectionId: string
@@ -143,23 +259,14 @@ async function verifiedGmailIdentity(input: {
   })
   const accountEmail = normalizeCommunicationIdentityEmail(profile.emailAddress)
   const identityEmail = normalizeCommunicationIdentityEmail(input.requestedIdentityEmail, accountEmail)
-  if (identityEmail !== accountEmail) {
-    const sendAs = await providerJson({
-      ownerEmail: input.ownerEmail,
-      app: 'google-mail',
-      connectionId: input.connectionId,
-      pathname: `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(identityEmail)}`,
-      label: 'Gmail sender',
-    })
-    const verifiedEmail = normalizeCommunicationIdentityEmail(sendAs.sendAsEmail)
-    const verificationStatus = String(sendAs.verificationStatus || '').trim().toLowerCase()
-    if (verifiedEmail !== identityEmail || verificationStatus !== 'accepted') {
-      throw new OrganizationCommunicationRequestError(
-        'The requested Gmail sender is not an accepted send-as identity',
-        422,
-        'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED',
-      )
-    }
+  const sendAsIdentities = await listGmailSendAsIdentities(input)
+  const selectedIdentity = sendAsIdentities.find((candidate) => candidate.email === identityEmail)
+  if (!selectedIdentity || selectedIdentity.verificationStatus !== 'accepted') {
+    throw new OrganizationCommunicationRequestError(
+      'The requested Gmail sender is not an accepted send-as identity',
+      422,
+      'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED',
+    )
   }
   return { accountEmail, identityEmail, calendarId: null }
 }
@@ -167,16 +274,71 @@ async function verifiedGmailIdentity(input: {
 async function verifiedCalendarIdentity(input: {
   ownerEmail: string
   connectionId: string
-}): Promise<{ accountEmail: string; identityEmail: string; calendarId: 'primary' }> {
-  const calendar = await providerJson({
-    ownerEmail: input.ownerEmail,
-    app: 'google-calendar',
-    connectionId: input.connectionId,
-    pathname: '/google-calendar/calendar/v3/users/me/calendarList/primary',
-    label: 'Google Calendar account',
+  accountEmail: string | null
+  requestedCalendarId?: unknown
+}): Promise<{ accountEmail: string; identityEmail: string; calendarId: string }> {
+  const calendars = await listAccessibleGoogleCalendars(input)
+  const requestedCalendarId = input.requestedCalendarId === undefined || input.requestedCalendarId === null
+    || String(input.requestedCalendarId).trim() === ''
+    ? null
+    : calendarId(input.requestedCalendarId)
+  const selectedCalendar = requestedCalendarId
+    ? calendars.find((calendar) => calendar.id === requestedCalendarId)
+    : calendars.find((calendar) => calendar.primary)
+  if (!selectedCalendar) {
+    throw new OrganizationCommunicationRequestError(
+      requestedCalendarId
+        ? 'The selected Google Calendar is not accessible with write permission on this connection'
+        : 'This connection has no writable primary Google Calendar',
+      422,
+      'ORGANIZATION_COMMUNICATION_CALENDAR_NOT_WRITABLE',
+    )
+  }
+  const identityEmail = normalizeCommunicationIdentityEmail(selectedCalendar.id)
+  const primaryCalendar = calendars.find((calendar) => calendar.primary)
+  const accountEmail = normalizeCommunicationIdentityEmail(primaryCalendar?.id, input.accountEmail || identityEmail)
+  return { accountEmail, identityEmail, calendarId: selectedCalendar.id }
+}
+
+export async function resolveVerifiedPipelineCalendarSelection(input: {
+  pipelineId: unknown
+  actorEmail: unknown
+  connectionId: unknown
+  calendarId: unknown
+}): Promise<PipelineCommunicationSnapshot> {
+  const actorEmail = normalizeCommunicationIdentityEmail(input.actorEmail)
+  const normalizedConnectionId = connectionId(input.connectionId)
+  const normalizedCalendarId = calendarId(input.calendarId)
+  const scope = await resolvePipelineCommunicationScopeInPostgres({
+    pipelineId: String(input.pipelineId || ''),
+    actorEmail,
   })
-  const accountEmail = normalizeCommunicationIdentityEmail(calendar.id)
-  return { accountEmail, identityEmail: accountEmail, calendarId: 'primary' }
+  const credential = await resolveUserMatonGatewayCredential({
+    ownerEmail: actorEmail,
+    app: 'google-calendar',
+    boundConnectionId: normalizedConnectionId,
+  }).catch(() => {
+    throw new OrganizationCommunicationRequestError(
+      'The selected Google Calendar connection is not active for this account',
+      422,
+      'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID',
+    )
+  })
+  const verified = await verifiedCalendarIdentity({
+    ownerEmail: actorEmail,
+    connectionId: credential.connectionId,
+    accountEmail: credential.accountEmail,
+    requestedCalendarId: normalizedCalendarId,
+  })
+  return {
+    organizationId: scope.organizationId,
+    credentialOwnerEmail: actorEmail,
+    connectionId: credential.connectionId,
+    accountEmail: verified.accountEmail,
+    identityEmail: verified.identityEmail,
+    calendarId: verified.calendarId,
+    source: 'meeting-override',
+  }
 }
 
 export async function getOrganizationCommunicationState(input: {
@@ -189,22 +351,52 @@ export async function getOrganizationCommunicationState(input: {
     listOrganizationCommunicationBindingsInPostgres(normalizedOrganizationId),
     getMatonCredentialState(actorEmail),
   ])
-  return {
-    organizationId: normalizedOrganizationId,
-    bindings,
-    availableConnections: credential.connections
-      .filter((connection) => (
-        connection.source === 'maton'
-        && connection.status === 'ACTIVE'
-        && ORGANIZATION_COMMUNICATION_APPS.includes(connection.app as OrganizationCommunicationApp)
-      ))
-      .map((connection) => ({
+  const availableConnections = await Promise.all(credential.connections
+    .filter((connection) => (
+      connection.source === 'maton'
+      && connection.status === 'ACTIVE'
+      && ORGANIZATION_COMMUNICATION_APPS.includes(connection.app as OrganizationCommunicationApp)
+    ))
+    .map(async (connection) => {
+      const base = {
         connectionId: connection.connectionId,
         name: connection.name,
         app: connection.app,
         accountEmail: connection.accountEmail,
         selectedForUser: connection.selected,
-      })),
+      }
+      try {
+        if (connection.app === 'google-mail') {
+          return {
+            ...base,
+            gmailSendAsIdentities: await listGmailSendAsIdentities({
+              ownerEmail: actorEmail,
+              connectionId: connection.connectionId,
+            }),
+          }
+        }
+        return {
+          ...base,
+          calendars: await listAccessibleGoogleCalendars({
+            ownerEmail: actorEmail,
+            connectionId: connection.connectionId,
+          }),
+        }
+      } catch (error) {
+        const sanitized = error instanceof OrganizationCommunicationRequestError
+          ? error
+          : new OrganizationCommunicationRequestError('Provider options are unavailable', 502)
+        return {
+          ...base,
+          ...(connection.app === 'google-mail' ? { gmailSendAsIdentities: [] } : { calendars: [] }),
+          selectionError: sanitized.message,
+        }
+      }
+    }))
+  return {
+    organizationId: normalizedOrganizationId,
+    bindings,
+    availableConnections,
   }
 }
 
@@ -214,11 +406,26 @@ export async function bindOrganizationCommunication(input: {
   app: unknown
   connectionId: unknown
   identityEmail?: unknown
+  gmailSendAsEmail?: unknown
+  calendarId?: unknown
 }) {
   const normalizedOrganizationId = organizationId(input.organizationId)
   const actorEmail = normalizeCommunicationIdentityEmail(input.actorEmail)
   const app = normalizeOrganizationCommunicationApp(input.app)
   const normalizedConnectionId = connectionId(input.connectionId)
+  const suppliedIdentity = String(input.identityEmail || '').trim()
+  const suppliedGmailSendAs = String(input.gmailSendAsEmail || '').trim()
+  if (suppliedIdentity && suppliedGmailSendAs && suppliedIdentity.toLowerCase() !== suppliedGmailSendAs.toLowerCase()) {
+    throw new OrganizationCommunicationRequestError('Conflicting Gmail sender identities were supplied')
+  }
+  if (app === 'google-mail' && String(input.calendarId || '').trim()) {
+    throw new OrganizationCommunicationRequestError('Gmail sender selection cannot select a Google Calendar')
+  }
+  if (app === 'google-calendar' && (suppliedIdentity || suppliedGmailSendAs)) {
+    throw new OrganizationCommunicationRequestError(
+      'Google Calendar organizer identity is derived from the selected writable calendar',
+    )
+  }
   const credential = await resolveUserMatonGatewayCredential({
     ownerEmail: actorEmail,
     app,
@@ -234,11 +441,13 @@ export async function bindOrganizationCommunication(input: {
     ? await verifiedGmailIdentity({
         ownerEmail: actorEmail,
         connectionId: credential.connectionId,
-        requestedIdentityEmail: input.identityEmail,
+        requestedIdentityEmail: suppliedGmailSendAs || suppliedIdentity,
       })
     : await verifiedCalendarIdentity({
         ownerEmail: actorEmail,
         connectionId: credential.connectionId,
+        accountEmail: credential.accountEmail,
+        requestedCalendarId: input.calendarId,
       })
 
   await upsertOrganizationCommunicationBindingInPostgres({

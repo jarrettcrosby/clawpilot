@@ -34,6 +34,7 @@ function loadTypeScriptModule(path, mocks = {}) {
     TextDecoder,
     TextEncoder,
     URL,
+    URLSearchParams,
     clearTimeout,
     console,
     exports: module.exports,
@@ -72,9 +73,20 @@ for (const fragment of [
   assert.ok(migration.includes(fragment), `Organization communication migration missing ${fragment}`)
 }
 
+const calendarSelectionMigration = read('db/migrations/0345_organization_calendar_selection.sql')
+for (const fragment of [
+  'DROP CONSTRAINT IF EXISTS organization_communication_bindings_calendar_id_valid',
+  'char_length(calendar_id) BETWEEN 1 AND 1024',
+  "calendar_id !~ '[[:cntrl:]]'",
+  "communication_binding_source IN ('organization', 'user-default', 'meeting-override')",
+]) {
+  assert.ok(calendarSelectionMigration.includes(fragment), `Calendar selection migration missing ${fragment}`)
+}
+
 const persistence = read('app_src/lib/persistence/organizationCommunications.ts')
 for (const fragment of [
   'resolvePipelineCommunicationSnapshotInPostgres',
+  'resolvePipelineCommunicationScopeInPostgres',
   'workspace_organization_id',
   'organization_communication_bindings',
   "connection.status = 'ACTIVE'",
@@ -104,50 +116,411 @@ for (const fragment of [
   'communication_binding_source',
   'existing.communication_identity_email IS NOT DISTINCT FROM $15',
   'existing.communication_binding_source IS NOT DISTINCT FROM $17',
-  'boundConnectionId: action.communicationConnectionId || undefined',
+  'boundConnectionId: action.communicationConnectionId',
   '/settings/sendAs/${encodeURIComponent(senderEmail)}',
-  '/google-calendar/calendar/v3/users/me/calendarList/primary',
-  'The queued Calendar account no longer matches its reviewed identity',
-  'selectedConnection.calendarId || \'primary\'',
+  '/google-calendar/calendar/v3/users/me/calendarList?',
+  'The queued Calendar organizer no longer matches its reviewed identity',
+  "calendarIdentifier(selectedConnection.calendarId, 'Queued Calendar ID')",
   'communication: action.communication',
+  "error.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_REQUIRED'",
+  'throw await providerRequestError(app, response)',
+  "'calendarDeliveryStatus', 'failed'",
+  "'CRM_ACTION_COMMUNICATION_SNAPSHOT_REQUIRED'",
+  "type CalendarMeetingMode = 'google_meet' | 'in_person' | 'custom_link'",
+  "meetingMode === 'google_meet'",
+  "? 'conferenceDataVersion=1&sendUpdates=all'",
+  'communicationOverride?: PipelineCommunicationSnapshot',
+  "value?.source !== 'meeting-override'",
+  'stageCrmMeetingAndEnqueueCalendarAction',
+  'previousCalendar',
+  'conferenceData: null',
+  'location: eventLocation || (!createDestinationEvent ? null : undefined)',
 ]) {
   assert.ok(actionRuntime.includes(fragment), `CRM communication runtime missing ${fragment}`)
 }
 
 const route = read('app_src/app/api/integrations/communications/route.ts')
 assert.ok(route.includes('requireManager(actor)'))
-assert.ok(route.includes("requireOnlyFields(body, ['action', 'app', 'connectionId', 'identityEmail'])"))
+const communicationGet = route.slice(route.indexOf('export async function GET'), route.indexOf('export async function PATCH'))
+assert.ok(!communicationGet.includes('requireManager(actor)'), 'read-only provider choices must be available to CRM editors')
+assert.ok(communicationGet.includes('canManageOrganizationCommunications(actor)'))
+assert.ok(communicationGet.includes('{ ...communication, bindings: [] }'), 'non-managers must not receive organization binding credential metadata')
+assert.ok(route.includes("'gmailSendAsEmail', 'calendarId'"))
 assert.ok(route.includes("String(body.action || '').trim() !== 'bind'"))
 
 const crmRoute = read('app_src/app/api/crm/route.ts')
 assert.ok(crmRoute.includes('calendarActionUnavailable'))
-assert.ok(crmRoute.includes("error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'"))
+assert.ok(crmRoute.includes("error.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_REQUIRED'"))
+assert.ok(crmRoute.includes("code: 'CRM_COMMUNICATION_CONNECTION_REQUIRED'"))
+assert.ok(crmRoute.includes('resolveVerifiedPipelineCalendarSelection'))
+assert.ok(crmRoute.includes('stageCrmMeetingAndEnqueueCalendarAction'))
+assert.ok(crmRoute.includes('meetingSaveIdempotencyKey'))
+assert.ok(crmRoute.includes('CRM_IMPERSONATION_FORBIDDEN'))
+const crmActionRoute = read('app_src/app/api/crm/actions/route.ts')
+assert.ok(crmActionRoute.includes("'calendarConnectionId'"))
+assert.ok(crmActionRoute.includes('resolveVerifiedPipelineCalendarSelection'))
+assert.ok(crmActionRoute.includes('communicationOverride'))
+assert.ok(crmActionRoute.includes('CRM_ACTION_IMPERSONATION_FORBIDDEN'))
 const suiteCrmMeetingIngestion = read('app_src/lib/crm/suiteCrmMeetingIngestion.ts')
 assert.ok(suiteCrmMeetingIngestion.includes("error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'"))
+
+class TestCrmIntegrationActionError extends Error {
+  constructor(message, status = 400, code = 'CRM_ACTION_INVALID') {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+const nextServerMock = {
+  NextRequest: class {},
+  NextResponse: {
+    json(payload, init = {}) {
+      return new Response(JSON.stringify(payload), {
+        status: init.status || 200,
+        headers: { 'Content-Type': 'application/json', ...(init.headers || {}) },
+      })
+    },
+  },
+}
+let routeSession = {
+  authenticatedUser: 'admin@example.com',
+  effectiveUser: 'member@example.com',
+  impersonating: true,
+}
+let guardedUserLookupCount = 0
+const guardedRequestUserMock = {
+  requestSession: async () => routeSession,
+  requireRequestUser: async () => {
+    guardedUserLookupCount += 1
+    throw new Error('write guard should run before user lookup')
+  },
+}
+const crmWriteRoute = loadTypeScriptModule('app_src/app/api/crm/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/globalIds.mjs': { GLOBAL_ID_MAX_LENGTH: 64 },
+  '@/lib/crm/types': { CRM_ENTITIES: ['organizations', 'contacts', 'products', 'leads', 'opportunities', 'meetings', 'interactions', 'campaigns'] },
+  '@/lib/currency': { isIso4217CurrencyCode: () => true },
+  '@/lib/crm/integrationActions': {
+    CrmIntegrationActionError: TestCrmIntegrationActionError,
+    stageCrmMeetingAndEnqueueCalendarAction: async () => { throw new Error('not expected') },
+  },
+  '@/lib/integrations/organizationCommunications': {},
+  '@/lib/crm/boardProjection': {},
+  '@/lib/persistence/crm': {},
+  '@/lib/organizations': {},
+  '@/lib/crm/suiteCrmPublicUrl': {},
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/organizationCommunications': { OrganizationCommunicationPersistenceError: class extends Error {} },
+  '@/lib/persistence/measurementPreferences': {},
+  '@/lib/operations/authorization': {},
+  '@/lib/requestUser': guardedRequestUserMock,
+  '@/lib/users': {},
+  '@/lib/tenancy': {},
+})
+const impersonatedRequest = { headers: new Headers(), cookies: { get: () => undefined } }
+let guardedResponse = await crmWriteRoute.POST(impersonatedRequest)
+assert.equal(guardedResponse.status, 403)
+assert.equal((await guardedResponse.json()).code, 'CRM_IMPERSONATION_FORBIDDEN')
+routeSession = { ...routeSession, impersonating: false }
+guardedResponse = await crmWriteRoute.PATCH(impersonatedRequest)
+assert.equal(guardedResponse.status, 403)
+assert.equal((await guardedResponse.json()).code, 'CRM_IMPERSONATION_FORBIDDEN')
+
+routeSession = { ...routeSession, impersonating: true }
+const crmActionWriteRoute = loadTypeScriptModule('app_src/app/api/crm/actions/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/crm/integrationActions': {
+    CrmIntegrationActionError: TestCrmIntegrationActionError,
+  },
+  '@/lib/integrations/organizationCommunications': {},
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/requestUser': guardedRequestUserMock,
+  '@/lib/tenancy': {},
+})
+guardedResponse = await crmActionWriteRoute.POST(impersonatedRequest)
+assert.equal(guardedResponse.status, 403)
+assert.equal((await guardedResponse.json()).code, 'CRM_ACTION_IMPERSONATION_FORBIDDEN')
+routeSession = { ...routeSession, impersonating: false }
+guardedResponse = await crmActionWriteRoute.PATCH(impersonatedRequest)
+assert.equal(guardedResponse.status, 403)
+assert.equal((await guardedResponse.json()).code, 'CRM_ACTION_IMPERSONATION_FORBIDDEN')
+assert.equal(guardedUserLookupCount, 0, 'impersonation writes must be rejected before resolving an effective actor')
+
+const ROUTE_PIPELINE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const ROUTE_ACTION_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const ROUTE_ACTOR_EMAIL = 'operator@example.com'
+const ROUTE_REFERENCE = 'gm1234567'
+const ROUTE_EXACT_HASH = 'a'.repeat(64)
+const ROUTE_CHANGED_HASH = 'b'.repeat(64)
+const ROUTE_DEFAULT_HASH = 'c'.repeat(64)
+const replayedActionView = {
+  id: ROUTE_ACTION_ID,
+  pipelineId: ROUTE_PIPELINE_ID,
+  provider: 'maton',
+  app: 'google-calendar',
+  actionType: 'create_calendar_event',
+  referenceCode: ROUTE_REFERENCE,
+  status: 'succeeded',
+  attempts: 1,
+  availableAt: '2026-09-02T12:00:00.000Z',
+  externalId: 'google-event-id',
+  responseSummary: { eventId: 'google-event-id' },
+  communication: null,
+  lastError: null,
+  processedAt: '2026-09-02T12:00:01.000Z',
+  createdAt: '2026-09-02T12:00:00.000Z',
+  updatedAt: '2026-09-02T12:00:01.000Z',
+}
+const validRouteRequestUserMock = {
+  requestSession: async () => ({
+    authenticatedUser: ROUTE_ACTOR_EMAIL,
+    effectiveUser: ROUTE_ACTOR_EMAIL,
+    impersonating: false,
+  }),
+  requireRequestUser: async () => ({ email: ROUTE_ACTOR_EMAIL }),
+}
+const validTenancyMock = {
+  PIPELINE_SELECTION_COOKIE: 'clawpilot-pipeline',
+  requireResourceEditor: () => {},
+  resolvePipelineSpaceAccess: async () => ({ id: ROUTE_PIPELINE_ID }),
+}
+const routeClientHash = (value) => {
+  if (
+    value?.payload?.subject === 'Changed retry intent'
+    || value?.fields?.subject === 'Changed retry intent'
+  ) return ROUTE_CHANGED_HASH
+  if (
+    value?.calendarSelection === null
+    || (value?.fields && !value.fields.calendarConnectionId && !value.fields.calendarId)
+  ) return ROUTE_DEFAULT_HASH
+  return ROUTE_EXACT_HASH
+}
+let actionCalendarResolutionCalls = 0
+let actionEnqueueCalls = 0
+let mutableCalendarState = 'revoked'
+const replayingActionRoute = loadTypeScriptModule('app_src/app/api/crm/actions/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/crm/integrationActions': {
+    CrmIntegrationActionError: TestCrmIntegrationActionError,
+    crmIntegrationClientRequestHash: routeClientHash,
+    replayCrmIntegrationActionByIdempotencyKey: async (input) => {
+      if (![ROUTE_EXACT_HASH, ROUTE_DEFAULT_HASH].includes(input.clientRequestHash)) {
+        throw new TestCrmIntegrationActionError(
+          'Idempotency key was already used for a different CRM action',
+          409,
+          'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+        )
+      }
+      return { action: replayedActionView, aggregateId: ROUTE_ACTION_ID, referenceCode: ROUTE_REFERENCE }
+    },
+    enqueueCrmIntegrationAction: async () => {
+      actionEnqueueCalls += 1
+      throw new Error('an exact replay must not enqueue again')
+    },
+  },
+  '@/lib/integrations/organizationCommunications': {
+    resolveVerifiedPipelineCalendarSelection: async () => {
+      actionCalendarResolutionCalls += 1
+      if (mutableCalendarState === 'revoked') throw new Error('Calendar connection was revoked')
+      return { connectionId: 'changed-binding' }
+    },
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/requestUser': validRouteRequestUserMock,
+  '@/lib/tenancy': validTenancyMock,
+})
+function crmActionRequest(subject, options = {}) {
+  const includeSelection = options.includeSelection !== false
+  const raw = JSON.stringify({
+    actionType: 'create_calendar_event',
+    referenceCode: ROUTE_REFERENCE,
+    payload: {
+      subject,
+      startsAt: '2026-09-03T14:00:00.000Z',
+      endsAt: '2026-09-03T14:30:00.000Z',
+      timezone: 'America/New_York',
+    },
+    ...(includeSelection ? {
+      calendarConnectionId: 'revoked-or-rebound-connection',
+      calendarId: 'jarrett@bposupplychain.com',
+    } : {}),
+    idempotencyKey: options.idempotencyKey || 'route-lost-response-key',
+  })
+  return {
+    headers: new Headers({ 'content-length': String(Buffer.byteLength(raw)) }),
+    cookies: { get: () => undefined },
+    text: async () => raw,
+  }
+}
+let replayResponse = await replayingActionRoute.POST(crmActionRequest('Original meeting intent'))
+assert.equal(replayResponse.status, 200)
+assert.equal((await replayResponse.json()).action.id, ROUTE_ACTION_ID)
+assert.equal(actionCalendarResolutionCalls, 0, 'lost-response replay must survive a revoked Calendar connection')
+assert.equal(actionEnqueueCalls, 0)
+mutableCalendarState = 'changed-binding'
+replayResponse = await replayingActionRoute.POST(crmActionRequest('Original meeting intent', {
+  includeSelection: false,
+  idempotencyKey: 'route-default-binding-lost-response-key',
+}))
+assert.equal(replayResponse.status, 200)
+assert.equal(actionCalendarResolutionCalls, 0, 'lost-response replay must ignore a changed organization Calendar binding')
+const actionConflictResponse = await replayingActionRoute.POST(crmActionRequest('Changed retry intent'))
+assert.equal(actionConflictResponse.status, 409)
+assert.equal((await actionConflictResponse.json()).code, 'CRM_ACTION_IDEMPOTENCY_CONFLICT')
+assert.equal(actionCalendarResolutionCalls, 0, 'same-key/different-payload conflict must precede Calendar resolution')
+
+let nativeCalendarResolutionCalls = 0
+let nativeHierarchyCalls = 0
+let nativeStageCalls = 0
+const replayingNativeMeetingRoute = loadTypeScriptModule('app_src/app/api/crm/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/globalIds.mjs': { GLOBAL_ID_MAX_LENGTH: 64 },
+  '@/lib/crm/types': { CRM_ENTITIES: ['organizations', 'contacts', 'products', 'leads', 'opportunities', 'meetings', 'interactions', 'campaigns'] },
+  '@/lib/currency': { isIso4217CurrencyCode: () => true },
+  '@/lib/crm/integrationActions': {
+    CrmIntegrationActionError: TestCrmIntegrationActionError,
+    crmIntegrationClientRequestHash: routeClientHash,
+    replayCrmMeetingSaveByIdempotencyKey: async (input) => {
+      if (![ROUTE_EXACT_HASH, ROUTE_DEFAULT_HASH].includes(input.clientRequestHash)) {
+        throw new TestCrmIntegrationActionError(
+          'Idempotency key was already used for a different CRM action',
+          409,
+          'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+        )
+      }
+      return {
+        action: replayedActionView,
+        created: false,
+        reused: true,
+        staged: {
+          id: ROUTE_ACTION_ID,
+          suiteCrmId: 'suitecrm-meeting-id',
+          referenceCode: ROUTE_REFERENCE,
+          shortUrl: `https://clawpilot.example/m/${ROUTE_REFERENCE}`,
+          sourceHash: 'persisted-meeting-source-hash',
+        },
+      }
+    },
+    stageCrmMeetingAndEnqueueCalendarAction: async () => {
+      nativeStageCalls += 1
+      throw new Error('an exact meeting replay must not stage again')
+    },
+  },
+  '@/lib/integrations/organizationCommunications': {
+    resolveVerifiedPipelineCalendarSelection: async () => {
+      nativeCalendarResolutionCalls += 1
+      throw new Error('Calendar connection was revoked')
+    },
+  },
+  '@/lib/crm/boardProjection': {},
+  '@/lib/persistence/crm': {
+    ensurePipelineCrmHierarchy: async () => {
+      nativeHierarchyCalls += 1
+      throw new Error('an exact meeting replay must not restage CRM hierarchy')
+    },
+  },
+  '@/lib/organizations': {},
+  '@/lib/crm/suiteCrmPublicUrl': {},
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/organizationCommunications': {
+    OrganizationCommunicationPersistenceError: class extends Error {},
+    resolvePipelineCommunicationSnapshotInPostgres: async () => {
+      nativeCalendarResolutionCalls += 1
+      throw new Error('Organization Calendar binding changed')
+    },
+  },
+  '@/lib/persistence/measurementPreferences': {},
+  '@/lib/operations/authorization': {},
+  '@/lib/requestUser': validRouteRequestUserMock,
+  '@/lib/users': {},
+  '@/lib/tenancy': validTenancyMock,
+})
+function nativeMeetingRequest(subject, options = {}) {
+  const includeSelection = options.includeSelection !== false
+  return {
+    headers: new Headers(),
+    cookies: { get: () => undefined },
+    json: async () => ({
+      entity: 'meetings',
+      idempotencyKey: options.idempotencyKey || 'native-lost-response-key',
+      fields: {
+        subject,
+        startsAt: '2026-09-03T14:00:00.000Z',
+        endsAt: '2026-09-03T14:30:00.000Z',
+        timezone: 'America/New_York',
+        ...(includeSelection ? {
+          calendarConnectionId: 'revoked-or-rebound-connection',
+          calendarId: 'jarrett@bposupplychain.com',
+        } : {}),
+      },
+    }),
+  }
+}
+replayResponse = await replayingNativeMeetingRoute.POST(nativeMeetingRequest('Original meeting intent'))
+assert.equal(replayResponse.status, 200)
+assert.equal((await replayResponse.json()).record.referenceCode, ROUTE_REFERENCE)
+assert.equal(nativeCalendarResolutionCalls, 0, 'native replay must precede selected/default Calendar resolution')
+assert.equal(nativeHierarchyCalls, 0, 'native replay must precede mutable CRM restaging')
+assert.equal(nativeStageCalls, 0)
+replayResponse = await replayingNativeMeetingRoute.POST(nativeMeetingRequest('Original meeting intent', {
+  includeSelection: false,
+  idempotencyKey: 'native-default-binding-lost-response-key',
+}))
+assert.equal(replayResponse.status, 200)
+assert.equal(nativeCalendarResolutionCalls, 0, 'native replay must ignore a changed organization Calendar default')
+const nativeConflictResponse = await replayingNativeMeetingRoute.POST(nativeMeetingRequest('Changed retry intent'))
+assert.equal(nativeConflictResponse.status, 409)
+assert.equal((await nativeConflictResponse.json()).code, 'CRM_ACTION_IDEMPOTENCY_CONFLICT')
+assert.equal(nativeCalendarResolutionCalls, 0)
 
 const writes = []
 let providerMode = 'alias-accepted'
 const providerRequests = []
 const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommunications.ts', {
   '@/lib/integrations/matonGatewayCredentials': {
-    resolveUserMatonGatewayCredential: async ({ ownerEmail, app, boundConnectionId }) => ({
-      apiKey: 'secret-not-returned',
-      connectionId: boundConnectionId,
-      accountEmail: ownerEmail,
-      app,
-    }),
+    resolveUserMatonGatewayCredential: async ({ ownerEmail, app, boundConnectionId }) => {
+      if (boundConnectionId === 'other-actor-connection') throw new Error('connection owner mismatch')
+      return {
+        apiKey: 'secret-not-returned',
+        connectionId: boundConnectionId,
+        accountEmail: boundConnectionId === 'personal-calendar-connection'
+          ? 'jarrettcrosby@gmail.com'
+          : ownerEmail,
+        app,
+      }
+    },
   },
   '@/lib/integrations/matonCredentials': {
     getMatonCredentialState: async () => ({
-      connections: [{
-        connectionId: 'mail-connection',
-        name: 'Primary Gmail',
-        app: 'google-mail',
-        accountEmail: 'jarrett@suburbiasandwichco.com',
-        status: 'ACTIVE',
-        source: 'maton',
-        selected: true,
-      }],
+      connections: [
+        {
+          connectionId: 'mail-connection',
+          name: 'Suburbia Gmail',
+          app: 'google-mail',
+          accountEmail: 'jarrett@suburbiasandwichco.com',
+          status: 'ACTIVE',
+          source: 'maton',
+          selected: true,
+        },
+        {
+          connectionId: 'calendar-connection',
+          name: 'Suburbia Google Calendar',
+          app: 'google-calendar',
+          accountEmail: 'jarrett@suburbiasandwichco.com',
+          status: 'ACTIVE',
+          source: 'maton',
+          selected: true,
+        },
+        {
+          connectionId: 'personal-calendar-connection',
+          name: 'Personal Google Calendar',
+          app: 'google-calendar',
+          accountEmail: 'jarrettcrosby@gmail.com',
+          status: 'ACTIVE',
+          source: 'maton',
+          selected: false,
+        },
+      ],
     }),
   },
   '@/lib/maton': {
@@ -159,14 +532,52 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
           headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (pathname.includes('/settings/sendAs/')) {
-        return new Response(JSON.stringify({
-          sendAsEmail: 'jarrett@bposupplychain.com',
-          verificationStatus: providerMode === 'alias-accepted' ? 'accepted' : 'pending',
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      if (pathname.endsWith('/settings/sendAs')) {
+        return new Response(JSON.stringify({ sendAs: [
+          {
+            sendAsEmail: 'jarrett@suburbiasandwichco.com',
+            verificationStatus: 'accepted',
+            isDefault: true,
+          },
+          {
+            sendAsEmail: 'jarrett@bposupplychain.com',
+            verificationStatus: providerMode === 'alias-accepted' ? 'accepted' : 'pending',
+            isDefault: false,
+          },
+        ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
-      if (pathname.endsWith('/calendarList/primary')) {
-        return new Response(JSON.stringify({ id: 'jarrett@bposupplychain.com' }), {
+      if (pathname.includes('/calendarList?')) {
+        if (context.boundConnectionId === 'personal-calendar-connection') {
+          return new Response(JSON.stringify({ items: [
+            {
+              id: 'jarrettcrosby@gmail.com',
+              summary: 'Jarrett personal',
+              primary: true,
+              accessRole: 'owner',
+            },
+          ] }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        return new Response(JSON.stringify({ items: [
+          {
+            id: 'jarrett@suburbiasandwichco.com',
+            summary: 'Suburbia primary calendar',
+            primary: true,
+            accessRole: 'owner',
+          },
+          {
+            id: 'jarrett@bposupplychain.com',
+            summary: 'BPO Supply Chain',
+            accessRole: 'writer',
+          },
+          {
+            id: 'readonly@example.com',
+            summary: 'Read only',
+            accessRole: 'reader',
+          },
+        ] }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -177,6 +588,9 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
   '@/lib/persistence/organizationCommunications': {
     deleteOrganizationCommunicationBindingInPostgres: async () => {},
     listOrganizationCommunicationBindingsInPostgres: async () => [],
+    resolvePipelineCommunicationScopeInPostgres: async () => ({
+      organizationId: '11111111-1111-4111-8111-111111111111',
+    }),
     upsertOrganizationCommunicationBindingInPostgres: async (input) => writes.push(input),
   },
   '@/lib/users': { normalizeUserEmail },
@@ -186,7 +600,7 @@ assert.equal(service.normalizeOrganizationCommunicationApp('gmail'), 'google-mai
 assert.equal(service.normalizeOrganizationCommunicationApp('calendar'), 'google-calendar')
 assert.throws(() => service.normalizeOrganizationCommunicationApp('drive'), /Gmail or Google Calendar/)
 
-await service.bindOrganizationCommunication({
+const gmailState = await service.bindOrganizationCommunication({
   organizationId: '11111111-1111-4111-8111-111111111111',
   actorEmail: 'jarrett@suburbiasandwichco.com',
   app: 'google-mail',
@@ -196,8 +610,24 @@ await service.bindOrganizationCommunication({
 assert.equal(writes[0].identityEmail, 'jarrett@bposupplychain.com')
 assert.equal(writes[0].accountEmail, 'jarrett@suburbiasandwichco.com')
 assert.equal(writes[0].calendarId, null)
-assert.ok(providerRequests.some((request) => request.pathname.includes('/settings/sendAs/jarrett%40bposupplychain.com')))
-assert.ok(providerRequests.every((request) => request.context.boundConnectionId === 'mail-connection'))
+assert.ok(providerRequests.some((request) => request.pathname.endsWith('/settings/sendAs')))
+assert.ok(providerRequests.every((request) => [
+  'mail-connection',
+  'calendar-connection',
+  'personal-calendar-connection',
+].includes(request.context.boundConnectionId)))
+assert.equal(
+  JSON.stringify(gmailState.availableConnections.find((connection) => connection.connectionId === 'mail-connection')?.gmailSendAsIdentities),
+  JSON.stringify([
+    { email: 'jarrett@suburbiasandwichco.com', verificationStatus: 'accepted', isDefault: true },
+    { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isDefault: false },
+  ]),
+)
+assert.equal(
+  gmailState.availableConnections.find((connection) => connection.connectionId === 'calendar-connection')?.calendars.length,
+  2,
+  'read-only calendars must not be offered',
+)
 
 providerMode = 'alias-pending'
 await assert.rejects(
@@ -217,8 +647,85 @@ await service.bindOrganizationCommunication({
   actorEmail: 'jarrett@suburbiasandwichco.com',
   app: 'google-calendar',
   connectionId: 'calendar-connection',
+  calendarId: 'jarrett@bposupplychain.com',
 })
 assert.equal(writes[1].identityEmail, 'jarrett@bposupplychain.com')
-assert.equal(writes[1].calendarId, 'primary')
+assert.equal(writes[1].accountEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(writes[1].calendarId, 'jarrett@bposupplychain.com')
+
+await assert.rejects(
+  service.bindOrganizationCommunication({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    app: 'google-calendar',
+    connectionId: 'calendar-connection',
+    calendarId: 'readonly@example.com',
+  }),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CALENDAR_NOT_WRITABLE',
+)
+
+await assert.rejects(
+  service.bindOrganizationCommunication({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    app: 'google-calendar',
+    connectionId: 'calendar-connection',
+    calendarId: 'jarrett@bposupplychain.com',
+    identityEmail: 'jarrett@suburbiasandwichco.com',
+  }),
+  /organizer identity is derived/,
+)
+
+const writesBeforeMeetingSelections = writes.length
+const bpoMeetingSelection = await service.resolveVerifiedPipelineCalendarSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'calendar-connection',
+  calendarId: 'jarrett@bposupplychain.com',
+})
+assert.equal(bpoMeetingSelection.organizationId, '11111111-1111-4111-8111-111111111111')
+assert.equal(bpoMeetingSelection.credentialOwnerEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(bpoMeetingSelection.connectionId, 'calendar-connection')
+assert.equal(bpoMeetingSelection.accountEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(bpoMeetingSelection.identityEmail, 'jarrett@bposupplychain.com')
+assert.equal(bpoMeetingSelection.calendarId, 'jarrett@bposupplychain.com')
+assert.equal(bpoMeetingSelection.source, 'meeting-override')
+
+const personalMeetingSelection = await service.resolveVerifiedPipelineCalendarSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'personal-calendar-connection',
+  calendarId: 'jarrettcrosby@gmail.com',
+})
+assert.equal(personalMeetingSelection.connectionId, 'personal-calendar-connection')
+assert.equal(personalMeetingSelection.accountEmail, 'jarrettcrosby@gmail.com')
+assert.equal(personalMeetingSelection.identityEmail, 'jarrettcrosby@gmail.com')
+assert.equal(personalMeetingSelection.calendarId, 'jarrettcrosby@gmail.com')
+assert.equal(personalMeetingSelection.source, 'meeting-override')
+assert.equal(
+  writes.length,
+  writesBeforeMeetingSelections,
+  'per-meeting Calendar selection must not mutate the organization default binding',
+)
+
+await assert.rejects(
+  service.resolveVerifiedPipelineCalendarSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId: 'calendar-connection',
+    calendarId: 'readonly@example.com',
+  }),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CALENDAR_NOT_WRITABLE',
+)
+
+await assert.rejects(
+  service.resolveVerifiedPipelineCalendarSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId: 'other-actor-connection',
+    calendarId: 'other@example.com',
+  }),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID',
+)
 
 console.log('organization communications contract tests passed')

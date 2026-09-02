@@ -9,7 +9,7 @@ import {
 type TimestampValue = string | Date
 
 export type OrganizationCommunicationApp = 'google-mail' | 'google-calendar'
-export type OrganizationCommunicationBindingSource = 'organization' | 'user-default'
+export type OrganizationCommunicationBindingSource = 'organization' | 'user-default' | 'meeting-override'
 export type OrganizationCommunicationBindingStatus = 'active' | 'disabled'
 
 type OrganizationCommunicationBindingRow = {
@@ -67,6 +67,10 @@ export type PipelineCommunicationSnapshot = {
   identityEmail: string
   calendarId: string | null
   source: OrganizationCommunicationBindingSource
+}
+
+export type PipelineCommunicationScope = {
+  organizationId: string
 }
 
 export class OrganizationCommunicationPersistenceError extends Error {
@@ -170,7 +174,7 @@ function normalizeCalendarId(
     }
     return null
   }
-  if (normalized !== 'primary' || CONTROL_CHARACTER_PATTERN.test(normalized)) {
+  if (!normalized || normalized.length > 1024 || CONTROL_CHARACTER_PATTERN.test(normalized)) {
     throw new OrganizationCommunicationPersistenceError('A valid Google Calendar ID is required')
   }
   return normalized
@@ -468,6 +472,45 @@ export async function deleteOrganizationCommunicationBindingInPostgres(input: {
   })
 }
 
+export async function resolvePipelineCommunicationScopeInPostgres(input: {
+  pipelineId: string
+  actorEmail: string
+}): Promise<PipelineCommunicationScope> {
+  const pipelineId = normalizeUuid(input.pipelineId, 'pipeline ID')
+  const actorEmail = normalizeEmail(input.actorEmail, 'actor email')
+  const result = await query<{
+    organization_id: string
+    actor_membership_status: string | null
+  }>(
+    `SELECT
+       pipeline.workspace_organization_id::text AS organization_id,
+       actor_membership.status AS actor_membership_status
+     FROM pipeline_spaces pipeline
+     LEFT JOIN app_user_organization_memberships actor_membership
+       ON actor_membership.organization_id = pipeline.workspace_organization_id
+      AND actor_membership.user_email = $2
+     WHERE pipeline.id = $1::uuid
+     LIMIT 1`,
+    [pipelineId, actorEmail],
+  )
+  const row = result.rows[0]
+  if (!row) {
+    throw new OrganizationCommunicationPersistenceError(
+      'The communication pipeline was not found',
+      404,
+      'ORGANIZATION_COMMUNICATION_PIPELINE_NOT_FOUND',
+    )
+  }
+  if (row.actor_membership_status !== 'active') {
+    throw new OrganizationCommunicationPersistenceError(
+      'The communication actor must be an active pipeline organization member',
+      403,
+      'ORGANIZATION_COMMUNICATION_MEMBERSHIP_REQUIRED',
+    )
+  }
+  return { organizationId: row.organization_id }
+}
+
 export async function resolvePipelineCommunicationSnapshotInPostgres(input: {
   pipelineId: string
   actorEmail: string
@@ -507,7 +550,13 @@ export async function resolvePipelineCommunicationSnapshotInPostgres(input: {
            AND binding.identity_email IS NOT NULL
            AND (
              (binding.app = 'google-mail' AND binding.calendar_id IS NULL)
-             OR (binding.app = 'google-calendar' AND binding.calendar_id = 'primary')
+             OR (
+               binding.app = 'google-calendar'
+               AND binding.calendar_id IS NOT NULL
+               AND binding.calendar_id = btrim(binding.calendar_id)
+               AND char_length(binding.calendar_id) BETWEEN 1 AND 1024
+               AND binding.calendar_id !~ '[[:cntrl:]]'
+             )
            )
          ) AS valid
        FROM pipeline_scope scope

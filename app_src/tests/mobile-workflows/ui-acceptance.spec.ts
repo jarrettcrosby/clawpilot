@@ -32,6 +32,17 @@ async function gotoApp(page: Page, path: string) {
   await expect(page.getByTestId('app-shell')).toBeVisible()
 }
 
+async function openWorkspaceSettings(page: Page) {
+  const settingsButton = page.getByRole('button', { name: 'Settings' })
+  const workspaceSettings = page.getByRole('menuitem', { name: /Workspace settings/ })
+
+  await expect(async () => {
+    if (!await workspaceSettings.isVisible()) await settingsButton.click()
+    await expect(workspaceSettings).toBeVisible({ timeout: 1_000 })
+  }).toPass({ timeout: 10_000 })
+  await workspaceSettings.click()
+}
+
 function activeSection(page: Page) {
   const sectionHost = page.getByTestId('app-header').locator('xpath=following-sibling::*[1]')
   return sectionHost.locator(':scope > div').first()
@@ -141,8 +152,23 @@ function note(testInfo: TestInfo, description: string) {
   testInfo.annotations.push({ type: 'limitation', description })
 }
 
-async function mockCrmRecords(page: Page) {
+type MockCrmOptions = {
+  failFirstCalendarAction?: boolean
+  failFirstMeetingCreate?: boolean
+  failFirstMeetingUpdate?: boolean
+}
+
+type CapturedCrmWrite = {
+  body: Record<string, unknown>
+  idempotencyHeader: string
+}
+
+async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
   const crmWrites: Array<Record<string, unknown>> = []
+  const crmWriteRequests: CapturedCrmWrite[] = []
+  let failedCalendarAction = false
+  let failedMeetingCreate = false
+  let failedMeetingUpdate = false
   await page.route((url) => url.pathname === '/api/workspaces', async (route) => {
     await route.fulfill({
       json: {
@@ -238,6 +264,53 @@ async function mockCrmRecords(page: Page) {
       location: 'Mobile Room',
       attendeeEmails: ['contact@example.test'],
       status: 'scheduled',
+      calendarDeliveryStatus: 'sent',
+      calendarOrganizerEmail: 'operator@example.test',
+      calendarConnectionId: 'calendar-personal-connection',
+      calendarId: 'operator@example.test',
+      meetingMode: 'google_meet',
+      provider: 'maton',
+      syncStatus: 'synced',
+    }, {
+      id: '00000000-0000-4000-8000-000000000203',
+      referenceCode: 'gm9753102',
+      shortUrl: null,
+      subject: 'Legacy Meeting Without Delivery Evidence',
+      organizationId: '00000000-0000-4000-8000-000000000201',
+      organizationName: 'Other Organization',
+      contactId: '00000000-0000-4000-8000-000000000202',
+      contactName: 'Other Contact',
+      startsAt: '2026-07-16T13:00:00.000Z',
+      endsAt: '2026-07-16T13:30:00.000Z',
+      timezone: 'America/New_York',
+      attendeeEmails: ['other-contact@example.test'],
+      status: 'scheduled',
+      syncStatus: 'synced',
+    }, {
+      id: '00000000-0000-4000-8000-000000000303',
+      referenceCode: 'gm8642097',
+      shortUrl: null,
+      subject: 'Existing Custom Meeting',
+      organizationId: '00000000-0000-4000-8000-000000000101',
+      organizationName: 'Acceptance Organization',
+      contactId: '00000000-0000-4000-8000-000000000102',
+      contactName: 'Acceptance Contact',
+      startsAt: '2026-07-18T15:00:00.000Z',
+      endsAt: '2026-07-18T15:45:00.000Z',
+      timezone: 'America/New_York',
+      location: '',
+      attendeeEmails: ['contact@example.test'],
+      status: 'scheduled',
+      calendarDeliveryStatus: 'sent',
+      calendarOrganizerEmail: 'operator@example.test',
+      calendarOwnerEmail: 'operator@example.test',
+      calendarConnectionId: 'calendar-personal-connection',
+      calendarId: 'operator@example.test',
+      meetingMode: 'custom_link',
+      customJoinUrl: 'https://meet.example.test/existing-custom',
+      joinUrl: 'https://meet.example.test/existing-custom',
+      externalEventId: 'existing-custom-event',
+      externalEventUrl: 'https://calendar.google.com/calendar/event?eid=existing-custom-event',
       provider: 'maton',
       syncStatus: 'synced',
     }],
@@ -315,6 +388,34 @@ async function mockCrmRecords(page: Page) {
     if (route.request().method() !== 'GET') {
       const body = route.request().postDataJSON() as Record<string, unknown>
       crmWrites.push(body)
+      crmWriteRequests.push({
+        body,
+        idempotencyHeader: route.request().headers()['idempotency-key'] || '',
+      })
+      const newMeetingCreate = route.request().method() === 'POST'
+        && body.entity === 'meetings'
+        && !body.id
+      const existingMeetingUpdate = route.request().method() === 'POST'
+        && body.entity === 'meetings'
+        && Boolean(body.id)
+      if (options.failFirstMeetingCreate && newMeetingCreate && !failedMeetingCreate) {
+        failedMeetingCreate = true
+        await route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({ ok: false, error: 'Simulated lost meeting response' }),
+        })
+        return
+      }
+      if (options.failFirstMeetingUpdate && existingMeetingUpdate && !failedMeetingUpdate) {
+        failedMeetingUpdate = true
+        await route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({ ok: false, error: 'Simulated lost meeting update response' }),
+        })
+        return
+      }
       await route.fulfill({
         status: 201,
         contentType: 'application/json',
@@ -338,7 +439,7 @@ async function mockCrmRecords(page: Page) {
           leads: 0,
           opportunities: 2,
           products: 1,
-          meetings: 1,
+          meetings: 3,
           interactions: 1,
           campaigns: 0,
           openPipelineValue: 0,
@@ -377,13 +478,168 @@ async function mockCrmRecords(page: Page) {
           suiteCrmMapped: false,
           suiteCrmUsername: null,
         }],
+        providerIdentities: {
+          googleMail: 'operator@example.test',
+          googleMailSendAsEmail: 'operator@example.test',
+          googleMailConnectionId: 'gmail-connection',
+          googleCalendar: 'calendar@example.test',
+          googleCalendarOrganizer: 'calendar@example.test',
+          googleCalendarConnectionId: 'calendar-org-connection',
+          googleCalendarId: 'calendar@example.test',
+          googleCalendarSource: 'organization',
+        },
         suiteCrmPunchoutUrl: 'https://crm.eigenracing.com',
         suiteCrmUsername: 'admin',
         suiteCrmAdminPortalUrl: 'https://railway.com/project/clawpilot',
       }),
     })
   })
-  return { crmWrites }
+
+  await page.route((url) => url.pathname === '/api/crm/actions', async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>
+    crmWrites.push(body)
+    crmWriteRequests.push({
+      body,
+      idempotencyHeader: route.request().headers()['idempotency-key'] || '',
+    })
+    if (
+      options.failFirstCalendarAction
+      && body.actionType === 'create_calendar_event'
+      && !failedCalendarAction
+    ) {
+      failedCalendarAction = true
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: false, error: 'Simulated lost Calendar response' }),
+      })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        action: {
+          status: 'succeeded',
+          lastError: null,
+          responseSummary: {},
+        },
+      }),
+    })
+  })
+  return { crmWrites, crmWriteRequests }
+}
+
+async function mockOrganizationCommunications(
+  page: Page,
+  options: { canManage?: boolean; includeOrganizationConnection?: boolean } = {},
+) {
+  const canManage = options.canManage ?? true
+  const includeOrganizationConnection = options.includeOrganizationConnection ?? true
+  await page.route((url) => url.pathname === '/api/integrations/maton', async (route) => {
+    await route.fulfill({ json: {
+      ok: true,
+      platformCredentialAvailable: false,
+      credential: {
+        configured: true,
+        loginEmail: 'operator@example.test',
+        keyLastFour: '1234',
+        updatedAt: '2026-07-16T13:00:00.000Z',
+        connections: [{
+          provider: 'google-mail',
+          app: 'google-mail',
+          label: 'Personal Gmail',
+          connectionId: 'gmail-connection',
+          accountEmail: 'operator@example.test',
+          status: 'ACTIVE',
+          selected: true,
+        }, {
+          provider: 'google-calendar',
+          app: 'google-calendar',
+          label: 'Personal Google Calendar',
+          connectionId: 'calendar-personal-connection',
+          accountEmail: 'operator@example.test',
+          status: 'ACTIVE',
+          selected: true,
+        }, {
+          provider: 'google-calendar',
+          app: 'google-calendar',
+          label: 'Suburbia Google Calendar',
+          connectionId: 'calendar-org-connection',
+          accountEmail: 'calendar@example.test',
+          status: 'ACTIVE',
+          selected: false,
+        }],
+      },
+    } })
+  })
+  await page.route((url) => url.pathname === '/api/integrations/communications', async (route) => {
+    await route.fulfill({ json: {
+      ok: true,
+      canManage,
+      communication: {
+        organizationId: '00000000-0000-4000-8000-000000000100',
+        bindings: canManage ? [{
+          app: 'google-mail',
+          connectionId: 'gmail-connection',
+          accountEmail: 'operator@example.test',
+          identityEmail: 'sender@example.test',
+          calendarId: null,
+          status: 'active',
+          verifiedAt: '2026-07-16T13:00:00.000Z',
+        }, {
+          app: 'google-calendar',
+          connectionId: 'calendar-org-connection',
+          accountEmail: 'calendar@example.test',
+          identityEmail: 'calendar@example.test',
+          calendarId: 'calendar@example.test',
+          status: 'active',
+          verifiedAt: '2026-07-16T13:00:00.000Z',
+        }] : [],
+        availableConnections: [{
+          connectionId: 'gmail-connection',
+          name: 'Personal Gmail',
+          app: 'google-mail',
+          accountEmail: 'operator@example.test',
+          selectedForUser: true,
+          gmailSendAsIdentities: [{
+            email: 'operator@example.test',
+            verificationStatus: 'accepted',
+            isDefault: true,
+          }, {
+            email: 'sender@example.test',
+            verificationStatus: 'accepted',
+            isDefault: false,
+          }],
+        }, {
+          connectionId: 'calendar-personal-connection',
+          name: 'Personal Google Calendar',
+          app: 'google-calendar',
+          accountEmail: 'operator@example.test',
+          selectedForUser: true,
+          calendars: [{
+            id: 'operator@example.test',
+            summary: 'Personal calendar',
+            primary: true,
+            accessRole: 'owner',
+          }],
+        }, ...(includeOrganizationConnection ? [{
+          connectionId: 'calendar-org-connection',
+          name: 'Suburbia Google Calendar',
+          app: 'google-calendar',
+          accountEmail: 'calendar@example.test',
+          selectedForUser: false,
+          calendars: [{
+            id: 'calendar@example.test',
+            summary: 'Organization calendar',
+            primary: true,
+            accessRole: 'owner',
+          }],
+        }] : [])],
+      },
+    } })
+  })
 }
 
 for (const viewport of MOBILE_VIEWPORTS) {
@@ -703,8 +959,9 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectNoDocumentOverflow(page)
     })
 
-    test('CRM email controls and meeting scheduler remain usable without submitting actions', async ({ page }) => {
-      await mockCrmRecords(page)
+    test('CRM email controls and meeting scheduler remain usable', async ({ page }) => {
+      await mockOrganizationCommunications(page, { includeOrganizationConnection: false })
+      const { crmWriteRequests } = await mockCrmRecords(page, { failFirstCalendarAction: true })
       await gotoApp(page, '/#crm')
 
       await page.getByRole('cell', { name: 'Acceptance Organization', exact: true }).click()
@@ -724,9 +981,42 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
       const organizationScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
       await expectUsableGeometry(organizationScheduleDialog, 'Organization meeting scheduler', 160, 280)
-      await expect(organizationScheduleDialog.getByLabel('Meeting')).toHaveValue('Meeting with Acceptance Organization')
+      await expect(organizationScheduleDialog.getByRole('combobox', { name: 'Send from calendar' }))
+        .toContainText('Organization default')
+      await expect(organizationScheduleDialog.getByText(/Invitation organizer: calendar@example\.test/))
+        .toBeVisible()
+      await organizationScheduleDialog.getByRole('combobox', { name: 'Send from calendar' }).click()
+      await expect(page.getByRole('listbox').getByRole('option')).toHaveCount(2)
+      await expect(page.getByRole('option', { name: /calendar@example\.test.*Organization default/ })).toBeVisible()
+      await expect(page.getByRole('option', { name: /Personal calendar.*operator@example\.test/ })).toBeVisible()
+      await page.getByRole('option', { name: /calendar@example\.test.*Organization default/ }).click()
+      await expect(organizationScheduleDialog.getByRole('textbox', { name: 'Meeting', exact: true }))
+        .toHaveValue('Meeting with Acceptance Organization')
       await expect(organizationScheduleDialog.getByLabel('Timezone')).toHaveValue('America/New_York')
-      await organizationScheduleDialog.getByRole('button', { name: 'Cancel' }).click()
+      await organizationScheduleDialog.getByLabel('Start').fill('2026-07-16T10:00')
+      const organizationSend = organizationScheduleDialog.getByRole('button', { name: 'Send' })
+      await organizationSend.click()
+      await expect(organizationScheduleDialog).toBeVisible()
+      await expect(organizationSend).toBeEnabled()
+      await organizationSend.click()
+      await expect(organizationScheduleDialog).toBeHidden()
+
+      const defaultCalendarRequests = crmWriteRequests.filter(
+        (request) => request.body.actionType === 'create_calendar_event',
+      )
+      expect(defaultCalendarRequests).toHaveLength(2)
+      const firstDefaultRequest = defaultCalendarRequests[0]
+      const retriedDefaultRequest = defaultCalendarRequests[1]
+      expect(firstDefaultRequest.body.idempotencyKey).toMatch(/^crm-ui:create_calendar_event:/)
+      expect(retriedDefaultRequest.body.idempotencyKey).toBe(firstDefaultRequest.body.idempotencyKey)
+      expect(firstDefaultRequest.idempotencyHeader).toBe(firstDefaultRequest.body.idempotencyKey)
+      expect(retriedDefaultRequest.idempotencyHeader).toBe(firstDefaultRequest.idempotencyHeader)
+      expect(firstDefaultRequest.body).not.toHaveProperty('calendarConnectionId')
+      expect(firstDefaultRequest.body).not.toHaveProperty('calendarId')
+      expect(firstDefaultRequest.body.payload).not.toMatchObject({
+        calendarConnectionId: expect.anything(),
+        calendarId: expect.anything(),
+      })
       await closeEditor.click()
 
       await page.getByRole('tab', { name: 'Contacts' }).click()
@@ -751,14 +1041,33 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await closeEditor.click()
 
       await page.getByRole('tab', { name: 'Meetings' }).click()
+      const meetingRow = page.getByRole('row').filter({ hasText: 'Acceptance Meeting' })
+      await expect(meetingRow.getByText('Delivered', { exact: true })).toBeVisible()
+      await expect(meetingRow.getByText('Synced', { exact: true })).toBeVisible()
+      const legacyMeetingRow = page.getByRole('row').filter({ hasText: 'Legacy Meeting Without Delivery Evidence' })
+      await expect(legacyMeetingRow.getByText('Unknown', { exact: true })).toBeVisible()
+      await expect(legacyMeetingRow.getByText('Delivered', { exact: true })).toHaveCount(0)
+      await expect(legacyMeetingRow.getByText('Synced', { exact: true })).toBeVisible()
       await page.getByRole('cell', { name: 'Acceptance Meeting', exact: true }).click()
       closeEditor = page.getByRole('button', { name: 'Close editor' })
       drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(drawer, 'Meeting editor drawer', 160, 280)
-      await expect(drawer.getByLabel('Starts')).toHaveValue('2026-07-15T09:00')
+      const editorSendFromCalendar = drawer.getByRole('combobox', { name: 'Send from calendar' })
+      await expect(editorSendFromCalendar).toContainText('Personal calendar')
+      await expect(drawer.getByText(/Invitation organizer: operator@example\.test/)).toBeVisible()
+      await editorSendFromCalendar.click()
+      await expect(page.getByRole('listbox').getByRole('option')).toHaveCount(2)
+      await expect(page.getByRole('option', { name: /calendar@example\.test.*Organization default/ })).toBeVisible()
+      await expect(page.getByRole('option', { name: /Personal calendar.*operator@example\.test/ })).toBeVisible()
+      await page.getByRole('option', { name: /Personal calendar.*operator@example\.test/ }).click()
+      await expect(drawer.getByRole('combobox', { name: 'Meeting type' })).toContainText('Google Meet')
+      await expect(drawer.getByLabel('Start')).toHaveValue('2026-07-15T09:00')
+      await expect(drawer.getByRole('combobox', { name: 'Duration' })).toContainText('30 minutes')
       await expect(drawer.getByLabel('Ends')).toHaveValue('2026-07-15T09:30')
       await expect(drawer.getByLabel('Timezone')).toHaveValue('America/New_York')
       await expect(drawer.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
+      await expect(drawer.getByText('Organizer: operator@example.test', { exact: true })).toBeVisible()
+      await expect(drawer.getByText('Calendar: operator@example.test', { exact: true })).toBeVisible()
 
       await drawer.getByRole('combobox', { name: 'Contact' }).click()
       await expect(page.getByRole('option', { name: 'Acceptance Contact' })).toBeVisible()
@@ -777,16 +1086,64 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
       const meetingScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
       await expectUsableGeometry(meetingScheduleDialog, 'Meeting scheduling dialog', 160, 280)
-      await expect(meetingScheduleDialog.getByLabel('Meeting')).toHaveValue('Acceptance Meeting')
-      await expect(meetingScheduleDialog.getByLabel('Starts')).toHaveValue('2026-07-15T09:00')
+      const sendFromCalendar = meetingScheduleDialog.getByRole('combobox', { name: 'Send from calendar' })
+      await expect(sendFromCalendar).toContainText('Personal calendar')
+      await expect(meetingScheduleDialog.getByText(/Invitation organizer: operator@example\.test/)).toBeVisible()
+      await sendFromCalendar.click()
+      await page.getByRole('option', { name: /calendar@example.test.*Organization default/ }).click()
+      await expect(sendFromCalendar).toContainText('Organization default')
+      await expect(meetingScheduleDialog.getByText(/Invitation organizer: calendar@example\.test/)).toBeVisible()
+      await sendFromCalendar.click()
+      await page.getByRole('option', { name: /Personal calendar.*operator@example.test/ }).click()
+      await expect(sendFromCalendar).toContainText('Personal calendar')
+      await expect(meetingScheduleDialog.getByText(/Invitation organizer: operator@example\.test/)).toBeVisible()
+      await expect(meetingScheduleDialog.getByRole('textbox', { name: 'Meeting', exact: true }))
+        .toHaveValue('Acceptance Meeting')
+      await expect(meetingScheduleDialog.getByRole('combobox', { name: 'Meeting type' })).toContainText('Google Meet')
+      await expect(meetingScheduleDialog.getByLabel('Start')).toHaveValue('2026-07-15T09:00')
+      await expect(meetingScheduleDialog.getByRole('combobox', { name: 'Duration' })).toContainText('30 minutes')
       await expect(meetingScheduleDialog.getByLabel('Ends')).toHaveValue('2026-07-15T09:30')
       await expect(meetingScheduleDialog.getByLabel('Timezone')).toHaveValue('America/New_York')
       await expect(meetingScheduleDialog.getByLabel('Attendee emails')).toHaveValue('contact@example.test')
-      await meetingScheduleDialog.getByRole('button', { name: 'Cancel' }).click()
+
+      await meetingScheduleDialog.getByRole('combobox', { name: 'Meeting type' }).click()
+      await page.getByRole('option', { name: 'In person' }).click()
+      await expect(meetingScheduleDialog.getByLabel('Physical address')).toHaveValue('Mobile Room')
+
+      await meetingScheduleDialog.getByRole('combobox', { name: 'Meeting type' }).click()
+      await page.getByRole('option', { name: 'Custom link' }).click()
+      await meetingScheduleDialog.getByLabel('Meeting link').fill('https://meet.example.test/acceptance')
+      await meetingScheduleDialog.getByRole('combobox', { name: 'Duration' }).click()
+      await page.getByRole('option', { name: '45 minutes' }).click()
+      await expect(meetingScheduleDialog.getByLabel('Ends')).toHaveValue('2026-07-15T09:45')
+      await meetingScheduleDialog.getByRole('button', { name: 'Send' }).click()
+      await expect(meetingScheduleDialog).toBeHidden()
+      const explicitCalendarRequest = crmWriteRequests.filter(
+        (request) => request.body.actionType === 'create_calendar_event',
+      ).at(-1)
+      expect(explicitCalendarRequest?.body).toMatchObject({
+        actionType: 'create_calendar_event',
+        calendarConnectionId: 'calendar-personal-connection',
+        calendarId: 'operator@example.test',
+        payload: {
+          startsAt: '2026-07-15T09:00',
+          endsAt: '2026-07-15T09:45',
+          timezone: 'America/New_York',
+          meetingMode: 'custom_link',
+          customJoinUrl: 'https://meet.example.test/acceptance',
+        },
+      })
+      expect(explicitCalendarRequest?.idempotencyHeader).toBe(
+        explicitCalendarRequest?.body.idempotencyKey,
+      )
+      expect(explicitCalendarRequest?.body.payload).not.toMatchObject({
+        calendarConnectionId: expect.anything(),
+        calendarId: expect.anything(),
+      })
       await closeEditor.click()
 
       await page.getByRole('tab', { name: 'Interactions' }).click()
-      await page.getByRole('cell', { name: 'Acceptance Interaction', exact: true }).click()
+      await page.getByRole('cell', { name: 'Acceptance Interaction', exact: true }).dispatchEvent('click')
       closeEditor = page.getByRole('button', { name: 'Close editor' })
       drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
       await expectUsableGeometry(drawer, 'Interaction editor drawer', 160, 280)
@@ -806,6 +1163,120 @@ for (const viewport of MOBILE_VIEWPORTS) {
       })).toHaveCount(0)
       await page.keyboard.press('Escape')
       await closeEditor.click()
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('New meeting retries reuse one request identity', async ({ page }) => {
+      await mockOrganizationCommunications(page, { includeOrganizationConnection: false })
+      const { crmWriteRequests } = await mockCrmRecords(page, { failFirstMeetingCreate: true })
+      await gotoApp(page, '/#crm')
+
+      await page.getByRole('tab', { name: 'Meetings' }).click()
+      await activeSection(page).getByRole('button', { name: 'Add', exact: true }).click()
+      const closeEditor = page.getByRole('button', { name: 'Close editor' })
+      const drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'New meeting editor drawer', 160, 280)
+      await drawer.getByRole('textbox', { name: 'Meeting', exact: true }).fill('Retry-safe meeting')
+      await expect(drawer.getByRole('combobox', { name: 'Send from calendar' })).toContainText('Organization default')
+      await drawer.getByLabel('Start').fill('2026-07-17T10:00')
+      await expect(drawer.getByLabel('Ends')).toHaveValue('2026-07-17T10:30')
+
+      const save = drawer.getByRole('button', { name: 'Save' })
+      await save.click()
+      await expect(drawer).toBeVisible()
+      await expect(save).toBeEnabled()
+      await save.click()
+      await expect(drawer).toBeHidden()
+
+      const meetingCreateRequests = crmWriteRequests.filter(
+        (request) => request.body.entity === 'meetings' && !request.body.id,
+      )
+      expect(meetingCreateRequests).toHaveLength(2)
+      expect(meetingCreateRequests[0].body.idempotencyKey).toMatch(/^crm-ui:meeting:create:/)
+      expect(meetingCreateRequests[1].body.idempotencyKey)
+        .toBe(meetingCreateRequests[0].body.idempotencyKey)
+      expect(meetingCreateRequests[0].idempotencyHeader)
+        .toBe(meetingCreateRequests[0].body.idempotencyKey)
+      expect(meetingCreateRequests[1].idempotencyHeader)
+        .toBe(meetingCreateRequests[0].idempotencyHeader)
+      expect(meetingCreateRequests[0].body).not.toHaveProperty('calendarConnectionId')
+      expect(meetingCreateRequests[0].body).not.toHaveProperty('calendarId')
+      expect(meetingCreateRequests[0].body.fields).not.toMatchObject({
+        calendarConnectionId: expect.anything(),
+        calendarId: expect.anything(),
+      })
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('Existing custom meeting keeps its calendar and request identity across retry', async ({ page }) => {
+      await mockOrganizationCommunications(page, { includeOrganizationConnection: false })
+      const { crmWriteRequests } = await mockCrmRecords(page, { failFirstMeetingUpdate: true })
+      await gotoApp(page, '/#crm')
+
+      await page.getByRole('tab', { name: 'Meetings' }).click()
+      await page.getByRole('cell', { name: 'Existing Custom Meeting', exact: true }).click()
+      const closeEditor = page.getByRole('button', { name: 'Close editor' })
+      const drawer = closeEditor.locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await expectUsableGeometry(drawer, 'Existing meeting editor drawer', 160, 280)
+      await expect(drawer.getByRole('combobox', { name: 'Send from calendar' })).toContainText('Personal calendar')
+      await expect(drawer.getByRole('combobox', { name: 'Meeting type' })).toContainText('Custom link')
+      await expect(drawer.getByLabel('Meeting link')).toHaveValue('https://meet.example.test/existing-custom')
+      await expect(drawer.getByRole('combobox', { name: 'Duration' })).toContainText('45 minutes')
+      await expect(drawer.getByLabel('Ends')).toHaveValue('2026-07-18T11:45')
+
+      const save = drawer.getByRole('button', { name: 'Save' })
+      await expect(save).toBeEnabled()
+      await save.click()
+      await expect(drawer).toBeVisible()
+      await expect(save).toBeEnabled()
+      await save.click()
+      await expect(drawer).toBeHidden()
+
+      const meetingUpdateRequests = crmWriteRequests.filter(
+        (request) => request.body.entity === 'meetings'
+          && request.body.id === '00000000-0000-4000-8000-000000000303',
+      )
+      expect(meetingUpdateRequests).toHaveLength(2)
+      expect(meetingUpdateRequests[0].body.idempotencyKey).toMatch(/^crm-ui:meeting:update:/)
+      expect(meetingUpdateRequests[1].body.idempotencyKey)
+        .toBe(meetingUpdateRequests[0].body.idempotencyKey)
+      expect(meetingUpdateRequests[0].idempotencyHeader)
+        .toBe(meetingUpdateRequests[0].body.idempotencyKey)
+      expect(meetingUpdateRequests[1].idempotencyHeader)
+        .toBe(meetingUpdateRequests[0].idempotencyHeader)
+      expect(meetingUpdateRequests[0].body.fields).toMatchObject({
+        calendarConnectionId: 'calendar-personal-connection',
+        calendarId: 'operator@example.test',
+        meetingMode: 'custom_link',
+        customJoinUrl: 'https://meet.example.test/existing-custom',
+        location: '',
+        startsAt: '2026-07-18T11:00',
+        endsAt: '2026-07-18T11:45',
+        externalEventId: 'existing-custom-event',
+      })
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('Meeting calendar chooser lists each linked calendar once', async ({ page }) => {
+      await mockOrganizationCommunications(page)
+      await mockCrmRecords(page)
+      await gotoApp(page, '/#crm')
+
+      await page.getByRole('cell', { name: 'Acceptance Organization', exact: true }).click()
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
+      const dialog = page.getByRole('dialog', { name: 'Schedule meeting' })
+      const sendFromCalendar = dialog.getByRole('combobox', { name: 'Send from calendar' })
+      await expect(sendFromCalendar).toContainText('Organization calendar')
+      await expect(sendFromCalendar).not.toContainText('Organization default')
+      await sendFromCalendar.click()
+      const options = page.getByRole('listbox').getByRole('option')
+      await expect(options).toHaveCount(2)
+      await expect(page.getByRole('option', { name: /Personal calendar.*operator@example\.test/ })).toHaveCount(1)
+      await expect(page.getByRole('option', { name: /Organization calendar.*calendar@example\.test/ })).toHaveCount(1)
+      await page.keyboard.press('Escape')
+      await dialog.getByRole('button', { name: 'Cancel' }).click()
       await expectNoDocumentOverflow(page)
     })
 
@@ -886,8 +1357,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
         })
       })
       await gotoApp(page, '/#dashboard')
-      await page.getByRole('button', { name: 'Settings' }).click()
-      await page.getByRole('menuitem', { name: /Workspace settings/ }).click()
+      await openWorkspaceSettings(page)
 
       const settings = page.getByRole('dialog', { name: 'Settings' })
       await expectUsableGeometry(settings, 'Settings dialog', 160, 280)
@@ -909,6 +1379,51 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await page.keyboard.press('Escape')
       await expect(activityDrawer).toBeHidden()
       await expectNoDocumentOverflow(page)
+    })
+
+    test('Organization Gmail sender and organizer calendar remain independently selectable', async ({ page }) => {
+      await mockOrganizationCommunications(page)
+      await gotoApp(page, '/#dashboard')
+      await openWorkspaceSettings(page)
+
+      const settings = page.getByRole('dialog', { name: 'Settings' })
+      await settings.getByRole('tab', { name: 'Integrations' }).click()
+      const matonTab = settings.getByRole('tab', { name: 'Maton', exact: true })
+      if (await matonTab.count()) await matonTab.click()
+      await expect(settings.getByText('Organization communication identities')).toBeVisible()
+      await expect(settings.getByText('Personal Maton connections')).toBeVisible()
+
+      await expect(settings.getByRole('combobox', { name: 'Gmail connection' }))
+        .toContainText('Personal Gmail')
+      await expect(settings.getByRole('combobox', { name: 'Gmail send-as address' }))
+        .toContainText('sender@example.test')
+      await expect(settings.getByRole('combobox', { name: 'Google Calendar connection' }))
+        .toContainText('Suburbia Google Calendar')
+      await expect(settings.getByRole('combobox', { name: 'Organizer calendar' }))
+        .toContainText('Organization calendar')
+      await expect(settings.getByLabel('Calendar organizer')).toHaveValue('calendar@example.test')
+      await expectNoDocumentOverflow(page)
+      await settings.getByRole('button', { name: 'Close settings' }).click()
+    })
+
+    test('Organization communication defaults are read-only for nonmanagers', async ({ page }) => {
+      await mockOrganizationCommunications(page, { canManage: false })
+      await gotoApp(page, '/#dashboard')
+      await openWorkspaceSettings(page)
+
+      const settings = page.getByRole('dialog', { name: 'Settings' })
+      await settings.getByRole('tab', { name: 'Integrations' }).click()
+      const matonTab = settings.getByRole('tab', { name: 'Maton', exact: true })
+      if (await matonTab.count()) await matonTab.click()
+      await expect(settings.getByText('Organization communication identities')).toBeVisible()
+      await expect(settings.getByText(
+        'Organization defaults can only be changed by an organization owner or access administrator.',
+      )).toBeVisible()
+      await expect(settings.getByRole('combobox', { name: 'Gmail connection' })).toHaveCount(0)
+      await expect(settings.getByRole('combobox', { name: 'Google Calendar connection' })).toHaveCount(0)
+      await expect(settings.getByText('Personal Maton connections')).toBeVisible()
+      await expectNoDocumentOverflow(page)
+      await settings.getByRole('button', { name: 'Close settings' }).click()
     })
 
     test('Links is covered when enabled and explicitly limited for local file storage', async ({ page }, testInfo) => {

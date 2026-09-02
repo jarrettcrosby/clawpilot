@@ -62,10 +62,14 @@ function organizationId(actor: AppUser): string {
   return actor.organizationId
 }
 
-function requireManager(actor: AppUser) {
+function canManageOrganizationCommunications(actor: AppUser) {
   const role = effectiveAuthorizationRole(actor)
   const permissions = effectiveUserPermissions(actor)
-  if (role !== 'owner' && (role !== 'admin' || !permissions.manageUserAccess)) {
+  return role === 'owner' || (role === 'admin' && permissions.manageUserAccess)
+}
+
+function requireManager(actor: AppUser) {
+  if (!canManageOrganizationCommunications(actor)) {
     throw Object.assign(new Error('Only an organization owner or access administrator can manage communication identities'), {
       status: 403,
       code: 'ORGANIZATION_COMMUNICATION_MANAGER_REQUIRED',
@@ -128,12 +132,18 @@ export async function GET(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     requirePostgres()
-    requireManager(actor)
+    const canManage = canManageOrganizationCommunications(actor)
     const communication = await getOrganizationCommunicationState({
       organizationId: organizationId(actor),
       actorEmail: actor.email,
     })
-    return json({ ok: true, communication })
+    return json({
+      ok: true,
+      canManage,
+      communication: canManage
+        ? communication
+        : { ...communication, bindings: [] },
+    })
   } catch (error) {
     return errorResponse(error)
   }
@@ -146,7 +156,7 @@ export async function PATCH(req: NextRequest) {
     requirePostgres()
     requireManager(actor)
     const body = await requestBody(req)
-    requireOnlyFields(body, ['action', 'app', 'connectionId', 'identityEmail'])
+    requireOnlyFields(body, ['action', 'app', 'connectionId', 'identityEmail', 'gmailSendAsEmail', 'calendarId'])
     if (String(body.action || '').trim() !== 'bind') {
       throw Object.assign(new Error('Unsupported organization communication action'), {
         status: 400,
@@ -159,6 +169,8 @@ export async function PATCH(req: NextRequest) {
       app: body.app,
       connectionId: body.connectionId,
       identityEmail: body.identityEmail,
+      gmailSendAsEmail: body.gmailSendAsEmail,
+      calendarId: body.calendarId,
     })
     return json({ ok: true, communication })
   } catch (error) {

@@ -163,7 +163,7 @@
     "test:pos-accounting-parity": "node scripts/test-pos-accounting-parity.mjs",
     "test:pos-accounting-notifications": "node scripts/test-pos-accounting-notifications.mjs",
     "test:quickbooks": "node scripts/test-quickbooks-integrations.mjs",
-    "test:organization-communications": "node scripts/test-organization-communications.mjs",
+    "test:organization-communications": "node scripts/test-organization-communications.mjs && node scripts/test-crm-calendar-delivery.mjs && node scripts/test-organization-communications-ui.mjs",
     "test:demo": "node scripts/test-demo-environment.mjs",
     "test:crm-card-boundaries": "node scripts/test-crm-card-boundaries.mjs",
     "test:crm-history": "node scripts/test-crm-interaction-history.mjs",
