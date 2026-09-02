@@ -291,6 +291,34 @@ async function seedTenant(pool) {
       [actorEmail, organizationId, JSON.stringify(permissions)],
     )
     await client.query(
+      `INSERT INTO user_maton_credentials (owner_email, login_email)
+       VALUES ($1, $1)`,
+      [actorEmail],
+    )
+    await client.query(
+      `INSERT INTO user_maton_connections (
+         owner_email, connection_id, name, app, status, account_email,
+         is_selected, source, last_refreshed_at
+       ) VALUES
+         ($1, 'crm-acceptance-gmail', 'CRM acceptance Gmail',
+          'google-mail', 'ACTIVE', $1, true, 'maton', now()),
+         ($1, 'crm-acceptance-calendar', 'CRM acceptance Calendar',
+          'google-calendar', 'ACTIVE', $1, true, 'maton', now())`,
+      [actorEmail],
+    )
+    await client.query(
+      `INSERT INTO organization_communication_bindings (
+         organization_id, app, credential_owner_email, maton_connection_id,
+         account_email, identity_email, calendar_id, status, verified_at,
+         verified_by, created_by, updated_by
+       ) VALUES
+         ($2::uuid, 'google-mail', $1, 'crm-acceptance-gmail',
+          $1, $1, NULL, 'active', now(), $1, $1, $1),
+         ($2::uuid, 'google-calendar', $1, 'crm-acceptance-calendar',
+          $1, $1, 'primary', 'active', now(), $1, $1, $1)`,
+      [actorEmail, organizationId],
+    )
+    await client.query(
       `UPDATE workspace_organizations SET created_by = $2, updated_by = $2 WHERE id = $1::uuid`,
       [organizationId, actorEmail],
     )
@@ -341,7 +369,7 @@ function fields(entity, fixture, relationships = {}) {
   return { entity, fields: { ...fixture, ...relationships } }
 }
 
-async function runApiAcceptance(baseUrl, token, pool) {
+async function runApiAcceptance(baseUrl, token, pool, organizationId) {
   await apiJson(baseUrl, token, '/api/crm?entity=leads&limit=10')
   const initialProfile = await pool.query(
     `SELECT contact.id::text, contact.pipeline_id::text, contact.organization_id::text,
@@ -573,6 +601,20 @@ async function runApiAcceptance(baseUrl, token, pool) {
     campaignAction.action.status,
     'succeeded',
     `Campaign expansion failed: ${JSON.stringify(campaignAction.action)}`,
+  )
+  assert.deepEqual(
+    {
+      organizationId: campaignAction.action.communication?.organizationId,
+      accountEmail: campaignAction.action.communication?.accountEmail,
+      identityEmail: campaignAction.action.communication?.identityEmail,
+      source: campaignAction.action.communication?.source,
+    },
+    {
+      organizationId,
+      accountEmail: actorEmail,
+      identityEmail: actorEmail,
+      source: 'organization',
+    },
   )
   const callAction = await apiJson(baseUrl, token, '/api/crm/actions', {
     method: 'POST',
@@ -956,7 +998,7 @@ async function main() {
     app.stdout.on('data', (chunk) => { logs = `${logs}${chunk}`.slice(-20_000) })
     app.stderr.on('data', (chunk) => { logs = `${logs}${chunk}`.slice(-20_000) })
     await waitForHttp(`${baseUrl}/api/health`, () => logs)
-    const records = await runApiAcceptance(baseUrl, tenant.token, pool)
+    const records = await runApiAcceptance(baseUrl, tenant.token, pool, tenant.organizationId)
     await runMobileAcceptance(baseUrl, tenant.token, records, () => logs)
     console.log('CRM Leads/Campaigns disposable acceptance passed')
     console.log('validated: create edit archive search Global-ID short-link SuiteCRM conversion activity campaign-membership mobile')

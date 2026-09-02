@@ -12,6 +12,10 @@ import {
   resolveCrmReferenceCode,
   stageCrmRecordInPostgres,
 } from '@/lib/persistence/crm'
+import {
+  resolvePipelineCommunicationSnapshotInPostgres,
+  type PipelineCommunicationSnapshot,
+} from '@/lib/persistence/organizationCommunications'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import type { CrmActivityStatus, CrmMeeting } from '@/lib/crm/types'
 import { normalizeUserEmail } from '@/lib/users'
@@ -58,6 +62,13 @@ type ActionRow = {
   response_summary: JsonObject
   last_error: string | null
   idempotency_key: string
+  workspace_organization_id: string | null
+  communication_credential_owner_email: string | null
+  communication_connection_id: string | null
+  communication_account_email: string | null
+  communication_identity_email: string | null
+  communication_calendar_id: string | null
+  communication_binding_source: 'organization' | 'user-default' | null
   processed_at: TimestampValue | null
   created_at: TimestampValue
   updated_at: TimestampValue
@@ -92,6 +103,7 @@ type PreparedAction = {
   referenceCode: string
   payload: JsonObject
   idempotencyKey: string
+  communication: PipelineCommunicationSnapshot | null
 }
 
 export type CrmIntegrationActionView = {
@@ -106,6 +118,13 @@ export type CrmIntegrationActionView = {
   availableAt: string
   externalId: string | null
   responseSummary: JsonObject
+  communication: {
+    organizationId: string
+    accountEmail: string | null
+    identityEmail: string | null
+    calendarId: string | null
+    source: 'organization' | 'user-default'
+  } | null
   lastError: string | null
   processedAt: string | null
   createdAt: string
@@ -119,6 +138,8 @@ export type LeasedCrmIntegrationAction = CrmIntegrationActionView & {
   payload: JsonObject
   lockToken: string
   idempotencyKey: string
+  communicationCredentialOwnerEmail: string | null
+  communicationConnectionId: string | null
 }
 
 export class CrmIntegrationActionError extends Error {
@@ -301,6 +322,15 @@ function normalizeEmailList(value: unknown): string[] {
 }
 
 function actionView(row: ActionRow): CrmIntegrationActionView {
+  const communication = row.workspace_organization_id && row.communication_binding_source
+    ? {
+        organizationId: row.workspace_organization_id,
+        accountEmail: row.communication_account_email,
+        identityEmail: row.communication_identity_email,
+        calendarId: row.communication_calendar_id,
+        source: row.communication_binding_source,
+      }
+    : null
   return {
     id: row.id,
     pipelineId: row.pipeline_id,
@@ -313,6 +343,7 @@ function actionView(row: ActionRow): CrmIntegrationActionView {
     availableAt: iso(row.available_at) as string,
     externalId: row.external_id,
     responseSummary: row.response_summary || {},
+    communication,
     lastError: row.last_error,
     processedAt: iso(row.processed_at),
     createdAt: iso(row.created_at) as string,
@@ -330,6 +361,8 @@ function leasedAction(row: ActionRow): LeasedCrmIntegrationAction {
     payload: row.payload || {},
     lockToken: row.lock_token,
     idempotencyKey: row.idempotency_key,
+    communicationCredentialOwnerEmail: row.communication_credential_owner_email,
+    communicationConnectionId: row.communication_connection_id,
   }
 }
 
@@ -511,6 +544,27 @@ async function prepareAction(input: {
     throw error
   }
   const runtime = ACTION_RUNTIME[actionType]
+  const communicationApp = actionType === 'send_campaign'
+    ? 'google-mail'
+    : runtime.provider === 'maton'
+      ? runtime.app as 'google-mail' | 'google-calendar'
+      : null
+  let communication: PipelineCommunicationSnapshot | null = null
+  if (communicationApp) {
+    try {
+      communication = await resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId,
+        actorEmail,
+        app: communicationApp,
+      })
+    } catch {
+      throw new CrmIntegrationActionError(
+        `Configure an active ${communicationApp === 'google-mail' ? 'Gmail' : 'Google Calendar'} connection for this organization`,
+        409,
+        'CRM_COMMUNICATION_CONNECTION_REQUIRED',
+      )
+    }
+  }
   return {
     pipelineId,
     actorEmail,
@@ -522,6 +576,7 @@ async function prepareAction(input: {
     referenceCode: target.referenceCode,
     payload: await normalizePayload(actionType, input.payload, target, pipelineId),
     idempotencyKey: normalizeIdempotencyKey(input.idempotencyKey, actionType),
+    communication,
   }
 }
 
@@ -561,9 +616,17 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
        INSERT INTO crm_integration_actions (
          pipeline_id, actor_email, provider, app, action_type, aggregate_type,
          aggregate_id, reference_code, payload, status, idempotency_key,
+         workspace_organization_id, communication_credential_owner_email,
+         communication_connection_id, communication_account_email,
+         communication_identity_email, communication_calendar_id,
+         communication_binding_source,
          created_at, available_at, updated_at
        )
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', $10, now(), now(), now())
+       VALUES (
+         $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', $10,
+         $11::uuid, $12, $13, $14, $15, $16, $17,
+         now(), now(), now()
+       )
        ON CONFLICT (actor_email, idempotency_key) DO NOTHING
        RETURNING *
      )
@@ -577,7 +640,14 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
         AND existing.aggregate_type = $6
         AND existing.aggregate_id = $7
         AND existing.reference_code IS NOT DISTINCT FROM $8
-        AND existing.payload = $9::jsonb) AS matches_intent
+        AND existing.payload = $9::jsonb
+        AND existing.workspace_organization_id IS NOT DISTINCT FROM $11::uuid
+        AND existing.communication_credential_owner_email IS NOT DISTINCT FROM $12
+        AND existing.communication_connection_id IS NOT DISTINCT FROM $13
+        AND existing.communication_account_email IS NOT DISTINCT FROM $14
+        AND existing.communication_identity_email IS NOT DISTINCT FROM $15
+        AND existing.communication_calendar_id IS NOT DISTINCT FROM $16
+        AND existing.communication_binding_source IS NOT DISTINCT FROM $17) AS matches_intent
      FROM crm_integration_actions existing
      WHERE existing.actor_email = $2 AND existing.idempotency_key = $10
        AND NOT EXISTS (SELECT 1 FROM inserted)
@@ -593,6 +663,13 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
       action.referenceCode,
       JSON.stringify(action.payload),
       action.idempotencyKey,
+      action.communication?.organizationId || null,
+      action.communication?.credentialOwnerEmail || null,
+      action.communication?.connectionId || null,
+      action.communication?.accountEmail || null,
+      action.communication?.identityEmail || null,
+      action.communication?.calendarId || null,
+      action.communication?.source || null,
     ],
   )
   const row = result.rows[0]
@@ -605,7 +682,13 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
     )
   }
   if (row.created) {
-    await auditAction(client, { ...action, id: row.id }, 'crm.integration_action.queued')
+    await auditAction(client, { ...action, id: row.id }, 'crm.integration_action.queued', {
+      communicationOrganizationId: action.communication?.organizationId || null,
+      communicationAccountEmail: action.communication?.accountEmail || null,
+      communicationIdentityEmail: action.communication?.identityEmail || null,
+      communicationCalendarId: action.communication?.calendarId || null,
+      communicationBindingSource: action.communication?.source || null,
+    })
   }
   return { action: actionView(row), created: row.created }
 }
@@ -799,13 +882,66 @@ async function bindAttemptConnection(action: LeasedCrmIntegrationAction, connect
 async function selectedMatonConnection(
   action: LeasedCrmIntegrationAction,
   app: string,
-): Promise<{ connectionId: string; accountEmail: string | null }> {
+): Promise<{
+  credentialOwnerEmail: string
+  connectionId: string
+  accountEmail: string | null
+  identityEmail: string | null
+  calendarId: string | null
+  bindingSource: 'organization' | 'user-default' | null
+}> {
+  const credentialOwnerEmail = action.communicationCredentialOwnerEmail || action.actorEmail
   const { connectionId, accountEmail } = await resolveUserMatonGatewayCredential({
-    ownerEmail: action.actorEmail,
+    ownerEmail: credentialOwnerEmail,
     app,
+    boundConnectionId: action.communicationConnectionId || undefined,
   })
+  if (action.communicationConnectionId && connectionId !== action.communicationConnectionId) {
+    throw new PermanentCrmIntegrationActionError('The queued communication connection no longer matches its reviewed identity')
+  }
+  if (
+    action.communication?.accountEmail
+    && accountEmail
+    && normalizeEmail(accountEmail, 'Selected provider account') !== action.communication.accountEmail
+  ) {
+    throw new PermanentCrmIntegrationActionError('The queued communication account no longer matches its reviewed identity')
+  }
   await bindAttemptConnection(action, connectionId)
-  return { connectionId, accountEmail }
+  return {
+    credentialOwnerEmail,
+    connectionId,
+    accountEmail: action.communication?.accountEmail || accountEmail,
+    identityEmail: action.communication?.identityEmail || accountEmail,
+    calendarId: action.communication?.calendarId || null,
+    bindingSource: action.communication?.source || null,
+  }
+}
+
+async function verifiedCalendarConnection(
+  action: LeasedCrmIntegrationAction,
+  selectedConnection: Awaited<ReturnType<typeof selectedMatonConnection>>,
+): Promise<string> {
+  const calendar = await matonJson(
+    action,
+    'google-calendar',
+    selectedConnection.connectionId,
+    '/google-calendar/calendar/v3/users/me/calendarList/primary',
+    { headers: { Accept: 'application/json' } },
+  )
+  const liveAccountEmail = normalizeEmail(calendar.id, 'Selected Calendar account')
+  if (
+    selectedConnection.accountEmail
+    && liveAccountEmail !== normalizeEmail(selectedConnection.accountEmail, 'Queued Calendar account')
+  ) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar account no longer matches its reviewed identity')
+  }
+  if (
+    selectedConnection.identityEmail
+    && liveAccountEmail !== normalizeEmail(selectedConnection.identityEmail, 'Queued Calendar organizer')
+  ) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar organizer no longer matches its reviewed identity')
+  }
+  return liveAccountEmail
 }
 
 async function recordAttemptSucceeded(
@@ -1094,7 +1230,7 @@ async function matonJson(
   init?: RequestInit,
 ): Promise<JsonObject> {
   const response = await matonFetch(pathname, init, {
-    ownerEmail: action.actorEmail,
+    ownerEmail: action.communicationCredentialOwnerEmail || action.actorEmail,
     app,
     boundConnectionId: connectionId,
   })
@@ -1198,7 +1334,8 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     ? normalizeEmail(action.responseSummary.senderEmail, 'Recorded Gmail sender')
     : null
   if (!messageId) {
-    const { connectionId } = await selectedMatonConnection(action, 'google-mail')
+    const selectedConnection = await selectedMatonConnection(action, 'google-mail')
+    const { connectionId } = selectedConnection
     const profile = await matonJson(
       action,
       'google-mail',
@@ -1206,7 +1343,28 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
       '/google-mail/gmail/v1/users/me/profile',
       { headers: { Accept: 'application/json' } },
     )
-    senderEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+    const profileEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+    if (selectedConnection.accountEmail && profileEmail !== selectedConnection.accountEmail) {
+      throw new PermanentCrmIntegrationActionError('The queued Gmail account no longer matches its reviewed identity')
+    }
+    senderEmail = selectedConnection.identityEmail
+      ? normalizeEmail(selectedConnection.identityEmail, 'Queued Gmail sender')
+      : profileEmail
+    if (senderEmail !== profileEmail) {
+      const sendAs = await matonJson(
+        action,
+        'google-mail',
+        connectionId,
+        `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(senderEmail)}`,
+        { headers: { Accept: 'application/json' } },
+      )
+      if (
+        normalizeEmail(sendAs.sendAsEmail, 'Verified Gmail sender') !== senderEmail
+        || String(sendAs.verificationStatus || '').trim().toLowerCase() !== 'accepted'
+      ) {
+        throw new PermanentCrmIntegrationActionError('The queued Gmail sender is no longer an accepted send-as identity')
+      }
+    }
     const delivered = await matonJson(
       action,
       'google-mail',
@@ -1231,7 +1389,15 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     if (!messageId) throw new Error('google-mail provider returned no message ID')
     threadId = cleanString(delivered.threadId, 1000, 'Gmail thread ID') || null
   }
-  const summary = { messageId, threadId, senderEmail, markerReferences }
+  const summary = {
+    messageId,
+    threadId,
+    senderEmail,
+    accountEmail: action.communication?.accountEmail || senderEmail,
+    communicationBindingSource: action.communication?.source || null,
+    communicationOrganizationId: action.communication?.organizationId || null,
+    markerReferences,
+  }
   await recordAttemptSucceeded(action, messageId, summary)
   await stageActionInteraction({
     action,
@@ -1338,7 +1504,8 @@ async function stageCalendarMeeting(
       source: 'crm-integration-action',
       actionId: action.id,
       provider: action.provider,
-      calendarOwnerEmail: action.actorEmail,
+      calendarOwnerEmail: action.communication?.identityEmail || action.actorEmail,
+      communicationOrganizationId: action.communication?.organizationId || null,
     },
     actorEmail: action.actorEmail,
     fields: {
@@ -1445,14 +1612,13 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     eventId = eventId || cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID') || null
     if (eventId) {
       const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
-      organizerEmail = selectedConnection.accountEmail
-        ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
-        : organizerEmail
+      organizerEmail = await verifiedCalendarConnection(action, selectedConnection)
+      const calendarId = selectedConnection.calendarId || 'primary'
       const response = await matonFetch(
-        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+        `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
         { method: 'DELETE' },
         {
-          ownerEmail: action.actorEmail,
+          ownerEmail: selectedConnection.credentialOwnerEmail,
           app: 'google-calendar',
           boundConnectionId: selectedConnection.connectionId,
         },
@@ -1468,6 +1634,9 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       meetingReferenceCode: provisionalMeeting.referenceCode,
       meetingUrl,
       organizerEmail,
+      accountEmail: action.communication?.accountEmail || organizerEmail,
+      communicationBindingSource: action.communication?.source || null,
+      communicationOrganizationId: action.communication?.organizationId || null,
       meetingStatus: 'cancelled',
     }
     await recordAttemptSucceeded(action, eventId, summary)
@@ -1484,9 +1653,8 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   if (!eventId) {
     const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
     const { connectionId } = selectedConnection
-    organizerEmail = selectedConnection.accountEmail
-      ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
-      : null
+    organizerEmail = await verifiedCalendarConnection(action, selectedConnection)
+    const calendarId = selectedConnection.calendarId || 'primary'
     const existingEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID')
     const requestedEventId = existingEventId || calendarEventIdForMeeting(provisionalMeeting.referenceCode)
     const eventBody = {
@@ -1518,7 +1686,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         action,
         'google-calendar',
         connectionId,
-        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(existingEventId)}?conferenceDataVersion=1&sendUpdates=all`,
+        `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(existingEventId)}?conferenceDataVersion=1&sendUpdates=all`,
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -1531,7 +1699,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           action,
           'google-calendar',
           connectionId,
-          '/google-calendar/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=all',
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?conferenceDataVersion=1&sendUpdates=all`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1544,7 +1712,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           action,
           'google-calendar',
           connectionId,
-          `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(requestedEventId)}`,
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(requestedEventId)}`,
           { headers: { Accept: 'application/json' } },
         )
       }
@@ -1561,6 +1729,9 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     meetingReferenceCode: provisionalMeeting.referenceCode,
     meetingUrl,
     organizerEmail,
+    accountEmail: action.communication?.accountEmail || organizerEmail,
+    communicationBindingSource: action.communication?.source || null,
+    communicationOrganizationId: action.communication?.organizationId || null,
     meetingStatus: finalMeetingStatus,
   }
   await recordAttemptSucceeded(action, eventId, summary)
@@ -1750,6 +1921,21 @@ async function expandCampaignAction(action: LeasedCrmIntegrationAction, target: 
           campaignRecipientId: recipient.id,
         },
         idempotencyKey: `crm:campaign:${action.id}:recipient:${recipient.id}`,
+        communication: action.communication
+          && action.communicationCredentialOwnerEmail
+          && action.communicationConnectionId
+          && action.communication.accountEmail
+          && action.communication.identityEmail
+          ? {
+              organizationId: action.communication.organizationId,
+              credentialOwnerEmail: action.communicationCredentialOwnerEmail,
+              connectionId: action.communicationConnectionId,
+              accountEmail: action.communication.accountEmail,
+              identityEmail: action.communication.identityEmail,
+              calendarId: action.communication.calendarId,
+              source: action.communication.source,
+            }
+          : null,
       })
       await client.query(
         `UPDATE crm_campaign_recipients

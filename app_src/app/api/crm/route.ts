@@ -8,7 +8,7 @@ import {
   type SuiteCrmInteractionModule,
 } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
-import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
+import { CrmIntegrationActionError, enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
   archiveCrmRecordInPostgres,
@@ -27,7 +27,7 @@ import {
 import { listWorkspaceOrganizationHierarchy, workspaceOrganizationById } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
+import { resolvePipelineCommunicationSnapshotInPostgres } from '@/lib/persistence/organizationCommunications'
 import { readMeasurementPreferences } from '@/lib/persistence/measurementPreferences'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -184,7 +184,15 @@ export async function GET(req: NextRequest) {
       })
     }
     await ensurePipelineCrmReferenceLinks(pipeline.id)
-    const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers, campaignRecipients] = await Promise.all([
+    const [
+      records,
+      summary,
+      workspaceHierarchy,
+      googleMailIdentity,
+      googleCalendarIdentity,
+      pipelineUsers,
+      campaignRecipients,
+    ] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
@@ -196,17 +204,21 @@ export async function GET(req: NextRequest) {
       }),
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor),
-      readMatonCredentialStateFromPostgres(actor.email),
+      resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        app: 'google-mail',
+      }).catch(() => null),
+      resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        app: 'google-calendar',
+      }).catch(() => null),
       listCrmPipelineUsersInPostgres(pipeline.id),
       relatedEntity === 'campaigns' && relatedId
         ? listCrmCampaignRecipientsInPostgres({ pipelineId: pipeline.id, campaignId: relatedId })
         : Promise.resolve([]),
     ])
-    const selectedProviderEmail = (app: string) => matonCredential.connections.find((connection) => (
-      connection.app === app
-      && connection.status === 'ACTIVE'
-      && connection.selected
-    ))?.accountEmail || null
     return NextResponse.json({
       ok: true,
       entity,
@@ -226,8 +238,10 @@ export async function GET(req: NextRequest) {
       canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
       canManageProductIdentities: operationsCapabilities(actor).canManage,
       providerIdentities: {
-        googleMail: selectedProviderEmail('google-mail'),
-        googleCalendar: selectedProviderEmail('google-calendar'),
+        googleMail: googleMailIdentity?.identityEmail || null,
+        googleCalendar: googleCalendarIdentity?.identityEmail || null,
+        googleMailSource: googleMailIdentity?.source || null,
+        googleCalendarSource: googleCalendarIdentity?.source || null,
       },
       suiteCrmPunchoutUrl: canOpenSuiteCrm ? '/api/crm/punchout' : null,
       suiteCrmUsername: canOpenSuiteCrm ? suiteCrmAdminUsername() : null,
@@ -487,7 +501,10 @@ export async function POST(req: NextRequest) {
           externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null, joinUrl: stringValue(fields.joinUrl, 2000) || null,
         },
       })
-      const calendarAction = await enqueueCrmIntegrationAction({
+      let calendarAction: Awaited<ReturnType<typeof enqueueCrmIntegrationAction>> | null = null
+      let calendarActionUnavailable: { code: string; message: string } | null = null
+      try {
+        calendarAction = await enqueueCrmIntegrationAction({
           pipelineId: pipeline.id,
           actorEmail: calendarOwnerEmail,
           actionType: 'create_calendar_event',
@@ -504,11 +521,22 @@ export async function POST(req: NextRequest) {
           },
           idempotencyKey: `crm:meeting-calendar-sync:${staged.referenceCode}:${staged.sourceHash}`,
         })
+      } catch (error) {
+        if (
+          error instanceof CrmIntegrationActionError
+          && error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'
+        ) {
+          calendarActionUnavailable = { code: error.code, message: error.message }
+        } else {
+          throw error
+        }
+      }
       return NextResponse.json({
         ok: true,
-        queued: true,
+        queued: Boolean(calendarAction),
         record: staged,
         calendarAction: calendarAction?.action || null,
+        calendarActionUnavailable,
       }, { status: body?.id ? 200 : 201 })
     }
 

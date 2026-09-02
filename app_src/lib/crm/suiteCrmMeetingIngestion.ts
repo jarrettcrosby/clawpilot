@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
+import { CrmIntegrationActionError, enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import {
   listSuiteCrmMeetingsUpdatedSince,
@@ -295,24 +295,34 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
     .update(dateModified)
     .digest('hex')
     .slice(0, 24)
-  const queued = await enqueueCrmIntegrationAction({
-    pipelineId: meeting.pipeline_id,
-    actorEmail: calendarOwnerEmail,
-    actionType: 'create_calendar_event',
-    referenceCode: staged.referenceCode,
-    payload: {
-      subject: fields.subject,
-      description: fields.description,
-      startsAt: fields.startsAt,
-      endsAt: fields.endsAt,
-      timezone: fields.timezone,
-      location: fields.location,
-      attendeeEmails: fields.attendeeEmails,
-      meetingStatus: fields.status,
-    },
-    idempotencyKey: `crm:suitecrm-meeting-calendar:${staged.referenceCode}:${revision}`,
-  })
-  return { matched: true, staged: true, calendarActionQueued: queued.created }
+  try {
+    const queued = await enqueueCrmIntegrationAction({
+      pipelineId: meeting.pipeline_id,
+      actorEmail: calendarOwnerEmail,
+      actionType: 'create_calendar_event',
+      referenceCode: staged.referenceCode,
+      payload: {
+        subject: fields.subject,
+        description: fields.description,
+        startsAt: fields.startsAt,
+        endsAt: fields.endsAt,
+        timezone: fields.timezone,
+        location: fields.location,
+        attendeeEmails: fields.attendeeEmails,
+        meetingStatus: fields.status,
+      },
+      idempotencyKey: `crm:suitecrm-meeting-calendar:${staged.referenceCode}:${revision}`,
+    })
+    return { matched: true, staged: true, calendarActionQueued: queued.created }
+  } catch (error) {
+    if (
+      error instanceof CrmIntegrationActionError
+      && error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'
+    ) {
+      return { matched: true, staged: true, calendarActionQueued: false }
+    }
+    throw error
+  }
 }
 
 async function meetingCalendarOwnerEmail(meeting: MeetingRow): Promise<string> {
