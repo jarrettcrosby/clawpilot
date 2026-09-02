@@ -448,14 +448,19 @@ async function runApiAcceptance(baseUrl, token, pool, organizationId) {
       contactIds: [contact.id],
     })),
   })).record
+  const meetingSaveIdempotencyKey = '9c70c0a4-f551-4a6f-9d50-257ae76dc26b'
   const meeting = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST',
-    body: JSON.stringify(fields('meetings', FIXTURES.meeting, {
-      organizationId: account.id,
-      contactId: contact.id,
-      leadId: lead.id,
-      opportunityId: opportunity.id,
-    })),
+    headers: { 'Idempotency-Key': meetingSaveIdempotencyKey },
+    body: JSON.stringify({
+      ...fields('meetings', FIXTURES.meeting, {
+        organizationId: account.id,
+        contactId: contact.id,
+        leadId: lead.id,
+        opportunityId: opportunity.id,
+      }),
+      idempotencyKey: meetingSaveIdempotencyKey,
+    }),
   })).record
   const campaign = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST', body: JSON.stringify(fields('campaigns', FIXTURES.campaign)),
