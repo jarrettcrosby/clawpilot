@@ -16,6 +16,8 @@ export type OperationsOrderSort =
   | 'priority'
   | 'updated_desc'
   | 'updated_asc'
+  | 'order_date_desc'
+  | 'order_date_asc'
   | 'order_asc'
   | 'order_desc'
   | 'customer_asc'
@@ -81,6 +83,10 @@ export function operationsOrderRowProvider(row: OperationsOrderWorkbenchRow) {
 
 export function operationsOrderRowUpdatedAt(row: OperationsOrderWorkbenchRow) {
   return row.order.updatedAt
+}
+
+export function operationsOrderRowOrderedAt(row: OperationsOrderWorkbenchRow) {
+  return row.order.orderedAt
 }
 
 export function operationsOrderRowTracking(row: OperationsOrderWorkbenchRow) {
@@ -259,6 +265,12 @@ export function compareOperationsOrderRows(
       milliseconds(operationsOrderRowUpdatedAt(left)),
       milliseconds(operationsOrderRowUpdatedAt(right)),
       sort === 'updated_asc' ? 'asc' : 'desc',
+    )
+  } else if (sort === 'order_date_desc' || sort === 'order_date_asc') {
+    comparison = compareNullableNumber(
+      milliseconds(operationsOrderRowOrderedAt(left)),
+      milliseconds(operationsOrderRowOrderedAt(right)),
+      sort === 'order_date_asc' ? 'asc' : 'desc',
     )
   } else if (sort === 'order_asc' || sort === 'order_desc') {
     comparison = textCompare(rowOrderNumber(left), rowOrderNumber(right))

@@ -1,5 +1,6 @@
 export const OPERATIONS_ORDER_SORTS = [
   'updated',
+  'order_date',
   'order_number',
   'customer',
   'status',
@@ -73,7 +74,9 @@ export function isOperationsOrderCursorSortValue(
   sort: OperationsOrderSort,
 ) {
   if (typeof value !== 'string') return false
-  if (sort === 'updated') return isOperationsOrderUpdatedAfter(value)
+  if (sort === 'updated' || sort === 'order_date') {
+    return isOperationsOrderUpdatedAfter(value)
+  }
   // PostgreSQL text cannot contain NUL. Reject it before the value is bound,
   // and reject malformed surrogate pairs that would not round-trip through
   // UTF-8 as the same cursor tuple.

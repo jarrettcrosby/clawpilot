@@ -384,7 +384,7 @@ for (const fragment of [
 }
 for (const fragment of [
   'matching_candidate_rows AS MATERIALIZED',
-  'matching_candidate_evidence AS (',
+  'matching_candidate_evidence AS MATERIALIZED (',
   "E'\\n' ORDER BY matching.candidate_id",
   'CROSS JOIN matching_candidate_evidence evidence',
 ]) {
@@ -441,6 +441,8 @@ for (const fragment of [
   'nextCursor',
   'complete: nextCursor === null',
   'truncated: nextCursor !== null',
+  'offset?: number',
+  'OFFSET $12::bigint',
 ]) {
   assert.ok(
     persistence.includes(fragment),
@@ -464,7 +466,7 @@ assert.ok(
 for (const fragment of [
   'export async function readOperationsOrderPageFromPostgres',
   'WITH matching_order_rows AS MATERIALIZED',
-  'matching_order_evidence AS (',
+  'matching_order_evidence AS MATERIALIZED (',
   "E'\\n' ORDER BY matching.id",
   'CROSS JOIN matching_order_evidence evidence',
   'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
@@ -472,6 +474,7 @@ for (const fragment of [
   'line.channel_sku ILIKE',
   'latest_tracking.tracking_number ILIKE',
   'LIMIT $10::integer',
+  'OFFSET $11::bigint',
   'orders.requested_delivery_at',
   'requestedDeliveryAt: row.requested_delivery_at?.toISOString() || null',
   'orderPage: orderPageResult.page',

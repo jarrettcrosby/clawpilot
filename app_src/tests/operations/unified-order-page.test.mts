@@ -71,7 +71,7 @@ test('unified merge returns one bounded page and source consumption evidence', (
   assert.equal(result.importedConsumed, 2)
 })
 
-test('equal cross-source keys use a deterministic direction-aware source rank', () => {
+test('equal cross-source keys use a fixed deterministic source rank', () => {
   const shared = {
     canonical: [{ row: canonical('gor-1'), evidence: evidence('c1', 'alpha') }],
     imported: [{ row: imported('gcoc-1'), evidence: evidence('i1', 'alpha') }],
@@ -86,7 +86,7 @@ test('equal cross-source keys use a deterministic direction-aware source rank', 
   assert.deepEqual(
     mergeUnifiedOperationsOrderPage({ ...shared, direction: 'desc' })
       .rows.map((row) => row.kind),
-    ['imported', 'canonical'],
+    ['canonical', 'imported'],
   )
 })
 
@@ -135,4 +135,87 @@ test('shared comparator validates timestamps and uses UTF-8 byte order for text'
     sort: 'updated',
     direction: 'asc',
   }), /invalid timestamp evidence/u)
+})
+
+test('Shopify order numbers sort naturally without losing integer precision', () => {
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    left: '#10000',
+    right: '#9999',
+    leftProvider: 'shopify',
+    rightProvider: 'shopify',
+    sort: 'order_number',
+    direction: 'desc',
+  }) < 0, true)
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    left: '#10000',
+    right: '#9999',
+    leftProvider: 'shopify',
+    rightProvider: 'shopify',
+    sort: 'order_number',
+    direction: 'asc',
+  }) > 0, true)
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    left: '#90071992547409930',
+    right: '#9007199254740993',
+    leftProvider: 'shopify',
+    rightProvider: 'shopify',
+    sort: 'order_number',
+    direction: 'desc',
+  }) < 0, true)
+})
+
+test('Shopify numeric and fallback identifiers reverse together with direction', () => {
+  assert.ok(compareUnifiedOperationsOrderSortValues({
+    left: '#10000',
+    right: 'DRAFT-9',
+    sort: 'order_number',
+    direction: 'asc',
+    leftProvider: 'shopify',
+    rightProvider: 'shopify',
+  }) < 0)
+  assert.ok(compareUnifiedOperationsOrderSortValues({
+    left: '#10000',
+    right: 'DRAFT-9',
+    sort: 'order_number',
+    direction: 'desc',
+    leftProvider: 'shopify',
+    rightProvider: 'shopify',
+  }) > 0)
+})
+
+test('provider rank remains fixed while Faire identifiers are deterministic', () => {
+  const shopifyBeforeFaire = {
+    left: '#1',
+    right: 'B2B-0001',
+    leftProvider: 'shopify',
+    rightProvider: 'faire',
+    sort: 'order_number' as const,
+  }
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    ...shopifyBeforeFaire,
+    direction: 'asc',
+  }) < 0, true)
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    ...shopifyBeforeFaire,
+    direction: 'desc',
+  }) < 0, true)
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    left: 'B2B-10A',
+    right: 'B2B-2A',
+    leftProvider: 'faire',
+    rightProvider: 'faire',
+    sort: 'order_number',
+    direction: 'asc',
+  }) < 0, true)
+})
+
+test('mixed-provider order-date sorting remains date-first', () => {
+  assert.equal(compareUnifiedOperationsOrderSortValues({
+    left: '2026-09-01T12:00:00.000Z',
+    right: '2026-09-02T12:00:00.000Z',
+    leftProvider: 'shopify',
+    rightProvider: 'faire',
+    sort: 'order_date',
+    direction: 'desc',
+  }) > 0, true)
 })

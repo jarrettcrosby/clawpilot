@@ -11,6 +11,7 @@ import type {
 
 export const UNIFIED_OPERATIONS_ORDER_SORTS = [
   'updated',
+  'order_date',
   'order_number',
   'customer',
 ] as const
@@ -37,6 +38,7 @@ export type OperationsOrderSourceEvidence = {
   rowCursor: string
   sortValue: string
   providerIdentity: OperationsOrderProviderIdentity | null
+  provider?: string
 }
 
 export type UnifiedOperationsOrderRow =
@@ -59,6 +61,8 @@ export type UnifiedOperationsOrderPage = {
   nextCursor: string | null
   complete: boolean
   truncated: boolean
+  /** Opaque result-set fence for direct numbered-page navigation. */
+  snapshot: string | null
 }
 
 export type UnifiedOperationsOrderPageInput = {
@@ -71,6 +75,10 @@ export type UnifiedOperationsOrderPageInput = {
   tracking?: OperationsOrderTrackingFilter | null
   updatedAfter?: string | null
   cursor?: string | null
+  /** One-based direct page request. Mutually exclusive with cursor. */
+  page?: number | null
+  /** Opaque result-set fence returned by the first direct page read. */
+  snapshot?: string | null
   pageSize?: number | null
 }
 
@@ -113,14 +121,55 @@ function compareUtf8(left: string, right: string) {
   return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
 }
 
+function orderProviderRank(value: string | null | undefined) {
+  const provider = String(value || '').trim().toLowerCase()
+  if (provider === 'shopify') return 0
+  if (provider === 'faire') return 1
+  return 2
+}
+
+function normalizedShopifyOrderNumber(value: string) {
+  const normalized = value.trim().replace(/^#/u, '')
+  return /^\d+$/u.test(normalized)
+    ? normalized.replace(/^0+(?=\d)/u, '')
+    : null
+}
+
+function compareNaturalOrderNumber(input: {
+  left: string
+  right: string
+  leftProvider?: string | null
+  rightProvider?: string | null
+}) {
+  const providerComparison = orderProviderRank(input.leftProvider)
+    - orderProviderRank(input.rightProvider)
+  if (providerComparison) return providerComparison
+  if (orderProviderRank(input.leftProvider) === 0) {
+    const leftNumber = normalizedShopifyOrderNumber(input.left)
+    const rightNumber = normalizedShopifyOrderNumber(input.right)
+    if (leftNumber && rightNumber) {
+      if (leftNumber.length !== rightNumber.length) {
+        return leftNumber.length < rightNumber.length ? -1 : 1
+      }
+      const numericComparison = compareUtf8(leftNumber, rightNumber)
+      if (numericComparison) return numericComparison
+    } else if (leftNumber || rightNumber) {
+      return leftNumber ? -1 : 1
+    }
+  }
+  return compareUtf8(input.left.toLowerCase(), input.right.toLowerCase())
+}
+
 export function compareUnifiedOperationsOrderSortValues(input: {
   left: string
   right: string
   sort: UnifiedOperationsOrderSort
   direction: OperationsOrderSortDirection
+  leftProvider?: string | null
+  rightProvider?: string | null
 }) {
   let comparison: number
-  if (input.sort === 'updated') {
+  if (input.sort === 'updated' || input.sort === 'order_date') {
     const left = Date.parse(input.left)
     const right = Date.parse(input.right)
     if (!Number.isFinite(left) || !Number.isFinite(right)) {
@@ -130,10 +179,42 @@ export function compareUnifiedOperationsOrderSortValues(input: {
       )
     }
     comparison = left === right ? 0 : left < right ? -1 : 1
+  } else if (input.sort === 'order_number') {
+    comparison = compareNaturalOrderNumber({
+      left: input.left,
+      right: input.right,
+      leftProvider: input.leftProvider,
+      rightProvider: input.rightProvider,
+    })
+    const providerComparison = orderProviderRank(input.leftProvider)
+      - orderProviderRank(input.rightProvider)
+    if (providerComparison) return providerComparison
   } else {
     comparison = compareUtf8(input.left, input.right)
   }
   return input.direction === 'asc' ? comparison : -comparison
+}
+
+function compareUnifiedOperationsOrderSourceEvidence(input: {
+  left: OperationsOrderSourceEvidence
+  leftSource: 'canonical' | 'imported'
+  right: OperationsOrderSourceEvidence
+  rightSource: 'canonical' | 'imported'
+  sort: UnifiedOperationsOrderSort
+  direction: OperationsOrderSortDirection
+}) {
+  const primaryComparison = compareUnifiedOperationsOrderSortValues({
+    left: input.left.sortValue,
+    right: input.right.sortValue,
+    sort: input.sort,
+    direction: input.direction,
+    leftProvider: input.left.provider,
+    rightProvider: input.right.provider,
+  })
+  if (primaryComparison || input.leftSource === input.rightSource) {
+    return primaryComparison
+  }
+  return input.leftSource === 'canonical' ? -1 : 1
 }
 
 function identityKey(identity: OperationsOrderProviderIdentity) {
@@ -233,15 +314,14 @@ export function mergeUnifiedOperationsOrderPage(
       canonicalConsumed += 1
       continue
     }
-    const primaryComparison = compareUnifiedOperationsOrderSortValues({
-      left: canonical.evidence.sortValue,
-      right: imported.evidence.sortValue,
+    const comparison = compareUnifiedOperationsOrderSourceEvidence({
+      left: canonical.evidence,
+      leftSource: 'canonical',
+      right: imported.evidence,
+      rightSource: 'imported',
       sort: input.sort,
       direction: input.direction,
     })
-    // A source rank makes equal primary keys deterministic without changing
-    // either source reader's own UUID-backed keyset order.
-    const comparison = primaryComparison || (input.direction === 'asc' ? -1 : 1)
     if (comparison <= 0) {
       rows.push(canonical.row)
       canonicalConsumed += 1
