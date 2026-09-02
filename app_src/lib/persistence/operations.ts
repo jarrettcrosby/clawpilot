@@ -5250,21 +5250,10 @@ export async function readOperationsOrderPageFromPostgres(input: {
   const orderDirection = direction === 'asc' ? 'ASC' : 'DESC'
   const result = await queryOperationsOrderPage<OperationsOrderListReadRow>(
     input.queryClient,
-    `WITH matching_order_ids AS (
+    `WITH matching_order_rows AS MATERIALIZED (
        SELECT orders.id, order_activity.activity_at AS updated_at,
               latest_tracking.tracking_number AS latest_tracking_number,
-              ${sortSql.expression} AS cursor_sort_value,
-              count(*) OVER ()::text AS matching_total_count,
-              md5(string_agg(
-                jsonb_build_array(
-                  orders.id::text,
-                  (${sortSql.expression})::text
-                )::text,
-                E'\n'
-              ) OVER (
-                ORDER BY orders.id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-              )) AS result_set_revision
+              ${sortSql.expression} AS cursor_sort_value
        FROM operations_orders orders
        JOIN crm_organizations customer
          ON customer.id = orders.customer_id
@@ -5446,13 +5435,24 @@ export async function readOperationsOrderPageFromPostgres(input: {
            $6::timestamptz IS NULL
            OR order_activity.activity_at > $6::timestamptz
          )
+     ), matching_order_evidence AS (
+       SELECT count(*)::text AS matching_total_count,
+              md5(string_agg(
+                jsonb_build_array(
+                  matching.id::text,
+                  matching.cursor_sort_value::text
+                )::text,
+                E'\n' ORDER BY matching.id
+              )) AS result_set_revision
+       FROM matching_order_rows matching
      ), page_order_ids AS (
        SELECT matching.id, matching.updated_at,
               matching.latest_tracking_number,
               matching.cursor_sort_value,
-              matching.matching_total_count,
-              matching.result_set_revision
-       FROM matching_order_ids matching
+              evidence.matching_total_count,
+              evidence.result_set_revision
+       FROM matching_order_rows matching
+       CROSS JOIN matching_order_evidence evidence
        WHERE NOT $7::boolean
           OR matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}
           OR (

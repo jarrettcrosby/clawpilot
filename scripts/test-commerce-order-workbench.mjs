@@ -367,6 +367,43 @@ assert.ok(
   'Already-canonical provider identities must not remain in the imported working-copy list',
 )
 assert.equal(
+  persistence.includes('candidate.*'),
+  false,
+  'The latest-live candidate selector must stay narrow so pagination does not spill encrypted provider rows to temporary disk',
+)
+for (const fragment of [
+  'candidate.id,',
+  'candidate.organization_id,',
+  'candidate.integration_account_id,',
+  'candidate.external_order_id',
+]) {
+  assert.ok(
+    persistence.includes(fragment),
+    `The latest-live candidate selector is missing its narrow identity column: ${fragment}`,
+  )
+}
+for (const fragment of [
+  'matching_candidate_rows AS MATERIALIZED',
+  'matching_candidate_evidence AS (',
+  "E'\\n' ORDER BY matching.candidate_id",
+  'CROSS JOIN matching_candidate_evidence evidence',
+]) {
+  assert.ok(
+    persistence.includes(fragment),
+    `Imported-order pagination must compute result-set evidence once: ${fragment}`,
+  )
+}
+assert.equal(
+  /string_agg\([\s\S]*?\) OVER \(/u.test(
+    persistence.slice(
+      persistence.indexOf('matching_candidate_rows AS MATERIALIZED'),
+      persistence.indexOf('page_candidate_ids AS ('),
+    ),
+  ),
+  false,
+  'Imported-order pagination must not repeat the full result-set revision in a window row',
+)
+assert.equal(
   /reasonValue|confirmationStatement|canActivate/u.test(route),
   false,
   'Ordinary local order edits must not require activation ceremony',
@@ -394,7 +431,7 @@ assert.ok(
 )
 for (const fragment of [
   'readCommerceOrderWorkbenchPageFromPostgres',
-  'count(*) OVER ()::text AS matching_total_count',
+  'count(*)::text AS matching_total_count',
   'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
   'matching.candidate_id ${comparison} $9::uuid',
   'selected.cursor_sort_value',
@@ -426,8 +463,10 @@ assert.ok(
 )
 for (const fragment of [
   'export async function readOperationsOrderPageFromPostgres',
-  'WITH matching_order_ids AS',
-  'count(*) OVER ()::text AS matching_total_count',
+  'WITH matching_order_rows AS MATERIALIZED',
+  'matching_order_evidence AS (',
+  "E'\\n' ORDER BY matching.id",
+  'CROSS JOIN matching_order_evidence evidence',
   'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
   'matching.id ${comparison} $9::uuid',
   'line.channel_sku ILIKE',
@@ -442,6 +481,16 @@ for (const fragment of [
     `Canonical order pagination is missing ${fragment}`,
   )
 }
+assert.equal(
+  /string_agg\([\s\S]*?\) OVER \(/u.test(
+    operations.slice(
+      operations.indexOf('WITH matching_order_rows AS MATERIALIZED'),
+      operations.indexOf('page_order_ids AS ('),
+    ),
+  ),
+  false,
+  'Canonical pagination must not repeat the full result-set revision in a window row',
+)
 for (const fragment of [
   'export async function GET',
   'readOperationsOrderPageFromPostgres',

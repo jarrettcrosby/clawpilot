@@ -1465,7 +1465,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          candidate.integration_account_id,
          candidate.external_order_id
        )
-         candidate.*
+         candidate.id,
+         candidate.organization_id,
+         candidate.integration_account_id,
+         candidate.external_order_id
        FROM operations_commerce_order_candidates candidate
        JOIN operations_commerce_intake_runs run
          ON run.organization_id = candidate.organization_id
@@ -1751,24 +1754,13 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
            WHERE ranked.subject_rank = 1
          ) subject_state
        ) latest_tracking ON true
-     ), matching_candidate_ids AS (
+     ), matching_candidate_rows AS MATERIALIZED (
        SELECT candidate_context.candidate_id,
               candidate_context.provider_updated_at,
               candidate_context.observed_at,
               candidate_context.activity_at,
               candidate_context.tracking_number,
-              ${sortSql.expression} AS cursor_sort_value,
-              count(*) OVER ()::text AS matching_total_count,
-              md5(string_agg(
-                jsonb_build_array(
-                  candidate_context.candidate_id::text,
-                  (${sortSql.expression})::text
-                )::text,
-                E'\n'
-              ) OVER (
-                ORDER BY candidate_context.candidate_id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-              )) AS result_set_revision
+              ${sortSql.expression} AS cursor_sort_value
        FROM candidate_context
        WHERE (
            $2::text IS NULL
@@ -1844,6 +1836,16 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
            $11::text IS NULL
            OR candidate_context.display_status = $11::text
          )
+     ), matching_candidate_evidence AS (
+       SELECT count(*)::text AS matching_total_count,
+              md5(string_agg(
+                jsonb_build_array(
+                  matching.candidate_id::text,
+                  matching.cursor_sort_value::text
+                )::text,
+                E'\n' ORDER BY matching.candidate_id
+              )) AS result_set_revision
+       FROM matching_candidate_rows matching
      ), page_candidate_ids AS (
        SELECT matching.candidate_id,
               matching.provider_updated_at,
@@ -1851,9 +1853,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
               matching.activity_at,
               matching.tracking_number,
               matching.cursor_sort_value,
-              matching.matching_total_count,
-              matching.result_set_revision
-       FROM matching_candidate_ids matching
+              evidence.matching_total_count,
+              evidence.result_set_revision
+       FROM matching_candidate_rows matching
+       CROSS JOIN matching_candidate_evidence evidence
        WHERE NOT $7::boolean
           OR matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}
           OR (
