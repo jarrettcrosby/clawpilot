@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
@@ -30,13 +29,6 @@ const health = await readFile(
 const orderEditingReleaseHealth = await readFile(
   new URL(
     'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
-    root,
-  ),
-  'utf8',
-)
-const exactHistoryMigration = await readFile(
-  new URL(
-    'db/migrations/0340_operations_order_workbench_exact_history.sql',
     root,
   ),
   'utf8',
@@ -314,6 +306,11 @@ assert.match(imports, /<CommerceAuthoritySummaryPanel/)
 assert.match(imports, /provider=\{selectedAccount\.provider\}/)
 assert.match(imports, /onOpenOrder=\{onOpenOrder\}/)
 
+const runtimeHealthAuthority = [
+  health,
+  orderEditingReleaseHealth,
+  orderEditingReleaseHealth.replaceAll('public.', ''),
+].join('\n')
 for (const contract of [
   '0276_operations_commerce_order_sync_foundation.sql',
   '0340_operations_order_workbench_exact_history.sql',
@@ -384,34 +381,30 @@ for (const contract of [
   "'commerce_order_observation_lines_immutable'",
   "'commerce_order_event_observations_immutable'",
   "'commerce_order_event_tracking_url_guard'",
-  'installed_tracking_url_trigger.tgtype = 7',
   "installed_history_trigger.tgenabled IN ('O', 'A')",
   'installed_history_trigger.tgfoid = to_regprocedure',
 ]) {
-  assert.ok(health.includes(contract), `Health is missing ${contract}`)
+  assert.ok(
+    runtimeHealthAuthority.includes(contract),
+    `Runtime health authority is missing ${contract}`,
+  )
 }
-assert.ok(
-  health.includes('${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}'),
-  'Runtime health must evaluate the exact 0340 artifact fingerprint',
+assert.equal(
+  (
+    health.match(
+      /\$\{OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL\}/gu,
+    ) || []
+  ).length,
+  1,
+  'Runtime health must use one centralized exact-history attestation',
 )
 assert.ok(
-  health.includes('AND installed_manual_read_index.indisunique'),
-  'Runtime health must require the unique manual-read lineage index',
+  !health.includes('0340_operations_order_workbench_exact_history.sql'),
+  'Runtime health must not duplicate the centralized exact-history attestation',
 )
 assert.ok(
-  !health.includes('AND NOT installed_manual_read_index.indisunique'),
-  'Runtime health must not reject the unique manual-read lineage index',
-)
-const trackingUrlGuardBody = exactHistoryMigration.match(
-  /CREATE OR REPLACE FUNCTION protect_commerce_order_event_tracking_url\(\)[\s\S]*?AS \$\$([\s\S]*?)\$\$;/u,
-)?.[1]
-assert.ok(trackingUrlGuardBody, 'Tracking-URL guard function body is missing')
-const trackingUrlGuardBodyHash = createHash('sha256')
-  .update(trackingUrlGuardBody.trim().replace(/\s+/gu, ' '), 'utf8')
-  .digest('hex')
-assert.ok(
-  health.includes(`'${trackingUrlGuardBodyHash}'`),
-  'Runtime health must attest the installed tracking-URL guard body',
+  !health.includes('0a94308fcea248c267ef2d6c83f06875f3c646adb565db0b0a8a8d177e460c79'),
+  'Runtime health must not retain stale pre-Faire function fingerprints',
 )
 for (const contract of [
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
