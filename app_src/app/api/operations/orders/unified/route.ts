@@ -181,6 +181,39 @@ export async function GET(req: NextRequest) {
     const cursor = String(
       req.nextUrl.searchParams.get('cursor') || '',
     ).trim()
+    const snapshot = String(
+      req.nextUrl.searchParams.get('snapshot') || '',
+    ).trim()
+    if (snapshot && !/^[A-Za-z0-9_-]{1,16384}$/u.test(snapshot)) {
+      requestError(
+        'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+        'The order page snapshot is invalid',
+      )
+    }
+    const pageValue = req.nextUrl.searchParams.get('page')
+    let page: number | null = null
+    if (pageValue !== null) {
+      const normalizedPage = pageValue.trim()
+      if (!/^[1-9]\d*$/u.test(normalizedPage)) {
+        requestError(
+          'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+          'Unified order page is invalid',
+        )
+      }
+      page = Number(normalizedPage)
+      if (!Number.isSafeInteger(page) || page < 1) {
+        requestError(
+          'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+          'Unified order page is invalid',
+        )
+      }
+    }
+    if (cursor && page !== null) {
+      requestError(
+        'OPERATIONS_UNIFIED_ORDER_PAGE_CURSOR_CONFLICT',
+        'Unified order page and cursor cannot be combined',
+      )
+    }
     const pageSizeValue = String(
       req.nextUrl.searchParams.get('pageSize') || '50',
     ).trim()
@@ -214,6 +247,8 @@ export async function GET(req: NextRequest) {
         : null,
       updatedAfter: updatedAfterValue || null,
       cursor: cursor || null,
+      page,
+      snapshot: snapshot || null,
       pageSize,
     })
     return response({ ok: true, rows: result.rows, page: result.page })

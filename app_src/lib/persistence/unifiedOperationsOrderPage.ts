@@ -31,6 +31,7 @@ import {
   getPostgresPool,
   normalizePostgresPersistenceError,
 } from './postgres'
+import { readUnifiedOperationsOrderIndexPage } from './unifiedOperationsOrderIndex'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 const SOURCE_CURSOR = /^[A-Za-z0-9_-]{1,4096}$/u
@@ -71,6 +72,13 @@ type CombinedCursor = {
   total: number
   canonical: SourceCursorState
   imported: SourceCursorState
+}
+
+type DirectPageSnapshot = {
+  v: 1
+  scopeHash: string
+  total: number
+  revision: string
 }
 
 type NormalizedInput = {
@@ -257,6 +265,64 @@ function encodeCombinedCursor(cursor: CombinedCursor) {
   return encoded
 }
 
+function decodeDirectPageSnapshot(
+  value: string | null | undefined,
+  expectedScopeHash: string,
+): DirectPageSnapshot | null {
+  if (!value) return null
+  if (!COMBINED_CURSOR.test(value)) {
+    requestError(
+      'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+      'The order page snapshot is invalid',
+    )
+  }
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'))
+  } catch {
+    requestError(
+      'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+      'The order page snapshot is invalid',
+    )
+  }
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    requestError(
+      'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+      'The order page snapshot is invalid',
+    )
+  }
+  const snapshot = decoded as Partial<DirectPageSnapshot>
+  if (
+    Object.keys(snapshot).sort().join(',') !== 'revision,scopeHash,total,v'
+    || snapshot.v !== 1
+    || snapshot.scopeHash !== expectedScopeHash
+    || typeof snapshot.scopeHash !== 'string'
+    || !SCOPE_HASH.test(snapshot.scopeHash)
+    || !Number.isSafeInteger(snapshot.total)
+    || Number(snapshot.total) < 0
+    || typeof snapshot.revision !== 'string'
+    || !RESULT_SET_REVISION.test(snapshot.revision)
+  ) {
+    requestError(
+      'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+      'The order page snapshot is invalid',
+    )
+  }
+  return snapshot as DirectPageSnapshot
+}
+
+function encodeDirectPageSnapshot(snapshot: DirectPageSnapshot) {
+  const encoded = Buffer.from(JSON.stringify(snapshot), 'utf8').toString('base64url')
+  if (encoded.length > MAX_UNIFIED_OPERATIONS_ORDER_CURSOR_LENGTH) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_EVIDENCE_INVALID',
+      'Unified order pagination produced an oversized snapshot',
+      500,
+    )
+  }
+  return encoded
+}
+
 function emptySourceResult(
   total: number,
   pageSize: number,
@@ -278,6 +344,7 @@ function emptySourceResult(
       providerIdentities: [],
       sourceEvidence: [] as OperationsOrderSourceEvidence[],
       resultSetRevision,
+      databaseIds: [] as string[],
     },
   }
 }
@@ -382,6 +449,17 @@ function nextSourceState(input: {
   }
 }
 
+function directPageValue(value: number | null | undefined) {
+  if (value === null || value === undefined) return null
+  if (!Number.isSafeInteger(value) || value < 1) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+      'Unified order page is invalid',
+    )
+  }
+  return value
+}
+
 export async function readUnifiedOperationsOrderPageFromPostgres(
   rawInput: UnifiedOperationsOrderPageInput,
 ): Promise<{
@@ -389,16 +467,33 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
   page: UnifiedOperationsOrderPage
 }> {
   const input = normalizedInput(rawInput)
+  const requestedPage = directPageValue(rawInput.page)
+  if (requestedPage !== null && String(rawInput.cursor || '').trim()) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_PAGE_CURSOR_CONFLICT',
+      'Unified order page and cursor cannot be combined',
+    )
+  }
   const expectedScopeHash = scopeHash(input)
+  if (requestedPage === null && String(rawInput.snapshot || '').trim()) {
+    requestError(
+      'OPERATIONS_ORDER_PAGE_SNAPSHOT_INVALID',
+      'An order page snapshot requires a direct page request',
+    )
+  }
   const cursor = decodeCombinedCursor(rawInput.cursor, expectedScopeHash)
+  const directSnapshot = decodeDirectPageSnapshot(
+    rawInput.snapshot,
+    expectedScopeHash,
+  )
   const initialSourceState: SourceCursorState = {
     cursor: null,
     done: false,
     total: 0,
     revision: EMPTY_OPERATIONS_ORDER_RESULT_SET_REVISION,
   }
-  const canonicalState = cursor?.canonical || initialSourceState
-  const importedState = cursor?.imported || initialSourceState
+  const canonicalState: SourceCursorState = cursor?.canonical || initialSourceState
+  const importedState: SourceCursorState = cursor?.imported || initialSourceState
   const shared = {
     organizationId: input.organizationId,
     search: input.search,
@@ -414,9 +509,139 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
 
-    // Reads are intentionally sequenced on one client. The first source read
-    // establishes the snapshot; a promotion committed before the second read
-    // cannot make an identity disappear between sources.
+    if (requestedPage !== null) {
+      // PostgreSQL can spend materially more time compiling this full-evidence
+      // page index than executing it at normal Operations order volumes. Keep
+      // the override local to this read-only snapshot transaction so unrelated
+      // queries retain the database's configured JIT policy.
+      await client.query('SET LOCAL jit = off')
+      const index = await readUnifiedOperationsOrderIndexPage({
+        client,
+        organizationId: input.organizationId,
+        search: input.search,
+        status: input.status,
+        sort: input.sort,
+        direction: input.direction,
+        provider: input.provider,
+        tracking: input.tracking,
+        updatedAfter: input.updatedAfter,
+        page: requestedPage,
+        pageSize: input.pageSize,
+      })
+      if (
+        directSnapshot
+        && (
+          directSnapshot.total !== index.total
+          || directSnapshot.revision !== index.revision
+        )
+      ) {
+        requestError(
+          'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED',
+          'The order result set changed while pages were being read; restart from page one',
+          409,
+        )
+      }
+      const canonicalIds = index.entries
+        .filter((entry) => entry.source === 'canonical')
+        .map((entry) => entry.rowId)
+      const importedIds = index.entries
+        .filter((entry) => entry.source === 'imported')
+        .map((entry) => entry.rowId)
+      const canonicalRows = new Map<string, UnifiedOperationsOrderRow>()
+      const importedRows = new Map<string, UnifiedOperationsOrderRow>()
+      if (canonicalIds.length) {
+        const canonicalRead = await readOperationsOrderPageFromPostgres({
+          ...shared,
+          pageSize: canonicalIds.length,
+          offset: 0,
+          selectedIds: canonicalIds,
+          queryClient: client,
+        })
+        canonicalRead.orders.forEach((order, position) => {
+          const databaseId = canonicalRead.internal.databaseIds[position]
+          if (!databaseId || canonicalRows.has(databaseId)) {
+            requestError(
+              'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+              'Canonical order batch hydration returned inconsistent evidence',
+              500,
+            )
+          }
+          canonicalRows.set(databaseId, {
+            kind: 'canonical',
+            key: `canonical:${order.globalId}`,
+            order,
+          })
+        })
+      }
+      if (importedIds.length) {
+        const importedRead = await readCommerceOrderWorkbenchPageFromPostgres({
+          ...shared,
+          pageSize: importedIds.length,
+          offset: 0,
+          selectedIds: importedIds,
+          queryClient: client,
+        })
+        importedRead.orders.forEach((order, position) => {
+          const databaseId = importedRead.internal.databaseIds[position]
+          if (!databaseId || importedRows.has(databaseId)) {
+            requestError(
+              'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+              'Imported-order batch hydration returned inconsistent evidence',
+              500,
+            )
+          }
+          importedRows.set(databaseId, {
+            kind: 'imported',
+            key: `imported:${order.candidateGlobalId}`,
+            order,
+          })
+        })
+      }
+      const rows = index.entries.map((entry) => (
+        entry.source === 'canonical'
+          ? canonicalRows.get(entry.rowId)
+          : importedRows.get(entry.rowId)
+      ))
+      if (
+        rows.some((row) => !row)
+        || canonicalRows.size !== canonicalIds.length
+        || importedRows.size !== importedIds.length
+      ) {
+        requestError(
+          'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+          'Unified order index and batch hydration did not identify the same rows',
+          500,
+        )
+      }
+      const snapshot = encodeDirectPageSnapshot({
+        v: 1,
+        scopeHash: expectedScopeHash,
+        total: index.total,
+        revision: index.revision,
+      })
+      const complete = index.offset + rows.length >= index.total
+      const directResult = {
+        rows: rows as UnifiedOperationsOrderRow[],
+        page: {
+          total: index.total,
+          returned: rows.length,
+          pageSize: input.pageSize,
+          offset: index.offset,
+          nextCursor: null,
+          complete,
+          truncated: !complete,
+          snapshot,
+        },
+      }
+      await client.query('COMMIT')
+      return directResult
+    }
+
+    const offset = cursor?.offset || 0
+    const expectedSnapshot = Boolean(cursor)
+
+    // Cursor reads are intentionally sequenced on one client. The first
+    // source read establishes the snapshot for both source result sets.
     const canonicalRead = await readOperationsOrderPageFromPostgres({
       ...shared,
       cursor: canonicalState.done ? null : canonicalState.cursor,
@@ -435,18 +660,18 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
       orders: canonicalRead.orders,
       page: canonicalRead.page,
       evidence: canonicalRead.internal.sourceEvidence,
-      expectedTotal: cursor ? canonicalState.total : null,
+      expectedTotal: expectedSnapshot ? canonicalState.total : null,
       resultSetRevision: canonicalRead.internal.resultSetRevision,
-      expectedResultSetRevision: cursor ? canonicalState.revision : null,
+      expectedResultSetRevision: expectedSnapshot ? canonicalState.revision : null,
     })
     assertSourceEvidence({
       source: 'Imported',
       orders: importedRead.orders,
       page: importedRead.page,
       evidence: importedRead.internal.sourceEvidence,
-      expectedTotal: cursor ? importedState.total : null,
+      expectedTotal: expectedSnapshot ? importedState.total : null,
       resultSetRevision: importedRead.internal.resultSetRevision,
-      expectedResultSetRevision: cursor ? importedState.revision : null,
+      expectedResultSetRevision: expectedSnapshot ? importedState.revision : null,
     })
 
     const canonical = canonicalState.done
@@ -495,7 +720,6 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
     }
 
     const total = canonical.page.total + imported.page.total
-    const offset = cursor?.offset || 0
     if (
       !Number.isSafeInteger(total)
       || total < 0
@@ -557,6 +781,7 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
         nextCursor,
         complete: nextCursor === null,
         truncated: nextCursor !== null,
+        snapshot: null,
       },
     }
     await client.query('COMMIT')

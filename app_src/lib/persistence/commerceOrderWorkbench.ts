@@ -149,6 +149,7 @@ type WorkbenchReadRow = {
   external_order_id: string
   order_number_snapshot: string
   source_hash: string
+  ordered_at: Date
   provider_updated_at: Date | null
   observed_at: Date
   candidate_row_version: string
@@ -479,7 +480,10 @@ function decodeWorkbenchPageCursor(
     ].sort().join(',')
     || parsed.v !== 2
     || !isOperationsOrderCursorSortValue(parsed.sortValue, sort)
-    || (sort === 'updated' && !validCursorTimestamp(parsed.sortValue))
+    || (
+      (sort === 'updated' || sort === 'order_date')
+      && !validCursorTimestamp(parsed.sortValue)
+    )
     || typeof parsed.candidateId !== 'string'
     || !UUID.test(parsed.candidateId)
     || !Number.isSafeInteger(parsed.total)
@@ -501,7 +505,7 @@ function encodeWorkbenchPageCursor(
   scopeHash: string,
   sort: OperationsOrderSort,
 ) {
-  const sortValue = sort === 'updated'
+  const sortValue = sort === 'updated' || sort === 'order_date'
     ? (row.cursor_sort_value as Date).toISOString()
     : String(row.cursor_sort_value)
   const encoded = Buffer.from(JSON.stringify({
@@ -612,6 +616,12 @@ function workbenchOrderSortSql(
   if (sort === 'updated') {
     return {
       expression: 'candidate_context.activity_at',
+      cursorCast: 'timestamptz',
+    }
+  }
+  if (sort === 'order_date') {
+    return {
+      expression: 'candidate_context.ordered_at',
       cursorCast: 'timestamptz',
     }
   }
@@ -1340,6 +1350,7 @@ function mappedWorkingCopy(
     sourceUpdatedAt: (
       row.provider_updated_at || row.observed_at
     ).toISOString(),
+    orderedAt: row.ordered_at.toISOString(),
     updatedAt: row.activity_at.toISOString(),
     trackingNumber: row.tracking_number,
     orderValueMinor: currentProviderHistory.providerTotalMinor
@@ -1413,8 +1424,12 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   pageSize?: number | null
   /** Server-only merge mode; scopes cursors to deterministic byte ordering. */
   stableTextCollation?: boolean
+  /** Server-only direct seek; never expose this source offset through an API. */
+  offset?: number
   /** Server-only: keep a unified multi-source read on one database snapshot. */
   queryClient?: PoolClient
+  /** Server-only batch hydration for IDs selected by the unified page index. */
+  selectedIds?: readonly string[]
 }): Promise<{
   orders: OperationsImportedOrderWorkingCopy[]
   page: OperationsImportedOrderPage
@@ -1424,6 +1439,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     providerIdentities: OperationsOrderProviderIdentity[]
     sourceEvidence: OperationsOrderSourceEvidence[]
     resultSetRevision: string | null
+    databaseIds: string[]
   }
 }> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -1442,6 +1458,37 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
   const pageSize = workbenchPageSize(input.pageSize)
+  const offset = input.offset ?? 0
+  const selectedIds = input.selectedIds === undefined
+    ? null
+    : [...new Set(input.selectedIds.map((value) => String(value).trim()))]
+  if (
+    selectedIds
+    && (
+      selectedIds.length > MAX_WORKBENCH_PAGE_SIZE
+      || selectedIds.some((value) => !UUID.test(value))
+    )
+  ) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_BATCH_INVALID',
+      'Imported-order hydration batch is invalid',
+      500,
+    )
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    requestError(
+      'OPERATIONS_PAGE_OFFSET_INVALID',
+      'Imported-order page offset is invalid',
+      500,
+    )
+  }
+  if (input.cursor && input.offset !== undefined) {
+    requestError(
+      'OPERATIONS_PAGE_OFFSET_INVALID',
+      'Imported-order page cursor and offset cannot be combined',
+      500,
+    )
+  }
   const scopeHash = workbenchPageScopeHash({
     organizationId,
     candidateGlobalId,
@@ -1476,6 +1523,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
         AND run.pipeline_id = candidate.pipeline_id
         AND run.id = candidate.run_id
        WHERE candidate.organization_id = $1::uuid
+         AND ($13::uuid[] IS NULL OR candidate.id = ANY($13::uuid[]))
          AND candidate.canonical_order_id IS NULL
          AND candidate.workflow_state IN ('held', 'resolving', 'ready')
          AND candidate.expires_at > now()
@@ -1515,6 +1563,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
           = retained.integration_account_id
         AND retained_candidate.id = retained.candidate_id
        WHERE retained.organization_id = $1::uuid
+         AND ($13::uuid[] IS NULL OR retained.candidate_id = ANY($13::uuid[]))
          AND retained.canonical_order_id IS NULL
          AND retained_candidate.canonical_order_id IS NULL
          AND NOT EXISTS (
@@ -1533,6 +1582,13 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
               candidate.external_order_id,
               display_snapshot.order_number_snapshot,
               display_snapshot.provider,
+              date_trunc('milliseconds', COALESCE(
+                latest_observation.provider_created_at,
+                latest_provider.provider_created_at,
+                display_snapshot.provider_created_at,
+                candidate.provider_created_at,
+                display_snapshot.observed_at
+              )) AS ordered_at,
               display_snapshot.provider_updated_at,
               display_snapshot.observed_at,
               account.display_name AS integration_account_name,
@@ -1593,6 +1649,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
         AND workbench.external_order_id = candidate.external_order_id
        LEFT JOIN LATERAL (
          SELECT provider_candidate.id,
+                provider_candidate.provider_created_at,
                 provider_candidate.provider_updated_at,
                 provider_candidate.observed_at
          FROM operations_commerce_order_candidates provider_candidate
@@ -1676,7 +1733,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          ON display_customer.pipeline_id = display_snapshot.pipeline_id
         AND display_customer.id = display_snapshot.customer_id
        LEFT JOIN LATERAL (
-         SELECT observation.provider_updated_at, observation.observed_at
+         SELECT observation.provider_created_at,
+                observation.provider_updated_at,
+                observation.observed_at
          FROM operations_commerce_order_observations observation
          WHERE observation.organization_id = candidate.organization_id
            AND observation.integration_account_id
@@ -1756,6 +1815,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        ) latest_tracking ON true
      ), matching_candidate_rows AS MATERIALIZED (
        SELECT candidate_context.candidate_id,
+              candidate_context.ordered_at,
               candidate_context.provider_updated_at,
               candidate_context.observed_at,
               candidate_context.activity_at,
@@ -1836,7 +1896,11 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
            $11::text IS NULL
            OR candidate_context.display_status = $11::text
          )
-     ), matching_candidate_evidence AS (
+         AND (
+           $13::uuid[] IS NULL
+           OR candidate_context.candidate_id = ANY($13::uuid[])
+         )
+     ), matching_candidate_evidence AS MATERIALIZED (
        SELECT count(*)::text AS matching_total_count,
               md5(string_agg(
                 jsonb_build_array(
@@ -1848,6 +1912,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        FROM matching_candidate_rows matching
      ), page_candidate_ids AS (
        SELECT matching.candidate_id,
+              matching.ordered_at,
               matching.provider_updated_at,
               matching.observed_at,
               matching.activity_at,
@@ -1866,6 +1931,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        ORDER BY matching.cursor_sort_value ${orderDirection},
                 matching.candidate_id ${orderDirection}
        LIMIT $10::integer
+       OFFSET $12::bigint
      )
      SELECT
        candidate.id::text AS candidate_id,
@@ -1879,6 +1945,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        candidate.external_order_id,
        display_snapshot.order_number_snapshot,
        display_snapshot.source_hash,
+       selected.ordered_at,
        display_snapshot.provider_updated_at,
        display_snapshot.observed_at,
        candidate.row_version::text AS candidate_row_version,
@@ -2182,6 +2249,8 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       cursor?.candidateId ?? null,
       pageSize + 1,
       status,
+      offset,
+      selectedIds,
     ],
   )
   const hasNextPage = result.rows.length > pageSize
@@ -2302,13 +2371,14 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     : null
   const sourceEvidence = pageRows.map((row): OperationsOrderSourceEvidence => ({
     rowCursor: encodeWorkbenchPageCursor(row, total, scopeHash, sort),
-    sortValue: sort === 'updated'
+    sortValue: sort === 'updated' || sort === 'order_date'
       ? (row.cursor_sort_value as Date).toISOString()
       : String(row.cursor_sort_value),
     providerIdentity: {
       integrationAccountGlobalId: row.integration_account_global_id,
       externalOrderId: row.external_order_id,
     },
+    provider: row.provider,
   }))
   const providerHistoryByCandidate = new Map<
     string,
@@ -2364,6 +2434,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
       )),
       sourceEvidence,
       resultSetRevision,
+      databaseIds: pageRows.map((row) => row.candidate_id),
     },
   }
 }

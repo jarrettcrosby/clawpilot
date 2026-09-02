@@ -717,6 +717,8 @@ export type OperationsOrderListItem = {
   expectedRevenueMinor: string | null
   expectedMarginMinor: string | null
   trackingNumber: string | null
+  /** Sales-channel creation time, falling back to ClawPilot intake time. */
+  orderedAt: string
   updatedAt: string
 }
 
@@ -1261,6 +1263,8 @@ export type OperationsImportedOrderWorkingCopy = {
   warehouseName: string | null
   lineCount: number
   sourceUpdatedAt: string
+  /** Sales-channel creation time, falling back to first observed time. */
+  orderedAt: string
   updatedAt: string
   trackingNumber: string | null
   orderValueMinor: string | null

@@ -23,9 +23,10 @@ for (const fragment of [
   'Filter orders by tracking state',
   'Sort operations orders',
   'Orders per page',
-  'showPreviousOrderPage',
-  'showNextOrderPage',
-  'orderPageNavigationRollback.current',
+  'Order pages',
+  'Go to order page',
+  'OPERATIONS_ORDER_PAGE_QUERY',
+  'setOrderPageNumber(page)',
   "params.set('includeOrderSummaries', 'false')",
   'synchronizeImportedOrder(',
   'candidate: detailed?.candidateGlobalId',
@@ -33,6 +34,7 @@ for (const fragment of [
   'orderPageStart}–${orderPageEnd} of ${orderPage?.total || 0} orders',
   '`/api/operations/orders/unified?${params.toString()}`',
   'pageSize: String(orderPageSize)',
+  'page: String(orderPageNumber)',
   'if (status) params.set(\'status\', status)',
   'Order pagination returned a duplicate order',
   'Order, customer, SKU, or tracking',
@@ -107,10 +109,15 @@ for (const fragment of [
   'Visible provider history:',
   'Visible canonical status:',
   'Background canonical status:',
-  'Order pagination did not advance',
+  'window.history.pushState(window.history.state, \'\', nextUrl)',
 ]) {
   assert.ok(operations.includes(fragment), `Operations UI is missing ${fragment}`)
 }
+assert.match(
+  operations,
+  /const orderPageUpdatedAfter = useMemo\(\(\) => orderListUpdatedAfter\(orderDate\), \[orderDate\]\)\s+const orderPageControlsKey = JSON\.stringify\(\{[\s\S]{0,400}updatedAfter: orderPageUpdatedAfter,/u,
+  'The activity cutoff feeding the order controls must remain stable across unrelated renders of the same date filter',
+)
 assert.match(
   operations,
   /const itemName = line\.titleSnapshot\s*\|\| line\.sku\s*\|\| line\.externalVariantId\s*\|\| line\.externalProductId\s*\|\| line\.externalLineId/u,
