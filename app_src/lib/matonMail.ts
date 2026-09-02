@@ -1,11 +1,12 @@
 import crypto from 'crypto'
-import { matonPlatformMailFetch } from '@/lib/maton'
+import { matonAuthMailFetch, matonPlatformMailFetch } from '@/lib/maton'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 const GMAIL_SEND_PATH = '/google-mail/gmail/v1/users/me/messages/send'
 const SENDER_VERIFICATION_TTL_MS = 5 * 60 * 1000
-let verifiedSender: { email: string; expiresAt: number } | null = null
+const verifiedSenders = new Map<string, number>()
+type MailProfile = 'auth' | 'platform'
 export type SendAuthMagicCodeEmailInput = {
   to: string
   code: string
@@ -43,6 +44,28 @@ export function mailFromAddress(): string {
   return assertEmail(configured || 'stewards@eigenracing.com').toLowerCase()
 }
 
+function authMailFromAddress(): string {
+  const connectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+  const configuredSender = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim()
+  if (Boolean(connectionId) !== Boolean(configuredSender)) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together')
+  }
+  if (connectionId && connectionId === String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID')
+  }
+  const sender = configuredSender ? assertEmail(configuredSender).toLowerCase() : mailFromAddress()
+  if (configuredSender && sender === mailFromAddress()) {
+    throw new Error('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM')
+  }
+  return sender
+}
+
+function authMailProfileForRecipient(recipient: string): MailProfile {
+  const authSender = authMailFromAddress()
+  const hasDedicatedAuthMail = Boolean(String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim())
+  return hasDedicatedAuthMail && recipient.trim().toLowerCase() === authSender ? 'platform' : 'auth'
+}
+
 function assertCode(value: string): string {
   const code = String(value || '')
   if (!/^\d{6}$/.test(code)) throw new Error('A six-digit sign-in code is required')
@@ -72,13 +95,12 @@ function cleanHeader(value: string, field: string): string {
   return normalized
 }
 
-function buildMessage(input: { to: string; subject: string; text: string; html: string }): string {
+function buildMessage(input: { from: string; to: string; subject: string; text: string; html: string }): string {
   const boundary = `clawpilot-${crypto.randomUUID()}`
-  const from = mailFromAddress()
   const subject = cleanHeader(input.subject, 'Email subject')
   return [
-    `From: ClawPilot Stewards <${from}>`,
-    `Reply-To: ClawPilot Stewards <${from}>`,
+    `From: ClawPilot Stewards <${input.from}>`,
+    `Reply-To: ClawPilot Stewards <${input.from}>`,
     `To: <${input.to}>`,
     `Subject: ${subject}`,
     'MIME-Version: 1.0',
@@ -99,11 +121,16 @@ function buildMessage(input: { to: string; subject: string; text: string; html: 
   ].join('\r\n')
 }
 
-async function sendMessage(input: { to: string; subject: string; text: string; html: string }) {
+async function sendMessage(
+  input: { to: string; subject: string; text: string; html: string },
+  profile: MailProfile = 'platform',
+) {
   const to = assertEmail(input.to)
-  await verifyPlatformSender()
-  const raw = base64Url(buildMessage({ ...input, to }))
-  const response = await matonPlatformMailFetch(GMAIL_SEND_PATH, {
+  const from = profile === 'auth' ? authMailFromAddress() : mailFromAddress()
+  await verifySender(profile, from)
+  const raw = base64Url(buildMessage({ ...input, from, to }))
+  const fetchMail = profile === 'auth' ? matonAuthMailFetch : matonPlatformMailFetch
+  const response = await fetchMail(GMAIL_SEND_PATH, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -119,10 +146,15 @@ async function sendMessage(input: { to: string; subject: string; text: string; h
   return { messageId: String(data.id || data.message?.id || '').trim() || null }
 }
 
-async function verifyPlatformSender() {
-  const sender = mailFromAddress()
-  if (verifiedSender?.email === sender && verifiedSender.expiresAt > Date.now()) return
-  const response = await matonPlatformMailFetch(
+async function verifySender(profile: MailProfile, sender: string) {
+  const platformConnectionId = String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()
+  const connectionId = profile === 'auth'
+    ? String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim() || platformConnectionId
+    : platformConnectionId
+  const cacheKey = `${profile}:${connectionId}:${sender}`
+  if ((verifiedSenders.get(cacheKey) || 0) > Date.now()) return
+  const fetchMail = profile === 'auth' ? matonAuthMailFetch : matonPlatformMailFetch
+  const response = await fetchMail(
     `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(sender)}`,
     { headers: { Accept: 'application/json' } },
   )
@@ -137,7 +169,7 @@ async function verifyPlatformSender() {
   ) {
     throw new Error('ClawPilot mail sender is not verified')
   }
-  verifiedSender = { email: sender, expiresAt: Date.now() + SENDER_VERIFICATION_TTL_MS }
+  verifiedSenders.set(cacheKey, Date.now() + SENDER_VERIFICATION_TTL_MS)
 }
 
 function authMagicCodeContent(to: string, code: string) {
@@ -171,7 +203,7 @@ export async function sendAuthMagicCodeEmail(
 ): Promise<{ messageId: string | null }> {
   const to = assertEmail(input.to)
   const code = assertCode(input.code)
-  return sendMessage(authMagicCodeContent(to, code))
+  return sendMessage(authMagicCodeContent(to, code), authMailProfileForRecipient(to))
 }
 
 export async function sendInvitationEmail(input: SendInvitationEmailInput): Promise<{ messageId: string | null }> {

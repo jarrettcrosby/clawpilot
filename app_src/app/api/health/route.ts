@@ -3079,6 +3079,24 @@ export async function GET() {
     if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
       errors.push('Hosted runtime Maton Gmail connection is not configured.')
     }
+    const authGmailConnectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+    const authMailFrom = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim()
+    if (Boolean(authGmailConnectionId) !== Boolean(authMailFrom)) {
+      errors.push('Hosted runtime authentication Gmail connection and sender must be configured together.')
+    } else if (authGmailConnectionId) {
+      if (authGmailConnectionId.length < 8 || authGmailConnectionId.length > 512 || !/^[\x21-\x7e]+$/.test(authGmailConnectionId)) {
+        errors.push('Hosted runtime authentication Gmail connection is invalid.')
+      }
+      if (authGmailConnectionId === String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()) {
+        errors.push('Hosted runtime authentication Gmail connection must differ from the platform Gmail connection.')
+      }
+      if (authMailFrom.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authMailFrom) || /[\r\n]/.test(authMailFrom)) {
+        errors.push('Hosted runtime authentication mail sender is invalid.')
+      }
+      if (authMailFrom.toLowerCase() === String(process.env.CLAWPILOT_MAIL_FROM || '').trim().toLowerCase()) {
+        errors.push('Hosted runtime authentication mail sender must differ from the platform mail sender.')
+      }
+    }
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
     }

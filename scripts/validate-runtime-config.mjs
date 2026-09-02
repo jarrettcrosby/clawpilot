@@ -198,6 +198,28 @@ function validateCareerSiteSubmissionsConfiguration() {
   return 'enabled'
 }
 
+function validateAuthMailConfiguration() {
+  const connectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+  const sender = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim().toLowerCase()
+  if (Boolean(connectionId) !== Boolean(sender)) {
+    fail('MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together')
+  }
+  if (!connectionId) return 'platform'
+  if (connectionId.length < 8 || connectionId.length > 512 || !/^[\x21-\x7e]+$/.test(connectionId)) {
+    fail('MATON_AUTH_GMAIL_CONNECTION_ID must be a valid Maton connection ID')
+  }
+  if (connectionId === String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()) {
+    fail('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID')
+  }
+  if (sender.length > 254 || !emailPattern.test(sender) || !/^[\x21-\x7e]+$/.test(sender)) {
+    fail('CLAWPILOT_AUTH_MAIL_FROM must be a valid email address')
+  }
+  if (sender === String(process.env.CLAWPILOT_MAIL_FROM || '').trim().toLowerCase()) {
+    fail('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM')
+  }
+  return 'dedicated'
+}
+
 function validateCareerSiteAgentsConfiguration() {
   const enabled = String(process.env.CAREER_SITE_AGENTS_ENABLED || '').trim()
   if (enabled !== '1') fail('CAREER_SITE_AGENTS_ENABLED must be 1')
@@ -381,6 +403,7 @@ function validateRevisionEvidenceConfiguration() {
 
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
+const authMail = validateAuthMailConfiguration()
 const careerSiteSubmissions = validateCareerSiteSubmissionsConfiguration()
 const careerSiteAgents = validateCareerSiteAgentsConfiguration()
 const embeddingProvider = validateEmbeddingConfiguration()
@@ -388,4 +411,4 @@ const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
 const printAgentRelease = validatePrintAgentReleaseConfiguration()
 const revisionEvidence = validateRevisionEvidenceConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} careerSiteSubmissions=${careerSiteSubmissions} careerSiteAgents=${careerSiteAgents} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} authMail=${authMail} careerSiteSubmissions=${careerSiteSubmissions} careerSiteAgents=${careerSiteAgents} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)

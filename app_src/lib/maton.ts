@@ -49,6 +49,24 @@ function readGmailConnectionId(): string {
   )
 }
 
+function readAuthGmailConnectionId(): string {
+  const configured = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+  const configuredSender = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim()
+  if (Boolean(configured) !== Boolean(configuredSender)) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together')
+  }
+  if (!configured) return readGmailConnectionId()
+  const connectionId = cleanHeaderCredential(
+    configured,
+    'MATON_AUTH_GMAIL_CONNECTION_ID',
+    512,
+  )
+  if (connectionId === readGmailConnectionId()) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID')
+  }
+  return connectionId
+}
+
 export function resolveMatonGatewayBaseUrl(value = process.env.MATON_BASE_URL): string {
   const configured = String(value || DEFAULT_BASE).trim()
   try {
@@ -179,5 +197,15 @@ export async function matonPlatformMailFetch(pathname: string, init?: RequestIni
   return gatewayFetch(pathname, init, base, app, {
     apiKey: readKey(),
     connectionId: readGmailConnectionId(),
+  })
+}
+
+export async function matonAuthMailFetch(pathname: string, init?: RequestInit) {
+  const app = inferMatonGatewayApp(pathname)
+  if (app !== 'google-mail') throw new Error('Authentication mail requests must use the Google Mail gateway')
+  const base = resolveMatonGatewayBaseUrl()
+  return gatewayFetch(pathname, init, base, app, {
+    apiKey: readKey(),
+    connectionId: readAuthGmailConnectionId(),
   })
 }
