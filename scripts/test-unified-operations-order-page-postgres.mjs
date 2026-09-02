@@ -37,7 +37,9 @@ function decodeSourceCursor(value) {
 }
 
 function sourceSortValue(row, sort) {
-  if (sort === 'updated') return row.updated_at.toISOString()
+  if (sort === 'updated' || sort === 'order_date') {
+    return row.updated_at.toISOString()
+  }
   if (sort === 'order_number') return row.order_number.toLowerCase()
   return row.customer_name.toLowerCase()
 }
@@ -66,7 +68,18 @@ function resultSetRevision(rows, sort) {
 
 function sourceReader(table, kind, hooks) {
   return async (input) => {
+    hooks.reads.push({
+      source: kind,
+      cursor: input.cursor || null,
+      offset: input.offset,
+      pageSize: input.pageSize,
+    })
     assert.ok(input.queryClient, 'Unified reads must supply one snapshot client')
+    assert.equal(
+      Boolean(input.cursor && input.offset !== undefined),
+      false,
+      'A source read must not combine cursor and offset',
+    )
     const transaction = await input.queryClient.query(
       `SELECT current_setting('transaction_isolation') AS isolation,
               current_setting('transaction_read_only') AS read_only`,
@@ -94,7 +107,7 @@ function sourceReader(table, kind, hooks) {
       : -1
     const remaining = decoded
       ? cursorIndex < 0 ? allRows : allRows.slice(cursorIndex + 1)
-      : allRows
+      : allRows.slice(input.offset || 0)
     const selected = remaining.slice(0, input.pageSize)
     const hasNext = remaining.length > input.pageSize
     const total = allRows.length
@@ -224,7 +237,7 @@ async function expectSnapshotConflict(action) {
 async function verify(databaseUrl) {
   const pool = new Pool({ connectionString: databaseUrl, max: 4 })
   const organizationId = randomUUID()
-  const hooks = { afterCanonicalRead: null }
+  const hooks = { afterCanonicalRead: null, reads: [] }
   const persistence = unifiedPersistence(pool, hooks)
   const baseInput = {
     organizationId,
@@ -264,6 +277,117 @@ async function verify(databaseUrl) {
       'imported',
       'canonical',
     ])
+
+    hooks.reads.length = 0
+    const directPage2 = await persistence
+      .readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: 2,
+      })
+    assert.equal(directPage2.page.offset, 2)
+    assert.deepEqual(Array.from(directPage2.rows, (item) => item.key), [
+      `imported:${rows[2].globalId}`,
+      `canonical:${rows[3].globalId}`,
+    ])
+    assert.ok(
+      hooks.reads.some((read) => Number(read.offset) > 0),
+      'A direct page must use server-only source offsets',
+    )
+    const directContinuation = await persistence
+      .readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        cursor: directPage2.page.nextCursor,
+      })
+    assert.equal(directContinuation.page.offset, 4)
+    assert.deepEqual(Array.from(directContinuation.rows, (item) => item.key), [
+      `imported:${rows[4].globalId}`,
+    ])
+
+    const clampedPage = await persistence
+      .readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: Number.MAX_SAFE_INTEGER,
+      })
+    assert.equal(clampedPage.page.offset, 4)
+    assert.deepEqual(Array.from(clampedPage.rows, (item) => item.key), [
+      `imported:${rows[4].globalId}`,
+    ])
+    await assert.rejects(
+      persistence.readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: 2,
+        cursor: page1.page.nextCursor,
+      }),
+      (error) => (
+        error?.code === 'OPERATIONS_UNIFIED_ORDER_PAGE_CURSOR_CONFLICT'
+        && error?.status === 400
+      ),
+    )
+    await assert.rejects(
+      persistence.readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: 0,
+      }),
+      (error) => (
+        error?.code === 'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID'
+        && error?.status === 400
+      ),
+    )
+
+    const directSnapshotRows = [
+      row('canonical', '000000000050', '2026-09-01T18:00:00.000Z'),
+      row('imported', '000000000051', '2026-09-01T17:00:00.000Z'),
+      row('imported', '000000000052', '2026-09-01T16:00:00.000Z'),
+      row('imported', '000000000053', '2026-09-01T15:00:00.000Z'),
+    ]
+    await resetFixture(pool, organizationId, directSnapshotRows)
+    const directMoving = directSnapshotRows[2]
+    hooks.afterCanonicalRead = async () => {
+      await pool.query('BEGIN')
+      try {
+        await pool.query(
+          `INSERT INTO unified_test_canonical
+           SELECT * FROM unified_test_imported
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, directMoving.id],
+        )
+        await pool.query(
+          `UPDATE unified_test_canonical SET global_id = $3
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, directMoving.id, 'gor000000000052'],
+        )
+        await pool.query(
+          `DELETE FROM unified_test_imported
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, directMoving.id],
+        )
+        await pool.query('COMMIT')
+      } catch (error) {
+        await pool.query('ROLLBACK')
+        throw error
+      }
+    }
+    const directSnapshot = await persistence
+      .readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: 2,
+      })
+    assert.equal(directSnapshot.page.total, 4)
+    assert.equal(directSnapshot.page.offset, 2)
+    assert.deepEqual(Array.from(directSnapshot.rows, (item) => item.key), [
+      `imported:${directMoving.globalId}`,
+      `imported:${directSnapshotRows[3].globalId}`,
+    ])
+
+    await resetFixture(pool, organizationId, [])
+    const emptyClampedPage = await persistence
+      .readUnifiedOperationsOrderPageFromPostgres({
+        ...baseInput,
+        page: Number.MAX_SAFE_INTEGER,
+      })
+    assert.equal(emptyClampedPage.page.total, 0)
+    assert.equal(emptyClampedPage.page.offset, 0)
+    assert.deepEqual(Array.from(emptyClampedPage.rows), [])
 
     const equalUpdatedAt = '2026-09-01T14:00:00.000Z'
     await resetFixture(pool, organizationId, [

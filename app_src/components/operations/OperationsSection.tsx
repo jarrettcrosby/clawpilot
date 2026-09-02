@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -22,6 +22,7 @@ import {
   InputAdornment,
   ListItemText,
   MenuItem,
+  Pagination,
   Radio,
   RadioGroup,
   Select,
@@ -820,10 +821,12 @@ const ORDER_STATUSES: Array<{ value: OperationsOrderFilter; label: string }> = [
 ]
 
 const ORDER_SORTS: Array<{ value: OperationsOrderSort; label: string }> = [
+  { value: 'order_date_desc', label: 'Order date: newest' },
+  { value: 'order_date_asc', label: 'Order date: oldest' },
   { value: 'updated_desc', label: 'Last activity: newest' },
   { value: 'updated_asc', label: 'Last activity: oldest' },
-  { value: 'order_desc', label: 'Order number: highest' },
-  { value: 'order_asc', label: 'Order number: lowest' },
+  { value: 'order_desc', label: 'Order ID: Z–A' },
+  { value: 'order_asc', label: 'Order ID: A–Z' },
   { value: 'customer_asc', label: 'Customer: A–Z' },
 ]
 
@@ -890,6 +893,14 @@ const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const OPERATIONS_ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
 const OPERATIONS_IMPORTED_ORDER_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
 const OPERATIONS_ORDER_QUERY = 'operationsOrder'
+const OPERATIONS_ORDER_SEARCH_QUERY = 'orderSearch'
+const OPERATIONS_ORDER_STATUS_QUERY = 'orderStatus'
+const OPERATIONS_ORDER_SORT_QUERY = 'orderSort'
+const OPERATIONS_ORDER_PROVIDER_QUERY = 'orderProvider'
+const OPERATIONS_ORDER_TRACKING_QUERY = 'orderTracking'
+const OPERATIONS_ORDER_DATE_QUERY = 'orderDate'
+const OPERATIONS_ORDER_PAGE_SIZE_QUERY = 'orderPageSize'
+const OPERATIONS_ORDER_PAGE_QUERY = 'orderPage'
 // The legacy organization-wide activation workflow remains available to the
 // server while per-connection Provider writes replaces it in the product UI.
 // Do not expose this migration-era profile in the daily Orders workbench.
@@ -1251,6 +1262,8 @@ function importedOrderWarehouseName(
 
 function orderListQuerySort(sort: OperationsOrderSort) {
   if (sort === 'updated_asc') return { sort: 'updated', direction: 'asc' }
+  if (sort === 'order_date_asc') return { sort: 'order_date', direction: 'asc' }
+  if (sort === 'order_date_desc') return { sort: 'order_date', direction: 'desc' }
   if (sort === 'order_asc') return { sort: 'order_number', direction: 'asc' }
   if (sort === 'order_desc') return { sort: 'order_number', direction: 'desc' }
   if (sort === 'customer_asc') return { sort: 'customer', direction: 'asc' }
@@ -1278,6 +1291,70 @@ function appendOrderListQuery(
   if (input.provider) params.set('provider', input.provider)
   if (input.tracking !== 'all') params.set('tracking', input.tracking)
   if (input.updatedAfter) params.set('updatedAfter', input.updatedAfter)
+}
+
+function operationsOrderUrlState(url: URL) {
+  const params = url.searchParams
+  const search = String(params.get(OPERATIONS_ORDER_SEARCH_QUERY) || '').trim()
+    .slice(0, 100)
+  const statusValue = String(
+    params.get(OPERATIONS_ORDER_STATUS_QUERY) || '',
+  ).trim()
+  const sortValue = String(
+    params.get(OPERATIONS_ORDER_SORT_QUERY) || '',
+  ).trim()
+  const providerValue = String(
+    params.get(OPERATIONS_ORDER_PROVIDER_QUERY) || '',
+  ).trim()
+  const trackingValue = String(
+    params.get(OPERATIONS_ORDER_TRACKING_QUERY) || '',
+  ).trim()
+  const dateValue = String(
+    params.get(OPERATIONS_ORDER_DATE_QUERY) || '',
+  ).trim()
+  const pageSizeValue = Number(
+    params.get(OPERATIONS_ORDER_PAGE_SIZE_QUERY) || '',
+  )
+  const pageValue = Number(params.get(OPERATIONS_ORDER_PAGE_QUERY) || '')
+  return {
+    search,
+    status: ORDER_STATUSES.some((option) => option.value === statusValue)
+      ? statusValue as OperationsOrderFilter
+      : '' as OperationsOrderFilter,
+    sort: ORDER_SORTS.some((option) => option.value === sortValue)
+      ? sortValue as OperationsOrderSort
+      : 'order_date_desc' as OperationsOrderSort,
+    provider: ['', 'shopify', 'faire'].includes(providerValue)
+      ? providerValue
+      : '',
+    tracking: ORDER_TRACKING_FILTERS.some((option) => (
+      option.value === trackingValue
+    ))
+      ? trackingValue as OperationsOrderTrackingFilter
+      : 'all' as OperationsOrderTrackingFilter,
+    date: ORDER_DATE_FILTERS.some((option) => option.value === dateValue)
+      ? dateValue as OperationsOrderDateFilter
+      : 'all' as OperationsOrderDateFilter,
+    pageSize: [25, 50, 100].includes(pageSizeValue)
+      ? pageSizeValue
+      : UNIFIED_ORDER_PAGE_SIZE_DEFAULT,
+    page: Number.isSafeInteger(pageValue) && pageValue > 0
+      ? pageValue
+      : 1,
+    selectedOrderGlobalId: String(
+      params.get(OPERATIONS_ORDER_QUERY) || '',
+    ).trim(),
+  }
+}
+
+function setOptionalUrlSearchParam(
+  params: URLSearchParams,
+  name: string,
+  value: string,
+  defaultValue = '',
+) {
+  if (value && value !== defaultValue) params.set(name, value)
+  else params.delete(name)
 }
 
 function operationalPlanningMaterialBlockers(
@@ -3954,7 +4031,7 @@ export default function OperationsSection({
   const [view, setView] = useState<OperationsView>(initialView)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<OperationsOrderFilter>('')
-  const [orderSort, setOrderSort] = useState<OperationsOrderSort>('updated_desc')
+  const [orderSort, setOrderSort] = useState<OperationsOrderSort>('order_date_desc')
   const [orderProvider, setOrderProvider] = useState('')
   const [orderTracking, setOrderTracking] =
     useState<OperationsOrderTrackingFilter>('all')
@@ -3969,10 +4046,9 @@ export default function OperationsSection({
   const [orderPageLoading, setOrderPageLoading] = useState(false)
   const [orderPageError, setOrderPageError] = useState('')
   const [orderPageRefreshRevision, setOrderPageRefreshRevision] = useState(0)
-  const [orderPageNavigation, setOrderPageNavigation] = useState<{
-    queryKey: string
-    cursors: Array<string | null>
-  }>({ queryKey: '', cursors: [null] })
+  const [orderUrlStateHydrated, setOrderUrlStateHydrated] = useState(false)
+  const [orderPageNumber, setOrderPageNumber] = useState(1)
+  const [orderPageInput, setOrderPageInput] = useState('1')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -3991,10 +4067,7 @@ export default function OperationsSection({
   const pendingOrderStatusSyncReload = useRef(false)
   const workspaceLoadGeneration = useRef(0)
   const orderPageLoadGeneration = useRef(0)
-  const orderPageNavigationRollback = useRef<{
-    queryKey: string
-    cursors: Array<string | null>
-  } | null>(null)
+  const orderPageOrganizationIdRef = useRef('')
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -4195,34 +4268,51 @@ export default function OperationsSection({
   const [confirmingPhysicalOutput, setConfirmingPhysicalOutput] = useState(false)
 
   useEffect(() => {
-    const pendingOrderGlobalId = new URL(window.location.href).searchParams
-      .get(OPERATIONS_ORDER_QUERY)?.trim() || ''
-    setView(initialView)
-    setSearch('')
-    if (
-      initialView === 'orders'
-      && OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
-    ) {
-      setSelectedGlobalId(pendingOrderGlobalId)
-      setDrawerOpen(true)
-      setSelectedImportedGlobalId(null)
-      setImportedDrawerOpen(false)
-    } else if (
-      initialView === 'orders'
-      && OPERATIONS_IMPORTED_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
-    ) {
-      setSelectedGlobalId(null)
-      setDrawerOpen(false)
-      setSelectedImportedGlobalId(pendingOrderGlobalId)
-      setImportedDrawerOpen(true)
-    } else {
-      setSelectedGlobalId(null)
-      setDrawerOpen(false)
-      setSelectedImportedGlobalId(null)
-      setImportedDrawerOpen(false)
+    const applyUrlState = () => {
+      const urlState = operationsOrderUrlState(new URL(window.location.href))
+      const pendingOrderGlobalId = urlState.selectedOrderGlobalId
+      setView(initialView)
+      if (initialView === 'orders') {
+        setSearch(urlState.search)
+        setStatus(urlState.status)
+        setOrderSort(urlState.sort)
+        setOrderProvider(urlState.provider)
+        setOrderTracking(urlState.tracking)
+        setOrderDate(urlState.date)
+        setOrderPageSize(urlState.pageSize)
+        setOrderPageNumber(urlState.page)
+      } else {
+        setSearch('')
+      }
+      if (
+        initialView === 'orders'
+        && OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
+      ) {
+        setSelectedGlobalId(pendingOrderGlobalId)
+        setDrawerOpen(true)
+        setSelectedImportedGlobalId(null)
+        setImportedDrawerOpen(false)
+      } else if (
+        initialView === 'orders'
+        && OPERATIONS_IMPORTED_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
+      ) {
+        setSelectedGlobalId(null)
+        setDrawerOpen(false)
+        setSelectedImportedGlobalId(pendingOrderGlobalId)
+        setImportedDrawerOpen(true)
+      } else {
+        setSelectedGlobalId(null)
+        setDrawerOpen(false)
+        setSelectedImportedGlobalId(null)
+        setImportedDrawerOpen(false)
+      }
+      setSelectedExceptionGlobalId(null)
+      setExceptionDrawerOpen(false)
+      setOrderUrlStateHydrated(true)
     }
-    setSelectedExceptionGlobalId(null)
-    setExceptionDrawerOpen(false)
+    applyUrlState()
+    window.addEventListener('popstate', applyUrlState)
+    return () => window.removeEventListener('popstate', applyUrlState)
   }, [initialView])
 
   const workspaceSearch = view === 'exceptions' ? search.trim() : ''
@@ -4266,7 +4356,6 @@ export default function OperationsSection({
       })
       return replaced ? rows : current
     })
-    setOrderPageRefreshRevision((current) => current + 1)
   }, [])
 
   const loadWorkspace = useCallback(async (
@@ -4322,9 +4411,8 @@ export default function OperationsSection({
     workspaceSearch,
   ])
 
-  const orderPageUpdatedAfter = orderListUpdatedAfter(orderDate)
-  const orderPageQueryKey = JSON.stringify({
-    organizationId: workspace?.organizationId || '',
+  const orderPageUpdatedAfter = useMemo(() => orderListUpdatedAfter(orderDate), [orderDate])
+  const orderPageControlsKey = JSON.stringify({
     search: search.trim(),
     status,
     sort: orderSort,
@@ -4333,29 +4421,24 @@ export default function OperationsSection({
     updatedAfter: orderPageUpdatedAfter,
     pageSize: orderPageSize,
   })
-  const activeOrderPageNavigation = orderPageNavigation.queryKey
-    === orderPageQueryKey
-    ? orderPageNavigation
-    : { queryKey: orderPageQueryKey, cursors: [null] }
-  const activeOrderPageCursor = activeOrderPageNavigation.cursors.at(-1) || null
   const orderPageOrganizationId = workspace?.organizationId || ''
 
   useEffect(() => {
-    orderPageNavigationRollback.current = null
-    setOrderPageNavigation({
-      queryKey: orderPageQueryKey,
-      cursors: [null],
-    })
+    if (!orderPageOrganizationId) return
+    const previous = orderPageOrganizationIdRef.current
+    orderPageOrganizationIdRef.current = orderPageOrganizationId
+    if (!previous || previous === orderPageOrganizationId) return
+    setOrderPageNumber(1)
     setOrderPageRows([])
     setOrderPage(null)
     setOrderPageError('')
-  }, [orderPageQueryKey])
+  }, [orderPageOrganizationId])
 
   useEffect(() => {
     if (
       view !== 'orders'
       || !orderPageOrganizationId
-      || orderPageNavigation.queryKey !== orderPageQueryKey
+      || !orderUrlStateHydrated
     ) return
     const requestGeneration = orderPageLoadGeneration.current + 1
     orderPageLoadGeneration.current = requestGeneration
@@ -4367,6 +4450,7 @@ export default function OperationsSection({
         const params = new URLSearchParams({
           organizationId: orderPageOrganizationId,
           pageSize: String(orderPageSize),
+          page: String(orderPageNumber),
         })
         if (search.trim()) params.set('search', search.trim())
         if (status) params.set('status', status)
@@ -4376,34 +4460,12 @@ export default function OperationsSection({
           tracking: orderTracking,
           updatedAfter: orderPageUpdatedAfter,
         })
-        if (activeOrderPageCursor) params.set('cursor', activeOrderPageCursor)
         const response = await fetch(
           `/api/operations/orders/unified?${params.toString()}`,
           { cache: 'no-store', signal: controller.signal },
         )
         const payload = await response.json().catch(() => ({})) as
           UnifiedOrderPagePayload
-        if (
-          response.status === 409
-          && payload.code === 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED'
-        ) {
-          if (
-            controller.signal.aborted
-            || requestGeneration !== orderPageLoadGeneration.current
-          ) return
-          orderPageNavigationRollback.current = null
-          setOrderPageNavigation({
-            queryKey: orderPageQueryKey,
-            cursors: [null],
-          })
-          setOrderPageRows([])
-          setOrderPage(null)
-          setOrderPageError('')
-          setNotice(
-            'Orders changed while you were paging. Returned to the first page.',
-          )
-          return
-        }
         if (
           !response.ok
           || !payload.ok
@@ -4427,17 +4489,18 @@ export default function OperationsSection({
           controller.signal.aborted
           || requestGeneration !== orderPageLoadGeneration.current
         ) return
-        orderPageNavigationRollback.current = null
         setOrderPageRows(payload.rows)
         setOrderPage(payload.page)
+        const actualPage = payload.page.total === 0
+          ? 1
+          : Math.floor(payload.page.offset / payload.page.pageSize) + 1
+        if (actualPage !== orderPageNumber) {
+          setOrderPageNumber(actualPage)
+          setNotice(`Page ${orderPageNumber} is no longer available. Showing page ${actualPage}.`)
+        }
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') return
         if (requestGeneration !== orderPageLoadGeneration.current) return
-        const rollback = orderPageNavigationRollback.current
-        if (rollback?.queryKey === orderPageQueryKey) {
-          orderPageNavigationRollback.current = null
-          setOrderPageNavigation(rollback)
-        }
         setOrderPageError(caught instanceof Error
           ? caught.message
           : 'The requested order page is unavailable')
@@ -4452,11 +4515,10 @@ export default function OperationsSection({
       controller.abort()
     }
   }, [
-    activeOrderPageCursor,
     orderDate,
-    orderPageQueryKey,
+    orderPageControlsKey,
+    orderPageNumber,
     orderPageOrganizationId,
-    orderPageNavigation.queryKey,
     orderPageRefreshRevision,
     orderPageSize,
     orderPageUpdatedAfter,
@@ -4466,7 +4528,74 @@ export default function OperationsSection({
     search,
     status,
     view,
+    orderUrlStateHydrated,
     workspace?.generatedAt,
+  ])
+
+  useEffect(() => {
+    setOrderPageInput(String(orderPageNumber))
+  }, [orderPageNumber])
+
+  useEffect(() => {
+    if (!orderUrlStateHydrated || initialView !== 'orders') return
+    const nextUrl = new URL(window.location.href)
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_SEARCH_QUERY,
+      search.trim(),
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_STATUS_QUERY,
+      status,
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_SORT_QUERY,
+      orderSort,
+      'order_date_desc',
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_PROVIDER_QUERY,
+      orderProvider,
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_TRACKING_QUERY,
+      orderTracking,
+      'all',
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_DATE_QUERY,
+      orderDate,
+      'all',
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_PAGE_SIZE_QUERY,
+      String(orderPageSize),
+      String(UNIFIED_ORDER_PAGE_SIZE_DEFAULT),
+    )
+    setOptionalUrlSearchParam(
+      nextUrl.searchParams,
+      OPERATIONS_ORDER_PAGE_QUERY,
+      String(orderPageNumber),
+      '1',
+    )
+    window.history.replaceState(window.history.state, '', nextUrl)
+  }, [
+    initialView,
+    orderDate,
+    orderPageNumber,
+    orderPageSize,
+    orderProvider,
+    orderSort,
+    orderTracking,
+    orderUrlStateHydrated,
+    search,
+    status,
   ])
 
   const refreshOrders = useCallback(async () => {
@@ -5146,6 +5275,9 @@ export default function OperationsSection({
     setImportedOrderError('')
     setSelectedGlobalId(order.globalId)
     setDrawerOpen(true)
+    const nextUrl = new URL(window.location.href)
+    nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, order.globalId)
+    window.history.pushState(window.history.state, '', nextUrl)
   }
 
   const chooseImportedOrder = (order: OperationsImportedOrderWorkingCopy) => {
@@ -5165,7 +5297,7 @@ export default function OperationsSection({
     setImportedOrderError('')
     const nextUrl = new URL(window.location.href)
     nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, order.candidateGlobalId)
-    window.history.replaceState(window.history.state, '', nextUrl)
+    window.history.pushState(window.history.state, '', nextUrl)
   }
 
   const closeDrawer = () => {
@@ -5208,6 +5340,7 @@ export default function OperationsSection({
     )
     window.history.replaceState(window.history.state, '', nextUrl)
     await loadWorkspace(canonicalOrderGlobalId)
+    setOrderPageRefreshRevision((current) => current + 1)
     setSelectedGlobalId(canonicalOrderGlobalId)
     setDrawerOpen(true)
     setNotice(`Order ${orderNumber} imported`)
@@ -8383,7 +8516,7 @@ export default function OperationsSection({
     || orderProvider
     || orderTracking !== 'all'
     || orderDate !== 'all'
-    || orderSort !== 'updated_desc',
+    || orderSort !== 'order_date_desc',
   )
   const orderPageStart = orderPage && orderPage.total > 0
     ? orderPage.offset + 1
@@ -8391,30 +8524,25 @@ export default function OperationsSection({
   const orderPageEnd = orderPage
     ? orderPage.offset + orderPage.returned
     : 0
-  const orderPageNumber = activeOrderPageNavigation.cursors.length
-  const canShowPreviousOrderPage = orderPageNumber > 1
+  const orderPageCount = Math.max(
+    1,
+    Math.ceil((orderPage?.total || 0) / orderPageSize),
+  )
 
-  const showNextOrderPage = () => {
-    const nextCursor = orderPage?.nextCursor
-    if (!nextCursor || orderPageLoading) return
-    if (activeOrderPageNavigation.cursors.includes(nextCursor)) {
-      setOrderPageError('Order pagination did not advance')
+  const goToOrderPage = () => {
+    const requested = Number(orderPageInput)
+    if (!Number.isSafeInteger(requested) || requested < 1) {
+      setOrderPageError('Enter a valid order page number')
+      setOrderPageInput(String(orderPageNumber))
       return
     }
-    orderPageNavigationRollback.current = activeOrderPageNavigation
-    setOrderPageNavigation({
-      queryKey: orderPageQueryKey,
-      cursors: [...activeOrderPageNavigation.cursors, nextCursor],
-    })
-  }
-
-  const showPreviousOrderPage = () => {
-    if (!canShowPreviousOrderPage || orderPageLoading) return
-    orderPageNavigationRollback.current = activeOrderPageNavigation
-    setOrderPageNavigation({
-      queryKey: orderPageQueryKey,
-      cursors: activeOrderPageNavigation.cursors.slice(0, -1),
-    })
+    setOrderPageError('')
+    const target = Math.min(orderPageCount, requested)
+    if (target === orderPageNumber) {
+      setOrderPageRefreshRevision((current) => current + 1)
+    } else {
+      setOrderPageNumber(target)
+    }
   }
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
@@ -9036,7 +9164,10 @@ export default function OperationsSection({
                 <TextField
                   size="small"
                   value={search}
-                  onChange={(event) => setSearch(event.target.value)}
+                  onChange={(event) => {
+                    setSearch(event.target.value)
+                    setOrderPageNumber(1)
+                  }}
                   placeholder="Order, customer, SKU, or tracking"
                   inputProps={{ 'aria-label': 'Search operations orders' }}
                   InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
@@ -9046,7 +9177,10 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={status}
-                  onChange={(event) => setStatus(event.target.value as OperationsOrderFilter)}
+                  onChange={(event) => {
+                    setStatus(event.target.value as OperationsOrderFilter)
+                    setOrderPageNumber(1)
+                  }}
                   inputProps={{ 'aria-label': 'Filter orders by status' }}
                   SelectProps={{ displayEmpty: true }}
                   sx={{ ...controlSx, flex: '0 1 180px', minWidth: 160 }}
@@ -9061,7 +9195,10 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={orderProvider}
-                  onChange={(event) => setOrderProvider(event.target.value)}
+                  onChange={(event) => {
+                    setOrderProvider(event.target.value)
+                    setOrderPageNumber(1)
+                  }}
                   inputProps={{ 'aria-label': 'Filter orders by sales channel' }}
                   SelectProps={{ displayEmpty: true }}
                   sx={{ ...controlSx, flex: '0 1 170px', minWidth: 150 }}
@@ -9074,7 +9211,10 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={orderDate}
-                  onChange={(event) => setOrderDate(event.target.value as OperationsOrderDateFilter)}
+                  onChange={(event) => {
+                    setOrderDate(event.target.value as OperationsOrderDateFilter)
+                    setOrderPageNumber(1)
+                  }}
                   inputProps={{ 'aria-label': 'Filter orders by last activity' }}
                   sx={{ ...controlSx, flex: '0 1 205px', minWidth: 180 }}
                 >
@@ -9084,7 +9224,10 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={orderTracking}
-                  onChange={(event) => setOrderTracking(event.target.value as OperationsOrderTrackingFilter)}
+                  onChange={(event) => {
+                    setOrderTracking(event.target.value as OperationsOrderTrackingFilter)
+                    setOrderPageNumber(1)
+                  }}
                   inputProps={{ 'aria-label': 'Filter orders by tracking state' }}
                   sx={{ ...controlSx, flex: '0 1 185px', minWidth: 165 }}
                 >
@@ -9094,7 +9237,10 @@ export default function OperationsSection({
                   select
                   size="small"
                   value={orderSort}
-                  onChange={(event) => setOrderSort(event.target.value as OperationsOrderSort)}
+                  onChange={(event) => {
+                    setOrderSort(event.target.value as OperationsOrderSort)
+                    setOrderPageNumber(1)
+                  }}
                   inputProps={{ 'aria-label': 'Sort operations orders' }}
                   sx={{ ...controlSx, flex: '0 1 210px', minWidth: 185 }}
                 >
@@ -9106,10 +9252,11 @@ export default function OperationsSection({
                     onClick={() => {
                       setSearch('')
                       setStatus('')
-                      setOrderSort('updated_desc')
+                      setOrderSort('order_date_desc')
                       setOrderProvider('')
                       setOrderTracking('all')
                       setOrderDate('all')
+                      setOrderPageNumber(1)
                     }}
                   >
                     Clear filters
@@ -9133,7 +9280,10 @@ export default function OperationsSection({
                     select
                     size="small"
                     value={orderPageSize}
-                    onChange={(event) => setOrderPageSize(Number(event.target.value))}
+                    onChange={(event) => {
+                      setOrderPageSize(Number(event.target.value))
+                      setOrderPageNumber(1)
+                    }}
                     inputProps={{ 'aria-label': 'Orders per page' }}
                     sx={{ ...controlSx, minWidth: 110 }}
                   >
@@ -9141,24 +9291,42 @@ export default function OperationsSection({
                       <MenuItem key={pageSize} value={pageSize}>{pageSize} / page</MenuItem>
                     ))}
                   </TextField>
+                  <Pagination
+                    count={orderPageCount}
+                    page={Math.min(orderPageNumber, orderPageCount)}
+                    onChange={(_event, page) => setOrderPageNumber(page)}
+                    disabled={orderPageLoading}
+                    showFirstButton
+                    showLastButton
+                    siblingCount={mobile ? 0 : 1}
+                    boundaryCount={1}
+                    size="small"
+                    aria-label="Order pages"
+                  />
+                  <TextField
+                    size="small"
+                    value={orderPageInput}
+                    onChange={(event) => setOrderPageInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') goToOrderPage()
+                    }}
+                    slotProps={{
+                      htmlInput: {
+                        'aria-label': 'Go to order page',
+                        inputMode: 'numeric',
+                        min: 1,
+                        max: orderPageCount,
+                      },
+                    }}
+                    sx={{ ...controlSx, width: 72 }}
+                  />
                   <Button
                     size="small"
                     variant="outlined"
-                    disabled={!canShowPreviousOrderPage || orderPageLoading}
-                    onClick={showPreviousOrderPage}
+                    disabled={orderPageLoading}
+                    onClick={goToOrderPage}
                   >
-                    Previous
-                  </Button>
-                  <Typography variant="caption" color="text.secondary">
-                    Page {orderPageNumber}
-                  </Typography>
-                  <Button
-                    size="small"
-                    variant="outlined"
-                    disabled={!orderPage?.nextCursor || orderPageLoading}
-                    onClick={showNextOrderPage}
-                  >
-                    Next
+                    Go
                   </Button>
                 </Stack>
               </Stack>
@@ -9351,7 +9519,11 @@ export default function OperationsSection({
                           {displayStatus(order.provider)} · {importedOrderWarehouseName(order)}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                          {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Updated{' '}
+                          {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Ordered{' '}
+                          {formatUserDateTime(order.orderedAt, dateTime, {
+                            month: 'short', day: 'numeric', fallback: '—',
+                          })}
+                          {' · Updated '}
                           {formatUserDateTime(order.updatedAt, dateTime, {
                             month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
                           })}
@@ -9402,6 +9574,10 @@ export default function OperationsSection({
                         {order.externallyFulfilled && order.providerLineCount !== null
                           ? `${order.providerLineCount} sales-channel ${order.providerLineCount === 1 ? 'line' : 'lines'} · ${order.lineCount} ClawPilot`
                           : `${order.lineCount} ${order.lineCount === 1 ? 'line' : 'lines'}`}
+                        {' · Ordered '}
+                        {formatUserDateTime(order.orderedAt, dateTime, {
+                          month: 'short', day: 'numeric', fallback: '—',
+                        })}
                         {' · Updated '}
                         {formatUserDateTime(order.updatedAt, dateTime, {
                           month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
@@ -9433,16 +9609,34 @@ export default function OperationsSection({
                     <TableSortLabel
                       active={orderSort === 'order_asc' || orderSort === 'order_desc'}
                       direction={orderSort === 'order_asc' ? 'asc' : 'desc'}
-                      onClick={() => setOrderSort(orderSort === 'order_asc' ? 'order_desc' : 'order_asc')}
+                      onClick={() => {
+                        setOrderSort(orderSort === 'order_asc' ? 'order_desc' : 'order_asc')
+                        setOrderPageNumber(1)
+                      }}
                     >
                       Order
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell sortDirection={orderSort === 'order_date_asc' ? 'asc' : orderSort === 'order_date_desc' ? 'desc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'order_date_asc' || orderSort === 'order_date_desc'}
+                      direction={orderSort === 'order_date_asc' ? 'asc' : 'desc'}
+                      onClick={() => {
+                        setOrderSort(orderSort === 'order_date_desc' ? 'order_date_asc' : 'order_date_desc')
+                        setOrderPageNumber(1)
+                      }}
+                    >
+                      Order date
                     </TableSortLabel>
                   </TableCell>
                   <TableCell sortDirection={orderSort === 'customer_asc' ? 'asc' : false}>
                     <TableSortLabel
                       active={orderSort === 'customer_asc'}
                       direction="asc"
-                      onClick={() => setOrderSort('customer_asc')}
+                      onClick={() => {
+                        setOrderSort('customer_asc')
+                        setOrderPageNumber(1)
+                      }}
                     >
                       Customer
                     </TableSortLabel>
@@ -9458,7 +9652,10 @@ export default function OperationsSection({
                     <TableSortLabel
                       active={orderSort === 'updated_asc' || orderSort === 'updated_desc'}
                       direction={orderSort === 'updated_asc' ? 'asc' : 'desc'}
-                      onClick={() => setOrderSort(orderSort === 'updated_desc' ? 'updated_asc' : 'updated_desc')}
+                      onClick={() => {
+                        setOrderSort(orderSort === 'updated_desc' ? 'updated_asc' : 'updated_desc')
+                        setOrderPageNumber(1)
+                      }}
                     >
                       Last activity
                     </TableSortLabel>
@@ -9486,6 +9683,11 @@ export default function OperationsSection({
                           <Typography variant="caption" color="#A8C7FA">
                             {displayStatus(order.provider)} · {order.candidateGlobalId}
                           </Typography>
+                        </TableCell>
+                        <TableCell>
+                          {formatUserDateTime(order.orderedAt, dateTime, {
+                            year: 'numeric', month: 'short', day: 'numeric', fallback: '—',
+                          })}
                         </TableCell>
                         <TableCell>
                           <Typography>{order.customerName || 'Not supplied'}</Typography>
@@ -9571,6 +9773,11 @@ export default function OperationsSection({
                         <Typography variant="caption" color="#A8C7FA">
                           {displayStatus(order.sourceProvider)} · {order.globalId}
                         </Typography>
+                      </TableCell>
+                      <TableCell>
+                        {formatUserDateTime(order.orderedAt, dateTime, {
+                          year: 'numeric', month: 'short', day: 'numeric', fallback: '—',
+                        })}
                       </TableCell>
                       <TableCell>
                         <Typography>{order.customerName}</Typography>

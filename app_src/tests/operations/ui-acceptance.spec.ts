@@ -83,6 +83,7 @@ const selectedOrder = {
   expectedRevenueMinor: '1335',
   expectedMarginMinor: '269',
   trackingNumber: null,
+  orderedAt: '2026-07-22T17:00:00.000Z',
   updatedAt: '2026-07-22T18:00:00.000Z',
   externalOrderId: 'mock-1042',
   currency: 'USD',
@@ -332,6 +333,7 @@ type UnifiedCanonicalOrderFixture = {
   status: string
   externallyFulfilled?: boolean
   trackingNumber?: string | null
+  orderedAt?: string
   updatedAt: string
 }
 
@@ -349,8 +351,7 @@ async function installUnifiedOrdersRoute(
       const requestUrl = new URL(route.request().url())
       onRequest?.(requestUrl)
       const pageSize = Number(requestUrl.searchParams.get('pageSize') || 50)
-      const cursor = requestUrl.searchParams.get('cursor') || ''
-      const offset = cursor ? Number(cursor.replace(/^page-/u, '')) : 0
+      const pageNumber = Number(requestUrl.searchParams.get('page') || 1)
       const provider = requestUrl.searchParams.get('provider') || ''
       const tracking = requestUrl.searchParams.get('tracking') || 'all'
       const status = requestUrl.searchParams.get('status') || ''
@@ -410,11 +411,18 @@ async function installUnifiedOrdersRoute(
           ? row.order.orderNumber.toLowerCase()
           : sort === 'customer'
             ? (row.order.customerName || '').toLowerCase()
-            : row.order.updatedAt
+            : sort === 'order_date'
+              ? row.order.orderedAt || row.order.updatedAt
+              : row.order.updatedAt
         const comparison = value(left).localeCompare(value(right))
           || left.key.localeCompare(right.key)
         return direction === 'asc' ? comparison : -comparison
       })
+      const requestedOffset = Math.max(0, (pageNumber - 1) * pageSize)
+      const lastOffset = unified.length === 0
+        ? 0
+        : Math.floor((unified.length - 1) / pageSize) * pageSize
+      const offset = Math.min(requestedOffset, lastOffset)
       const pageRows = unified.slice(offset, offset + pageSize)
       const nextOffset = offset + pageRows.length
       const nextCursor = nextOffset < unified.length ? `page-${nextOffset}` : null
@@ -1522,6 +1530,7 @@ function importedWorkbenchOrder(
     warehouseName: null,
     lineCount: 1,
     sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
+    orderedAt: '2026-08-21T17:00:00.000Z',
     updatedAt: '2026-08-21T18:00:00.000Z',
     trackingNumber: null,
     orderValueMinor: '2000',
@@ -3617,7 +3626,7 @@ test('orders workbench globally filters and sorts both order sources', async ({ 
 
   await page.getByRole('button', { name: 'Clear filters' }).click()
   await page.getByRole('combobox', { name: 'Sort operations orders' }).click()
-  await page.getByRole('option', { name: 'Order number: lowest' }).click()
+  await page.getByRole('option', { name: 'Order ID: A–Z' }).click()
   await expect(page.locator('tbody tr').nth(0)).toContainText('#7001')
   await expect.poll(() => unifiedQueries.at(-1)?.get('sort')).toBe('order_number')
   await expect.poll(() => unifiedQueries.at(-1)?.get('direction')).toBe('asc')
@@ -3897,7 +3906,7 @@ for (const evidence of ['invalid_counts', 'invalid_writes'] as const) {
   })
 }
 
-test('Orders pane requests bounded unified pages only after user navigation', async ({ page }) => {
+test('Orders pane supports direct URL-backed pages and preserves the page while an order opens', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const orders = Array.from({ length: 111 }, (_, index) => ({
     id: `canonical-order-${index + 1}`,
@@ -3919,31 +3928,20 @@ test('Orders pane requests bounded unified pages only after user navigation', as
     expectedRevenueMinor: '1000',
     expectedMarginMinor: null,
     trackingNumber: null,
+    orderedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
     updatedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
   }))
-  const unifiedPageRequests: Array<string | null> = []
+  const unifiedPageRequests: number[] = []
   let failLastPageOnce = true
-  let conflictSecondPageOnce = false
   await page.route(
     (url) => url.pathname === '/api/operations/orders/unified',
     async (route) => {
       const params = new URL(route.request().url()).searchParams
       expect(params.get('pageSize')).toBe('50')
-      const cursor = params.get('cursor')
-      unifiedPageRequests.push(cursor)
-      if (cursor === 'page-50' && conflictSecondPageOnce) {
-        conflictSecondPageOnce = false
-        await route.fulfill({
-          status: 409,
-          json: {
-            ok: false,
-            code: 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED',
-            error: 'The order result set changed while pages were being read; restart from page one',
-          },
-        })
-        return
-      }
-      if (cursor === 'page-100' && failLastPageOnce) {
+      expect(params.get('cursor')).toBeNull()
+      const requestedPage = Number(params.get('page') || 1)
+      unifiedPageRequests.push(requestedPage)
+      if (requestedPage === 3 && failLastPageOnce) {
         failLastPageOnce = false
         await route.fulfill({
           status: 503,
@@ -3951,7 +3949,11 @@ test('Orders pane requests bounded unified pages only after user navigation', as
         })
         return
       }
-      const offset = cursor ? Number(cursor.replace('page-', '')) : 0
+      const requestedOffset = (requestedPage - 1) * 50
+      const offset = Math.min(
+        requestedOffset,
+        Math.floor((orders.length - 1) / 50) * 50,
+      )
       const rows = orders.slice(offset, offset + 50).map((order) => ({
         kind: 'canonical',
         key: `canonical:${order.globalId}`,
@@ -4014,53 +4016,39 @@ test('Orders pane requests bounded unified pages only after user navigation', as
 
   await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(50)
   await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
-  expect(unifiedPageRequests).toEqual([null])
+  expect(unifiedPageRequests).toEqual([1])
 
-  await page.getByRole('button', { name: 'Next' }).click()
+  await page.getByRole('button', { name: 'Go to page 2' }).click()
   await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
   await expect(page.getByRole('row', { name: /#7050/u })).toBeVisible()
   await expect(page.getByRole('row', { name: /#7000/u })).toHaveCount(0)
-  expect(unifiedPageRequests).toEqual([null, 'page-50'])
+  expect(unifiedPageRequests).toEqual([1, 2])
+  await expect(page).toHaveURL(/orderPage=2/u)
 
-  await page.getByRole('button', { name: 'Next' }).click()
-  await expect.poll(() => [...unifiedPageRequests]).toEqual([
-    null,
-    'page-50',
-    'page-100',
-    'page-50',
-  ])
+  await page.getByRole('row', { name: /#7050/u }).click()
   await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
-  await expect(page.getByText('Page 2', { exact: true })).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/operationsOrder=gor2000050/u)
+  expect(unifiedPageRequests).toEqual([1, 2])
 
-  await page.getByRole('button', { name: 'Previous' }).click()
-  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
-  await expect(page.getByRole('row', { name: /#7000/u })).toBeVisible()
-  expect(unifiedPageRequests).toEqual([
-    null,
-    'page-50',
-    'page-100',
-    'page-50',
-    null,
-  ])
+  await page.getByRole('button', { name: 'Close order details' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
 
-  conflictSecondPageOnce = true
-  await page.getByRole('button', { name: 'Next' }).click()
-  await expect(page.getByText(
-    'Orders changed while you were paging. Returned to the first page.',
-  )).toBeVisible()
-  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
-  await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(50)
-  await expect(page.getByRole('row', { name: /#7000/u })).toBeVisible()
-  await expect(page.getByRole('row', { name: /#7050/u })).toHaveCount(0)
-  expect(unifiedPageRequests).toEqual([
-    null,
-    'page-50',
-    'page-100',
-    'page-50',
-    null,
-    'page-50',
-    null,
-  ])
+  await page.getByRole('textbox', { name: 'Go to order page' }).fill('3')
+  await page.getByRole('button', { name: 'Go', exact: true }).click()
+  await expect(page.getByText('Temporary unified-page failure')).toBeVisible()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await page.getByRole('button', { name: 'Go', exact: true }).click()
+  await expect(page.getByText('101–111 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7100/u })).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=3/u)
+  expect(unifiedPageRequests).toEqual([1, 2, 3, 3])
+
+  await page.reload()
+  await expect(page.getByText('101–111 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7100/u })).toBeVisible()
+  expect(unifiedPageRequests.at(-1)).toBe(3)
 })
 test('orders refresh leaves provider continuation for the next manager action', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })

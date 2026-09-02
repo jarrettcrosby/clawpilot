@@ -15,6 +15,7 @@ import {
   UnifiedOperationsOrderPageError,
   isUnifiedOperationsOrderSort,
   mergeUnifiedOperationsOrderPage,
+  seekUnifiedOperationsOrderPartition,
   type OperationsOrderSourceEvidence,
   type UnifiedOperationsOrderPage,
   type UnifiedOperationsOrderPageInput,
@@ -382,6 +383,75 @@ function nextSourceState(input: {
   }
 }
 
+function directPageValue(value: number | null | undefined) {
+  if (value === null || value === undefined) return null
+  if (!Number.isSafeInteger(value) || value < 1) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+      'Unified order page is invalid',
+    )
+  }
+  return value
+}
+
+function clampedPageOffset(input: {
+  page: number
+  pageSize: number
+  total: number
+}) {
+  if (!Number.isSafeInteger(input.total) || input.total < 0) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_EVIDENCE_INVALID',
+      'Unified order pagination returned invalid total evidence',
+      500,
+    )
+  }
+  if (input.total === 0) return 0
+  const lastPageOffset = Math.floor((input.total - 1) / input.pageSize)
+    * input.pageSize
+  const lastPage = (lastPageOffset / input.pageSize) + 1
+  return input.page >= lastPage
+    ? lastPageOffset
+    : (input.page - 1) * input.pageSize
+}
+
+function directSourceState(input: {
+  offset: number
+  total: number
+  revision: string
+  before: OperationsOrderSourceEvidence | null
+}): SourceCursorState {
+  if (input.offset === input.total) {
+    return {
+      cursor: null,
+      done: true,
+      total: input.total,
+      revision: input.revision,
+    }
+  }
+  if (input.offset === 0) {
+    return {
+      cursor: null,
+      done: input.total === 0,
+      total: input.total,
+      revision: input.revision,
+    }
+  }
+  if (!input.before?.rowCursor) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+      'Unified order pagination did not return direct-page boundary evidence',
+      500,
+    )
+  }
+  return {
+    cursor: input.before.rowCursor,
+    done: false,
+    total: input.total,
+    revision: input.revision,
+  }
+}
+
 export async function readUnifiedOperationsOrderPageFromPostgres(
   rawInput: UnifiedOperationsOrderPageInput,
 ): Promise<{
@@ -389,6 +459,13 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
   page: UnifiedOperationsOrderPage
 }> {
   const input = normalizedInput(rawInput)
+  const requestedPage = directPageValue(rawInput.page)
+  if (requestedPage !== null && String(rawInput.cursor || '').trim()) {
+    requestError(
+      'OPERATIONS_UNIFIED_ORDER_PAGE_CURSOR_CONFLICT',
+      'Unified order page and cursor cannot be combined',
+    )
+  }
   const expectedScopeHash = scopeHash(input)
   const cursor = decodeCombinedCursor(rawInput.cursor, expectedScopeHash)
   const initialSourceState: SourceCursorState = {
@@ -397,8 +474,8 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
     total: 0,
     revision: EMPTY_OPERATIONS_ORDER_RESULT_SET_REVISION,
   }
-  const canonicalState = cursor?.canonical || initialSourceState
-  const importedState = cursor?.imported || initialSourceState
+  let canonicalState: SourceCursorState = cursor?.canonical || initialSourceState
+  let importedState: SourceCursorState = cursor?.imported || initialSourceState
   const shared = {
     organizationId: input.organizationId,
     search: input.search,
@@ -414,39 +491,217 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
   try {
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
 
-    // Reads are intentionally sequenced on one client. The first source read
-    // establishes the snapshot; a promotion committed before the second read
-    // cannot make an identity disappear between sources.
-    const canonicalRead = await readOperationsOrderPageFromPostgres({
-      ...shared,
-      cursor: canonicalState.done ? null : canonicalState.cursor,
-      pageSize: canonicalState.done ? 1 : input.pageSize,
-      queryClient: client,
-    })
-    const importedRead = await readCommerceOrderWorkbenchPageFromPostgres({
-      ...shared,
-      cursor: importedState.done ? null : importedState.cursor,
-      pageSize: importedState.done ? 1 : input.pageSize,
-      queryClient: client,
-    })
+    let canonicalRead: Awaited<
+      ReturnType<typeof readOperationsOrderPageFromPostgres>
+    >
+    let importedRead: Awaited<
+      ReturnType<typeof readCommerceOrderWorkbenchPageFromPostgres>
+    >
+    let offset = cursor?.offset || 0
+    let expectedSnapshot = Boolean(cursor)
+
+    if (requestedPage !== null) {
+      const initialPageSize = requestedPage === 1 ? input.pageSize : 1
+      // These reads establish both source totals and revisions before a seek.
+      // Keeping them sequenced on this client prevents a promotion committed
+      // between source reads from crossing the repeatable-read snapshot.
+      const canonicalHead = await readOperationsOrderPageFromPostgres({
+        ...shared,
+        offset: 0,
+        pageSize: initialPageSize,
+        queryClient: client,
+      })
+      const importedHead = await readCommerceOrderWorkbenchPageFromPostgres({
+        ...shared,
+        offset: 0,
+        pageSize: initialPageSize,
+        queryClient: client,
+      })
+      assertSourceEvidence({
+        source: 'Canonical',
+        orders: canonicalHead.orders,
+        page: canonicalHead.page,
+        evidence: canonicalHead.internal.sourceEvidence,
+        expectedTotal: null,
+        resultSetRevision: canonicalHead.internal.resultSetRevision,
+        expectedResultSetRevision: null,
+      })
+      assertSourceEvidence({
+        source: 'Imported',
+        orders: importedHead.orders,
+        page: importedHead.page,
+        evidence: importedHead.internal.sourceEvidence,
+        expectedTotal: null,
+        resultSetRevision: importedHead.internal.resultSetRevision,
+        expectedResultSetRevision: null,
+      })
+      const canonicalRevision = canonicalHead.internal.resultSetRevision as string
+      const importedRevision = importedHead.internal.resultSetRevision as string
+      const initialTotal = canonicalHead.page.total + importedHead.page.total
+      if (!Number.isSafeInteger(initialTotal) || initialTotal < 0) {
+        requestError(
+          'OPERATIONS_UNIFIED_ORDER_EVIDENCE_INVALID',
+          'Unified order pagination returned invalid total evidence',
+          500,
+        )
+      }
+      offset = clampedPageOffset({
+        page: requestedPage,
+        pageSize: input.pageSize,
+        total: initialTotal,
+      })
+
+      const canonicalProbeCache = new Map<number, OperationsOrderSourceEvidence>()
+      const importedProbeCache = new Map<number, OperationsOrderSourceEvidence>()
+      const canonicalHeadEvidence = canonicalHead.internal.sourceEvidence[0]
+      const importedHeadEvidence = importedHead.internal.sourceEvidence[0]
+      if (canonicalHeadEvidence) canonicalProbeCache.set(0, canonicalHeadEvidence)
+      if (importedHeadEvidence) importedProbeCache.set(0, importedHeadEvidence)
+
+      const canonicalAt = async (sourceOffset: number) => {
+        const cached = canonicalProbeCache.get(sourceOffset)
+        if (cached) return cached
+        const probe = await readOperationsOrderPageFromPostgres({
+          ...shared,
+          offset: sourceOffset,
+          pageSize: 1,
+          queryClient: client,
+        })
+        assertSourceEvidence({
+          source: 'Canonical',
+          orders: probe.orders,
+          page: probe.page,
+          evidence: probe.internal.sourceEvidence,
+          expectedTotal: canonicalHead.page.total,
+          resultSetRevision: probe.internal.resultSetRevision,
+          expectedResultSetRevision: canonicalRevision,
+        })
+        if (probe.orders.length !== 1 || !probe.internal.sourceEvidence[0]) {
+          requestError(
+            'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+            'Canonical order pagination did not return offset-probe evidence',
+            500,
+          )
+        }
+        canonicalProbeCache.set(sourceOffset, probe.internal.sourceEvidence[0])
+        return probe.internal.sourceEvidence[0]
+      }
+      const importedAt = async (sourceOffset: number) => {
+        const cached = importedProbeCache.get(sourceOffset)
+        if (cached) return cached
+        const probe = await readCommerceOrderWorkbenchPageFromPostgres({
+          ...shared,
+          offset: sourceOffset,
+          pageSize: 1,
+          queryClient: client,
+        })
+        assertSourceEvidence({
+          source: 'Imported',
+          orders: probe.orders,
+          page: probe.page,
+          evidence: probe.internal.sourceEvidence,
+          expectedTotal: importedHead.page.total,
+          resultSetRevision: probe.internal.resultSetRevision,
+          expectedResultSetRevision: importedRevision,
+        })
+        if (probe.orders.length !== 1 || !probe.internal.sourceEvidence[0]) {
+          requestError(
+            'OPERATIONS_UNIFIED_ORDER_SOURCE_EVIDENCE_INVALID',
+            'Imported-order pagination did not return offset-probe evidence',
+            500,
+          )
+        }
+        importedProbeCache.set(sourceOffset, probe.internal.sourceEvidence[0])
+        return probe.internal.sourceEvidence[0]
+      }
+
+      let partition
+      try {
+        partition = await seekUnifiedOperationsOrderPartition({
+          canonicalTotal: canonicalHead.page.total,
+          importedTotal: importedHead.page.total,
+          offset,
+          sort: input.sort,
+          direction: input.direction,
+          canonicalAt,
+          importedAt,
+        })
+      } catch (error) {
+        if (error instanceof UnifiedOperationsOrderPageError) {
+          requestError(error.code, error.message, 500)
+        }
+        throw error
+      }
+      canonicalState = directSourceState({
+        offset: partition.canonicalOffset,
+        total: canonicalHead.page.total,
+        revision: canonicalRevision,
+        before: partition.canonicalBefore,
+      })
+      importedState = directSourceState({
+        offset: partition.importedOffset,
+        total: importedHead.page.total,
+        revision: importedRevision,
+        before: partition.importedBefore,
+      })
+
+      canonicalRead = canonicalState.done
+        ? canonicalHead
+        : partition.canonicalOffset === 0
+          && initialPageSize === input.pageSize
+        ? canonicalHead
+        : await readOperationsOrderPageFromPostgres({
+            ...shared,
+            offset: partition.canonicalOffset,
+            pageSize: input.pageSize,
+            queryClient: client,
+          })
+      importedRead = importedState.done
+        ? importedHead
+        : partition.importedOffset === 0
+          && initialPageSize === input.pageSize
+        ? importedHead
+        : await readCommerceOrderWorkbenchPageFromPostgres({
+            ...shared,
+            offset: partition.importedOffset,
+            pageSize: input.pageSize,
+            queryClient: client,
+          })
+      expectedSnapshot = true
+    } else {
+      // Cursor reads are intentionally sequenced on one client. The first
+      // source read establishes the snapshot for both source result sets.
+      canonicalRead = await readOperationsOrderPageFromPostgres({
+        ...shared,
+        cursor: canonicalState.done ? null : canonicalState.cursor,
+        pageSize: canonicalState.done ? 1 : input.pageSize,
+        queryClient: client,
+      })
+      importedRead = await readCommerceOrderWorkbenchPageFromPostgres({
+        ...shared,
+        cursor: importedState.done ? null : importedState.cursor,
+        pageSize: importedState.done ? 1 : input.pageSize,
+        queryClient: client,
+      })
+    }
 
     assertSourceEvidence({
       source: 'Canonical',
       orders: canonicalRead.orders,
       page: canonicalRead.page,
       evidence: canonicalRead.internal.sourceEvidence,
-      expectedTotal: cursor ? canonicalState.total : null,
+      expectedTotal: expectedSnapshot ? canonicalState.total : null,
       resultSetRevision: canonicalRead.internal.resultSetRevision,
-      expectedResultSetRevision: cursor ? canonicalState.revision : null,
+      expectedResultSetRevision: expectedSnapshot ? canonicalState.revision : null,
     })
     assertSourceEvidence({
       source: 'Imported',
       orders: importedRead.orders,
       page: importedRead.page,
       evidence: importedRead.internal.sourceEvidence,
-      expectedTotal: cursor ? importedState.total : null,
+      expectedTotal: expectedSnapshot ? importedState.total : null,
       resultSetRevision: importedRead.internal.resultSetRevision,
-      expectedResultSetRevision: cursor ? importedState.revision : null,
+      expectedResultSetRevision: expectedSnapshot ? importedState.revision : null,
     })
 
     const canonical = canonicalState.done
@@ -495,7 +750,6 @@ export async function readUnifiedOperationsOrderPageFromPostgres(
     }
 
     const total = canonical.page.total + imported.page.total
-    const offset = cursor?.offset || 0
     if (
       !Number.isSafeInteger(total)
       || total < 0

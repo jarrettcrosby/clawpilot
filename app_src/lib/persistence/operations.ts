@@ -756,6 +756,7 @@ type OperationsOrderListReadRow = QueryResultRow & {
   expected_revenue_minor: string | null
   expected_margin_minor: string | null
   tracking_number: string | null
+  ordered_at: Date
   updated_at: Date
   cursor_sort_value: Date | string
   matching_total_count: string
@@ -3747,6 +3748,7 @@ async function readOrderDetail(
     expected_margin_minor: string | null
     tracking_number: string | null
     ship_to: Record<string, unknown>
+    ordered_at: Date
     updated_at: Date
     one_off_shipping_mode: 'test' | 'live' | null
     shopify_external_fulfillment_reconciliation_required: boolean
@@ -3884,14 +3886,22 @@ async function readOrderDetail(
        plan.estimated_cost_minor::text AS expected_cost_minor,
        plan.estimated_revenue_minor::text AS expected_revenue_minor,
        plan.estimated_margin_minor::text AS expected_margin_minor,
-       latest_tracking.tracking_number, orders.updated_at
+       latest_tracking.tracking_number,
+       date_trunc('milliseconds', COALESCE(
+         planning_candidate.provider_created_at,
+         planning_candidate.observed_at,
+         orders.imported_at,
+         orders.created_at
+       )) AS ordered_at,
+       orders.updated_at
      FROM operations_orders orders
      JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
      LEFT JOIN operations_integration_accounts source_account
        ON source_account.organization_id = orders.organization_id
       AND source_account.id = orders.integration_account_id
      LEFT JOIN LATERAL (
-       SELECT candidate.global_id, candidate.row_version, candidate.test_order
+       SELECT candidate.global_id, candidate.row_version, candidate.test_order,
+              candidate.provider_created_at, candidate.observed_at
        FROM operations_commerce_order_candidates candidate
        WHERE candidate.organization_id = orders.organization_id
          AND candidate.integration_account_id = orders.integration_account_id
@@ -4695,6 +4705,7 @@ async function readOrderDetail(
     shipTo: address(orderShipToStorageValue(shipmentShipTo.value)),
     shipmentShipTo,
     providerHistory,
+    orderedAt: row.ordered_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     lines: lineResult.rows.map((item) => ({
       globalId: item.global_id,
@@ -4954,7 +4965,7 @@ function decodeOperationsOrderPageCursor(
     || parsed.v !== 2
     || !isOperationsOrderCursorSortValue(parsed.sortValue, sort)
     || (
-      sort === 'updated'
+      (sort === 'updated' || sort === 'order_date')
       && !validOperationsOrderCursorTimestamp(parsed.sortValue)
     )
     || typeof parsed.orderId !== 'string'
@@ -4978,7 +4989,7 @@ function encodeOperationsOrderPageCursor(
   scopeHash: string,
   sort: OperationsOrderSort,
 ) {
-  const sortValue = sort === 'updated'
+  const sortValue = sort === 'updated' || sort === 'order_date'
     ? (row.cursor_sort_value as Date).toISOString()
     : String(row.cursor_sort_value)
   const encoded = Buffer.from(JSON.stringify({
@@ -5075,6 +5086,12 @@ function operationsOrderSortSql(
   if (sort === 'updated') {
     return {
       expression: 'order_activity.activity_at',
+      cursorCast: 'timestamptz',
+    }
+  }
+  if (sort === 'order_date') {
+    return {
+      expression: 'order_date.ordered_at',
       cursorCast: 'timestamptz',
     }
   }
@@ -5190,6 +5207,7 @@ function operationsOrderListItem(row: OperationsOrderListReadRow): OperationsOrd
     expectedRevenueMinor: row.expected_revenue_minor,
     expectedMarginMinor: row.expected_margin_minor,
     trackingNumber: row.tracking_number,
+    orderedAt: row.ordered_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   }
 }
@@ -5207,6 +5225,8 @@ export async function readOperationsOrderPageFromPostgres(input: {
   pageSize?: number | null
   /** Server-only merge mode; scopes cursors to deterministic byte ordering. */
   stableTextCollation?: boolean
+  /** Server-only direct seek; never expose this source offset through an API. */
+  offset?: number
   /** Server-only: keep a unified multi-source read on one database snapshot. */
   queryClient?: PoolClient
 }): Promise<{
@@ -5233,6 +5253,21 @@ export async function readOperationsOrderPageFromPostgres(input: {
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
   const pageSize = operationsOrderPageSize(input.pageSize)
+  const offset = input.offset ?? 0
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_OFFSET_INVALID',
+      'Order page offset is invalid',
+      500,
+    )
+  }
+  if (input.cursor && input.offset !== undefined) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_OFFSET_INVALID',
+      'Order page cursor and offset cannot be combined',
+      500,
+    )
+  }
   const scopeHash = operationsOrderPageScopeHash({
     organizationId,
     search,
@@ -5251,13 +5286,25 @@ export async function readOperationsOrderPageFromPostgres(input: {
   const result = await queryOperationsOrderPage<OperationsOrderListReadRow>(
     input.queryClient,
     `WITH matching_order_rows AS MATERIALIZED (
-       SELECT orders.id, order_activity.activity_at AS updated_at,
+       SELECT orders.id, order_date.ordered_at,
+              order_activity.activity_at AS updated_at,
               latest_tracking.tracking_number AS latest_tracking_number,
               ${sortSql.expression} AS cursor_sort_value
        FROM operations_orders orders
        JOIN crm_organizations customer
          ON customer.id = orders.customer_id
         AND customer.pipeline_id = orders.pipeline_id
+       LEFT JOIN operations_commerce_order_candidates origin_candidate
+         ON origin_candidate.organization_id = orders.organization_id
+        AND origin_candidate.canonical_order_id = orders.id
+       CROSS JOIN LATERAL (
+         SELECT date_trunc('milliseconds', COALESCE(
+                  origin_candidate.provider_created_at,
+                  origin_candidate.observed_at,
+                  orders.imported_at,
+                  orders.created_at
+                )) AS ordered_at
+       ) order_date
        LEFT JOIN LATERAL (
          SELECT candidate.tracking_number,
                 COALESCE(candidate.shipped_at, candidate.created_at)
@@ -5435,7 +5482,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
            $6::timestamptz IS NULL
            OR order_activity.activity_at > $6::timestamptz
          )
-     ), matching_order_evidence AS (
+     ), matching_order_evidence AS MATERIALIZED (
        SELECT count(*)::text AS matching_total_count,
               md5(string_agg(
                 jsonb_build_array(
@@ -5446,7 +5493,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
               )) AS result_set_revision
        FROM matching_order_rows matching
      ), page_order_ids AS (
-       SELECT matching.id, matching.updated_at,
+       SELECT matching.id, matching.ordered_at, matching.updated_at,
               matching.latest_tracking_number,
               matching.cursor_sort_value,
               evidence.matching_total_count,
@@ -5462,6 +5509,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
        ORDER BY matching.cursor_sort_value ${orderDirection},
                 matching.id ${orderDirection}
        LIMIT $10::integer
+       OFFSET $11::bigint
      )
      SELECT orders.id::text, orders.global_id, orders.order_number,
             customer.name AS customer_name,
@@ -5503,6 +5551,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
             plan.estimated_revenue_minor::text AS expected_revenue_minor,
             plan.estimated_margin_minor::text AS expected_margin_minor,
             selected.latest_tracking_number AS tracking_number,
+            selected.ordered_at,
             selected.updated_at,
             selected.cursor_sort_value,
             selected.matching_total_count,
@@ -5551,6 +5600,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
       cursor?.sortValue ?? null,
       cursor?.orderId ?? null,
       pageSize + 1,
+      offset,
     ],
   )
   const hasNextPage = result.rows.length > pageSize
@@ -5583,7 +5633,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
     : null
   const sourceEvidence = pageRows.map((row): OperationsOrderSourceEvidence => ({
     rowCursor: encodeOperationsOrderPageCursor(row, total, scopeHash, sort),
-    sortValue: sort === 'updated'
+    sortValue: sort === 'updated' || sort === 'order_date'
       ? (row.cursor_sort_value as Date).toISOString()
       : String(row.cursor_sort_value),
     providerIdentity: row.integration_account_global_id && row.external_order_id

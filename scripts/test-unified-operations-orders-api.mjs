@@ -73,4 +73,98 @@ assert.deepEqual(JSON.parse(JSON.stringify(result.payload)), {
 assert.equal(result.headers['Cache-Control'], 'private, no-store')
 assert.equal(result.headers.Vary, 'Cookie')
 
+let capturedInput = null
+const activeRoute = loadTypeScriptModule(
+  'app_src/app/api/operations/orders/unified/route.ts',
+  {
+    'next/server': {
+      NextResponse: {
+        json(payload, options) {
+          return {
+            payload,
+            status: options.status,
+            headers: options.headers,
+          }
+        },
+      },
+    },
+    '@/lib/operations/orderListQuery': {
+      isOperationsOrderProviderFilter: () => true,
+      isOperationsOrderSortDirection: () => true,
+      isOperationsOrderTrackingFilter: () => true,
+      isOperationsOrderUpdatedAfter: () => true,
+    },
+    '@/lib/operations/unifiedOrderPage': {
+      MAX_UNIFIED_OPERATIONS_ORDER_PAGE_SIZE: 100,
+      isUnifiedOperationsOrderSort: () => true,
+    },
+    '@/lib/operations/authorization': {
+      activeOperationsOrganizationId: () => (
+        '00000000-0000-4000-8000-000000000001'
+      ),
+      operationsCapabilities: () => ({ canView: true }),
+    },
+    '@/lib/persistence/config': {
+      isPostgresStorageEnabled: () => true,
+    },
+    '@/lib/persistence/operations': { OperationsRequestError },
+    '@/lib/persistence/unifiedOperationsOrderPage': {
+      readUnifiedOperationsOrderPageFromPostgres(input) {
+        capturedInput = input
+        return {
+          rows: [],
+          page: {
+            total: 0,
+            returned: 0,
+            pageSize: input.pageSize,
+            offset: 0,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+        }
+      },
+    },
+    '@/lib/requestUser': {
+      requireRequestUser: async () => ({ email: 'operator@clawpilot.test' }),
+    },
+  },
+)
+
+const directPageResult = await activeRoute.GET({
+  nextUrl: new URL(
+    'http://localhost/api/operations/orders/unified?page=7&pageSize=25',
+  ),
+})
+assert.equal(directPageResult.status, 200)
+assert.equal(capturedInput.page, 7)
+assert.equal(capturedInput.cursor, null)
+assert.equal(capturedInput.pageSize, 25)
+
+capturedInput = null
+const conflictResult = await activeRoute.GET({
+  nextUrl: new URL(
+    'http://localhost/api/operations/orders/unified?page=2&cursor=abc&pageSize=25',
+  ),
+})
+assert.equal(conflictResult.status, 400)
+assert.equal(
+  conflictResult.payload.code,
+  'OPERATIONS_UNIFIED_ORDER_PAGE_CURSOR_CONFLICT',
+)
+assert.equal(capturedInput, null)
+
+for (const page of ['', '0', '-1', '1.5', '9007199254740992']) {
+  const invalidPageResult = await activeRoute.GET({
+    nextUrl: new URL(
+      `http://localhost/api/operations/orders/unified?page=${encodeURIComponent(page)}`,
+    ),
+  })
+  assert.equal(invalidPageResult.status, 400)
+  assert.equal(
+    invalidPageResult.payload.code,
+    'OPERATIONS_UNIFIED_ORDER_PAGE_INVALID',
+  )
+}
+
 console.log('Unified operations orders API contract passed')
