@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import type { OperationsOrderStatus } from '@/lib/operations/types'
 import {
+  isOperationsOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+} from '@/lib/operations/orderListQuery'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -103,6 +110,57 @@ export async function GET(req: NextRequest) {
     ) {
       requestError('OPERATIONS_STATUS_INVALID', 'Order status is invalid')
     }
+    const sortValue = String(
+      req.nextUrl.searchParams.get('sort') || 'updated',
+    ).trim()
+    if (!isOperationsOrderSort(sortValue)) {
+      requestError('OPERATIONS_ORDER_SORT_INVALID', 'Order sort is invalid')
+    }
+    const directionValue = String(
+      req.nextUrl.searchParams.get('direction') || 'desc',
+    ).trim()
+    if (!isOperationsOrderSortDirection(directionValue)) {
+      requestError(
+        'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+        'Order sort direction is invalid',
+      )
+    }
+    const providerValue = String(
+      req.nextUrl.searchParams.get('provider') || '',
+    ).trim()
+    if (providerValue && !isOperationsOrderProviderFilter(providerValue)) {
+      requestError(
+        'OPERATIONS_ORDER_PROVIDER_INVALID',
+        'Order provider is invalid',
+      )
+    }
+    const trackingValue = String(
+      req.nextUrl.searchParams.get('tracking') || '',
+    ).trim()
+    if (
+      trackingValue
+      && !isOperationsOrderTrackingFilter(trackingValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+        'Order tracking filter is invalid',
+      )
+    }
+    const tracking = isOperationsOrderTrackingFilter(trackingValue)
+      ? trackingValue
+      : null
+    const updatedAfterValue = String(
+      req.nextUrl.searchParams.get('updatedAfter') || '',
+    ).trim()
+    if (
+      updatedAfterValue
+      && !isOperationsOrderUpdatedAfter(updatedAfterValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+        'Order updated-after value is invalid',
+      )
+    }
     const cursor = String(
       req.nextUrl.searchParams.get('cursor') || '',
     ).trim()
@@ -124,6 +182,11 @@ export async function GET(req: NextRequest) {
       organizationId: activeOperationsOrganizationId(actor),
       search,
       status: (statusValue as OperationsOrderPageStatus) || null,
+      sort: sortValue,
+      direction: directionValue,
+      provider: providerValue || null,
+      tracking,
+      updatedAfter: updatedAfterValue || null,
       cursor: cursor || null,
       pageSize,
     })

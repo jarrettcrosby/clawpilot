@@ -13,6 +13,8 @@ const requireFromApp = createRequire(
 )
 const ts = requireFromApp('typescript')
 const routePath = 'app_src/app/api/operations/order-status-sync/route.ts'
+const scheduleRoutePath =
+  'app_src/app/api/operations/order-reconciliation-schedule/route.ts'
 const discoveryRoutePath = 'app_src/app/api/operations/order-discovery/route.ts'
 const discoveryPersistencePath =
   'app_src/lib/persistence/commerceOrderDiscovery.ts'
@@ -76,6 +78,14 @@ class CommerceOrderRevisionDispositionError extends Error {
   }
 }
 
+class CommerceOrderSyncError extends Error {
+  constructor(code, message, status = 409) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const otherOrganizationId = '22222222-2222-4222-8222-222222222222'
 const actorEmail = 'manager@example.test'
@@ -93,6 +103,25 @@ let maximumActiveRefreshes = 0
 const batchReceiptId = '33333333-3333-4333-8333-333333333333'
 const batchAttemptToken = '44444444-4444-4444-8444-444444444444'
 const calls = { candidates: [], prepare: [], refresh: [], complete: [] }
+const scheduleCalls = []
+const historyScheduleCalls = []
+let scheduleResult = {
+  totalEligible: 111,
+  scheduled: 110,
+  alreadyScheduled: 1,
+  providerWrites: 0,
+}
+let historyScheduleResult = {
+  totalEligibleAccounts: 2,
+  scheduledAccounts: 1,
+  alreadyScheduledAccounts: 1,
+  deferredAccounts: 0,
+  newSessions: 1,
+  resumedSessions: 0,
+  newDeferredRefreshes: 0,
+  alreadyDeferredRefreshes: 0,
+  providerWrites: 0,
+}
 
 const route = loadTypeScriptModule(routePath, {
   'next/server': {
@@ -133,6 +162,13 @@ const route = loadTypeScriptModule(routePath, {
       return postgresEnabled
     },
   },
+  '@/lib/persistence/commerceOrderSync': {
+    CommerceOrderSyncError,
+    async scheduleAllCommerceOrderHistoryRefreshesInPostgres(input) {
+      historyScheduleCalls.push(input)
+      return historyScheduleResult
+    },
+  },
   '@/lib/persistence/commerceOrderRevisions': {
     CommerceOrderRevisionDispositionError,
     async listCommerceOrderRevisionRefreshCandidatesInPostgres(input) {
@@ -159,6 +195,54 @@ const route = loadTypeScriptModule(routePath, {
   },
 })
 
+const scheduleRoute = loadTypeScriptModule(scheduleRoutePath, {
+  'next/server': {
+    NextResponse: {
+      json(payload, init = {}) {
+        return new Response(JSON.stringify(payload), {
+          status: init.status || 200,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(init.headers || {}),
+          },
+        })
+      },
+    },
+  },
+  '@/lib/operations/authorization': {
+    operationsCapabilities(value) {
+      return value.capabilities
+    },
+    activeOperationsOrganizationId(value) {
+      return value.organizationId
+    },
+  },
+  '@/lib/persistence/config': {
+    isPostgresStorageEnabled() {
+      return postgresEnabled
+    },
+  },
+  '@/lib/persistence/commerceOrderSync': {
+    CommerceOrderSyncError,
+    async scheduleAllCommerceOrderHistoryRefreshesInPostgres(input) {
+      historyScheduleCalls.push(input)
+      return historyScheduleResult
+    },
+  },
+  '@/lib/persistence/commerceOrderRevisions': {
+    CommerceOrderRevisionDispositionError,
+    async scheduleAllCommerceOrderRevisionRefreshesInPostgres(input) {
+      scheduleCalls.push(input)
+      return scheduleResult
+    },
+  },
+  '@/lib/requestUser': {
+    async requireRequestUser() {
+      return actor
+    },
+  },
+})
+
 function request(options = {}) {
   const headers = options.headers === undefined
     ? {
@@ -174,6 +258,26 @@ function request(options = {}) {
       body: options.body === undefined
         ? JSON.stringify({ excludeOrderGlobalIds: [] })
         : options.body,
+    },
+  )
+  Object.defineProperty(result, 'nextUrl', { value: new URL(result.url) })
+  return result
+}
+
+function scheduleRequest(options = {}) {
+  const headers = options.headers === undefined
+    ? {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': 'schedule-refresh-request-1',
+      }
+    : options.headers
+  const result = new Request(
+    options.url
+      || 'https://clawpilot.example/api/operations/order-reconciliation-schedule',
+    {
+      method: 'POST',
+      headers,
+      body: options.body === undefined ? JSON.stringify({}) : options.body,
     },
   )
   Object.defineProperty(result, 'nextUrl', { value: new URL(result.url) })
@@ -357,6 +461,51 @@ assert.deepEqual(plain(calls.candidates[0]), {
 assert.deepEqual(plain(calls.prepare[0].excludeOrderGlobalIds), ['gor1000001'])
 
 reset()
+await route.POST(request({
+  body: JSON.stringify({
+    excludeOrderGlobalIds: ['gor1000001'],
+    orderGlobalIds: ['gor1000002', 'gor1000003'],
+  }),
+}))
+assert.deepEqual(plain(calls.candidates[0]), {
+  organizationId,
+  limit: 10,
+  excludeOrderGlobalIds: ['gor1000001'],
+  orderGlobalIds: ['gor1000002', 'gor1000003'],
+})
+assert.deepEqual(
+  plain(calls.prepare[0].orderGlobalIds),
+  ['gor1000002', 'gor1000003'],
+)
+
+reset()
+const explicitEmptyTargets = await route.POST(request({
+  body: JSON.stringify({ orderGlobalIds: [] }),
+}))
+assert.equal(explicitEmptyTargets.status, 200)
+assert.deepEqual(plain(calls.candidates[0]), {
+  organizationId,
+  limit: 10,
+  excludeOrderGlobalIds: [],
+  orderGlobalIds: [],
+})
+assert.deepEqual(plain(calls.prepare[0].orderGlobalIds), [])
+
+const maximumTargetIds = Array.from(
+  { length: 101 },
+  (_, index) => `gor${String(2_000_000 + index).padStart(7, '0')}`,
+)
+reset()
+const maximumTargets = await route.POST(request({
+  body: JSON.stringify({ orderGlobalIds: maximumTargetIds.slice(0, 100) }),
+}))
+assert.equal(maximumTargets.status, 200)
+assert.deepEqual(
+  plain(calls.candidates[0].orderGlobalIds),
+  maximumTargetIds.slice(0, 100),
+)
+
+reset()
 actor = { ...actor, capabilities: { canManage: false } }
 const forbidden = await route.POST(request())
 assert.equal(forbidden.status, 403)
@@ -388,6 +537,41 @@ assert.equal(
 assert.equal(calls.candidates.length, 0)
 
 reset()
+const duplicateTargets = await route.POST(request({
+  body: JSON.stringify({
+    orderGlobalIds: ['gor1000001', 'gor1000001'],
+  }),
+}))
+assert.equal(duplicateTargets.status, 400)
+assert.equal(
+  (await duplicateTargets.json()).code,
+  'COMMERCE_ORDER_STATUS_SYNC_BODY_INVALID',
+)
+assert.equal(calls.candidates.length, 0)
+
+reset()
+const invalidTarget = await route.POST(request({
+  body: JSON.stringify({ orderGlobalIds: ['gcoc1000001'] }),
+}))
+assert.equal(invalidTarget.status, 400)
+assert.equal(
+  (await invalidTarget.json()).code,
+  'COMMERCE_ORDER_STATUS_SYNC_BODY_INVALID',
+)
+assert.equal(calls.candidates.length, 0)
+
+reset()
+const tooManyTargets = await route.POST(request({
+  body: JSON.stringify({ orderGlobalIds: maximumTargetIds }),
+}))
+assert.equal(tooManyTargets.status, 400)
+assert.equal(
+  (await tooManyTargets.json()).code,
+  'COMMERCE_ORDER_STATUS_SYNC_BODY_INVALID',
+)
+assert.equal(calls.candidates.length, 0)
+
+reset()
 postgresEnabled = false
 const unavailable = await route.POST(request())
 assert.equal(unavailable.status, 503)
@@ -414,6 +598,140 @@ assert.equal(
   'COMMERCE_ORDER_STATUS_SYNC_QUERY_INVALID',
 )
 assert.equal(calls.candidates.length, 0)
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+const scheduled = await scheduleRoute.POST(scheduleRequest())
+assert.equal(scheduled.status, 200)
+assert.equal(scheduled.headers.get('cache-control'), 'private, no-store')
+assert.deepEqual(plain(await scheduled.json()), {
+  ok: true,
+  result: {
+    ...scheduleResult,
+    providerHistory: historyScheduleResult,
+  },
+})
+assert.deepEqual(plain(scheduleCalls), [{
+  organizationId,
+  actorEmail,
+  idempotencyKey: 'schedule-refresh-request-1',
+  excludeOrderGlobalIds: [],
+}])
+assert.deepEqual(plain(historyScheduleCalls), [{
+  organizationId,
+  actorEmail,
+  idempotencyKey: 'schedule-refresh-request-1',
+}])
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+const scheduleExclusions = maximumTargetIds.slice(0, 100)
+const scheduledWithExclusions = await scheduleRoute.POST(scheduleRequest({
+  body: JSON.stringify({ excludeOrderGlobalIds: scheduleExclusions }),
+}))
+assert.equal(scheduledWithExclusions.status, 200)
+assert.deepEqual(plain(scheduleCalls), [{
+  organizationId,
+  actorEmail,
+  idempotencyKey: 'schedule-refresh-request-1',
+  excludeOrderGlobalIds: scheduleExclusions,
+}])
+assert.deepEqual(plain(historyScheduleCalls), [{
+  organizationId,
+  actorEmail,
+  idempotencyKey: 'schedule-refresh-request-1',
+}], 'provider-history scheduling must remain independent from exclusions')
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+actor = { ...actor, capabilities: { canManage: false } }
+const scheduleForbidden = await scheduleRoute.POST(scheduleRequest())
+assert.equal(scheduleForbidden.status, 403)
+assert.equal(
+  (await scheduleForbidden.json()).code,
+  'OPERATIONS_MANAGE_REQUIRED',
+)
+assert.equal(scheduleCalls.length, 0)
+assert.equal(historyScheduleCalls.length, 0)
+
+for (const invalidExclusions of [
+  'gor1000001',
+  ['gor1000001', 'gor1000001'],
+  ['gcoc1000001'],
+  maximumTargetIds.slice(0, 101),
+]) {
+  reset()
+  scheduleCalls.length = 0
+  historyScheduleCalls.length = 0
+  const invalidExclusionsResponse = await scheduleRoute.POST(scheduleRequest({
+    body: JSON.stringify({ excludeOrderGlobalIds: invalidExclusions }),
+  }))
+  assert.equal(invalidExclusionsResponse.status, 400)
+  assert.equal(
+    (await invalidExclusionsResponse.json()).code,
+    'COMMERCE_ORDER_RECONCILIATION_SCHEDULE_BODY_INVALID',
+  )
+  assert.equal(scheduleCalls.length, 0)
+  assert.equal(historyScheduleCalls.length, 0)
+}
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+const scheduleOversizedBody = await scheduleRoute.POST(scheduleRequest({
+  body: `{${' '.repeat(4096)}}`,
+}))
+assert.equal(scheduleOversizedBody.status, 400)
+assert.equal(
+  (await scheduleOversizedBody.json()).code,
+  'COMMERCE_ORDER_RECONCILIATION_SCHEDULE_BODY_INVALID',
+)
+assert.equal(scheduleCalls.length, 0)
+assert.equal(historyScheduleCalls.length, 0)
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+const scheduleInvalidBody = await scheduleRoute.POST(scheduleRequest({
+  body: JSON.stringify({ organizationId: otherOrganizationId }),
+}))
+assert.equal(scheduleInvalidBody.status, 400)
+assert.equal(
+  (await scheduleInvalidBody.json()).code,
+  'COMMERCE_ORDER_RECONCILIATION_SCHEDULE_BODY_INVALID',
+)
+assert.equal(scheduleCalls.length, 0)
+assert.equal(historyScheduleCalls.length, 0)
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+const scheduleInvalidQuery = await scheduleRoute.POST(scheduleRequest({
+  url: 'https://clawpilot.example/api/operations/order-reconciliation-schedule?organizationId=attacker',
+}))
+assert.equal(scheduleInvalidQuery.status, 400)
+assert.equal(
+  (await scheduleInvalidQuery.json()).code,
+  'COMMERCE_ORDER_RECONCILIATION_SCHEDULE_QUERY_INVALID',
+)
+assert.equal(scheduleCalls.length, 0)
+assert.equal(historyScheduleCalls.length, 0)
+
+reset()
+scheduleCalls.length = 0
+historyScheduleCalls.length = 0
+postgresEnabled = false
+const scheduleUnavailable = await scheduleRoute.POST(scheduleRequest())
+assert.equal(scheduleUnavailable.status, 503)
+assert.equal(
+  (await scheduleUnavailable.json()).code,
+  'COMMERCE_ORDER_RECONCILIATION_SCHEDULE_POSTGRES_REQUIRED',
+)
+assert.equal(scheduleCalls.length, 0)
+assert.equal(historyScheduleCalls.length, 0)
 
 const retainedReplayCapture = {
   observationGlobalId: 'gcor1000011',
@@ -1158,6 +1476,10 @@ assert.ok(durableDiscoveryLocks.every((key) => (
 )))
 
 const routeSource = readFileSync(resolve(root, routePath), 'utf8')
+const scheduleRouteSource = readFileSync(
+  resolve(root, scheduleRoutePath),
+  'utf8',
+)
 const discoveryRouteSource = readFileSync(resolve(root, discoveryRoutePath), 'utf8')
 const discoveryPersistenceSource = readFileSync(
   resolve(root, discoveryPersistencePath),
@@ -1173,6 +1495,25 @@ assert.match(routeSource, /completeCommerceOrderStatusSyncBatchInPostgres/)
 assert.match(routeSource, /attemptToken: batch\.attemptToken/)
 assert.match(routeSource, /providerWrites: 0/)
 assert.match(routeSource, /canonicalOrderWrites: 0/)
+assert.match(
+  scheduleRouteSource,
+  /scheduleAllCommerceOrderRevisionRefreshesInPostgres/,
+)
+assert.match(
+  scheduleRouteSource,
+  /scheduleAllCommerceOrderHistoryRefreshesInPostgres/,
+)
+assert.match(scheduleRouteSource, /const MAX_REQUEST_BYTES = 4096/)
+assert.match(scheduleRouteSource, /const MAX_EXCLUDED_ORDERS = 100/)
+assert.match(
+  scheduleRouteSource,
+  /const GLOBAL_ORDER_ID = \/\^gor/,
+)
+assert.match(
+  scheduleRouteSource,
+  /keys\.some\(\(key\) => key !== 'excludeOrderGlobalIds'\)/,
+)
+assert.match(scheduleRouteSource, /operationsCapabilities\(actor\)\.canManage/)
 assert.match(discoveryRouteSource, /processCommerceOrderReconciliation/)
 assert.match(
   discoveryRouteSource,
@@ -1222,14 +1563,18 @@ assert.match(operationsSource, /AND NOT \(\$\{externallyFulfilledOrderSql\('summ
 assert.match(operationsSource, /\$3::text = 'fulfilled_externally'/)
 assert.match(
   operationsSource,
-  /\$3::text <> 'fulfilled_externally'[\s\S]*AND NOT \(\$\{externallyFulfilledOrderSql\('orders'\)\}\)/,
+  /\$3::text NOT IN \('fulfilled_externally', 'closed_externally'\)[\s\S]*AND NOT \(\$\{externallyFulfilledOrderSql\('orders'\)\}\)/,
   'canonical status filters must exclude externally fulfilled display overrides',
 )
 assert.match(uiSource, /fetch\('\/api\/operations\/order-status-sync'/)
+assert.match(
+  uiSource,
+  /fetch\(\s*'\/api\/operations\/order-reconciliation-schedule'/,
+)
 assert.match(uiSource, /fetch\('\/api\/operations\/order-discovery'/)
 assert.match(uiSource, /Refresh connected-store orders/)
-assert.match(uiSource, /MAX_ORDER_STATUS_SYNC_ORDERS = 500/)
-assert.match(uiSource, /MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 20/)
+assert.doesNotMatch(uiSource, /MAX_ORDER_STATUS_SYNC_ORDERS/)
+assert.match(uiSource, /MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 1/)
 assert.match(
   uiSource,
   /invocation < MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT/,
@@ -1237,8 +1582,25 @@ assert.match(
 assert.match(uiSource, /if \(!result\.pagination\.hasNextBatch\)/)
 assert.match(uiSource, /accountComplete = true/)
 assert.match(routeSource, /MAX_EXCLUDED_ORDERS = 500/)
+assert.match(routeSource, /MAX_TARGETED_ORDERS = 100/)
 assert.match(persistenceSource, /excludeOrderGlobalIds\.length > 500/)
+assert.match(persistenceSource, /orderGlobalIds\.length > 100/)
+assert.match(
+  persistenceSource,
+  /\$4::text\[\] IS NULL OR order_row\.global_id = ANY\(\$4::text\[\]\)/,
+)
 assert.match(uiSource, /excludeOrderGlobalIds: \[\.\.\.checkedOrderGlobalIds\]/)
+assert.match(uiSource, /const visibleCanonicalOrderGlobalIds =/)
+assert.match(uiSource, /runOrderStatusSyncBatch\(\s*visibleCanonicalOrderGlobalIds/)
+assert.match(uiSource, /excludeOrderGlobalIds: \[\.\.\.checkedOrderGlobalIds\],[\s\S]*orderGlobalIds,/)
+assert.doesNotMatch(
+  uiSource,
+  /runOrderStatusSyncBatch\(\s*\)/,
+  'manager refresh must not start an unscoped synchronous status scan',
+)
+assert.match(uiSource, /Background canonical status: queued/)
+assert.match(uiSource, /active ClawPilot/)
+assert.match(uiSource, /for an exact background status check/)
 assert.match(uiSource, /\{ value: 'fulfilled_externally', label: 'Fulfilled externally' \}/)
 assert.match(uiSource, /ClawPilot shipped today/)
 assert.match(

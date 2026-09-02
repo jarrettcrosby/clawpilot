@@ -10,6 +10,7 @@ import type {
   CommerceDataField,
   CommerceMoneySet,
   CommerceNormalizedOrder,
+  ShopifyNormalizedOrderFacts,
 } from '@/lib/operations/commerceNormalization'
 import {
   commerceOrderRevisionProtectedPlaintext,
@@ -57,6 +58,7 @@ export type ShopifyCanonicalOrderRevisionSnapshot = Readonly<{
         | 'unreconciled'
     }>
     requestedDeliveryAt: string | null
+    deliveryPromise: ShopifyNormalizedOrderFacts['deliveryPromise']
     partyFingerprint: string
     shipToFingerprint: string
     lines: ReadonlyArray<Readonly<{
@@ -236,6 +238,12 @@ export function shopifyCanonicalOrderRevisionSnapshot(input: {
       'Shopify exact order revision normalization is incomplete or mismatched',
     )
   }
+  if (input.order.providerFacts.provider !== 'shopify') {
+    throw new ShopifyOrderRevisionError(
+      'SHOPIFY_ORDER_REVISION_NORMALIZATION_INVALID',
+      'Shopify exact order revision normalization is incomplete or mismatched',
+    )
+  }
   const lines = input.order.lines.map((line) => ({
     externalLineId: line.identity.value,
     externalProductId: identityValue(line.productIdentity),
@@ -292,6 +300,7 @@ export function shopifyCanonicalOrderRevisionSnapshot(input: {
       requestedDeliveryAt: input.order.requestedDeliveryAt.state === 'available'
         ? input.order.requestedDeliveryAt.value
         : null,
+      deliveryPromise: input.order.providerFacts.deliveryPromise,
       partyFingerprint: protectedFingerprint({
         field: input.order.party,
         claim: input.claim,

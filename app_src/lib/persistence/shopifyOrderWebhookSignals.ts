@@ -1243,10 +1243,16 @@ async function insertExactObservation(
       `INSERT INTO operations_commerce_order_observation_lines (
          organization_id, observation_id, external_line_id,
          external_product_id, external_variant_id, sku,
+         title_snapshot, variant_title_snapshot, vendor_snapshot,
          original_quantity, current_quantity, unfulfilled_quantity,
-         fulfilled_quantity, returned_quantity, requires_shipping
+         fulfilled_quantity, returned_quantity, requires_shipping,
+         unit_price_currency, unit_price_minor,
+         subtotal_currency, subtotal_minor,
+         discount_currency, discount_minor, tax_currency, tax_minor
        ) VALUES (
-         $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+         $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
+         $10, $11, $12, $13, $14, $15,
+         $16, $17, $18, $19, $20, $21, $22, $23
        )`,
       [
         claim.organizationId,
@@ -1255,12 +1261,23 @@ async function insertExactObservation(
         line.externalProductId,
         line.externalVariantId,
         line.sku,
+        line.titleSnapshot,
+        line.variantTitleSnapshot,
+        line.vendorSnapshot,
         line.originalQuantity,
         line.currentQuantity,
         line.unfulfilledQuantity,
         line.fulfilledQuantity,
         line.returnedQuantity,
         line.requiresShipping,
+        line.unitPriceCurrency,
+        line.unitPriceMinor,
+        line.subtotalCurrency,
+        line.subtotalMinor,
+        line.discountCurrency,
+        line.discountMinor,
+        line.taxCurrency,
+        line.taxMinor,
       ],
     )
     linesAppended += Number(result.rowCount || 0)

@@ -4,6 +4,7 @@ import {
   claimCommerceOrderBackfillsInPostgres,
   ensureContinuousCommerceOrderPollsInPostgres,
   failCommerceOrderBackfillInPostgres,
+  materializeDeferredCommerceOrderHistoryRefreshesInPostgres,
   parkCommerceOrderBackfillForStoreSyncPauseInPostgres,
   readCommerceOrderBackfillCursorFromPostgres,
   readCommerceOrderSyncCursorKeyReadinessFromPostgres,
@@ -69,6 +70,11 @@ export async function processCommerceOrderHistory(input: {
   const limit = Math.max(1, Math.min(Number(input.limit || 1), 2))
   const sensitiveEvidenceRedaction =
     await redactExpiredCommerceOrderSensitiveEvidenceInPostgres({ limit: 250 })
+  // Full-history intent has priority over opening a new continuous-poll slot.
+  // The second pass below consumes an intent released by a poll that reaches a
+  // terminal state during this same drain.
+  const deferredBeforeClaim =
+    await materializeDeferredCommerceOrderHistoryRefreshesInPostgres({ limit })
   const continuousScheduling =
     await ensureContinuousCommerceOrderPollsInPostgres({ limit })
   let succeeded = 0
@@ -213,12 +219,22 @@ export async function processCommerceOrderHistory(input: {
     })
     if (!jobs.length) drainStopReason = 'queue_empty'
   }
+  const deferredAfterDrain =
+    await materializeDeferredCommerceOrderHistoryRefreshesInPostgres({ limit })
   const [health, cursorKeyReadiness] = await Promise.all([
     readCommerceOrderSyncHealthFromPostgres(),
     readCommerceOrderSyncCursorKeyReadinessFromPostgres(),
   ])
   return {
     scheduled: continuousScheduling.scheduled,
+    deferredHistoricalRefreshes: {
+      beforeClaim: deferredBeforeClaim.materialized,
+      afterDrain: deferredAfterDrain.materialized,
+      materialized:
+        deferredBeforeClaim.materialized + deferredAfterDrain.materialized,
+      skipped: deferredBeforeClaim.skipped + deferredAfterDrain.skipped,
+      providerWrites: 0 as const,
+    },
     claimed,
     claimWaves,
     pageAttempts,

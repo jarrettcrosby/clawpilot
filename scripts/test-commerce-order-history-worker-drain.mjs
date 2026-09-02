@@ -100,6 +100,9 @@ async function runDrainScenario({ finalPage }) {
       async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
         return { redacted: 0, providerWrites: 0 }
       },
+      async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+        return { materialized: 0, skipped: 0, providerWrites: 0 }
+      },
       async ensureContinuousCommerceOrderPollsInPostgres() {
         return { scheduled: 0, providerWrites: 0 }
       },
@@ -160,6 +163,16 @@ assert.equal(completedDrain.result.providerReadReservations, 96)
 assert.equal(completedDrain.result.drainStopReason, 'terminal')
 assert.equal(completedDrain.result.providerWrites, 0)
 assert.equal(completedDrain.result.operationsOrderWrites, 0)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(completedDrain.result.deferredHistoricalRefreshes)),
+  {
+    beforeClaim: 0,
+    afterDrain: 0,
+    materialized: 0,
+    skipped: 0,
+    providerWrites: 0,
+  },
+)
 assert.equal(
   completedDrain.runtime.commerceOrderHistoryWorkerLimits
     .providerDrainClaimWindowMs,
@@ -210,6 +223,9 @@ const isolatedFailureRuntime = loadWorker({
   '@/lib/persistence/commerceOrderSync': {
     async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
       return { redacted: 0, providerWrites: 0 }
+    },
+    async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+      return { materialized: 0, skipped: 0, providerWrites: 0 }
     },
     async ensureContinuousCommerceOrderPollsInPostgres() {
       return { scheduled: 0, providerWrites: 0 }

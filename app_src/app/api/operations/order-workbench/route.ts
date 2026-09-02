@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
 import {
+  exactFaireOrderHistoryProviderReads,
   exactShopifyOrderHistoryProviderReads,
+  readExactFaireOrderHistoryObservation,
   readExactShopifyOrderHistoryObservation,
 } from '@/lib/integrations/commerceOrderHistory'
 import {
@@ -9,6 +11,7 @@ import {
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
+import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -21,6 +24,13 @@ import {
   type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
+import {
+  isOperationsImportedOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+} from '@/lib/operations/orderListQuery'
 import type {
   OperationsImportedOrderResolutionDraft,
 } from '@/lib/operations/types'
@@ -60,10 +70,12 @@ const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const MAX_PAGE_SIZE = 250
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
-const DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES = new Set([
+const DEGRADABLE_EXACT_HISTORY_CODES = new Set([
   'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
+  'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
   'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
   'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+  'FAIRE_READ_ORDERS_REQUIRED',
   'SHOPIFY_READ_ORDERS_REQUIRED',
 ])
 const REFRESH_FIELDS = new Set<string>([
@@ -106,13 +118,25 @@ function requestError(code: string, message: string, status = 400): never {
   throw new CommerceOrderWorkbenchApiError(code, message, status)
 }
 
-function exactShopifyHistoryUnavailableCode(error: unknown) {
-  if (error instanceof ShopifyCommerceClientError) return error.code
+function exactHistoryUnavailableCode(error: unknown) {
+  if (
+    error instanceof ShopifyCommerceClientError
+    || error instanceof FaireCommerceClientError
+  ) return error.code
   if (
     error instanceof CommerceOrderSyncError
-    && DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES.has(error.code)
+    && DEGRADABLE_EXACT_HISTORY_CODES.has(error.code)
   ) return error.code
   return null
+}
+
+function exactHistoryProviderReads(
+  provider: 'shopify' | 'faire',
+  error: unknown,
+) {
+  return provider === 'shopify'
+    ? exactShopifyOrderHistoryProviderReads(error)
+    : exactFaireOrderHistoryProviderReads(error)
 }
 
 function requirePostgres() {
@@ -451,6 +475,60 @@ export async function GET(req: NextRequest) {
     const candidateValue = String(
       req.nextUrl.searchParams.get('candidate') || '',
     ).trim()
+    const sortValue = String(
+      req.nextUrl.searchParams.get('sort') || 'updated',
+    ).trim()
+    if (!isOperationsOrderSort(sortValue)) {
+      requestError('OPERATIONS_ORDER_SORT_INVALID', 'Order sort is invalid')
+    }
+    const directionValue = String(
+      req.nextUrl.searchParams.get('direction') || 'desc',
+    ).trim()
+    if (!isOperationsOrderSortDirection(directionValue)) {
+      requestError(
+        'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+        'Order sort direction is invalid',
+      )
+    }
+    const providerValue = String(
+      req.nextUrl.searchParams.get('provider') || '',
+    ).trim()
+    if (
+      providerValue
+      && !isOperationsImportedOrderProviderFilter(providerValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_PROVIDER_INVALID',
+        'Imported-order provider is invalid',
+      )
+    }
+    const trackingValue = String(
+      req.nextUrl.searchParams.get('tracking') || '',
+    ).trim()
+    if (
+      trackingValue
+      && !isOperationsOrderTrackingFilter(trackingValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+        'Order tracking filter is invalid',
+      )
+    }
+    const tracking = isOperationsOrderTrackingFilter(trackingValue)
+      ? trackingValue
+      : null
+    const updatedAfterValue = String(
+      req.nextUrl.searchParams.get('updatedAfter') || '',
+    ).trim()
+    if (
+      updatedAfterValue
+      && !isOperationsOrderUpdatedAfter(updatedAfterValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+        'Order updated-after value is invalid',
+      )
+    }
     const cursor = String(
       req.nextUrl.searchParams.get('cursor') || '',
     ).trim()
@@ -477,6 +555,11 @@ export async function GET(req: NextRequest) {
         ? candidateGlobalIdValue(candidateValue)
         : null,
       includeResolutionDetails: Boolean(candidateValue),
+      sort: sortValue,
+      direction: directionValue,
+      provider: providerValue || null,
+      tracking,
+      updatedAfter: updatedAfterValue || null,
       cursor: cursor || null,
       pageSize: candidateValue ? 1 : pageSize,
     })
@@ -628,7 +711,7 @@ export async function POST(req: NextRequest) {
         }),
         candidateGlobalId,
       })
-      if (target.provider === 'shopify') {
+      if (target.provider === 'shopify' || target.provider === 'faire') {
         const historyIntentKey = [
           'order-workbench-history',
           requestKey,
@@ -638,6 +721,7 @@ export async function POST(req: NextRequest) {
           await readCommerceOrderWorkbenchExactReadReplayInPostgres({
             organizationId,
             integrationAccountId: target.integrationAccountId,
+            provider: target.provider,
             externalOrderId: target.externalOrderId,
             intentKey: historyIntentKey,
           })
@@ -658,30 +742,39 @@ export async function POST(req: NextRequest) {
             acquiredBy: actor.email,
             read: async (providerReadLease) => {
               try {
-                const exact = await readExactShopifyOrderHistoryObservation({
-                  organizationId,
-                  accountGlobalId: target.accountGlobalId,
-                  expectedCredentialGeneration: target.credentialGeneration,
-                  externalOrderId: target.externalOrderId,
-                  observationKind: 'manual_exact_read',
-                })
+                const exact = target.provider === 'shopify'
+                  ? await readExactShopifyOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
+                  : await readExactFaireOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
                 return appendCommerceOrderWorkbenchExactReadInPostgres({
                   organizationId,
                   integrationAccountId: target.integrationAccountId,
                   accountGlobalId: target.accountGlobalId,
+                  provider: target.provider,
                   credentialGeneration: target.credentialGeneration,
                   externalOrderId: target.externalOrderId,
                   providerReadLease,
                   observation: exact.observation,
                 })
               } catch (error) {
-                const code = exactShopifyHistoryUnavailableCode(error)
+                const code = exactHistoryUnavailableCode(error)
                 if (!code) throw error
                 return {
                   status: 'unavailable' as const,
                   code,
                   providerReads:
-                    exactShopifyOrderHistoryProviderReads(error),
+                    exactHistoryProviderReads(target.provider, error),
                   providerWrites: 0 as const,
                 }
               }

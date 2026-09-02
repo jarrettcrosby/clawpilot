@@ -9,6 +9,10 @@ export function commerceOrderHistoryDurableDegraded(input: {
   failed: number
   blocked: number
   dead: number
+  /** Superseded or stale-authority terminal sessions; retained as telemetry. */
+  historicalDead?: number
+  /** Superseded or stale-authority blocked sessions; telemetry only. */
+  historicalBlocked?: number
   overduePolls: number
   expiredSensitiveEvidence: number
   cursorKeysReady: boolean

@@ -94,7 +94,7 @@ assert.doesNotMatch(
   'Normalized product-image evidence must not expose provider URLs or bytes',
 )
 includesAllIn(shopifyNormalizer, [
-  "'shopify-commerce-normalizer-v5'",
+  "'shopify-commerce-normalizer-v6'",
   'shopifyProductImages',
   'shopifyProductSourceEvidence',
 ], 'Shopify product-image normalizer')

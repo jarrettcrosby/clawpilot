@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,6 +26,20 @@ const { Pool } = requireFromApp('pg')
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value))
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+function sha256Canonical(value) {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
 }
 
 function errorCode(error) {
@@ -233,6 +247,48 @@ async function verifyCandidateScheduling(pool, persistence, ids, tenantTwo) {
   assert.ok(initial.every((candidate) => candidate.totalEligible === 3))
   assert.ok(initial.every((candidate) => candidate.orderGlobalId !== 'gor0009401'))
 
+  const targeted = plain(
+    await persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: ['gor0009302', 'gor0009401'],
+    }),
+  )
+  assert.deepEqual(
+    targeted.map((candidate) => candidate.orderGlobalId),
+    ['gor0009302'],
+    'target IDs remain organization-scoped even when another tenant ID is supplied',
+  )
+  assert.equal(targeted[0].totalEligible, 1)
+
+  const emptyTarget = plain(
+    await persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: [],
+    }),
+  )
+  assert.deepEqual(
+    emptyTarget,
+    [],
+    'an explicit empty target set selects no orders instead of reverting to legacy all-order selection',
+  )
+
+  const targetedAndExcluded = plain(
+    await persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: ['gor0009301', 'gor0009302'],
+      excludeOrderGlobalIds: ['gor0009301'],
+    }),
+  )
+  assert.deepEqual(
+    targetedAndExcluded.map((candidate) => candidate.orderGlobalId),
+    ['gor0009302'],
+    'exclusions are applied within the exact targeted set',
+  )
+  assert.equal(targetedAndExcluded[0].totalEligible, 1)
+
   const excluded = plain(
     await persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
       organizationId: ids.organization,
@@ -251,6 +307,33 @@ async function verifyCandidateScheduling(pool, persistence, ids, tenantTwo) {
       organizationId: ids.organization,
       limit: 10,
       excludeOrderGlobalIds: ['gor0009301', 'gor0009301'],
+    }),
+    'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
+  )
+  await assertRejectsCode(
+    persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: ['gor0009301', 'gor0009301'],
+    }),
+    'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
+  )
+  await assertRejectsCode(
+    persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: ['gcoc0009301'],
+    }),
+    'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
+  )
+  await assertRejectsCode(
+    persistence.listCommerceOrderRevisionRefreshCandidatesInPostgres({
+      organizationId: ids.organization,
+      limit: 10,
+      orderGlobalIds: Array.from(
+        { length: 101 },
+        (_, index) => `gor${String(2_000_000 + index).padStart(7, '0')}`,
+      ),
     }),
     'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
   )
@@ -409,7 +492,7 @@ async function verifyDurableBatchReceipts(
   assert.equal(emptyReplay.attemptToken, null)
   assert.deepEqual(emptyReplay.replayedResult, emptyResult)
   const emptyReceipt = (await pool.query(
-    `SELECT status, attempts, result_payload
+    `SELECT status, attempts, request_hash, result_payload
      FROM operations_command_receipts
      WHERE organization_id = $1::uuid
        AND command_type = 'operations.commerce_order_status_sync'
@@ -418,10 +501,34 @@ async function verifyDurableBatchReceipts(
   )).rows[0]
   assert.equal(emptyReceipt.status, 'succeeded')
   assert.equal(emptyReceipt.attempts, 1)
+  assert.equal(
+    emptyReceipt.request_hash,
+    sha256Canonical({
+      action: 'sync_order_status_from_provider',
+      organizationId: ids.organization,
+      actorEmail,
+      batchLimit: 5,
+      excludeOrderGlobalIds: [],
+      providerWrites: 0,
+      canonicalOrderWrites: 0,
+    }),
+    'omitting orderGlobalIds preserves the pre-targeting idempotency hash',
+  )
   assert.equal(emptyReceipt.result_payload.batchLimit, 5)
   assert.equal(emptyReceipt.result_payload.totalEligible, 0)
   assert.deepEqual(emptyReceipt.result_payload.candidates, [])
   assert.deepEqual(emptyReceipt.result_payload.response, emptyResult)
+  await assertRejectsCode(
+    persistence.prepareCommerceOrderStatusSyncBatchInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: emptyKey,
+      batchLimit: 5,
+      candidates: [],
+      orderGlobalIds: [],
+    }),
+    'COMMERCE_ORDER_STATUS_SYNC_IDEMPOTENCY_CONFLICT',
+  )
 
   const requestHashKey = 'order-status-sync-request-hash-0001'
   const requestHashPrepared = plain(
@@ -449,6 +556,46 @@ async function verifyDurableBatchReceipts(
     organizationId: ids.organization,
     receiptId: requestHashPrepared.receiptId,
     attemptToken: requestHashPrepared.attemptToken,
+    result: emptyBatchResult(),
+  })
+
+  const targetedRequestHashKey = 'order-status-sync-target-hash-0001'
+  const targetedRequestHashPrepared = plain(
+    await persistence.prepareCommerceOrderStatusSyncBatchInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: targetedRequestHashKey,
+      batchLimit: 5,
+      candidates: [],
+      orderGlobalIds: ['gor0009302', 'gor0009301'],
+    }),
+  )
+  await assertRejectsCode(
+    persistence.prepareCommerceOrderStatusSyncBatchInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: targetedRequestHashKey,
+      batchLimit: 5,
+      candidates: [],
+      orderGlobalIds: ['gor0009303'],
+    }),
+    'COMMERCE_ORDER_STATUS_SYNC_IDEMPOTENCY_CONFLICT',
+  )
+  await assertRejectsCode(
+    persistence.prepareCommerceOrderStatusSyncBatchInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: targetedRequestHashKey,
+      batchLimit: 5,
+      candidates: [],
+      orderGlobalIds: ['gor0009301', 'gor0009302'],
+    }),
+    'COMMERCE_ORDER_STATUS_SYNC_IN_PROGRESS',
+  )
+  await persistence.completeCommerceOrderStatusSyncBatchInPostgres({
+    organizationId: ids.organization,
+    receiptId: targetedRequestHashPrepared.receiptId,
+    attemptToken: targetedRequestHashPrepared.attemptToken,
     result: emptyBatchResult(),
   })
 
@@ -706,6 +853,315 @@ async function verifyDurableBatchReceipts(
   })
 }
 
+async function verifyScheduleAllRevisionRefreshes(
+  pool,
+  persistence,
+  ids,
+  tenantTwo,
+) {
+  const missingTargetOrderId = randomUUID()
+  const excludedTargetOrderId = randomUUID()
+  await pool.query('SET session_replication_role = replica')
+  try {
+    await pool.query(
+      `INSERT INTO operations_orders (
+         id, global_id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, status, currency, merchandise_total_minor,
+         ship_to, source_payload, created_by, updated_by
+       ) VALUES (
+         $1::uuid, 'gor0009501', $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', 'gid://shopify/Order/9501', '#9501',
+         'imported', 'USD', 1000, '{"country":"US"}'::jsonb,
+         jsonb_build_object('sourceHash', $6::text), $7, $7
+       ), (
+         $8::uuid, 'gor0009502', $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', 'gid://shopify/Order/9502', '#9502',
+         'imported', 'USD', 1000, '{"country":"US"}'::jsonb,
+         jsonb_build_object('sourceHash', $9::text), $7, $7
+       )`,
+      [
+        missingTargetOrderId,
+        ids.organization,
+        ids.pipeline,
+        ids.customer,
+        ids.integration,
+        '8'.repeat(64),
+        actorEmail,
+        excludedTargetOrderId,
+        '9'.repeat(64),
+      ],
+    )
+  } finally {
+    await pool.query('SET session_replication_role = origin')
+  }
+
+  const protectedBefore = plain((await pool.query(
+    `SELECT order_id::text, claim_state, attempt_count,
+            next_check_at::text, locked_by, lock_token::text,
+            locked_until::text, row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid
+       AND order_id IN ($2::uuid, $3::uuid)
+     ORDER BY order_id`,
+    [ids.organization, ids.missing, ids.stale],
+  )).rows)
+  assert.deepEqual(
+    new Set(protectedBefore.map((row) => row.claim_state)),
+    new Set(['processing', 'dead_letter']),
+    'the schedule-all fixture retains processing and dead-letter targets',
+  )
+  const tenantBefore = plain((await pool.query(
+    `SELECT claim_state, next_check_at::text, row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid`,
+    [tenantTwo.organization, tenantTwo.order],
+  )).rows[0])
+
+  const scheduleKey = 'order-revision-schedule-all-0001'
+  const scheduled = plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: scheduleKey,
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  )
+  assert.deepEqual(scheduled, {
+    totalEligible: 3,
+    scheduled: 2,
+    alreadyScheduled: 1,
+    providerWrites: 0,
+  }, 'a missing target and safe future target are scheduled while processing remains in flight')
+
+  const scheduledTargets = plain((await pool.query(
+    `SELECT order_id::text, claim_state, attempt_count,
+            next_check_at <= now() AS due, accepted_source_hash,
+            row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid
+       AND order_id IN ($2::uuid, $3::uuid)
+     ORDER BY order_id`,
+    [ids.organization, ids.current, missingTargetOrderId],
+  )).rows)
+  assert.equal(scheduledTargets.length, 2)
+  assert.ok(scheduledTargets.every((row) => row.due === true))
+  assert.equal(
+    scheduledTargets.find((row) => row.order_id === missingTargetOrderId)
+      ?.accepted_source_hash,
+    '8'.repeat(64),
+    'a missing revision target is inserted with the canonical accepted source hash',
+  )
+  assert.equal(
+    Number((await pool.query(
+      `SELECT count(*)::text AS value
+       FROM operations_commerce_order_revision_targets
+       WHERE organization_id = $1::uuid AND order_id = $2::uuid`,
+      [ids.organization, excludedTargetOrderId],
+    )).rows[0]?.value),
+    0,
+    'an immediately refreshed visible order is excluded from bulk scheduling',
+  )
+
+  const protectedAfter = plain((await pool.query(
+    `SELECT order_id::text, claim_state, attempt_count,
+            next_check_at::text, locked_by, lock_token::text,
+            locked_until::text, row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid
+       AND order_id IN ($2::uuid, $3::uuid)
+     ORDER BY order_id`,
+    [ids.organization, ids.missing, ids.stale],
+  )).rows)
+  assert.deepEqual(
+    protectedAfter,
+    protectedBefore,
+    'processing and dead-letter targets are not reset or rewritten',
+  )
+  const tenantAfter = plain((await pool.query(
+    `SELECT claim_state, next_check_at::text, row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid`,
+    [tenantTwo.organization, tenantTwo.order],
+  )).rows[0])
+  assert.deepEqual(tenantAfter, tenantBefore, 'another tenant queue is not touched')
+
+  const rowsAfterFirstSchedule = plain((await pool.query(
+    `SELECT order_id::text, claim_state, next_check_at::text, row_version::text
+     FROM operations_commerce_order_revision_targets
+     WHERE organization_id = $1::uuid
+     ORDER BY order_id`,
+    [ids.organization],
+  )).rows)
+  const replay = plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: scheduleKey,
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  )
+  assert.deepEqual(replay, scheduled, 'the same command key replays exact retained counts')
+  assert.deepEqual(
+    plain((await pool.query(
+      `SELECT order_id::text, claim_state, next_check_at::text, row_version::text
+       FROM operations_commerce_order_revision_targets
+       WHERE organization_id = $1::uuid
+       ORDER BY order_id`,
+      [ids.organization],
+    )).rows),
+    rowsAfterFirstSchedule,
+    'idempotent replay performs no queue writes',
+  )
+  await assertRejectsCode(
+    persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: scheduleKey,
+      excludeOrderGlobalIds: [],
+    }),
+    'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_IDEMPOTENCY_CONFLICT',
+  )
+
+  for (const excludeOrderGlobalIds of [
+    ['gor0009502', 'gor0009502'],
+    ['gcoc0009502'],
+    Array.from({ length: 101 }, (_value, index) => (
+      `gor${(9_600_000 + index).toString()}`
+    )),
+  ]) {
+    await assertRejectsCode(
+      persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+        organizationId: ids.organization,
+        actorEmail,
+        idempotencyKey: `order-revision-schedule-invalid-${excludeOrderGlobalIds.length}`,
+        excludeOrderGlobalIds,
+      }),
+      'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_INVALID',
+    )
+  }
+
+  const alreadyDue = plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'order-revision-schedule-all-0002',
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  )
+  assert.deepEqual(alreadyDue, {
+    totalEligible: 3,
+    scheduled: 0,
+    alreadyScheduled: 3,
+    providerWrites: 0,
+  }, 'a fresh command reports already-due and processing work without rewriting it')
+
+  await pool.query(
+    `UPDATE operations_integration_accounts
+     SET status = 'error'
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+  assert.deepEqual(plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'order-revision-schedule-all-account-fence',
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  ), {
+    totalEligible: 0,
+    scheduled: 0,
+    alreadyScheduled: 0,
+    providerWrites: 0,
+  }, 'an unreadable account cannot enqueue revision reads')
+  await pool.query(
+    `UPDATE operations_integration_accounts
+     SET status = 'active'
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+
+  await pool.query(
+    `UPDATE operations_commerce_credentials
+     SET verification_status = 'failed'
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+  assert.deepEqual(plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'order-revision-schedule-all-credential-fence',
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  ), {
+    totalEligible: 0,
+    scheduled: 0,
+    alreadyScheduled: 0,
+    providerWrites: 0,
+  }, 'an unverified credential cannot enqueue revision reads')
+  await pool.query(
+    `UPDATE operations_commerce_credentials
+     SET verification_status = 'verified'
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+
+  await pool.query(
+    `UPDATE operations_integration_accounts
+     SET commerce_credential_generation = 2
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+  assert.deepEqual(plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'order-revision-schedule-all-generation-fence',
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  ), {
+    totalEligible: 0,
+    scheduled: 0,
+    alreadyScheduled: 0,
+    providerWrites: 0,
+  }, 'a stale credential generation cannot enqueue revision reads')
+  await pool.query('SET session_replication_role = replica')
+  try {
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET commerce_credential_generation = 1
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [ids.organization, ids.integration],
+    )
+  } finally {
+    await pool.query('SET session_replication_role = origin')
+  }
+
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Paused by schedule-all acceptance', updated_at = now()
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.integration],
+  )
+  assert.deepEqual(plain(
+    await persistence.scheduleAllCommerceOrderRevisionRefreshesInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'order-revision-schedule-all-store-sync-fence',
+      excludeOrderGlobalIds: ['gor0009502'],
+    }),
+  ), {
+    totalEligible: 0,
+    scheduled: 0,
+    alreadyScheduled: 0,
+    providerWrites: 0,
+  }, 'a paused Store sync account cannot enqueue revision reads')
+}
+
 async function verifyAcceptance(databaseUrl, ids) {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 })
   try {
@@ -723,6 +1179,12 @@ async function verifyAcceptance(databaseUrl, ids) {
       ids,
       tenantTwo,
       retainedCandidate,
+    )
+    await verifyScheduleAllRevisionRefreshes(
+      pool,
+      persistence,
+      ids,
+      tenantTwo,
     )
   } finally {
     await pool.end()

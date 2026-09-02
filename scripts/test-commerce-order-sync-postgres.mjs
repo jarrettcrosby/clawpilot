@@ -44,12 +44,969 @@ function providerReadIntentFingerprint(input) {
     .digest('hex')
 }
 
+async function verifyHistoryFollowupMigrationSchema(pool) {
+  const schema = (await pool.query(
+    `SELECT
+       EXISTS (
+         SELECT 1
+         FROM schema_migrations
+         WHERE filename =
+           '0343_operations_commerce_order_history_followups.sql'
+           AND checksum =
+             '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628'
+       ) AS migration_attested,
+       (
+         SELECT count(*)::int
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'operations_commerce_order_sync_policies'
+           AND column_name IN (
+             'historical_refresh_requested_at',
+             'historical_refresh_requested_by',
+             'historical_refresh_idempotency_key'
+           )
+       ) AS followup_column_count,
+       EXISTS (
+         SELECT 1
+         FROM pg_constraint
+         WHERE conrelid = to_regclass(
+             'public.operations_commerce_order_sync_policies'
+           )
+           AND conname =
+             'commerce_order_sync_policy_history_request_valid'
+           AND contype = 'c'
+           AND convalidated
+       ) AS followup_constraint_ready,
+       pg_get_expr(followup_index.indpred, followup_index.indrelid)
+         AS followup_predicate,
+       pg_get_indexdef(followup_index.indexrelid)
+         AS followup_index_definition,
+       pg_get_indexdef(stream_head_index.indexrelid)
+         AS stream_head_index_definition
+     FROM pg_index followup_index
+     CROSS JOIN pg_index stream_head_index
+     WHERE followup_index.indexrelid = to_regclass(
+         'public.idx_commerce_order_history_refresh_followups'
+       )
+       AND followup_index.indisvalid
+       AND followup_index.indisready
+       AND stream_head_index.indexrelid = to_regclass(
+         'public.idx_commerce_order_backfill_stream_head'
+       )
+       AND stream_head_index.indisvalid
+       AND stream_head_index.indisready`,
+  )).rows[0]
+  assert.ok(schema, 'History follow-up migration indexes must be queryable')
+  assert.equal(schema.migration_attested, true)
+  assert.equal(schema.followup_column_count, 3)
+  assert.equal(schema.followup_constraint_ready, true)
+  assert.equal(
+    schema.followup_predicate,
+    '(historical_refresh_requested_at IS NOT NULL)',
+  )
+  assert.match(
+    schema.followup_index_definition,
+    /\(historical_refresh_requested_at, organization_id, integration_account_id\)/u,
+  )
+  assert.match(
+    schema.stream_head_index_definition,
+    /\(organization_id, integration_account_id, session_kind, created_at DESC, id DESC\)/u,
+  )
+}
+
+async function verifyAllAccountHistoryRefreshScheduling(pool, persistence) {
+  const organizationId = randomUUID()
+  const pipelineId = randomUUID()
+  await pool.query(
+    `INSERT INTO workspace_organizations (
+       id, name, organization_type, reference_code
+     ) VALUES (
+       $1::uuid, 'All account history refresh tenant', 'member', 'ga0009601'
+     )`,
+    [organizationId],
+  )
+  await pool.query(
+    `INSERT INTO pipeline_spaces (
+       id, name, owner_email, is_default, workspace_organization_id
+     ) VALUES (
+       $1::uuid, 'All account history refresh tenant', $2, true, $3::uuid
+     )`,
+    [pipelineId, actorEmail, organizationId],
+  )
+  await pool.query(
+    `INSERT INTO operations_activation_scopes (
+       organization_id, data_pipeline_id, state, revision
+     ) VALUES ($1::uuid, $2::uuid, 'shadow', 1)`,
+    [organizationId, pipelineId],
+  )
+  await pool.query(
+    `INSERT INTO app_user_organization_memberships (
+       user_email, organization_id, role, status, is_default,
+       created_by, updated_by
+     ) VALUES ($1, $2::uuid, 'owner', 'active', false, $1, $1)`,
+    [actorEmail, organizationId],
+  )
+
+  const fixtures = [
+    {
+      key: 'resume', status: 'active', provider: 'faire',
+      environment: 'sandbox',
+    },
+    {
+      key: 'already', status: 'active', provider: 'faire',
+      environment: 'production',
+    },
+    {
+      key: 'new', status: 'active', provider: 'shopify',
+      environment: 'sandbox',
+    },
+    {
+      key: 'deferred', status: 'active', provider: 'shopify',
+      environment: 'production',
+    },
+  ]
+  for (const [index, fixture] of fixtures.entries()) {
+    fixture.id = randomUUID()
+    fixture.externalId = fixture.provider === 'shopify'
+      ? `gid://shopify/Shop/${9601 + index}`
+      : `brand_history_schedule_${index + 1}`
+    fixture.globalId = (await pool.query(
+      `INSERT INTO operations_integration_accounts (
+         id, organization_id, provider, integration_type, environment,
+         display_name, status, configuration, external_account_id,
+         commerce_credential_generation, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, 'commerce', $4, $5, $6,
+         CASE WHEN $3 = 'shopify'
+           THEN jsonb_build_object(
+             'shopDomain', 'history-schedule-' || $7::text || '.myshopify.com',
+             'grantedScopes', jsonb_build_array('read_orders')
+           )
+           ELSE jsonb_build_object('brandId', $7::text)
+         END,
+         $7, 1, $8, $8
+       ) RETURNING global_id`,
+      [
+        fixture.id,
+        organizationId,
+        fixture.provider,
+        fixture.environment,
+        `History schedule ${fixture.key}`,
+        fixture.status,
+        fixture.externalId,
+        actorEmail,
+      ],
+    )).rows[0].global_id
+    await pool.query(
+      `INSERT INTO operations_commerce_credentials (
+         organization_id, integration_account_id, external_account_id,
+         auth_mode, credential_ciphertext, credential_iv, credential_tag,
+         credential_version, credential_identifier_last_four,
+         verification_status, verified_at, webhook_verification_status,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, decode('01', 'hex'),
+         decode(repeat('00', 12), 'hex'), decode(repeat('00', 16), 'hex'),
+         1, $5, 'verified', now(), $6, $7, $7
+       )`,
+      [
+        organizationId,
+        fixture.id,
+        fixture.externalId,
+        fixture.provider === 'shopify'
+          ? 'shopify_client_credentials'
+          : 'faire_brand_token',
+        String(9601 + index).slice(-4),
+        fixture.provider === 'shopify' ? 'unverified' : 'not_applicable',
+        actorEmail,
+      ],
+    )
+  }
+
+  const resume = fixtures.find((fixture) => fixture.key === 'resume')
+  const already = fixtures.find((fixture) => fixture.key === 'already')
+  const fresh = fixtures.find((fixture) => fixture.key === 'new')
+  const deferred = fixtures.find((fixture) => fixture.key === 'deferred')
+  for (const fixture of [resume, already, deferred]) {
+    await pool.query(
+      `INSERT INTO operations_commerce_order_sync_policies (
+         organization_id, integration_account_id,
+         historical_observation_enabled, continuous_observation_enabled,
+         continuous_transport, provider_event_processor_state, revision,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, true, true, 'scheduled_poll', $4,
+         1, $3, $3
+       )`,
+      [
+        organizationId,
+        fixture.id,
+        actorEmail,
+        fixture.provider === 'shopify' ? 'processor_pending' : 'unsupported',
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_commerce_order_backfill_sessions (
+         organization_id, integration_account_id, provider, session_kind,
+         credential_generation, policy_revision, coverage_basis, status,
+         requested_from, requested_through, max_attempts,
+         idempotency_key, request_hash,
+         query_hash, requested_by, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, $7, $8, 1, 1,
+         $9, 'pending',
+         CASE WHEN $8 = 'continuous_poll'
+           THEN date_trunc('milliseconds', now() - interval '1 hour')
+           ELSE NULL
+         END,
+         date_trunc('milliseconds', now()), 2, $3, $4, $5, $6,
+         'All account history refresh scheduling regression'
+       )`,
+      [
+        organizationId,
+        fixture.id,
+        `history-schedule-${fixture.key}`,
+        evidenceHash(`history-schedule-${fixture.key}-request`),
+        evidenceHash(`history-schedule-${fixture.key}-query`),
+        actorEmail,
+        fixture.provider,
+        fixture.key === 'deferred'
+          ? 'continuous_poll'
+          : 'historical_backfill',
+        fixture.key === 'deferred'
+          ? fixture.provider === 'shopify'
+            ? 'shopify_updated_at_overlap'
+            : 'faire_updated_at_overlap_unfenced'
+          : 'faire_provider_available_orders',
+      ],
+    )
+  }
+  const expiredResumeLockToken = randomUUID()
+  await pool.query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'processing', attempt_count = attempt_count + 1,
+         locked_at = now() - interval '10 minutes',
+         locked_by = 'expired-history-resume-regression',
+         lock_token = $3::uuid,
+         lease_expires_at = now() - interval '5 minutes',
+         started_at = COALESCE(started_at, now() - interval '10 minutes'),
+         last_error_code = NULL,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, resume.id, expiredResumeLockToken],
+  )
+  const deferredLockToken = randomUUID()
+  await pool.query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'processing', attempt_count = attempt_count + 1,
+         locked_at = now(), locked_by = 'deferred-history-regression',
+         lock_token = $3::uuid, lease_expires_at = now() + interval '10 minutes',
+         started_at = COALESCE(started_at, now()), last_error_code = NULL,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, deferred.id, deferredLockToken],
+  )
+  const input = {
+    organizationId,
+    actorEmail,
+    idempotencyKey: 'all-history-refresh-schedule-1',
+  }
+  const scheduled = JSON.parse(JSON.stringify(
+    await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres(input),
+  ))
+  assert.deepEqual(scheduled, {
+    totalEligibleAccounts: 4,
+    scheduledAccounts: 2,
+    alreadyScheduledAccounts: 1,
+    deferredAccounts: 1,
+    newSessions: 1,
+    resumedSessions: 1,
+    newDeferredRefreshes: 1,
+    alreadyDeferredRefreshes: 0,
+    providerWrites: 0,
+  })
+  const resumedLease = (await pool.query(
+    `SELECT status, last_error_code, locked_at, locked_by, lock_token,
+            lease_expires_at, available_at <= now() AS available_now
+     FROM operations_commerce_order_backfill_sessions
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status IN ('pending', 'processing', 'failed')`,
+    [organizationId, resume.id],
+  )).rows[0]
+  assert.deepEqual(resumedLease, {
+    status: 'failed',
+    last_error_code: 'COMMERCE_ORDER_SYNC_LEASE_EXPIRED',
+    locked_at: null,
+    locked_by: null,
+    lock_token: null,
+    lease_expires_at: null,
+    available_now: true,
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres(input),
+    )),
+    scheduled,
+    'An exact retry must replay retained scheduling evidence',
+  )
+  await rejection(
+    persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+      ...input,
+      actorEmail: 'other-manager@example.test',
+    }),
+    (error) => (
+      error?.code
+        === 'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_IDEMPOTENCY_CONFLICT'
+    ),
+  )
+
+  await pool.query(
+    `UPDATE operations_commerce_credentials
+     SET verification_status = 'failed', verified_at = NULL, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+        ...input,
+        idempotencyKey: 'all-history-refresh-credential-fence',
+      }),
+    )),
+    {
+      totalEligibleAccounts: 3,
+      scheduledAccounts: 0,
+      alreadyScheduledAccounts: 2,
+      deferredAccounts: 1,
+      newSessions: 0,
+      resumedSessions: 0,
+      newDeferredRefreshes: 0,
+      alreadyDeferredRefreshes: 1,
+      providerWrites: 0,
+    },
+    'A non-current credential must not be scheduled',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_credentials
+     SET verification_status = 'verified', verified_at = now(),
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id],
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Provider-history refresh store-sync fence regression',
+         updated_by = $3, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id, actorEmail],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+        ...input,
+        idempotencyKey: 'all-history-refresh-store-sync-fence',
+      }),
+    )),
+    {
+      totalEligibleAccounts: 3,
+      scheduledAccounts: 0,
+      alreadyScheduledAccounts: 2,
+      deferredAccounts: 1,
+      newSessions: 0,
+      resumedSessions: 0,
+      newDeferredRefreshes: 0,
+      alreadyDeferredRefreshes: 1,
+      providerWrites: 0,
+    },
+    'A store-sync-paused account must not be scheduled',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'running', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Restore provider-history refresh store-sync regression',
+         updated_by = $3, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id, actorEmail],
+  )
+
+  const sessions = await pool.query(
+    `SELECT account.display_name, session.status,
+            session.available_at <= now() AS available_now,
+            session.reason
+     FROM operations_integration_accounts account
+     LEFT JOIN operations_commerce_order_backfill_sessions session
+       ON session.organization_id = account.organization_id
+      AND session.integration_account_id = account.id
+      AND session.status IN ('pending', 'processing', 'failed')
+     WHERE account.organization_id = $1::uuid
+     ORDER BY account.display_name`,
+    [organizationId],
+  )
+  assert.deepEqual(sessions.rows, [
+    {
+      display_name: 'History schedule already',
+      status: 'pending',
+      available_now: true,
+      reason: 'All account history refresh scheduling regression',
+    },
+    {
+      display_name: 'History schedule deferred',
+      status: 'processing',
+      available_now: true,
+      reason: 'All account history refresh scheduling regression',
+    },
+    {
+      display_name: 'History schedule new',
+      status: 'pending',
+      available_now: true,
+      reason: 'Refresh all provider-authoritative order history',
+    },
+    {
+      display_name: 'History schedule resume',
+      status: 'failed',
+      available_now: true,
+      reason: 'All account history refresh scheduling regression',
+    },
+  ])
+  const policyState = await pool.query(
+    `SELECT account.display_name, policy.revision,
+            policy.historical_observation_enabled,
+            policy.continuous_observation_enabled,
+            policy.continuous_transport,
+            policy.provider_event_processor_state,
+            policy.historical_refresh_requested_at IS NOT NULL
+              AS history_refresh_deferred,
+            policy.historical_refresh_idempotency_key
+     FROM operations_integration_accounts account
+     LEFT JOIN operations_commerce_order_sync_policies policy
+       ON policy.organization_id = account.organization_id
+      AND policy.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+     ORDER BY account.display_name`,
+    [organizationId],
+  )
+  assert.deepEqual(policyState.rows, [
+    {
+      display_name: 'History schedule already',
+      revision: 1,
+      historical_observation_enabled: true,
+      continuous_observation_enabled: true,
+      continuous_transport: 'scheduled_poll',
+      provider_event_processor_state: 'unsupported',
+      history_refresh_deferred: false,
+      historical_refresh_idempotency_key: null,
+    },
+    {
+      display_name: 'History schedule deferred',
+      revision: 1,
+      historical_observation_enabled: true,
+      continuous_observation_enabled: true,
+      continuous_transport: 'scheduled_poll',
+      provider_event_processor_state: 'processor_pending',
+      history_refresh_deferred: true,
+      historical_refresh_idempotency_key: input.idempotencyKey,
+    },
+    {
+      display_name: 'History schedule new',
+      revision: 1,
+      historical_observation_enabled: true,
+      continuous_observation_enabled: true,
+      continuous_transport: 'scheduled_poll',
+      provider_event_processor_state: 'processor_pending',
+      history_refresh_deferred: false,
+      historical_refresh_idempotency_key: null,
+    },
+    {
+      display_name: 'History schedule resume',
+      revision: 1,
+      historical_observation_enabled: true,
+      continuous_observation_enabled: true,
+      continuous_transport: 'scheduled_poll',
+      provider_event_processor_state: 'unsupported',
+      history_refresh_deferred: false,
+      historical_refresh_idempotency_key: null,
+    },
+  ])
+
+  await pool.query(
+    `UPDATE operations_commerce_order_sync_policies
+     SET revision = revision + 1, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+        ...input,
+        idempotencyKey: 'all-history-refresh-stale-replacement',
+      }),
+    )),
+    {
+      totalEligibleAccounts: 4,
+      scheduledAccounts: 1,
+      alreadyScheduledAccounts: 2,
+      deferredAccounts: 1,
+      newSessions: 1,
+      resumedSessions: 0,
+      newDeferredRefreshes: 0,
+      alreadyDeferredRefreshes: 1,
+      providerWrites: 0,
+    },
+    'A stale active session must be terminalized and replaced exactly once',
+  )
+
+  await pool.query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'cancelled',
+         last_error_code = 'COMMERCE_ORDER_SYNC_TEST_SUPERSEDED',
+         cursor_ciphertext = NULL, cursor_iv = NULL, cursor_tag = NULL,
+         cursor_key_id = NULL, cursor_hash = NULL,
+         cursor_encryption_version = NULL, cursor_aad_version = NULL,
+         locked_at = NULL, locked_by = NULL, lock_token = NULL,
+         lease_expires_at = NULL, completed_at = now(), updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status IN ('pending', 'failed')`,
+    [organizationId, fresh.id],
+  )
+  const currentFreshPolicyRevision = Number((await pool.query(
+    `SELECT revision
+     FROM operations_commerce_order_sync_policies
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, fresh.id],
+  )).rows[0]?.revision)
+  assert.ok(currentFreshPolicyRevision > 0)
+  await pool.query(
+    `WITH bounds AS (
+       SELECT date_trunc('milliseconds', clock_timestamp()) AS requested_through
+     )
+     INSERT INTO operations_commerce_order_backfill_sessions (
+       organization_id, integration_account_id, provider, session_kind,
+       credential_generation, policy_revision, coverage_basis, status,
+       requested_from, requested_through, max_attempts, idempotency_key,
+       request_hash, query_hash, requested_by, reason
+     )
+     SELECT $1::uuid, $2::uuid, 'shopify', 'historical_backfill',
+            1, $3, 'shopify_rolling_60_days', 'pending',
+            requested_through - interval '60 days', requested_through, 2,
+            'history-schedule-exhausted', $4, $5, $6,
+            'Retry-exhausted history replacement regression'
+     FROM bounds`,
+    [
+      organizationId,
+      fresh.id,
+      currentFreshPolicyRevision,
+      evidenceHash('history-schedule-exhausted-request'),
+      evidenceHash('history-schedule-exhausted-query'),
+      actorEmail,
+    ],
+  )
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const lockToken = randomUUID()
+    await pool.query(
+      `UPDATE operations_commerce_order_backfill_sessions
+       SET status = 'processing', attempt_count = attempt_count + 1,
+           locked_at = now(), locked_by = 'exhausted-history-regression',
+           lock_token = $3::uuid,
+           lease_expires_at = now() + interval '10 minutes',
+           started_at = COALESCE(started_at, now()), last_error_code = NULL,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND idempotency_key = 'history-schedule-exhausted'`,
+      [organizationId, fresh.id, lockToken],
+    )
+    await pool.query(
+      `UPDATE operations_commerce_order_backfill_sessions
+       SET status = 'failed',
+           last_error_code = 'COMMERCE_ORDER_SYNC_FAILED',
+           available_at = CASE WHEN $3::int = 1
+             THEN now()
+             ELSE now() + interval '1 hour'
+           END,
+           locked_at = NULL, locked_by = NULL, lock_token = NULL,
+           lease_expires_at = NULL, completed_at = NULL, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND idempotency_key = 'history-schedule-exhausted'
+         AND status = 'processing'`,
+      [organizationId, fresh.id, attempt],
+    )
+  }
+  const exhaustedReplacementInput = {
+    ...input,
+    idempotencyKey: 'all-history-refresh-exhausted-replacement',
+  }
+  const exhaustedReplacement = JSON.parse(JSON.stringify(
+    await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres(
+      exhaustedReplacementInput,
+    ),
+  ))
+  assert.deepEqual(exhaustedReplacement, {
+    totalEligibleAccounts: 4,
+    scheduledAccounts: 1,
+    alreadyScheduledAccounts: 2,
+    deferredAccounts: 1,
+    newSessions: 1,
+    resumedSessions: 0,
+    newDeferredRefreshes: 0,
+    alreadyDeferredRefreshes: 1,
+    providerWrites: 0,
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres(
+        exhaustedReplacementInput,
+      ),
+    )),
+    exhaustedReplacement,
+    'An exhausted-session replacement command must replay without duplication',
+  )
+  const recoveredTerminalSessions = await pool.query(
+    `SELECT session.status, session.last_error_code
+     FROM operations_commerce_order_backfill_sessions session
+     WHERE session.organization_id = $1::uuid
+       AND session.integration_account_id = $2::uuid
+       AND session.status IN ('dead', 'blocked')
+     ORDER BY session.created_at, session.id`,
+    [organizationId, fresh.id],
+  )
+  assert.deepEqual(recoveredTerminalSessions.rows, [
+    {
+      status: 'blocked',
+      last_error_code: 'COMMERCE_ORDER_SYNC_AUTHORITY_STALE',
+    },
+    {
+      status: 'dead',
+      last_error_code: 'COMMERCE_ORDER_SYNC_RETRY_EXHAUSTED',
+    },
+  ])
+  const freshActiveSessions = await pool.query(
+    `SELECT count(*)::int AS value
+     FROM operations_commerce_order_backfill_sessions
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status IN ('pending', 'processing', 'failed')`,
+    [organizationId, fresh.id],
+  )
+  assert.equal(freshActiveSessions.rows[0].value, 1)
+
+  await pool.query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'blocked',
+         last_error_code = 'COMMERCE_ORDER_SYNC_AUTHORITY_STALE',
+         cursor_ciphertext = NULL, cursor_iv = NULL, cursor_tag = NULL,
+         cursor_key_id = NULL, cursor_hash = NULL,
+         cursor_encryption_version = NULL, cursor_aad_version = NULL,
+         locked_at = NULL, locked_by = NULL, lock_token = NULL,
+         lease_expires_at = NULL, completed_at = now(), updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND status = 'processing'
+       AND lock_token = $3::uuid`,
+    [organizationId, deferred.id, deferredLockToken],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence
+        .materializeDeferredCommerceOrderHistoryRefreshesInPostgres({
+          limit: 5,
+        }),
+    )),
+    { materialized: 1, skipped: 0, providerWrites: 0 },
+    'A released continuous-poll slot must materialize its durable history intent without another manager command',
+  )
+  const deferredFollowup = await pool.query(
+    `SELECT session.session_kind, session.status,
+            policy.historical_refresh_requested_at,
+            policy.historical_refresh_idempotency_key
+     FROM operations_commerce_order_backfill_sessions session
+     JOIN operations_commerce_order_sync_policies policy
+       ON policy.organization_id = session.organization_id
+      AND policy.integration_account_id = session.integration_account_id
+     WHERE session.organization_id = $1::uuid
+       AND session.integration_account_id = $2::uuid
+     ORDER BY session.created_at, session.id`,
+    [organizationId, deferred.id],
+  )
+  assert.deepEqual(deferredFollowup.rows, [
+    {
+      session_kind: 'continuous_poll',
+      status: 'blocked',
+      historical_refresh_requested_at: null,
+      historical_refresh_idempotency_key: null,
+    },
+    {
+      session_kind: 'historical_backfill',
+      status: 'pending',
+      historical_refresh_requested_at: null,
+      historical_refresh_idempotency_key: null,
+    },
+  ])
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence
+        .materializeDeferredCommerceOrderHistoryRefreshesInPostgres({
+          limit: 5,
+        }),
+    )),
+    { materialized: 0, skipped: 0, providerWrites: 0 },
+    'A consumed history intent must not create a second replacement session',
+  )
+  const receiptCount = await pool.query(
+    `SELECT count(*)::int AS value
+     FROM operations_command_receipts
+     WHERE organization_id = $1::uuid
+       AND command_type = 'operations.commerce_order_history.schedule_all'
+       AND idempotency_key = $2`,
+    [organizationId, input.idempotencyKey],
+  )
+  assert.equal(receiptCount.rows[0].value, 1)
+
+  const retainedScheduleRequestHash = evidenceHash(JSON.stringify({
+    action: 'schedule_all_commerce_order_history_refreshes',
+    organizationId,
+    actorEmail,
+    providerWrites: 0,
+  }))
+  const insertRetainedSchedule = async (idempotencyKey, resultPayload) => {
+    await pool.query(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id, result_payload, completed_at
+       ) VALUES (
+         $1::uuid, 'operations.commerce_order_history.schedule_all', $2, $3,
+         $4, 'succeeded', $5::uuid, $6::jsonb, now()
+       )`,
+      [
+        organizationId,
+        idempotencyKey,
+        retainedScheduleRequestHash,
+        actorEmail,
+        randomUUID(),
+        JSON.stringify(resultPayload),
+      ],
+    )
+  }
+  const legacyReceiptKey = 'all-history-refresh-legacy-receipt'
+  await insertRetainedSchedule(legacyReceiptKey, {
+    totalEligibleAccounts: 4,
+    scheduledAccounts: 2,
+    alreadyScheduledAccounts: 2,
+    newSessions: 1,
+    resumedSessions: 1,
+    providerWrites: 0,
+  })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+        ...input,
+        idempotencyKey: legacyReceiptKey,
+      }),
+    )),
+    {
+      totalEligibleAccounts: 4,
+      scheduledAccounts: 2,
+      alreadyScheduledAccounts: 2,
+      deferredAccounts: 0,
+      newSessions: 1,
+      resumedSessions: 1,
+      newDeferredRefreshes: 0,
+      alreadyDeferredRefreshes: 0,
+      providerWrites: 0,
+    },
+    'A retained pre-follow-up result must replay with truthful zero deferred counts',
+  )
+  const partialReceiptKey = 'all-history-refresh-partial-receipt'
+  await insertRetainedSchedule(partialReceiptKey, {
+    totalEligibleAccounts: 1,
+    scheduledAccounts: 0,
+    alreadyScheduledAccounts: 0,
+    deferredAccounts: 1,
+    newSessions: 0,
+    resumedSessions: 0,
+    alreadyDeferredRefreshes: 1,
+    providerWrites: 0,
+  })
+  await rejection(
+    persistence.scheduleAllCommerceOrderHistoryRefreshesInPostgres({
+      ...input,
+      idempotencyKey: partialReceiptKey,
+    }),
+    (error) => (
+      error?.code === 'COMMERCE_ORDER_HISTORY_SCHEDULE_ALL_RESULT_INVALID'
+    ),
+  )
+}
+
+async function verifyCurrentOrderHistoryDeadHealth(
+  pool,
+  persistence,
+  organizationId,
+  integrationAccountId,
+) {
+  const baseline = await persistence.readCommerceOrderSyncHealthFromPostgres()
+  const policyRevision = Number((await pool.query(
+    `SELECT revision
+     FROM operations_commerce_order_sync_policies
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, integrationAccountId],
+  )).rows[0]?.revision)
+  assert.ok(policyRevision > 0)
+
+  const insertSession = async (sessionKind, key) => {
+    const historical = sessionKind === 'historical_backfill'
+    return (await pool.query(
+      `INSERT INTO operations_commerce_order_backfill_sessions (
+         organization_id, integration_account_id, provider, session_kind,
+         credential_generation, policy_revision, coverage_basis, status,
+         requested_from, requested_through, idempotency_key,
+         request_hash, query_hash, requested_by, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, 'faire', $3, 1, $4, $5, 'pending',
+         CASE WHEN $3 = 'continuous_poll'
+           THEN clock_timestamp() - interval '5 minutes'
+           ELSE NULL
+         END,
+         clock_timestamp(), $6, $7, $8, $9,
+         'Current versus historical dead-session health regression'
+       ) RETURNING id::text`,
+      [
+        organizationId,
+        integrationAccountId,
+        sessionKind,
+        policyRevision,
+        historical
+          ? 'faire_provider_available_orders'
+          : 'faire_updated_at_overlap_unfenced',
+        `dead-health-${key}`,
+        evidenceHash(`dead-health-request-${key}`),
+        evidenceHash(`dead-health-query-${key}`),
+        actorEmail,
+      ],
+    )).rows[0].id
+  }
+  const terminalize = async (id, status) => {
+    await pool.query(
+      `UPDATE operations_commerce_order_backfill_sessions
+       SET status = $3,
+           last_error_code = $4,
+           completed_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        organizationId,
+        id,
+        status,
+        status === 'dead'
+          ? 'COMMERCE_ORDER_SYNC_TEST_TERMINAL'
+          : 'COMMERCE_ORDER_SYNC_TEST_SUPERSEDED',
+      ],
+    )
+  }
+
+  const currentDeadId = await insertSession(
+    'historical_backfill',
+    'current-historical',
+  )
+  await terminalize(currentDeadId, 'dead')
+  const currentDead = await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(currentDead.dead, baseline.dead + 1)
+  assert.equal(currentDead.historicalDead, baseline.historicalDead)
+
+  const otherStreamId = await insertSession(
+    'continuous_poll',
+    'different-stream',
+  )
+  const differentStream =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(
+    differentStream.dead,
+    baseline.dead + 1,
+    'A newer session in another session kind must not supersede a dead stream',
+  )
+  await terminalize(otherStreamId, 'cancelled')
+
+  const recoveredStreamId = await insertSession(
+    'historical_backfill',
+    'recovered-stream',
+  )
+  const recoveredStream =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(recoveredStream.dead, baseline.dead)
+  assert.equal(recoveredStream.historicalDead, baseline.historicalDead + 1)
+  await terminalize(recoveredStreamId, 'cancelled')
+
+  const staleAuthorityId = await insertSession(
+    'continuous_poll',
+    'stale-authority',
+  )
+  await terminalize(staleAuthorityId, 'dead')
+  const currentAuthority =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(currentAuthority.dead, baseline.dead + 1)
+  assert.equal(currentAuthority.historicalDead, baseline.historicalDead + 1)
+
+  const currentBlockedId = await insertSession(
+    'historical_backfill',
+    'current-blocked',
+  )
+  await terminalize(currentBlockedId, 'blocked')
+  const currentBlocked =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(currentBlocked.blocked, baseline.blocked + 1)
+  assert.equal(
+    currentBlocked.historicalBlocked,
+    baseline.historicalBlocked,
+  )
+
+  const recoveredBlockedStreamId = await insertSession(
+    'historical_backfill',
+    'recovered-blocked-stream',
+  )
+  const recoveredBlocked =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(recoveredBlocked.blocked, baseline.blocked)
+  assert.equal(
+    recoveredBlocked.historicalBlocked,
+    baseline.historicalBlocked + 1,
+  )
+  await terminalize(recoveredBlockedStreamId, 'cancelled')
+
+  await pool.query(
+    `UPDATE operations_commerce_order_sync_policies
+     SET revision = revision + 1, updated_by = $3, updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [organizationId, integrationAccountId, actorEmail],
+  )
+  const staleAuthority =
+    await persistence.readCommerceOrderSyncHealthFromPostgres()
+  assert.equal(staleAuthority.dead, baseline.dead)
+  assert.equal(staleAuthority.historicalDead, baseline.historicalDead + 2)
+}
+
 async function verify(databaseUrl, ids) {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 })
   const accountTwo = randomUUID()
   const lockOne = randomUUID()
   const lockTwo = randomUUID()
   try {
+    await verifyHistoryFollowupMigrationSchema(pool)
     await pool.query(
       `INSERT INTO app_user_organization_memberships (
          user_email, organization_id, role, status, is_default,
@@ -96,7 +1053,7 @@ async function verify(databaseUrl, ids) {
        ) VALUES
          ($1::uuid, $2::uuid, true, true, 'scheduled_poll',
           'processor_pending', 1, $4, $4),
-         ($1::uuid, $3::uuid, false, true, 'scheduled_poll',
+         ($1::uuid, $3::uuid, true, true, 'scheduled_poll',
           'processor_pending', 1, $4, $4)`,
       [ids.organization, ids.integration, accountTwo, actorEmail],
     )
@@ -260,7 +1217,6 @@ async function verify(databaseUrl, ids) {
         'e'.repeat(64), actorEmail,
       ],
     )).rows[0]
-
     const adapter = postgresAdapter(pool)
     const persistence = loadTypeScriptModule(
       'app_src/lib/persistence/commerceOrderSync.ts',
@@ -366,11 +1322,22 @@ async function verify(databaseUrl, ids) {
         externalProductId: 'gid://shopify/Product/manual-9402',
         externalVariantId: 'gid://shopify/ProductVariant/manual-9402',
         sku: 'MANUAL-9402',
+        titleSnapshot: 'Original Shopify item',
+        variantTitleSnapshot: 'Large',
+        vendorSnapshot: 'Provider vendor',
         originalQuantity: 7,
         currentQuantity: 5,
         fulfilledQuantity: 5,
         unfulfilledQuantity: 0,
         requiresShipping: true,
+        unitPriceCurrency: 'USD',
+        unitPriceMinor: 1100,
+        subtotalCurrency: 'USD',
+        subtotalMinor: 7700,
+        discountCurrency: 'USD',
+        discountMinor: 600,
+        taxCurrency: 'USD',
+        taxMinor: 300,
       }],
       events: [{
         externalEventId: 'manual-9402-fulfillment',
@@ -461,6 +1428,7 @@ async function verify(databaseUrl, ids) {
         organizationId: ids.organization,
         integrationAccountId: ids.integration,
         accountGlobalId: 'gia0009301',
+        provider: 'shopify',
         credentialGeneration: 1,
         externalOrderId: manualExternalOrderId,
         providerReadLease: {
@@ -491,10 +1459,21 @@ async function verify(databaseUrl, ids) {
               observation.canonical_return_state,
               (SELECT jsonb_agg(jsonb_build_object(
                  'externalLineId', line.external_line_id,
+                 'title', line.title_snapshot,
+                 'variantTitle', line.variant_title_snapshot,
+                 'vendor', line.vendor_snapshot,
                  'originalQuantity', line.original_quantity,
                  'currentQuantity', line.current_quantity,
                  'fulfilledQuantity', line.fulfilled_quantity,
-                 'unfulfilledQuantity', line.unfulfilled_quantity
+                 'unfulfilledQuantity', line.unfulfilled_quantity,
+                 'unitPriceCurrency', line.unit_price_currency,
+                 'unitPriceMinor', line.unit_price_minor,
+                 'subtotalCurrency', line.subtotal_currency,
+                 'subtotalMinor', line.subtotal_minor,
+                 'discountCurrency', line.discount_currency,
+                 'discountMinor', line.discount_minor,
+                 'taxCurrency', line.tax_currency,
+                 'taxMinor', line.tax_minor
                ) ORDER BY line.external_line_id)
                FROM operations_commerce_order_observation_lines line
                WHERE line.organization_id = observation.organization_id
@@ -525,10 +1504,21 @@ async function verify(databaseUrl, ids) {
       canonical_return_state: 'returned',
       lines: [{
         externalLineId: 'gid://shopify/LineItem/manual-9402-1',
+        title: 'Original Shopify item',
+        variantTitle: 'Large',
+        vendor: 'Provider vendor',
         originalQuantity: 7,
         currentQuantity: 5,
         fulfilledQuantity: 5,
         unfulfilledQuantity: 0,
+        unitPriceCurrency: 'USD',
+        unitPriceMinor: 1100,
+        subtotalCurrency: 'USD',
+        subtotalMinor: 7700,
+        discountCurrency: 'USD',
+        discountMinor: 600,
+        taxCurrency: 'USD',
+        taxMinor: 300,
       }],
       events: [{
         kind: 'fulfillment_updated',
@@ -575,6 +1565,7 @@ async function verify(databaseUrl, ids) {
         await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
           organizationId: ids.organization,
           integrationAccountId: ids.integration,
+          provider: 'shopify',
           externalOrderId: manualExternalOrderId,
           intentKey: manualIntentKey,
         }),
@@ -590,21 +1581,25 @@ async function verify(databaseUrl, ids) {
     const isolatedReplayInputs = [{
       organizationId: randomUUID(),
       integrationAccountId: ids.integration,
+      provider: 'shopify',
       externalOrderId: manualExternalOrderId,
       intentKey: manualIntentKey,
     }, {
       organizationId: ids.organization,
       integrationAccountId: accountTwo,
+      provider: 'shopify',
       externalOrderId: manualExternalOrderId,
       intentKey: manualIntentKey,
     }, {
       organizationId: ids.organization,
       integrationAccountId: ids.integration,
+      provider: 'shopify',
       externalOrderId: `${manualExternalOrderId}-different`,
       intentKey: manualIntentKey,
     }, {
       organizationId: ids.organization,
       integrationAccountId: ids.integration,
+      provider: 'shopify',
       externalOrderId: manualExternalOrderId,
       intentKey: `${manualIntentKey}-different`,
     }]
@@ -617,11 +1612,14 @@ async function verify(databaseUrl, ids) {
         'Exact-read replay must remain isolated by organization, account, order, and intent',
       )
     }
-    const createAdditionalManualLease = async (intentKey) => {
+    const createAdditionalManualLease = async (
+      intentKey,
+      integrationAccountId = ids.integration,
+    ) => {
       const id = randomUUID()
       const intentFingerprintSha256 = providerReadIntentFingerprint({
         organizationId: ids.organization,
-        integrationAccountId: ids.integration,
+        integrationAccountId,
         intentKey,
       })
       const lease = (await pool.query(
@@ -650,7 +1648,7 @@ async function verify(databaseUrl, ids) {
         [
           id,
           ids.organization,
-          ids.integration,
+          integrationAccountId,
           intentFingerprintSha256,
           actorEmail,
         ],
@@ -666,6 +1664,7 @@ async function verify(databaseUrl, ids) {
         organizationId: ids.organization,
         integrationAccountId: ids.integration,
         accountGlobalId: 'gia0009301',
+        provider: 'shopify',
         credentialGeneration: 1,
         externalOrderId: manualExternalOrderId,
         providerReadLease: {
@@ -692,6 +1691,7 @@ async function verify(databaseUrl, ids) {
         await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
           organizationId: ids.organization,
           integrationAccountId: ids.integration,
+          provider: 'shopify',
           externalOrderId: manualExternalOrderId,
           intentKey: sameFactLease.intentKey,
         }),
@@ -717,6 +1717,7 @@ async function verify(databaseUrl, ids) {
         organizationId: ids.organization,
         integrationAccountId: ids.integration,
         accountGlobalId: 'gia0009301',
+        provider: 'shopify',
         credentialGeneration: 1,
         externalOrderId: manualExternalOrderId,
         providerReadLease: {
@@ -765,12 +1766,168 @@ async function verify(databaseUrl, ids) {
       [manualLease.id, sameFactLease.id, delayedOlderLease.id].sort(),
       'Every exact command must retain one independently replayable observation',
     )
+    const faireManualIntentKey = 'manual-exact-faire-order-history'
+    const faireManualLease = await createAdditionalManualLease(
+      faireManualIntentKey,
+      accountTwo,
+    )
+    const faireExternalOrderId = 'faire-order-manual-9402'
+    const faireTrackingNumber = 'FAIRE-TRACKING-9402'
+    const faireObservation = {
+      observationKind: 'manual_exact_read',
+      externalOrderId: faireExternalOrderId,
+      orderNumber: 'FAIRE-9402',
+      sourceRevision: manualObservedAt,
+      sourceHash: evidenceHash('manual-exact-faire-history-observation'),
+      canonicalLifecycleState: 'closed',
+      canonicalPaymentState: 'paid',
+      canonicalFulfillmentState: 'fulfilled',
+      canonicalReturnState: 'none',
+      currency: 'USD',
+      providerTotalMinor: 4200,
+      providerCreatedAt: manualObservedAt,
+      providerUpdatedAt: manualObservedAt,
+      providerClosedAt: manualObservedAt,
+      observedAt: manualObservedAt,
+      providerReadCount: 2,
+      lines: [{
+        externalLineId: 'faire-line-manual-9402-1',
+        externalProductId: 'faire-product-manual-9402',
+        externalVariantId: 'faire-variant-manual-9402',
+        sku: null,
+        titleSnapshot: 'Replacement Faire item',
+        variantTitleSnapshot: 'Blue case',
+        vendorSnapshot: 'Faire brand',
+        originalQuantity: 1,
+        currentQuantity: 1,
+        fulfilledQuantity: 1,
+        unfulfilledQuantity: 0,
+        requiresShipping: true,
+        unitPriceCurrency: 'USD',
+        unitPriceMinor: 4200,
+        subtotalCurrency: 'USD',
+        subtotalMinor: 4200,
+        discountCurrency: 'USD',
+        discountMinor: 0,
+        taxCurrency: 'USD',
+        taxMinor: 210,
+      }],
+      events: [{
+        externalEventId: 'faire-manual-9402-tracking',
+        externalSubjectId: 'faire-manual-9402-shipment',
+        eventKind: 'tracking_updated',
+        eventStatus: 'delivered',
+        inventoryEffectKind: 'none',
+        attributionSource: 'provider_system',
+        trackingCarrier: 'UPS',
+        trackingNumber: faireTrackingNumber,
+        occurredAt: manualObservedAt,
+      }],
+    }
+    const faireManualAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: accountTwo,
+        accountGlobalId: accountTwoRow.global_id,
+        provider: 'faire',
+        credentialGeneration: 1,
+        externalOrderId: faireExternalOrderId,
+        providerReadLease: {
+          id: faireManualLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256:
+            faireManualLease.intentFingerprintSha256,
+          controlRevision: faireManualLease.control_revision,
+          activationRevision: faireManualLease.activation_revision,
+          expiresAt: faireManualLease.expires_at.toISOString(),
+        },
+        observation: faireObservation,
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(faireManualAppend)), {
+      appended: 1,
+      preserved: 0,
+      linesAppended: 1,
+      eventsAppended: 1,
+      providerReads: 2,
+      providerWrites: 0,
+    })
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+          organizationId: ids.organization,
+          integrationAccountId: accountTwo,
+          provider: 'faire',
+          externalOrderId: faireExternalOrderId,
+          intentKey: faireManualIntentKey,
+        }),
+      )),
+      {
+        status: 'captured',
+        code: null,
+        providerReads: 0,
+        providerWrites: 0,
+      },
+      'Faire exact history must replay without a second provider read',
+    )
+    assert.equal(
+      (await pool.query(
+        `SELECT event.tracking_number
+         FROM operations_commerce_order_event_observations event
+         WHERE event.organization_id = $1::uuid
+           AND event.integration_account_id = $2::uuid
+           AND event.provider = 'faire'
+           AND event.external_order_id = $3
+           AND event.event_kind = 'tracking_updated'`,
+        [ids.organization, accountTwo, faireExternalOrderId],
+      )).rows[0]?.tracking_number,
+      faireTrackingNumber,
+      'Faire manual exact history must retain shipment tracking evidence',
+    )
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT sku, title_snapshot, variant_title_snapshot, vendor_snapshot,
+                unit_price_currency, unit_price_minor::text,
+                subtotal_currency, subtotal_minor::text,
+                discount_currency, discount_minor::text,
+                tax_currency, tax_minor::text
+         FROM operations_commerce_order_observation_lines line
+         JOIN operations_commerce_order_observations observation
+           ON observation.organization_id = line.organization_id
+          AND observation.id = line.observation_id
+         WHERE observation.organization_id = $1::uuid
+           AND observation.integration_account_id = $2::uuid
+           AND observation.external_order_id = $3
+           AND observation.observation_kind = 'manual_exact_read'`,
+        [ids.organization, accountTwo, faireExternalOrderId],
+      )).rows[0],
+      {
+        sku: null,
+        title_snapshot: 'Replacement Faire item',
+        variant_title_snapshot: 'Blue case',
+        vendor_snapshot: 'Faire brand',
+        unit_price_currency: 'USD',
+        unit_price_minor: '4200',
+        subtotal_currency: 'USD',
+        subtotal_minor: '4200',
+        discount_currency: 'USD',
+        discount_minor: '0',
+        tax_currency: 'USD',
+        tax_minor: '210',
+      },
+      'Faire exact history retains descriptive and monetary line evidence without requiring a SKU',
+    )
     await pool.query(
       `UPDATE operations_commerce_store_sync_read_leases
        SET released_at = date_trunc('milliseconds', clock_timestamp()),
            release_reason = 'completed'
        WHERE id = ANY($1::uuid[])`,
-      [[manualLease.id, sameFactLease.id, delayedOlderLease.id]],
+      [[
+        manualLease.id,
+        sameFactLease.id,
+        delayedOlderLease.id,
+        faireManualLease.id,
+      ]],
     )
     const laterScheduledObservedAt = new Date(
       new Date(manualObservedAt).getTime() + 60_000,
@@ -1130,6 +2287,45 @@ async function verify(databaseUrl, ids) {
       readAllOrdersScopeObserved: null,
       returnHistoryScopeObserved: null,
     })
+    const faireHistoricalSession = (await pool.query(
+      `INSERT INTO operations_commerce_order_backfill_sessions (
+         organization_id, integration_account_id, provider, session_kind,
+         credential_generation, policy_revision, coverage_basis, status,
+         requested_from, requested_through, idempotency_key,
+         request_hash, query_hash, requested_by, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, 'faire', 'historical_backfill', 1, 1,
+         'faire_provider_available_orders', 'pending', NULL,
+         date_trunc('milliseconds', now()), 'history-faire-null-window',
+         $3, $4, $5, 'Faire unbounded history regression'
+       ) RETURNING id::text`,
+      [
+        ids.organization, accountTwo, '1'.repeat(64),
+        '2'.repeat(64), actorEmail,
+      ],
+    )).rows[0]
+    const faireHistoricalClaims =
+      await persistence.claimCommerceOrderBackfillsInPostgres({
+        workerId: 'faire-null-window-history',
+        limit: 1,
+      })
+    assert.equal(faireHistoricalClaims[0]?.id, faireHistoricalSession.id)
+    const faireHistoricalPage = await persistence
+      .appendCommerceOrderBackfillPageInPostgres({
+        job: faireHistoricalClaims[0],
+        pageNumber: 1,
+        providerRecordsSeen: 0,
+        observations: [],
+        hasNextPage: false,
+        nextProviderCursor: null,
+        readAllOrdersScopeObserved: null,
+        returnHistoryScopeObserved: null,
+      })
+    assert.equal(
+      faireHistoricalPage.status,
+      'succeeded',
+      'Faire historical sessions retain NULL requested-from authority',
+    )
     const pollCadences = (await pool.query(
       `SELECT account.provider,
               extract(epoch FROM (
@@ -1499,7 +2695,7 @@ async function verify(databaseUrl, ids) {
       accountGlobalId: accountTwoRow.global_id,
       limit: 10,
     })
-    assert.equal(page.items.length, 1)
+    assert.equal(page.items.length, 2)
     assert.equal(page.items[0].observationGlobalId, evidenceObservation.global_id)
     assert.equal(page.items[0].orderGlobalId, null)
     assert.equal(page.items[0].orderedQuantity, 3)
@@ -2771,6 +3967,13 @@ async function verify(databaseUrl, ids) {
       1,
     )
     assert.equal(durableTransport.transport, 'mixed')
+    await verifyAllAccountHistoryRefreshScheduling(pool, persistence)
+    await verifyCurrentOrderHistoryDeadHealth(
+      pool,
+      persistence,
+      ids.organization,
+      accountTwo,
+    )
   } finally {
     await pool.end()
   }

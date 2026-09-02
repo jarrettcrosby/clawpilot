@@ -190,6 +190,13 @@ function providerOrderStatus(order: OperationsImportedOrderWorkingCopy) {
   if (['on_hold', 'scheduled'].includes(order.providerState.fulfillment)) {
     return { label: 'On hold', color: 'warning' as const, terminal: false }
   }
+  if (!order.actionAvailable) {
+    return {
+      label: 'Refresh needed',
+      color: 'warning' as const,
+      terminal: false,
+    }
+  }
   return {
     label: order.needsInfo ? 'Needs info' : 'Imported',
     color: order.needsInfo ? 'warning' as const : 'success' as const,
@@ -276,8 +283,9 @@ export default function ImportedOrderWorkingCopyDrawer({
   const draftReadiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
   const currentProviderStatus = order ? providerOrderStatus(order) : null
   const providerTerminal = currentProviderStatus?.terminal === true
+  const editorUnavailable = providerTerminal || order?.actionAvailable === false
   const shipToFieldsDisabled = !order?.resolutionDetailsLoaded
-    || providerTerminal
+    || editorUnavailable
     || !canManage
     || saving
   const trackingHistory = (order?.providerHistory.events || []).filter((event) => (
@@ -467,6 +475,12 @@ export default function ImportedOrderWorkingCopyDrawer({
               {currentProviderStatus?.label.toLowerCase()}. It remains visible
               for provider history and is not eligible for a new ClawPilot
               fulfillment.
+            </Alert>
+          )}
+          {order && !providerTerminal && !order.actionAvailable && (
+            <Alert severity="info">
+              This retained provider copy is no longer eligible for edits or
+              import. Refresh it to fetch a current provider revision.
             </Alert>
           )}
           {order && !order.resolutionDetailsLoaded && (
@@ -742,7 +756,7 @@ export default function ImportedOrderWorkingCopyDrawer({
               onChange={(event) => setCustomerGlobalId(event.target.value)}
               disabled={
                 !order?.resolutionDetailsLoaded
-                || providerTerminal
+                || editorUnavailable
                 || !canManage
                 || saving
                 || !order.customer.options.length
@@ -771,7 +785,7 @@ export default function ImportedOrderWorkingCopyDrawer({
               onChange={(event) => setRequestedDeliveryAt(event.target.value)}
               disabled={
                 !order?.resolutionDetailsLoaded
-                || providerTerminal
+                || editorUnavailable
                 || !canManage
                 || saving
               }
@@ -872,7 +886,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                         ))}
                       </Stack>
                     </Box>
-                    {!providerTerminal && (
+                    {!editorUnavailable && (
                       <>
                         <TextField
                           select
@@ -885,7 +899,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                           })}
                           disabled={
                             !order?.resolutionDetailsLoaded
-                            || providerTerminal
+                            || editorUnavailable
                             || !canManage
                             || saving
                             || !order.productOptions.length
@@ -911,7 +925,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                           })}
                           disabled={
                             !order?.resolutionDetailsLoaded
-                            || providerTerminal
+                            || editorUnavailable
                             || !canManage
                             || saving
                             || !draft?.productGlobalId
@@ -940,7 +954,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                             })}
                             disabled={
                               !order?.resolutionDetailsLoaded
-                              || providerTerminal
+                              || editorUnavailable
                               || !canManage
                               || saving
                               || !draft?.productGlobalId
@@ -1105,7 +1119,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 !order
                 || !order.resolutionDetailsLoaded
                 || !canManage
-                || providerTerminal
+                || editorUnavailable
                 || saving
                 || changed
                 || !savedDraftComplete
@@ -1123,7 +1137,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 !order
                 || !order.resolutionDetailsLoaded
                 || !canManage
-                || providerTerminal
+                || editorUnavailable
                 || saving
                 || !changed
                 || invalidLinePrices.size > 0

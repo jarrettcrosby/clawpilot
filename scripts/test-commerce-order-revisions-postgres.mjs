@@ -232,6 +232,11 @@ export function loadTypeScriptModule(path, mocks = {}) {
           'app_src/lib/operations/commerceStoreSync.ts',
         )
       }
+      if (specifier === '@/lib/operations/orderListQuery') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/orderListQuery.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceStoreSync') {
         return {
           async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},

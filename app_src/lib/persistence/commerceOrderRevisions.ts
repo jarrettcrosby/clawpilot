@@ -214,6 +214,13 @@ export type CommerceOrderRevisionRefreshCandidate = Readonly<{
   totalEligible: number
 }>
 
+export type CommerceOrderRevisionScheduleAllResult = Readonly<{
+  totalEligible: number
+  scheduled: number
+  alreadyScheduled: number
+  providerWrites: 0
+}>
+
 export type CommerceOrderStatusSyncBatchPreparation = Readonly<{
   receiptId: string
   attemptToken: string | null
@@ -526,6 +533,37 @@ function validatedRefreshCandidate(
   })
 }
 
+function validatedScheduleAllResult(
+  value: unknown,
+): CommerceOrderRevisionScheduleAllResult {
+  if (
+    !plainRecord(value)
+    || !exactKeys(value, [
+      'alreadyScheduled',
+      'providerWrites',
+      'scheduled',
+      'totalEligible',
+    ])
+    || !nonnegativeSafeInteger(value.totalEligible)
+    || !nonnegativeSafeInteger(value.scheduled)
+    || !nonnegativeSafeInteger(value.alreadyScheduled)
+    || value.totalEligible !== Number(value.scheduled) + Number(value.alreadyScheduled)
+    || value.providerWrites !== 0
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_RESULT_INVALID',
+      'The retained all-order reconciliation schedule result is invalid',
+      500,
+    )
+  }
+  return Object.freeze({
+    totalEligible: Number(value.totalEligible),
+    scheduled: Number(value.scheduled),
+    alreadyScheduled: Number(value.alreadyScheduled),
+    providerWrites: 0,
+  })
+}
+
 function validatedManagerRefreshReplayCapture(
   value: unknown,
   expected: {
@@ -597,6 +635,7 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
     organizationId: string
     limit?: number
     excludeOrderGlobalIds?: readonly string[]
+    orderGlobalIds?: readonly string[]
   },
 ): Promise<CommerceOrderRevisionRefreshCandidate[]> {
   if (!UUID.test(input.organizationId)) {
@@ -612,11 +651,21 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
     10,
   )
   const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
+  const orderGlobalIds = input.orderGlobalIds
   if (
     !Array.isArray(excludeOrderGlobalIds)
     || excludeOrderGlobalIds.length > 500
     || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
     || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+    || (
+      orderGlobalIds !== undefined
+      && (
+        !Array.isArray(orderGlobalIds)
+        || orderGlobalIds.length > 100
+        || new Set(orderGlobalIds).size !== orderGlobalIds.length
+        || orderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+      )
+    )
   ) {
     throw new CommerceOrderRevisionDispositionError(
       'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
@@ -646,6 +695,7 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
       AND target.order_id = order_row.id
      WHERE order_row.organization_id = $1::uuid
        AND NOT (order_row.global_id = ANY($3::text[]))
+       AND ($4::text[] IS NULL OR order_row.global_id = ANY($4::text[]))
        AND order_row.archived_at IS NULL
        AND order_row.status NOT IN ('shipped', 'cancelled')
        AND order_row.source_provider IN ('shopify', 'faire')
@@ -675,7 +725,7 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
               order_row.updated_at ASC,
               order_row.id ASC
      LIMIT $2`,
-    [input.organizationId, limit, excludeOrderGlobalIds],
+    [input.organizationId, limit, excludeOrderGlobalIds, orderGlobalIds ?? null],
   )
   return result.rows.map((row) => validatedRefreshCandidate({
       orderGlobalId: row.order_global_id,
@@ -683,6 +733,236 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
       provider: row.provider,
       totalEligible: Number(row.total_eligible),
     }))
+}
+
+/**
+ * Makes every safely claimable canonical commerce order in one organization
+ * due for the existing revision worker. This command performs no provider I/O.
+ *
+ * Caller-supplied visible orders are excluded after their immediate exact
+ * refresh so this bulk command cannot duplicate those provider reads.
+ * Processing targets remain in flight and count as already scheduled.
+ * Dead-letter, exhausted, corrupt, terminal, archived, paused, unreadable, or
+ * stale-credential orders are excluded from totalEligible and never revived.
+ */
+export async function scheduleAllCommerceOrderRevisionRefreshesInPostgres(
+  input: {
+    organizationId: string
+    actorEmail: string
+    idempotencyKey: string
+    excludeOrderGlobalIds?: readonly string[]
+  },
+): Promise<CommerceOrderRevisionScheduleAllResult> {
+  let actorEmail = ''
+  try {
+    actorEmail = boundedText(input.actorEmail, 'Actor email', 320)
+  } catch {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_INVALID',
+      'All-order reconciliation schedule input is invalid',
+      400,
+    )
+  }
+  const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
+  if (
+    !UUID.test(input.organizationId)
+    || !IDEMPOTENCY_KEY.test(input.idempotencyKey)
+    || !Array.isArray(excludeOrderGlobalIds)
+    || excludeOrderGlobalIds.length > 100
+    || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
+    || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_INVALID',
+      'All-order reconciliation schedule input is invalid',
+      400,
+    )
+  }
+  const normalizedExcludedOrderGlobalIds = [...excludeOrderGlobalIds].sort()
+  const requestHash = createHash('sha256').update(canonicalJson({
+    action: 'schedule_all_commerce_order_revision_refreshes',
+    organizationId: input.organizationId,
+    actorEmail,
+    excludeOrderGlobalIds: normalizedExcludedOrderGlobalIds,
+    providerWrites: 0,
+  })).digest('hex')
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-order-revision-schedule-all:${input.organizationId}`,
+    )
+    const existing = await client.query<RevisionCommandReceiptRow>(
+      `SELECT id::text, request_hash, status, correlation_id::text,
+              result_payload, error_code, error_message, updated_at
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'operations.commerce_order_revision.schedule_all'
+         AND idempotency_key = $2
+       FOR UPDATE`,
+      [input.organizationId, input.idempotencyKey],
+    )
+    const receipt = existing.rows[0] || null
+    if (receipt && receipt.request_hash !== requestHash) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_IDEMPOTENCY_CONFLICT',
+        'This Idempotency-Key was already used for a different all-order reconciliation schedule',
+      )
+    }
+    if (receipt?.status === 'succeeded') {
+      return validatedScheduleAllResult(receipt.result_payload)
+    }
+    if (receipt?.status === 'processing') {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_IN_PROGRESS',
+        'This exact all-order reconciliation schedule is already in progress',
+      )
+    }
+    if (receipt?.status === 'failed') {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_PREVIOUSLY_FAILED',
+        'This all-order reconciliation schedule previously failed. Retry with a new Idempotency-Key.',
+        409,
+        true,
+      )
+    }
+
+    const counts = await client.query<{
+      total_eligible: string
+      scheduled: string
+      already_scheduled: string
+    }>(
+      `WITH eligible_orders AS MATERIALIZED (
+         SELECT order_row.id AS order_id,
+                order_row.organization_id,
+                order_row.integration_account_id,
+                order_row.source_provider AS provider,
+                CASE
+                  WHEN COALESCE(order_row.source_payload->>'sourceHash', '')
+                       ~ '^[a-f0-9]{64}$'
+                  THEN order_row.source_payload->>'sourceHash'
+                  ELSE encode(
+                    digest(convert_to(order_row.source_payload::text, 'UTF8'), 'sha256'),
+                    'hex'
+                  )
+                END AS accepted_source_hash
+         FROM operations_orders order_row
+         JOIN operations_integration_accounts account
+           ON account.organization_id = order_row.organization_id
+          AND account.id = order_row.integration_account_id
+         JOIN operations_commerce_credentials credential
+           ON credential.organization_id = account.organization_id
+          AND credential.integration_account_id = account.id
+         WHERE order_row.organization_id = $1::uuid
+           AND NOT (order_row.global_id = ANY($2::text[]))
+           AND order_row.archived_at IS NULL
+           AND order_row.status NOT IN ('shipped', 'cancelled')
+           AND order_row.source_provider IN ('shopify', 'faire')
+           AND account.integration_type = 'commerce'
+           AND account.provider = order_row.source_provider
+           AND account.external_account_id IS NOT NULL
+           AND ${READABLE_ACCOUNT_SQL}
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND credential.verification_status = 'verified'
+           AND credential.credential_version = account.commerce_credential_generation
+           AND credential.external_account_id = account.external_account_id
+       ), target_states AS MATERIALIZED (
+         SELECT eligible.*,
+                target.id AS target_id,
+                target.integration_account_id AS target_integration_account_id,
+                target.provider AS target_provider,
+                target.claim_state,
+                target.attempt_count,
+                target.next_check_at
+         FROM eligible_orders eligible
+         LEFT JOIN operations_commerce_order_revision_targets target
+           ON target.organization_id = eligible.organization_id
+          AND target.order_id = eligible.order_id
+       ), inserted AS (
+         INSERT INTO operations_commerce_order_revision_targets (
+           organization_id, integration_account_id, order_id, provider,
+           accepted_source_hash, claim_state, attempt_count, next_check_at
+         )
+         SELECT organization_id, integration_account_id, order_id, provider,
+                accepted_source_hash, 'pending', 0, now()
+         FROM target_states
+         WHERE target_id IS NULL
+         ON CONFLICT (organization_id, order_id) DO NOTHING
+         RETURNING order_id
+       ), rescheduled AS (
+         UPDATE operations_commerce_order_revision_targets target
+         SET next_check_at = now(),
+             row_version = target.row_version + 1,
+             updated_at = now()
+         FROM target_states state
+         WHERE target.organization_id = state.organization_id
+           AND target.id = state.target_id
+           AND state.target_integration_account_id = state.integration_account_id
+           AND state.target_provider = state.provider
+           AND state.claim_state IN ('pending', 'ready', 'failed')
+           AND state.attempt_count < 8
+           AND state.next_check_at > now()
+         RETURNING target.order_id
+       ), already_scheduled AS (
+         SELECT count(*)::bigint AS value
+         FROM target_states state
+         WHERE state.target_id IS NOT NULL
+           AND state.target_integration_account_id = state.integration_account_id
+           AND state.target_provider = state.provider
+           AND (
+             state.claim_state = 'processing'
+             OR (
+               state.claim_state IN ('pending', 'ready', 'failed')
+               AND state.attempt_count < 8
+               AND state.next_check_at <= now()
+             )
+           )
+       ), scheduled AS (
+         SELECT
+           (SELECT count(*) FROM inserted)
+           + (SELECT count(*) FROM rescheduled) AS value
+       )
+       SELECT
+         (scheduled.value + already_scheduled.value)::text AS total_eligible,
+         scheduled.value::text AS scheduled,
+         already_scheduled.value::text AS already_scheduled
+       FROM scheduled, already_scheduled`,
+      [input.organizationId, normalizedExcludedOrderGlobalIds],
+    )
+    const row = counts.rows[0]
+    const result = validatedScheduleAllResult({
+      totalEligible: Number(row?.total_eligible),
+      scheduled: Number(row?.scheduled),
+      alreadyScheduled: Number(row?.already_scheduled),
+      providerWrites: 0,
+    })
+    const created = await client.query<{ id: string }>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id, result_payload, completed_at
+       ) VALUES (
+         $1::uuid, 'operations.commerce_order_revision.schedule_all', $2, $3,
+         $4, 'succeeded', $5::uuid, $6::jsonb, now()
+       )
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        input.idempotencyKey,
+        requestHash,
+        actorEmail,
+        randomUUID(),
+        JSON.stringify(result),
+      ],
+    )
+    if (created.rowCount !== 1) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_SCHEDULE_ALL_NOT_RETAINED',
+        'The all-order reconciliation schedule was not retained',
+        500,
+      )
+    }
+    return result
+  })
 }
 
 /**
@@ -697,6 +977,7 @@ export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
   batchLimit: number
   candidates: readonly CommerceOrderRevisionRefreshCandidate[]
   excludeOrderGlobalIds?: readonly string[]
+  orderGlobalIds?: readonly string[]
 }): Promise<CommerceOrderStatusSyncBatchPreparation> {
   let actorEmail = ''
   try {
@@ -727,11 +1008,21 @@ export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
     input.batchLimit,
   )
   const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
+  const orderGlobalIds = input.orderGlobalIds
   if (
     !Array.isArray(excludeOrderGlobalIds)
     || excludeOrderGlobalIds.length > 500
     || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
     || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+    || (
+      orderGlobalIds !== undefined
+      && (
+        !Array.isArray(orderGlobalIds)
+        || orderGlobalIds.length > 100
+        || new Set(orderGlobalIds).size !== orderGlobalIds.length
+        || orderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+      )
+    )
   ) {
     throw new CommerceOrderRevisionDispositionError(
       'COMMERCE_ORDER_STATUS_SYNC_INVALID',
@@ -740,6 +1031,9 @@ export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
     )
   }
   const normalizedExcludedOrderGlobalIds = [...excludeOrderGlobalIds].sort()
+  const normalizedOrderGlobalIds = orderGlobalIds === undefined
+    ? undefined
+    : [...orderGlobalIds].sort()
   const totalEligible = candidates[0]?.totalEligible || 0
   const requestHash = createHash('sha256').update(canonicalJson({
     action: 'sync_order_status_from_provider',
@@ -747,6 +1041,9 @@ export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
     actorEmail,
     batchLimit: input.batchLimit,
     excludeOrderGlobalIds: normalizedExcludedOrderGlobalIds,
+    ...(normalizedOrderGlobalIds === undefined
+      ? {}
+      : { orderGlobalIds: normalizedOrderGlobalIds }),
     providerWrites: 0,
     canonicalOrderWrites: 0,
   })).digest('hex')
@@ -3283,6 +3580,7 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
       order_global_id: string
       order_row_version: string
       order_status: string
+      order_requested_delivery_at: Date | null
       previous_source_hash: string
       pipeline_id: string
       integration_account_id: string
@@ -3317,6 +3615,7 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
               order_row.global_id AS order_global_id,
               order_row.row_version::text AS order_row_version,
               order_row.status AS order_status,
+              order_row.requested_delivery_at AS order_requested_delivery_at,
               CASE WHEN COALESCE(order_row.source_payload->>'sourceHash', '')
                          ~ '^[a-f0-9]{64}$'
                    THEN order_row.source_payload->>'sourceHash'
@@ -3568,6 +3867,13 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
         'Exact provider delivery timing is invalid',
       )
     }
+    const deliveryPromise = jsonRecord(providerOrder.deliveryPromise)
+    const requestedDeliveryForApply = (
+      row.provider === 'shopify'
+      && deliveryPromise?.coverage === 'partial'
+    )
+      ? row.order_requested_delivery_at?.toISOString() || null
+      : requestedDeliveryAt
     if (!/^[A-Z]{3}$/u.test(currency)) {
       throw new CommerceOrderRevisionDispositionError(
         'COMMERCE_ORDER_REVISION_MONEY_INCOMPLETE',
@@ -4355,6 +4661,7 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
       partyFingerprint: expectedPartyFingerprint,
       shipToFingerprint: expectedShipToFingerprint,
       lineQuantityEvidence: rawLines,
+      providerDeliveryPromise: deliveryPromise,
       providerWrites: 0,
       syncCursorAdvanced: false,
       inventoryWrites: 0,
@@ -4374,7 +4681,7 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
       [
         input.organizationId, row.order_id, orderNumber, currency,
         merchandiseTotalMinor.toString(),
-        requestedDeliveryAt,
+        requestedDeliveryForApply,
         JSON.stringify(shipTo), JSON.stringify(sourcePayload), actorEmail,
         input.expectedRowVersion,
       ],

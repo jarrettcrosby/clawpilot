@@ -41,6 +41,27 @@ const exactHistoryMigration = await readFile(
   ),
   'utf8',
 )
+const faireExactHistoryMigration = await readFile(
+  new URL(
+    'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+    root,
+  ),
+  'utf8',
+)
+const lineFidelityMigration = await readFile(
+  new URL(
+    'db/migrations/0342_operations_order_history_line_fidelity.sql',
+    root,
+  ),
+  'utf8',
+)
+const historyFollowupsMigration = await readFile(
+  new URL(
+    'db/migrations/0343_operations_commerce_order_history_followups.sql',
+    root,
+  ),
+  'utf8',
+)
 const predeploy = await readFile(
   new URL('scripts/verify-predeploy.mjs', root),
   'utf8',
@@ -208,6 +229,8 @@ const cleanDurable = {
   failed: 0,
   blocked: 0,
   dead: 0,
+  historicalDead: 7,
+  historicalBlocked: 5,
   overduePolls: 0,
   expiredSensitiveEvidence: 0,
   cursorKeysReady: true,
@@ -220,6 +243,10 @@ assert.equal(commerceOrderHistoryDurableDegraded({
 assert.equal(commerceOrderHistoryDurableDegraded({
   ...cleanDurable,
   blocked: 1,
+}), true)
+assert.equal(commerceOrderHistoryDurableDegraded({
+  ...cleanDurable,
+  dead: 1,
 }), true)
 
 assert.match(route, /operationsCapabilities\(actor\)\.canManage/)
@@ -290,11 +317,14 @@ assert.match(imports, /onOpenOrder=\{onOpenOrder\}/)
 for (const contract of [
   '0276_operations_commerce_order_sync_foundation.sql',
   '0340_operations_order_workbench_exact_history.sql',
+  '0343_operations_commerce_order_history_followups.sql',
   '0277_operations_commerce_authority_policies.sql',
   '0278_operations_shopify_order_webhook_signals.sql',
   'operations_commerce_order_sync_foundation_applied',
+  'operations_commerce_order_history_followups_applied',
   'operations_order_workbench_exact_history_applied',
   '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e',
+  '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628',
   "'manual_provider_read_lease_id'",
   "'tracking_url'",
   "'commerce_order_observation_manual_read_lease_fkey'",
@@ -320,6 +350,7 @@ for (const contract of [
   'The latest commerce order history worker cycle was degraded.',
   'failed: durable.failed',
   'blocked: durable.blocked',
+  'historicalBlocked: durable.historicalBlocked',
   'Commerce order history has failed or blocked provider-read sessions.',
   "'operations_commerce_order_sync_policies'",
   "'operations_commerce_order_observation_lines'",
@@ -383,10 +414,14 @@ assert.ok(
   'Runtime health must attest the installed tracking-URL guard body',
 )
 for (const contract of [
-  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17',
-  'c9a6a9a9a29fe4feea20572ada59bb054b07fa8eb80a0d787b4bda492d747017',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
+  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
+  '0341_operations_faire_order_workbench_exact_history.sql',
+  '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1',
+  '0342_operations_order_history_line_fidelity.sql',
+  '5d292963a5a8e4b117ff8a5388a660ed87e090d6e0239b3288bed9e506e8cc8d',
 ]) {
   assert.ok(
     orderEditingReleaseHealth.includes(contract),
@@ -397,6 +432,11 @@ assert.ok(
   (health.match(/operations_commerce_order_sync_foundation_applied/gu) || [])
     .length >= 4,
   'Order-history migration must gate database readiness and health errors',
+)
+assert.ok(
+  (health.match(/operations_commerce_order_history_followups_applied/gu) || [])
+    .length >= 5,
+  'History follow-up migration must gate database readiness and health errors',
 )
 assert.ok(
   (health.match(/operations_order_workbench_exact_history_applied/gu) || [])
@@ -411,6 +451,9 @@ assert.ok(
 for (const contract of [
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',
   'db/migrations/0340_operations_order_workbench_exact_history.sql',
+  'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+  'db/migrations/0342_operations_order_history_line_fidelity.sql',
+  'db/migrations/0343_operations_commerce_order_history_followups.sql',
   'db/migrations/0277_operations_commerce_authority_policies.sql',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',
@@ -427,6 +470,49 @@ for (const contract of [
   'scripts/test-commerce-order-history-worker-drain.mjs',
 ]) {
   assert.ok(predeploy.includes(contract), `Predeploy is missing ${contract}`)
+}
+for (const contract of [
+  'historical_refresh_requested_at',
+  'historical_refresh_requested_by',
+  'historical_refresh_idempotency_key',
+  'commerce_order_sync_policy_history_request_valid',
+  'idx_commerce_order_history_refresh_followups',
+  'idx_commerce_order_backfill_stream_head',
+]) {
+  assert.ok(
+    historyFollowupsMigration.includes(contract),
+    `History follow-up migration is missing ${contract}`,
+  )
+}
+assert.match(
+  faireExactHistoryMigration,
+  /observation\.provider IN \('shopify', 'faire'\)/u,
+  'Faire exact-history children must retain an exact provider fence',
+)
+assert.match(
+  faireExactHistoryMigration,
+  /NEW\.provider_read_count <> \([\s\S]*WHEN NEW\.provider = 'shopify' THEN 3[\s\S]*ELSE 2/u,
+  'Faire exact-history lineage must pin its two-read provider evidence',
+)
+for (const contract of [
+  'title_snapshot text',
+  'variant_title_snapshot text',
+  'vendor_snapshot text',
+  'unit_price_currency text',
+  'unit_price_minor bigint',
+  'subtotal_currency text',
+  'subtotal_minor bigint',
+  'discount_currency text',
+  'discount_minor bigint',
+  'tax_currency text',
+  'tax_minor bigint',
+  'commerce_order_observation_line_snapshots_valid',
+  'commerce_order_observation_line_money_valid',
+]) {
+  assert.ok(
+    lineFidelityMigration.includes(contract),
+    `Line-fidelity migration is missing ${contract}`,
+  )
 }
 
 console.log('Commerce order history API and UI contracts passed')

@@ -208,6 +208,14 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
         CASE WHEN EXISTS (
           SELECT 1 FROM public.schema_migrations
           WHERE filename =
+            '0341_operations_faire_order_workbench_exact_history.sql'
+            AND checksum =
+              '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1'
+        ) THEN
+          '354a02eca72636fc7f298f7a7438bbd043340072507503a11dd12e949185304e'
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
             '0340_operations_order_workbench_exact_history.sql'
             AND checksum =
               '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e'

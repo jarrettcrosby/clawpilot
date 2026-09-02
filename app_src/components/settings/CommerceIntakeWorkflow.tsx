@@ -88,6 +88,11 @@ import {
   type CommerceStoreSyncEffectiveReason,
   type CommerceStoreSyncPendingCommand,
 } from '@/lib/operations/commerceStoreSync'
+import {
+  commerceIntakeCandidateIsHistoricalOutcome,
+  commerceIntakeCandidateNeedsOperatorAction,
+  commerceIntakeHistoricalOutcomeLabel,
+} from '@/lib/operations/commerceIntakeAttention'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CandidateState =
@@ -1342,6 +1347,9 @@ export default function CommerceIntakeWorkflow({
       onReviewOrders()
       return
     }
+    setOrderSearch('')
+    setOrderFilter('all')
+    setOrderPage(0)
     setWorkbenchTab('orders')
   }
   const [productDrafts, setProductDrafts] = useState<
@@ -2069,18 +2077,45 @@ export default function CommerceIntakeWorkflow({
     for (const candidate of candidates) counts[candidate.state] += 1
     return counts
   }, [candidates])
-  const blockerCount = candidates.reduce(
+  const {
+    historicalOrderCandidates,
+    retainedNoActionOrderCandidates,
+    actionableCandidatesWithBlockers,
+    activeOrderCandidates,
+  } = useMemo(() => {
+    const historicalOrders: IntakeCandidate[] = []
+    const retainedNoActionOrders: IntakeCandidate[] = []
+    const actionable: IntakeCandidate[] = []
+    const active: IntakeCandidate[] = []
+    for (const candidate of candidates) {
+      const historicalOutcome = commerceIntakeCandidateIsHistoricalOutcome(candidate)
+      const needsOperatorAction = commerceIntakeCandidateNeedsOperatorAction(candidate)
+      if (historicalOutcome) historicalOrders.push(candidate)
+      if (!needsOperatorAction) retainedNoActionOrders.push(candidate)
+      if (needsOperatorAction) active.push(candidate)
+      if ((candidate.blockers?.length || 0) === 0) continue
+      if (needsOperatorAction) actionable.push(candidate)
+    }
+    return {
+      historicalOrderCandidates: historicalOrders,
+      retainedNoActionOrderCandidates: retainedNoActionOrders,
+      actionableCandidatesWithBlockers: actionable,
+      activeOrderCandidates: active,
+    }
+  }, [candidates])
+  const blockerCount = actionableCandidatesWithBlockers.reduce(
     (count, candidate) => count + (candidate.blockers?.length || 0),
     0,
-  )
-  const candidatesWithBlockers = candidates.filter(
-    (candidate) => (candidate.blockers?.length || 0) > 0,
   )
   const rejectionSummary = intake?.rejectionSummary
   const totalRejectionCount = rejectionSummary?.total ?? rejections.length
   const rejectionReviewTruncated = Boolean(rejectionSummary?.truncated)
   const issueRecordCount =
-    totalRejectionCount + candidatesWithBlockers.length
+    totalRejectionCount + actionableCandidatesWithBlockers.length
+  const retainedNoActionOrderCount = retainedNoActionOrderCandidates.length
+  const readyCandidateCount = activeOrderCandidates.filter(
+    (candidate) => candidate.state === 'ready',
+  ).length
   const unresolvedProductCount = productCandidates.filter((candidate) => (
     !terminalStates.has(candidate.state)
     && candidate.mappingStatus !== 'resolved'
@@ -2158,6 +2193,7 @@ export default function CommerceIntakeWorkflow({
       const matchesFilter = orderFilter === 'all'
         || (
           orderFilter === 'needs_review'
+          && commerceIntakeCandidateNeedsOperatorAction(candidate)
           && (
             candidate.state === 'held'
             || candidate.state === 'resolving'
@@ -2165,6 +2201,7 @@ export default function CommerceIntakeWorkflow({
         )
         || (
           orderFilter === 'ready'
+          && commerceIntakeCandidateNeedsOperatorAction(candidate)
           && candidate.state === 'ready'
         )
         || (
@@ -2230,7 +2267,7 @@ export default function CommerceIntakeWorkflow({
       action: string
       count: number
     }>()
-    for (const candidate of candidates) {
+    for (const candidate of actionableCandidatesWithBlockers) {
       const seen = new Set<string>()
       for (const blocker of candidate.blockers || []) {
         if (seen.has(blocker.code)) continue
@@ -2254,7 +2291,28 @@ export default function CommerceIntakeWorkflow({
     }
     return Array.from(grouped.values())
       .sort((left, right) => right.count - left.count)
-  }, [candidates, issueSearch])
+  }, [actionableCandidatesWithBlockers, issueSearch])
+  const historicalOutcomeGroups = useMemo(() => {
+    const query = issueSearch.trim().toLocaleLowerCase()
+    const grouped = new Map<string, { label: string; count: number }>()
+    for (const candidate of historicalOrderCandidates) {
+      const label = commerceIntakeHistoricalOutcomeLabel(candidate)
+      const searchable = [
+        label,
+        candidate.externalOrderId,
+        candidate.orderNumber,
+        ...(candidate.blockers || []).flatMap((blocker) => [
+          blocker.code,
+          blocker.label,
+        ]),
+      ].join(' ').toLocaleLowerCase()
+      if (query && !searchable.includes(query)) continue
+      const current = grouped.get(label)
+      grouped.set(label, { label, count: (current?.count || 0) + 1 })
+    }
+    return Array.from(grouped.values())
+      .sort((left, right) => right.count - left.count)
+  }, [historicalOrderCandidates, issueSearch])
   const safeProductPage = Math.min(
     productPage,
     Math.max(0, Math.ceil(filteredProductCandidates.length / workbenchPageSize) - 1),
@@ -2300,17 +2358,25 @@ export default function CommerceIntakeWorkflow({
             label: `Review ${issueRecordCount} ${
               issueRecordCount === 1 ? 'exception' : 'exceptions'
             }`,
-            detail: 'Retained provider rejections and blocked order candidates show what genuinely needs attention.',
+            detail: 'Only open provider errors and fulfillment blockers are included. Historical outcomes stay visible without becoming operator work.',
             tab: 'issues' as WorkbenchTab,
           }
-        : candidates.length > 0
+        : activeOrderCandidates.length > 0
           ? {
-              label: `Review ${candidates.length} ${
-                candidates.length === 1 ? 'order' : 'orders'
+              label: `Review ${activeOrderCandidates.length} ${
+                activeOrderCandidates.length === 1 ? 'order' : 'orders'
               }`,
               detail: 'Complete required details, validate, and add each approved order.',
               tab: 'orders' as WorkbenchTab,
             }
+          : retainedNoActionOrderCount > 0
+            ? {
+                label: 'View retained provider records',
+                detail: `${retainedNoActionOrderCount} completed, cancelled, or already imported ${
+                  retainedNoActionOrderCount === 1 ? 'order is' : 'orders are'
+                } retained with no intake action required.`,
+                tab: 'orders' as WorkbenchTab,
+              }
           : !manualProviderReadsAllowed
             ? {
                 label: 'Review provider-read access',
@@ -3018,10 +3084,10 @@ export default function CommerceIntakeWorkflow({
       }.`
     }
     if (candidate.state === 'expired') {
-      return 'This retained candidate expired. Fetch a current provider copy.'
+      return 'This provider snapshot expired. Refresh it to fetch the current provider revision.'
     }
     if (candidate.state === 'failed') {
-      return 'This disposition is terminal. Refresh to fetch a current provider revision.'
+      return 'This provider snapshot could not be staged. Refresh it to fetch the current provider revision.'
     }
     return ''
   }
@@ -3930,8 +3996,20 @@ export default function CommerceIntakeWorkflow({
               />
               <Chip
                 size="small"
-                label={`${candidates.length} orders ready for review`}
+                label={`${activeOrderCandidates.length} active ${
+                  activeOrderCandidates.length === 1 ? 'order' : 'orders'
+                } for review`}
               />
+              {retainedNoActionOrderCount > 0 ? (
+                <Chip
+                  size="small"
+                  color="success"
+                  variant="outlined"
+                  label={`${retainedNoActionOrderCount} no-action ${
+                    retainedNoActionOrderCount === 1 ? 'record' : 'records'
+                  } retained`}
+                />
+              ) : null}
               <Chip
                 size="small"
                 color={
@@ -3949,8 +4027,8 @@ export default function CommerceIntakeWorkflow({
                 size="small"
                 color={issueRecordCount ? 'warning' : 'default'}
                 label={`${issueRecordCount} ${
-                  issueRecordCount === 1 ? 'exception' : 'exceptions'
-                }`}
+                  issueRecordCount === 1 ? 'item needs' : 'items need'
+                } action`}
               />
             </Stack>
           </Stack>
@@ -4031,7 +4109,7 @@ export default function CommerceIntakeWorkflow({
               id={`commerce-intake-tab-issues-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-issues-${accountGlobalId}`}
               value="issues"
-              label={`Exceptions (${issueRecordCount})`}
+              label={`Needs action (${issueRecordCount})`}
             />
           </Tabs>
         </Box>
@@ -4446,10 +4524,10 @@ export default function CommerceIntakeWorkflow({
               },
               {
                 label: '2 · Review',
-                value: `${blockerCount} order ${
+                value: `${blockerCount} actionable ${
                   blockerCount === 1 ? 'issue' : 'issues'
                 }`,
-                detail: `${totalUnresolvedProductCount} ${
+                detail: `${retainedNoActionOrderCount} retained · ${totalUnresolvedProductCount} ${
                   totalUnresolvedProductCount === 1
                     ? 'product needs a decision'
                     : 'products need decisions'
@@ -4457,7 +4535,7 @@ export default function CommerceIntakeWorkflow({
               },
               {
                 label: '3 · Check',
-                value: `${candidateCounts.ready} ready`,
+                value: `${readyCandidateCount} ready`,
                 detail: 'Required details confirmed',
               },
               {
@@ -4710,12 +4788,12 @@ export default function CommerceIntakeWorkflow({
               >
                 <Box>
                   <Typography variant="h6" fontWeight={700}>
-                    Provider issues
+                    Import attention
                   </Typography>
                   <Typography variant="body2" color="text.secondary">
-                    Review provider records that could not be staged safely.
-                    Identical failures are summarized before individual
-                    recovery actions.
+                    Review only open records that block fulfillment or failed
+                    provider reads. Completed and cancelled orders remain
+                    available as history without becoming operator work.
                   </Typography>
                 </Box>
                 <Stack
@@ -4735,7 +4813,7 @@ export default function CommerceIntakeWorkflow({
                       : 'Export provider issues CSV'}
                   </Button>
                   <TextField
-                    label="Search issues"
+                    label="Search attention and history"
                     value={issueSearch}
                     onChange={(event) => {
                       setIssueSearch(event.target.value)
@@ -4745,6 +4823,22 @@ export default function CommerceIntakeWorkflow({
                   />
                 </Stack>
               </Stack>
+              <Alert severity={issueRecordCount > 0 ? 'warning' : 'success'}>
+                <Typography variant="body2" fontWeight={700}>
+                  {issueRecordCount > 0
+                    ? `${issueRecordCount} ${
+                        issueRecordCount === 1 ? 'record needs' : 'records need'
+                      } action`
+                    : 'No import records need action'}
+                </Typography>
+                <Typography variant="body2">
+                  {retainedNoActionOrderCount > 0
+                    ? `${retainedNoActionOrderCount} completed, cancelled, or already imported ${
+                        retainedNoActionOrderCount === 1 ? 'order is' : 'orders are'
+                      } retained as no-action provider history.`
+                    : 'Historical provider outcomes will remain visible here when available.'}
+                </Typography>
+              </Alert>
               {rejectionReviewTruncated ? (
                 <Alert severity="info">
                   Showing the newest {rejectionSummary?.returned ?? 0} of{' '}
@@ -4806,6 +4900,72 @@ export default function CommerceIntakeWorkflow({
                     </Card>
                   ))}
                 </Box>
+              ) : null}
+              {historicalOutcomeGroups.length ? (
+                <Stack spacing={1}>
+                  <Box>
+                    <Typography variant="subtitle1" fontWeight={700}>
+                      Observed history
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      These provider outcomes have no remaining ClawPilot
+                      fulfillment demand. No refresh, exclusion, or unsupported
+                      disposition is required.
+                    </Typography>
+                  </Box>
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: {
+                        xs: '1fr',
+                        md: 'repeat(2, minmax(0, 1fr))',
+                      },
+                      gap: 1,
+                    }}
+                  >
+                    {historicalOutcomeGroups.map((group) => (
+                      <Card
+                        key={group.label}
+                        variant="outlined"
+                        sx={{ borderColor: 'success.dark' }}
+                      >
+                        <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+                          <Stack spacing={0.75}>
+                            <Stack
+                              direction="row"
+                              justifyContent="space-between"
+                              spacing={1}
+                            >
+                              <Typography fontWeight={700}>
+                                {group.label}
+                              </Typography>
+                              <Chip
+                                size="small"
+                                color="success"
+                                variant="outlined"
+                                label={`${group.count} ${
+                                  group.count === 1 ? 'order' : 'orders'
+                                }`}
+                              />
+                            </Stack>
+                            <Typography variant="body2" color="text.secondary">
+                              Exact provider history remains available in Orders.
+                            </Typography>
+                            <Button
+                              size="small"
+                              variant="text"
+                              color="success"
+                              onClick={reviewOrders}
+                              sx={{ alignSelf: 'flex-start' }}
+                            >
+                              View order history
+                            </Button>
+                          </Stack>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </Box>
+                </Stack>
               ) : null}
               {rejectionGroups.length ? (
                 <Box
@@ -4912,7 +5072,7 @@ export default function CommerceIntakeWorkflow({
               && candidateBlockerGroups.length === 0
               && rejectionGroups.length === 0 ? (
                 <Alert severity="info">
-                  No issues match the current search.
+                  No actionable records match the current search.
                 </Alert>
                 ) : null}
           {filteredRejections.length ? (
@@ -5055,9 +5215,10 @@ export default function CommerceIntakeWorkflow({
               })}
             </Stack>
           ) : rejections.length === 0
-          && candidateBlockerGroups.length === 0 ? (
+          && candidateBlockerGroups.length === 0
+          && historicalOutcomeGroups.length === 0 ? (
             <Alert severity="success">
-              No provider or order issues are waiting for review.
+              No provider or order records are waiting for review.
             </Alert>
           ) : null}
               {filteredRejections.length > workbenchPageSize ? (
@@ -6433,20 +6594,30 @@ export default function CommerceIntakeWorkflow({
                 </Alert>
               ) : null}
               {visibleOrderCandidates.map((candidate) => {
+                const historicalOutcome =
+                  commerceIntakeCandidateIsHistoricalOutcome(candidate)
+                const needsOperatorAction =
+                  commerceIntakeCandidateNeedsOperatorAction(candidate)
+                const historicalOutcomeLabel = historicalOutcome
+                  ? commerceIntakeHistoricalOutcomeLabel(candidate)
+                  : null
                 const unavailableReason = candidateUnavailableReason(candidate)
                 const candidateLocked = Boolean(unavailableReason)
                   || !operatorCommandsAllowed
-                const localReviewLocked = Boolean(unavailableReason)
+                const localReviewLocked = historicalOutcome
+                  || Boolean(unavailableReason)
                   || !localReviewCommandsAllowed
                 const refreshLocked = (
+                  historicalOutcome
+                  ||
                   !manualProviderReadsAllowed
                   ||
                   !Number.isInteger(candidate.rowVersion)
                   || candidate.state === 'promoted'
-                  || candidate.state === 'expired'
                 )
                 const packPlanningLocked = (
-                  !Number.isInteger(candidate.rowVersion)
+                  historicalOutcome
+                  || !Number.isInteger(candidate.rowVersion)
                   || candidate.state === 'failed'
                   || candidate.state === 'expired'
                 )
@@ -6504,18 +6675,30 @@ export default function CommerceIntakeWorkflow({
                             </Typography>
                           </Box>
                           <Stack direction="row" gap={0.75} flexWrap="wrap">
+                            {!historicalOutcome ? (
+                              <Chip
+                                size="small"
+                                color={stateColor(candidate.state)}
+                                label={candidateStateLabel(candidate.state)}
+                              />
+                            ) : null}
+                            {historicalOutcomeLabel ? (
+                              <Chip
+                                size="small"
+                                color="success"
+                                variant="outlined"
+                                label={historicalOutcomeLabel}
+                              />
+                            ) : null}
                             <Chip
                               size="small"
-                              color={stateColor(candidate.state)}
-                              label={candidateStateLabel(candidate.state)}
-                            />
-                            <Chip
-                              size="small"
-                              color={candidate.headerMoney?.state
+                              color={!historicalOutcome
+                                && candidate.headerMoney?.state
                                 === 'operational_incomplete'
                                 ? 'warning'
                                 : 'default'}
-                              variant={candidate.headerMoney?.state
+                              variant={!historicalOutcome
+                                && candidate.headerMoney?.state
                                 === 'operational_incomplete'
                                 ? 'outlined'
                                 : 'filled'}
@@ -6532,7 +6715,8 @@ export default function CommerceIntakeWorkflow({
                                     candidate.currency,
                                   )}
                             />
-                            {candidate.headerMoney?.unavailableFields
+                            {!historicalOutcome
+                            && candidate.headerMoney?.unavailableFields
                               .includes('shipping') ? (
                               <Chip
                                 size="small"
@@ -6614,7 +6798,8 @@ export default function CommerceIntakeWorkflow({
                             {' '}was created.
                           </Alert>
                         ) : null}
-                        {candidate.checkoutRateReconciliation ? (
+                        {!historicalOutcome
+                        && candidate.checkoutRateReconciliation ? (
                           <Alert
                             severity={
                               candidate.checkoutRateReconciliation
@@ -6649,14 +6834,19 @@ export default function CommerceIntakeWorkflow({
                           </Alert>
                         ) : null}
                         {candidate.unsupportedReason ? (
-                          <Alert severity="warning">
-                            Unsupported: {candidate.unsupportedReason}
+                          <Alert severity={historicalOutcome ? 'info' : 'warning'}>
+                            {historicalOutcome
+                              ? 'Provider history note'
+                              : 'Unsupported'}: {candidate.unsupportedReason}
                           </Alert>
                         ) : null}
                         {unavailableReason ? (
-                          <Alert severity="info">{unavailableReason}</Alert>
+                          <Alert severity={needsOperatorAction ? 'warning' : 'info'}>
+                            {unavailableReason}
+                          </Alert>
                         ) : null}
-                        {candidate.headerMoney?.state
+                        {!historicalOutcome
+                        && candidate.headerMoney?.state
                           === 'operational_incomplete' ? (
                           <Alert severity="warning">
                             The provider did not return exact{' '}
@@ -6682,28 +6872,65 @@ export default function CommerceIntakeWorkflow({
                           ) : null}
 
                         {candidate.blockers?.length ? (
-                          <Alert severity="warning">
-                            <Typography variant="body2" fontWeight={700}>
-                              Resolution required
-                            </Typography>
-                            <Stack component="ul" spacing={0.5} sx={{ pl: 2.5 }}>
-                              {candidate.blockers.map((blocker) => (
-                                <Typography
-                                  key={`${blocker.code}:${blocker.label}`}
-                                  component="li"
-                                  variant="body2"
-                                >
-                                  {blocker.label} — {blocker.action}
-                                  {blocker.terminal
-                                    ? ' This provider condition is terminal.'
-                                    : ''}
-                                </Typography>
-                              ))}
-                            </Stack>
-                          </Alert>
+                          !needsOperatorAction || unavailableReason ? (
+                            <Alert severity="info">
+                              <Typography variant="body2" fontWeight={700}>
+                                {needsOperatorAction
+                                  ? 'Provider refresh required'
+                                  : 'Retained provider evidence'}
+                              </Typography>
+                              <Typography variant="body2">
+                                {needsOperatorAction
+                                  ? 'These captured conditions cannot be resolved against an unavailable snapshot. Refresh the order to load the current provider revision.'
+                                  : <>These conditions were retained from intake for
+                                    audit history. {historicalOutcome
+                                      ? `This order is already ${historicalOutcomeLabel?.toLocaleLowerCase()}.`
+                                      : 'This order was already imported.'}{' '}
+                                    No intake resolution is required on this record.</>}
+                              </Typography>
+                              <Stack component="ul" spacing={0.5} sx={{ pl: 2.5 }}>
+                                {candidate.blockers.map((blocker) => (
+                                  <Typography
+                                    key={`${blocker.code}:${blocker.label}`}
+                                    component="li"
+                                    variant="body2"
+                                  >
+                                    {blocker.label}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          ) : (
+                            <Alert severity="warning">
+                              <Typography variant="body2" fontWeight={700}>
+                                Resolution required
+                              </Typography>
+                              <Stack component="ul" spacing={0.5} sx={{ pl: 2.5 }}>
+                                {candidate.blockers.map((blocker) => (
+                                  <Typography
+                                    key={`${blocker.code}:${blocker.label}`}
+                                    component="li"
+                                    variant="body2"
+                                  >
+                                    {blocker.label} — {blocker.action}
+                                    {blocker.terminal
+                                      ? ' This provider condition is terminal.'
+                                      : ''}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Alert>
+                          )
                         ) : null}
 
-                        {!localReviewLocked ? (
+                        {historicalOutcome ? (
+                          <Alert severity="success">
+                            This provider order is retained as{' '}
+                            {historicalOutcomeLabel?.toLocaleLowerCase()}.
+                            Its latest order facts remain available in Orders;
+                            no intake decisions are required here.
+                          </Alert>
+                        ) : !localReviewLocked ? (
                           <>
                         <Accordion disableGutters variant="outlined">
                           <AccordionSummary
@@ -7733,6 +7960,7 @@ export default function CommerceIntakeWorkflow({
 
                         <Divider />
 
+                        {!historicalOutcome ? (
                         <Stack
                           direction={{ xs: 'column', md: 'row' }}
                           spacing={1}
@@ -7862,8 +8090,11 @@ export default function CommerceIntakeWorkflow({
                             Add order to ClawPilot
                           </Button>
                         </Stack>
+                        ) : null}
 
-                        {candidate.state !== 'ready'
+                        {needsOperatorAction
+                          && !unavailableReason
+                          && candidate.state !== 'ready'
                           && candidate.state !== 'promoted' ? (
                           <Typography
                             variant="caption"
@@ -7873,7 +8104,8 @@ export default function CommerceIntakeWorkflow({
                           </Typography>
                         ) : null}
 
-                        {!terminalStates.has(candidate.state) ? (
+                        {!historicalOutcome
+                        && !terminalStates.has(candidate.state) ? (
                           <Box
                             sx={{
                               display: 'grid',

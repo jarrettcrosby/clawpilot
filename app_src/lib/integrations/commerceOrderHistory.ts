@@ -6,6 +6,7 @@ import {
 } from '@/lib/integrations/commerceCredentialCrypto'
 import { normalizeFaireCommerce } from '@/lib/integrations/faireCommerceNormalizer'
 import {
+  getFaireOrder,
   listFaireOrders,
   probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
@@ -36,7 +37,11 @@ import {
 
 const SHOPIFY_PAGE_SIZE = 5
 const SHOPIFY_LINE_LIMIT = 50
-const SHOPIFY_FULFILLMENT_LIMIT = 20
+// Shopify returns Order.fulfillments as a bounded list rather than a cursor
+// connection. Real multi-parcel wholesale orders can legitimately exceed 20
+// fulfillments, so retain a production-sized envelope without letting one
+// large order terminate the account-wide history stream.
+const SHOPIFY_FULFILLMENT_LIMIT = 100
 const SHOPIFY_TRACKING_LIMIT = 10
 const SHOPIFY_REFUND_LIMIT = 100
 const SHOPIFY_RETURN_LIMIT = 20
@@ -93,7 +98,26 @@ export type ExactShopifyOrderHistoryRead = {
   returnHistoryScopeObserved: boolean
 }
 
+export type ExactFaireOrderHistoryInput = {
+  organizationId: string
+  accountGlobalId: string
+  expectedCredentialGeneration: number
+  externalOrderId: string
+  observedAt?: string
+  observationKind: 'manual_exact_read'
+}
+
+export type ExactFaireOrderHistoryRead = {
+  provider: 'faire'
+  observation: CommerceOrderObservationInput
+  providerReads: 2
+  providerWrites: 0
+  readAllOrdersScopeObserved: null
+  returnHistoryScopeObserved: null
+}
+
 const exactShopifyOrderHistoryReadAttempts = new WeakMap<object, number>()
+const exactFaireOrderHistoryReadAttempts = new WeakMap<object, number>()
 
 /**
  * Returns the number of Shopify network reads attempted before an exact-order
@@ -107,12 +131,34 @@ export function exactShopifyOrderHistoryProviderReads(error: unknown) {
   return exactShopifyOrderHistoryReadAttempts.get(error as object) ?? null
 }
 
+/**
+ * Returns the number of Faire network reads attempted before an exact-order
+ * read failed. This is diagnostic evidence only and never changes the
+ * provider error exposed by the route.
+ */
+export function exactFaireOrderHistoryProviderReads(error: unknown) {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
+    return null
+  }
+  return exactFaireOrderHistoryReadAttempts.get(error as object) ?? null
+}
+
 function retainExactShopifyOrderHistoryReadAttempts(
   error: unknown,
   providerReads: number,
 ): never {
   if (error && (typeof error === 'object' || typeof error === 'function')) {
     exactShopifyOrderHistoryReadAttempts.set(error as object, providerReads)
+  }
+  throw error
+}
+
+function retainExactFaireOrderHistoryReadAttempts(
+  error: unknown,
+  providerReads: number,
+): never {
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    exactFaireOrderHistoryReadAttempts.set(error as object, providerReads)
   }
   throw error
 }
@@ -450,6 +496,16 @@ function money(order: CommerceNormalizedOrder) {
   return Number.isSafeInteger(minor)
     ? { currency: order.total.value.primary.currency, minor }
     : { currency: null, minor: null }
+}
+
+function lineMoney(
+  field: CommerceNormalizedOrder['lines'][number]['unitPrice'] | undefined,
+) {
+  if (!field || field.state !== 'available') return null
+  const amountMinor = Number(field.value.primary.amountMinor)
+  return Number.isSafeInteger(amountMinor)
+    ? { currency: field.value.primary.currency, amountMinor }
+    : null
 }
 
 function refundMoney(refund: JsonRecord) {
@@ -883,7 +939,7 @@ export function privacyMinimizedCommerceOrderEventEvidence(
   )))
 }
 
-function observation(
+export function commerceOrderHistoryObservation(
   provider: 'shopify' | 'faire',
   order: CommerceNormalizedOrder,
   source: JsonRecord,
@@ -925,6 +981,9 @@ function observation(
         ? line.variantIdentity.value.value
         : null,
       sku: line.sku,
+      title: line.titleSnapshot,
+      variantTitle: line.variantTitleSnapshot,
+      vendor: line.vendorSnapshot,
       ordered: line.orderedQuantity,
       current: line.currentQuantity,
       unfulfilled: line.unfulfilledQuantity,
@@ -932,6 +991,10 @@ function observation(
       returned: returnedQuantities.get(line.identity.value)
         ?? line.returnedQuantity,
       requiresShipping: line.requiresShipping,
+      unitPrice: lineMoney(line.unitPrice),
+      subtotal: lineMoney(line.lineSubtotal),
+      discount: lineMoney(line.lineDiscount),
+      tax: lineMoney(line.lineTax),
     })),
     events: events.map(privacyMinimizedCommerceOrderEventEvidence),
   }
@@ -973,12 +1036,23 @@ function observation(
       externalProductId: line.product,
       externalVariantId: line.variant,
       sku: line.sku,
+      titleSnapshot: line.title,
+      variantTitleSnapshot: line.variantTitle,
+      vendorSnapshot: line.vendor,
       originalQuantity: line.ordered,
       currentQuantity: line.current,
       unfulfilledQuantity: line.unfulfilled,
       fulfilledQuantity: line.fulfilled,
       returnedQuantity: line.returned,
       requiresShipping: line.requiresShipping,
+      unitPriceCurrency: line.unitPrice?.currency || null,
+      unitPriceMinor: line.unitPrice?.amountMinor ?? null,
+      subtotalCurrency: line.subtotal?.currency || null,
+      subtotalMinor: line.subtotal?.amountMinor ?? null,
+      discountCurrency: line.discount?.currency || null,
+      discountMinor: line.discount?.amountMinor ?? null,
+      taxCurrency: line.tax?.currency || null,
+      taxMinor: line.tax?.amountMinor ?? null,
     })),
     events,
   }
@@ -1870,7 +1944,7 @@ async function readShopifyHistoryPage(
   )
   return {
     provider: 'shopify',
-    observations: normalized.orders.map((order) => observation(
+    observations: normalized.orders.map((order) => commerceOrderHistoryObservation(
       'shopify',
       order,
       sourceById.get(order.identity.value) || {},
@@ -1991,7 +2065,7 @@ async function readFaireHistoryPage(
   ]))
   return {
     provider: 'faire',
-    observations: windowOrders.map((order) => observation(
+    observations: windowOrders.map((order) => commerceOrderHistoryObservation(
       'faire',
       order,
       sourceById.get(order.identity.value) || {},
@@ -2109,6 +2183,13 @@ export async function readExactShopifyOrderHistoryObservation(
       variables: { id: externalOrderId },
     }, { timeoutMs: PROVIDER_TIMEOUT_MS })
     const source = asRecord(detail.order)
+    if (detail.order === null || detail.order === undefined) {
+      historyError(
+        'SHOPIFY_ORDER_HISTORY_EXACT_ORDER_UNAVAILABLE',
+        'Shopify no longer makes this exact order available to the connection',
+        404,
+      )
+    }
     if (!source || exactString(source.id) !== externalOrderId) {
       historyError(
         'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
@@ -2138,7 +2219,7 @@ export async function readExactShopifyOrderHistoryObservation(
     }
     return {
       provider: 'shopify',
-      observation: observation(
+      observation: commerceOrderHistoryObservation(
         'shopify',
         normalized.orders[0],
         source,
@@ -2153,5 +2234,122 @@ export async function readExactShopifyOrderHistoryObservation(
     }
   } catch (error) {
     retainExactShopifyOrderHistoryReadAttempts(error, providerReads)
+  }
+}
+
+/**
+ * Reads one exact Faire order for an explicitly authorized manual refresh.
+ * Faire exposes the complete current order, including embedded shipments,
+ * through GET /orders/{id}. This path verifies the brand before the exact
+ * read, performs no list scan, advances no cursor, and issues no provider
+ * write.
+ */
+export async function readExactFaireOrderHistoryObservation(
+  input: ExactFaireOrderHistoryInput,
+): Promise<ExactFaireOrderHistoryRead> {
+  const observedAt = requiredIso(
+    input.observedAt || new Date().toISOString(),
+    'Observation time',
+  )
+  const externalOrderId = exactString(input.externalOrderId)
+  if (
+    !externalOrderId
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(externalOrderId)
+  ) {
+    historyError(
+      'FAIRE_ORDER_HISTORY_EXACT_ID_INVALID',
+      'The exact Faire order ID is invalid',
+      400,
+    )
+  }
+  const runtime = await runtimeFor(input)
+  if (runtime.provider !== 'faire') {
+    historyError(
+      'FAIRE_ORDER_HISTORY_ACCOUNT_REQUIRED',
+      'Exact Faire order reads require a Faire connection',
+    )
+  }
+  const secret = decryptCommerceCredential(
+    runtime.encrypted,
+    runtime.organizationId,
+    runtime.provider,
+    runtime.environment,
+    runtime.externalAccountId,
+  )
+  if (secret.provider !== 'faire') {
+    historyError(
+      'COMMERCE_ORDER_HISTORY_CREDENTIAL_INVALID',
+      'The credential provider changed',
+    )
+  }
+  if (secret.authMode === 'faire_oauth' && !secret.scopes.includes('READ_ORDERS')) {
+    historyError(
+      'FAIRE_READ_ORDERS_REQUIRED',
+      'Faire must grant READ_ORDERS for exact order reads',
+    )
+  }
+  const options = secret.authMode === 'faire_oauth'
+    ? {
+        accessToken: secret.accessToken,
+        applicationId: secret.applicationId,
+        applicationSecret: secret.applicationSecret,
+        timeoutMs: PROVIDER_TIMEOUT_MS,
+      }
+    : { accessToken: secret.accessToken, timeoutMs: PROVIDER_TIMEOUT_MS }
+  let providerReads = 0
+  try {
+    providerReads += 1
+    exactFaireBrand(
+      await probeFaireBrandProfile(options),
+      runtime.externalAccountId,
+    )
+    providerReads += 1
+    const source = asRecord(await getFaireOrder(options, externalOrderId))
+    if (
+      !source
+      || exactString(source.id ?? source.order_id) !== externalOrderId
+    ) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+        'Faire exact-order hydration changed identity',
+        502,
+      )
+    }
+    assertFaireOrderHistoryDetailEvidence(source)
+    assertFaireBrandScope([source], runtime.externalAccountId)
+    const normalized = normalizeFaireCommerce({
+      brand: { id: runtime.externalAccountId },
+      orders: completeFairePage({ orders: [source] }, [source]),
+      products: completeFairePage({ products: [] }, []),
+    }, context(runtime, observedAt))
+    if (
+      normalized.rejections.length
+      || normalized.orders.length !== 1
+      || normalized.orders[0].identity.value !== externalOrderId
+      || normalized.orders[0].lineItemsTruncated
+    ) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
+        'The Faire exact-order read could not be normalized without loss',
+        409,
+      )
+    }
+    return {
+      provider: 'faire',
+      observation: commerceOrderHistoryObservation(
+        'faire',
+        normalized.orders[0],
+        source,
+        observedAt,
+        2,
+        input.observationKind,
+      ),
+      providerReads: 2,
+      providerWrites: 0,
+      readAllOrdersScopeObserved: null,
+      returnHistoryScopeObserved: null,
+    }
+  } catch (error) {
+    retainExactFaireOrderHistoryReadAttempts(error, providerReads)
   }
 }

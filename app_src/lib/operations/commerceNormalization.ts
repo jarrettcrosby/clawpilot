@@ -234,6 +234,18 @@ export type ShopifyNormalizedOrderFacts = Readonly<{
   shopDomain: string | null
   sourceName: string | null
   testOrder: boolean
+  deliveryPromise: Readonly<{
+    source:
+      | 'order.requestedDeliveryAt'
+      | 'fulfillment_order.deliveryMethod'
+      | 'unavailable'
+    observedMaxDeliveryAt: string | null
+    coverage: 'complete' | 'partial' | 'unavailable'
+    effectiveScopes: readonly string[]
+    connectionComplete: boolean
+    eligibleNodeCount: number
+    datedNodeCount: number
+  }>
   shippingService: Readonly<{
     code: string | null
     title: string | null

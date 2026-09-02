@@ -60,6 +60,7 @@ const [
   unitCartonizationMigration,
   duplicateWorkbenchMigration,
   persistence,
+  providerOrderHistory,
   route,
   ordersRoute,
   operationsRoute,
@@ -69,11 +70,13 @@ const [
   candidateResolver,
   drawer,
   idempotency,
+  orderListQuery,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
   read('db/migrations/0321_operations_unit_item_cartonization.sql'),
   read('db/migrations/0322_operations_duplicate_order_workbench_recovery.sql'),
   read('app_src/lib/persistence/commerceOrderWorkbench.ts'),
+  read('app_src/lib/operations/providerOrderHistory.ts'),
   read('app_src/app/api/operations/order-workbench/route.ts'),
   read('app_src/app/api/operations/orders/route.ts'),
   read('app_src/app/api/operations/route.ts'),
@@ -83,6 +86,7 @@ const [
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
   read('app_src/lib/operations/orderWorkbenchIdempotency.ts'),
+  read('app_src/lib/operations/orderListQuery.ts'),
 ])
 
 for (const fragment of [
@@ -176,10 +180,19 @@ for (const fragment of [
   'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
   'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
   'provider_rebased',
-  'returnedQuantity: optionalTimelineInteger(line.returnedQuantity)',
   'providerObservationKinds:',
   "'manual_exact_read', 'webhook_exact_read'",
+  'observation.provider = candidate.provider',
   'row.latest_exact_history_observed_at?.toISOString() || null',
+  'currentExactProviderOrderMoney',
+  'currentProviderHistoryIsExact',
+  'provider_status.observation_kind',
+  'provider_status.provider_total_minor::text',
+  'mapping.active = true',
+  "warehouse.status = 'active'",
+  'JOIN operations_locations location',
+  'location.warehouse_id = warehouse.id',
+  'location.active = true',
   'resolveCommerceCandidateCustomerInPostgres',
   'resolveCommerceCandidateDeliveryInPostgres',
   'resolveCommerceCandidateProductInPostgres',
@@ -194,6 +207,36 @@ for (const fragment of [
   "field: 'requestedDeliveryAt'",
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
+}
+assert.ok(
+  providerOrderHistory.includes(
+    'returnedQuantity: optionalTimelineInteger(line.returnedQuantity)',
+  ),
+  'Provider-history projection is missing returned quantities',
+)
+for (const fragment of [
+  'externalSubjectId: optionalTimelineText(',
+  'event.payload.externalSubjectId',
+  'quantity: optionalTimelineInteger(event.payload.quantity)',
+  'amountMinor: optionalTimelineInteger(event.payload.amountMinor)',
+  'currency: optionalTimelineText(event.payload.currency)',
+]) {
+  assert.ok(
+    providerOrderHistory.includes(fragment),
+    `Provider-history event projection is missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'const providerHistoryMoney = currentExactProviderOrderMoney({',
+  'currency: row.current_provider_currency',
+  'providerTotalMinor: row.current_provider_total_minor',
+  'providerTotalMinor: providerHistoryMoney?.totalMinor || null',
+  'orderValueMinor: row.order_value_minor',
+]) {
+  assert.ok(
+    operations.includes(fragment),
+    `Canonical provider-total wiring is missing ${fragment}`,
+  )
 }
 assert.match(
   persistence,
@@ -217,11 +260,11 @@ assert.equal(
 )
 assert.ok(
   persistence.indexOf("ILIKE $3 ESCAPE '!'")
-    < persistence.indexOf('LIMIT $8::integer'),
+    < persistence.indexOf('LIMIT $10::integer'),
   'Search must execute in SQL before the bounded result cap',
 )
 assert.ok(
-  persistence.includes('LIMIT $8::integer'),
+  persistence.includes('LIMIT $10::integer'),
   'Each Orders pane keyset query must retain a bounded page size',
 )
 assert.equal(
@@ -352,7 +395,12 @@ assert.ok(
 for (const fragment of [
   'readCommerceOrderWorkbenchPageFromPostgres',
   'count(*) OVER ()::text AS matching_total_count',
-  'matching.candidate_id < $7::uuid',
+  'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
+  'matching.candidate_id ${comparison} $9::uuid',
+  'selected.cursor_sort_value',
+  'candidate_context.tracking_number ILIKE',
+  'COALESCE(line.sku_snapshot',
+  'COALESCE(line.sku',
   'nextCursor',
   'complete: nextCursor === null',
   'truncated: nextCursor !== null',
@@ -360,6 +408,16 @@ for (const fragment of [
   assert.ok(
     persistence.includes(fragment),
     `Workbench pagination is missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'includeOrderSummaries?: boolean',
+  'input.includeOrderSummaries === false',
+  'Promise.resolve(omittedOrderSummaries)',
+]) {
+  assert.ok(
+    operations.includes(fragment),
+    `Operations workspace summary suppression is missing ${fragment}`,
   )
 }
 assert.ok(
@@ -370,8 +428,13 @@ for (const fragment of [
   'export async function readOperationsOrderPageFromPostgres',
   'WITH matching_order_ids AS',
   'count(*) OVER ()::text AS matching_total_count',
-  'matching.id < $6::uuid',
-  'LIMIT $7::integer',
+  'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
+  'matching.id ${comparison} $9::uuid',
+  'line.channel_sku ILIKE',
+  'latest_tracking.tracking_number ILIKE',
+  'LIMIT $10::integer',
+  'orders.requested_delivery_at',
+  'requestedDeliveryAt: row.requested_delivery_at?.toISOString() || null',
   'orderPage: orderPageResult.page',
 ]) {
   assert.ok(
@@ -384,10 +447,25 @@ for (const fragment of [
   'readOperationsOrderPageFromPostgres',
   'cursor: cursor || null',
   'pageSize',
+  'sort: sortValue',
+  'direction: directionValue',
+  'provider: providerValue || null',
+  'tracking,',
+  'updatedAfter: updatedAfterValue || null',
 ]) {
   assert.ok(
     ordersRoute.includes(fragment),
     `Canonical order page route is missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  "searchParams.get('includeOrderSummaries')",
+  "includeOrderSummaries: includeOrderSummariesValue !== 'false'",
+  'OPERATIONS_ORDER_SUMMARY_MODE_INVALID',
+]) {
+  assert.ok(
+    operationsRoute.includes(fragment),
+    `Operations workspace order-summary mode is missing ${fragment}`,
   )
 }
 assert.ok(
@@ -395,12 +473,57 @@ assert.ok(
   'Workspace contract must expose canonical order page completion evidence',
 )
 for (const fragment of [
+  'workflowState:',
+  'actionAvailable: boolean',
+  'candidate_context.display_status',
+  'display_snapshot.order_number_snapshot',
+]) {
+  assert.ok(
+    types.includes(fragment) || persistence.includes(fragment),
+    `Unified order contract is missing ${fragment}`,
+  )
+}
+assert.ok(
+  orderListQuery.includes('OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS = 500'),
+  'Order-list cursor sort keys must have a shared bounded width',
+)
+for (const fragment of [
+  "'updated'",
+  "'order_number'",
+  "'customer'",
+  "'status'",
+  "'provider'",
+  "'tracking'",
+  'isOperationsOrderUpdatedAfter',
+]) {
+  assert.ok(
+    orderListQuery.includes(fragment),
+    `Order-list query contract is missing ${fragment}`,
+  )
+}
+for (const source of [route, ordersRoute, operationsRoute]) {
+  for (const fragment of [
+    "searchParams.get('sort')",
+    "searchParams.get('direction')",
+    "searchParams.get('provider')",
+    "searchParams.get('tracking')",
+    "searchParams.get('updatedAfter')",
+  ]) {
+    assert.ok(source.includes(fragment), `Order route is missing ${fragment}`)
+  }
+}
+for (const fragment of [
   'canonicalOrderGlobalId: string | null',
   "promotionStatus: 'not_ready' | 'needs_info' | 'promoted'",
   'remainingBlockerCodes: string[]',
   'resolutionDetailsLoaded: boolean',
   'OperationsImportedOrderWorkingCopyDraft',
   'requestedDeliveryAt: string | null',
+  'updatedAt: string',
+  'trackingNumber: string | null',
+  'orderValueMinor: string | null',
+  'currency: string',
+  'providerTotalMinor: string | null',
 ]) {
   assert.ok(types.includes(fragment), `Result contract is missing ${fragment}`)
 }
@@ -438,6 +561,14 @@ class ShopifyCommerceClientError extends Error {
   }
 }
 
+class FaireCommerceClientError extends Error {
+  constructor(message, status = 502, code = 'FAIRE_UPSTREAM_FAILED') {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
 const organizationId = 'bb13beb0-2b75-48a2-8b1d-2bd154950668'
 const actorEmail = 'workbench-route@example.test'
 const candidateGlobalId = 'gcoc1000001'
@@ -451,9 +582,14 @@ const rebaseCalls = []
 let historyReadError = null
 let historyAppendError = null
 let historyReplay = null
+let refreshProvider = 'shopify'
 const idempotencyModule = loadTypeScriptSourceModule(
   idempotency,
   'app_src/lib/operations/orderWorkbenchIdempotency.ts',
+)
+const orderListQueryModule = loadTypeScriptSourceModule(
+  orderListQuery,
+  'app_src/lib/operations/orderListQuery.ts',
 )
 const workbenchRoute = loadTypeScriptSourceModule(
   route,
@@ -478,13 +614,18 @@ const workbenchRoute = loadTypeScriptSourceModule(
       },
     },
     '@/lib/integrations/commerceOrderHistory': {
+      exactFaireOrderHistoryProviderReads(error) {
+        return Number.isSafeInteger(error?.providerReads)
+          ? error.providerReads
+          : null
+      },
       exactShopifyOrderHistoryProviderReads(error) {
         return Number.isSafeInteger(error?.providerReads)
           ? error.providerReads
           : null
       },
       async readExactShopifyOrderHistoryObservation(input) {
-        historyReadCalls.push(input)
+        historyReadCalls.push({ provider: 'shopify', ...input })
         if (historyReadError) throw historyReadError
         return {
           observation: {
@@ -493,6 +634,19 @@ const workbenchRoute = loadTypeScriptSourceModule(
             providerReadCount: 3,
           },
           providerReads: 3,
+          providerWrites: 0,
+        }
+      },
+      async readExactFaireOrderHistoryObservation(input) {
+        historyReadCalls.push({ provider: 'faire', ...input })
+        if (historyReadError) throw historyReadError
+        return {
+          observation: {
+            observationKind: 'manual_exact_read',
+            externalOrderId: input.externalOrderId,
+            providerReadCount: 2,
+          },
+          providerReads: 2,
           providerWrites: 0,
         }
       },
@@ -510,6 +664,9 @@ const workbenchRoute = loadTypeScriptSourceModule(
     '@/lib/integrations/shopifyCommerceClient': {
       ShopifyCommerceClientError,
     },
+    '@/lib/integrations/faireCommerceClient': {
+      FaireCommerceClientError,
+    },
     '@/lib/operations/authorization': {
       activeOperationsOrganizationId(actor) {
         return actor.organizationId
@@ -518,6 +675,7 @@ const workbenchRoute = loadTypeScriptSourceModule(
         return actor.capabilities
       },
     },
+    '@/lib/operations/orderListQuery': orderListQueryModule,
     '@/lib/operations/orderWorkbenchIdempotency': idempotencyModule,
     '@/lib/operations/orderShipTo': {
       ORDER_SHIP_TO_FIELDS: [
@@ -544,7 +702,10 @@ const workbenchRoute = loadTypeScriptSourceModule(
       async appendCommerceOrderWorkbenchExactReadInPostgres(input) {
         historyAppendCalls.push(input)
         if (historyAppendError) throw historyAppendError
-        return { providerReads: 3, providerWrites: 0 }
+        return {
+          providerReads: input.provider === 'shopify' ? 3 : 2,
+          providerWrites: 0,
+        }
       },
     },
     '@/lib/persistence/commerceStoreSync': {
@@ -570,8 +731,10 @@ const workbenchRoute = loadTypeScriptSourceModule(
         return {
           accountGlobalId: 'gia1000001',
           integrationAccountId: 'f923a810-9f0d-45ae-865b-cbb4f41553cc',
-          provider: 'shopify',
-          externalOrderId: 'gid://shopify/Order/1000001',
+          provider: refreshProvider,
+          externalOrderId: refreshProvider === 'shopify'
+            ? 'gid://shopify/Order/1000001'
+            : 'faire-order-1000001',
           credentialGeneration: 1,
           candidateGlobalId: latestTargetCandidateGlobalId,
           candidateRowVersion: 0,
@@ -593,7 +756,7 @@ const workbenchRoute = loadTypeScriptSourceModule(
         }
       },
       async readCommerceOrderWorkbenchFromPostgres() {
-        return [{ candidateGlobalId, provider: 'shopify' }]
+        return [{ candidateGlobalId, provider: refreshProvider }]
       },
     },
     '@/lib/requestUser': {
@@ -657,6 +820,7 @@ assert.deepEqual(
   {
     organizationId,
     integrationAccountId: 'f923a810-9f0d-45ae-865b-cbb4f41553cc',
+    provider: 'shopify',
     externalOrderId: 'gid://shopify/Order/1000001',
     intentKey: `order-workbench-history:${inboundIdempotencyKey}:${candidateGlobalId}`,
   },
@@ -736,6 +900,42 @@ assert.deepEqual(
 )
 historyReadError = null
 
+historyReadError = new CommerceOrderSyncError(
+  'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
+  'The exact order exceeds a bounded nested page',
+  409,
+)
+historyReadError.providerReads = 3
+const nestedPageResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'e465df0f-7701-43c3-bd15-19a6cf3a3fee',
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(nestedPageResponse.status, 200)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    (await nestedPageResponse.json()).historyRefresh,
+  )),
+  {
+    status: 'unavailable',
+    code: 'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
+    providerReads: 3,
+    providerWrites: 0,
+  },
+  'a bounded nested-page limit must preserve the refreshed order and complete the read fence',
+)
+historyReadError = null
+
 historyReplay = {
   status: 'unavailable',
   code: 'COMMERCE_ORDER_HISTORY_PREVIOUSLY_UNAVAILABLE',
@@ -765,8 +965,43 @@ assert.deepEqual(
   historyReplay,
   'a same-key unavailable result must replay without a duplicate provider read',
 )
-assert.equal(historyReadCalls.length, 2)
+assert.equal(historyReadCalls.length, 3)
 historyReplay = null
+
+refreshProvider = 'faire'
+const faireRefreshResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': '8718b11d-9efb-49b7-b8af-d95c072a9d14',
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(faireRefreshResponse.status, 200)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    (await faireRefreshResponse.json()).historyRefresh,
+  )),
+  {
+    status: 'captured',
+    code: null,
+    providerReads: 2,
+    providerWrites: 0,
+  },
+)
+assert.equal(historyReadCalls.at(-1).provider, 'faire')
+assert.equal(historyReadCalls.at(-1).externalOrderId, 'faire-order-1000001')
+assert.equal(historyAppendCalls.at(-1).provider, 'faire')
+assert.equal(historyAppendCalls.at(-1).observation.providerReadCount, 2)
+assert.equal(historyReplayCalls.at(-1).provider, 'faire')
+refreshProvider = 'shopify'
 
 historyAppendError = new Error('exact history append failed')
 const persistenceFailureResponse = await workbenchRoute.POST(new Request(

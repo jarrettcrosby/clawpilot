@@ -846,9 +846,12 @@ async function seedTerminalProviderObservation(pool, fixture, key) {
 async function seedNewerTerminalProviderCandidate(pool, fixture) {
   const runId = randomUUID()
   const candidateId = randomUUID()
+  const customerId = randomUUID()
   const runGlobalId = 'gcir0009715'
   const candidateGlobalId = 'gcoc0009715'
   const externalLineId = 'gid://shopify/LineItem/latest-terminal-0009715'
+  const orderNumber = '#LATEST-TERMINAL-9715'
+  const customerName = 'Zulu Terminal Customer'
   const client = await pool.connect()
   try {
     await client.query('SET session_replication_role = replica')
@@ -882,6 +885,24 @@ async function seedNewerTerminalProviderCandidate(pool, fixture) {
         fixture.pipeline,
         `workbench-run-${runGlobalId}`,
         'd'.repeat(64),
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO crm_organizations (
+         id, pipeline_id, source_key, name, source_payload, source_hash,
+         identity_key, relationship_type, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, '{}'::jsonb, $5,
+         $6, 'customer', $7, $7
+       )`,
+      [
+        customerId,
+        fixture.pipeline,
+        'workbench-latest-terminal-customer',
+        customerName,
+        '5'.repeat(64),
+        'customer:workbench-latest-terminal',
         actorEmail,
       ],
     )
@@ -922,8 +943,8 @@ async function seedNewerTerminalProviderCandidate(pool, fixture) {
         fixture.pipeline,
         runId,
         `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
-        `#${fixture.candidateGlobalId.slice(-7)}`,
-        fixture.customer,
+        orderNumber,
+        customerId,
         'workbench-latest-terminal-source',
         '7'.repeat(64),
         actorEmail,
@@ -974,7 +995,13 @@ async function seedNewerTerminalProviderCandidate(pool, fixture) {
         actorEmail,
       ],
     )
-    return { candidateId, candidateGlobalId, externalLineId }
+    return {
+      candidateId,
+      candidateGlobalId,
+      externalLineId,
+      orderNumber,
+      customerName,
+    }
   } finally {
     await client.query('SET session_replication_role = origin').catch(() => {})
     client.release()
@@ -987,11 +1014,65 @@ async function seedExactTerminalProviderHistory(
   terminalCandidate,
 ) {
   const leaseId = randomUUID()
+  const warehouseId = randomUUID()
+  const locationId = randomUUID()
+  const inventoryPoolId = randomUUID()
+  const locationMappingId = randomUUID()
+  const providerLocationId = 'gid://shopify/Location/exact-history-0009715'
+  const warehouseName = 'Current exact-history warehouse'
   const exactOnlyExternalLineId =
     'gid://shopify/LineItem/exact-history-only-0009715'
   const client = await pool.connect()
   try {
     await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO operations_warehouses (
+         id, global_id, organization_id, code, name, status
+       ) VALUES (
+         $1::uuid, 'gwh9715001', $2::uuid,
+         'EXACT-HISTORY', $3, 'active'
+       )`,
+      [warehouseId, fixture.organization, warehouseName],
+    )
+    await client.query(
+      `INSERT INTO operations_locations (
+         id, global_id, organization_id, warehouse_id, code, active
+       ) VALUES (
+         $1::uuid, 'gwl9715001', $2::uuid, $3::uuid,
+         'EXACT-HISTORY-PICK', true
+       )`,
+      [locationId, fixture.organization, warehouseId],
+    )
+    await client.query(
+      `INSERT INTO operations_inventory_pools (
+         id, global_id, organization_id, pipeline_id, name, pool_type
+       ) VALUES (
+         $1::uuid, 'gip9715001', $2::uuid, $3::uuid,
+         'Exact history current mapping', 'shared'
+       )`,
+      [inventoryPoolId, fixture.organization, fixture.pipeline],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_inventory_location_mappings (
+         id, global_id, organization_id, integration_account_id,
+         external_location_id, external_location_name,
+         warehouse_id, location_id, inventory_pool_id,
+         mapping_method, active
+       ) VALUES (
+         $1::uuid, 'gilm9715001', $2::uuid, $3::uuid,
+         $4, 'Exact history provider location',
+         $5::uuid, $6::uuid, $7::uuid, 'manual', true
+       )`,
+      [
+        locationMappingId,
+        fixture.organization,
+        fixture.integration,
+        providerLocationId,
+        warehouseId,
+        locationId,
+        inventoryPoolId,
+      ],
+    )
     await client.query(
       `INSERT INTO operations_commerce_store_sync_controls (
          organization_id, integration_account_id, desired_state,
@@ -1032,12 +1113,13 @@ async function seedExactTerminalProviderHistory(
          observation_kind, external_order_id, order_number,
          source_revision, source_hash, canonical_lifecycle_state,
          canonical_payment_state, canonical_fulfillment_state,
-         canonical_return_state, provider_updated_at, observed_at,
-         provider_read_count
+         canonical_return_state, currency, provider_total_minor,
+         provider_updated_at, observed_at, provider_read_count
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, 'shopify', 1,
          'manual_exact_read', $4, $5, $6, $7,
          'closed', 'paid', 'fulfilled', 'returned',
+         'CAD', 7654,
          now() + interval '4 seconds', now() + interval '4 seconds', 3
        ) RETURNING id::text, global_id, observed_at`,
       [
@@ -1054,17 +1136,26 @@ async function seedExactTerminalProviderHistory(
       `INSERT INTO operations_commerce_order_observation_lines (
          organization_id, observation_id, external_line_id,
          external_product_id, external_variant_id, sku,
+         title_snapshot, variant_title_snapshot, vendor_snapshot,
          original_quantity, current_quantity, unfulfilled_quantity,
-         fulfilled_quantity, returned_quantity, requires_shipping
+         fulfilled_quantity, returned_quantity, requires_shipping,
+         unit_price_currency, unit_price_minor,
+         subtotal_currency, subtotal_minor,
+         discount_currency, discount_minor,
+         tax_currency, tax_minor
        ) VALUES
          ($1::uuid, $2::uuid, $3,
           'gid://shopify/Product/exact-matched',
           'gid://shopify/ProductVariant/exact-matched', 'EXACT-MATCHED',
-          9, 8, 0, 8, 3, true),
+          'Current exact matched title', 'Current case', 'Current vendor',
+          9, 8, 0, 8, 3, true,
+          'CAD', 900, 'CAD', 7200, 'CAD', 500, 'CAD', 0),
          ($1::uuid, $2::uuid, $4,
           'gid://shopify/Product/exact-only',
           'gid://shopify/ProductVariant/exact-only', 'EXACT-ONLY-SKU',
-          2, 1, 0, 1, 1, true)`,
+          'Current exact-only title', NULL, 'Current vendor',
+          2, 1, 0, 1, 1, true,
+          'CAD', 454, 'CAD', 454, 'CAD', 0, 'CAD', 0)`,
       [
         fixture.organization,
         observation.id,
@@ -1072,10 +1163,47 @@ async function seedExactTerminalProviderHistory(
         exactOnlyExternalLineId,
       ],
     )
+    const trackingNumber = '1ZEXACTWORKBENCH0009715'
+    const trackingEvent = (await client.query(
+      `INSERT INTO operations_commerce_order_event_observations (
+         organization_id, integration_account_id, observation_id,
+         provider, external_order_id, external_event_id,
+         external_subject_id, event_hash, event_kind, event_status,
+         attribution_source, tracking_carrier, tracking_number,
+         tracking_url, provider_location_id, sensitive_evidence_expires_at,
+         occurred_at, observed_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', $4,
+         'workbench-exact-tracking-0009715',
+         'workbench-exact-shipment-0009715', $5,
+         'tracking_updated', 'delivered', 'provider_system', 'UPS', $6,
+         'https://www.ups.com/track?tracknum=1ZEXACTWORKBENCH0009715',
+         $7, $8::timestamptz + interval '30 days',
+         $8::timestamptz + interval '1 day',
+         $8::timestamptz + interval '1 day'
+       )
+       RETURNING occurred_at`,
+      [
+        fixture.organization,
+        fixture.integration,
+        observation.id,
+        `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
+        '4'.repeat(64),
+        trackingNumber,
+        providerLocationId,
+        observation.observed_at,
+      ],
+    )).rows[0]
     return {
       exactOnlyExternalLineId,
       observationGlobalId: observation.global_id,
       observedAt: observation.observed_at.toISOString(),
+      currency: 'CAD',
+      providerTotalMinor: '7654',
+      locationId,
+      warehouseName,
+      trackingActivityAt: trackingEvent.occurred_at.toISOString(),
+      trackingNumber,
     }
   } finally {
     await client.query('SET session_replication_role = origin').catch(() => {})
@@ -1554,6 +1682,12 @@ function workbenchPersistence(pool) {
     {
       '@/lib/auditWriter': auditPersistence(pool),
       '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/operations/providerOrderMoney': loadTypeScriptModule(
+        'app_src/lib/operations/providerOrderMoney.ts',
+      ),
+      '@/lib/operations/providerOrderHistory': loadTypeScriptModule(
+        'app_src/lib/operations/providerOrderHistory.ts',
+      ),
       '@/lib/persistence/commerceIntake': candidateResolver,
       '@/lib/persistence/commerceIntegrations': runtimePersistence,
       '@/lib/persistence/commerceOrderSync': {
@@ -1600,10 +1734,16 @@ function workbenchPersistence(pool) {
           }
           const lines = (await pool.query(
             `SELECT external_line_id, external_product_id,
-                    external_variant_id, sku, original_quantity::text,
+                    external_variant_id, sku,
+                    title_snapshot, variant_title_snapshot, vendor_snapshot,
+                    original_quantity::text,
                     current_quantity::text, unfulfilled_quantity::text,
                     fulfilled_quantity::text, returned_quantity::text,
-                    requires_shipping
+                    requires_shipping,
+                    unit_price_currency, unit_price_minor::text,
+                    subtotal_currency, subtotal_minor::text,
+                    discount_currency, discount_minor::text,
+                    tax_currency, tax_minor::text
              FROM operations_commerce_order_observation_lines
              WHERE organization_id = $1::uuid
                AND observation_id = $2::uuid
@@ -1632,6 +1772,9 @@ function workbenchPersistence(pool) {
                   externalProductId: line.external_product_id,
                   externalVariantId: line.external_variant_id,
                   sku: line.sku,
+                  titleSnapshot: line.title_snapshot,
+                  variantTitleSnapshot: line.variant_title_snapshot,
+                  vendorSnapshot: line.vendor_snapshot,
                   originalQuantity: Number(line.original_quantity),
                   currentQuantity: line.current_quantity === null
                     ? null
@@ -1646,6 +1789,14 @@ function workbenchPersistence(pool) {
                     ? null
                     : Number(line.returned_quantity),
                   requiresShipping: line.requires_shipping,
+                  unitPriceCurrency: line.unit_price_currency,
+                  unitPriceMinor: line.unit_price_minor,
+                  subtotalCurrency: line.subtotal_currency,
+                  subtotalMinor: line.subtotal_minor,
+                  discountCurrency: line.discount_currency,
+                  discountMinor: line.discount_minor,
+                  taxCurrency: line.tax_currency,
+                  taxMinor: line.tax_minor,
                 })),
               },
             }],
@@ -1967,6 +2118,12 @@ async function verifyAcceptance(
       observedAt: failedRetained[0].providerState.observedAt,
       source: 'retained',
     })
+    assert.equal(failedRetained[0].workflowState, 'failed')
+    assert.equal(
+      failedRetained[0].actionAvailable,
+      false,
+      'a retained failed candidate must remain visible without looking ready',
+    )
     const latestTerminalCandidate = await seedNewerTerminalProviderCandidate(
       pool,
       failedRetainedFixture,
@@ -1985,6 +2142,43 @@ async function verifyAcceptance(
       failedRetainedTerminalSummary[0].providerHistory.observedAt,
       exactTerminalHistory.observedAt,
       'summary rows must expose the latest persisted exact-history observation marker',
+    )
+    assert.equal(
+      failedRetainedTerminalSummary[0].orderNumber,
+      latestTerminalCandidate.orderNumber,
+      'terminal summary identity must use the same latest snapshot as display',
+    )
+    assert.equal(
+      failedRetainedTerminalSummary[0].customerName,
+      latestTerminalCandidate.customerName,
+      'terminal customer sort and search identity must match the displayed snapshot',
+    )
+    assert.equal(
+      failedRetainedTerminalSummary[0].orderValueMinor,
+      exactTerminalHistory.providerTotalMinor,
+      'a current exact provider observation must replace a stale candidate header total',
+    )
+    assert.equal(
+      failedRetainedTerminalSummary[0].currency,
+      exactTerminalHistory.currency,
+      'the exact provider total must retain its own currency',
+    )
+    assert.deepEqual(
+      {
+        currency: failedRetainedTerminalSummary[0].providerHistory.currency,
+        providerTotalMinor:
+          failedRetainedTerminalSummary[0].providerHistory.providerTotalMinor,
+      },
+      {
+        currency: exactTerminalHistory.currency,
+        providerTotalMinor: exactTerminalHistory.providerTotalMinor,
+      },
+      'summary provider history must carry current exact header money without loading lines',
+    )
+    assert.equal(
+      failedRetainedTerminalSummary[0].warehouseName,
+      exactTerminalHistory.warehouseName,
+      'imported rows must project the current active provider-location mapping',
     )
     assert.deepEqual(
       failedRetainedTerminalSummary[0].providerHistory.currentLines,
@@ -2025,6 +2219,223 @@ async function verifyAcceptance(
       'the exact provider observation must retain its complete line snapshot',
     )
     assert.deepEqual(
+      {
+        orderValueMinor: failedRetainedTerminal[0].orderValueMinor,
+        currency: failedRetainedTerminal[0].providerHistory.currency,
+        providerTotalMinor:
+          failedRetainedTerminal[0].providerHistory.providerTotalMinor,
+      },
+      {
+        orderValueMinor: exactTerminalHistory.providerTotalMinor,
+        currency: exactTerminalHistory.currency,
+        providerTotalMinor: exactTerminalHistory.providerTotalMinor,
+      },
+      'detail history must retain the exact provider header instead of summing adjusted lines',
+    )
+    assert.equal(
+      failedRetainedTerminal[0].trackingNumber,
+      exactTerminalHistory.trackingNumber,
+      'the imported summary must expose current unredacted tracking evidence',
+    )
+    assert.equal(
+      failedRetainedTerminal[0].updatedAt,
+      exactTerminalHistory.trackingActivityAt,
+      'imported activity time must include the latest provider tracking event',
+    )
+    const searchedExactSku = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        search: 'EXACT-ONLY-SKU',
+      }))
+    assert.deepEqual(
+      searchedExactSku.map((order) => order.candidateGlobalId),
+      [failedRetainedFixture.candidateGlobalId],
+      'imported search must include exact provider-history SKUs',
+    )
+    const searchedTracking = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        search: exactTerminalHistory.trackingNumber,
+      }))
+    assert.deepEqual(
+      searchedTracking.map((order) => order.candidateGlobalId),
+      [failedRetainedFixture.candidateGlobalId],
+      'imported search must include unredacted tracking evidence',
+    )
+    for (const displaySearch of [
+      latestTerminalCandidate.orderNumber,
+      latestTerminalCandidate.customerName,
+    ]) {
+      const searchedDisplayIdentity = plain(await persistence
+        .readCommerceOrderWorkbenchFromPostgres({
+          organizationId: failedRetainedFixture.organization,
+          search: displaySearch,
+        }))
+      assert.deepEqual(
+        searchedDisplayIdentity.map((order) => order.candidateGlobalId),
+        [failedRetainedFixture.candidateGlobalId],
+        'terminal search must use the same order and customer identity shown to users',
+      )
+    }
+    const trackingPresent = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        tracking: 'present',
+      }))
+    assert.equal(trackingPresent.orders.length, 1)
+    const trackingMissing = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        tracking: 'missing',
+      }))
+    assert.equal(trackingMissing.orders.length, 0)
+    const shopifyOnly = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        provider: 'shopify',
+      }))
+    assert.equal(shopifyOnly.orders.length, 1)
+    const faireOnly = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        provider: 'faire',
+      }))
+    assert.equal(faireOnly.orders.length, 0)
+    const oneMillisecondBeforeActivity = new Date(
+      Date.parse(failedRetainedTerminal[0].updatedAt) - 1,
+    ).toISOString()
+    const updatedAfterEarlier = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        updatedAfter: oneMillisecondBeforeActivity,
+      }))
+    assert.equal(updatedAfterEarlier.orders.length, 1)
+    const updatedAfterExact = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        updatedAfter: failedRetainedTerminal[0].updatedAt,
+      }))
+    assert.equal(updatedAfterExact.orders.length, 0)
+    const unrelatedTrackingStateAt = new Date(
+      Date.parse(exactTerminalHistory.trackingActivityAt) + 43_200_000,
+    ).toISOString()
+    const unrelatedTrackingStateSeed = await pool.connect()
+    try {
+      await unrelatedTrackingStateSeed.query(
+        'SET session_replication_role = replica',
+      )
+      await unrelatedTrackingStateSeed.query(
+        `INSERT INTO operations_commerce_order_event_observations (
+         organization_id, integration_account_id, observation_id,
+         provider, external_order_id, external_event_id,
+         external_subject_id, event_hash, event_kind, event_status,
+         attribution_source, tracking_carrier, tracking_number,
+         tracking_url, sensitive_evidence_expires_at,
+         occurred_at, observed_at
+       )
+       SELECT $1::uuid, $2::uuid, observation.id, 'shopify', $3,
+              'workbench-unrelated-tracking-state-0009715',
+              'workbench-unrelated-shipment-0009715', $4,
+              'tracking_updated', 'fulfilled', 'provider_system',
+              NULL, NULL, NULL, $5::timestamptz + interval '30 days',
+              $5::timestamptz, $5::timestamptz
+       FROM operations_commerce_order_observations observation
+       WHERE observation.organization_id = $1::uuid
+         AND observation.global_id = $6`,
+        [
+          failedRetainedFixture.organization,
+          failedRetainedFixture.integration,
+          `gid://shopify/Order/${failedRetainedFixture.candidateGlobalId.slice(-7)}`,
+          '2'.repeat(64),
+          unrelatedTrackingStateAt,
+          exactTerminalHistory.observationGlobalId,
+        ],
+      )
+    } finally {
+      await unrelatedTrackingStateSeed.query(
+        'SET session_replication_role = origin',
+      ).catch(() => {})
+      unrelatedTrackingStateSeed.release()
+    }
+    const unrelatedTrackingState = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        tracking: 'present',
+      }))
+    assert.equal(unrelatedTrackingState.orders.length, 1)
+    assert.equal(
+      unrelatedTrackingState.orders[0].trackingNumber,
+      exactTerminalHistory.trackingNumber,
+      'a newer blank state for another fulfillment must not hide current tracking',
+    )
+    assert.equal(
+      unrelatedTrackingState.orders[0].updatedAt,
+      unrelatedTrackingStateAt,
+      'an unrelated fulfillment update must still advance imported order activity',
+    )
+    const searchedTrackingAfterUnrelatedState = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        search: exactTerminalHistory.trackingNumber,
+      }))
+    assert.deepEqual(
+      searchedTrackingAfterUnrelatedState.orders.map(
+        (order) => order.candidateGlobalId,
+      ),
+      [failedRetainedFixture.candidateGlobalId],
+      'tracking search must retain another fulfillment current tracking number',
+    )
+    const trackingRemovedAt = new Date(
+      Date.parse(exactTerminalHistory.trackingActivityAt) + 86_400_000,
+    ).toISOString()
+    const trackingRemovalSeed = await pool.connect()
+    try {
+      await trackingRemovalSeed.query('SET session_replication_role = replica')
+      await trackingRemovalSeed.query(
+        `INSERT INTO operations_commerce_order_event_observations (
+         organization_id, integration_account_id, observation_id,
+         provider, external_order_id, external_event_id,
+         external_subject_id, event_hash, event_kind, event_status,
+         attribution_source, tracking_carrier, tracking_number,
+         tracking_url, sensitive_evidence_expires_at,
+         occurred_at, observed_at
+       )
+       SELECT $1::uuid, $2::uuid, observation.id, 'shopify', $3,
+              'workbench-tracking-removed-0009715',
+              'workbench-exact-shipment-0009715', $4,
+              'tracking_updated', 'fulfilled', 'provider_system',
+              NULL, NULL, NULL, $5::timestamptz + interval '30 days',
+              $5::timestamptz, $5::timestamptz
+       FROM operations_commerce_order_observations observation
+       WHERE observation.organization_id = $1::uuid
+         AND observation.global_id = $6`,
+        [
+          failedRetainedFixture.organization,
+          failedRetainedFixture.integration,
+          `gid://shopify/Order/${failedRetainedFixture.candidateGlobalId.slice(-7)}`,
+          '3'.repeat(64),
+          trackingRemovedAt,
+          exactTerminalHistory.observationGlobalId,
+        ],
+      )
+    } finally {
+      await trackingRemovalSeed.query('SET session_replication_role = origin')
+        .catch(() => {})
+      trackingRemovalSeed.release()
+    }
+    const removedTrackingState = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        tracking: 'missing',
+      }))
+    assert.equal(removedTrackingState.orders.length, 1)
+    assert.equal(removedTrackingState.orders[0].trackingNumber, null)
+    assert.equal(
+      removedTrackingState.orders[0].updatedAt,
+      trackingRemovedAt,
+      'a newer no-tracking event must replace stale tracking and remain activity',
+    )
+    assert.deepEqual(
       Object.fromEntries(failedRetainedTerminal[0].lines.map((line) => [
         line.externalLineId,
         {
@@ -2043,7 +2454,7 @@ async function verifyAcceptance(
       ])),
       {
         [latestTerminalCandidate.externalLineId]: {
-          title: 'Latest externally fulfilled item',
+          title: 'Current exact matched title',
           sku: 'EXACT-MATCHED',
           quantity: 0,
           orderedQuantity: 9,
@@ -2056,7 +2467,7 @@ async function verifyAcceptance(
           blockerCodes: [],
         },
         [exactTerminalHistory.exactOnlyExternalLineId]: {
-          title: 'EXACT-ONLY-SKU',
+          title: 'Current exact-only title',
           sku: 'EXACT-ONLY-SKU',
           quantity: 0,
           orderedQuantity: 2,
@@ -2071,10 +2482,109 @@ async function verifyAcceptance(
       },
       'terminal detail must prefer exact-observation adjustments and include history-only lines from the latest provider revision',
     )
+    assert.deepEqual(
+      Object.fromEntries(failedRetainedTerminal[0].lines.map((line) => [
+        line.externalLineId,
+        {
+          unitPriceMinor: line.unitPriceMinor,
+          currency: line.currency,
+          priceStatus: line.priceStatus,
+        },
+      ])),
+      {
+        [latestTerminalCandidate.externalLineId]: {
+          unitPriceMinor: 900,
+          currency: 'CAD',
+          priceStatus: 'provider',
+        },
+        [exactTerminalHistory.exactOnlyExternalLineId]: {
+          unitPriceMinor: 454,
+          currency: 'CAD',
+          priceStatus: 'provider',
+        },
+      },
+      'terminal detail must use the latest exact provider line prices and currencies',
+    )
     assert.equal(
       failedRetainedTerminal[0].blockerCodes.includes('packaging_required'),
       false,
       'terminal line history must not reintroduce active packaging blockers',
+    )
+    await pool.query(
+      `UPDATE operations_locations
+       SET active = false
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [failedRetainedFixture.organization, exactTerminalHistory.locationId],
+    )
+    const inactiveLocationProjection = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+      }))
+    assert.equal(
+      inactiveLocationProjection[0].warehouseName,
+      null,
+      'an inactive operations location must clear the current mapped warehouse',
+    )
+    const newerCandidateRevision = await pool.connect()
+    try {
+      await newerCandidateRevision.query('SET session_replication_role = replica')
+      await newerCandidateRevision.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_updated_at = now() + interval '8 seconds'
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          failedRetainedFixture.organization,
+          latestTerminalCandidate.candidateId,
+        ],
+      )
+    } finally {
+      await newerCandidateRevision.query('SET session_replication_role = origin')
+        .catch(() => {})
+      newerCandidateRevision.release()
+    }
+    const newerCandidateProjection = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+      }))
+    assert.deepEqual(
+      {
+        orderValueMinor: newerCandidateProjection[0].orderValueMinor,
+        currency: newerCandidateProjection[0].currency,
+        providerHistoryCurrency:
+          newerCandidateProjection[0].providerHistory.currency,
+        providerHistoryTotalMinor:
+          newerCandidateProjection[0].providerHistory.providerTotalMinor,
+      },
+      {
+        orderValueMinor: '5000',
+        currency: 'USD',
+        providerHistoryCurrency: null,
+        providerHistoryTotalMinor: null,
+      },
+      'an older exact observation must not override the current provider revision',
+    )
+    const newerCandidateDetail = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(
+      newerCandidateDetail[0].lineCount,
+      1,
+      'an older exact observation must not replace newer provider-candidate lines',
+    )
+    assert.deepEqual(
+      newerCandidateDetail[0].lines.map((line) => line.externalLineId),
+      [latestTerminalCandidate.externalLineId],
+      'terminal detail must display the current provider revision, not stale exact-history adjustments',
+    )
+    assert.deepEqual(
+      newerCandidateDetail[0].providerHistory.currentLines,
+      [],
+      'a newer provider revision must suppress stale exact-history line details',
     )
     const failedRetainedTerminalState = await stateCounts(
       pool,
@@ -2820,6 +3330,170 @@ async function verifyAcceptance(
       'keyset pages must include each current provider order exactly once',
     )
     assert.ok(firstBoundaryCursor)
+    const yearZeroCursorPayload = JSON.parse(
+      Buffer.from(firstBoundaryCursor, 'base64url').toString('utf8'),
+    )
+    yearZeroCursorPayload.sortValue = '0000-01-01T00:00:00.000Z'
+    const yearZeroCursor = Buffer.from(
+      JSON.stringify(yearZeroCursorPayload),
+      'utf8',
+    ).toString('base64url')
+    await expectWorkbenchError(
+      () => persistence.readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: primary.organization,
+        cursor: yearZeroCursor,
+        pageSize: 100,
+      }),
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      400,
+    )
+    const orderNumberSorted = []
+    let orderNumberCursor = null
+    do {
+      const page = plain(await persistence
+        .readCommerceOrderWorkbenchPageFromPostgres({
+          organizationId: primary.organization,
+          sort: 'order_number',
+          direction: 'asc',
+          cursor: orderNumberCursor,
+          pageSize: 250,
+        }))
+      orderNumberSorted.push(...page.orders)
+      orderNumberCursor = page.page.nextCursor
+    } while (orderNumberCursor)
+    const expectedOrderNumberSort = await pool.query(
+      `SELECT candidate.global_id
+       FROM operations_commerce_order_candidates candidate
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.canonical_order_id IS NULL
+         AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         AND candidate.expires_at > now()
+       ORDER BY lower(candidate.order_number_snapshot) ASC,
+                candidate.id ASC`,
+      [primary.organization],
+    )
+    assert.deepEqual(
+      orderNumberSorted.map((order) => order.candidateGlobalId),
+      expectedOrderNumberSort.rows.map((row) => row.global_id),
+      'order-number keyset pages must use the selected sort tuple exactly once',
+    )
+    const missingCustomerSorted = []
+    let missingCustomerCursor = null
+    do {
+      const page = plain(await persistence
+        .readCommerceOrderWorkbenchPageFromPostgres({
+          organizationId: primary.organization,
+          sort: 'customer',
+          direction: 'asc',
+          cursor: missingCustomerCursor,
+          pageSize: 250,
+        }))
+      missingCustomerSorted.push(...page.orders)
+      missingCustomerCursor = page.page.nextCursor
+    } while (missingCustomerCursor)
+    assert.equal(
+      missingCustomerSorted.length,
+      boundaryCount.rows[0].count,
+      'empty customer sort keys must remain valid across every keyset page',
+    )
+    assert.equal(
+      new Set(missingCustomerSorted.map((order) => order.candidateGlobalId)).size,
+      boundaryCount.rows[0].count,
+      'customer sorting must not skip orders with missing customer names',
+    )
+    const longCustomerId = randomUUID()
+    await pool.query(
+      `INSERT INTO crm_organizations (
+         id, pipeline_id, source_key, name, source_payload, source_hash,
+         identity_key, relationship_type, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, '{}'::jsonb, $5,
+         $6, 'customer', $7, $7
+       )`,
+      [
+        longCustomerId,
+        primary.pipeline,
+        'workbench-long-cursor-customer',
+        '客'.repeat(500),
+        '9'.repeat(64),
+        'customer:workbench-long-cursor',
+        actorEmail,
+      ],
+    )
+    await pool.query(
+      `UPDATE operations_commerce_order_candidates
+       SET customer_resolution_state = 'resolved',
+           customer_match_method = 'exact_name', customer_id = $2::uuid,
+           row_version = row_version + 1
+       WHERE organization_id = $1::uuid
+         AND external_order_id LIKE 'gid://shopify/Order/boundary-%'`,
+      [primary.organization, longCustomerId],
+    )
+    const longCustomerFirstPage = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: primary.organization,
+        search: '#BOUNDARY-',
+        sort: 'customer',
+        direction: 'asc',
+        pageSize: 1,
+      }))
+    assert.ok(longCustomerFirstPage.page.nextCursor)
+    assert.ok(
+      longCustomerFirstPage.page.nextCursor.length > 2000,
+      'multibyte customer evidence must exceed the former cursor envelope',
+    )
+    assert.ok(longCustomerFirstPage.page.nextCursor.length <= 4096)
+    const longCustomerSecondPage = plain(await persistence
+      .readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: primary.organization,
+        search: '#BOUNDARY-',
+        sort: 'customer',
+        direction: 'asc',
+        cursor: longCustomerFirstPage.page.nextCursor,
+        pageSize: 1,
+      }))
+    assert.equal(longCustomerSecondPage.orders.length, 1)
+    assert.notEqual(
+      longCustomerSecondPage.orders[0].candidateGlobalId,
+      longCustomerFirstPage.orders[0].candidateGlobalId,
+    )
+    const nulCustomerCursorPayload = JSON.parse(
+      Buffer.from(
+        longCustomerFirstPage.page.nextCursor,
+        'base64url',
+      ).toString('utf8'),
+    )
+    nulCustomerCursorPayload.sortValue = 'forged\u0000customer'
+    const nulCustomerCursor = Buffer.from(
+      JSON.stringify(nulCustomerCursorPayload),
+      'utf8',
+    ).toString('base64url')
+    await expectWorkbenchError(
+      () => persistence.readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: primary.organization,
+        search: '#BOUNDARY-',
+        sort: 'customer',
+        direction: 'asc',
+        cursor: nulCustomerCursor,
+        pageSize: 1,
+      }),
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      400,
+    )
+    await pool.query(
+      `UPDATE operations_commerce_order_candidates
+       SET customer_resolution_state = 'unresolved',
+           customer_match_method = NULL, customer_id = NULL,
+           row_version = row_version + 1
+       WHERE organization_id = $1::uuid
+         AND external_order_id LIKE 'gid://shopify/Order/boundary-%'`,
+      [primary.organization],
+    )
+    await pool.query(
+      `DELETE FROM crm_organizations
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+      [primary.pipeline, longCustomerId],
+    )
     await expectWorkbenchError(
       () => persistence.readCommerceOrderWorkbenchPageFromPostgres({
         organizationId: primary.organization,
@@ -2830,6 +3504,24 @@ async function verifyAcceptance(
       'OPERATIONS_PAGE_CURSOR_INVALID',
       400,
     )
+    for (const changedScope of [
+      { sort: 'order_number' },
+      { direction: 'asc' },
+      { provider: 'shopify' },
+      { tracking: 'missing' },
+      { updatedAfter: '2026-09-01T00:00:00.000Z' },
+    ]) {
+      await expectWorkbenchError(
+        () => persistence.readCommerceOrderWorkbenchPageFromPostgres({
+          organizationId: primary.organization,
+          cursor: firstBoundaryCursor,
+          pageSize: 100,
+          ...changedScope,
+        }),
+        'OPERATIONS_PAGE_CURSOR_INVALID',
+        400,
+      )
+    }
     const unfilteredBoundary = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({
         organizationId: primary.organization,
@@ -3604,6 +4296,7 @@ async function verifyAcceptance(
     assert.equal(after[0].shipTo.readiness, 'carrier_ready')
     assert.equal(after[0].shipTo.provenance, 'local')
     assert.equal(after[0].shipTo.syncStatus, 'local_only')
+    assert.equal(after[0].actionAvailable, true)
     assert.deepEqual(after[0].shipTo.value, {
       name: 'Vendor Receiving',
       line1: '10 Example Way',
@@ -3624,6 +4317,11 @@ async function verifyAcceptance(
     assert.equal(retainedAfterExpiry[0].rowVersion, 4)
     assert.equal(retainedAfterExpiry[0].shipTo.readiness, 'carrier_ready')
     assert.equal(retainedAfterExpiry[0].providerVersionChanged, false)
+    assert.equal(
+      retainedAfterExpiry[0].actionAvailable,
+      false,
+      'expired candidate or run evidence must never appear ready to fulfill',
+    )
     const expiredSave = plain(await persistence
       .updateCommerceOrderWorkbenchShipToInPostgres({
         organizationId: primary.organization,
