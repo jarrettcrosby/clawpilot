@@ -677,6 +677,7 @@ try {
   const matonCalls = []
   let authTransportFailure = null
   let authTransportStatus = null
+  let authSenderVerification = 'accepted'
   const mockMatonMailFetch = async (profile, pathname, init) => {
     matonCalls.push({ profile, pathname, init })
     if (profile === 'auth' && authTransportFailure) throw authTransportFailure
@@ -685,9 +686,13 @@ try {
     }
     if (pathname.includes('/settings/sendAs/')) {
       const requestedSender = decodeURIComponent(pathname.split('/').at(-1))
+      const authVerificationStatus = ['empty', 'primary'].includes(authSenderVerification)
+        ? ''
+        : authSenderVerification
       return new Response(JSON.stringify({
+        isPrimary: profile === 'auth' && authSenderVerification === 'primary',
         sendAsEmail: requestedSender,
-        verificationStatus: 'accepted',
+        verificationStatus: profile === 'auth' ? authVerificationStatus : 'accepted',
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -814,13 +819,58 @@ try {
   assert.match(rotatedConnectionCalls[0].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
   assert.equal(rotatedConnectionCalls[1].pathname, '/google-mail/gmail/v1/users/me/messages/send')
 
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'primary-empty-auth-gmail-connection'
+  authSenderVerification = 'primary'
+  const callsBeforePrimarySender = matonCalls.length
+  await mailModule.exports.sendAuthMagicCodeEmail({
+    to: 'operator@example.com',
+    code: '567890',
+  })
+  const primarySenderCalls = matonCalls.slice(callsBeforePrimarySender)
+  assert.equal(primarySenderCalls.length, 2)
+  assert.ok(primarySenderCalls.every((call) => call.profile === 'auth'))
+  assert.match(primarySenderCalls[0].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
+  assert.equal(primarySenderCalls[1].pathname, '/google-mail/gmail/v1/users/me/messages/send')
+
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'non-primary-empty-auth-gmail-connection'
+  authSenderVerification = 'empty'
+  const callsBeforeUnverifiedSender = matonCalls.length
+  const platformCallsBeforeUnverifiedSender = matonCalls.filter((call) => call.profile === 'platform').length
+  await assert.rejects(
+    mailModule.exports.sendAuthMagicCodeEmail({
+      to: 'operator@example.com',
+      code: '678901',
+    }),
+    /Authentication mail sender is not verified/,
+  )
+  const unverifiedSenderCalls = matonCalls.slice(callsBeforeUnverifiedSender)
+  assert.equal(unverifiedSenderCalls.length, 1)
+  assert.equal(unverifiedSenderCalls[0].profile, 'auth')
+  assert.equal(matonCalls.filter((call) => call.profile === 'platform').length, platformCallsBeforeUnverifiedSender)
+
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'non-primary-pending-auth-gmail-connection'
+  authSenderVerification = 'pending'
+  const callsBeforePendingSender = matonCalls.length
+  await assert.rejects(
+    mailModule.exports.sendAuthMagicCodeEmail({
+      to: 'operator@example.com',
+      code: '789012',
+    }),
+    /Authentication mail sender is not verified/,
+  )
+  const pendingSenderCalls = matonCalls.slice(callsBeforePendingSender)
+  assert.equal(pendingSenderCalls.length, 1)
+  assert.equal(pendingSenderCalls[0].profile, 'auth')
+  authSenderVerification = 'accepted'
+
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'rotated-personal-auth-gmail-connection'
   authTransportStatus = 503
   const callsBeforeAuthFailure = matonCalls.length
   const platformCallsBeforeAuthFailure = matonCalls.filter((call) => call.profile === 'platform').length
   await assert.rejects(
     mailModule.exports.sendAuthMagicCodeEmail({
       to: 'operator@example.com',
-      code: '567890',
+      code: '890123',
     }),
     /Maton Gmail delivery failed with status 503/,
   )
@@ -837,7 +887,7 @@ try {
   await assert.rejects(
     mailModule.exports.sendAuthMagicCodeEmail({
       to: 'operator@example.com',
-      code: '678901',
+      code: '901234',
     }),
     /simulated authentication mail transport timeout/,
   )

@@ -33,7 +33,7 @@ const apiKey = required('MATON_API_KEY', 16)
 const platformConnectionId = required('MATON_GMAIL_CONNECTION_ID', 8)
 const platformSender = required('CLAWPILOT_MAIL_FROM', 5).toLowerCase()
 if (!platformSender.includes('@') || /[\r\n]/.test(platformSender)) throw new Error('CLAWPILOT_MAIL_FROM is invalid')
-const senderProfiles = [{ sender: platformSender, connectionId: platformConnectionId }]
+const senderProfiles = [{ label: 'Platform', sender: platformSender, connectionId: platformConnectionId }]
 const authConnectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
 const authSender = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim().toLowerCase()
 if (Boolean(authConnectionId) !== Boolean(authSender)) {
@@ -50,14 +50,14 @@ if (authConnectionId) {
   if (authSender === platformSender) {
     throw new Error('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM')
   }
-  senderProfiles.push({ sender: authSender, connectionId: authConnectionId })
+  senderProfiles.push({ label: 'Authentication', sender: authSender, connectionId: authConnectionId })
 }
 if (String(process.env.CAREER_SITE_SUBMISSIONS_ENABLED || '0') === '1') {
   const careerSender = required('CAREER_SITE_MAIL_FROM', 5).toLowerCase()
   if (careerSender !== 'info@suburbiasandwichco.com' || /[\r\n]/.test(careerSender)) {
     throw new Error('CAREER_SITE_MAIL_FROM is invalid')
   }
-  senderProfiles.push({ sender: careerSender, connectionId: platformConnectionId })
+  senderProfiles.push({ label: 'Career site', sender: careerSender, connectionId: platformConnectionId })
 }
 const base = resolveMatonGatewayBaseUrl()
 
@@ -106,12 +106,17 @@ async function verifySender(profile) {
     'sender lookup',
   )
   if (String(data?.sendAsEmail || '').trim().toLowerCase() !== profile.sender) {
-    throw new Error('Gmail returned a different sender identity')
+    throw new Error(`${profile.label} Gmail returned a different sender identity`)
   }
-  if (String(data?.verificationStatus || '').toLowerCase() !== 'accepted') {
-    throw new Error('Gmail sender identity is not accepted')
+  const verificationStatus = String(data?.verificationStatus || '').trim().toLowerCase()
+  if (verificationStatus !== 'accepted' && data?.isPrimary !== true) {
+    throw new Error(`${profile.label} Gmail sender identity is not accepted`)
   }
-  return { sender: profile.sender, verificationStatus: 'accepted' }
+  return {
+    isPrimary: data?.isPrimary === true,
+    sender: profile.sender,
+    verificationStatus: verificationStatus || null,
+  }
 }
 
 async function verify() {

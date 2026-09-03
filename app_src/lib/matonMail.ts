@@ -158,16 +158,19 @@ async function verifySender(profile: MailProfile, sender: string) {
     `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(sender)}`,
     { headers: { Accept: 'application/json' } },
   )
-  if (!response.ok) throw new Error('ClawPilot mail sender is not available')
+  const profileLabel = profile === 'auth' ? 'Authentication' : 'Platform'
+  if (!response.ok) throw new Error(`${profileLabel} mail sender is not available`)
   const data = await response.json().catch(() => ({})) as {
+    isPrimary?: unknown
     sendAsEmail?: unknown
     verificationStatus?: unknown
   }
+  const verificationStatus = String(data.verificationStatus || '').trim().toLowerCase()
   if (
     String(data.sendAsEmail || '').trim().toLowerCase() !== sender
-    || String(data.verificationStatus || '').trim().toLowerCase() !== 'accepted'
+    || (verificationStatus !== 'accepted' && data.isPrimary !== true)
   ) {
-    throw new Error('ClawPilot mail sender is not verified')
+    throw new Error(`${profileLabel} mail sender is not verified`)
   }
   verifiedSenders.set(cacheKey, Date.now() + SENDER_VERIFICATION_TTL_MS)
 }

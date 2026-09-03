@@ -54,7 +54,12 @@ assert.equal(reusedSender.status, 1)
 assert.match(reusedSender.stderr, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
 assert.doesNotMatch(reusedSender.stderr, /FETCH_MUST_NOT_RUN/)
 
-function runWithMockProfiles({ sameProfile }) {
+function runWithMockProfiles({
+  sameProfile,
+  authVerificationStatus = 'accepted',
+  authIsPrimary = false,
+  authReturnedSender = null,
+}) {
   const mockSource = `
     globalThis.fetch = async (url, init) => {
       const connectionId = init.headers['Maton-Connection'];
@@ -71,7 +76,11 @@ function runWithMockProfiles({ sameProfile }) {
       const sender = decodeURIComponent(String(url).split('/').at(-1));
       const expected = isPlatform ? 'stewards@eigenracing.com' : 'jarrettcrosby@gmail.com';
       if (sender !== expected) return new Response('{}', { status: 403 });
-      return Response.json({ sendAsEmail: sender, verificationStatus: 'accepted' });
+      return Response.json({
+        isPrimary: isAuth ? ${JSON.stringify(authIsPrimary)} : false,
+        sendAsEmail: isAuth && ${JSON.stringify(authReturnedSender)} ? ${JSON.stringify(authReturnedSender)} : sender,
+        verificationStatus: isAuth ? ${JSON.stringify(authVerificationStatus)} : 'accepted',
+      });
     };
   `
   return spawnSync(
@@ -94,6 +103,50 @@ function runWithMockProfiles({ sameProfile }) {
 const distinctProfiles = runWithMockProfiles({ sameProfile: false })
 assert.equal(distinctProfiles.status, 0, distinctProfiles.stderr)
 assert.match(distinctProfiles.stdout, /jarrettcrosby@gmail\.com/)
+
+const primaryAuthSender = runWithMockProfiles({
+  sameProfile: false,
+  authVerificationStatus: '',
+  authIsPrimary: true,
+})
+assert.equal(primaryAuthSender.status, 0, primaryAuthSender.stderr)
+assert.match(primaryAuthSender.stdout, /"isPrimary":true/)
+assert.match(primaryAuthSender.stdout, /"verificationStatus":null/)
+
+const unverifiedAuthAlias = runWithMockProfiles({
+  sameProfile: false,
+  authVerificationStatus: '',
+  authIsPrimary: false,
+})
+assert.equal(unverifiedAuthAlias.status, 1)
+assert.match(unverifiedAuthAlias.stderr, /Authentication Gmail sender identity is not accepted/)
+assert.doesNotMatch(unverifiedAuthAlias.stderr, /jarrettcrosby@gmail\.com|auth-gmail-connection/)
+
+const pendingAuthAlias = runWithMockProfiles({
+  sameProfile: false,
+  authVerificationStatus: 'pending',
+  authIsPrimary: false,
+})
+assert.equal(pendingAuthAlias.status, 1)
+assert.match(pendingAuthAlias.stderr, /Authentication Gmail sender identity is not accepted/)
+
+const stringPrimaryAuthAlias = runWithMockProfiles({
+  sameProfile: false,
+  authVerificationStatus: '',
+  authIsPrimary: 'true',
+})
+assert.equal(stringPrimaryAuthAlias.status, 1)
+assert.match(stringPrimaryAuthAlias.stderr, /Authentication Gmail sender identity is not accepted/)
+
+const mismatchedPrimaryAuthSender = runWithMockProfiles({
+  sameProfile: false,
+  authVerificationStatus: '',
+  authIsPrimary: true,
+  authReturnedSender: 'different@example.com',
+})
+assert.equal(mismatchedPrimaryAuthSender.status, 1)
+assert.match(mismatchedPrimaryAuthSender.stderr, /Authentication Gmail returned a different sender identity/)
+assert.doesNotMatch(mismatchedPrimaryAuthSender.stderr, /different@example\.com|jarrettcrosby@gmail\.com/)
 
 const duplicateProfiles = runWithMockProfiles({ sameProfile: true })
 assert.equal(duplicateProfiles.status, 1)
@@ -127,5 +180,7 @@ assert.match(source, /Authentication Gmail account must differ from platform Gma
 assert.match(source, /MATON_AUTH_GMAIL_CONNECTION_ID/)
 assert.match(source, /CLAWPILOT_AUTH_MAIL_FROM/)
 assert.match(source, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
+assert.match(source, /data\?\.isPrimary !== true/)
+assert.match(source, /\$\{profile\.label\} Gmail sender identity is not accepted/)
 
 console.log('Mail sender verifier Maton origin boundary verified')
