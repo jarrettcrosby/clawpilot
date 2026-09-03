@@ -61,16 +61,52 @@ function event(row, overrides = {}) {
 const selectionKeys = ['calendarConnectionId', 'calendarId', 'calendarOrganizerEmail', 'communicationOrganizationId']
 const hasSelection = (row) => selectionKeys.some((key) => Object.hasOwn(row.source_payload || {}, key))
 const active = (row) => !['true', '1', 'yes'].includes(String(row.source_payload?.archived ?? 'false').toLowerCase())
+function outboundAction(row, overrides = {}) {
+  const source = row.source_payload
+  return {
+    pipeline_id: row.pipeline_id, aggregate_type: 'crm_meeting', aggregate_id: row.id,
+    reference_code: row.reference_code, app: 'google-calendar', action_type: 'create_calendar_event',
+    status: 'queued', external_id: null, available_at: '2099-01-01T00:00:00Z',
+    communication_credential_owner_email: source.calendarOwnerEmail,
+    communication_connection_id: source.calendarConnectionId,
+    communication_calendar_id: source.calendarId, communication_identity_email: source.calendarOrganizerEmail,
+    payload: { previousCalendar: {
+      eventId: row.external_event_id, credentialOwnerEmail: source.calendarOwnerEmail,
+      connectionId: source.calendarConnectionId, calendarId: source.calendarId,
+      organizerEmail: source.calendarOrganizerEmail,
+    } }, ...overrides,
+  }
+}
 
 function fixture(rows = [meeting()], options = {}) {
   const state = {
-    rows: copy(rows), staged: [], gets: [], queries: [], authority: [], cursors: new Map(),
+    rows: copy(rows), staged: [], gets: [], queries: [], authority: [], cursors: new Map(), actions: [],
     transaction: false, locked: false, activeConnection: true, access: true, pipelineAccessDisabled: false,
     legacyEvents: options.legacyEvents || [],
   }
   const selected = { owner_email: OWNER, connection_id: options.selectedConnection || 'legacy-primary-connection' }
   async function db(sql, params = [], client = false) {
     state.queries.push({ sql, params, client })
+    if (sql.includes('SELECT 1 FROM crm_integration_actions action')) {
+      assert.ok(sql.includes("action.status IN ('queued', 'processing', 'failed', 'dead')"))
+      assert.ok(!sql.includes('available_at'), 'delayed retry still retains local intent')
+      assert.ok(!sql.includes('FOR UPDATE'), 'avoid action/meeting lock inversion')
+      if (client) assert.equal(state.transaction && state.locked, true)
+      const [pipeline, meetingId, reference, owner, connection, calendar, organizer, eventId] = params
+      const matches = state.actions.filter((action) => {
+        const previous = action.payload?.previousCalendar || {}
+        return action.pipeline_id === pipeline && action.aggregate_type === 'crm_meeting'
+          && action.aggregate_id === meetingId && action.reference_code === reference
+          && action.app === 'google-calendar' && action.action_type === 'create_calendar_event'
+          && ['queued', 'processing', 'failed', 'dead'].includes(action.status)
+          && ((previous.credentialOwnerEmail === owner && previous.connectionId === connection
+            && previous.calendarId === calendar && previous.organizerEmail === organizer && previous.eventId === eventId)
+            || (action.communication_credential_owner_email === owner && action.communication_connection_id === connection
+              && action.communication_calendar_id === calendar && action.communication_identity_email === organizer
+              && (action.external_id === eventId || previous.eventId === eventId)))
+      })
+      return { rows: matches.length ? [{}] : [] }
+    }
     if (sql.includes('SELECT cursor_value')) return { rows: [state.cursors.get(params[2])].filter(Boolean) }
     if (sql.includes('INSERT INTO crm_integration_cursors')) {
       state.cursors.set(params[2], { cursor_value: params[3], last_polled_at: params[4], last_error: params[5] })
@@ -224,6 +260,93 @@ for (const httpStatus of [403, 404, 410]) {
   assert.equal(counts.cancelledEvents, 0)
   assert.equal(state.staged.length, 0, `${httpStatus} is not evidence of cancellation`)
 }
+for (const status of ['queued', 'processing', 'failed', 'dead']) {
+  const row = meeting(1, { subject: 'Newer SuiteCRM intent' })
+  const { state, run } = fixture([row], { event: (row) => event(row, { summary: 'Old provider echo' }) })
+  state.actions.push(outboundAction(row, { status }))
+  const counts = await run()
+  assert.equal(counts.deferredMeetings, 1)
+  assert.equal(counts.errors, 0, 'pending intent is not an ingestion error')
+  assert.equal(counts.meetingsMatched, 0, 'deferred is not reported as successful reconciliation')
+  assert.equal(state.gets.length, 0, `${status} outbound action suppresses stale provider read`)
+  assert.equal(state.staged.length, 0)
+  assert.equal(state.rows[0].subject, 'Newer SuiteCRM intent')
+}
+{
+  const row = meeting()
+  const { state, run } = fixture([row])
+  state.actions.push(outboundAction(row, {
+    communication_credential_owner_email: 'new-owner@example.com',
+    communication_connection_id: 'new-connection', communication_calendar_id: 'new-calendar@example.com',
+    communication_identity_email: 'new-calendar@example.com',
+  }))
+  assert.equal((await run()).deferredMeetings, 1, 'pending move holds the original full previousCalendar tuple')
+  assert.equal(state.gets.length, 0)
+  assert.equal(state.staged.length, 0)
+}
+{
+  const original = meeting()
+  const moved = copy(original)
+  moved.source_payload.calendarConnectionId = 'new-connection'
+  moved.source_payload.calendarId = 'new-calendar@example.com'
+  moved.source_payload.calendarOrganizerEmail = 'new-calendar@example.com'
+  const { state, run } = fixture([moved], {
+    onAuthority: () => { throw new Error('No delivered action exists on the destination yet') },
+  })
+  state.actions.push(outboundAction(original, {
+    communication_connection_id: 'new-connection', communication_calendar_id: 'new-calendar@example.com',
+    communication_identity_email: 'new-calendar@example.com',
+  }))
+  const counts = await run()
+  assert.equal(counts.deferredMeetings, 1, 'already-staged destination holds via action destination plus original event')
+  assert.equal(counts.errors, 0, 'pending move is not a missing-delivered-snapshot error loop')
+  assert.equal(state.authority.length, 0)
+  assert.equal(state.gets.length, 0)
+  assert.equal(state.staged.length, 0)
+}
+for (const timing of ['get', 'lock']) {
+  const row = meeting(1, { subject: 'Newer local intent' })
+  const addPending = (state) => { state.actions.push(outboundAction(row)) }
+  const { state, run } = fixture([row], {
+    ...(timing === 'get' ? { onGet: addPending } : { onLock: addPending }),
+    event: (row) => event(row, { summary: 'Old provider echo' }),
+  })
+  assert.equal((await run()).deferredMeetings, 1)
+  assert.equal(state.gets.length, 1)
+  assert.equal(state.staged.length, 0, 'racing enqueue is checked under the same meeting lock')
+  assert.equal(state.rows[0].source_hash, row.source_hash, 'pending guard is independent of source-hash change')
+}
+for (const unrelated of [
+  (action) => { action.pipeline_id = '10000000-0000-4000-8000-000000000009' },
+  (action) => { action.aggregate_id = id(999) },
+  (action) => { action.reference_code = 'gm9999999' },
+  (action) => { action.action_type = 'send_email'; action.app = 'google-mail' },
+  (action) => { action.payload.previousCalendar.eventId = 'other-event' },
+  (action) => { action.payload.previousCalendar.credentialOwnerEmail = 'other@example.com'; action.communication_credential_owner_email = 'other@example.com' },
+  (action) => { action.payload.previousCalendar.connectionId = 'other'; action.communication_connection_id = 'other' },
+  (action) => { action.payload.previousCalendar.calendarId = 'other'; action.communication_calendar_id = 'other' },
+  (action) => { action.payload.previousCalendar.organizerEmail = 'other@example.com'; action.communication_identity_email = 'other@example.com' },
+]) {
+  const row = meeting()
+  const { state, run } = fixture([row])
+  const action = outboundAction(row)
+  unrelated(action)
+  state.actions.push(action)
+  const counts = await run()
+  assert.equal(counts.deferredMeetings, 0, 'unrelated outbound action does not hold this event')
+  assert.equal(counts.meetingsStaged, 1)
+}
+for (const terminal of ['succeeded', 'cancelled']) {
+  const row = meeting()
+  const { state, run } = fixture([row], { event: (row) => event(row, { summary: 'Provider follow-up edit' }) })
+  state.actions.push(outboundAction(row))
+  assert.equal((await run()).deferredMeetings, 1)
+  state.actions[0].status = terminal
+  const counts = await run()
+  assert.equal(counts.deferredMeetings, 0, `${terminal} explicitly releases hold`)
+  assert.equal(counts.meetingsStaged, 1)
+  assert.equal(state.staged[0].fields.subject, 'Provider follow-up edit')
+}
 for (const archived of [true, 'true', 1, '1', 'yes', 'YES']) {
   for (const legacy of [false, true]) {
     const row = meeting(1, legacy ? { source_payload: { calendarOwnerEmail: OWNER } } : {})
@@ -299,6 +422,15 @@ for (const archived of [true, 'true', 1, '1', 'yes', 'YES']) {
   const third = await run()
   assert.equal(third.errors, 1, 'wrap retries a previously denied record')
   assert.equal(state.gets.length, 101)
+}
+{
+  const rows = Array.from({ length: 53 }, (_, index) => meeting(index + 1))
+  const { state, run } = fixture(rows)
+  state.actions.push(outboundAction(rows[0]))
+  assert.equal((await run()).deferredMeetings, 1)
+  assert.equal(state.gets.length, 49)
+  assert.equal((await run()).pendingRecordedCalendars, 0)
+  assert.equal(state.gets.length, 52, 'deferred first meeting does not starve tail')
 }
 {
   const { state, run } = fixture()

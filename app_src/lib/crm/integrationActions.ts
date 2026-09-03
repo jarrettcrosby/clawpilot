@@ -1079,6 +1079,21 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
   action: CrmIntegrationActionView
   created: boolean
 }> {
+  if (action.actionType === 'create_calendar_event' && action.aggregateType === 'crm_meeting') {
+    // Reverse Calendar ingestion holds this row while checking for undelivered
+    // intent. Every meeting enqueue must participate, including the generic
+    // action route; atomic meeting saves already hold the same row lock.
+    const meeting = await client.query(
+      `SELECT source_hash FROM crm_meetings
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid
+         AND COALESCE(lower(crm_meetings.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+       FOR UPDATE`,
+      [action.pipelineId, action.aggregateId],
+    )
+    if (!meeting.rows[0]) {
+      throw new CrmIntegrationActionError('CRM meeting was not found in the selected pipeline', 404, 'CRM_RECORD_NOT_FOUND')
+    }
+  }
   const result = await client.query<InsertedActionRow>(
     `WITH inserted AS (
        INSERT INTO crm_integration_actions (
@@ -1090,10 +1105,15 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
          communication_binding_source,
          created_at, available_at, updated_at
        )
-       VALUES (
+       SELECT
          $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', $10,
          $11::uuid, $12, $13, $14, $15, $16, $17,
          now(), now(), now()
+       -- Calendar retries lock action then meeting. Skip a committed replay
+       -- without probing its unique-index entry while holding the meeting lock.
+       WHERE $5 <> 'create_calendar_event' OR $6 <> 'crm_meeting' OR NOT EXISTS (
+         SELECT 1 FROM crm_integration_actions replay
+         WHERE replay.actor_email = $2 AND replay.idempotency_key = $10
        )
        ON CONFLICT (actor_email, idempotency_key) DO NOTHING
        RETURNING *

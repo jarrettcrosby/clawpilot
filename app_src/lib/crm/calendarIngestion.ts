@@ -90,6 +90,7 @@ type MeetingRow = {
 type ReconciliationResult = {
   matched: boolean
   staged: boolean
+  deferred?: boolean
 }
 
 export type CalendarIngestionCounts = {
@@ -106,6 +107,7 @@ export type CalendarIngestionCounts = {
   recordedCalendars: number
   recordedMeetingsPolled: number
   pendingRecordedCalendars: number
+  deferredMeetings: number
 }
 
 class SafeCalendarIngestionError extends Error {
@@ -469,6 +471,47 @@ function recordedAuthority(meeting: MeetingRow): Promise<RecordedCommunication> 
   })
 }
 
+async function hasUnresolvedCalendarAction(
+  meeting: MeetingRow,
+  client?: PoolClient,
+): Promise<boolean> {
+  const source = asRecord(meeting.source_payload) || {}
+  const identity = ['calendarOwnerEmail', 'calendarConnectionId', 'calendarId', 'calendarOrganizerEmail']
+    .map((key) => typeof source[key] === 'string' ? source[key].trim() : '')
+  if (identity.some((value) => !value) || !meeting.external_event_id) return false
+  // Failed/dead actions still represent unsent local intent. Do not silently
+  // discard it because a retry is delayed or needs operator review. Only an
+  // explicit terminal success/cancellation releases that action's hold.
+  const sql = `SELECT 1 FROM crm_integration_actions action
+    WHERE action.pipeline_id = $1::uuid
+      AND action.aggregate_type = 'crm_meeting' AND action.aggregate_id = $2
+      AND action.reference_code = $3
+      AND action.app = 'google-calendar' AND action.action_type = 'create_calendar_event'
+      AND action.status IN ('queued', 'processing', 'failed', 'dead')
+      AND (
+        (
+          action.payload #>> '{previousCalendar,credentialOwnerEmail}' = $4
+          AND action.payload #>> '{previousCalendar,connectionId}' = $5
+          AND action.payload #>> '{previousCalendar,calendarId}' = $6
+          AND action.payload #>> '{previousCalendar,organizerEmail}' = $7
+          AND action.payload #>> '{previousCalendar,eventId}' = $8
+        ) OR (
+          action.communication_credential_owner_email = $4
+          AND action.communication_connection_id = $5
+          AND action.communication_calendar_id = $6
+          AND action.communication_identity_email = $7
+          AND (action.external_id = $8 OR action.payload #>> '{previousCalendar,eventId}' = $8)
+        )
+      )
+    LIMIT 1`
+  const values = [meeting.pipeline_id, meeting.id, meeting.reference_code,
+    identity[0].toLowerCase(), identity[1], identity[2], identity[3].toLowerCase(), meeting.external_event_id]
+  // No action-row locks: enqueue owns the meeting lock first, while dispatch
+  // may hold an action row before it materializes the meeting.
+  const result = client ? await client.query(sql, values) : await query(sql, values)
+  return result.rows.length > 0
+}
+
 async function recordedCalendars(): Promise<SelectedCalendar[]> {
   const result = await query<SelectedCalendar>(
     `SELECT DISTINCT connection.owner_email, connection.connection_id
@@ -780,6 +823,9 @@ async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): P
     if (!current || !sameRecordedIdentity(meeting, current)) return { matched: false, staged: false }
     // Re-read authority after the row lock: an in-flight provider response must
     // not overwrite a moved meeting or survive revoked organization access.
+    if (await hasUnresolvedCalendarAction(current, client)) {
+      return { matched: true, staged: false, deferred: true }
+    }
     const authority = await recordedAuthority(current)
     return stageReconciledMeeting(client, current, event, status,
       authority.actorEmail, authority.communication.credentialOwnerEmail)
@@ -807,6 +853,7 @@ function newCounts(activeCalendars: number): CalendarIngestionCounts {
     recordedCalendars: 0,
     recordedMeetingsPolled: 0,
     pendingRecordedCalendars: 0,
+    deferredMeetings: 0,
   }
 }
 
@@ -905,23 +952,31 @@ async function pollRecordedCalendar(calendar: SelectedCalendar, counts: Calendar
   let lastError: string | null = null
   for (const meeting of meetings.slice(0, MAX_RECORDED_MEETINGS_PER_CALENDAR)) {
     try {
-      const authority = await recordedAuthority(meeting)
-      const selection = authority.previousCalendar
-      // Exact event reads only. Never enumerate another personal calendar, infer
-      // an event ID from a subject, or turn a 404/410 into a cancellation.
-      if (selection.credentialOwnerEmail !== calendar.owner_email || selection.connectionId !== calendar.connection_id) {
-        throw new SafeCalendarIngestionError('The recorded Google Calendar connection does not match')
-      }
-      const event = await calendarJson(calendar,
-        `/google-calendar/calendar/v3/calendars/${encodeURIComponent(selection.calendarId)}/events/${encodeURIComponent(selection.eventId)}`)
-      counts.recordedMeetingsPolled += 1
-      const result = await reconcileRecordedEvent(meeting, event)
-      if (calendarEventStatus(event) === 'cancelled') counts.cancelledEvents += 1
-      if (!result.matched) counts.unmatchedEvents += 1
-      else {
-        counts.meetingsMatched += 1
-        if (result.staged) counts.meetingsStaged += 1
-        else counts.unchangedMeetings += 1
+      // A pending move may already store the destination selection but still
+      // have the original event ID. Defer before requiring a delivered snapshot
+      // for that destination; no provider access or CRM writes occur on this path.
+      if (await hasUnresolvedCalendarAction(meeting)) {
+        counts.deferredMeetings += 1
+      } else {
+        const authority = await recordedAuthority(meeting)
+        const selection = authority.previousCalendar
+        // Exact event reads only. Never enumerate another personal calendar,
+        // infer an event ID from a subject, or turn a 404/410 into cancellation.
+        if (selection.credentialOwnerEmail !== calendar.owner_email || selection.connectionId !== calendar.connection_id) {
+          throw new SafeCalendarIngestionError('The recorded Google Calendar connection does not match')
+        }
+        const event = await calendarJson(calendar,
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(selection.calendarId)}/events/${encodeURIComponent(selection.eventId)}`)
+        counts.recordedMeetingsPolled += 1
+        const result = await reconcileRecordedEvent(meeting, event)
+        if (calendarEventStatus(event) === 'cancelled') counts.cancelledEvents += 1
+        if (result.deferred) counts.deferredMeetings += 1
+        else if (!result.matched) counts.unmatchedEvents += 1
+        else {
+          counts.meetingsMatched += 1
+          if (result.staged) counts.meetingsStaged += 1
+          else counts.unchangedMeetings += 1
+        }
       }
     } catch (error) {
       counts.errors += 1
