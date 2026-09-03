@@ -877,11 +877,12 @@ async function seedLegacyCancellationAuthorization(
     [fixture.organizationId],
   )
   assert.equal(activation.rowCount, 1)
+  const now = Date.now()
   const preparedAt = new Date(
-    Date.now() - (status === 'prepared' ? 60_000 : 10 * 60_000),
+    now - (status === 'prepared' ? 60_000 : 10 * 60_000),
   ).toISOString()
   const observedAt = new Date(
-    Date.now() - (status === 'prepared' ? 30_000 : 9 * 60_000),
+    now - (status === 'prepared' ? 30_000 : 9 * 60_000),
   ).toISOString()
   const evidenceHash = createHash('sha256')
     .update(`${fixture.organizationId}:${status}`)
