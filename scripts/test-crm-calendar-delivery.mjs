@@ -94,6 +94,7 @@ const PREVIOUS_CONNECTION_ID = 'previous-calendar-connection'
 const PREVIOUS_CALENDAR_EMAIL = 'legacy-calendar@example.com'
 const CONTACT_REFERENCE = 'gc1234567'
 const MEETING_REFERENCE = 'gm1234567'
+const MEETING_ALIAS_REFERENCE = 'gm7654321'
 
 const communicationSnapshot = {
   organizationId: ORGANIZATION_ID,
@@ -428,6 +429,32 @@ const routeReplay = await prepareRuntime.replayCrmIntegrationActionByIdempotency
 })
 assert.equal(routeReplay.action.id, ACTION_ID)
 assert.equal(routeReplay.aggregateId, MEETING_ID)
+const canonicalReplayRow = preparedExistingAction
+const aliasRouteClientRequestHash = prepareRuntime.crmIntegrationClientRequestHash({
+  ...routeClientIntent,
+  referenceCode: MEETING_ALIAS_REFERENCE,
+})
+preparedExistingAction = actionRow({
+  aggregate_type: 'crm_meeting',
+  aggregate_id: MEETING_ID,
+  reference_code: MEETING_REFERENCE,
+  payload: { ...queuedMeetingPayload, _clientRequestHash: aliasRouteClientRequestHash },
+  idempotency_key: mutableMeetingRequest.idempotencyKey,
+  status: 'succeeded',
+  external_id: 'provider-event-id',
+  response_summary: { eventId: 'provider-event-id' },
+})
+const aliasRouteReplay = await prepareRuntime.replayCrmIntegrationActionByIdempotencyKey({
+  pipelineId: PIPELINE_ID,
+  actorEmail: ACTOR_EMAIL,
+  actionType: 'create_calendar_event',
+  referenceCode: MEETING_ALIAS_REFERENCE,
+  idempotencyKey: mutableMeetingRequest.idempotencyKey,
+  clientRequestHash: aliasRouteClientRequestHash,
+})
+assert.equal(aliasRouteReplay.action.id, ACTION_ID)
+assert.equal(aliasRouteReplay.referenceCode, MEETING_REFERENCE)
+preparedExistingAction = canonicalReplayRow
 await assert.rejects(
   prepareRuntime.replayCrmIntegrationActionByIdempotencyKey({
     pipelineId: PIPELINE_ID,

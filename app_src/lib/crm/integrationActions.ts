@@ -18,6 +18,7 @@ import {
   OrganizationCommunicationPersistenceError,
   resolvePipelineCommunicationScopeInPostgres,
   resolvePipelineCommunicationSnapshotInPostgres,
+  type OrganizationCommunicationBindingSource,
   type PipelineCommunicationSnapshot,
 } from '@/lib/persistence/organizationCommunications'
 import { query, withTransaction } from '@/lib/persistence/postgres'
@@ -72,7 +73,7 @@ type ActionRow = {
   communication_account_email: string | null
   communication_identity_email: string | null
   communication_calendar_id: string | null
-  communication_binding_source: 'organization' | 'user-default' | 'meeting-override' | null
+  communication_binding_source: OrganizationCommunicationBindingSource | null
   processed_at: TimestampValue | null
   created_at: TimestampValue
   updated_at: TimestampValue
@@ -129,7 +130,7 @@ export type CrmIntegrationActionView = {
     accountEmail: string | null
     identityEmail: string | null
     calendarId: string | null
-    source: 'organization' | 'user-default' | 'meeting-override'
+    source: OrganizationCommunicationBindingSource
   } | null
   lastError: string | null
   processedAt: string | null
@@ -345,6 +346,48 @@ function normalizeReviewedCalendarSelection(
   return normalizeCalendarCommunicationSnapshot(value, actorEmail)
 }
 
+function normalizeReviewedGmailSelection(
+  value: PipelineCommunicationSnapshot,
+  actorEmail: string,
+): PipelineCommunicationSnapshot {
+  if (value?.source !== 'email-override') {
+    throw new CrmIntegrationActionError(
+      'A reviewed per-action Gmail sender selection is required',
+      400,
+      'CRM_GMAIL_SELECTION_INVALID',
+    )
+  }
+  const organizationId = normalizeUuid(value.organizationId, 'Gmail organization ID')
+  const credentialOwnerEmail = normalizeEmail(value.credentialOwnerEmail, 'Gmail credential owner')
+  if (credentialOwnerEmail !== actorEmail) {
+    throw new CrmIntegrationActionError(
+      'The selected Gmail connection must belong to the signed-in user',
+      403,
+      'CRM_GMAIL_SELECTION_FORBIDDEN',
+    )
+  }
+  const selectedConnectionId = requiredString(value.connectionId, 512, 'Gmail connection ID')
+  if (!/^[\x21-\x7e]+$/.test(selectedConnectionId)) {
+    throw new CrmIntegrationActionError('Gmail connection ID is invalid')
+  }
+  if (value.calendarId !== null) {
+    throw new CrmIntegrationActionError(
+      'A Gmail sender selection cannot select a Google Calendar',
+      400,
+      'CRM_GMAIL_SELECTION_INVALID',
+    )
+  }
+  return {
+    organizationId,
+    credentialOwnerEmail,
+    connectionId: selectedConnectionId,
+    accountEmail: normalizeEmail(value.accountEmail, 'Gmail account email'),
+    identityEmail: normalizeEmail(value.identityEmail, 'Gmail sender email'),
+    calendarId: null,
+    source: 'email-override',
+  }
+}
+
 function calendarIdentifier(value: unknown, field: string): string {
   const identifier = typeof value === 'string' ? value.trim() : ''
   if (!identifier || identifier.length > 1024 || /[\u0000-\u001f\u007f]/.test(identifier)) {
@@ -533,18 +576,31 @@ export async function replayCrmIntegrationActionByIdempotencyKey(input: {
     ? row.payload._clientRequestHash.toLowerCase()
     : ''
   const runtime = ACTION_RUNTIME[actionType]
-  const matchesScopeAndIntent = row.pipeline_id === pipelineId
+  const matchesStableScope = row.pipeline_id === pipelineId
     && row.actor_email === actorEmail
     && row.provider === runtime.provider
     && row.app === runtime.app
     && row.action_type === actionType
+  const matchesLegacyIntent = matchesStableScope
     && (referenceCode === undefined || row.reference_code === referenceCode)
     && (aggregateType === undefined || row.aggregate_type === aggregateType)
 
   // Legacy actions without an immutable client-intent hash retain the existing
   // lower-level replay path, which can compare the older provider-bound hash.
-  if (matchesScopeAndIntent && !storedClientRequestHash) return null
-  if (!matchesScopeAndIntent || storedClientRequestHash !== clientRequestHash) {
+  if (!storedClientRequestHash) {
+    if (matchesLegacyIntent) return null
+    throw new CrmIntegrationActionError(
+      'Idempotency key was already used for a different CRM action',
+      409,
+      'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+    )
+  }
+
+  // New actions compare the immutable client request hash. The stored row uses
+  // the canonical CRM reference, while the client hash intentionally preserves
+  // the submitted reference alias so an exact lost-response retry can replay
+  // without resolving mutable provider or CRM state again.
+  if (!matchesStableScope || storedClientRequestHash !== clientRequestHash) {
     throw new CrmIntegrationActionError(
       'Idempotency key was already used for a different CRM action',
       409,
@@ -939,17 +995,19 @@ async function prepareAction(input: {
     : runtime.provider === 'maton'
       ? runtime.app as 'google-mail' | 'google-calendar'
       : null
-  if (input.communicationOverride !== undefined && actionType !== 'create_calendar_event') {
+  if (input.communicationOverride !== undefined && !communicationApp) {
     throw new CrmIntegrationActionError(
-      'Per-meeting Calendar selection is only supported for Calendar event actions',
+      'This CRM action does not support a communication identity override',
       400,
-      'CRM_CALENDAR_SELECTION_INVALID',
+      'CRM_COMMUNICATION_SELECTION_INVALID',
     )
   }
   let communication: PipelineCommunicationSnapshot | null = null
   if (communicationApp) {
     if (input.communicationOverride !== undefined) {
-      communication = normalizeReviewedCalendarSelection(input.communicationOverride, actorEmail)
+      communication = communicationApp === 'google-calendar'
+        ? normalizeReviewedCalendarSelection(input.communicationOverride, actorEmail)
+        : normalizeReviewedGmailSelection(input.communicationOverride, actorEmail)
     } else {
       try {
         communication = await resolvePipelineCommunicationSnapshotInPostgres({
@@ -1065,6 +1123,10 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
             $5 = 'create_calendar_event'
             AND COALESCE(existing.payload->>'_requestHash', '') <> ''
             AND existing.payload->>'_requestHash' = ($9::jsonb)->>'_requestHash'
+          )
+          OR (
+            COALESCE(existing.payload->>'_clientRequestHash', '') <> ''
+            AND existing.payload->>'_clientRequestHash' = ($9::jsonb)->>'_clientRequestHash'
           )
         )) AS matches_intent
      FROM crm_integration_actions existing
@@ -1680,7 +1742,7 @@ async function selectedMatonConnection(
   accountEmail: string | null
   identityEmail: string | null
   calendarId: string | null
-  bindingSource: 'organization' | 'user-default' | 'meeting-override' | null
+  bindingSource: OrganizationCommunicationBindingSource | null
 }> {
   if (
     !action.communicationCredentialOwnerEmail
@@ -1729,6 +1791,40 @@ async function selectedMatonConnection(
     calendarId: action.communication?.calendarId || null,
     bindingSource: action.communication?.source || null,
   }
+}
+
+async function verifiedGmailSelectionForAction(action: LeasedCrmIntegrationAction) {
+  const selectedConnection = await selectedMatonConnection(action, 'google-mail')
+  const profile = await matonJson(
+    action,
+    'google-mail',
+    selectedConnection.connectionId,
+    '/google-mail/gmail/v1/users/me/profile',
+    { headers: { Accept: 'application/json' } },
+  )
+  const profileEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+  if (selectedConnection.accountEmail && profileEmail !== selectedConnection.accountEmail) {
+    throw new PermanentCrmIntegrationActionError('The queued Gmail account no longer matches its reviewed identity')
+  }
+  const senderEmail = selectedConnection.identityEmail
+    ? normalizeEmail(selectedConnection.identityEmail, 'Queued Gmail sender')
+    : profileEmail
+  if (senderEmail !== profileEmail) {
+    const sendAs = await matonJson(
+      action,
+      'google-mail',
+      selectedConnection.connectionId,
+      `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(senderEmail)}`,
+      { headers: { Accept: 'application/json' } },
+    )
+    if (
+      normalizeEmail(sendAs.sendAsEmail, 'Verified Gmail sender') !== senderEmail
+      || String(sendAs.verificationStatus || '').trim().toLowerCase() !== 'accepted'
+    ) {
+      throw new PermanentCrmIntegrationActionError('The queued Gmail sender is no longer an accepted send-as identity')
+    }
+  }
+  return { selectedConnection, profileEmail, senderEmail }
 }
 
 async function verifiedCalendarConnection(
@@ -2298,6 +2394,9 @@ async function stageActionInteraction(input: {
   activityStatus?: CrmActivityStatus | null
   durationMinutes?: number | null
   direction?: 'inbound' | 'outbound'
+  senderEmail?: string | null
+  senderAccountEmail?: string | null
+  communicationBindingSource?: OrganizationCommunicationBindingSource | null
 }) {
   const links = interactionLinks(input.target, input.meetingId)
   const parentSuiteCrmType = suiteCrmParentType(input.target.entity)
@@ -2313,6 +2412,9 @@ async function stageActionInteraction(input: {
       actionId: input.action.id,
       actionType: input.action.actionType,
       provider: input.action.provider,
+      senderEmail: input.senderEmail || null,
+      senderAccountEmail: input.senderAccountEmail || null,
+      communicationBindingSource: input.communicationBindingSource || null,
     },
     actorEmail: input.action.actorEmail,
     fields: {
@@ -2339,6 +2441,9 @@ async function stageActionInteraction(input: {
         actionId: input.action.id,
         actionType: input.action.actionType,
         app: input.action.app,
+        senderEmail: input.senderEmail || null,
+        senderAccountEmail: input.senderAccountEmail || null,
+        communicationBindingSource: input.communicationBindingSource || null,
       },
     },
   })
@@ -2369,37 +2474,9 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     ? normalizeEmail(action.responseSummary.senderEmail, 'Recorded Gmail sender')
     : null
   if (!messageId) {
-    const selectedConnection = await selectedMatonConnection(action, 'google-mail')
+    const { selectedConnection, senderEmail: verifiedSenderEmail } = await verifiedGmailSelectionForAction(action)
     const { connectionId } = selectedConnection
-    const profile = await matonJson(
-      action,
-      'google-mail',
-      connectionId,
-      '/google-mail/gmail/v1/users/me/profile',
-      { headers: { Accept: 'application/json' } },
-    )
-    const profileEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
-    if (selectedConnection.accountEmail && profileEmail !== selectedConnection.accountEmail) {
-      throw new PermanentCrmIntegrationActionError('The queued Gmail account no longer matches its reviewed identity')
-    }
-    senderEmail = selectedConnection.identityEmail
-      ? normalizeEmail(selectedConnection.identityEmail, 'Queued Gmail sender')
-      : profileEmail
-    if (senderEmail !== profileEmail) {
-      const sendAs = await matonJson(
-        action,
-        'google-mail',
-        connectionId,
-        `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(senderEmail)}`,
-        { headers: { Accept: 'application/json' } },
-      )
-      if (
-        normalizeEmail(sendAs.sendAsEmail, 'Verified Gmail sender') !== senderEmail
-        || String(sendAs.verificationStatus || '').trim().toLowerCase() !== 'accepted'
-      ) {
-        throw new PermanentCrmIntegrationActionError('The queued Gmail sender is no longer an accepted send-as identity')
-      }
-    }
+    senderEmail = verifiedSenderEmail
     const delivered = await matonJson(
       action,
       'google-mail',
@@ -2443,6 +2520,9 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     deliveryStatus: 'sent',
     providerMessageId: messageId,
     providerThreadId: threadId,
+    senderEmail,
+    senderAccountEmail: action.communication?.accountEmail || senderEmail,
+    communicationBindingSource: action.communication?.source || null,
   })
   await completeAction(action, messageId, summary)
 }
@@ -3169,6 +3249,10 @@ async function expandCampaignAction(action: LeasedCrmIntegrationAction, target: 
   if (target.entity !== 'campaigns') {
     throw new PermanentCrmIntegrationActionError('Campaign action target is no longer a campaign')
   }
+  // The parent action performs no delivery itself, so verify its immutable
+  // Gmail snapshot before creating any recipient fanout or CRM projection.
+  // Each child verifies again immediately before provider delivery.
+  await verifiedGmailSelectionForAction(action)
   const references = Array.isArray(action.payload.recipientReferences)
     ? action.payload.recipientReferences.map((value) => normalizeReference(value))
     : []
@@ -3342,6 +3426,9 @@ async function expandCampaignAction(action: LeasedCrmIntegrationAction, target: 
     description: `${summary.queuedCount} recipients queued; ${summary.suppressedCount} suppressed.`,
     interactionType: 'campaign',
     deliveryStatus: 'queued',
+    senderEmail: action.communication?.identityEmail || null,
+    senderAccountEmail: action.communication?.accountEmail || null,
+    communicationBindingSource: action.communication?.source || null,
   })
   await completeAction(action, null, summary)
 }

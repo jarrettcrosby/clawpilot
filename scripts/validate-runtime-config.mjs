@@ -214,9 +214,6 @@ function validateAuthMailConfiguration() {
   if (sender.length > 254 || !emailPattern.test(sender) || !/^[\x21-\x7e]+$/.test(sender)) {
     fail('CLAWPILOT_AUTH_MAIL_FROM must be a valid email address')
   }
-  if (sender === String(process.env.CLAWPILOT_MAIL_FROM || '').trim().toLowerCase()) {
-    fail('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM')
-  }
   return 'dedicated'
 }
 

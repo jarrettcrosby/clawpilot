@@ -46,19 +46,14 @@ assert.equal(reusedConnection.status, 1)
 assert.match(reusedConnection.stderr, /MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID/)
 assert.doesNotMatch(reusedConnection.stderr, /FETCH_MUST_NOT_RUN/)
 
-const reusedSender = runWithFetchTrap({
-  MATON_AUTH_GMAIL_CONNECTION_ID: 'auth-gmail-connection',
-  CLAWPILOT_AUTH_MAIL_FROM: ' STEWARDS@EIGENRACING.COM ',
-})
-assert.equal(reusedSender.status, 1)
-assert.match(reusedSender.stderr, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
-assert.doesNotMatch(reusedSender.stderr, /FETCH_MUST_NOT_RUN/)
-
 function runWithMockProfiles({
   sameProfile,
+  platformProfileEmail = 'workspace@example.com',
+  authProfileEmail = sameProfile ? platformProfileEmail : 'jarrettcrosby@gmail.com',
   authVerificationStatus = 'accepted',
   authIsPrimary = false,
   authReturnedSender = null,
+  authSender = 'stewards@eigenracing.com',
 }) {
   const mockSource = `
     globalThis.fetch = async (url, init) => {
@@ -68,13 +63,13 @@ function runWithMockProfiles({
       if (!isPlatform && !isAuth) return new Response('{}', { status: 403 });
       if (String(url).endsWith('/users/me/profile')) {
         return Response.json({
-          emailAddress: isPlatform || ${sameProfile ? 'true' : 'false'}
-            ? 'workspace@example.com'
-            : 'jarrettcrosby@gmail.com',
+          emailAddress: isPlatform
+            ? ${JSON.stringify(platformProfileEmail)}
+            : ${JSON.stringify(authProfileEmail)},
         });
       }
       const sender = decodeURIComponent(String(url).split('/').at(-1));
-      const expected = isPlatform ? 'stewards@eigenracing.com' : 'jarrettcrosby@gmail.com';
+      const expected = isPlatform ? 'stewards@eigenracing.com' : ${JSON.stringify(authSender)};
       if (sender !== expected) return new Response('{}', { status: 403 });
       return Response.json({
         isPrimary: isAuth ? ${JSON.stringify(authIsPrimary)} : false,
@@ -92,7 +87,7 @@ function runWithMockProfiles({
         ...baseEnv,
         MATON_BASE_URL: 'https://gateway.maton.ai',
         MATON_AUTH_GMAIL_CONNECTION_ID: 'auth-gmail-connection',
-        CLAWPILOT_AUTH_MAIL_FROM: 'jarrettcrosby@gmail.com',
+        CLAWPILOT_AUTH_MAIL_FROM: authSender,
       },
       encoding: 'utf8',
       timeout: 5_000,
@@ -100,14 +95,20 @@ function runWithMockProfiles({
   )
 }
 
-const distinctProfiles = runWithMockProfiles({ sameProfile: false })
-assert.equal(distinctProfiles.status, 0, distinctProfiles.stderr)
-assert.match(distinctProfiles.stdout, /jarrettcrosby@gmail\.com/)
+const sameVisibleSenderDistinctProfiles = runWithMockProfiles({ sameProfile: false })
+assert.equal(sameVisibleSenderDistinctProfiles.status, 0, sameVisibleSenderDistinctProfiles.stderr)
+assert.equal(
+  JSON.parse(sameVisibleSenderDistinctProfiles.stdout).senders.filter(
+    (sender) => sender.sender === 'stewards@eigenracing.com',
+  ).length,
+  2,
+)
 
 const primaryAuthSender = runWithMockProfiles({
   sameProfile: false,
   authVerificationStatus: '',
   authIsPrimary: true,
+  authSender: 'jarrettcrosby@gmail.com',
 })
 assert.equal(primaryAuthSender.status, 0, primaryAuthSender.stderr)
 assert.match(primaryAuthSender.stdout, /"isPrimary":true/)
@@ -143,6 +144,7 @@ const mismatchedPrimaryAuthSender = runWithMockProfiles({
   authVerificationStatus: '',
   authIsPrimary: true,
   authReturnedSender: 'different@example.com',
+  authSender: 'jarrettcrosby@gmail.com',
 })
 assert.equal(mismatchedPrimaryAuthSender.status, 1)
 assert.match(mismatchedPrimaryAuthSender.stderr, /Authentication Gmail returned a different sender identity/)
@@ -152,6 +154,28 @@ const duplicateProfiles = runWithMockProfiles({ sameProfile: true })
 assert.equal(duplicateProfiles.status, 1)
 assert.match(duplicateProfiles.stderr, /Authentication Gmail account must differ from platform Gmail account/)
 assert.doesNotMatch(duplicateProfiles.stderr, /test-api-key-that-must-not-leave-the-process/)
+
+for (const equivalentProfiles of [
+  {
+    platformProfileEmail: 'j.arrett.crosby@gmail.com',
+    authProfileEmail: 'jarrettcrosby@googlemail.com',
+  },
+  {
+    platformProfileEmail: 'jarrett@bposupplychain.com',
+    authProfileEmail: 'JARRETT+clawpilot@BPOSUPPLYCHAIN.COM',
+  },
+]) {
+  const result = runWithMockProfiles({ sameProfile: false, ...equivalentProfiles })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /Authentication Gmail account must differ from platform Gmail account/)
+}
+
+const distinctWorkspaceDots = runWithMockProfiles({
+  sameProfile: false,
+  platformProfileEmail: 'jarrett.crosby@bposupplychain.com',
+  authProfileEmail: 'jarrettcrosby@bposupplychain.com',
+})
+assert.equal(distinctWorkspaceDots.status, 0, distinctWorkspaceDots.stderr)
 
 for (const hostileBase of [
   'https://attacker.example',
@@ -177,9 +201,10 @@ assert.match(source, /cache:\s*'no-store'/)
 assert.match(source, /'Maton-Connection': connectionId/)
 assert.match(source, /\/google-mail\/gmail\/v1\/users\/me\/profile/)
 assert.match(source, /Authentication Gmail account must differ from platform Gmail account/)
+assert.match(source, /isSameGmailDeliveryMailbox\(platformProfileEmail, authProfileEmail\)/)
 assert.match(source, /MATON_AUTH_GMAIL_CONNECTION_ID/)
 assert.match(source, /CLAWPILOT_AUTH_MAIL_FROM/)
-assert.match(source, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
+assert.doesNotMatch(source, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
 assert.match(source, /data\?\.isPrimary !== true/)
 assert.match(source, /\$\{profile\.label\} Gmail sender identity is not accepted/)
 

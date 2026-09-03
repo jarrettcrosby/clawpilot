@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -126,44 +125,12 @@ for (const configurationSource of [
   read('scripts/verify-mail-sender.mjs'),
   read('app_src/lib/matonMail.ts'),
 ]) {
-  assert.ok(configurationSource.includes('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM'))
+  assert.ok(configurationSource.includes('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID'))
+  assert.ok(!configurationSource.includes('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM'))
 }
-assert.ok(read('app_src/app/api/health/route.ts').includes(
+assert.ok(!read('app_src/app/api/health/route.ts').includes(
   'Hosted runtime authentication mail sender must differ from the platform mail sender.',
 ))
-
-const rejectedRailwayAuthSender = spawnSync('bash', ['scripts/start-railway.sh'], {
-  cwd: root,
-  encoding: 'utf8',
-  env: {
-    PATH: process.env.PATH || '',
-    CLAWPILOT_STORAGE: 'postgres',
-    CLAWPILOT_DB_FALLBACK_TO_FILE: 'false',
-    APP_AUTH_REQUIRED: '1',
-    CLAWPILOT_EXECUTION_ENABLED: '0',
-    CAREER_SITE_AGENTS_ENABLED: '1',
-    DATABASE_URL: 'postgres://test:test@localhost:5432/clawpilot',
-    APP_LOGIN_PASSWORD: 'test-login-password-with-32-characters',
-    APP_LOGIN_EMAIL: 'operator@example.com',
-    APP_SESSION_SECRET: 'test-session-secret-with-32-characters',
-    AGENT_CREDENTIAL_ENCRYPTION_KEY: 'test-agent-encryption-key-32-characters',
-    INTEGRATION_EVIDENCE_FINGERPRINT_KEY: 'test-fingerprint-key-with-32-characters',
-    INTEGRATION_EVIDENCE_ACTIVE_KEY_ID: 'test-v1',
-    INTEGRATION_EVIDENCE_ENCRYPTION_KEYS: '{"test-v1":"test-encryption-key-with-32-characters"}',
-    AGENT_CREDENTIAL_DATABASE_URL: 'postgres://test:test@localhost:5432/clawpilot',
-    CLAWPILOT_PUBLIC_URL: 'https://aiapp.eigenracing.com',
-    PIPELINE_OUTBOX_WORKER_SECRET: 'test-pipeline-secret-with-32-characters',
-    SHORTLINK_PUBLIC_ORIGIN: 'https://aiapp.eigenracing.com',
-    MATON_API_KEY: 'test-maton-key-with-16-characters',
-    MATON_GMAIL_CONNECTION_ID: 'platform-gmail-connection',
-    CLAWPILOT_MAIL_FROM: 'Stewards@EigenRacing.com',
-    PIPELINE_SHEET_ID: 'test-pipeline-sheet-id-with-20-characters',
-    MATON_AUTH_GMAIL_CONNECTION_ID: 'dedicated-auth-gmail-connection',
-    CLAWPILOT_AUTH_MAIL_FROM: ' stewards@eigenracing.com ',
-  },
-})
-assert.equal(rejectedRailwayAuthSender.status, 1)
-assert.match(rejectedRailwayAuthSender.stderr, /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/)
 
 const nativeAuthAdapter = read('clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
 for (const fragment of [
@@ -678,11 +645,18 @@ try {
   let authTransportFailure = null
   let authTransportStatus = null
   let authSenderVerification = 'accepted'
+  let platformMailboxEmail = 'workspace@example.com'
+  let authMailboxEmail = 'jarrettcrosby@gmail.com'
   const mockMatonMailFetch = async (profile, pathname, init) => {
     matonCalls.push({ profile, pathname, init })
     if (profile === 'auth' && authTransportFailure) throw authTransportFailure
     if (profile === 'auth' && authTransportStatus) {
       return new Response('{}', { status: authTransportStatus })
+    }
+    if (pathname.endsWith('/users/me/profile')) {
+      return Response.json({
+        emailAddress: profile === 'auth' ? authMailboxEmail : platformMailboxEmail,
+      })
     }
     if (pathname.includes('/settings/sendAs/')) {
       const requestedSender = decodeURIComponent(pathname.split('/').at(-1))
@@ -719,6 +693,66 @@ try {
       isHostedRuntime() { return false },
     },
   })
+
+  function loadFocusedMailHarness({
+    platformMailbox,
+    authMailbox,
+    lookupDelayMs = 0,
+    authProfileFailures = 0,
+    authSenderFailures = 0,
+  }) {
+    const calls = []
+    let remainingAuthProfileFailures = authProfileFailures
+    let remainingAuthSenderFailures = authSenderFailures
+    const waitForLookup = async () => {
+      if (lookupDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, lookupDelayMs))
+    }
+    const mockFetch = async (profile, pathname, init) => {
+      calls.push({ profile, pathname, init })
+      if (pathname.endsWith('/users/me/profile')) {
+        await waitForLookup()
+        if (profile === 'auth' && remainingAuthProfileFailures > 0) {
+          remainingAuthProfileFailures -= 1
+          return new Response('{}', { status: 503 })
+        }
+        return Response.json({
+          emailAddress: profile === 'auth' ? authMailbox : platformMailbox,
+        })
+      }
+      if (pathname.includes('/settings/sendAs/')) {
+        await waitForLookup()
+        if (profile === 'auth' && remainingAuthSenderFailures > 0) {
+          remainingAuthSenderFailures -= 1
+          return new Response('{}', { status: 503 })
+        }
+        const requestedSender = decodeURIComponent(pathname.split('/').at(-1))
+        return Response.json({
+          isPrimary: false,
+          sendAsEmail: requestedSender,
+          verificationStatus: 'accepted',
+        })
+      }
+      return Response.json({ id: 'focused-gmail-message-id' })
+    }
+    const loaded = loadTypeScriptModule('app_src/lib/matonMail.ts', {
+      '@/lib/maton': {
+        async matonAuthMailFetch(pathname, init) {
+          return mockFetch('auth', pathname, init)
+        },
+        async matonPlatformMailFetch(pathname, init) {
+          return mockFetch('platform', pathname, init)
+        },
+      },
+      '@/lib/publicUrl': {
+        appPublicUrl() { return 'https://aiapp.eigenracing.com' },
+      },
+      '@/lib/persistence/config': {
+        isHostedRuntime() { return false },
+      },
+    })
+    return { calls, mail: loaded.exports }
+  }
+
   const mailResult = await mailModule.exports.sendAuthMagicCodeEmail({
     to: 'operator@example.com',
     code: '123456',
@@ -766,35 +800,43 @@ try {
 
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'personal-auth-gmail-connection'
   process.env.CLAWPILOT_AUTH_MAIL_FROM = ' STEWARDS@EIGENRACING.COM '
-  await assert.rejects(
-    mailModule.exports.sendAuthMagicCodeEmail({
-      to: 'operator@example.com',
-      code: '234567',
-    }),
-    /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/,
-  )
-  assert.equal(matonCalls.length, 2)
-
-  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'personal-auth-gmail-connection'
-  process.env.CLAWPILOT_AUTH_MAIL_FROM = 'JarrettCrosby@gmail.com'
   const dedicatedAuthMailResult = await mailModule.exports.sendAuthMagicCodeEmail({
     to: 'operator@example.com',
     code: '234567',
   })
   assert.equal(dedicatedAuthMailResult.messageId, 'gmail-message-id')
-  assert.equal(matonCalls.length, 4)
-  assert.equal(matonCalls[2].profile, 'auth')
-  assert.match(matonCalls[2].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
-  assert.equal(matonCalls[3].profile, 'auth')
-  const dedicatedAuthPayload = JSON.parse(matonCalls[3].init.body)
+  const dedicatedAuthCalls = matonCalls.slice(2)
+  assert.equal(dedicatedAuthCalls.length, 4)
+  assert.deepEqual(
+    dedicatedAuthCalls.slice(0, 2).map((call) => [call.profile, call.pathname]).sort(),
+    [
+      ['auth', '/google-mail/gmail/v1/users/me/profile'],
+      ['platform', '/google-mail/gmail/v1/users/me/profile'],
+    ],
+  )
+  assert.equal(dedicatedAuthCalls[2].profile, 'auth')
+  assert.match(dedicatedAuthCalls[2].pathname, /\/settings\/sendAs\/stewards%40eigenracing\.com$/)
+  assert.equal(dedicatedAuthCalls[3].profile, 'auth')
+  assert.equal(dedicatedAuthCalls[3].pathname, '/google-mail/gmail/v1/users/me/messages/send')
+  const dedicatedAuthPayload = JSON.parse(dedicatedAuthCalls[3].init.body)
   const dedicatedAuthMessage = decodeBase64Url(dedicatedAuthPayload.raw)
-  assert.match(dedicatedAuthMessage, /From: ClawPilot Stewards <jarrettcrosby@gmail\.com>/)
+  assert.match(dedicatedAuthMessage, /From: ClawPilot Stewards <stewards@eigenracing\.com>/)
   assert.match(dedicatedAuthMessage, /234567/)
+
+  const callsBeforeVisibleAliasRecipient = matonCalls.length
+  await mailModule.exports.sendAuthMagicCodeEmail({
+    to: ' STEWARDS@EIGENRACING.COM ',
+    code: '345678',
+  })
+  const visibleAliasRecipientCalls = matonCalls.slice(callsBeforeVisibleAliasRecipient)
+  assert.equal(visibleAliasRecipientCalls.length, 1)
+  assert.equal(visibleAliasRecipientCalls[0].profile, 'auth')
+  assert.equal(visibleAliasRecipientCalls[0].pathname, '/google-mail/gmail/v1/users/me/messages/send')
 
   const callsBeforeSelfAddressedCode = matonCalls.length
   const selfAddressedAuthMailResult = await mailModule.exports.sendAuthMagicCodeEmail({
     to: ' JARRETTCROSBY@GMAIL.COM ',
-    code: '345678',
+    code: '456789',
   })
   assert.equal(selfAddressedAuthMailResult.messageId, 'gmail-message-id')
   const selfAddressedCalls = matonCalls.slice(callsBeforeSelfAddressedCode)
@@ -807,19 +849,142 @@ try {
   assert.match(selfAddressedMessage, /From: ClawPilot Stewards <stewards@eigenracing\.com>/)
   assert.match(selfAddressedMessage, /To: <JARRETTCROSBY@GMAIL\.COM>/)
 
+  process.env.MATON_GMAIL_CONNECTION_ID = 'consumer-routing-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'consumer-routing-auth-connection'
+  process.env.CLAWPILOT_AUTH_MAIL_FROM = 'stewards@eigenracing.com'
+  const consumerRouting = loadFocusedMailHarness({
+    platformMailbox: 'workspace@example.com',
+    authMailbox: 'jarrett.crosby@gmail.com',
+  })
+  await consumerRouting.mail.sendAuthMagicCodeEmail({
+    to: ' J.A.R.R.E.T.T.C.R.O.S.B.Y+ClawPilot@GOOGLEMAIL.COM ',
+    code: '456780',
+  })
+  const consumerRoutingSend = consumerRouting.calls.find((call) => call.pathname.endsWith('/messages/send'))
+  assert.equal(consumerRoutingSend.profile, 'platform')
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'workspace-routing-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'workspace-routing-auth-connection'
+  const workspaceRouting = loadFocusedMailHarness({
+    platformMailbox: 'platform@example.com',
+    authMailbox: 'Jarrett@bposupplychain.com',
+  })
+  await workspaceRouting.mail.sendAuthMagicCodeEmail({
+    to: ' JARRETT+ClawPilot@BPOSUPPLYCHAIN.COM ',
+    code: '456781',
+  })
+  const workspaceRoutingSend = workspaceRouting.calls.find((call) => call.pathname.endsWith('/messages/send'))
+  assert.equal(workspaceRoutingSend.profile, 'platform')
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'workspace-dot-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'workspace-dot-auth-connection'
+  const workspaceDotRouting = loadFocusedMailHarness({
+    platformMailbox: 'platform@example.com',
+    authMailbox: 'jarrett.crosby@bposupplychain.com',
+  })
+  await workspaceDotRouting.mail.sendAuthMagicCodeEmail({
+    to: 'jarrettcrosby@bposupplychain.com',
+    code: '456782',
+  })
+  const workspaceDotRoutingSend = workspaceDotRouting.calls.find((call) => call.pathname.endsWith('/messages/send'))
+  assert.equal(workspaceDotRoutingSend.profile, 'auth')
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'gmail-equivalent-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'gmail-equivalent-auth-connection'
+  const gmailEquivalentAccounts = loadFocusedMailHarness({
+    platformMailbox: 'j.arrett@gmail.com',
+    authMailbox: 'jarrett@googlemail.com',
+  })
+  await assert.rejects(
+    gmailEquivalentAccounts.mail.sendAuthMagicCodeEmail({
+      to: 'operator@example.com',
+      code: '456783',
+    }),
+    /Authentication Gmail account must differ from platform Gmail account/,
+  )
+  assert.ok(gmailEquivalentAccounts.calls.every((call) => !call.pathname.endsWith('/messages/send')))
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'single-flight-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'single-flight-auth-connection'
+  const singleFlight = loadFocusedMailHarness({
+    platformMailbox: 'workspace@example.com',
+    authMailbox: 'jarrettcrosby@gmail.com',
+    lookupDelayMs: 5,
+  })
+  await Promise.all(Array.from({ length: 4 }, (_, index) => (
+    singleFlight.mail.sendAuthMagicCodeEmail({
+      to: `operator-${index}@example.com`,
+      code: `45679${index}`,
+    })
+  )))
+  assert.equal(singleFlight.calls.filter((call) => call.pathname.endsWith('/users/me/profile')).length, 2)
+  assert.equal(singleFlight.calls.filter((call) => call.pathname.includes('/settings/sendAs/')).length, 1)
+  assert.equal(singleFlight.calls.filter((call) => call.pathname.endsWith('/messages/send')).length, 4)
+  await singleFlight.mail.sendAuthMagicCodeEmail({
+    to: 'cached-operator@example.com',
+    code: '456794',
+  })
+  assert.equal(singleFlight.calls.filter((call) => call.pathname.endsWith('/users/me/profile')).length, 2)
+  assert.equal(singleFlight.calls.filter((call) => call.pathname.includes('/settings/sendAs/')).length, 1)
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'profile-recovery-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'profile-recovery-auth-connection'
+  const profileRecovery = loadFocusedMailHarness({
+    platformMailbox: 'workspace@example.com',
+    authMailbox: 'jarrettcrosby@gmail.com',
+    lookupDelayMs: 5,
+    authProfileFailures: 1,
+  })
+  const failedProfileRequests = await Promise.allSettled([
+    profileRecovery.mail.sendAuthMagicCodeEmail({ to: 'first@example.com', code: '456795' }),
+    profileRecovery.mail.sendAuthMagicCodeEmail({ to: 'second@example.com', code: '456796' }),
+  ])
+  assert.ok(failedProfileRequests.every((result) => result.status === 'rejected'))
+  assert.equal(profileRecovery.calls.filter((call) => call.profile === 'auth' && call.pathname.endsWith('/users/me/profile')).length, 1)
+  await profileRecovery.mail.sendAuthMagicCodeEmail({
+    to: 'retry@example.com',
+    code: '456797',
+  })
+  assert.equal(profileRecovery.calls.filter((call) => call.profile === 'auth' && call.pathname.endsWith('/users/me/profile')).length, 2)
+  assert.equal(profileRecovery.calls.filter((call) => call.pathname.endsWith('/messages/send')).length, 1)
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'sender-recovery-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'sender-recovery-auth-connection'
+  const senderRecovery = loadFocusedMailHarness({
+    platformMailbox: 'workspace@example.com',
+    authMailbox: 'jarrettcrosby@gmail.com',
+    lookupDelayMs: 5,
+    authSenderFailures: 1,
+  })
+  const failedSenderRequests = await Promise.allSettled([
+    senderRecovery.mail.sendAuthMagicCodeEmail({ to: 'first@example.com', code: '456798' }),
+    senderRecovery.mail.sendAuthMagicCodeEmail({ to: 'second@example.com', code: '456799' }),
+  ])
+  assert.ok(failedSenderRequests.every((result) => result.status === 'rejected'))
+  assert.equal(senderRecovery.calls.filter((call) => call.pathname.includes('/settings/sendAs/')).length, 1)
+  await senderRecovery.mail.sendAuthMagicCodeEmail({
+    to: 'retry@example.com',
+    code: '456800',
+  })
+  assert.equal(senderRecovery.calls.filter((call) => call.pathname.includes('/settings/sendAs/')).length, 2)
+  assert.equal(senderRecovery.calls.filter((call) => call.pathname.endsWith('/messages/send')).length, 1)
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'test-gmail-connection'
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'rotated-personal-auth-gmail-connection'
   const callsBeforeConnectionRotation = matonCalls.length
   await mailModule.exports.sendAuthMagicCodeEmail({
     to: 'operator@example.com',
-    code: '456789',
+    code: '567890',
   })
   const rotatedConnectionCalls = matonCalls.slice(callsBeforeConnectionRotation)
-  assert.equal(rotatedConnectionCalls.length, 2)
+  assert.equal(rotatedConnectionCalls.length, 3)
   assert.ok(rotatedConnectionCalls.every((call) => call.profile === 'auth'))
-  assert.match(rotatedConnectionCalls[0].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
-  assert.equal(rotatedConnectionCalls[1].pathname, '/google-mail/gmail/v1/users/me/messages/send')
+  assert.equal(rotatedConnectionCalls[0].pathname, '/google-mail/gmail/v1/users/me/profile')
+  assert.match(rotatedConnectionCalls[1].pathname, /\/settings\/sendAs\/stewards%40eigenracing\.com$/)
+  assert.equal(rotatedConnectionCalls[2].pathname, '/google-mail/gmail/v1/users/me/messages/send')
 
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'primary-empty-auth-gmail-connection'
+  process.env.CLAWPILOT_AUTH_MAIL_FROM = 'jarrettcrosby@gmail.com'
   authSenderVerification = 'primary'
   const callsBeforePrimarySender = matonCalls.length
   await mailModule.exports.sendAuthMagicCodeEmail({
@@ -827,12 +992,14 @@ try {
     code: '567890',
   })
   const primarySenderCalls = matonCalls.slice(callsBeforePrimarySender)
-  assert.equal(primarySenderCalls.length, 2)
+  assert.equal(primarySenderCalls.length, 3)
   assert.ok(primarySenderCalls.every((call) => call.profile === 'auth'))
-  assert.match(primarySenderCalls[0].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
-  assert.equal(primarySenderCalls[1].pathname, '/google-mail/gmail/v1/users/me/messages/send')
+  assert.equal(primarySenderCalls[0].pathname, '/google-mail/gmail/v1/users/me/profile')
+  assert.match(primarySenderCalls[1].pathname, /\/settings\/sendAs\/jarrettcrosby%40gmail\.com$/)
+  assert.equal(primarySenderCalls[2].pathname, '/google-mail/gmail/v1/users/me/messages/send')
 
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'non-primary-empty-auth-gmail-connection'
+  process.env.CLAWPILOT_AUTH_MAIL_FROM = 'stewards@eigenracing.com'
   authSenderVerification = 'empty'
   const callsBeforeUnverifiedSender = matonCalls.length
   const platformCallsBeforeUnverifiedSender = matonCalls.filter((call) => call.profile === 'platform').length
@@ -844,8 +1011,10 @@ try {
     /Authentication mail sender is not verified/,
   )
   const unverifiedSenderCalls = matonCalls.slice(callsBeforeUnverifiedSender)
-  assert.equal(unverifiedSenderCalls.length, 1)
-  assert.equal(unverifiedSenderCalls[0].profile, 'auth')
+  assert.equal(unverifiedSenderCalls.length, 2)
+  assert.ok(unverifiedSenderCalls.every((call) => call.profile === 'auth'))
+  assert.equal(unverifiedSenderCalls[0].pathname, '/google-mail/gmail/v1/users/me/profile')
+  assert.match(unverifiedSenderCalls[1].pathname, /\/settings\/sendAs\/stewards%40eigenracing\.com$/)
   assert.equal(matonCalls.filter((call) => call.profile === 'platform').length, platformCallsBeforeUnverifiedSender)
 
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'non-primary-pending-auth-gmail-connection'
@@ -859,11 +1028,41 @@ try {
     /Authentication mail sender is not verified/,
   )
   const pendingSenderCalls = matonCalls.slice(callsBeforePendingSender)
-  assert.equal(pendingSenderCalls.length, 1)
-  assert.equal(pendingSenderCalls[0].profile, 'auth')
+  assert.equal(pendingSenderCalls.length, 2)
+  assert.ok(pendingSenderCalls.every((call) => call.profile === 'auth'))
+  assert.equal(pendingSenderCalls[0].pathname, '/google-mail/gmail/v1/users/me/profile')
+  assert.match(pendingSenderCalls[1].pathname, /\/settings\/sendAs\/stewards%40eigenracing\.com$/)
   authSenderVerification = 'accepted'
 
+  process.env.MATON_GMAIL_CONNECTION_ID = 'same-mailbox-platform-connection'
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'same-mailbox-auth-connection'
+  platformMailboxEmail = 'same-account@gmail.com'
+  authMailboxEmail = ' SAME-ACCOUNT@GMAIL.COM '
+  const callsBeforeSameMailbox = matonCalls.length
+  await assert.rejects(
+    mailModule.exports.sendAuthMagicCodeEmail({
+      to: 'operator@example.com',
+      code: '789012',
+    }),
+    /Authentication Gmail account must differ from platform Gmail account/,
+  )
+  const sameMailboxCalls = matonCalls.slice(callsBeforeSameMailbox)
+  assert.equal(sameMailboxCalls.length, 2)
+  assert.deepEqual(
+    sameMailboxCalls.map((call) => [call.profile, call.pathname]).sort(),
+    [
+      ['auth', '/google-mail/gmail/v1/users/me/profile'],
+      ['platform', '/google-mail/gmail/v1/users/me/profile'],
+    ],
+  )
+  assert.ok(sameMailboxCalls.every((call) => !call.pathname.includes('/settings/sendAs/')))
+  assert.ok(sameMailboxCalls.every((call) => !call.pathname.endsWith('/messages/send')))
+
+  process.env.MATON_GMAIL_CONNECTION_ID = 'test-gmail-connection'
   process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'rotated-personal-auth-gmail-connection'
+  platformMailboxEmail = 'workspace@example.com'
+  authMailboxEmail = 'jarrettcrosby@gmail.com'
+
   authTransportStatus = 503
   const callsBeforeAuthFailure = matonCalls.length
   const platformCallsBeforeAuthFailure = matonCalls.filter((call) => call.profile === 'platform').length

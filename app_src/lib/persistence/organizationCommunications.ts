@@ -9,7 +9,11 @@ import {
 type TimestampValue = string | Date
 
 export type OrganizationCommunicationApp = 'google-mail' | 'google-calendar'
-export type OrganizationCommunicationBindingSource = 'organization' | 'user-default' | 'meeting-override'
+export type OrganizationCommunicationBindingSource =
+  | 'organization'
+  | 'user-default'
+  | 'meeting-override'
+  | 'email-override'
 export type OrganizationCommunicationBindingStatus = 'active' | 'disabled'
 
 type OrganizationCommunicationBindingRow = {

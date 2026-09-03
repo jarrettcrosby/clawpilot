@@ -130,7 +130,10 @@ function errorResponse(error: unknown) {
 
 export async function GET(req: NextRequest) {
   try {
-    const actor = await requireRequestUser(req)
+    // Personal Gmail aliases and writable calendars belong to the authenticated
+    // actor, not an impersonated/effective user. Keep this read path under the
+    // same exact-actor boundary as bind and disconnect.
+    const actor = await exactRequestActor(req)
     requirePostgres()
     const canManage = canManageOrganizationCommunications(actor)
     const communication = await getOrganizationCommunicationState({

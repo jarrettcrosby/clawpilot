@@ -83,6 +83,21 @@ for (const fragment of [
   assert.ok(calendarSelectionMigration.includes(fragment), `Calendar selection migration missing ${fragment}`)
 }
 
+const emailSenderSelectionMigration = read('db/migrations/0346_organization_email_sender_selection.sql')
+for (const fragment of [
+  'DROP CONSTRAINT IF EXISTS crm_integration_actions_communication_snapshot_valid',
+  "'email-override'",
+  'communication_credential_owner_email IS NOT NULL',
+  'communication_connection_id IS NOT NULL',
+  'communication_account_email IS NOT NULL',
+  'communication_identity_email IS NOT NULL',
+]) {
+  assert.ok(
+    emailSenderSelectionMigration.includes(fragment),
+    `Email sender selection migration missing ${fragment}`,
+  )
+}
+
 const persistence = read('app_src/lib/persistence/organizationCommunications.ts')
 for (const fragment of [
   'resolvePipelineCommunicationSnapshotInPostgres',
@@ -135,6 +150,10 @@ for (const fragment of [
   'previousCalendar',
   'conferenceData: null',
   'location: eventLocation || (!createDestinationEvent ? null : undefined)',
+  "value?.source !== 'email-override'",
+  "actionType === 'send_campaign'",
+  "await verifiedGmailSelectionForAction(action)",
+  'senderAccountEmail: action.communication?.accountEmail',
 ]) {
   assert.ok(actionRuntime.includes(fragment), `CRM communication runtime missing ${fragment}`)
 }
@@ -158,9 +177,26 @@ assert.ok(crmRoute.includes('meetingSaveIdempotencyKey'))
 assert.ok(crmRoute.includes('CRM_IMPERSONATION_FORBIDDEN'))
 const crmActionRoute = read('app_src/app/api/crm/actions/route.ts')
 assert.ok(crmActionRoute.includes("'calendarConnectionId'"))
+assert.ok(crmActionRoute.includes("'gmailConnectionId'"))
+assert.ok(crmActionRoute.includes("'gmailSendAsEmail'"))
 assert.ok(crmActionRoute.includes('resolveVerifiedPipelineCalendarSelection'))
+assert.ok(crmActionRoute.includes('resolveVerifiedPipelineGmailSelection'))
 assert.ok(crmActionRoute.includes('communicationOverride'))
 assert.ok(crmActionRoute.includes('CRM_ACTION_IMPERSONATION_FORBIDDEN'))
+
+const healthRoute = read('app_src/app/api/health/route.ts')
+for (const fragment of [
+  'organization_email_sender_selection_applied',
+  "filename = '0346_organization_email_sender_selection.sql'",
+  "'2c10df72a620bd2f78ed472846b56841c77ba69836e61fd13b8533590e154e81'",
+  "LIKE '%email-override%'",
+]) {
+  assert.ok(healthRoute.includes(fragment), `Email sender migration readiness missing ${fragment}`)
+}
+assert.ok(
+  (healthRoute.match(/row\?\.organization_email_sender_selection_applied/g) || []).length >= 2,
+  'Email sender migration must gate both migrationsCurrent and public health errors',
+)
 const suiteCrmMeetingIngestion = read('app_src/lib/crm/suiteCrmMeetingIngestion.ts')
 assert.ok(suiteCrmMeetingIngestion.includes("error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'"))
 
@@ -244,6 +280,29 @@ routeSession = { ...routeSession, impersonating: false }
 guardedResponse = await crmActionWriteRoute.PATCH(impersonatedRequest)
 assert.equal(guardedResponse.status, 403)
 assert.equal((await guardedResponse.json()).code, 'CRM_ACTION_IMPERSONATION_FORBIDDEN')
+
+routeSession = { ...routeSession, impersonating: true }
+const communicationsRoute = loadTypeScriptModule('app_src/app/api/integrations/communications/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/browserSameOrigin': { isBrowserSameOriginRequest: () => true },
+  '@/lib/integrations/organizationCommunications': {
+    getOrganizationCommunicationState: async () => {
+      throw new Error('impersonation must be rejected before enumerating personal connections')
+    },
+    sanitizeOrganizationCommunicationError: (error) => ({
+      message: error instanceof Error ? error.message : 'unexpected error',
+      status: 500,
+      code: 'UNEXPECTED',
+    }),
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/publicUrl': { appPublicUrl: () => 'https://clawpilot.example' },
+  '@/lib/requestUser': guardedRequestUserMock,
+  '@/lib/users': {},
+})
+guardedResponse = await communicationsRoute.GET(impersonatedRequest)
+assert.equal(guardedResponse.status, 403)
+assert.equal((await guardedResponse.json()).code, 'ORGANIZATION_COMMUNICATION_IMPERSONATION_FORBIDDEN')
 assert.equal(guardedUserLookupCount, 0, 'impersonation writes must be rejected before resolving an effective actor')
 
 const ROUTE_PIPELINE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
@@ -291,6 +350,7 @@ const routeClientHash = (value) => {
   ) return ROUTE_CHANGED_HASH
   if (
     value?.calendarSelection === null
+    || value?.gmailSelection === null
     || (value?.fields && !value.fields.calendarConnectionId && !value.fields.calendarId)
   ) return ROUTE_DEFAULT_HASH
   return ROUTE_EXACT_HASH
@@ -368,6 +428,86 @@ const actionConflictResponse = await replayingActionRoute.POST(crmActionRequest(
 assert.equal(actionConflictResponse.status, 409)
 assert.equal((await actionConflictResponse.json()).code, 'CRM_ACTION_IDEMPOTENCY_CONFLICT')
 assert.equal(actionCalendarResolutionCalls, 0, 'same-key/different-payload conflict must precede Calendar resolution')
+
+let actionGmailResolutionCalls = 0
+let actionEmailEnqueueCalls = 0
+const replayingEmailActionRoute = loadTypeScriptModule('app_src/app/api/crm/actions/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/crm/integrationActions': {
+    CrmIntegrationActionError: TestCrmIntegrationActionError,
+    crmIntegrationClientRequestHash: routeClientHash,
+    replayCrmIntegrationActionByIdempotencyKey: async (input) => {
+      if (![ROUTE_EXACT_HASH, ROUTE_DEFAULT_HASH].includes(input.clientRequestHash)) {
+        throw new TestCrmIntegrationActionError(
+          'Idempotency key was already used for a different CRM action',
+          409,
+          'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+        )
+      }
+      return { action: replayedActionView, aggregateId: ROUTE_ACTION_ID, referenceCode: ROUTE_REFERENCE }
+    },
+    enqueueCrmIntegrationAction: async () => {
+      actionEmailEnqueueCalls += 1
+      throw new Error('an exact email replay must not enqueue again')
+    },
+  },
+  '@/lib/integrations/organizationCommunications': {
+    resolveVerifiedPipelineCalendarSelection: async () => {
+      throw new Error('Calendar resolution is not expected for an email action')
+    },
+    resolveVerifiedPipelineGmailSelection: async () => {
+      actionGmailResolutionCalls += 1
+      throw new Error('Gmail connection was revoked')
+    },
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/requestUser': validRouteRequestUserMock,
+  '@/lib/tenancy': validTenancyMock,
+})
+function crmEmailActionRequest(subject, options = {}) {
+  const includeSelection = options.includeSelection !== false
+  const raw = JSON.stringify({
+    actionType: options.actionType || 'send_email',
+    referenceCode: ROUTE_REFERENCE,
+    payload: { subject, text: 'Reviewed email body' },
+    ...(includeSelection ? {
+      gmailConnectionId: 'revoked-or-rebound-gmail-connection',
+      gmailSendAsEmail: 'stewards@eigenracing.com',
+    } : {}),
+    idempotencyKey: options.idempotencyKey || 'route-email-lost-response-key',
+  })
+  return {
+    headers: new Headers({ 'content-length': String(Buffer.byteLength(raw)) }),
+    cookies: { get: () => undefined },
+    text: async () => raw,
+  }
+}
+replayResponse = await replayingEmailActionRoute.POST(crmEmailActionRequest('Original email intent'))
+assert.equal(replayResponse.status, 200)
+assert.equal((await replayResponse.json()).action.id, ROUTE_ACTION_ID)
+assert.equal(actionGmailResolutionCalls, 0, 'lost-response replay must survive a revoked Gmail connection')
+assert.equal(actionEmailEnqueueCalls, 0)
+replayResponse = await replayingEmailActionRoute.POST(crmEmailActionRequest('Original email intent', {
+  includeSelection: false,
+  idempotencyKey: 'route-email-default-lost-response-key',
+}))
+assert.equal(replayResponse.status, 200)
+assert.equal(actionGmailResolutionCalls, 0, 'default Gmail lost-response replay must precede mutable binding resolution')
+const emailConflictResponse = await replayingEmailActionRoute.POST(crmEmailActionRequest('Changed retry intent'))
+assert.equal(emailConflictResponse.status, 409)
+assert.equal((await emailConflictResponse.json()).code, 'CRM_ACTION_IDEMPOTENCY_CONFLICT')
+assert.equal(actionGmailResolutionCalls, 0, 'same-key/different-email conflict must precede Gmail resolution')
+const incompleteGmailRequest = crmEmailActionRequest('Incomplete Gmail selection')
+incompleteGmailRequest.text = async () => JSON.stringify({
+  actionType: 'send_email',
+  referenceCode: ROUTE_REFERENCE,
+  payload: { subject: 'Incomplete Gmail selection', text: 'Reviewed email body' },
+  gmailConnectionId: 'gmail-connection-without-alias',
+  idempotencyKey: 'route-email-incomplete-key',
+})
+const incompleteGmailResponse = await replayingEmailActionRoute.POST(incompleteGmailRequest)
+assert.equal(incompleteGmailResponse.status, 400)
+assert.equal((await incompleteGmailResponse.json()).code, 'CRM_GMAIL_SELECTION_INCOMPLETE')
 
 let nativeCalendarResolutionCalls = 0
 let nativeHierarchyCalls = 0
@@ -503,6 +643,15 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
           selected: true,
         },
         {
+          connectionId: 'personal-mail-connection',
+          name: 'Personal Gmail',
+          app: 'google-mail',
+          accountEmail: 'jarrettcrosby@gmail.com',
+          status: 'ACTIVE',
+          source: 'maton',
+          selected: false,
+        },
+        {
           connectionId: 'calendar-connection',
           name: 'Suburbia Google Calendar',
           app: 'google-calendar',
@@ -527,12 +676,35 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
     matonFetch: async (pathname, _init, context) => {
       providerRequests.push({ pathname, context })
       if (pathname.endsWith('/profile')) {
-        return new Response(JSON.stringify({ emailAddress: 'jarrett@suburbiasandwichco.com' }), {
+        return new Response(JSON.stringify({
+          emailAddress: context.boundConnectionId === 'personal-mail-connection'
+            ? 'jarrettcrosby@gmail.com'
+            : 'jarrett@suburbiasandwichco.com',
+        }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
       }
       if (pathname.endsWith('/settings/sendAs')) {
+        if (context.boundConnectionId === 'personal-mail-connection') {
+          return new Response(JSON.stringify({ sendAs: [
+            {
+              sendAsEmail: 'jarrettcrosby@gmail.com',
+              verificationStatus: 'accepted',
+              isDefault: true,
+            },
+            {
+              sendAsEmail: 'stewards@eigenracing.com',
+              verificationStatus: 'accepted',
+              isDefault: false,
+            },
+            {
+              sendAsEmail: 'pending@example.com',
+              verificationStatus: 'pending',
+              isDefault: false,
+            },
+          ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
         return new Response(JSON.stringify({ sendAs: [
           {
             sendAsEmail: 'jarrett@suburbiasandwichco.com',
@@ -613,6 +785,7 @@ assert.equal(writes[0].calendarId, null)
 assert.ok(providerRequests.some((request) => request.pathname.endsWith('/settings/sendAs')))
 assert.ok(providerRequests.every((request) => [
   'mail-connection',
+  'personal-mail-connection',
   'calendar-connection',
   'personal-calendar-connection',
 ].includes(request.context.boundConnectionId)))
@@ -628,6 +801,29 @@ assert.equal(
   2,
   'read-only calendars must not be offered',
 )
+assert.equal(
+  JSON.stringify(gmailState.availableConnections
+    .filter((connection) => connection.app === 'google-mail')
+    .map((connection) => ({
+      connectionId: connection.connectionId,
+      identities: connection.gmailSendAsIdentities,
+    }))),
+  JSON.stringify([{
+    connectionId: 'mail-connection',
+    identities: [
+      { email: 'jarrett@suburbiasandwichco.com', verificationStatus: 'accepted', isDefault: true },
+      { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isDefault: false },
+    ],
+  }, {
+    connectionId: 'personal-mail-connection',
+    identities: [
+      { email: 'jarrettcrosby@gmail.com', verificationStatus: 'accepted', isDefault: true },
+      { email: 'pending@example.com', verificationStatus: 'pending', isDefault: false },
+      { email: 'stewards@eigenracing.com', verificationStatus: 'accepted', isDefault: false },
+    ],
+  }]),
+  'All linked Gmail accounts and provider-reported aliases must remain distinguishable for the UI',
+)
 
 providerMode = 'alias-pending'
 await assert.rejects(
@@ -642,6 +838,56 @@ await assert.rejects(
 )
 
 providerMode = 'alias-accepted'
+const writesBeforeEmailSelections = writes.length
+const bpoEmailSelection = await service.resolveVerifiedPipelineGmailSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'mail-connection',
+  gmailSendAsEmail: 'jarrett@bposupplychain.com',
+})
+assert.equal(JSON.stringify(bpoEmailSelection), JSON.stringify({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  credentialOwnerEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'mail-connection',
+  accountEmail: 'jarrett@suburbiasandwichco.com',
+  identityEmail: 'jarrett@bposupplychain.com',
+  calendarId: null,
+  source: 'email-override',
+}))
+const stewardsEmailSelection = await service.resolveVerifiedPipelineGmailSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'personal-mail-connection',
+  gmailSendAsEmail: 'stewards@eigenracing.com',
+})
+assert.equal(stewardsEmailSelection.accountEmail, 'jarrettcrosby@gmail.com')
+assert.equal(stewardsEmailSelection.identityEmail, 'stewards@eigenracing.com')
+assert.equal(stewardsEmailSelection.connectionId, 'personal-mail-connection')
+assert.equal(stewardsEmailSelection.source, 'email-override')
+assert.equal(
+  writes.length,
+  writesBeforeEmailSelections,
+  'Per-send Gmail selection must not mutate the organization default binding',
+)
+await assert.rejects(
+  service.resolveVerifiedPipelineGmailSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId: 'personal-mail-connection',
+    gmailSendAsEmail: 'pending@example.com',
+  }),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED',
+)
+await assert.rejects(
+  service.resolveVerifiedPipelineGmailSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId: 'other-actor-connection',
+    gmailSendAsEmail: 'other@example.com',
+  }),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID',
+)
+
 await service.bindOrganizationCommunication({
   organizationId: '11111111-1111-4111-8111-111111111111',
   actorEmail: 'jarrett@suburbiasandwichco.com',

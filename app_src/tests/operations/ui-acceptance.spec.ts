@@ -3934,7 +3934,33 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
     orderedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
     updatedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
   }))
+  const pageTwoFaireCandidateGlobalId = 'gcoc2000051'
+  const pageTwoFaireOrder: OperationsImportedOrderWorkingCopy = {
+    ...importedWorkbenchOrder(true),
+    globalId: pageTwoFaireCandidateGlobalId,
+    candidateGlobalId: pageTwoFaireCandidateGlobalId,
+    integrationAccountGlobalId: 'gia2000051',
+    integrationAccountName: 'Faire Page Two',
+    provider: 'faire',
+    externalOrderId: 'WXVFX9CS9C',
+    orderNumber: 'WXVFX9CS9C',
+    customerName: 'Faire page-two customer',
+    sourceUpdatedAt: '2026-08-31T12:00:51.000Z',
+    orderedAt: '2026-08-31T12:00:51.000Z',
+    updatedAt: '2026-08-31T12:00:51.000Z',
+  }
+  const pageTwoFaireSummary: OperationsImportedOrderWorkingCopy = {
+    ...pageTwoFaireOrder,
+    resolutionDetailsLoaded: false,
+    customer: {
+      ...pageTwoFaireOrder.customer,
+      options: [],
+    },
+    lines: [],
+    productOptions: [],
+  }
   const unifiedPageRequests: Array<{ page: number; snapshot: string | null }> = []
+  let pageTwoFaireDetailReads = 0
   let failLastPageOnce = true
   let driftPageOnce: number | null = null
   let currentSnapshot = 'orders-snapshot-v1'
@@ -3973,11 +3999,19 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
         requestedOffset,
         Math.floor((orders.length - 1) / 50) * 50,
       )
-      const rows = orders.slice(offset, offset + 50).map((order) => ({
-        kind: 'canonical',
-        key: `canonical:${order.globalId}`,
-        order,
-      }))
+      const rows = orders.slice(offset, offset + 50).map((order, index) => (
+        requestedPage === 2 && index === 1
+          ? {
+              kind: 'imported' as const,
+              key: `imported:${pageTwoFaireCandidateGlobalId}`,
+              order: pageTwoFaireSummary,
+            }
+          : {
+              kind: 'canonical' as const,
+              key: `canonical:${order.globalId}`,
+              order,
+            }
+      ))
       const nextOffset = offset + rows.length
       const complete = nextOffset >= orders.length
       await route.fulfill({
@@ -4031,6 +4065,21 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
       },
     })
   })
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      expect(route.request().method()).toBe('GET')
+      expect(new URL(route.request().url()).searchParams.get('candidate'))
+        .toBe(pageTwoFaireCandidateGlobalId)
+      pageTwoFaireDetailReads += 1
+      await route.fulfill({
+        json: {
+          ok: true,
+          orders: [pageTwoFaireOrder],
+        },
+      })
+    },
+  )
 
   await gotoApp(page, '/#operations')
 
@@ -4050,13 +4099,27 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
   await expect(page).toHaveURL(/orderPage=2/u)
   await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
 
-  await page.getByRole('row', { name: /#7050/u }).click()
+  await page.getByRole('button', { name: 'Open order #7050' }).click()
   await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
   await expect(page).toHaveURL(/orderPage=2/u)
   await expect(page).toHaveURL(/operationsOrder=gor2000050/u)
   expect(unifiedPageRequests).toHaveLength(2)
 
   await page.getByRole('button', { name: 'Close order details' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
+
+  await page.getByRole('button', { name: 'Open order WXVFX9CS9C' }).click()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(pageTwoFaireDetailReads).toBe(1)
+
+  await page.getByRole('button', { name: 'Close imported order' }).click()
   await expect(page).toHaveURL(/orderPage=2/u)
   await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
   await expect(page).not.toHaveURL(/operationsOrder=/u)
@@ -4129,6 +4192,25 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
     { page: 1, snapshot: 'orders-snapshot-stale' },
     { page: 1, snapshot: null },
   ])
+
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await gotoApp(
+    page,
+    `/?orderPage=2&orderSnapshot=orders-snapshot-v2&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
+  )
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(pageTwoFaireDetailReads).toBe(2)
+
+  await page.getByRole('button', { name: 'Close imported order' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
 })
 test('orders refresh leaves provider continuation for the next manager action', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
