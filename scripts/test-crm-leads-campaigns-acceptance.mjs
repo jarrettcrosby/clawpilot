@@ -7,7 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -17,6 +17,16 @@ const contractsOnly = process.argv.includes('--contracts-only')
 const actorEmail = 'crm.acceptance@example.test'
 const shortLinkOrigin = 'https://links.acceptance.example.test'
 const sessionSecret = 'crm-acceptance-session-secret-00000000000000000000'
+const testMatonKey = 'crm-acceptance-maton-key-0000000000000000'
+
+function encryptedTestMatonKey(ownerEmail) {
+  const iv = crypto.randomBytes(12)
+  const key = crypto.createHash('sha256').update(sessionSecret).digest()
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(Buffer.from(`clawpilot:maton:${ownerEmail}:api-key:v1`, 'utf8'))
+  const ciphertext = Buffer.concat([cipher.update(testMatonKey, 'utf8'), cipher.final()])
+  return { ciphertext, iv, tag: cipher.getAuthTag() }
+}
 
 const FIXTURES = Object.freeze({
   account: {
@@ -290,10 +300,19 @@ async function seedTenant(pool) {
        ) VALUES ($1, $2::uuid, 'owner', $3::jsonb, 'active', true, $1, $1)`,
       [actorEmail, organizationId, JSON.stringify(permissions)],
     )
+    const encryptedCredential = encryptedTestMatonKey(actorEmail)
     await client.query(
-      `INSERT INTO user_maton_credentials (owner_email, login_email)
-       VALUES ($1, $1)`,
-      [actorEmail],
+      `INSERT INTO user_maton_credentials (
+         owner_email, login_email, api_key_ciphertext, api_key_iv, api_key_tag,
+         api_key_last_four, api_key_version, key_rotated_at
+       ) VALUES ($1, $1, $2, $3, $4, $5, 1, now())`,
+      [
+        actorEmail,
+        encryptedCredential.ciphertext,
+        encryptedCredential.iv,
+        encryptedCredential.tag,
+        testMatonKey.slice(-4),
+      ],
     )
     await client.query(
       `INSERT INTO user_maton_connections (
@@ -994,6 +1013,12 @@ async function main() {
         APP_AUTH_REQUIRED: '1',
         APP_LOGIN_EMAIL: actorEmail,
         APP_SESSION_SECRET: sessionSecret,
+        AGENT_CREDENTIAL_ENCRYPTION_KEY: sessionSecret,
+        MATON_BASE_URL: 'https://crm-acceptance.gateway.maton.ai',
+        NODE_OPTIONS: [
+          process.env.NODE_OPTIONS,
+          `--import=${pathToFileURL(path.join(root, 'scripts', 'fixtures', 'mock-crm-acceptance-maton-fetch.mjs')).href}`,
+        ].filter(Boolean).join(' '),
         CLAWPILOT_PUBLIC_URL: 'https://acceptance.clawpilot.test',
         SHORTLINK_PUBLIC_ORIGIN: shortLinkOrigin,
         NEXT_PUBLIC_APP_URL: baseUrl,

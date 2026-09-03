@@ -3603,6 +3603,10 @@ function interactionFromRow(
   row: Record<string, unknown>,
   contacts: CrmInteraction['contacts'] = [],
 ): CrmInteraction {
+  const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? row.metadata as Record<string, unknown>
+    : {}
+  const communicationBindingSource = clean(metadata.communicationBindingSource)
   const fallbackContact = row.contact_id ? [{
     id: String(row.contact_id),
     referenceCode: clean(row.contact_reference_code),
@@ -3635,7 +3639,13 @@ function interactionFromRow(
     occurredAt: row.occurred_at ? String(row.occurred_at) : null,
     description: clean(row.description), direction: (row.direction || 'internal') as CrmInteraction['direction'],
     deliveryStatus: clean(row.delivery_status), providerMessageId: nullable(row.provider_message_id),
-    providerThreadId: nullable(row.provider_thread_id), syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
+    providerThreadId: nullable(row.provider_thread_id),
+    senderEmail: nullable(metadata.senderEmail),
+    senderAccountEmail: nullable(metadata.senderAccountEmail),
+    communicationBindingSource: ['organization', 'user-default', 'email-override'].includes(communicationBindingSource)
+      ? communicationBindingSource as CrmInteraction['communicationBindingSource']
+      : null,
+    syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
 }

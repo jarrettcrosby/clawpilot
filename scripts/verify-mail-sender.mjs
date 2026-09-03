@@ -47,9 +47,6 @@ if (authConnectionId) {
     throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID')
   }
   if (!authSender.includes('@') || /[\r\n]/.test(authSender)) throw new Error('CLAWPILOT_AUTH_MAIL_FROM is invalid')
-  if (authSender === platformSender) {
-    throw new Error('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM')
-  }
   senderProfiles.push({ label: 'Authentication', sender: authSender, connectionId: authConnectionId })
 }
 if (String(process.env.CAREER_SITE_SUBMISSIONS_ENABLED || '0') === '1') {
@@ -99,6 +96,25 @@ async function gmailProfileEmail(connectionId, label) {
   return emailAddress
 }
 
+function gmailDeliveryIdentity(value) {
+  const email = String(value || '').trim().toLowerCase()
+  const atIndex = email.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex === email.length - 1) return email
+
+  const domain = email.slice(atIndex + 1)
+  const consumerGmail = domain === 'gmail.com' || domain === 'googlemail.com'
+  const normalizedDomain = consumerGmail ? 'gmail.com' : domain
+  const local = email.slice(0, atIndex)
+  const plusIndex = local.indexOf('+')
+  const withoutPlus = plusIndex >= 0 ? local.slice(0, plusIndex) : local
+  const normalizedLocal = consumerGmail ? withoutPlus.replace(/\./g, '') : withoutPlus
+  return `${normalizedLocal}@${normalizedDomain}`
+}
+
+function isSameGmailDeliveryMailbox(left, right) {
+  return gmailDeliveryIdentity(left) === gmailDeliveryIdentity(right)
+}
+
 async function verifySender(profile) {
   const data = await fetchGmailJson(
     profile.connectionId,
@@ -123,7 +139,7 @@ async function verify() {
   if (authConnectionId) {
     const platformProfileEmail = await gmailProfileEmail(platformConnectionId, 'Platform')
     const authProfileEmail = await gmailProfileEmail(authConnectionId, 'Authentication')
-    if (platformProfileEmail === authProfileEmail) {
+    if (isSameGmailDeliveryMailbox(platformProfileEmail, authProfileEmail)) {
       throw new Error('Authentication Gmail account must differ from platform Gmail account')
     }
   }

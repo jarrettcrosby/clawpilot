@@ -8,7 +8,10 @@ import {
   replayCrmIntegrationActionByIdempotencyKey,
   retryCrmIntegrationAction,
 } from '@/lib/crm/integrationActions'
-import { resolveVerifiedPipelineCalendarSelection } from '@/lib/integrations/organizationCommunications'
+import {
+  resolveVerifiedPipelineCalendarSelection,
+  resolveVerifiedPipelineGmailSelection,
+} from '@/lib/integrations/organizationCommunications'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
 import {
@@ -86,6 +89,8 @@ function requireOnlyFields(body: Record<string, unknown>) {
     'processNow',
     'calendarConnectionId',
     'calendarId',
+    'gmailConnectionId',
+    'gmailSendAsEmail',
   ]
   const unsupported = Object.keys(body).find((key) => !allowed.includes(key))
   if (unsupported) {
@@ -175,6 +180,8 @@ export async function POST(req: NextRequest) {
     const idempotencyKey = body.idempotencyKey ?? headerIdempotencyKey
     const calendarConnectionSupplied = body.calendarConnectionId !== undefined
     const calendarIdSupplied = body.calendarId !== undefined
+    const gmailConnectionSupplied = body.gmailConnectionId !== undefined
+    const gmailSendAsSupplied = body.gmailSendAsEmail !== undefined
     if (calendarConnectionSupplied !== calendarIdSupplied) {
       throw new CrmIntegrationActionError(
         'Per-meeting Calendar selection requires both calendarConnectionId and calendarId',
@@ -187,6 +194,27 @@ export async function POST(req: NextRequest) {
         'Per-meeting Calendar selection is only supported for Calendar event actions',
         400,
         'CRM_CALENDAR_SELECTION_INVALID',
+      )
+    }
+    if (gmailConnectionSupplied !== gmailSendAsSupplied) {
+      throw new CrmIntegrationActionError(
+        'Per-send Gmail selection requires both gmailConnectionId and gmailSendAsEmail',
+        400,
+        'CRM_GMAIL_SELECTION_INCOMPLETE',
+      )
+    }
+    if (gmailConnectionSupplied && actionType !== 'send_email' && actionType !== 'send_campaign') {
+      throw new CrmIntegrationActionError(
+        'Per-send Gmail selection is only supported for email and campaign actions',
+        400,
+        'CRM_GMAIL_SELECTION_INVALID',
+      )
+    }
+    if (calendarConnectionSupplied && gmailConnectionSupplied) {
+      throw new CrmIntegrationActionError(
+        'Choose either a Gmail sender or a Google Calendar, not both',
+        400,
+        'CRM_COMMUNICATION_SELECTION_INVALID',
       )
     }
     const clientRequestHash = actionType === 'create_calendar_event'
@@ -204,7 +232,22 @@ export async function POST(req: NextRequest) {
               }
             : null,
         })
-      : undefined
+      : actionType === 'send_email' || actionType === 'send_campaign'
+        ? crmIntegrationClientRequestHash({
+            contract: 'crm-gmail-action-v1',
+            pipelineId: pipeline.id,
+            actorEmail: actor.email,
+            actionType,
+            referenceCode: String(referenceCode ?? '').trim().toLowerCase(),
+            payload: body.payload ?? null,
+            gmailSelection: gmailConnectionSupplied
+              ? {
+                  connectionId: String(body.gmailConnectionId ?? '').trim(),
+                  gmailSendAsEmail: String(body.gmailSendAsEmail ?? '').trim().toLowerCase(),
+                }
+              : null,
+          })
+        : undefined
     if (clientRequestHash && idempotencyKey !== undefined) {
       const replay = await replayCrmIntegrationActionByIdempotencyKey({
         pipelineId: pipeline.id,
@@ -230,7 +273,14 @@ export async function POST(req: NextRequest) {
           connectionId: body.calendarConnectionId,
           calendarId: body.calendarId,
         })
-      : undefined
+      : gmailConnectionSupplied
+        ? await resolveVerifiedPipelineGmailSelection({
+            pipelineId: pipeline.id,
+            actorEmail: actor.email,
+            connectionId: body.gmailConnectionId,
+            gmailSendAsEmail: body.gmailSendAsEmail,
+          })
+        : undefined
 
     const queued = await enqueueCrmIntegrationAction({
       pipelineId: pipeline.id,

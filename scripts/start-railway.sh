@@ -53,10 +53,6 @@ if [[ -n "$AUTH_GMAIL_CONNECTION_VALUE" || -n "$AUTH_MAIL_FROM_VALUE" ]]; then
     || fail "MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID"
   [[ "$CLAWPILOT_AUTH_MAIL_FROM" == *@* ]] \
     || fail "CLAWPILOT_AUTH_MAIL_FROM must be an email address"
-  AUTH_MAIL_FROM_NORMALIZED="$(printf '%s' "$CLAWPILOT_AUTH_MAIL_FROM" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
-  PLATFORM_MAIL_FROM_NORMALIZED="$(printf '%s' "$CLAWPILOT_MAIL_FROM" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
-  [[ "$AUTH_MAIL_FROM_NORMALIZED" != "$PLATFORM_MAIL_FROM_NORMALIZED" ]] \
-    || fail "CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM"
 fi
 if [[ "${CLAWPILOT_REPOSITORY_RUNNER_ENABLED:-0}" == "1" ]]; then
   require_value CLAWPILOT_GITHUB_APP_ID 1

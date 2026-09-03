@@ -9853,7 +9853,14 @@ export default function OperationsSection({
                         </TableCell>
                         <TableCell padding="checkbox">
                           <Tooltip title="Open order">
-                            <IconButton size="small" aria-label={`Open order ${order.orderNumber}`}>
+                            <IconButton
+                              size="small"
+                              aria-label={`Open order ${order.orderNumber}`}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                chooseImportedOrder(order)
+                              }}
+                            >
                               <OpenInNewRounded fontSize="small" />
                             </IconButton>
                           </Tooltip>
@@ -9956,7 +9963,20 @@ export default function OperationsSection({
                           month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
                         })}
                       </TableCell>
-                      <TableCell padding="checkbox"><Tooltip title="Open order"><IconButton size="small" aria-label={`Open order ${order.orderNumber}`}><OpenInNewRounded fontSize="small" /></IconButton></Tooltip></TableCell>
+                      <TableCell padding="checkbox">
+                        <Tooltip title="Open order">
+                          <IconButton
+                            size="small"
+                            aria-label={`Open order ${order.orderNumber}`}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              chooseOrder(order)
+                            }}
+                          >
+                            <OpenInNewRounded fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
+                      </TableCell>
                     </TableRow>
                   )
                 })}

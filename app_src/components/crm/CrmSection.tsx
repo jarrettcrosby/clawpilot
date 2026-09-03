@@ -77,7 +77,17 @@ import { dateTimeLocalValue, zonedDateTimeToIso } from '@/lib/zonedDateTime'
 type RecordValue = Record<string, unknown>
 type CrmActionType = 'send_email' | 'create_calendar_event' | 'log_call' | 'send_campaign'
 type MeetingMode = 'google_meet' | 'in_person' | 'custom_link'
+const ORGANIZATION_DEFAULT_EMAIL_KEY = '__organization_default_email__'
 const ORGANIZATION_DEFAULT_CALENDAR_KEY = '__organization_default_calendar__'
+type EmailSenderChoice = {
+  key: string
+  source: 'organization-default' | 'actor-connection'
+  connectionId: string
+  connectionName: string
+  accountEmail: string
+  senderEmail: string
+  isDefault: boolean
+}
 type MeetingCalendarChoice = {
   key: string
   source: 'organization-default' | 'actor-connection' | 'unavailable-current'
@@ -158,6 +168,8 @@ type CrmPayload = {
     googleMail?: string | null
     googleMailSendAsEmail?: string | null
     googleMailConnectionId?: string | null
+    googleMailAccountEmail?: string | null
+    googleMailSource?: string | null
     googleCalendar?: string | null
     googleCalendarOrganizer?: string | null
     googleCalendarConnectionId?: string | null
@@ -174,7 +186,13 @@ type OrganizationCommunicationsPayload = {
       name?: string | null
       app?: string | null
       accountEmail?: string | null
+      selectedForUser?: boolean
       selectionError?: string | null
+      gmailSendAsIdentities?: Array<{
+        email?: string | null
+        verificationStatus?: string | null
+        isDefault?: boolean
+      }> | null
       calendars?: Array<{
         id?: string | null
         summary?: string | null
@@ -307,6 +325,59 @@ function validHttpsMeetingLink(value: unknown) {
   } catch {
     return false
   }
+}
+
+function emailSenderChoiceKey(connectionId: string, senderEmail: string) {
+  return JSON.stringify([connectionId, senderEmail.toLowerCase()])
+}
+
+function emailSenderChoices(
+  payload: OrganizationCommunicationsPayload,
+): { choices: EmailSenderChoice[]; errors: string[] } {
+  const connections = Array.isArray(payload.communication?.availableConnections)
+    ? payload.communication.availableConnections
+    : []
+  const choices: EmailSenderChoice[] = []
+  const errors: string[] = []
+  const seen = new Set<string>()
+
+  for (const connection of connections) {
+    if (String(connection.app || '').trim().toLowerCase() !== 'google-mail') continue
+    const connectionId = String(connection.connectionId || '').trim()
+    if (!connectionId) continue
+    const selectionError = String(connection.selectionError || '').trim()
+    if (selectionError) errors.push(selectionError)
+    const identities = Array.isArray(connection.gmailSendAsIdentities)
+      ? connection.gmailSendAsIdentities
+      : []
+    for (const identity of identities) {
+      const senderEmail = String(identity.email || '').trim().toLowerCase()
+      const verificationStatus = String(identity.verificationStatus || '').trim().toLowerCase()
+      if (!senderEmail || verificationStatus !== 'accepted') continue
+      const key = emailSenderChoiceKey(connectionId, senderEmail)
+      if (seen.has(key)) continue
+      seen.add(key)
+      choices.push({
+        key,
+        source: 'actor-connection',
+        connectionId,
+        connectionName: String(connection.name || '').trim() || 'Google account',
+        accountEmail: String(connection.accountEmail || '').trim().toLowerCase(),
+        senderEmail,
+        isDefault: identity.isDefault === true,
+      })
+    }
+  }
+
+  return { choices, errors: Array.from(new Set(errors)) }
+}
+
+function emailSenderChoiceLabel(choice: EmailSenderChoice) {
+  const linkedAccount = choice.accountEmail
+    || (choice.source === 'organization-default' ? 'managed organization account' : choice.connectionName)
+  return choice.source === 'organization-default'
+    ? `${choice.senderEmail} · Organization default · Linked account ${linkedAccount}`
+    : `${choice.senderEmail} · Linked account ${linkedAccount}`
 }
 
 function meetingCalendarChoiceKey(connectionId: string, calendarId: string) {
@@ -908,11 +979,16 @@ export default function CrmSection() {
   const [providerIdentities, setProviderIdentities] = useState({
     googleMail: null as string | null,
     googleMailConnectionId: null as string | null,
+    googleMailAccountEmail: null as string | null,
+    googleMailSource: null as string | null,
     googleCalendarOrganizer: null as string | null,
     googleCalendarConnectionId: null as string | null,
     googleCalendarId: null as string | null,
     googleCalendarSource: null as string | null,
   })
+  const [emailSenders, setEmailSenders] = useState<EmailSenderChoice[]>([])
+  const [emailSendersLoading, setEmailSendersLoading] = useState(false)
+  const [emailSendersError, setEmailSendersError] = useState('')
   const [meetingCalendars, setMeetingCalendars] = useState<MeetingCalendarChoice[]>([])
   const [meetingCalendarsLoading, setMeetingCalendarsLoading] = useState(false)
   const [meetingCalendarsError, setMeetingCalendarsError] = useState('')
@@ -930,8 +1006,31 @@ export default function CrmSection() {
   const [routeQuery, setRouteQuery] = useState('')
   const [routeReady, setRouteReady] = useState(false)
   const deepLinkOpened = useRef(false)
+  const emailSenderComposerOpen = actionComposer?.type === 'send_email'
+    || actionComposer?.type === 'send_campaign'
   const meetingCalendarComposerOpen = actionComposer?.type === 'create_calendar_event'
   const meetingEditorOpen = editorEntity === 'meetings' && editorRecord !== undefined
+  const organizationDefaultEmailSender = useMemo<EmailSenderChoice | null>(() => {
+    const senderEmail = providerIdentities.googleMail || ''
+    if (providerIdentities.googleMailSource !== 'organization' || !senderEmail) return null
+    return {
+      key: ORGANIZATION_DEFAULT_EMAIL_KEY,
+      source: 'organization-default',
+      connectionId: '',
+      connectionName: 'Organization default',
+      accountEmail: providerIdentities.googleMailAccountEmail || '',
+      senderEmail,
+      isDefault: true,
+    }
+  }, [
+    providerIdentities.googleMail,
+    providerIdentities.googleMailAccountEmail,
+    providerIdentities.googleMailSource,
+  ])
+  const availableEmailSenders = useMemo(() => [
+    ...(organizationDefaultEmailSender ? [organizationDefaultEmailSender] : []),
+    ...emailSenders,
+  ], [emailSenders, organizationDefaultEmailSender])
   const organizationDefaultMeetingCalendar = useMemo<MeetingCalendarChoice | null>(() => {
     const calendarId = providerIdentities.googleCalendarId || ''
     if (providerIdentities.googleCalendarSource !== 'organization' || !calendarId) return null
@@ -1024,6 +1123,8 @@ export default function CrmSection() {
           || payload.providerIdentities?.googleMail
           || null,
         googleMailConnectionId: payload.providerIdentities?.googleMailConnectionId || null,
+        googleMailAccountEmail: payload.providerIdentities?.googleMailAccountEmail || null,
+        googleMailSource: payload.providerIdentities?.googleMailSource || null,
         googleCalendarOrganizer: payload.providerIdentities?.googleCalendarOrganizer
           || payload.providerIdentities?.googleCalendar
           || null,
@@ -1167,6 +1268,119 @@ export default function CrmSection() {
   useEffect(() => {
     if (routeReady) void load(entity, routeQuery, needsReviewOnly)
   }, [entity, load, needsReviewOnly, routeQuery, routeReady])
+
+  useEffect(() => {
+    if (!emailSenderComposerOpen) {
+      setEmailSenders([])
+      setEmailSendersError('')
+      setEmailSendersLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const controller = new AbortController()
+    setEmailSenders([])
+    setEmailSendersError('')
+    setEmailSendersLoading(true)
+
+    const loadEmailSenders = async () => {
+      try {
+        const response = await fetch('/api/integrations/communications', {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        const payload = await response.json().catch(() => ({})) as OrganizationCommunicationsPayload
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || 'Unable to load verified Gmail senders')
+        }
+        const normalized = emailSenderChoices(payload)
+        const choices = normalized.choices
+        if (cancelled) return
+        setEmailSenders(choices)
+        setEmailSendersError(normalized.errors.join(' '))
+        setActionFields((current) => {
+          const explicitCurrentKey = current.gmailConnectionId && current.gmailSendAsEmail
+            ? emailSenderChoiceKey(current.gmailConnectionId, current.gmailSendAsEmail)
+            : ''
+          const currentKey = current.emailSenderChoiceKey || explicitCurrentKey
+          const verifiedCurrent = currentKey
+            ? choices.find((choice) => choice.key === currentKey)
+            : null
+          if (verifiedCurrent) {
+            return {
+              ...current,
+              emailSenderChoiceKey: verifiedCurrent.key,
+              gmailConnectionId: verifiedCurrent.connectionId,
+              gmailSendAsEmail: verifiedCurrent.senderEmail,
+            }
+          }
+          if (organizationDefaultEmailSender) {
+            return {
+              ...current,
+              emailSenderChoiceKey: ORGANIZATION_DEFAULT_EMAIL_KEY,
+              gmailConnectionId: '',
+              gmailSendAsEmail: '',
+            }
+          }
+          const resolvedDefault = providerIdentities.googleMailConnectionId && providerIdentities.googleMail
+            ? choices.find((choice) => (
+                choice.connectionId === providerIdentities.googleMailConnectionId
+                && choice.senderEmail === providerIdentities.googleMail
+              ))
+            : null
+          // A Gmail account can disappear from the verified choices when its
+          // live sender enumeration fails. Never replace that configured
+          // account with another linked account implicitly; require the user
+          // to make an explicit choice instead.
+          const selected = resolvedDefault
+          return selected
+            ? {
+                ...current,
+                emailSenderChoiceKey: selected.key,
+                gmailConnectionId: selected.connectionId,
+                gmailSendAsEmail: selected.senderEmail,
+              }
+            : {
+                ...current,
+                emailSenderChoiceKey: '',
+                gmailConnectionId: '',
+                gmailSendAsEmail: '',
+              }
+        })
+      } catch (senderError) {
+        if (cancelled || controller.signal.aborted) return
+        setEmailSendersError(senderError instanceof Error
+          ? senderError.message
+          : 'Unable to load verified Gmail senders')
+        setActionFields((current) => organizationDefaultEmailSender
+          ? {
+              ...current,
+              emailSenderChoiceKey: ORGANIZATION_DEFAULT_EMAIL_KEY,
+              gmailConnectionId: '',
+              gmailSendAsEmail: '',
+            }
+          : {
+              ...current,
+              emailSenderChoiceKey: '',
+              gmailConnectionId: '',
+              gmailSendAsEmail: '',
+            })
+      } finally {
+        if (!cancelled) setEmailSendersLoading(false)
+      }
+    }
+
+    void loadEmailSenders()
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [
+    emailSenderComposerOpen,
+    organizationDefaultEmailSender,
+    providerIdentities.googleMail,
+    providerIdentities.googleMailConnectionId,
+  ])
 
   useEffect(() => {
     if (!meetingCalendarComposerOpen && !meetingEditorOpen) {
@@ -1510,6 +1724,13 @@ export default function CrmSection() {
       textValue(opportunity, 'id') === textValue(editorRecord, 'convertedOpportunityId')
     )) || null
   }, [editorRecord, opportunities])
+  const actionEmailSenderKey = actionFields.emailSenderChoiceKey
+    || (actionFields.gmailConnectionId && actionFields.gmailSendAsEmail
+      ? emailSenderChoiceKey(actionFields.gmailConnectionId, actionFields.gmailSendAsEmail)
+      : '')
+  const actionEmailSender = availableEmailSenders.find(
+    (choice) => choice.key === actionEmailSenderKey,
+  ) || null
   const actionMeetingMode = meetingModeValue(actionFields.meetingMode)
   const actionMeetingDuration = meetingDurationMinutes(actionFields.durationMinutes)
   const actionMeetingEnd = meetingEndValue(actionFields.startsAt, actionFields.durationMinutes)
@@ -1531,7 +1752,10 @@ export default function CrmSection() {
     && validTimeZone(actionFields.timezone)
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
-      ? providerIdentities.googleMail && actionFields.subject?.trim() && actionFields.text?.trim()
+      ? !emailSendersLoading
+        && actionEmailSender
+        && actionFields.subject?.trim()
+        && actionFields.text?.trim()
       : actionComposer.type === 'log_call'
         ? actionFields.subject?.trim()
         : actionComposer.type === 'create_calendar_event'
@@ -1541,7 +1765,8 @@ export default function CrmSection() {
             && actionFields.subject?.trim()
             && actionMeetingTimingReady
             && actionMeetingLocationReady
-          : providerIdentities.googleMail
+          : !emailSendersLoading
+            && actionEmailSender
             && actionFields.recipientReferences?.trim()
             && actionFields.subject?.trim()
             && actionFields.text?.trim()
@@ -1896,7 +2121,14 @@ export default function CrmSection() {
     const idempotencyKey = `crm-ui:${type}:${crypto.randomUUID()}`
     if (type === 'send_email') {
       if (!textValue(record, 'email') || emailOptedOut(record)) return
-      setActionFields({ subject: `Follow-up: ${recordName}`, text: '', idempotencyKey })
+      setActionFields({
+        subject: `Follow-up: ${recordName}`,
+        text: '',
+        idempotencyKey,
+        emailSenderChoiceKey: organizationDefaultEmailSender?.key || '',
+        gmailConnectionId: '',
+        gmailSendAsEmail: '',
+      })
     } else if (type === 'create_calendar_event') {
       setMeetingCalendarsLoading(true)
       setMeetingCalendarsError('')
@@ -1946,6 +2178,9 @@ export default function CrmSection() {
         recipientReferences: '',
         subject: textValue(record, 'subjectTemplate'),
         text: textValue(record, 'bodyTemplate'),
+        emailSenderChoiceKey: organizationDefaultEmailSender?.key || '',
+        gmailConnectionId: '',
+        gmailSendAsEmail: '',
       })
     }
     setActionComposer({ type, record })
@@ -2002,6 +2237,11 @@ export default function CrmSection() {
             && actionMeetingCalendar?.source === 'actor-connection' ? {
             calendarConnectionId: actionMeetingCalendar.connectionId,
             calendarId: actionMeetingCalendar.calendarId,
+          } : {}),
+          ...((actionComposer.type === 'send_email' || actionComposer.type === 'send_campaign')
+            && actionEmailSender?.source === 'actor-connection' ? {
+            gmailConnectionId: actionEmailSender.connectionId,
+            gmailSendAsEmail: actionEmailSender.senderEmail,
           } : {}),
           idempotencyKey: actionFields.idempotencyKey,
           processNow: true,
@@ -2546,13 +2786,39 @@ export default function CrmSection() {
           <Stack spacing={2} mt={0.5}>
             {actionComposer?.type === 'send_email' && <>
               <TextField
-                disabled
-                label="Email sender"
-                value={providerIdentities.googleMail || 'Not connected for this organization'}
-                helperText={providerIdentities.googleMail
-                  ? 'Accepted Gmail send-as address'
-                  : 'Connect Gmail in Settings before sending.'}
-              />
+                select
+                required
+                label="Send from"
+                disabled={emailSendersLoading && availableEmailSenders.length === 0}
+                value={actionEmailSenderKey}
+                onChange={(event) => {
+                  const choice = availableEmailSenders.find((candidate) => candidate.key === event.target.value)
+                  setActionFields({
+                    ...actionFields,
+                    emailSenderChoiceKey: choice?.key || '',
+                    gmailConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : '',
+                    gmailSendAsEmail: choice?.source === 'actor-connection' ? choice.senderEmail : '',
+                  })
+                }}
+                helperText={emailSendersLoading
+                  ? 'Loading accepted Gmail send-as addresses…'
+                  : actionEmailSender
+                    ? actionEmailSender.source === 'organization-default'
+                      ? `Using the organization default ${actionEmailSender.senderEmail}; linked Gmail account ${actionEmailSender.accountEmail || 'is managed by the organization'}.`
+                      : `Using ${actionEmailSender.senderEmail} through linked Gmail account ${actionEmailSender.accountEmail || actionEmailSender.connectionName}.`
+                    : 'Connect Gmail in Settings or configure an organization default before sending.'}
+              >
+                {availableEmailSenders.map((choice) => (
+                  <MenuItem key={choice.key} value={choice.key}>
+                    {emailSenderChoiceLabel(choice)}
+                  </MenuItem>
+                ))}
+              </TextField>
+              {emailSendersError ? (
+                <Alert severity={availableEmailSenders.length > 0 ? 'warning' : 'error'}>
+                  {emailSendersError}
+                </Alert>
+              ) : null}
               <TextField label="Subject" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} />
             </>}
@@ -2732,13 +2998,39 @@ export default function CrmSection() {
             </>}
             {actionComposer?.type === 'send_campaign' && <>
               <TextField
-                disabled
-                label="Email sender"
-                value={providerIdentities.googleMail || 'Not connected for this organization'}
-                helperText={providerIdentities.googleMail
-                  ? 'Accepted Gmail send-as address'
-                  : 'Connect Gmail in Settings before sending.'}
-              />
+                select
+                required
+                label="Send from"
+                disabled={emailSendersLoading && availableEmailSenders.length === 0}
+                value={actionEmailSenderKey}
+                onChange={(event) => {
+                  const choice = availableEmailSenders.find((candidate) => candidate.key === event.target.value)
+                  setActionFields({
+                    ...actionFields,
+                    emailSenderChoiceKey: choice?.key || '',
+                    gmailConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : '',
+                    gmailSendAsEmail: choice?.source === 'actor-connection' ? choice.senderEmail : '',
+                  })
+                }}
+                helperText={emailSendersLoading
+                  ? 'Loading accepted Gmail send-as addresses…'
+                  : actionEmailSender
+                    ? actionEmailSender.source === 'organization-default'
+                      ? `Campaign recipients will use the organization default ${actionEmailSender.senderEmail}; linked Gmail account ${actionEmailSender.accountEmail || 'is managed by the organization'}.`
+                      : `Campaign recipients will use ${actionEmailSender.senderEmail} through linked Gmail account ${actionEmailSender.accountEmail || actionEmailSender.connectionName}.`
+                    : 'Connect Gmail in Settings or configure an organization default before sending.'}
+              >
+                {availableEmailSenders.map((choice) => (
+                  <MenuItem key={choice.key} value={choice.key}>
+                    {emailSenderChoiceLabel(choice)}
+                  </MenuItem>
+                ))}
+              </TextField>
+              {emailSendersError ? (
+                <Alert severity={availableEmailSenders.length > 0 ? 'warning' : 'error'}>
+                  {emailSendersError}
+                </Alert>
+              ) : null}
               <TextField label="Recipient CRM IDs" required value={actionFields.recipientReferences || ''} onChange={(event) => setActionFields({ ...actionFields, recipientReferences: event.target.value })} helperText="Use gc or gl IDs, separated by commas or spaces" />
               <TextField label="Subject template" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message template" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} helperText="Merge fields: {{firstName}}, {{lastName}}, {{name}}, {{email}}, {{referenceCode}}" />
@@ -3844,6 +4136,28 @@ export default function CrmSection() {
                 </MenuItem>
               ))}
             </TextField>
+            {editorRecord && (textValue(editorRecord, 'senderEmail') || textValue(editorRecord, 'senderAccountEmail')) ? (
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  fullWidth
+                  disabled
+                  label="Sent from"
+                  value={textValue(editorRecord, 'senderEmail') || 'Not recorded'}
+                  helperText="Verified Gmail send-as identity captured when this action ran."
+                />
+                <TextField
+                  fullWidth
+                  disabled
+                  label="Linked Gmail account"
+                  value={textValue(editorRecord, 'senderAccountEmail') || 'Not recorded'}
+                  helperText={textValue(editorRecord, 'communicationBindingSource') === 'organization'
+                    ? 'Organization default'
+                    : textValue(editorRecord, 'communicationBindingSource') === 'email-override'
+                      ? 'Selected for this send'
+                      : 'User default'}
+                />
+              </Stack>
+            ) : null}
           </>}
           {editorEntity === 'campaigns' && <>
             <TextField disabled={!recordEditable} label="Campaign" value={fields.name || ''} onChange={(event) => setFields({ ...fields, name: event.target.value })} required />
@@ -3854,7 +4168,13 @@ export default function CrmSection() {
               <TextField disabled={!recordEditable} fullWidth label="Start date" type="date" value={fields.startDate || ''} onChange={(event) => setFields({ ...fields, startDate: event.target.value })} InputLabelProps={{ shrink: true }} />
               <TextField disabled={!recordEditable} fullWidth label="End date" type="date" value={fields.endDate || ''} onChange={(event) => setFields({ ...fields, endDate: event.target.value })} InputLabelProps={{ shrink: true }} />
             </Stack>
-            <TextField disabled={!recordEditable} label="Sender email" type="email" value={fields.senderEmail || ''} onChange={(event) => setFields({ ...fields, senderEmail: event.target.value })} />
+            <TextField
+              disabled
+              label="Last recorded sender"
+              type="email"
+              value={fields.senderEmail || ''}
+              helperText="Choose an accepted Gmail sender when you send this campaign. This value is retained only for imported history."
+            />
             <TextField disabled={!recordEditable} label="Subject template" value={fields.subjectTemplate || ''} onChange={(event) => setFields({ ...fields, subjectTemplate: event.target.value })} />
             <TextField disabled={!recordEditable} label="Message template" value={fields.bodyTemplate || ''} onChange={(event) => setFields({ ...fields, bodyTemplate: event.target.value })} multiline minRows={8} />
           </>}

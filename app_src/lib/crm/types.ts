@@ -272,6 +272,9 @@ export type CrmInteraction = {
   deliveryStatus: string
   providerMessageId: string | null
   providerThreadId: string | null
+  senderEmail: string | null
+  senderAccountEmail: string | null
+  communicationBindingSource: 'organization' | 'user-default' | 'email-override' | null
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string

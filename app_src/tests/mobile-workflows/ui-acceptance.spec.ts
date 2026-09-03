@@ -156,6 +156,7 @@ type MockCrmOptions = {
   failFirstCalendarAction?: boolean
   failFirstMeetingCreate?: boolean
   failFirstMeetingUpdate?: boolean
+  googleMailSource?: 'organization' | 'user-default'
 }
 
 type CapturedCrmWrite = {
@@ -479,9 +480,11 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
           suiteCrmUsername: null,
         }],
         providerIdentities: {
-          googleMail: 'operator@example.test',
-          googleMailSendAsEmail: 'operator@example.test',
+          googleMail: 'sender@example.test',
+          googleMailSendAsEmail: 'sender@example.test',
           googleMailConnectionId: 'gmail-connection',
+          googleMailAccountEmail: 'operator@example.test',
+          googleMailSource: options.googleMailSource || 'organization',
           googleCalendar: 'calendar@example.test',
           googleCalendarOrganizer: 'calendar@example.test',
           googleCalendarConnectionId: 'calendar-org-connection',
@@ -533,9 +536,14 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
 
 async function mockOrganizationCommunications(
   page: Page,
-  options: { canManage?: boolean; includeOrganizationConnection?: boolean } = {},
+  options: {
+    canManage?: boolean
+    includeConfiguredGmailConnection?: boolean
+    includeOrganizationConnection?: boolean
+  } = {},
 ) {
   const canManage = options.canManage ?? true
+  const includeConfiguredGmailConnection = options.includeConfiguredGmailConnection ?? true
   const includeOrganizationConnection = options.includeOrganizationConnection ?? true
   await page.route((url) => url.pathname === '/api/integrations/maton', async (route) => {
     await route.fulfill({ json: {
@@ -554,6 +562,14 @@ async function mockOrganizationCommunications(
           accountEmail: 'operator@example.test',
           status: 'ACTIVE',
           selected: true,
+        }, {
+          provider: 'google-mail',
+          app: 'google-mail',
+          label: 'Stewards Gmail',
+          connectionId: 'gmail-stewards-connection',
+          accountEmail: 'jarrettcrosby@gmail.com',
+          status: 'ACTIVE',
+          selected: false,
         }, {
           provider: 'google-calendar',
           app: 'google-calendar',
@@ -597,7 +613,7 @@ async function mockOrganizationCommunications(
           status: 'active',
           verifiedAt: '2026-07-16T13:00:00.000Z',
         }] : [],
-        availableConnections: [{
+        availableConnections: [...(includeConfiguredGmailConnection ? [{
           connectionId: 'gmail-connection',
           name: 'Personal Gmail',
           app: 'google-mail',
@@ -609,6 +625,25 @@ async function mockOrganizationCommunications(
             isDefault: true,
           }, {
             email: 'sender@example.test',
+            verificationStatus: 'accepted',
+            isDefault: false,
+          }, {
+            email: 'pending@example.test',
+            verificationStatus: 'pending',
+            isDefault: false,
+          }],
+        }] : []), {
+          connectionId: 'gmail-stewards-connection',
+          name: 'Stewards Gmail',
+          app: 'google-mail',
+          accountEmail: 'jarrettcrosby@gmail.com',
+          selectedForUser: false,
+          gmailSendAsIdentities: [{
+            email: 'jarrettcrosby@gmail.com',
+            verificationStatus: 'accepted',
+            isDefault: true,
+          }, {
+            email: 'stewards@eigenracing.com',
             verificationStatus: 'accepted',
             isDefault: false,
           }],
@@ -974,9 +1009,29 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await drawer.getByRole('button', { name: 'Email', exact: true }).click()
       const emailDialog = page.getByRole('dialog', { name: 'Send email' })
       await expectUsableGeometry(emailDialog, 'Organization email composer', 160, 280)
+      const emailSender = emailDialog.getByRole('combobox', { name: 'Send from' })
+      await expect(emailSender).toContainText('sender@example.test')
+      await expect(emailSender).toContainText('Organization default')
+      await emailSender.click()
+      await expect(page.getByRole('option', { name: /stewards@eigenracing\.com.*jarrettcrosby@gmail\.com/ }))
+        .toBeVisible()
+      await expect(page.getByRole('option', { name: /pending@example\.test/ })).toHaveCount(0)
+      await page.getByRole('option', { name: /stewards@eigenracing\.com.*jarrettcrosby@gmail\.com/ }).click()
       await expect(emailDialog.getByLabel('Subject')).toHaveValue('Follow-up: Acceptance Organization')
-      await expect(emailDialog.getByLabel('Message')).toBeVisible()
-      await emailDialog.getByRole('button', { name: 'Cancel' }).click()
+      await emailDialog.getByLabel('Message').fill('Reviewed sender-alias acceptance message')
+      await emailDialog.getByRole('button', { name: 'Send' }).click()
+      await expect(emailDialog).toBeHidden()
+      const explicitEmailRequest = crmWriteRequests.find(
+        (request) => request.body.actionType === 'send_email',
+      )
+      expect(explicitEmailRequest?.body).toMatchObject({
+        gmailConnectionId: 'gmail-stewards-connection',
+        gmailSendAsEmail: 'stewards@eigenracing.com',
+      })
+      expect(explicitEmailRequest?.body.payload).not.toMatchObject({
+        gmailConnectionId: expect.anything(),
+        gmailSendAsEmail: expect.anything(),
+      })
 
       await drawer.getByRole('button', { name: 'Schedule', exact: true }).click()
       const organizationScheduleDialog = page.getByRole('dialog', { name: 'Schedule meeting' })
@@ -1163,6 +1218,30 @@ for (const viewport of MOBILE_VIEWPORTS) {
       })).toHaveCount(0)
       await page.keyboard.press('Escape')
       await closeEditor.click()
+      await expectNoDocumentOverflow(page)
+    })
+
+    test('CRM email sender requires an explicit choice when the configured Gmail account is unavailable', async ({ page }) => {
+      await mockOrganizationCommunications(page, {
+        includeConfiguredGmailConnection: false,
+        includeOrganizationConnection: false,
+      })
+      await mockCrmRecords(page, { googleMailSource: 'user-default' })
+      await gotoApp(page, '/#crm')
+
+      await page.getByRole('cell', { name: 'Acceptance Organization', exact: true }).click()
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await drawer.getByRole('button', { name: 'Email', exact: true }).click()
+      const emailDialog = page.getByRole('dialog', { name: 'Send email' })
+      const emailSender = emailDialog.getByRole('combobox', { name: 'Send from' })
+
+      await expect(emailSender).toHaveText('')
+      await expect(emailDialog.getByRole('button', { name: 'Send' })).toBeDisabled()
+      await emailSender.click()
+      await page.getByRole('option', { name: /stewards@eigenracing\.com.*jarrettcrosby@gmail\.com/ }).click()
+      await emailDialog.getByLabel('Message').fill('Explicit sender selection test')
+      await expect(emailDialog.getByRole('button', { name: 'Send' })).toBeEnabled()
       await expectNoDocumentOverflow(page)
     })
 

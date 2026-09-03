@@ -341,6 +341,46 @@ export async function resolveVerifiedPipelineCalendarSelection(input: {
   }
 }
 
+export async function resolveVerifiedPipelineGmailSelection(input: {
+  pipelineId: unknown
+  actorEmail: unknown
+  connectionId: unknown
+  gmailSendAsEmail: unknown
+}): Promise<PipelineCommunicationSnapshot> {
+  const actorEmail = normalizeCommunicationIdentityEmail(input.actorEmail)
+  const normalizedConnectionId = connectionId(input.connectionId)
+  const normalizedIdentityEmail = normalizeCommunicationIdentityEmail(input.gmailSendAsEmail)
+  const scope = await resolvePipelineCommunicationScopeInPostgres({
+    pipelineId: String(input.pipelineId || ''),
+    actorEmail,
+  })
+  const credential = await resolveUserMatonGatewayCredential({
+    ownerEmail: actorEmail,
+    app: 'google-mail',
+    boundConnectionId: normalizedConnectionId,
+  }).catch(() => {
+    throw new OrganizationCommunicationRequestError(
+      'The selected Gmail connection is not active for this account',
+      422,
+      'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID',
+    )
+  })
+  const verified = await verifiedGmailIdentity({
+    ownerEmail: actorEmail,
+    connectionId: credential.connectionId,
+    requestedIdentityEmail: normalizedIdentityEmail,
+  })
+  return {
+    organizationId: scope.organizationId,
+    credentialOwnerEmail: actorEmail,
+    connectionId: credential.connectionId,
+    accountEmail: verified.accountEmail,
+    identityEmail: verified.identityEmail,
+    calendarId: null,
+    source: 'email-override',
+  }
+}
+
 export async function getOrganizationCommunicationState(input: {
   organizationId: unknown
   actorEmail: unknown

@@ -81,9 +81,22 @@ for (const fragment of [
   "const ORGANIZATION_DEFAULT_CALENDAR_KEY = '__organization_default_calendar__'",
   "source: 'organization-default' | 'actor-connection'",
   "providerIdentities.googleCalendarSource !== 'organization'",
-  'providerIdentities.googleMail && actionFields.subject?.trim()',
-  'label="Email sender"',
-  'Accepted Gmail send-as address',
+  "const ORGANIZATION_DEFAULT_EMAIL_KEY = '__organization_default_email__'",
+  'emailSenderChoices(payload)',
+  "verificationStatus !== 'accepted'",
+  "actionComposer?.type === 'send_email'",
+  "|| actionComposer?.type === 'send_campaign'",
+  '!emailSendersLoading',
+  '&& actionEmailSender',
+  'label="Send from"',
+  'Linked account ${linkedAccount}',
+  'gmailConnectionId: actionEmailSender.connectionId',
+  'gmailSendAsEmail: actionEmailSender.senderEmail',
+  'label="Sent from"',
+  'label="Linked Gmail account"',
+  "communicationBindingSource') === 'email-override'",
+  'label="Last recorded sender"',
+  'Choose an accepted Gmail sender when you send this campaign.',
   'label="Meeting type"',
   'label="Send from calendar"',
   'Invitation organizer: ${editorMeetingCalendar.organizerEmail}',
@@ -139,6 +152,22 @@ assert.ok(
   'Only a verified actor-owned Calendar choice may send explicit provider override fields',
 )
 assert.ok(
+  crm.includes("actionEmailSender?.source === 'actor-connection'")
+    && crm.includes('gmailConnectionId: actionEmailSender.connectionId')
+    && crm.includes('gmailSendAsEmail: actionEmailSender.senderEmail'),
+  'Only a provider-verified actor-owned Gmail choice may send explicit account-and-alias override fields',
+)
+assert.ok(
+  crm.includes("gmailConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : ''")
+    && crm.includes("gmailSendAsEmail: choice?.source === 'actor-connection' ? choice.senderEmail : ''"),
+  'Gmail selection must preserve the exact linked account and clear override fields for the opaque organization default',
+)
+assert.ok(
+  crm.includes("if (!senderEmail || verificationStatus !== 'accepted') continue")
+    && crm.includes('emailSenderChoiceKey(connectionId, senderEmail)'),
+  'The sender chooser must exclude non-accepted aliases and key choices by connection plus alias',
+)
+assert.ok(
   crm.includes("calendarChoiceKey: choice?.key || ''")
     && crm.includes("calendarConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : ''")
     && crm.includes("calendarId: choice?.source === 'actor-connection' ? choice.calendarId : ''"),
@@ -179,6 +208,12 @@ for (const fragment of [
   "googleCalendarSource: 'organization'",
   "getByRole('combobox', { name: 'Meeting type' })",
   "getByRole('combobox', { name: 'Send from calendar' })",
+  "getByRole('combobox', { name: 'Send from' })",
+  "stewards@eigenracing\\.com.*jarrettcrosby@gmail\\.com",
+  "getByRole('option', { name: /pending@example\\.test/ })).toHaveCount(0)",
+  "gmailConnectionId: 'gmail-stewards-connection'",
+  "gmailSendAsEmail: 'stewards@eigenracing.com'",
+  "expect(explicitEmailRequest?.body.payload).not.toMatchObject",
   "includeOrganizationConnection: false",
   "expect(firstDefaultRequest.body).not.toHaveProperty('calendarConnectionId')",
   "expect(firstDefaultRequest.body).not.toHaveProperty('calendarId')",

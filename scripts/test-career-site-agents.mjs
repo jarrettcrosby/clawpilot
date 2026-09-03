@@ -357,17 +357,14 @@ assert.match(
   /MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID/,
 );
 
-const reusedAuthMailSenderRuntime = validateRuntime({
+const sameVisibleAuthMailSenderRuntime = validateRuntime({
   MATON_GMAIL_CONNECTION_ID: "platform-gmail-connection",
   CLAWPILOT_MAIL_FROM: "Stewards@EigenRacing.com",
   MATON_AUTH_GMAIL_CONNECTION_ID: "dedicated-auth-gmail-connection",
   CLAWPILOT_AUTH_MAIL_FROM: " stewards@eigenracing.com ",
 });
-assert.notEqual(reusedAuthMailSenderRuntime.status, 0);
-assert.match(
-  reusedAuthMailSenderRuntime.stderr,
-  /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/,
-);
+assert.equal(sameVisibleAuthMailSenderRuntime.status, 0, sameVisibleAuthMailSenderRuntime.stderr);
+assert.match(sameVisibleAuthMailSenderRuntime.stdout, /authMail=dedicated/);
 
 const disabledRuntime = validateRuntime({}, ["CAREER_SITE_AGENTS_ENABLED"]);
 assert.notEqual(disabledRuntime.status, 0);

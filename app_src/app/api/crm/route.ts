@@ -310,6 +310,7 @@ export async function GET(req: NextRequest) {
         googleCalendar: googleCalendarIdentity?.identityEmail || null,
         googleMailSendAsEmail: googleMailIdentity?.identityEmail || null,
         googleMailConnectionId: googleMailIdentity?.connectionId || null,
+        googleMailAccountEmail: googleMailIdentity?.accountEmail || null,
         googleCalendarOrganizer: googleCalendarIdentity?.identityEmail || null,
         googleCalendarConnectionId: googleCalendarIdentity?.connectionId || null,
         googleCalendarId: googleCalendarIdentity?.calendarId || null,

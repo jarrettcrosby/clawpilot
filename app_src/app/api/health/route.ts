@@ -3093,9 +3093,6 @@ export async function GET() {
       if (authMailFrom.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authMailFrom) || /[\r\n]/.test(authMailFrom)) {
         errors.push('Hosted runtime authentication mail sender is invalid.')
       }
-      if (authMailFrom.toLowerCase() === String(process.env.CLAWPILOT_MAIL_FROM || '').trim().toLowerCase()) {
-        errors.push('Hosted runtime authentication mail sender must differ from the platform mail sender.')
-      }
     }
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
@@ -3270,6 +3267,7 @@ export async function GET() {
           crm_identity_hierarchy_migration_applied: boolean
           pipeline_sheet_links_migration_applied: boolean
           crm_integrations_migration_applied: boolean
+          organization_email_sender_selection_applied: boolean
           crm_board_projection_migration_applied: boolean
           account_membership_migration_applied: boolean
           suitecrm_inbound_sync_migration_applied: boolean
@@ -3584,6 +3582,26 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0023_crm_modules_references_and_integrations.sql'
               ) AS crm_integrations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM public.schema_migrations
+                WHERE filename = '0346_organization_email_sender_selection.sql'
+                  AND checksum =
+                    '2c10df72a620bd2f78ed472846b56841c77ba69836e61fd13b8533590e154e81'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_constraint installed_email_sender_constraint
+                WHERE installed_email_sender_constraint.conrelid =
+                    pg_catalog.to_regclass('public.crm_integration_actions')
+                  AND installed_email_sender_constraint.conname =
+                    'crm_integration_actions_communication_snapshot_valid'
+                  AND installed_email_sender_constraint.contype = 'c'
+                  AND installed_email_sender_constraint.convalidated
+                  AND pg_catalog.pg_get_constraintdef(
+                    installed_email_sender_constraint.oid
+                  ) LIKE '%email-override%'
+              ) AS organization_email_sender_selection_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8313,6 +8331,7 @@ export async function GET() {
             && row?.crm_identity_hierarchy_migration_applied
             && row?.pipeline_sheet_links_migration_applied
             && row?.crm_integrations_migration_applied
+            && row?.organization_email_sender_selection_applied
             && row?.crm_board_projection_migration_applied
             && row?.account_membership_migration_applied
             && row?.suitecrm_inbound_sync_migration_applied
@@ -8866,6 +8885,7 @@ export async function GET() {
           || !row?.crm_identity_hierarchy_migration_applied
           || !row?.pipeline_sheet_links_migration_applied
           || !row?.crm_integrations_migration_applied
+          || !row?.organization_email_sender_selection_applied
           || !row?.crm_board_projection_migration_applied
           || !row?.account_membership_migration_applied
           || !row?.suitecrm_inbound_sync_migration_applied

@@ -93,7 +93,7 @@ assert.ok(!matonSource.includes('console.'))
 
 const mailSource = read('app_src/lib/matonMail.ts')
 assert.ok(mailSource.includes('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID'))
-assert.ok(mailSource.includes('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM'))
+assert.ok(!mailSource.includes('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM'))
 assert.ok(!mailSource.includes("'Maton-Connection'"))
 assert.ok(mailSource.includes('mailFromAddress'))
 assert.ok(mailSource.includes('matonPlatformMailFetch'))
