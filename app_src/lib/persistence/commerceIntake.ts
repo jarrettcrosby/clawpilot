@@ -4988,17 +4988,20 @@ export async function captureCommerceIntakeProviderReadInPostgres(input: {
     input.requestHash,
   )
   return withTransaction(async (client) => {
+    // Keep account -> store-control ordering, including the control lock
+    // taken by the provider-read lease assertion. Taking that shared lock
+    // first can deadlock with an intake transaction upgrading the control.
+    const account = await resolveAccount(client, {
+      organizationId: input.runtime.organizationId,
+      accountGlobalId: input.runtime.globalId,
+      forUpdate: true,
+    })
     await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
       organizationId: input.runtime.organizationId,
       integrationAccountId: input.runtime.integrationAccountId,
       lease: input.providerReadLease,
       authorityKind: input.providerReadLease.authorityKind,
       readKind: 'catalog_intake',
-    })
-    const account = await resolveAccount(client, {
-      organizationId: input.runtime.organizationId,
-      accountGlobalId: input.runtime.globalId,
-      forUpdate: true,
     })
     const intent = await client.query<{
       id: string

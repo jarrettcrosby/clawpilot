@@ -3960,22 +3960,31 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
     productOptions: [],
   }
   const unifiedPageRequests: Array<{ page: number; snapshot: string | null }> = []
+  const unifiedPageQueryStrings: string[] = []
   let pageTwoFaireDetailReads = 0
   let failLastPageOnce = true
   let driftPageOnce: number | null = null
+  let rejectFreshSnapshotOnce = false
+  let nextDriftSnapshot = 'orders-snapshot-v2'
   let currentSnapshot = 'orders-snapshot-v1'
   await page.route(
     (url) => url.pathname === '/api/operations/orders/unified',
     async (route) => {
       const params = new URL(route.request().url()).searchParams
-      expect(params.get('pageSize')).toBe('50')
+      const requestedPageSize = Number(params.get('pageSize'))
+      expect([25, 50]).toContain(requestedPageSize)
       expect(params.get('cursor')).toBeNull()
       const requestedPage = Number(params.get('page') || 1)
       const requestSnapshot = params.get('snapshot')
       unifiedPageRequests.push({ page: requestedPage, snapshot: requestSnapshot })
-      if (requestedPage === driftPageOnce) {
+      unifiedPageQueryStrings.push(params.toString())
+      if (
+        requestedPage === driftPageOnce
+        || (!requestSnapshot && rejectFreshSnapshotOnce)
+      ) {
+        if (!requestSnapshot) rejectFreshSnapshotOnce = false
         driftPageOnce = null
-        currentSnapshot = 'orders-snapshot-v2'
+        currentSnapshot = nextDriftSnapshot
         await route.fulfill({
           status: 409,
           json: {
@@ -3994,13 +4003,13 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
         })
         return
       }
-      const requestedOffset = (requestedPage - 1) * 50
+      const requestedOffset = (requestedPage - 1) * requestedPageSize
       const offset = Math.min(
         requestedOffset,
-        Math.floor((orders.length - 1) / 50) * 50,
+        Math.floor((orders.length - 1) / requestedPageSize) * requestedPageSize,
       )
-      const rows = orders.slice(offset, offset + 50).map((order, index) => (
-        requestedPage === 2 && index === 1
+      const rows = orders.slice(offset, offset + requestedPageSize).map((order, index) => (
+        offset === requestedPageSize && index === 1
           ? {
               kind: 'imported' as const,
               key: `imported:${pageTwoFaireCandidateGlobalId}`,
@@ -4021,7 +4030,7 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
           page: {
             total: orders.length,
             returned: rows.length,
-            pageSize: 50,
+            pageSize: requestedPageSize,
             offset,
             nextCursor: null,
             complete,
@@ -4166,51 +4175,134 @@ test('Orders pane supports direct URL-backed pages and preserves the page while 
   driftPageOnce = 2
   await page.getByRole('button', { name: 'Go to previous page' }).click()
   await expect(page.getByText(
-    'Orders changed while you were paging. Returned to the first page.',
+    'Orders changed. Refreshed page 2 with current results.',
   )).toBeVisible()
-  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
-  await expect(page).not.toHaveURL(/orderPage=/u)
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
   await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
   expect(unifiedPageRequests.slice(-2)).toEqual([
     { page: 2, snapshot: 'orders-snapshot-v1' },
-    { page: 1, snapshot: null },
+    { page: 2, snapshot: null },
   ])
 
-  driftPageOnce = 1
+  driftPageOnce = 2
+  nextDriftSnapshot = 'orders-snapshot-v3'
   await page.evaluate(() => {
     const url = new URL(window.location.href)
     url.searchParams.set('orderSnapshot', 'orders-snapshot-stale')
+    url.searchParams.set('operationsOrder', 'gcoc2000051')
     window.history.replaceState(window.history.state, '', url)
   })
   await page.reload()
   await expect(page.getByText(
-    'Orders changed while you were paging. Returned to the first page.',
+    'Orders changed. Refreshed page 2 with current results.',
   )).toBeVisible()
-  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
-  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
   expect(unifiedPageRequests.slice(-2)).toEqual([
-    { page: 1, snapshot: 'orders-snapshot-stale' },
-    { page: 1, snapshot: null },
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
   ])
+  expect(pageTwoFaireDetailReads).toBe(2)
 
   await page.setViewportSize({ width: 1366, height: 900 })
   await gotoApp(
     page,
-    `/?orderPage=2&orderSnapshot=orders-snapshot-v2&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
+    `/?orderPage=2&orderSnapshot=orders-snapshot-v3&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
   )
   await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
     .toBeVisible()
   await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
   await expect(page).toHaveURL(/orderPage=2/u)
-  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
   await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
-  expect(pageTwoFaireDetailReads).toBe(2)
+  expect(pageTwoFaireDetailReads).toBe(3)
 
   await page.getByRole('button', { name: 'Close imported order' }).click()
   await expect(page).toHaveURL(/orderPage=2/u)
-  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
   await expect(page).not.toHaveURL(/operationsOrder=/u)
+
+  // A second conflict must surface an error, not retry indefinitely or erase
+  // the requested page, filters, snapshot, or open drawer from the reload URL.
+  driftPageOnce = 2
+  rejectFreshSnapshotOnce = true
+  nextDriftSnapshot = 'orders-snapshot-v4'
+  const beforeFailedRecovery = unifiedPageRequests.length
+  await gotoApp(
+    page,
+    `/?orderPage=2&orderPageSize=25&orderSearch=page-two&orderStatus=imported&orderSort=order_asc&orderProvider=faire&orderTracking=present&orderSnapshot=orders-snapshot-stale&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
+  )
+  await expect(page.getByText(
+    'The order result set changed [OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED]',
+    { exact: true },
+  )).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-stale/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(unifiedPageRequests.slice(beforeFailedRecovery)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
+  ])
+  const failedRecoveryQueries = unifiedPageQueryStrings.slice(-2).map(
+    (query) => new URLSearchParams(query),
+  )
+  failedRecoveryQueries[0].delete('snapshot')
+  expect(failedRecoveryQueries[0].toString())
+    .toBe(failedRecoveryQueries[1].toString())
+  expect(Object.fromEntries(failedRecoveryQueries[1])).toMatchObject({
+    page: '2',
+    pageSize: '25',
+    search: 'page-two',
+    status: 'imported',
+    sort: 'order_number',
+    direction: 'asc',
+    provider: 'faire',
+    tracking: 'present',
+  })
+
+  driftPageOnce = 2
+  await page.reload()
+  await expect(page.getByText('26–50 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderPageSize=25/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v4/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  expect(unifiedPageRequests.slice(-2)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
+  ])
+
+  // Only a no-longer-existing page may be clamped; the selected order remains
+  // addressable even when it is no longer part of the visible list page.
+  orders.splice(20)
+  driftPageOnce = 2
+  nextDriftSnapshot = 'orders-snapshot-v5'
+  await page.reload()
+  await expect(page.getByText('1–20 of 20 orders')).toBeVisible()
+  await expect(page.getByText(
+    'Page 2 is no longer available. Showing page 1.',
+  )).toBeVisible()
+  await expect(page).not.toHaveURL(/orderPage=/u)
+  await expect(page).toHaveURL(/orderPageSize=25/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v5/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect.poll(() => unifiedPageRequests.slice(-3)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-v4' },
+    { page: 2, snapshot: null },
+    { page: 1, snapshot: 'orders-snapshot-v5' },
+  ])
 })
 test('orders refresh leaves provider continuation for the next manager action', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })

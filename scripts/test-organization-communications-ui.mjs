@@ -163,9 +163,15 @@ assert.ok(
   'Gmail selection must preserve the exact linked account and clear override fields for the opaque organization default',
 )
 assert.ok(
-  crm.includes("if (!senderEmail || verificationStatus !== 'accepted') continue")
+  crm.includes("if (!senderEmail || (verificationStatus !== 'accepted' && identity.isPrimary !== true)) continue")
     && crm.includes('emailSenderChoiceKey(connectionId, senderEmail)'),
-  'The sender chooser must exclude non-accepted aliases and key choices by connection plus alias',
+  'The sender chooser must accept provider primaries, exclude non-accepted custom aliases, and key choices by connection plus sender',
+)
+assert.ok(
+  settings.includes("identity.verificationStatus === 'accepted' || identity.isPrimary")
+    && settings.includes("identity.verificationStatus !== 'accepted' && !identity.isPrimary")
+    && crm.includes('Choose an available verified Gmail sender before sending.'),
+  'Settings must accept provider primaries and CRM must request an explicit available choice rather than claim Gmail is disconnected',
 )
 assert.ok(
   crm.includes("calendarChoiceKey: choice?.key || ''")

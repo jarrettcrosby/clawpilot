@@ -218,6 +218,7 @@ const commonMocks = {
 
 let credentialMode = 'available'
 let aliasMode = 'accepted'
+let liveProfileEmail = GMAIL_ACCOUNT
 let currentRow = actionRow()
 let providerRequests = []
 let targetReads = 0
@@ -400,7 +401,7 @@ const runtime = loadTypeScriptModule('app_src/lib/crm/integrationActions.ts', {
       assert.equal(context.app, 'google-mail')
       assert.equal(context.boundConnectionId, CONNECTION_ID)
       if (pathname.endsWith('/users/me/profile')) {
-        return new Response(JSON.stringify({ emailAddress: GMAIL_ACCOUNT }), {
+        return new Response(JSON.stringify({ emailAddress: liveProfileEmail }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         })
@@ -496,6 +497,33 @@ assert.equal(interactionWrites.length, 1)
 assert.equal(interactionWrites[0].sourcePayload.senderEmail, SENDER_ALIAS)
 assert.equal(interactionWrites[0].sourcePayload.senderAccountEmail, GMAIL_ACCOUNT)
 assert.equal(interactionWrites[0].sourcePayload.communicationBindingSource, 'email-override')
+
+// A provider primary is verified by the exact live profile, with no alias
+// verificationStatus required. Cached account labels must not override a
+// freshly reviewed, immutable account snapshot after a Workspace rename.
+for (const primaryEmail of [GMAIL_ACCOUNT, 'jarrett@bposupplychain.com']) {
+  liveProfileEmail = primaryEmail
+  reset(actionRow({
+    communication_account_email: primaryEmail,
+    communication_identity_email: primaryEmail,
+  }))
+  const primaryResult = await runtime.processCrmIntegrationAction(emailAction(), { maxAttempts: 1 })
+  assert.equal(primaryResult.status, 'succeeded', primaryResult.lastError || 'primary Gmail sender should succeed')
+  assert.equal(providerRequests.some((request) => request.pathname.includes('/settings/sendAs/')), false)
+  const primarySend = providerRequests.find((request) => request.pathname.endsWith('/messages/send'))
+  assert.ok(primarySend)
+  assert.equal(primarySend.context.boundConnectionId, CONNECTION_ID)
+  assert.ok(Buffer.from(primarySend.body.raw, 'base64url').toString('utf8').includes(`From: <${primaryEmail}>`))
+  assert.equal(interactionWrites[0].sourcePayload.senderEmail, primaryEmail)
+  assert.equal(interactionWrites[0].sourcePayload.senderAccountEmail, primaryEmail)
+}
+reset(actionRow({ communication_identity_email: GMAIL_ACCOUNT }))
+const staleAccountResult = await runtime.processCrmIntegrationAction(emailAction(), { maxAttempts: 1 })
+assert.equal(staleAccountResult.status, 'dead')
+assert.match(staleAccountResult.lastError, /queued Gmail account no longer matches its reviewed identity/)
+assert.equal(providerRequests.some((request) => request.pathname.endsWith('/messages/send')), false)
+assert.equal(interactionWrites.length, 0)
+liveProfileEmail = GMAIL_ACCOUNT
 
 credentialMode = 'missing'
 aliasMode = 'accepted'

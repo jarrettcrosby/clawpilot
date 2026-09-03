@@ -58,6 +58,7 @@ import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
+import EmailBodyPreview from '@/components/crm/EmailBodyPreview'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
 import ProductImagePanel from '@/components/crm/ProductImagePanel'
 import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
@@ -191,6 +192,7 @@ type OrganizationCommunicationsPayload = {
       gmailSendAsIdentities?: Array<{
         email?: string | null
         verificationStatus?: string | null
+        isPrimary?: boolean
         isDefault?: boolean
       }> | null
       calendars?: Array<{
@@ -353,7 +355,7 @@ function emailSenderChoices(
     for (const identity of identities) {
       const senderEmail = String(identity.email || '').trim().toLowerCase()
       const verificationStatus = String(identity.verificationStatus || '').trim().toLowerCase()
-      if (!senderEmail || verificationStatus !== 'accepted') continue
+      if (!senderEmail || (verificationStatus !== 'accepted' && identity.isPrimary !== true)) continue
       const key = emailSenderChoiceKey(connectionId, senderEmail)
       if (seen.has(key)) continue
       seen.add(key)
@@ -2806,7 +2808,9 @@ export default function CrmSection() {
                     ? actionEmailSender.source === 'organization-default'
                       ? `Using the organization default ${actionEmailSender.senderEmail}; linked Gmail account ${actionEmailSender.accountEmail || 'is managed by the organization'}.`
                       : `Using ${actionEmailSender.senderEmail} through linked Gmail account ${actionEmailSender.accountEmail || actionEmailSender.connectionName}.`
-                    : 'Connect Gmail in Settings or configure an organization default before sending.'}
+                    : availableEmailSenders.length > 0
+                      ? 'Choose an available verified Gmail sender before sending.'
+                      : 'Connect Gmail in Settings or configure an organization default before sending.'}
               >
                 {availableEmailSenders.map((choice) => (
                   <MenuItem key={choice.key} value={choice.key}>
@@ -3018,7 +3022,9 @@ export default function CrmSection() {
                     ? actionEmailSender.source === 'organization-default'
                       ? `Campaign recipients will use the organization default ${actionEmailSender.senderEmail}; linked Gmail account ${actionEmailSender.accountEmail || 'is managed by the organization'}.`
                       : `Campaign recipients will use ${actionEmailSender.senderEmail} through linked Gmail account ${actionEmailSender.accountEmail || actionEmailSender.connectionName}.`
-                    : 'Connect Gmail in Settings or configure an organization default before sending.'}
+                    : availableEmailSenders.length > 0
+                      ? 'Choose an available verified Gmail sender before sending.'
+                      : 'Connect Gmail in Settings or configure an organization default before sending.'}
               >
                 {availableEmailSenders.map((choice) => (
                   <MenuItem key={choice.key} value={choice.key}>
@@ -4178,7 +4184,16 @@ export default function CrmSection() {
             <TextField disabled={!recordEditable} label="Subject template" value={fields.subjectTemplate || ''} onChange={(event) => setFields({ ...fields, subjectTemplate: event.target.value })} />
             <TextField disabled={!recordEditable} label="Message template" value={fields.bodyTemplate || ''} onChange={(event) => setFields({ ...fields, bodyTemplate: event.target.value })} multiline minRows={8} />
           </>}
-          <TextField disabled={!recordEditable} label="Description" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
+          {editorEntity === 'interactions' && fields.interactionType === 'email' && editorRecord ? (
+            <EmailBodyPreview
+              key={textValue(editorRecord, 'id')}
+              disabled={!recordEditable}
+              value={fields.description || fields.notes || ''}
+              onChange={(value) => setFields({ ...fields, description: value, notes: value })}
+            />
+          ) : (
+            <TextField disabled={!recordEditable} label="Description" value={fields.description || fields.notes || ''} onChange={(event) => setFields({ ...fields, description: event.target.value, notes: event.target.value })} multiline minRows={4} />
+          )}
           {editorEntity === 'leads' && editorRecord && convertedLead && (
             <Box component="section" aria-label="Converted records" sx={{ minWidth: 0 }}>
               <Typography variant="subtitle2" fontWeight={700}>Converted records</Typography>

@@ -1,5 +1,12 @@
 import { expect, test } from '@playwright/test'
 import type { Locator, Page, TestInfo } from '@playwright/test'
+import {
+  CRM_EMAIL_PREVIEW_HTML,
+  CRM_EMAIL_PREVIEW_NOTE,
+  CRM_EMAIL_PREVIEW_ORIGIN,
+  CRM_EMAIL_PREVIEW_RECORDS,
+  CRM_EMAIL_PREVIEW_REPLY,
+} from './fixtures/crm-email-preview'
 
 test.use({ hasTouch: true, isMobile: true })
 
@@ -157,6 +164,8 @@ type MockCrmOptions = {
   failFirstMeetingCreate?: boolean
   failFirstMeetingUpdate?: boolean
   googleMailSource?: 'organization' | 'user-default'
+  googleMailIdentity?: string
+  interactionRecords?: Array<Record<string, unknown>>
 }
 
 type CapturedCrmWrite = {
@@ -363,7 +372,7 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
       active: true,
       syncStatus: 'synced',
     }],
-    interactions: [{
+    interactions: options.interactionRecords ?? [{
       id: '00000000-0000-4000-8000-000000000104',
       referenceCode: 'gi7654321',
       shortUrl: null,
@@ -441,7 +450,7 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
           opportunities: 2,
           products: 1,
           meetings: 3,
-          interactions: 1,
+          interactions: recordsByEntity.interactions.length,
           campaigns: 0,
           openPipelineValue: 0,
           weightedPipelineValue: 0,
@@ -480,8 +489,8 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
           suiteCrmUsername: null,
         }],
         providerIdentities: {
-          googleMail: 'sender@example.test',
-          googleMailSendAsEmail: 'sender@example.test',
+          googleMail: options.googleMailIdentity || 'sender@example.test',
+          googleMailSendAsEmail: options.googleMailIdentity || 'sender@example.test',
           googleMailConnectionId: 'gmail-connection',
           googleMailAccountEmail: 'operator@example.test',
           googleMailSource: options.googleMailSource || 'organization',
@@ -540,6 +549,8 @@ async function mockOrganizationCommunications(
     canManage?: boolean
     includeConfiguredGmailConnection?: boolean
     includeOrganizationConnection?: boolean
+    renamedGmailPrimary?: boolean
+    primaryVerificationOmitted?: boolean
   } = {},
 ) {
   const canManage = options.canManage ?? true
@@ -600,7 +611,7 @@ async function mockOrganizationCommunications(
           app: 'google-mail',
           connectionId: 'gmail-connection',
           accountEmail: 'operator@example.test',
-          identityEmail: 'sender@example.test',
+          identityEmail: options.renamedGmailPrimary ? 'operator@example.test' : 'sender@example.test',
           calendarId: null,
           status: 'active',
           verifiedAt: '2026-07-16T13:00:00.000Z',
@@ -617,11 +628,12 @@ async function mockOrganizationCommunications(
           connectionId: 'gmail-connection',
           name: 'Personal Gmail',
           app: 'google-mail',
-          accountEmail: 'operator@example.test',
+          accountEmail: options.renamedGmailPrimary ? 'operator@bposupplychain.test' : 'operator@example.test',
           selectedForUser: true,
           gmailSendAsIdentities: [{
-            email: 'operator@example.test',
-            verificationStatus: 'accepted',
+            email: options.renamedGmailPrimary ? 'operator@bposupplychain.test' : 'operator@example.test',
+            verificationStatus: options.primaryVerificationOmitted ? undefined : 'accepted',
+            isPrimary: true,
             isDefault: true,
           }, {
             email: 'sender@example.test',
@@ -630,6 +642,9 @@ async function mockOrganizationCommunications(
           }, {
             email: 'pending@example.test',
             verificationStatus: 'pending',
+            isDefault: false,
+          }, {
+            email: 'unverified@example.test',
             isDefault: false,
           }],
         }] : []), {
@@ -640,7 +655,8 @@ async function mockOrganizationCommunications(
           selectedForUser: false,
           gmailSendAsIdentities: [{
             email: 'jarrettcrosby@gmail.com',
-            verificationStatus: 'accepted',
+            verificationStatus: options.primaryVerificationOmitted ? undefined : 'accepted',
+            isPrimary: true,
             isDefault: true,
           }, {
             email: 'stewards@eigenracing.com',
@@ -994,6 +1010,79 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expectNoDocumentOverflow(page)
     })
 
+    test('CRM archived email preview is readable, safe, and preserves original content', async ({ page }, testInfo) => {
+      const remoteRequests: string[] = []
+      await page.route(`${CRM_EMAIL_PREVIEW_ORIGIN}/**`, async (route) => {
+        remoteRequests.push(route.request().url())
+        await route.abort()
+      })
+      const { crmWriteRequests } = await mockCrmRecords(page, { interactionRecords: CRM_EMAIL_PREVIEW_RECORDS })
+      await gotoApp(page, '/crm/gi8642101')
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      const preview = drawer.getByTestId('crm-email-preview')
+      await expect(preview).toContainText('The proposal and presentation are linked below for review.')
+      await expect(preview).not.toContainText('<div')
+      await expect(preview).not.toContainText('<p>')
+      await expect(preview).not.toContainText('Hidden frame')
+      expect((await preview.innerText()).match(/Hi Casey,/g)).toHaveLength(2)
+      await expect(preview).toContainText('alex@example.test')
+      await expect(preview).toContainText('%gsltga7654321 %gsltgc7654321')
+      await expect(preview.getByRole('link', { name: 'Presentation — Discussion Draft (PDF)' }))
+        .toHaveAttribute('href', 'https://example.test/presentation.pdf?version=2&review=yes')
+      await expect(preview.getByRole('link', { name: 'Proposal — Discussion Draft (PDF)' }))
+        .toHaveAttribute('href', 'https://example.test/proposal.pdf')
+      await expect(preview.getByRole('link', { name: 'alex@example.test' }))
+        .toHaveAttribute('href', 'mailto:alex@example.test')
+      await expect(preview.getByRole('link', { name: '+1 555 010 0100' }))
+        .toHaveAttribute('href', 'tel:+15550100100')
+      await expect(preview.getByRole('link', { name: 'Unsafe action' })).toHaveCount(0)
+      await expect(preview.getByRole('link', { name: 'Plain reference' })).toHaveCount(0)
+      await expect(preview.locator('img, iframe, script, style')).toHaveCount(0)
+      for (const link of await preview.getByRole('link').all()) {
+        await expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+        await expect(link).toHaveAttribute('referrerpolicy', 'no-referrer')
+      }
+      expect(await page.evaluate(() => Reflect.get(window, '__crmEmailPreviewExecuted'))).toBeUndefined()
+      await expect(drawer.getByLabel('Description', { exact: true })).toBeHidden()
+      await preview.scrollIntoViewIfNeeded()
+      await expectNoDocumentOverflow(page)
+      await page.screenshot({ path: testInfo.outputPath(`crm-email-html-${viewport.name}.png`), fullPage: true })
+      await drawer.getByText('View or edit original content', { exact: true }).click()
+      await expect(drawer.getByLabel('Description', { exact: true })).toHaveValue(CRM_EMAIL_PREVIEW_HTML)
+      await drawer.getByRole('textbox', { name: /^Subject/ }).fill('Synthetic HTML archive reviewed')
+      await drawer.getByRole('button', { name: 'Save', exact: true }).click()
+      await expect.poll(() => crmWriteRequests.length).toBe(1)
+      const saved = crmWriteRequests[0].body.fields as Record<string, unknown>
+      expect(saved.description).toBe(CRM_EMAIL_PREVIEW_HTML)
+      expect(saved.organizationId).toBe(CRM_EMAIL_PREVIEW_RECORDS[0].organizationId)
+      expect(saved.contactId).toBe(CRM_EMAIL_PREVIEW_RECORDS[0].contactId)
+      expect(saved.contactIds).toEqual(CRM_EMAIL_PREVIEW_RECORDS[0].contactIds)
+
+      await page.goto('/crm/gi8642102')
+      await expect(preview).toContainText('I will be in touch next week.')
+      await expect(preview).not.toContainText('[cid:')
+      await expect(preview).not.toContainText('<tel:>')
+      await expect(preview).not.toContainText('<fax:')
+      expect(await preview.innerText()).not.toMatch(/\n{3,}/)
+      await expect(preview.getByRole('link', { name: 'https://example.test/' }))
+        .toHaveAttribute('href', 'https://example.test/')
+      await expect(drawer.getByLabel('Description', { exact: true })).toBeHidden()
+      await preview.scrollIntoViewIfNeeded()
+      await expectNoDocumentOverflow(page)
+      await page.screenshot({ path: testInfo.outputPath(`crm-email-plain-${viewport.name}.png`), fullPage: true })
+      await drawer.getByText('View or edit original content', { exact: true }).click()
+      await expect(drawer.getByLabel('Description', { exact: true })).toHaveValue(CRM_EMAIL_PREVIEW_REPLY.replace(/\r\n/g, '\n'))
+
+      await page.goto('/crm/gi8642103')
+      await expect(drawer.getByLabel('Description', { exact: true })).toHaveValue(CRM_EMAIL_PREVIEW_NOTE)
+      await expect(drawer.getByLabel('Description', { exact: true })).toBeVisible()
+      await expect(preview).toHaveCount(0)
+      expect(remoteRequests).toEqual([])
+      expect(await page.evaluate(() => Reflect.get(window, '__crmEmailPreviewExecuted'))).toBeUndefined()
+      await expectNoDocumentOverflow(page)
+    })
+
     test('CRM email controls and meeting scheduler remain usable', async ({ page }) => {
       await mockOrganizationCommunications(page, { includeOrganizationConnection: false })
       const { crmWriteRequests } = await mockCrmRecords(page, { failFirstCalendarAction: true })
@@ -1243,6 +1332,46 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await emailDialog.getByLabel('Message').fill('Explicit sender selection test')
       await expect(emailDialog.getByRole('button', { name: 'Send' })).toBeEnabled()
       await expectNoDocumentOverflow(page)
+    })
+
+    test('CRM Gmail primaries remain selectable after an account rename without alias verification status', async ({ page }, testInfo) => {
+      await mockOrganizationCommunications(page, {
+        includeOrganizationConnection: false,
+        renamedGmailPrimary: true,
+        primaryVerificationOmitted: true,
+      })
+      const { crmWriteRequests } = await mockCrmRecords(page, {
+        googleMailSource: 'user-default',
+        googleMailIdentity: 'operator@example.test',
+      })
+      await gotoApp(page, '/#crm')
+      await page.getByRole('cell', { name: 'Acceptance Organization', exact: true }).click()
+      const drawer = page.getByRole('button', { name: 'Close editor' })
+        .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
+      await drawer.getByRole('button', { name: 'Email', exact: true }).click()
+      const emailDialog = page.getByRole('dialog', { name: 'Send email' })
+      const sender = emailDialog.getByRole('combobox', { name: 'Send from' })
+      await expect(sender).toHaveText('')
+      await expect(emailDialog.getByText('Choose an available verified Gmail sender before sending.')).toBeVisible()
+      await expect(emailDialog.getByText('Connect Gmail in Settings or configure an organization default before sending.')).toHaveCount(0)
+      await expect(emailDialog.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
+      await sender.click()
+      await expect(page.getByRole('option', { name: /^operator@bposupplychain\.test/ })).toBeVisible()
+      await expect(page.getByRole('option', { name: /^jarrettcrosby@gmail\.com/ })).toBeVisible()
+      await expect(page.getByRole('option', { name: /pending@example\.test|unverified@example\.test/ })).toHaveCount(0)
+      await expect(page.getByRole('option', { name: /operator@example\.test/ })).toHaveCount(0)
+      await page.getByRole('option', { name: /^operator@bposupplychain\.test/ }).click()
+      await expect(page.getByRole('listbox')).toBeHidden()
+      await emailDialog.getByLabel('Message').fill('Synthetic primary-account sender test')
+      await expect(emailDialog.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
+      await expectNoDocumentOverflow(page)
+      await page.screenshot({ path: testInfo.outputPath(`crm-primary-sender-${viewport.name}.png`), fullPage: true })
+      await emailDialog.getByRole('button', { name: 'Send', exact: true }).click()
+      await expect(emailDialog).toBeHidden()
+      expect(crmWriteRequests.find((request) => request.body.actionType === 'send_email')?.body).toMatchObject({
+        gmailConnectionId: 'gmail-connection',
+        gmailSendAsEmail: 'operator@bposupplychain.test',
+      })
     })
 
     test('New meeting retries reuse one request identity', async ({ page }) => {

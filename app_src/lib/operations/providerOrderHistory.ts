@@ -1,6 +1,52 @@
 import type { CommerceOrderEvidenceTimelinePage } from '@/lib/persistence/commerceOrderSync'
 import type { OperationsProviderOrderHistory } from './types'
 
+type PresentableTimelineEvent = {
+  evidenceSource: string
+  eventKind: string
+  eventStatus: string | null
+  occurredAt: string
+  locationReference?: string | null
+  payload: Record<string, unknown>
+}
+
+/**
+ * Shopify exposes a fulfillment's tracking status alongside its tracking
+ * numbers. Keep every concrete package/change, but do not display a second
+ * generic status row for the same fulfillment, timestamp, and status.
+ * This is presentation only: retained provider/audit evidence is untouched.
+ */
+export function presentCommerceOrderTimelineEvents<T extends PresentableTimelineEvent>(
+  events: readonly T[],
+): T[] {
+  const trackingKey = (event: T) => {
+    const subject = optionalTimelineText(event.payload.externalSubjectId)
+    return event.evidenceSource === 'provider'
+      && event.eventKind === 'tracking_updated'
+      && subject
+      ? JSON.stringify([
+          subject, event.occurredAt, event.eventStatus,
+          event.locationReference || null,
+        ])
+      : null
+  }
+  const hasTracking = (event: T) => Boolean(
+    optionalTimelineText(event.payload.trackingNumber)
+    || optionalTimelineText(event.payload.trackingUrl),
+  )
+  const concreteTracking = new Set(events.flatMap((event) => {
+    const key = trackingKey(event)
+    return key && hasTracking(event) ? [key] : []
+  }))
+  return events.filter((event) => {
+    const key = trackingKey(event)
+    return !key
+      || hasTracking(event)
+      || Boolean(optionalTimelineText(event.payload.sensitiveEvidenceRedactedAt))
+      || !concreteTracking.has(key)
+  })
+}
+
 function optionalTimelineText(value: unknown) {
   return typeof value === 'string' && value.trim() ? value : null
 }
@@ -43,7 +89,7 @@ export function emptyOperationsProviderOrderHistory(
 export function operationsProviderHistoryFromTimeline(
   timeline: CommerceOrderEvidenceTimelinePage,
 ): OperationsProviderOrderHistory {
-  const providerEvents = timeline.items.filter((event) => (
+  const providerEvents = presentCommerceOrderTimelineEvents(timeline.items).filter((event) => (
     event.evidenceSource === 'provider'
   ))
   const lineSnapshot = providerEvents.find((event) => (

@@ -107,6 +107,67 @@ assert.equal(
   '3 ordered · 0 fulfilled',
   'An exact provider zero remains visible as zero',
 )
+const providerHistorySource = await readFile(
+  new URL('app_src/lib/operations/providerOrderHistory.ts', root), 'utf8',
+)
+const providerHistoryModule = { exports: {} }
+vm.runInNewContext(ts.transpileModule(providerHistorySource, {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, {
+  exports: providerHistoryModule.exports, module: providerHistoryModule,
+})
+const {
+  presentCommerceOrderTimelineEvents,
+  operationsProviderHistoryFromTimeline,
+} = providerHistoryModule.exports
+const trackingEvent = (id, payload = {}, changes = {}) => ({
+  evidenceSource: 'provider', evidenceGlobalId: id, eventKind: 'tracking_updated',
+  eventStatus: 'SUCCESS', occurredAt: '2026-09-02T14:50:44.000Z',
+  locationReference: null, attributionSource: 'unavailable', actorEmail: null,
+  payload: { externalSubjectId: 'gid://shopify/Fulfillment/123', ...payload },
+  ...changes,
+})
+const genericTracking = trackingEvent('generic')
+const packageA = trackingEvent('package-a', { trackingNumber: 'TEST-PACKAGE-A' })
+const visibleIds = (events) => Array.from(
+  presentCommerceOrderTimelineEvents(events), (event) => event.evidenceGlobalId,
+)
+assert.deepEqual(visibleIds([genericTracking, packageA]), ['package-a'],
+  'One fulfillment with generic and concrete tracking renders one tracking entry')
+const packageB = trackingEvent('package-b', { trackingNumber: 'TEST-PACKAGE-B' })
+const otherGeneric = trackingEvent('other-generic', { externalSubjectId: 'gid://shopify/Fulfillment/456' })
+const otherPackage = trackingEvent('other-package', {
+  externalSubjectId: 'gid://shopify/Fulfillment/456', trackingNumber: 'TEST-PACKAGE-C',
+})
+assert.deepEqual(visibleIds([genericTracking, packageA, packageB, otherGeneric, otherPackage]),
+  ['package-a', 'package-b', 'other-package'],
+  'Distinct tracking numbers and fulfillment subjects must all remain visible')
+const laterGeneric = trackingEvent('later-generic', {}, { occurredAt: '2026-09-03T14:50:44.000Z' })
+assert.deepEqual(visibleIds([packageA, laterGeneric]), ['package-a', 'later-generic'],
+  'A later status change cannot be hidden by earlier tracking evidence')
+assert.deepEqual(visibleIds([genericTracking]), ['generic'], 'Standalone tracking status remains visible')
+const redactedTracking = trackingEvent('redacted', { sensitiveEvidenceRedactedAt: '2026-09-03T00:00:00Z' })
+assert.deepEqual(visibleIds([redactedTracking, packageA]), ['redacted', 'package-a'],
+  'Redacted retained evidence is not a redundant generic row')
+const changedStatus = trackingEvent('changed-status', {}, { eventStatus: 'DELIVERED' })
+const changedLocation = trackingEvent('changed-location', {}, { locationReference: 'location-2' })
+const unscoped = trackingEvent('unscoped', { externalSubjectId: null })
+const orderChange = trackingEvent('order-change', {}, { eventKind: 'order_updated' })
+const localAction = trackingEvent('local-action', {}, { evidenceSource: 'clawpilot' })
+assert.deepEqual(visibleIds([packageA, changedStatus, changedLocation, unscoped, orderChange, localAction]),
+  ['package-a', 'changed-status', 'changed-location', 'unscoped', 'order-change', 'local-action'],
+  'Status/location changes, unscoped events, order changes and local audit actions are never collapsed')
+const retainedTimeline = { items: [genericTracking, packageA], truncated: false, limit: 500, providerWrites: 0 }
+const beforePresentation = JSON.stringify(retainedTimeline)
+const projectedHistory = operationsProviderHistoryFromTimeline(retainedTimeline)
+assert.deepEqual(Array.from(projectedHistory.events, (event) => event.globalId), ['package-a'],
+  'The shared canonical/imported drawer projection uses the same presentation rule')
+assert.equal(JSON.stringify(retainedTimeline), beforePresentation,
+  'Presentation must not mutate retained provider or audit rows')
+assert.ok(panel.includes('presentCommerceOrderTimelineEvents(timeline).map'),
+  'The raw history panel shares the tracking presentation rule')
+assert.ok(panel.includes('Provider reference ${event.payload.externalSubjectId}'),
+  'Repeated-looking fulfillment activity includes its distinct provider subject')
 const compiledRequestFence = ts.transpileModule(requestFenceSource, {
   compilerOptions: {
     module: ts.ModuleKind.CommonJS,

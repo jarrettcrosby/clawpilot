@@ -4507,12 +4507,13 @@ export default function OperationsSection({
           tracking: orderTracking,
           updatedAfter: orderPageUpdatedAfter,
         })
-        const response = await fetch(
+        let response = await fetch(
           `/api/operations/orders/unified?${params.toString()}`,
           { cache: 'no-store', signal: controller.signal },
         )
-        const payload = await response.json().catch(() => ({})) as
+        let payload = await response.json().catch(() => ({})) as
           UnifiedOrderPagePayload
+        let refreshedSnapshot = false
         if (
           response.status === 409
           && payload.code === 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED'
@@ -4521,13 +4522,17 @@ export default function OperationsSection({
             controller.signal.aborted
             || requestGeneration !== orderPageLoadGeneration.current
           ) return
-          updateOrderPageSnapshot('')
-          setOrderPageNumber(1)
-          setOrderPageInput('1')
-          setOrderPageRefreshRevision((current) => current + 1)
-          setOrderPageError('')
-          setNotice('Orders changed while you were paging. Returned to the first page.')
-          return
+          // A stale snapshot invalidates the evidence, not the requested page.
+          // Retry once against the current result set, keeping the committed
+          // rows and URL intact until the replacement page has been validated.
+          params.delete('snapshot')
+          response = await fetch(
+            `/api/operations/orders/unified?${params.toString()}`,
+            { cache: 'no-store', signal: controller.signal },
+          )
+          payload = await response.json().catch(() => ({})) as
+            UnifiedOrderPagePayload
+          refreshedSnapshot = true
         }
         if (
           !response.ok
@@ -4566,6 +4571,8 @@ export default function OperationsSection({
         if (actualPage !== orderPageNumber) {
           setOrderPageNumber(actualPage)
           setNotice(`Page ${orderPageNumber} is no longer available. Showing page ${actualPage}.`)
+        } else if (refreshedSnapshot) {
+          setNotice(`Orders changed. Refreshed page ${actualPage} with current results.`)
         }
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') return

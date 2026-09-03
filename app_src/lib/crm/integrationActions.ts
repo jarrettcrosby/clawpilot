@@ -1776,7 +1776,10 @@ async function selectedMatonConnection(
     throw new PermanentCrmIntegrationActionError('The queued communication connection no longer matches its reviewed identity')
   }
   if (
-    action.communication?.accountEmail
+    // Gmail verifies the reviewed account against the live provider profile
+    // immediately below; cached connection email can lag a Workspace rename.
+    app !== 'google-mail'
+    && action.communication?.accountEmail
     && accountEmail
     && normalizeEmail(accountEmail, 'Selected provider account') !== action.communication.accountEmail
   ) {

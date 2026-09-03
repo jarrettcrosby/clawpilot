@@ -1345,13 +1345,6 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
     )
   }
   return withTransaction(async (client) => {
-    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
-      organizationId: input.organizationId,
-      integrationAccountId: input.integrationAccountId,
-      lease: input.providerReadLease,
-      authorityKind: 'manual_read_only',
-      readKind: 'order_history',
-    })
     const account = await client.query<{ integration_account_id: string }>(
       `SELECT account.id::text AS integration_account_id
        FROM operations_integration_accounts account
@@ -1390,6 +1383,15 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
         'The exact verified commerce connection changed before history was saved',
       )
     }
+    // Match intake's account -> store-control ordering without upgrading
+    // this exact-read path's existing shared account/credential locks.
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'manual_read_only',
+      readKind: 'order_history',
+    })
     const persisted = await appendObservationsWithClient(client, {
       organizationId: input.organizationId,
       integrationAccountId: input.integrationAccountId,
@@ -3325,6 +3327,16 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       ? 'available'
       : 'unavailable'
   return withTransaction(async (client) => {
+    // The session validation below already requires UPDATE(account). Take
+    // that same lock before the lease assertion locks the store control,
+    // matching intake capture/reservation instead of inverting their order.
+    await client.query(
+      `SELECT id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       FOR UPDATE`,
+      [input.job.organizationId, input.job.integrationAccountId],
+    )
     await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
       organizationId: input.job.organizationId,
       integrationAccountId: input.job.integrationAccountId,
