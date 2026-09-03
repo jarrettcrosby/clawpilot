@@ -307,6 +307,7 @@ const validRuntimeEnvironment = {
   CRM_ENABLED: "0",
   CLAWPILOT_REPOSITORY_RUNNER_ENABLED: "0",
   CLAWPILOT_PRINT_AGENT_RELEASE_ENABLED: "0",
+  MATON_GMAIL_CONNECTION_ID: "platform-gmail-connection",
   INTEGRATION_EVIDENCE_FINGERPRINT_KEY:
     "career-test-fingerprint-key-000000000000000001",
   INTEGRATION_EVIDENCE_ACTIVE_KEY_ID: "career-test-v1",
@@ -328,6 +329,45 @@ function validateRuntime(overrides = {}, removedNames = []) {
 const validRuntime = validateRuntime();
 assert.equal(validRuntime.status, 0, validRuntime.stderr);
 assert.match(validRuntime.stdout, /careerSiteAgents=enabled/);
+assert.match(validRuntime.stdout, /authMail=platform/);
+
+const dedicatedAuthMailRuntime = validateRuntime({
+  MATON_AUTH_GMAIL_CONNECTION_ID: "dedicated-auth-gmail-connection",
+  CLAWPILOT_AUTH_MAIL_FROM: "jarrettcrosby@gmail.com",
+});
+assert.equal(dedicatedAuthMailRuntime.status, 0, dedicatedAuthMailRuntime.stderr);
+assert.match(dedicatedAuthMailRuntime.stdout, /authMail=dedicated/);
+
+const partialAuthMailRuntime = validateRuntime({
+  MATON_AUTH_GMAIL_CONNECTION_ID: "dedicated-auth-gmail-connection",
+});
+assert.notEqual(partialAuthMailRuntime.status, 0);
+assert.match(
+  partialAuthMailRuntime.stderr,
+  /MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together/,
+);
+
+const reusedAuthMailRuntime = validateRuntime({
+  MATON_AUTH_GMAIL_CONNECTION_ID: "platform-gmail-connection",
+  CLAWPILOT_AUTH_MAIL_FROM: "jarrettcrosby@gmail.com",
+});
+assert.notEqual(reusedAuthMailRuntime.status, 0);
+assert.match(
+  reusedAuthMailRuntime.stderr,
+  /MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID/,
+);
+
+const reusedAuthMailSenderRuntime = validateRuntime({
+  MATON_GMAIL_CONNECTION_ID: "platform-gmail-connection",
+  CLAWPILOT_MAIL_FROM: "Stewards@EigenRacing.com",
+  MATON_AUTH_GMAIL_CONNECTION_ID: "dedicated-auth-gmail-connection",
+  CLAWPILOT_AUTH_MAIL_FROM: " stewards@eigenracing.com ",
+});
+assert.notEqual(reusedAuthMailSenderRuntime.status, 0);
+assert.match(
+  reusedAuthMailSenderRuntime.stderr,
+  /CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM/,
+);
 
 const disabledRuntime = validateRuntime({}, ["CAREER_SITE_AGENTS_ENABLED"]);
 assert.notEqual(disabledRuntime.status, 0);
