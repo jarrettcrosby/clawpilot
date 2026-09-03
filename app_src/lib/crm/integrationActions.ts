@@ -10,8 +10,16 @@ import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
   resolveCrmReferenceCode,
+  stageCrmRecordWithClient,
   stageCrmRecordInPostgres,
+  type StageCrmRecordInput,
 } from '@/lib/persistence/crm'
+import {
+  OrganizationCommunicationPersistenceError,
+  resolvePipelineCommunicationScopeInPostgres,
+  resolvePipelineCommunicationSnapshotInPostgres,
+  type PipelineCommunicationSnapshot,
+} from '@/lib/persistence/organizationCommunications'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import type { CrmActivityStatus, CrmMeeting } from '@/lib/crm/types'
 import { normalizeUserEmail } from '@/lib/users'
@@ -58,6 +66,13 @@ type ActionRow = {
   response_summary: JsonObject
   last_error: string | null
   idempotency_key: string
+  workspace_organization_id: string | null
+  communication_credential_owner_email: string | null
+  communication_connection_id: string | null
+  communication_account_email: string | null
+  communication_identity_email: string | null
+  communication_calendar_id: string | null
+  communication_binding_source: 'organization' | 'user-default' | 'meeting-override' | null
   processed_at: TimestampValue | null
   created_at: TimestampValue
   updated_at: TimestampValue
@@ -92,6 +107,7 @@ type PreparedAction = {
   referenceCode: string
   payload: JsonObject
   idempotencyKey: string
+  communication: PipelineCommunicationSnapshot | null
 }
 
 export type CrmIntegrationActionView = {
@@ -106,6 +122,15 @@ export type CrmIntegrationActionView = {
   availableAt: string
   externalId: string | null
   responseSummary: JsonObject
+  communication: {
+    organizationId: string
+    credentialOwnerEmail: string | null
+    connectionId: string | null
+    accountEmail: string | null
+    identityEmail: string | null
+    calendarId: string | null
+    source: 'organization' | 'user-default' | 'meeting-override'
+  } | null
   lastError: string | null
   processedAt: string | null
   createdAt: string
@@ -119,6 +144,8 @@ export type LeasedCrmIntegrationAction = CrmIntegrationActionView & {
   payload: JsonObject
   lockToken: string
   idempotencyKey: string
+  communicationCredentialOwnerEmail: string | null
+  communicationConnectionId: string | null
 }
 
 export class CrmIntegrationActionError extends Error {
@@ -137,6 +164,22 @@ class PermanentCrmIntegrationActionError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'PermanentCrmIntegrationActionError'
+  }
+}
+
+class ProviderCrmIntegrationActionError extends Error {
+  constructor(
+    readonly app: 'google-mail' | 'google-calendar',
+    readonly providerStatus: number,
+    readonly providerCode: string | null,
+    readonly providerError: string,
+  ) {
+    super(
+      `${app} provider request failed with status ${providerStatus}`
+      + (providerCode ? ` (${providerCode})` : '')
+      + (providerError ? `: ${providerError}` : ''),
+    )
+    this.name = 'ProviderCrmIntegrationActionError'
   }
 }
 
@@ -182,6 +225,11 @@ const CRM_REPLY_MARKER_PATTERN = new RegExp(
 )
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 const MAX_CAMPAIGN_RECIPIENTS = 500
+const MAX_PROVIDER_ERROR_BYTES = 8 * 1024
+const MAX_PROVIDER_ERROR_LENGTH = 500
+const MAX_PROVIDER_CODE_LENGTH = 120
+const MAX_CALENDAR_LIST_PAGES = 4
+const MAX_CALENDAR_OPTIONS = 1000
 
 function iso(value: TimestampValue | null): string | null {
   return value === null ? null : new Date(value).toISOString()
@@ -236,6 +284,75 @@ function normalizeUuid(value: unknown, field: string): string {
   return normalized
 }
 
+function normalizeCalendarCommunicationSnapshot(
+  value: PipelineCommunicationSnapshot,
+  actorEmail: string,
+): PipelineCommunicationSnapshot {
+  if (
+    !value
+    || typeof value !== 'object'
+    || !['organization', 'user-default', 'meeting-override'].includes(value.source)
+  ) {
+    throw new CrmIntegrationActionError(
+      'A reviewed Google Calendar selection is required',
+      400,
+      'CRM_CALENDAR_SELECTION_INVALID',
+    )
+  }
+  const organizationId = normalizeUuid(value.organizationId, 'Calendar organization ID')
+  const credentialOwnerEmail = normalizeEmail(value.credentialOwnerEmail, 'Calendar credential owner')
+  if (value.source !== 'organization' && credentialOwnerEmail !== actorEmail) {
+    throw new CrmIntegrationActionError(
+      'The selected Google Calendar connection must belong to the signed-in user',
+      403,
+      'CRM_CALENDAR_SELECTION_FORBIDDEN',
+    )
+  }
+  const selectedConnectionId = requiredString(value.connectionId, 512, 'Calendar connection ID')
+  if (!/^[\x21-\x7e]+$/.test(selectedConnectionId)) {
+    throw new CrmIntegrationActionError('Calendar connection ID is invalid')
+  }
+  const selectedCalendarId = typeof value.calendarId === 'string' ? value.calendarId.trim() : ''
+  if (
+    !selectedCalendarId
+    || selectedCalendarId.length > 1024
+    || /[\u0000-\u001f\u007f]/.test(selectedCalendarId)
+  ) {
+    throw new CrmIntegrationActionError('Calendar ID is invalid')
+  }
+  return {
+    organizationId,
+    credentialOwnerEmail,
+    connectionId: selectedConnectionId,
+    accountEmail: normalizeEmail(value.accountEmail, 'Calendar account email'),
+    identityEmail: normalizeEmail(value.identityEmail, 'Calendar organizer email'),
+    calendarId: selectedCalendarId,
+    source: value.source,
+  }
+}
+
+function normalizeReviewedCalendarSelection(
+  value: PipelineCommunicationSnapshot,
+  actorEmail: string,
+): PipelineCommunicationSnapshot {
+  if (value?.source !== 'meeting-override') {
+    throw new CrmIntegrationActionError(
+      'A reviewed per-meeting Google Calendar selection is required',
+      400,
+      'CRM_CALENDAR_SELECTION_INVALID',
+    )
+  }
+  return normalizeCalendarCommunicationSnapshot(value, actorEmail)
+}
+
+function calendarIdentifier(value: unknown, field: string): string {
+  const identifier = typeof value === 'string' ? value.trim() : ''
+  if (!identifier || identifier.length > 1024 || /[\u0000-\u001f\u007f]/.test(identifier)) {
+    throw new PermanentCrmIntegrationActionError(`${field} is invalid`)
+  }
+  return identifier
+}
+
 function normalizeActionType(value: unknown): CrmIntegrationActionType {
   const actionType = cleanString(value, 64, 'CRM action type') as CrmIntegrationActionType
   if (!CRM_INTEGRATION_ACTION_TYPES.includes(actionType)) {
@@ -251,6 +368,41 @@ function normalizeIdempotencyKey(value: unknown, actionType: CrmIntegrationActio
     throw new CrmIntegrationActionError('Idempotency key is invalid')
   }
   return idempotencyKey
+}
+
+function normalizeClientRequestHash(value: unknown): string {
+  const hash = cleanString(value, 64, 'Client request hash').toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    throw new CrmIntegrationActionError('Client request hash is invalid')
+  }
+  return hash
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalJsonValue(item))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, canonicalJsonValue(item)]),
+    )
+  }
+  if (typeof value === 'number' && !Number.isFinite(value)) return null
+  return value
+}
+
+/**
+ * Hashes the immutable HTTP request intent separately from provider-resolved
+ * Calendar metadata. This lets a lost-response retry return the committed
+ * action even when a connection is later revoked or an organization default
+ * changes, while a reused key with different client intent remains a conflict.
+ */
+export function crmIntegrationClientRequestHash(value: unknown): string {
+  const serialized = JSON.stringify(canonicalJsonValue(value)) ?? 'null'
+  return crypto.createHash('sha256')
+    .update(serialized)
+    .digest('hex')
 }
 
 function normalizeTimezone(value: unknown): string {
@@ -301,6 +453,17 @@ function normalizeEmailList(value: unknown): string[] {
 }
 
 function actionView(row: ActionRow): CrmIntegrationActionView {
+  const communication = row.workspace_organization_id && row.communication_binding_source
+    ? {
+        organizationId: row.workspace_organization_id,
+        credentialOwnerEmail: row.communication_credential_owner_email,
+        connectionId: row.communication_connection_id,
+        accountEmail: row.communication_account_email,
+        identityEmail: row.communication_identity_email,
+        calendarId: row.communication_calendar_id,
+        source: row.communication_binding_source,
+      }
+    : null
   return {
     id: row.id,
     pipelineId: row.pipeline_id,
@@ -313,10 +476,85 @@ function actionView(row: ActionRow): CrmIntegrationActionView {
     availableAt: iso(row.available_at) as string,
     externalId: row.external_id,
     responseSummary: row.response_summary || {},
+    communication,
     lastError: row.last_error,
     processedAt: iso(row.processed_at),
     createdAt: iso(row.created_at) as string,
     updatedAt: iso(row.updated_at) as string,
+  }
+}
+
+export type CrmIntegrationActionReplay = {
+  action: CrmIntegrationActionView
+  aggregateId: string
+  referenceCode: string | null
+}
+
+/**
+ * Reads an idempotent action only inside the caller's already-authorized actor
+ * and pipeline scope. Rows in another actor or pipeline are intentionally
+ * indistinguishable from a missing key.
+ */
+export async function replayCrmIntegrationActionByIdempotencyKey(input: {
+  pipelineId: unknown
+  actorEmail: unknown
+  idempotencyKey: unknown
+  clientRequestHash: unknown
+  actionType: unknown
+  referenceCode?: unknown
+  aggregateType?: unknown
+}): Promise<CrmIntegrationActionReplay | null> {
+  const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
+  let actorEmail: string
+  try {
+    actorEmail = normalizeUserEmail(input.actorEmail)
+  } catch {
+    throw new CrmIntegrationActionError('A valid signed-in user is required', 401, 'UNAUTHORIZED')
+  }
+  const actionType = normalizeActionType(input.actionType)
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey, actionType)
+  const clientRequestHash = normalizeClientRequestHash(input.clientRequestHash)
+  const referenceCode = input.referenceCode === undefined
+    ? undefined
+    : normalizeReference(input.referenceCode)
+  const aggregateType = input.aggregateType === undefined
+    ? undefined
+    : requiredString(input.aggregateType, 100, 'CRM aggregate type')
+  const existing = await query<ActionRow>(
+    `SELECT * FROM crm_integration_actions
+     WHERE actor_email = $1 AND pipeline_id = $2::uuid AND idempotency_key = $3
+     LIMIT 1`,
+    [actorEmail, pipelineId, idempotencyKey],
+  )
+  const row = existing.rows[0]
+  if (!row) return null
+
+  const storedClientRequestHash = typeof row.payload?._clientRequestHash === 'string'
+    ? row.payload._clientRequestHash.toLowerCase()
+    : ''
+  const runtime = ACTION_RUNTIME[actionType]
+  const matchesScopeAndIntent = row.pipeline_id === pipelineId
+    && row.actor_email === actorEmail
+    && row.provider === runtime.provider
+    && row.app === runtime.app
+    && row.action_type === actionType
+    && (referenceCode === undefined || row.reference_code === referenceCode)
+    && (aggregateType === undefined || row.aggregate_type === aggregateType)
+
+  // Legacy actions without an immutable client-intent hash retain the existing
+  // lower-level replay path, which can compare the older provider-bound hash.
+  if (matchesScopeAndIntent && !storedClientRequestHash) return null
+  if (!matchesScopeAndIntent || storedClientRequestHash !== clientRequestHash) {
+    throw new CrmIntegrationActionError(
+      'Idempotency key was already used for a different CRM action',
+      409,
+      'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+    )
+  }
+  return {
+    action: actionView(row),
+    aggregateId: row.aggregate_id,
+    referenceCode: row.reference_code,
   }
 }
 
@@ -330,17 +568,110 @@ function leasedAction(row: ActionRow): LeasedCrmIntegrationAction {
     payload: row.payload || {},
     lockToken: row.lock_token,
     idempotencyKey: row.idempotency_key,
+    communicationCredentialOwnerEmail: row.communication_credential_owner_email,
+    communicationConnectionId: row.communication_connection_id,
   }
 }
 
 function safeErrorMessage(error: unknown): string {
-  const source = error instanceof Error ? error.message : 'CRM action processing failed'
+  const source = error instanceof Error
+    ? error.message
+    : error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
+      ? String((error as { message: string }).message)
+      : 'CRM action processing failed'
   const redacted = source
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [redacted]')
     .replace(/\b(?:api[_ -]?key|authorization)\s*[:=]\s*\S+/gi, '$1=[redacted]')
     .replace(/[A-Za-z0-9_-]{80,}/g, '[redacted]')
     .trim()
   return (redacted || 'CRM action processing failed').slice(0, 1000)
+}
+
+function boundedProviderValue(value: unknown, maxLength: number): string {
+  if (value === undefined || value === null) return ''
+  return safeErrorMessage(new Error(String(value)))
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .trim()
+    .slice(0, maxLength)
+}
+
+async function boundedResponseText(response: Response): Promise<string> {
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let remaining = MAX_PROVIDER_ERROR_BYTES
+  let text = ''
+  try {
+    while (remaining > 0) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value?.byteLength) continue
+      const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value
+      remaining -= chunk.byteLength
+      text += decoder.decode(chunk, { stream: remaining > 0 })
+      if (remaining === 0) {
+        await reader.cancel().catch(() => undefined)
+        break
+      }
+    }
+    text += decoder.decode()
+    return text
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+async function providerRequestError(
+  app: 'google-mail' | 'google-calendar',
+  response: Response,
+): Promise<ProviderCrmIntegrationActionError> {
+  const raw = await boundedResponseText(response).catch(() => '')
+  let payload: JsonObject = {}
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as JsonObject
+  } catch {
+    // A bounded plain-text provider response is still useful failure evidence.
+  }
+  const nested = payload.error && typeof payload.error === 'object' && !Array.isArray(payload.error)
+    ? payload.error as JsonObject
+    : {}
+  const providerCode = boundedProviderValue(
+    nested.status ?? nested.code ?? payload.code ?? response.status,
+    MAX_PROVIDER_CODE_LENGTH,
+  ) || null
+  const providerError = boundedProviderValue(
+    nested.message
+      ?? (typeof payload.error === 'string' ? payload.error : undefined)
+      ?? payload.message
+      ?? payload.error_description
+      ?? (raw || undefined)
+      ?? response.statusText,
+    MAX_PROVIDER_ERROR_LENGTH,
+  ) || 'Provider rejected the request'
+  return new ProviderCrmIntegrationActionError(
+    app,
+    response.status,
+    providerCode,
+    providerError,
+  )
+}
+
+function providerFailureEvidence(error: unknown): JsonObject {
+  return error instanceof ProviderCrmIntegrationActionError
+    ? {
+        providerStatus: error.providerStatus,
+        providerCode: error.providerCode,
+        providerError: error.providerError,
+      }
+    : {}
+}
+
+function isPermanentProviderFailure(error: unknown): boolean {
+  if (!(error instanceof ProviderCrmIntegrationActionError)) return false
+  return error.providerStatus >= 400
+    && error.providerStatus < 500
+    && ![408, 409, 425, 429].includes(error.providerStatus)
 }
 
 function safeHttpsUrl(value: unknown): string | null {
@@ -377,6 +708,125 @@ async function readCampaignTargets(pipelineId: string, references: string[]): Pr
   return result.rows
 }
 
+type PreviousCalendarEventSnapshot = {
+  eventId: string
+  credentialOwnerEmail: string
+  connectionId: string
+  calendarId: string
+  organizerEmail: string | null
+}
+
+function previousCalendarEventSnapshot(target: CrmReferenceRecord): PreviousCalendarEventSnapshot | null {
+  if (target.entity !== 'meetings' || !target.externalEventId) return null
+  const source = target.sourcePayload && typeof target.sourcePayload === 'object'
+    && !Array.isArray(target.sourcePayload)
+    ? target.sourcePayload
+    : {}
+  const credentialOwnerEmail = typeof source.calendarOwnerEmail === 'string'
+    ? source.calendarOwnerEmail.trim()
+    : ''
+  const connectionId = typeof source.calendarConnectionId === 'string'
+    ? source.calendarConnectionId.trim()
+    : ''
+  const calendarId = typeof source.calendarId === 'string' ? source.calendarId.trim() : ''
+  if (!credentialOwnerEmail || !connectionId || !calendarId) return null
+  return {
+    eventId: requiredString(target.externalEventId, 1000, 'Existing Calendar event ID'),
+    credentialOwnerEmail: normalizeEmail(credentialOwnerEmail, 'Existing Calendar credential owner'),
+    connectionId: requiredString(connectionId, 512, 'Existing Calendar connection ID'),
+    calendarId: cleanString(calendarId, 1024, 'Existing Calendar ID'),
+    organizerEmail: typeof source.calendarOrganizerEmail === 'string' && source.calendarOrganizerEmail.trim()
+      ? normalizeEmail(source.calendarOrganizerEmail, 'Existing Calendar organizer')
+      : null,
+  }
+}
+
+function normalizeCalendarPayload(
+  value: unknown,
+  target?: CrmReferenceRecord,
+): JsonObject {
+  const payload = objectValue(value)
+  assertOnlyFields(payload, [
+    'subject', 'title', 'description', 'startsAt', 'start', 'endsAt', 'end',
+    'timezone', 'location', 'attendeeEmails', 'meetingStatus', 'meetingMode',
+    'customJoinUrl',
+  ])
+  if (target?.entity === 'interactions' || target?.entity === 'campaigns') {
+    throw new CrmIntegrationActionError('Calendar actions cannot target this CRM record type')
+  }
+  const subject = requiredString(payload.subject ?? payload.title, 300, 'Calendar event subject')
+  const timezone = normalizeTimezone(payload.timezone)
+  const startsAt = zonedDateTimeToIso(payload.startsAt ?? payload.start, timezone)
+  const endsAt = zonedDateTimeToIso(payload.endsAt ?? payload.end, timezone)
+  if (!startsAt) throw new CrmIntegrationActionError('Calendar event start is invalid for the selected timezone')
+  if (!endsAt) throw new CrmIntegrationActionError('Calendar event end is invalid for the selected timezone')
+  if (Date.parse(endsAt) <= Date.parse(startsAt)) {
+    throw new CrmIntegrationActionError('Calendar event end must be after its start')
+  }
+  const attendeeEmails = normalizeEmailList(payload.attendeeEmails)
+  if (target?.email && EMAIL_PATTERN.test(target.email)) attendeeEmails.unshift(target.email.toLowerCase())
+  const meetingStatus = normalizeMeetingStatus(payload.meetingStatus)
+  const meetingMode = normalizeMeetingMode(payload.meetingMode)
+  const location = cleanString(payload.location, 1000, 'Calendar event location')
+  const customJoinUrl = safeHttpsUrl(payload.customJoinUrl)
+  if (meetingMode === 'in_person' && !location) {
+    throw new CrmIntegrationActionError('An in-person meeting requires a location')
+  }
+  if (meetingMode === 'custom_link' && !customJoinUrl) {
+    throw new CrmIntegrationActionError('A custom-link meeting requires a valid HTTPS meeting URL')
+  }
+  const previousCalendar = target ? previousCalendarEventSnapshot(target) : null
+  return {
+    subject,
+    description: cleanString(payload.description, 50_000, 'Calendar event description'),
+    startsAt,
+    endsAt,
+    timezone,
+    location,
+    attendeeEmails: Array.from(new Set(attendeeEmails)),
+    meetingStatus,
+    meetingMode,
+    customJoinUrl,
+    ...(previousCalendar ? { previousCalendar } : {}),
+  }
+}
+
+function calendarActionRequestHash(input: {
+  pipelineId: string
+  actorEmail: string
+  referenceCode: string
+  payload: unknown
+  communicationOverride?: PipelineCommunicationSnapshot
+}) {
+  const communicationOverride = input.communicationOverride === undefined
+    ? null
+    : normalizeReviewedCalendarSelection(input.communicationOverride, input.actorEmail)
+  return crypto.createHash('sha256').update(JSON.stringify({
+    pipelineId: input.pipelineId,
+    actorEmail: input.actorEmail,
+    actionType: 'create_calendar_event',
+    referenceCode: input.referenceCode,
+    payload: normalizeCalendarPayload(input.payload),
+    communicationOverride,
+  })).digest('hex')
+}
+
+function existingCalendarActionMatchesRequest(input: {
+  row: ActionRow
+  pipelineId: string
+  actorEmail: string
+  referenceCode: string
+  requestHash: string
+}) {
+  return input.row.pipeline_id === input.pipelineId
+    && input.row.actor_email === input.actorEmail
+    && input.row.provider === ACTION_RUNTIME.create_calendar_event.provider
+    && input.row.app === ACTION_RUNTIME.create_calendar_event.app
+    && input.row.action_type === 'create_calendar_event'
+    && input.row.reference_code === input.referenceCode
+    && input.row.payload?._requestHash === input.requestHash
+}
+
 async function normalizePayload(
   actionType: CrmIntegrationActionType,
   value: unknown,
@@ -405,35 +855,7 @@ async function normalizePayload(
   }
 
   if (actionType === 'create_calendar_event') {
-    assertOnlyFields(payload, [
-      'subject', 'title', 'description', 'startsAt', 'start', 'endsAt', 'end',
-      'timezone', 'location', 'attendeeEmails', 'meetingStatus',
-    ])
-    if (target.entity === 'interactions' || target.entity === 'campaigns') {
-      throw new CrmIntegrationActionError('Calendar actions cannot target this CRM record type')
-    }
-    const subject = requiredString(payload.subject ?? payload.title, 300, 'Calendar event subject')
-    const timezone = normalizeTimezone(payload.timezone)
-    const startsAt = zonedDateTimeToIso(payload.startsAt ?? payload.start, timezone)
-    const endsAt = zonedDateTimeToIso(payload.endsAt ?? payload.end, timezone)
-    if (!startsAt) throw new CrmIntegrationActionError('Calendar event start is invalid for the selected timezone')
-    if (!endsAt) throw new CrmIntegrationActionError('Calendar event end is invalid for the selected timezone')
-    if (Date.parse(endsAt) <= Date.parse(startsAt)) {
-      throw new CrmIntegrationActionError('Calendar event end must be after its start')
-    }
-    const attendeeEmails = normalizeEmailList(payload.attendeeEmails)
-    if (target.email && EMAIL_PATTERN.test(target.email)) attendeeEmails.unshift(target.email.toLowerCase())
-    const meetingStatus = normalizeMeetingStatus(payload.meetingStatus)
-    return {
-      subject,
-      description: cleanString(payload.description, 50_000, 'Calendar event description'),
-      startsAt,
-      endsAt,
-      timezone,
-      location: cleanString(payload.location, 1000, 'Calendar event location'),
-      attendeeEmails: Array.from(new Set(attendeeEmails)),
-      meetingStatus,
-    }
+    return normalizeCalendarPayload(payload, target)
   }
 
   if (actionType === 'log_call') {
@@ -489,6 +911,7 @@ async function prepareAction(input: {
   referenceCode: unknown
   payload?: unknown
   idempotencyKey?: unknown
+  communicationOverride?: PipelineCommunicationSnapshot
 }): Promise<PreparedAction> {
   const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
   let actorEmail: string
@@ -511,6 +934,47 @@ async function prepareAction(input: {
     throw error
   }
   const runtime = ACTION_RUNTIME[actionType]
+  const communicationApp = actionType === 'send_campaign'
+    ? 'google-mail'
+    : runtime.provider === 'maton'
+      ? runtime.app as 'google-mail' | 'google-calendar'
+      : null
+  if (input.communicationOverride !== undefined && actionType !== 'create_calendar_event') {
+    throw new CrmIntegrationActionError(
+      'Per-meeting Calendar selection is only supported for Calendar event actions',
+      400,
+      'CRM_CALENDAR_SELECTION_INVALID',
+    )
+  }
+  let communication: PipelineCommunicationSnapshot | null = null
+  if (communicationApp) {
+    if (input.communicationOverride !== undefined) {
+      communication = normalizeReviewedCalendarSelection(input.communicationOverride, actorEmail)
+    } else {
+      try {
+        communication = await resolvePipelineCommunicationSnapshotInPostgres({
+          pipelineId,
+          actorEmail,
+          app: communicationApp,
+        })
+      } catch (error) {
+        if (
+          error instanceof OrganizationCommunicationPersistenceError
+          && error.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_REQUIRED'
+        ) {
+          throw new CrmIntegrationActionError(
+            `Configure an active ${communicationApp === 'google-mail' ? 'Gmail' : 'Google Calendar'} connection for this organization`,
+            409,
+            'CRM_COMMUNICATION_CONNECTION_REQUIRED',
+          )
+        }
+        throw error
+      }
+    }
+    if (communicationApp === 'google-calendar' && communication) {
+      communication = normalizeCalendarCommunicationSnapshot(communication, actorEmail)
+    }
+  }
   return {
     pipelineId,
     actorEmail,
@@ -522,6 +986,7 @@ async function prepareAction(input: {
     referenceCode: target.referenceCode,
     payload: await normalizePayload(actionType, input.payload, target, pipelineId),
     idempotencyKey: normalizeIdempotencyKey(input.idempotencyKey, actionType),
+    communication,
   }
 }
 
@@ -561,9 +1026,17 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
        INSERT INTO crm_integration_actions (
          pipeline_id, actor_email, provider, app, action_type, aggregate_type,
          aggregate_id, reference_code, payload, status, idempotency_key,
+         workspace_organization_id, communication_credential_owner_email,
+         communication_connection_id, communication_account_email,
+         communication_identity_email, communication_calendar_id,
+         communication_binding_source,
          created_at, available_at, updated_at
        )
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', $10, now(), now(), now())
+       VALUES (
+         $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', $10,
+         $11::uuid, $12, $13, $14, $15, $16, $17,
+         now(), now(), now()
+       )
        ON CONFLICT (actor_email, idempotency_key) DO NOTHING
        RETURNING *
      )
@@ -577,7 +1050,23 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
         AND existing.aggregate_type = $6
         AND existing.aggregate_id = $7
         AND existing.reference_code IS NOT DISTINCT FROM $8
-        AND existing.payload = $9::jsonb) AS matches_intent
+        AND (
+          (
+            existing.payload = $9::jsonb
+            AND existing.workspace_organization_id IS NOT DISTINCT FROM $11::uuid
+            AND existing.communication_credential_owner_email IS NOT DISTINCT FROM $12
+            AND existing.communication_connection_id IS NOT DISTINCT FROM $13
+            AND existing.communication_account_email IS NOT DISTINCT FROM $14
+            AND existing.communication_identity_email IS NOT DISTINCT FROM $15
+            AND existing.communication_calendar_id IS NOT DISTINCT FROM $16
+            AND existing.communication_binding_source IS NOT DISTINCT FROM $17
+          )
+          OR (
+            $5 = 'create_calendar_event'
+            AND COALESCE(existing.payload->>'_requestHash', '') <> ''
+            AND existing.payload->>'_requestHash' = ($9::jsonb)->>'_requestHash'
+          )
+        )) AS matches_intent
      FROM crm_integration_actions existing
      WHERE existing.actor_email = $2 AND existing.idempotency_key = $10
        AND NOT EXISTS (SELECT 1 FROM inserted)
@@ -593,6 +1082,13 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
       action.referenceCode,
       JSON.stringify(action.payload),
       action.idempotencyKey,
+      action.communication?.organizationId || null,
+      action.communication?.credentialOwnerEmail || null,
+      action.communication?.connectionId || null,
+      action.communication?.accountEmail || null,
+      action.communication?.identityEmail || null,
+      action.communication?.calendarId || null,
+      action.communication?.source || null,
     ],
   )
   const row = result.rows[0]
@@ -605,9 +1101,269 @@ async function insertPreparedAction(client: PoolClient, action: PreparedAction):
     )
   }
   if (row.created) {
-    await auditAction(client, { ...action, id: row.id }, 'crm.integration_action.queued')
+    await auditAction(client, { ...action, id: row.id }, 'crm.integration_action.queued', {
+      communicationOrganizationId: action.communication?.organizationId || null,
+      communicationAccountEmail: action.communication?.accountEmail || null,
+      communicationIdentityEmail: action.communication?.identityEmail || null,
+      communicationCalendarId: action.communication?.calendarId || null,
+      communicationBindingSource: action.communication?.source || null,
+    })
   }
   return { action: actionView(row), created: row.created }
+}
+
+type StageMeetingInput = Extract<StageCrmRecordInput, { entity: 'meetings' }>
+
+function normalizedPreviousCalendarSnapshot(value: unknown): PreviousCalendarEventSnapshot | null {
+  if (value === undefined || value === null) return null
+  const snapshot = objectValue(value, 'Previous Calendar event snapshot')
+  assertOnlyFields(snapshot, [
+    'eventId', 'credentialOwnerEmail', 'connectionId', 'calendarId', 'organizerEmail',
+  ])
+  const connectionId = requiredString(snapshot.connectionId, 512, 'Previous Calendar connection ID')
+  if (!/^[\x21-\x7e]+$/.test(connectionId)) {
+    throw new CrmIntegrationActionError('Previous Calendar connection ID is invalid')
+  }
+  const calendarId = cleanString(snapshot.calendarId, 1024, 'Previous Calendar ID')
+  if (!calendarId) throw new CrmIntegrationActionError('Previous Calendar ID is required')
+  return {
+    eventId: requiredString(snapshot.eventId, 1000, 'Previous Calendar event ID'),
+    credentialOwnerEmail: normalizeEmail(snapshot.credentialOwnerEmail, 'Previous Calendar credential owner'),
+    connectionId,
+    calendarId,
+    organizerEmail: snapshot.organizerEmail
+      ? normalizeEmail(snapshot.organizerEmail, 'Previous Calendar organizer')
+      : null,
+  }
+}
+
+function meetingSaveRequestHash(input: {
+  stageInput: StageMeetingInput
+  payload: JsonObject
+  communication: PipelineCommunicationSnapshot
+}) {
+  const requestedPayload = { ...input.payload }
+  delete requestedPayload.previousCalendar
+  delete requestedPayload._requestHash
+  delete requestedPayload._clientRequestHash
+  return crypto.createHash('sha256').update(JSON.stringify({
+    pipelineId: input.stageInput.pipelineId,
+    actorEmail: input.stageInput.actorEmail,
+    localId: input.stageInput.localId || null,
+    sourceKey: input.stageInput.sourceKey,
+    fields: input.stageInput.fields,
+    payload: requestedPayload,
+    communication: input.communication,
+  })).digest('hex')
+}
+
+function existingMeetingActionMatches(input: {
+  row: ActionRow
+  pipelineId: string
+  actorEmail: string
+  localId: string | null
+  requestHash: string
+  communication: PipelineCommunicationSnapshot
+}) {
+  const rowHash = typeof input.row.payload?._requestHash === 'string'
+    ? input.row.payload._requestHash
+    : ''
+  return input.row.pipeline_id === input.pipelineId
+    && input.row.actor_email === input.actorEmail
+    && input.row.action_type === 'create_calendar_event'
+    && input.row.aggregate_type === 'crm_meeting'
+    && (!input.localId || input.row.aggregate_id === input.localId)
+    && rowHash === input.requestHash
+    && input.row.workspace_organization_id === input.communication.organizationId
+    && input.row.communication_credential_owner_email === input.communication.credentialOwnerEmail
+    && input.row.communication_connection_id === input.communication.connectionId
+    && input.row.communication_account_email === input.communication.accountEmail
+    && input.row.communication_identity_email === input.communication.identityEmail
+    && input.row.communication_calendar_id === input.communication.calendarId
+    && input.row.communication_binding_source === input.communication.source
+}
+
+/**
+ * Persists the app-owned meeting, SuiteCRM outbox record, and Calendar action in
+ * one database transaction. A client-generated key is mandatory so a retry
+ * after a lost HTTP response returns the same meeting/action without restaging
+ * a meeting that a worker may already have delivered.
+ */
+export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
+  stageInput: StageMeetingInput
+  payload: unknown
+  idempotencyKey: unknown
+  clientRequestHash?: unknown
+  communication: PipelineCommunicationSnapshot
+  previousCalendar?: unknown
+}) {
+  if (input.idempotencyKey === undefined || input.idempotencyKey === null || input.idempotencyKey === '') {
+    throw new CrmIntegrationActionError(
+      'Meeting save idempotency key is required',
+      400,
+      'CRM_MEETING_IDEMPOTENCY_REQUIRED',
+    )
+  }
+  const pipelineId = normalizeUuid(input.stageInput.pipelineId, 'Pipeline ID')
+  let actorEmail: string
+  try {
+    actorEmail = normalizeUserEmail(input.stageInput.actorEmail)
+  } catch {
+    throw new CrmIntegrationActionError('A valid signed-in user is required', 401, 'UNAUTHORIZED')
+  }
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey, 'create_calendar_event')
+  const communication = normalizeCalendarCommunicationSnapshot(input.communication, actorEmail)
+  const previousCalendar = normalizedPreviousCalendarSnapshot(input.previousCalendar)
+  const normalizedPayload = normalizeCalendarPayload(input.payload)
+  const payload: JsonObject = {
+    ...normalizedPayload,
+    ...(previousCalendar ? { previousCalendar } : {}),
+  }
+  const stageInput: StageMeetingInput = {
+    ...input.stageInput,
+    pipelineId,
+    actorEmail,
+  }
+  const requestHash = meetingSaveRequestHash({ stageInput, payload, communication })
+  payload._requestHash = requestHash
+  if (input.clientRequestHash !== undefined) {
+    payload._clientRequestHash = normalizeClientRequestHash(input.clientRequestHash)
+  }
+
+  const transactionResult = await withTransaction(async (client) => {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [`crm-meeting-save:${actorEmail}:${idempotencyKey}`],
+    )
+    const existing = await client.query<ActionRow>(
+      `SELECT * FROM crm_integration_actions
+       WHERE actor_email = $1 AND idempotency_key = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [actorEmail, idempotencyKey],
+    )
+    if (existing.rows[0]) {
+      if (!existingMeetingActionMatches({
+        row: existing.rows[0],
+        pipelineId,
+        actorEmail,
+        localId: stageInput.localId || null,
+        requestHash,
+        communication,
+      })) {
+        throw new CrmIntegrationActionError(
+          'Idempotency key was already used for a different CRM meeting save',
+          409,
+          'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+        )
+      }
+      const existingMeeting = await client.query<{
+        id: string
+        suitecrm_id: string
+        reference_code: string
+        source_hash: string
+      }>(
+        `SELECT id::text, suitecrm_id, reference_code, source_hash
+         FROM crm_meetings
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid
+         LIMIT 1`,
+        [pipelineId, existing.rows[0].aggregate_id],
+      )
+      if (!existingMeeting.rows[0]) {
+        throw new Error('Idempotent CRM meeting action has no persisted meeting')
+      }
+      return {
+        action: actionView(existing.rows[0]),
+        created: false,
+        staged: existingMeeting.rows[0],
+        reused: true as const,
+      }
+    }
+
+    const staged = await stageCrmRecordWithClient(client, stageInput)
+    const inserted = await insertPreparedAction(client, {
+      pipelineId,
+      actorEmail,
+      provider: ACTION_RUNTIME.create_calendar_event.provider,
+      app: ACTION_RUNTIME.create_calendar_event.app,
+      actionType: 'create_calendar_event',
+      aggregateType: 'crm_meeting',
+      aggregateId: staged.id,
+      referenceCode: staged.referenceCode,
+      payload,
+      idempotencyKey,
+      communication,
+    })
+    return { ...inserted, staged, reused: false as const }
+  })
+
+  if (!transactionResult.reused) return transactionResult
+  const current = await readCrmRecordByReference({
+    pipelineId,
+    referenceCode: transactionResult.staged.reference_code,
+  })
+  return {
+    action: transactionResult.action,
+    created: false,
+    reused: true as const,
+    staged: {
+      id: transactionResult.staged.id,
+      suiteCrmId: transactionResult.staged.suitecrm_id,
+      referenceCode: transactionResult.staged.reference_code,
+      shortUrl: current.shortUrl,
+      sourceHash: transactionResult.staged.source_hash,
+    },
+  }
+}
+
+export async function replayCrmMeetingSaveByIdempotencyKey(input: {
+  pipelineId: unknown
+  actorEmail: unknown
+  idempotencyKey: unknown
+  clientRequestHash: unknown
+}) {
+  const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
+  const replay = await replayCrmIntegrationActionByIdempotencyKey({
+    pipelineId,
+    actorEmail: input.actorEmail,
+    idempotencyKey: input.idempotencyKey,
+    clientRequestHash: input.clientRequestHash,
+    actionType: 'create_calendar_event',
+    aggregateType: 'crm_meeting',
+  })
+  if (!replay) return null
+  if (!replay.referenceCode) {
+    throw new Error('Idempotent CRM meeting action has no persisted meeting reference')
+  }
+  const meeting = await query<{
+    id: string
+    suitecrm_id: string
+    reference_code: string
+    source_hash: string
+  }>(
+    `SELECT id::text, suitecrm_id, reference_code, source_hash
+     FROM crm_meetings
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+     LIMIT 1`,
+    [pipelineId, replay.aggregateId],
+  )
+  if (!meeting.rows[0]) throw new Error('Idempotent CRM meeting action has no persisted meeting')
+  const current = await readCrmRecordByReference({
+    pipelineId,
+    referenceCode: meeting.rows[0].reference_code,
+  })
+  return {
+    action: replay.action,
+    created: false,
+    reused: true as const,
+    staged: {
+      id: meeting.rows[0].id,
+      suiteCrmId: meeting.rows[0].suitecrm_id,
+      referenceCode: meeting.rows[0].reference_code,
+      shortUrl: current.shortUrl,
+      sourceHash: meeting.rows[0].source_hash,
+    },
+  }
 }
 
 export async function enqueueCrmIntegrationAction(input: {
@@ -617,8 +1373,57 @@ export async function enqueueCrmIntegrationAction(input: {
   referenceCode: unknown
   payload?: unknown
   idempotencyKey?: unknown
+  clientRequestHash?: unknown
+  communicationOverride?: PipelineCommunicationSnapshot
 }) {
-  const action = await prepareAction(input)
+  const actionType = normalizeActionType(input.actionType)
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey, actionType)
+  const preparedInput = { ...input, actionType, idempotencyKey }
+  let requestHash: string | null = null
+  if (actionType === 'create_calendar_event') {
+    const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
+    let actorEmail: string
+    try {
+      actorEmail = normalizeUserEmail(input.actorEmail)
+    } catch {
+      throw new CrmIntegrationActionError('A valid signed-in user is required', 401, 'UNAUTHORIZED')
+    }
+    const referenceCode = normalizeReference(input.referenceCode)
+    requestHash = calendarActionRequestHash({
+      pipelineId,
+      actorEmail,
+      referenceCode,
+      payload: input.payload,
+      communicationOverride: input.communicationOverride,
+    })
+    const existing = await query<ActionRow>(
+      `SELECT * FROM crm_integration_actions
+       WHERE actor_email = $1 AND idempotency_key = $2
+       LIMIT 1`,
+      [actorEmail, idempotencyKey],
+    )
+    if (existing.rows[0]) {
+      if (!existingCalendarActionMatchesRequest({
+        row: existing.rows[0],
+        pipelineId,
+        actorEmail,
+        referenceCode,
+        requestHash,
+      })) {
+        throw new CrmIntegrationActionError(
+          'Idempotency key was already used for a different CRM action',
+          409,
+          'CRM_ACTION_IDEMPOTENCY_CONFLICT',
+        )
+      }
+      return { action: actionView(existing.rows[0]), created: false }
+    }
+  }
+  const action = await prepareAction(preparedInput)
+  if (requestHash) action.payload._requestHash = requestHash
+  if (input.clientRequestHash !== undefined) {
+    action.payload._clientRequestHash = normalizeClientRequestHash(input.clientRequestHash)
+  }
   return withTransaction((client) => insertPreparedAction(client, action))
 }
 
@@ -716,7 +1521,14 @@ export async function leaseCrmIntegrationActions(input: {
          SELECT id
          FROM crm_integration_actions
          WHERE status IN ('queued', 'failed')
-           AND attempts < $2
+           AND attempts < GREATEST(
+             $2,
+             CASE
+               WHEN response_summary #>> '{operatorRetry,authorizedThroughAttempt}' ~ '^[0-9]+$'
+                 THEN (response_summary #>> '{operatorRetry,authorizedThroughAttempt}')::integer
+               ELSE 0
+             END
+           )
            AND available_at <= now()
            AND ($4::uuid IS NULL OR id = $4::uuid)
            AND ($5::uuid IS NULL OR pipeline_id = $5::uuid)
@@ -796,16 +1608,161 @@ async function bindAttemptConnection(action: LeasedCrmIntegrationAction, connect
   if (result.rowCount !== 1) throw new Error('CRM action lease was lost')
 }
 
+function sameCommunicationSnapshot(
+  left: PipelineCommunicationSnapshot,
+  right: NonNullable<LeasedCrmIntegrationAction['communication']>,
+) {
+  return left.organizationId === right.organizationId
+    && left.credentialOwnerEmail === right.credentialOwnerEmail
+    && left.connectionId === right.connectionId
+    && left.accountEmail === right.accountEmail
+    && left.identityEmail === right.identityEmail
+    && left.calendarId === right.calendarId
+    && left.source === right.source
+}
+
+async function assertQueuedCommunicationAuthorization(
+  action: LeasedCrmIntegrationAction,
+  app: 'google-mail' | 'google-calendar',
+) {
+  if (!action.communication) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued communication action has no reviewed identity snapshot; create a new action',
+    )
+  }
+  let scope: { organizationId: string }
+  try {
+    scope = await resolvePipelineCommunicationScopeInPostgres({
+      pipelineId: action.pipelineId,
+      actorEmail: action.actorEmail,
+    })
+  } catch {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued communication actor is no longer authorized for this organization',
+    )
+  }
+  if (scope.organizationId !== action.communication.organizationId) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued communication organization no longer matches the selected pipeline',
+    )
+  }
+  if (action.communication.source === 'organization') {
+    let active: PipelineCommunicationSnapshot
+    try {
+      active = await resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: action.pipelineId,
+        actorEmail: action.actorEmail,
+        app,
+      })
+    } catch {
+      throw new PermanentCrmIntegrationActionError(
+        'The queued organization communication identity is no longer active',
+      )
+    }
+    if (!sameCommunicationSnapshot(active, action.communication)) {
+      throw new PermanentCrmIntegrationActionError(
+        'The queued organization communication identity no longer matches the active binding',
+      )
+    }
+  } else if (action.communication.credentialOwnerEmail !== action.actorEmail) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued personal communication identity must belong to the action actor',
+    )
+  }
+}
+
 async function selectedMatonConnection(
   action: LeasedCrmIntegrationAction,
   app: string,
-): Promise<{ connectionId: string; accountEmail: string | null }> {
+): Promise<{
+  credentialOwnerEmail: string
+  connectionId: string
+  accountEmail: string | null
+  identityEmail: string | null
+  calendarId: string | null
+  bindingSource: 'organization' | 'user-default' | 'meeting-override' | null
+}> {
+  if (
+    !action.communicationCredentialOwnerEmail
+    || !action.communicationConnectionId
+    || !action.communication
+    || !action.communication.organizationId
+    || !action.communication.accountEmail
+    || !action.communication.identityEmail
+    || !action.communication.source
+  ) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued communication action has no reviewed identity snapshot; create a new action',
+    )
+  }
+  if (app === 'google-calendar' && !action.communication.calendarId) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued Calendar action has no reviewed calendar snapshot; create a new action',
+    )
+  }
+  if (app !== 'google-mail' && app !== 'google-calendar') {
+    throw new PermanentCrmIntegrationActionError('The queued communication provider is not supported')
+  }
+  await assertQueuedCommunicationAuthorization(action, app)
+  const credentialOwnerEmail = action.communicationCredentialOwnerEmail
   const { connectionId, accountEmail } = await resolveUserMatonGatewayCredential({
-    ownerEmail: action.actorEmail,
+    ownerEmail: credentialOwnerEmail,
     app,
+    boundConnectionId: action.communicationConnectionId,
   })
+  if (connectionId !== action.communicationConnectionId) {
+    throw new PermanentCrmIntegrationActionError('The queued communication connection no longer matches its reviewed identity')
+  }
+  if (
+    action.communication?.accountEmail
+    && accountEmail
+    && normalizeEmail(accountEmail, 'Selected provider account') !== action.communication.accountEmail
+  ) {
+    throw new PermanentCrmIntegrationActionError('The queued communication account no longer matches its reviewed identity')
+  }
   await bindAttemptConnection(action, connectionId)
-  return { connectionId, accountEmail }
+  return {
+    credentialOwnerEmail,
+    connectionId,
+    accountEmail: action.communication?.accountEmail || accountEmail,
+    identityEmail: action.communication?.identityEmail || accountEmail,
+    calendarId: action.communication?.calendarId || null,
+    bindingSource: action.communication?.source || null,
+  }
+}
+
+async function verifiedCalendarConnection(
+  action: LeasedCrmIntegrationAction,
+  selectedConnection: Awaited<ReturnType<typeof selectedMatonConnection>>,
+): Promise<{
+  organizerEmail: string
+  calendarId: string
+  calendarSummary: string
+  accessRole: 'owner' | 'writer'
+}> {
+  const requestedCalendarId = calendarIdentifier(selectedConnection.calendarId, 'Queued Calendar ID')
+  const calendars = await writableCalendarsForAction(action, selectedConnection.connectionId)
+  const selectedCalendar = requestedCalendarId === 'primary'
+    ? calendars.find((calendar) => calendar.primary)
+    : calendars.find((calendar) => calendar.id === requestedCalendarId)
+  if (!selectedCalendar) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued Calendar is no longer accessible with write permission on its reviewed connection',
+    )
+  }
+  const organizerEmail = normalizeEmail(selectedCalendar.id, 'Selected Calendar organizer')
+  if (
+    selectedConnection.identityEmail
+    && organizerEmail !== normalizeEmail(selectedConnection.identityEmail, 'Queued Calendar organizer')
+  ) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar organizer no longer matches its reviewed identity')
+  }
+  return {
+    organizerEmail,
+    calendarId: selectedCalendar.id,
+    calendarSummary: selectedCalendar.summary,
+    accessRole: selectedCalendar.accessRole,
+  }
 }
 
 async function recordAttemptSucceeded(
@@ -817,7 +1774,7 @@ async function recordAttemptSucceeded(
   await withTransaction(async (client) => {
     const current = await client.query(
       `UPDATE crm_integration_actions
-       SET external_id = COALESCE($3, external_id), response_summary = $4::jsonb, updated_at = now()
+       SET external_id = $3, response_summary = $4::jsonb, updated_at = now()
        WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2`,
       [action.id, action.lockToken, safeExternalId, JSON.stringify(responseSummary)],
     )
@@ -826,6 +1783,29 @@ async function recordAttemptSucceeded(
       `UPDATE crm_integration_action_attempts
        SET status = 'succeeded', external_id = $3, response_summary = $4::jsonb,
          error = NULL, finished_at = now()
+       WHERE action_id = $1::uuid AND attempt_number = $2 AND status = 'started'`,
+      [action.id, action.attempts, safeExternalId, JSON.stringify(responseSummary)],
+    )
+  })
+}
+
+async function recordAttemptProgress(
+  action: LeasedCrmIntegrationAction,
+  externalId: string,
+  responseSummary: JsonObject,
+) {
+  const safeExternalId = requiredString(externalId, 1000, 'Provider result ID')
+  await withTransaction(async (client) => {
+    const current = await client.query(
+      `UPDATE crm_integration_actions
+       SET external_id = COALESCE($3, external_id), response_summary = $4::jsonb, updated_at = now()
+       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2`,
+      [action.id, action.lockToken, safeExternalId, JSON.stringify(responseSummary)],
+    )
+    if (current.rowCount !== 1) throw new Error('CRM action lease was lost')
+    await client.query(
+      `UPDATE crm_integration_action_attempts
+       SET external_id = $3, response_summary = $4::jsonb
        WHERE action_id = $1::uuid AND attempt_number = $2 AND status = 'started'`,
       [action.id, action.attempts, safeExternalId, JSON.stringify(responseSummary)],
     )
@@ -920,23 +1900,60 @@ async function failAction(input: {
   const delaySeconds = Math.min(retryBaseSeconds * (2 ** Math.max(0, input.action.attempts - 1)), 3600)
   const availableAt = new Date(Date.now() + delaySeconds * 1000).toISOString()
   const error = safeErrorMessage(input.error)
+  const failureEvidence = providerFailureEvidence(input.error)
 
   await withTransaction(async (client) => {
     await client.query(
       `UPDATE crm_integration_action_attempts
-       SET status = 'failed', error = $3, finished_at = now()
+       SET status = 'failed', error = $3,
+         response_summary = COALESCE(response_summary, '{}'::jsonb) || $4::jsonb,
+         finished_at = now()
        WHERE action_id = $1::uuid AND attempt_number = $2 AND status = 'started'`,
-      [input.action.id, input.action.attempts, error],
+      [input.action.id, input.action.attempts, error, JSON.stringify(failureEvidence)],
     )
     const result = await client.query(
       `UPDATE crm_integration_actions
        SET status = $3, last_error = $4, available_at = $5::timestamptz,
+         response_summary = COALESCE(response_summary, '{}'::jsonb) || $6::jsonb,
          processed_at = CASE WHEN $3 = 'dead' THEN now() ELSE NULL END,
          locked_at = NULL, lock_token = NULL, updated_at = now()
        WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2`,
-      [input.action.id, input.action.lockToken, status, error, availableAt],
+      [
+        input.action.id,
+        input.action.lockToken,
+        status,
+        error,
+        availableAt,
+        JSON.stringify(failureEvidence),
+      ],
     )
     if (result.rowCount !== 1) throw new Error('CRM action lease was lost')
+
+    if (status === 'dead' && input.action.actionType === 'create_calendar_event') {
+      await client.query(
+        `UPDATE crm_meetings
+         SET status = 'failed',
+           source_payload = COALESCE(source_payload, '{}'::jsonb) || jsonb_build_object(
+             'calendarDeliveryStatus', 'failed',
+             'calendarDeliveryError', $4::text,
+             'calendarDeliveryFailure', $5::jsonb
+           ),
+           updated_at = now()
+         WHERE pipeline_id = $1::uuid
+           AND (
+             source_payload->>'actionId' = $2
+             OR ($3 = 'crm_meeting' AND id = $6::uuid)
+           )`,
+        [
+          input.action.pipelineId,
+          input.action.id,
+          input.action.aggregateType,
+          error,
+          JSON.stringify(failureEvidence),
+          input.action.aggregateType === 'crm_meeting' ? input.action.aggregateId : null,
+        ],
+      )
+    }
 
     const campaignRecipientId = typeof input.action.payload.campaignRecipientId === 'string'
       ? input.action.payload.campaignRecipientId
@@ -968,6 +1985,7 @@ async function failAction(input: {
       attempts: input.action.attempts,
       error,
       availableAt: status === 'failed' ? availableAt : null,
+      ...failureEvidence,
     })
   })
   return status
@@ -1093,14 +2111,167 @@ async function matonJson(
   pathname: string,
   init?: RequestInit,
 ): Promise<JsonObject> {
+  if (!action.communicationCredentialOwnerEmail) {
+    throw new PermanentCrmIntegrationActionError(
+      'The queued communication action has no reviewed credential owner; create a new action',
+    )
+  }
   const response = await matonFetch(pathname, init, {
-    ownerEmail: action.actorEmail,
+    ownerEmail: action.communicationCredentialOwnerEmail,
     app,
     boundConnectionId: connectionId,
   })
-  if (!response.ok) throw new Error(`${app} provider request failed with status ${response.status}`)
+  if (!response.ok) throw await providerRequestError(app, response)
   const parsed = await response.json().catch(() => ({}))
   return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as JsonObject : {}
+}
+
+type WritableCalendarOption = {
+  id: string
+  summary: string
+  primary: boolean
+  accessRole: 'owner' | 'writer'
+}
+
+async function listWritableCalendars(
+  readPage: (pathname: string) => Promise<JsonObject>,
+): Promise<WritableCalendarOption[]> {
+  const calendars: WritableCalendarOption[] = []
+  const seen = new Set<string>()
+  let pageToken = ''
+  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && calendars.length < MAX_CALENDAR_OPTIONS; page += 1) {
+    const parameters = new URLSearchParams({
+      maxResults: '250',
+      minAccessRole: 'writer',
+      showHidden: 'false',
+    })
+    if (pageToken) parameters.set('pageToken', pageToken)
+    const response = await readPage(
+      `/google-calendar/calendar/v3/users/me/calendarList?${parameters.toString()}`,
+    )
+    const items = Array.isArray(response.items) ? response.items : []
+    for (const value of items) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+      const item = value as JsonObject
+      const accessRole = String(item.accessRole || '').trim().toLowerCase()
+      if (accessRole !== 'owner' && accessRole !== 'writer') continue
+      let id: string
+      try {
+        id = calendarIdentifier(item.id, 'Provider Calendar ID')
+      } catch {
+        continue
+      }
+      if (seen.has(id)) continue
+      seen.add(id)
+      const rawSummary = String(item.summaryOverride || item.summary || id)
+      const summary = rawSummary.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 300) || id
+      calendars.push({ id, summary, primary: item.primary === true, accessRole })
+      if (calendars.length >= MAX_CALENDAR_OPTIONS) break
+    }
+    const nextPageToken = typeof response.nextPageToken === 'string' ? response.nextPageToken.trim() : ''
+    if (!nextPageToken) break
+    if (nextPageToken.length > 2048 || /[\u0000-\u001f\u007f]/.test(nextPageToken)) {
+      throw new PermanentCrmIntegrationActionError('Google Calendar list returned an invalid page token')
+    }
+    pageToken = nextPageToken
+  }
+  return calendars
+}
+
+async function writableCalendarsForAction(
+  action: LeasedCrmIntegrationAction,
+  connectionId: string,
+): Promise<WritableCalendarOption[]> {
+  return listWritableCalendars((pathname) => matonJson(
+    action,
+    'google-calendar',
+    connectionId,
+    pathname,
+    { headers: { Accept: 'application/json' } },
+  ))
+}
+
+async function previousCalendarJson(
+  selection: PreviousCalendarEventSnapshot,
+  pathname: string,
+  init?: RequestInit,
+): Promise<JsonObject> {
+  const response = await matonFetch(pathname, init, {
+    ownerEmail: selection.credentialOwnerEmail,
+    app: 'google-calendar',
+    boundConnectionId: selection.connectionId,
+  })
+  if (!response.ok) throw await providerRequestError('google-calendar', response)
+  const parsed = await response.json().catch(() => ({}))
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as JsonObject : {}
+}
+
+async function verifiedPreviousCalendarSelection(
+  action: LeasedCrmIntegrationAction,
+  selection: PreviousCalendarEventSnapshot,
+) {
+  if (selection.credentialOwnerEmail !== action.actorEmail) {
+    let activeOrganizationCalendar: PipelineCommunicationSnapshot
+    try {
+      activeOrganizationCalendar = await resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: action.pipelineId,
+        actorEmail: action.actorEmail,
+        app: 'google-calendar',
+      })
+    } catch {
+      throw new PermanentCrmIntegrationActionError(
+        'The previous Calendar credential owner is no longer authorized for this organization',
+      )
+    }
+    if (
+      activeOrganizationCalendar.source !== 'organization'
+      || activeOrganizationCalendar.organizationId !== action.communication?.organizationId
+      || activeOrganizationCalendar.credentialOwnerEmail !== selection.credentialOwnerEmail
+      || activeOrganizationCalendar.connectionId !== selection.connectionId
+      || activeOrganizationCalendar.calendarId !== selection.calendarId
+      || (
+        selection.organizerEmail
+        && activeOrganizationCalendar.identityEmail !== selection.organizerEmail
+      )
+    ) {
+      throw new PermanentCrmIntegrationActionError(
+        'The previous Calendar credential owner is no longer authorized for this organization',
+      )
+    }
+  }
+  const credential = await resolveUserMatonGatewayCredential({
+    ownerEmail: selection.credentialOwnerEmail,
+    app: 'google-calendar',
+    boundConnectionId: selection.connectionId,
+  })
+  if (credential.connectionId !== selection.connectionId) {
+    throw new PermanentCrmIntegrationActionError(
+      'The previous Calendar connection no longer matches its recorded identity',
+    )
+  }
+  const calendars = await listWritableCalendars((pathname) => previousCalendarJson(
+    selection,
+    pathname,
+    { headers: { Accept: 'application/json' } },
+  ))
+  const requestedCalendarId = calendarIdentifier(selection.calendarId, 'Previous Calendar ID')
+  const calendar = requestedCalendarId === 'primary'
+    ? calendars.find((value) => value.primary)
+    : calendars.find((value) => value.id === requestedCalendarId)
+  if (!calendar) {
+    throw new PermanentCrmIntegrationActionError(
+      'The previous Calendar is no longer accessible with write permission on its recorded connection',
+    )
+  }
+  if (
+    selection.organizerEmail
+    && normalizeEmail(calendar.id, 'Previous Calendar organizer') !== selection.organizerEmail
+  ) {
+    throw new PermanentCrmIntegrationActionError(
+      'The previous Calendar organizer no longer matches its recorded identity',
+    )
+  }
+  return calendar
 }
 
 function interactionLinks(target: CrmReferenceRecord, meetingId?: string | null) {
@@ -1198,7 +2369,8 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     ? normalizeEmail(action.responseSummary.senderEmail, 'Recorded Gmail sender')
     : null
   if (!messageId) {
-    const { connectionId } = await selectedMatonConnection(action, 'google-mail')
+    const selectedConnection = await selectedMatonConnection(action, 'google-mail')
+    const { connectionId } = selectedConnection
     const profile = await matonJson(
       action,
       'google-mail',
@@ -1206,7 +2378,28 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
       '/google-mail/gmail/v1/users/me/profile',
       { headers: { Accept: 'application/json' } },
     )
-    senderEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+    const profileEmail = normalizeEmail(profile.emailAddress, 'Selected Gmail profile')
+    if (selectedConnection.accountEmail && profileEmail !== selectedConnection.accountEmail) {
+      throw new PermanentCrmIntegrationActionError('The queued Gmail account no longer matches its reviewed identity')
+    }
+    senderEmail = selectedConnection.identityEmail
+      ? normalizeEmail(selectedConnection.identityEmail, 'Queued Gmail sender')
+      : profileEmail
+    if (senderEmail !== profileEmail) {
+      const sendAs = await matonJson(
+        action,
+        'google-mail',
+        connectionId,
+        `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(senderEmail)}`,
+        { headers: { Accept: 'application/json' } },
+      )
+      if (
+        normalizeEmail(sendAs.sendAsEmail, 'Verified Gmail sender') !== senderEmail
+        || String(sendAs.verificationStatus || '').trim().toLowerCase() !== 'accepted'
+      ) {
+        throw new PermanentCrmIntegrationActionError('The queued Gmail sender is no longer an accepted send-as identity')
+      }
+    }
     const delivered = await matonJson(
       action,
       'google-mail',
@@ -1231,7 +2424,15 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     if (!messageId) throw new Error('google-mail provider returned no message ID')
     threadId = cleanString(delivered.threadId, 1000, 'Gmail thread ID') || null
   }
-  const summary = { messageId, threadId, senderEmail, markerReferences }
+  const summary = {
+    messageId,
+    threadId,
+    senderEmail,
+    accountEmail: action.communication?.accountEmail || senderEmail,
+    communicationBindingSource: action.communication?.source || null,
+    communicationOrganizationId: action.communication?.organizationId || null,
+    markerReferences,
+  }
   await recordAttemptSucceeded(action, messageId, summary)
   await stageActionInteraction({
     action,
@@ -1251,7 +2452,17 @@ async function stageCalendarMeeting(
   target: CrmReferenceRecord,
   result: { eventId: string | null; eventUrl: string | null; joinUrl: string | null },
   status: CrmMeeting['status'],
+  options: { preserveMissingJoinUrl?: boolean } = {},
 ) {
+  const meetingMode = storedMeetingMode(action.payload.meetingMode)
+  const customJoinUrl = storedCustomJoinUrl(action.payload.customJoinUrl, meetingMode)
+  const calendarDeliveryStatus = status === 'queued' || status === 'planned'
+    ? 'queued'
+    : status === 'failed'
+      ? 'failed'
+      : status === 'cancelled'
+        ? 'cancelled'
+        : 'sent'
   let organizationId = target.entity === 'organizations' ? target.id : target.organizationId
   let contactId = target.entity === 'contacts' ? target.id : null
   let leadId = target.entity === 'leads' ? target.id : null
@@ -1328,7 +2539,7 @@ async function stageCalendarMeeting(
     parentSuiteCrmType = 'Accounts'
   }
 
-  return stageCrmRecordInPostgres({
+  const staged = await stageCrmRecordInPostgres({
     entity: 'meetings',
     pipelineId: action.pipelineId,
     localId,
@@ -1338,7 +2549,16 @@ async function stageCalendarMeeting(
       source: 'crm-integration-action',
       actionId: action.id,
       provider: action.provider,
-      calendarOwnerEmail: action.actorEmail,
+      calendarOwnerEmail: action.communicationCredentialOwnerEmail || action.actorEmail,
+      calendarConnectionId: action.communicationConnectionId,
+      calendarOrganizerEmail: action.communication?.identityEmail || null,
+      calendarId: action.communication?.calendarId || null,
+      calendarDeliveryStatus,
+      calendarDeliveryError: null,
+      calendarDeliveryFailure: null,
+      meetingMode,
+      customJoinUrl,
+      communicationOrganizationId: action.communication?.organizationId || null,
     },
     actorEmail: action.actorEmail,
     fields: {
@@ -1363,6 +2583,15 @@ async function stageCalendarMeeting(
       joinUrl: result.joinUrl,
     },
   })
+  if (!result.joinUrl && !options.preserveMissingJoinUrl) {
+    await query(
+      `UPDATE crm_meetings
+       SET join_url = NULL, updated_at = now()
+       WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+      [action.pipelineId, staged.id],
+    )
+  }
+  return staged
 }
 
 function normalizeMeetingStatus(value: unknown): CrmMeeting['status'] {
@@ -1372,6 +2601,36 @@ function normalizeMeetingStatus(value: unknown): CrmMeeting['status'] {
     return status as CrmMeeting['status']
   }
   throw new PermanentCrmIntegrationActionError('Calendar action meeting status is invalid')
+}
+
+type CalendarMeetingMode = 'google_meet' | 'in_person' | 'custom_link'
+
+function calendarMeetingMode(value: unknown): CalendarMeetingMode | null {
+  const mode = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (!mode) return 'google_meet'
+  return mode === 'google_meet' || mode === 'in_person' || mode === 'custom_link'
+    ? mode
+    : null
+}
+
+function normalizeMeetingMode(value: unknown): CalendarMeetingMode {
+  const mode = calendarMeetingMode(value)
+  if (!mode) throw new CrmIntegrationActionError('Meeting mode must be Google Meet, in person, or custom link')
+  return mode
+}
+
+function storedMeetingMode(value: unknown): CalendarMeetingMode {
+  const mode = calendarMeetingMode(value)
+  if (!mode) throw new PermanentCrmIntegrationActionError('Calendar action meeting mode is invalid')
+  return mode
+}
+
+function storedCustomJoinUrl(value: unknown, mode: CalendarMeetingMode): string | null {
+  const joinUrl = safeHttpsUrl(value)
+  if (mode === 'custom_link' && !joinUrl) {
+    throw new PermanentCrmIntegrationActionError('Calendar action custom meeting URL is invalid')
+  }
+  return mode === 'custom_link' ? joinUrl : null
 }
 
 function calendarEventIdForMeeting(referenceCode: string): string {
@@ -1390,14 +2649,87 @@ function meetingCalendarDescription(description: string, referenceCode: string, 
   return `${operatorDescription}${operatorDescription ? '\n\n---\n' : ''}${footer}`
 }
 
+function queuedPreviousCalendarSnapshot(value: unknown): PreviousCalendarEventSnapshot | null {
+  try {
+    return normalizedPreviousCalendarSnapshot(value)
+  } catch (error) {
+    throw new PermanentCrmIntegrationActionError(
+      error instanceof Error ? error.message : 'Previous Calendar event snapshot is invalid',
+    )
+  }
+}
+
+type PendingCalendarMove = {
+  sourceEventId: string
+  sourceCalendarId: string
+  destinationEventId: string
+  destinationCalendarId: string
+}
+
+function queuedPendingCalendarMove(value: unknown): PendingCalendarMove | null {
+  if (value === undefined || value === null) return null
+  try {
+    const pending = objectValue(value, 'Pending Calendar move')
+    assertOnlyFields(pending, [
+      'state', 'sourceEventId', 'sourceCalendarId', 'destinationEventId', 'destinationCalendarId',
+    ])
+    if (pending.state !== 'destination-written-source-delete-pending') {
+      throw new CrmIntegrationActionError('Pending Calendar move state is invalid')
+    }
+    return {
+      sourceEventId: requiredString(pending.sourceEventId, 1000, 'Pending source Calendar event ID'),
+      sourceCalendarId: calendarIdentifier(pending.sourceCalendarId, 'Pending source Calendar ID'),
+      destinationEventId: requiredString(pending.destinationEventId, 1000, 'Pending destination Calendar event ID'),
+      destinationCalendarId: calendarIdentifier(pending.destinationCalendarId, 'Pending destination Calendar ID'),
+    }
+  } catch (error) {
+    throw new PermanentCrmIntegrationActionError(
+      error instanceof Error ? error.message : 'Pending Calendar move evidence is invalid',
+    )
+  }
+}
+
+function previousCalendarSnapshotFromSource(
+  eventId: string,
+  sourcePayload: JsonObject | null,
+): PreviousCalendarEventSnapshot | null {
+  if (!sourcePayload || typeof sourcePayload !== 'object' || Array.isArray(sourcePayload)) return null
+  const candidate = {
+    eventId,
+    credentialOwnerEmail: sourcePayload.calendarOwnerEmail,
+    connectionId: sourcePayload.calendarConnectionId,
+    calendarId: sourcePayload.calendarId,
+    organizerEmail: sourcePayload.calendarOrganizerEmail || null,
+  }
+  if (!candidate.credentialOwnerEmail || !candidate.connectionId || !candidate.calendarId) return null
+  return queuedPreviousCalendarSnapshot(candidate)
+}
+
+function sameCalendarSelection(
+  previous: PreviousCalendarEventSnapshot,
+  selected: Awaited<ReturnType<typeof selectedMatonConnection>>,
+) {
+  return previous.credentialOwnerEmail === selected.credentialOwnerEmail
+    && previous.connectionId === selected.connectionId
+    && (
+      previous.calendarId === selected.calendarId
+      || Boolean(
+        previous.organizerEmail
+        && selected.identityEmail
+        && previous.organizerEmail === selected.identityEmail,
+      )
+    )
+}
+
 async function existingCalendarEvent(pipelineId: string, target: CrmReferenceRecord) {
   if (target.entity !== 'meetings') return null
   const result = await query<{
     external_event_id: string | null
     external_event_url: string | null
     join_url: string | null
+    source_payload: JsonObject | null
   }>(
-    `SELECT external_event_id, external_event_url, join_url
+    `SELECT external_event_id, external_event_url, join_url, source_payload
      FROM crm_meetings WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
     [pipelineId, target.id],
   )
@@ -1411,7 +2743,13 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   const endsAt = normalizeDateTime(action.payload.endsAt, 'Calendar event end')
   const timezone = normalizeTimezone(action.payload.timezone)
   const description = cleanString(action.payload.description, 50_000, 'Calendar event description')
+  const meetingMode = storedMeetingMode(action.payload.meetingMode)
+  const customJoinUrl = storedCustomJoinUrl(action.payload.customJoinUrl, meetingMode)
   const location = cleanString(action.payload.location, 1000, 'Calendar event location')
+  if (meetingMode === 'in_person' && !location) {
+    throw new PermanentCrmIntegrationActionError('An in-person meeting requires a location')
+  }
+  const eventLocation = meetingMode === 'custom_link' ? location || customJoinUrl || '' : location
   const attendeeEmails = normalizeEmailList(action.payload.attendeeEmails)
   const desiredMeetingStatus = normalizeMeetingStatus(action.payload.meetingStatus)
   const provisionalStatus: CrmMeeting['status'] = ['completed', 'cancelled', 'failed'].includes(desiredMeetingStatus)
@@ -1421,11 +2759,49 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     ? 'scheduled'
     : desiredMeetingStatus
 
+  const currentEvent = await existingCalendarEvent(action.pipelineId, target)
+  const currentEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID') || null
+  const queuedPreviousCalendar = queuedPreviousCalendarSnapshot(action.payload.previousCalendar)
+  if (
+    queuedPreviousCalendar
+    && currentEventId
+    && queuedPreviousCalendar.eventId !== currentEventId
+  ) {
+    throw new PermanentCrmIntegrationActionError(
+      'The recorded Calendar event changed after this action was queued; review and create a new action',
+    )
+  }
+  const previousCalendar = queuedPreviousCalendar || (
+    currentEventId
+      ? previousCalendarSnapshotFromSource(currentEventId, currentEvent?.source_payload || null)
+      : null
+  )
+  const pendingCalendarMove = queuedPendingCalendarMove(action.responseSummary.calendarMove)
+  if (currentEventId && !previousCalendar) {
+    throw new PermanentCrmIntegrationActionError(
+      'The existing Calendar event has no verified Calendar identity; review the meeting before updating it',
+    )
+  }
+  if (
+    pendingCalendarMove
+    && (
+      !action.externalId
+      || action.externalId !== pendingCalendarMove.destinationEventId
+      || !previousCalendar
+      || currentEventId !== pendingCalendarMove.sourceEventId
+    )
+  ) {
+    throw new PermanentCrmIntegrationActionError(
+      'The pending Calendar move no longer matches its durable provider evidence; review and create a new action',
+    )
+  }
+
   const provisionalMeeting = await stageCalendarMeeting(
     action,
     target,
-    { eventId: null, eventUrl: null, joinUrl: null },
+    { eventId: null, eventUrl: null, joinUrl: customJoinUrl },
     provisionalStatus,
+    { preserveMissingJoinUrl: true },
   )
   const meetingTarget = await readCrmRecordByReference({
     pipelineId: action.pipelineId,
@@ -1433,32 +2809,68 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   })
   const meetingUrl = safeHttpsUrl(provisionalMeeting.shortUrl)
   if (!meetingUrl) throw new PermanentCrmIntegrationActionError('CRM meeting short link is unavailable')
-  const currentEvent = await existingCalendarEvent(action.pipelineId, meetingTarget)
   let eventId = action.externalId
   let eventUrl = safeHttpsUrl(action.responseSummary.eventUrl) || safeHttpsUrl(currentEvent?.external_event_url)
-  let joinUrl = safeHttpsUrl(action.responseSummary.joinUrl) || safeHttpsUrl(currentEvent?.join_url)
+  let joinUrl = meetingMode === 'custom_link'
+    ? customJoinUrl
+    : meetingMode === 'in_person'
+      ? null
+      : safeHttpsUrl(action.responseSummary.joinUrl) || safeHttpsUrl(currentEvent?.join_url)
   let organizerEmail = typeof action.responseSummary.organizerEmail === 'string'
     ? normalizeEmail(action.responseSummary.organizerEmail, 'Recorded Calendar organizer')
     : null
+  let verifiedCalendarId = typeof action.responseSummary.calendarId === 'string'
+    ? cleanString(action.responseSummary.calendarId, 1024, 'Recorded Calendar ID')
+    : null
+  let calendarSummary = typeof action.responseSummary.calendarSummary === 'string'
+    ? cleanString(action.responseSummary.calendarSummary, 300, 'Recorded Calendar summary')
+    : null
+  let calendarAccessRole = action.responseSummary.calendarAccessRole === 'owner'
+    || action.responseSummary.calendarAccessRole === 'writer'
+    ? action.responseSummary.calendarAccessRole
+    : null
 
   if (desiredMeetingStatus === 'cancelled') {
-    eventId = eventId || cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID') || null
+    eventId = eventId || currentEventId
     if (eventId) {
       const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
-      organizerEmail = selectedConnection.accountEmail
-        ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
-        : organizerEmail
-      const response = await matonFetch(
-        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
-        { method: 'DELETE' },
-        {
-          ownerEmail: action.actorEmail,
-          app: 'google-calendar',
-          boundConnectionId: selectedConnection.connectionId,
-        },
-      )
+      const calendar = await verifiedCalendarConnection(action, selectedConnection)
+      organizerEmail = calendar.organizerEmail
+      verifiedCalendarId = calendar.calendarId
+      calendarSummary = calendar.calendarSummary
+      calendarAccessRole = calendar.accessRole
+      const deleteFromPrevious = previousCalendar
+        && !sameCalendarSelection(previousCalendar, selectedConnection)
+      let response: Response
+      if (deleteFromPrevious && previousCalendar) {
+        const previous = await verifiedPreviousCalendarSelection(action, previousCalendar)
+        organizerEmail = previous.id
+        verifiedCalendarId = previous.id
+        calendarSummary = previous.summary
+        calendarAccessRole = previous.accessRole
+        response = await matonFetch(
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.id)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+          { method: 'DELETE' },
+          {
+            ownerEmail: previousCalendar.credentialOwnerEmail,
+            app: 'google-calendar',
+            boundConnectionId: previousCalendar.connectionId,
+          },
+        )
+      } else {
+        const calendarId = selectedConnection.calendarId || 'primary'
+        response = await matonFetch(
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+          { method: 'DELETE' },
+          {
+            ownerEmail: selectedConnection.credentialOwnerEmail,
+            app: 'google-calendar',
+            boundConnectionId: selectedConnection.connectionId,
+          },
+        )
+      }
       if (!response.ok && response.status !== 404 && response.status !== 410) {
-        throw new Error(`google-calendar provider request failed with status ${response.status}`)
+        throw await providerRequestError('google-calendar', response)
       }
     }
     const summary = {
@@ -1468,7 +2880,15 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       meetingReferenceCode: provisionalMeeting.referenceCode,
       meetingUrl,
       organizerEmail,
+      calendarId: verifiedCalendarId,
+      calendarSummary,
+      calendarAccessRole,
+      accountEmail: action.communication?.accountEmail || organizerEmail,
+      communicationBindingSource: action.communication?.source || null,
+      communicationOrganizationId: action.communication?.organizationId || null,
       meetingStatus: 'cancelled',
+      meetingMode,
+      customJoinUrl,
     }
     await recordAttemptSucceeded(action, eventId, summary)
     await stageCalendarMeeting(
@@ -1481,27 +2901,60 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     return
   }
 
-  if (!eventId) {
+  if (!eventId || pendingCalendarMove) {
     const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
     const { connectionId } = selectedConnection
-    organizerEmail = selectedConnection.accountEmail
-      ? normalizeEmail(selectedConnection.accountEmail, 'Selected Calendar account')
+    const calendar = await verifiedCalendarConnection(action, selectedConnection)
+    organizerEmail = calendar.organizerEmail
+    verifiedCalendarId = calendar.calendarId
+    calendarSummary = calendar.calendarSummary
+    calendarAccessRole = calendar.accessRole
+    const calendarId = selectedConnection.calendarId || 'primary'
+    const existingEventId = currentEventId || previousCalendar?.eventId || ''
+    const existingEventOnSelectedCalendar = Boolean(
+      existingEventId
+      && previousCalendar
+      && previousCalendar.credentialOwnerEmail === selectedConnection.credentialOwnerEmail
+      && previousCalendar.connectionId === selectedConnection.connectionId
+      && (
+        previousCalendar.calendarId === calendar.calendarId
+        || previousCalendar.calendarId === calendarId
+        || previousCalendar.organizerEmail === calendar.organizerEmail
+      ),
+    )
+    const calendarSelectionChanged = Boolean(existingEventId && !existingEventOnSelectedCalendar)
+    const createDestinationEvent = !existingEventId || calendarSelectionChanged
+    const verifiedPreviousCalendar = calendarSelectionChanged && previousCalendar
+      ? await verifiedPreviousCalendarSelection(action, previousCalendar)
       : null
-    const existingEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID')
-    const requestedEventId = existingEventId || calendarEventIdForMeeting(provisionalMeeting.referenceCode)
-    const eventBody = {
-      ...(!existingEventId ? {
-        id: requestedEventId,
+    if (
+      pendingCalendarMove
+      && (
+        !verifiedPreviousCalendar
+        || pendingCalendarMove.destinationCalendarId !== calendar.calendarId
+        || pendingCalendarMove.sourceCalendarId !== verifiedPreviousCalendar.id
+      )
+    ) {
+      throw new PermanentCrmIntegrationActionError(
+        'The pending Calendar move no longer matches the reviewed source and destination Calendars',
+      )
+    }
+    const requestedEventId = createDestinationEvent
+      ? calendarEventIdForMeeting(provisionalMeeting.referenceCode)
+      : existingEventId
+    const eventBody: JsonObject = {
+      ...(createDestinationEvent ? { id: requestedEventId } : {}),
+      ...(meetingMode === 'google_meet' ? {
         conferenceData: {
           createRequest: {
             requestId: `clawpilot-${provisionalMeeting.referenceCode}`,
             conferenceSolutionKey: { type: 'hangoutsMeet' },
           },
         },
-      } : {}),
+      } : !createDestinationEvent ? { conferenceData: null } : {}),
       summary: subject,
       description: meetingCalendarDescription(description, provisionalMeeting.referenceCode, meetingUrl),
-      location: location || undefined,
+      location: eventLocation || (!createDestinationEvent ? null : undefined),
       start: { dateTime: startsAt, timeZone: timezone },
       end: { dateTime: endsAt, timeZone: timezone },
       attendees: attendeeEmails.map((email) => ({ email })),
@@ -1512,13 +2965,22 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         },
       },
     }
+    const eventWriteQuery = meetingMode === 'google_meet' || !createDestinationEvent
+      ? 'conferenceDataVersion=1&sendUpdates=all'
+      : 'sendUpdates=all'
     let delivered: JsonObject
-    if (existingEventId) {
+    if (pendingCalendarMove) {
+      delivered = {
+        id: pendingCalendarMove.destinationEventId,
+        htmlLink: eventUrl,
+        hangoutLink: joinUrl,
+      }
+    } else if (!createDestinationEvent) {
       delivered = await matonJson(
         action,
         'google-calendar',
         connectionId,
-        `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(existingEventId)}?conferenceDataVersion=1&sendUpdates=all`,
+        `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(existingEventId)}?${eventWriteQuery}`,
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -1531,7 +2993,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           action,
           'google-calendar',
           connectionId,
-          '/google-calendar/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=all',
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${eventWriteQuery}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1539,20 +3001,98 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           },
         )
       } catch (error) {
-        if (!(error instanceof Error) || !/status 409\b/.test(error.message)) throw error
+        if (!(error instanceof ProviderCrmIntegrationActionError) || error.providerStatus !== 409) throw error
+        const existingDestination = await matonJson(
+          action,
+          'google-calendar',
+          connectionId,
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(requestedEventId)}`,
+          { headers: { Accept: 'application/json' } },
+        )
+        const extendedProperties = existingDestination.extendedProperties
+          && typeof existingDestination.extendedProperties === 'object'
+          && !Array.isArray(existingDestination.extendedProperties)
+          ? existingDestination.extendedProperties as JsonObject
+          : {}
+        const existingPrivate = extendedProperties.private
+          && typeof extendedProperties.private === 'object'
+          && !Array.isArray(extendedProperties.private)
+          ? extendedProperties.private as JsonObject
+          : {}
+        if (existingPrivate.clawpilotMeetingReference !== provisionalMeeting.referenceCode) {
+          throw new PermanentCrmIntegrationActionError(
+            'The destination Calendar already contains an event with the reserved ClawPilot ID',
+          )
+        }
+        const patchBody = { ...eventBody }
+        delete patchBody.id
         delivered = await matonJson(
           action,
           'google-calendar',
           connectionId,
-          `/google-calendar/calendar/v3/calendars/primary/events/${encodeURIComponent(requestedEventId)}`,
-          { headers: { Accept: 'application/json' } },
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(requestedEventId)}?${eventWriteQuery}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patchBody),
+          },
         )
       }
     }
     eventId = cleanString(delivered.id, 1000, 'Calendar event ID') || requestedEventId
     if (!eventId) throw new Error('google-calendar provider returned no event ID')
-    eventUrl = safeHttpsUrl(delivered.htmlLink) || eventUrl
-    joinUrl = safeHttpsUrl(delivered.hangoutLink) || joinUrl
+    eventUrl = safeHttpsUrl(delivered.htmlLink) || (calendarSelectionChanged ? null : eventUrl)
+    joinUrl = meetingMode === 'google_meet'
+      ? safeHttpsUrl(delivered.hangoutLink)
+      : meetingMode === 'custom_link'
+        ? customJoinUrl
+        : null
+
+    if (calendarSelectionChanged && previousCalendar && verifiedPreviousCalendar) {
+      const previous = verifiedPreviousCalendar
+      const sameVerifiedCalendar = previousCalendar.credentialOwnerEmail === selectedConnection.credentialOwnerEmail
+        && previousCalendar.connectionId === selectedConnection.connectionId
+        && previous.id === calendar.calendarId
+      if (!sameVerifiedCalendar) {
+        const pendingMoveSummary = {
+          eventId,
+          eventUrl,
+          joinUrl,
+          meetingReferenceCode: provisionalMeeting.referenceCode,
+          meetingUrl,
+          organizerEmail,
+          calendarId: verifiedCalendarId,
+          calendarSummary,
+          calendarAccessRole,
+          accountEmail: action.communication?.accountEmail || organizerEmail,
+          communicationBindingSource: action.communication?.source || null,
+          communicationOrganizationId: action.communication?.organizationId || null,
+          meetingStatus: finalMeetingStatus,
+          meetingMode,
+          customJoinUrl,
+          calendarMove: {
+            state: 'destination-written-source-delete-pending',
+            sourceEventId: previousCalendar.eventId,
+            sourceCalendarId: previous.id,
+            destinationEventId: eventId,
+            destinationCalendarId: calendar.calendarId,
+          },
+        }
+        await recordAttemptProgress(action, eventId, pendingMoveSummary)
+        const response = await matonFetch(
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.id)}/events/${encodeURIComponent(previousCalendar.eventId)}?sendUpdates=all`,
+          { method: 'DELETE' },
+          {
+            ownerEmail: previousCalendar.credentialOwnerEmail,
+            app: 'google-calendar',
+            boundConnectionId: previousCalendar.connectionId,
+          },
+        )
+        if (!response.ok && response.status !== 404 && response.status !== 410) {
+          throw await providerRequestError('google-calendar', response)
+        }
+      }
+    }
   }
   const summary = {
     eventId,
@@ -1561,7 +3101,15 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     meetingReferenceCode: provisionalMeeting.referenceCode,
     meetingUrl,
     organizerEmail,
+    calendarId: verifiedCalendarId,
+    calendarSummary,
+    calendarAccessRole,
+    accountEmail: action.communication?.accountEmail || organizerEmail,
+    communicationBindingSource: action.communication?.source || null,
+    communicationOrganizationId: action.communication?.organizationId || null,
     meetingStatus: finalMeetingStatus,
+    meetingMode,
+    customJoinUrl,
   }
   await recordAttemptSucceeded(action, eventId, summary)
   await stageCalendarMeeting(
@@ -1750,6 +3298,21 @@ async function expandCampaignAction(action: LeasedCrmIntegrationAction, target: 
           campaignRecipientId: recipient.id,
         },
         idempotencyKey: `crm:campaign:${action.id}:recipient:${recipient.id}`,
+        communication: action.communication
+          && action.communicationCredentialOwnerEmail
+          && action.communicationConnectionId
+          && action.communication.accountEmail
+          && action.communication.identityEmail
+          ? {
+              organizationId: action.communication.organizationId,
+              credentialOwnerEmail: action.communicationCredentialOwnerEmail,
+              connectionId: action.communicationConnectionId,
+              accountEmail: action.communication.accountEmail,
+              identityEmail: action.communication.identityEmail,
+              calendarId: action.communication.calendarId,
+              source: action.communication.source,
+            }
+          : null,
       })
       await client.query(
         `UPDATE crm_campaign_recipients
@@ -1815,7 +3378,7 @@ export async function processCrmIntegrationAction(
       error,
       maxAttempts: Math.max(1, Math.min(Math.trunc(Number(options.maxAttempts) || 5), 20)),
       retryBaseSeconds: Math.max(5, Math.min(Math.trunc(Number(options.retryBaseSeconds) || 30), 3600)),
-      permanent: error instanceof PermanentCrmIntegrationActionError,
+      permanent: error instanceof PermanentCrmIntegrationActionError || isPermanentProviderFailure(error),
     })
   }
   return readCrmIntegrationAction({
@@ -1866,26 +3429,99 @@ export async function retryCrmIntegrationAction(input: {
   actionId: unknown
   pipelineId: unknown
   actorEmail: unknown
+  reviewed?: unknown
+  reason?: unknown
 }): Promise<CrmIntegrationActionView> {
-  const current = await readCrmIntegrationAction(input)
-  if (current.status !== 'failed') {
-    throw new CrmIntegrationActionError('Only failed CRM actions can be retried', 409, 'CRM_ACTION_NOT_RETRYABLE')
-  }
   const actionId = normalizeUuid(input.actionId, 'CRM action ID')
   const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
   const actorEmail = normalizeUserEmail(input.actorEmail)
+  const reviewed = input.reviewed === true
+  const reason = cleanString(input.reason, 1000, 'CRM action retry reason')
   await withTransaction(async (client) => {
+    const selected = await client.query<ActionRow>(
+      `SELECT *
+       FROM crm_integration_actions
+       WHERE id = $1::uuid AND pipeline_id = $2::uuid AND actor_email = $3
+       FOR UPDATE`,
+      [actionId, pipelineId, actorEmail],
+    )
+    const current = selected.rows[0]
+    if (!current) {
+      throw new CrmIntegrationActionError('CRM action was not found', 404, 'CRM_ACTION_NOT_FOUND')
+    }
+    if (current.status !== 'failed' && current.status !== 'dead') {
+      throw new CrmIntegrationActionError('Only failed or dead CRM actions can be retried', 409, 'CRM_ACTION_NOT_RETRYABLE')
+    }
+    if (current.status === 'dead' && (!reviewed || !reason)) {
+      throw new CrmIntegrationActionError(
+        'Retrying a dead CRM action requires an explicit review and reason',
+        409,
+        'CRM_ACTION_RETRY_REVIEW_REQUIRED',
+      )
+    }
+    if (
+      current.provider === 'maton'
+      && (
+        !current.workspace_organization_id
+        || !current.communication_credential_owner_email
+        || !current.communication_connection_id
+        || !current.communication_account_email
+        || !current.communication_identity_email
+        || !current.communication_binding_source
+        || (current.app === 'google-calendar' && !current.communication_calendar_id)
+      )
+    ) {
+      throw new CrmIntegrationActionError(
+        'This historical communication action has no reviewed identity snapshot; create a new action instead',
+        409,
+        'CRM_ACTION_COMMUNICATION_SNAPSHOT_REQUIRED',
+      )
+    }
+    const authorizedThroughAttempt = current.status === 'dead'
+      ? Number(current.attempts) + 1
+      : null
     const retried = await client.query<ActionRow>(
       `UPDATE crm_integration_actions
        SET status = 'queued', available_at = now(), last_error = NULL,
+         response_summary = COALESCE(response_summary, '{}'::jsonb) || jsonb_build_object(
+           'operatorRetry', jsonb_build_object(
+             'reviewed', $4::boolean,
+             'reason', NULLIF($5::text, ''),
+             'authorizedThroughAttempt', $6::integer,
+             'reviewedAt', now()
+           )
+         ),
          processed_at = NULL, locked_at = NULL, lock_token = NULL, updated_at = now()
        WHERE id = $1::uuid AND pipeline_id = $2::uuid AND actor_email = $3
-         AND status = 'failed'
+         AND status IN ('failed', 'dead')
        RETURNING *`,
-      [actionId, pipelineId, actorEmail],
+      [actionId, pipelineId, actorEmail, reviewed, reason, authorizedThroughAttempt],
     )
     const row = retried.rows[0]
     if (!row) throw new CrmIntegrationActionError('CRM action is no longer retryable', 409, 'CRM_ACTION_NOT_RETRYABLE')
+    if (row.action_type === 'create_calendar_event') {
+      await client.query(
+        `UPDATE crm_meetings
+         SET status = CASE WHEN status = 'failed' THEN 'queued' ELSE status END,
+           source_payload = COALESCE(source_payload, '{}'::jsonb) || jsonb_build_object(
+             'calendarDeliveryStatus', 'queued',
+             'calendarDeliveryError', NULL,
+             'calendarDeliveryFailure', NULL
+           ),
+           updated_at = now()
+         WHERE pipeline_id = $1::uuid
+           AND (
+             source_payload->>'actionId' = $2
+             OR ($3 = 'crm_meeting' AND id = $4::uuid)
+           )`,
+        [
+          row.pipeline_id,
+          row.id,
+          row.aggregate_type,
+          row.aggregate_type === 'crm_meeting' ? row.aggregate_id : null,
+        ],
+      )
+    }
     await auditAction(client, {
       id: row.id,
       actorEmail: row.actor_email,
@@ -1896,7 +3532,12 @@ export async function retryCrmIntegrationAction(input: {
       referenceCode: row.reference_code || '',
       provider: row.provider || 'internal',
       app: row.app,
-    }, 'crm.integration_action.retried')
+    }, 'crm.integration_action.retried', {
+      previousStatus: current.status,
+      reason: reason || null,
+      reviewed,
+      authorizedThroughAttempt,
+    })
   })
   return readCrmIntegrationAction(input)
 }

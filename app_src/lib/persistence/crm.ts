@@ -3812,6 +3812,17 @@ function leadFromRow(row: Record<string, unknown>): CrmLead {
 }
 
 function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
+  const sourcePayload = row.source_payload && typeof row.source_payload === 'object' && !Array.isArray(row.source_payload)
+    ? row.source_payload as Record<string, unknown>
+    : {}
+  const rawCalendarDeliveryStatus = clean(sourcePayload.calendarDeliveryStatus)
+  const calendarDeliveryStatus = ['not-configured', 'queued', 'sent', 'failed', 'cancelled'].includes(rawCalendarDeliveryStatus)
+    ? rawCalendarDeliveryStatus as CrmMeeting['calendarDeliveryStatus']
+    : null
+  const rawMeetingMode = clean(sourcePayload.meetingMode)
+  const meetingMode = ['google_meet', 'in_person', 'custom_link'].includes(rawMeetingMode)
+    ? rawMeetingMode as CrmMeeting['meetingMode']
+    : 'google_meet'
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
@@ -3823,6 +3834,11 @@ function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
       ? row.attendee_emails.map(clean).filter(Boolean) : [],
     status: row.status as CrmMeeting['status'], provider: clean(row.provider), externalEventId: nullable(row.external_event_id),
     externalEventUrl: nullable(row.external_event_url), joinUrl: nullable(row.join_url),
+    calendarDeliveryStatus, calendarDeliveryError: nullable(sourcePayload.calendarDeliveryError),
+    calendarOwnerEmail: nullable(sourcePayload.calendarOwnerEmail),
+    calendarConnectionId: nullable(sourcePayload.calendarConnectionId),
+    calendarOrganizerEmail: nullable(sourcePayload.calendarOrganizerEmail), calendarId: nullable(sourcePayload.calendarId), meetingMode,
+    customJoinUrl: nullable(sourcePayload.customJoinUrl),
     syncStatus: row.sync_status as CrmMeeting['syncStatus'], syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
   }
 }

@@ -76,6 +76,20 @@ import { dateTimeLocalValue, zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 type RecordValue = Record<string, unknown>
 type CrmActionType = 'send_email' | 'create_calendar_event' | 'log_call' | 'send_campaign'
+type MeetingMode = 'google_meet' | 'in_person' | 'custom_link'
+const ORGANIZATION_DEFAULT_CALENDAR_KEY = '__organization_default_calendar__'
+type MeetingCalendarChoice = {
+  key: string
+  source: 'organization-default' | 'actor-connection' | 'unavailable-current'
+  connectionId: string
+  connectionName: string
+  accountEmail: string
+  calendarId: string
+  organizerEmail: string
+  calendarSummary: string
+  primary: boolean
+  accessRole: 'owner' | 'writer'
+}
 type CrmActionPayload = {
   ok?: boolean
   error?: string
@@ -142,7 +156,32 @@ type CrmPayload = {
   suiteCrmAdminPortalUrl?: string | null
   providerIdentities?: {
     googleMail?: string | null
+    googleMailSendAsEmail?: string | null
+    googleMailConnectionId?: string | null
     googleCalendar?: string | null
+    googleCalendarOrganizer?: string | null
+    googleCalendarConnectionId?: string | null
+    googleCalendarId?: string | null
+    googleCalendarSource?: string | null
+  }
+}
+type OrganizationCommunicationsPayload = {
+  ok?: boolean
+  error?: string
+  communication?: {
+    availableConnections?: Array<{
+      connectionId?: string | null
+      name?: string | null
+      app?: string | null
+      accountEmail?: string | null
+      selectionError?: string | null
+      calendars?: Array<{
+        id?: string | null
+        summary?: string | null
+        primary?: boolean
+        accessRole?: string | null
+      }> | null
+    }> | null
   }
 }
 type CrmLifecyclePayload = {
@@ -201,6 +240,172 @@ const ACTIVITY_STATUSES = [
   { value: 'held', label: 'Held' },
   { value: 'not_held', label: 'Not held' },
 ] as const
+
+const MEETING_DURATION_PRESETS = [15, 30, 45, 60, 90] as const
+const DATE_TIME_LOCAL_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/
+
+function meetingModeValue(value: unknown): MeetingMode {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'in_person' || normalized === 'custom_link') return normalized
+  return 'google_meet'
+}
+
+function validTimeZone(value: unknown) {
+  const timezone = String(value || '').trim()
+  if (!timezone) return false
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+    return true
+  } catch {
+    return false
+  }
+}
+
+function validLocalDateTime(value: unknown) {
+  const match = String(value || '').match(DATE_TIME_LOCAL_PATTERN)
+  if (!match) return false
+  const [, year, month, day, hour, minute] = match.map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute))
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day
+    && date.getUTCHours() === hour
+    && date.getUTCMinutes() === minute
+}
+
+function meetingDurationMinutes(value: unknown) {
+  const duration = Number(value)
+  return Number.isInteger(duration) && duration >= 1 && duration <= 1440 ? duration : null
+}
+
+function meetingEndValue(startsAt: unknown, durationValue: unknown) {
+  const start = String(startsAt || '')
+  const match = start.match(DATE_TIME_LOCAL_PATTERN)
+  const duration = meetingDurationMinutes(durationValue)
+  if (!match || !duration || !validLocalDateTime(start)) return ''
+  const [, year, month, day, hour, minute] = match.map(Number)
+  const end = new Date(Date.UTC(year, month - 1, day, hour, minute) + duration * 60_000)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${end.getUTCFullYear()}-${pad(end.getUTCMonth() + 1)}-${pad(end.getUTCDate())}T${pad(end.getUTCHours())}:${pad(end.getUTCMinutes())}`
+}
+
+function durationForMeetingRecord(record: RecordValue, timezone: string) {
+  const start = dateTimeLocalValue(record.startsAt, timezone)
+  const end = dateTimeLocalValue(record.endsAt, timezone)
+  if (!validLocalDateTime(start) || !validLocalDateTime(end)) return 30
+  const [startDate, startTime] = start.split('T')
+  const [endDate, endTime] = end.split('T')
+  const startMs = Date.parse(`${startDate}T${startTime}:00Z`)
+  const endMs = Date.parse(`${endDate}T${endTime}:00Z`)
+  const duration = Math.round((endMs - startMs) / 60_000)
+  return meetingDurationMinutes(duration) || 30
+}
+
+function validHttpsMeetingLink(value: unknown) {
+  try {
+    return new URL(String(value || '').trim()).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function meetingCalendarChoiceKey(connectionId: string, calendarId: string) {
+  return JSON.stringify([connectionId, calendarId])
+}
+
+function meetingCalendarChoices(
+  payload: OrganizationCommunicationsPayload,
+): { choices: MeetingCalendarChoice[]; errors: string[] } {
+  const connections = Array.isArray(payload.communication?.availableConnections)
+    ? payload.communication.availableConnections
+    : []
+  const choices: MeetingCalendarChoice[] = []
+  const errors: string[] = []
+  const seen = new Set<string>()
+
+  for (const connection of connections) {
+    if (String(connection.app || '').trim().toLowerCase() !== 'google-calendar') continue
+    const connectionId = String(connection.connectionId || '').trim()
+    if (!connectionId) continue
+    const selectionError = String(connection.selectionError || '').trim()
+    if (selectionError) errors.push(selectionError)
+    const calendars = Array.isArray(connection.calendars) ? connection.calendars : []
+    for (const calendar of calendars) {
+      const calendarId = String(calendar.id || '').trim()
+      const accessRole = String(calendar.accessRole || '').trim().toLowerCase()
+      if (!calendarId || (accessRole !== 'owner' && accessRole !== 'writer')) continue
+      const key = meetingCalendarChoiceKey(connectionId, calendarId)
+      if (seen.has(key)) continue
+      seen.add(key)
+      choices.push({
+        key,
+        source: 'actor-connection',
+        connectionId,
+        connectionName: String(connection.name || '').trim() || 'Google Calendar',
+        accountEmail: String(connection.accountEmail || '').trim(),
+        calendarId,
+        organizerEmail: calendarId,
+        calendarSummary: String(calendar.summary || '').trim() || calendarId,
+        primary: calendar.primary === true,
+        accessRole,
+      })
+    }
+  }
+
+  return { choices, errors: Array.from(new Set(errors)) }
+}
+
+function meetingCalendarChoiceLabel(choice: MeetingCalendarChoice) {
+  const calendarName = choice.primary
+    ? `${choice.calendarSummary} (primary)`
+    : choice.calendarSummary
+  const organizer = choice.organizerEmail
+    && choice.organizerEmail !== choice.calendarSummary
+    ? ` · ${choice.organizerEmail}`
+    : ''
+  if (choice.source === 'organization-default') {
+    return `${calendarName}${organizer} · Organization default`
+  }
+  if (choice.source === 'unavailable-current') {
+    return `${calendarName}${organizer} · No longer linked`
+  }
+  const linkedAccount = choice.accountEmail && choice.accountEmail !== choice.organizerEmail
+    ? ` · Linked account ${choice.accountEmail}`
+    : ''
+  return `${calendarName}${organizer}${linkedAccount}`
+}
+
+function meetingCalendarStatusLabel(value: unknown) {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'sent' || status === 'scheduled') return 'Delivered'
+  if (status === 'queued') return 'Pending'
+  if (status === 'failed') return 'Failed'
+  if (status === 'not-configured') return 'Not configured'
+  if (status === 'planned') return 'Not sent'
+  if (status === 'completed') return 'Completed'
+  if (status === 'cancelled') return 'Cancelled'
+  return 'Unknown'
+}
+
+function meetingCalendarStatusColor(value: unknown): 'default' | 'success' | 'warning' | 'error' {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'sent' || status === 'scheduled' || status === 'completed') return 'success'
+  if (status === 'queued') return 'warning'
+  if (status === 'failed') return 'error'
+  return 'default'
+}
+
+function meetingCalendarDeliveryValue(record: RecordValue) {
+  return textValue(record, 'calendarDeliveryStatus')
+}
+
+function suiteCrmSyncStatusLabel(value: unknown) {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'synced') return 'Synced'
+  if (status === 'failed') return 'Failed'
+  if (status === 'pending' || status === 'queued') return 'Pending'
+  return 'Not synced'
+}
 
 function interactionTypeValue(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
@@ -466,7 +671,7 @@ function columns(entity: CrmEntity) {
     ['price', 'Price'],
   ] as const
   if (entity === 'meetings') return [
-    ['referenceCode', 'ID'], ['subject', 'Meeting'], ['startsAt', 'Starts'], ['status', 'Status'], ['contactName', 'Contact'],
+    ['referenceCode', 'ID'], ['subject', 'Meeting'], ['startsAt', 'Starts'], ['status', 'Calendar'], ['contactName', 'Contact'],
   ] as const
   if (entity === 'campaigns') return [
     ['referenceCode', 'ID'], ['name', 'Campaign'], ['status', 'Status'], ['recipientCount', 'Recipients'], ['sentCount', 'Sent'],
@@ -539,14 +744,34 @@ function initialFields(
     url: textValue(source, 'url'), active: textValue(source, 'active') || 'true', description: textValue(source, 'description'),
   }
   if (entity === 'meetings') {
-    const timezone = textValue(source, 'timezone') || 'America/New_York'
+    const timezone = textValue(source, 'timezone') || userTimeZone || 'America/New_York'
+    const durationMinutes = record ? durationForMeetingRecord(source, timezone) : 30
+    const calendarConnectionId = textValue(source, 'calendarConnectionId')
+    const calendarId = textValue(source, 'calendarId')
+    const meetingMode = meetingModeValue(source.meetingMode)
     return {
       subject: textValue(source, 'subject'), organizationId: textValue(source, 'organizationId'),
       contactId: textValue(source, 'contactId'), leadId: textValue(source, 'leadId'),
       opportunityId: textValue(source, 'opportunityId'), startsAt: dateTimeLocalValue(source.startsAt, timezone),
       endsAt: dateTimeLocalValue(source.endsAt, timezone), timezone,
+      durationPreset: MEETING_DURATION_PRESETS.includes(durationMinutes as typeof MEETING_DURATION_PRESETS[number])
+        ? String(durationMinutes)
+        : 'custom',
+      durationMinutes: String(durationMinutes),
+      meetingMode,
       location: textValue(source, 'location'), attendeeEmails: Array.isArray(source.attendeeEmails)
         ? source.attendeeEmails.map(String).join(', ') : '', status: textValue(source, 'status') || 'planned',
+      customJoinUrl: textValue(source, 'customJoinUrl')
+        || (meetingMode === 'custom_link' ? textValue(source, 'joinUrl') : ''),
+      calendarChoiceKey: calendarConnectionId && calendarId
+        ? meetingCalendarChoiceKey(calendarConnectionId, calendarId)
+        : '',
+      calendarConnectionId,
+      calendarId,
+      provider: textValue(source, 'provider'),
+      externalEventId: textValue(source, 'externalEventId'),
+      externalEventUrl: textValue(source, 'externalEventUrl'),
+      joinUrl: textValue(source, 'joinUrl'),
       description: textValue(source, 'description'),
     }
   }
@@ -682,13 +907,21 @@ export default function CrmSection() {
   const [suiteCrmAdminPortalUrl, setSuiteCrmAdminPortalUrl] = useState<string | null>(null)
   const [providerIdentities, setProviderIdentities] = useState({
     googleMail: null as string | null,
-    googleCalendar: null as string | null,
+    googleMailConnectionId: null as string | null,
+    googleCalendarOrganizer: null as string | null,
+    googleCalendarConnectionId: null as string | null,
+    googleCalendarId: null as string | null,
+    googleCalendarSource: null as string | null,
   })
+  const [meetingCalendars, setMeetingCalendars] = useState<MeetingCalendarChoice[]>([])
+  const [meetingCalendarsLoading, setMeetingCalendarsLoading] = useState(false)
+  const [meetingCalendarsError, setMeetingCalendarsError] = useState('')
   const [suiteCrmAccessOpen, setSuiteCrmAccessOpen] = useState(false)
   const [hierarchyOpen, setHierarchyOpen] = useState(false)
   const [relatedContactsLoading, setRelatedContactsLoading] = useState(false)
   const [actionComposer, setActionComposer] = useState<{ type: CrmActionType; record: RecordValue } | null>(null)
   const [actionFields, setActionFields] = useState<Record<string, string>>({})
+  const [editorMeetingIdempotencyKey, setEditorMeetingIdempotencyKey] = useState('')
   const [lifecycleDialog, setLifecycleDialog] = useState<LifecycleDialog | null>(null)
   const [lifecycleFields, setLifecycleFields] = useState<Record<string, string>>({})
   const [dataTransferOpen, setDataTransferOpen] = useState(false)
@@ -697,6 +930,72 @@ export default function CrmSection() {
   const [routeQuery, setRouteQuery] = useState('')
   const [routeReady, setRouteReady] = useState(false)
   const deepLinkOpened = useRef(false)
+  const meetingCalendarComposerOpen = actionComposer?.type === 'create_calendar_event'
+  const meetingEditorOpen = editorEntity === 'meetings' && editorRecord !== undefined
+  const organizationDefaultMeetingCalendar = useMemo<MeetingCalendarChoice | null>(() => {
+    const calendarId = providerIdentities.googleCalendarId || ''
+    if (providerIdentities.googleCalendarSource !== 'organization' || !calendarId) return null
+    return {
+      key: ORGANIZATION_DEFAULT_CALENDAR_KEY,
+      source: 'organization-default',
+      connectionId: '',
+      connectionName: 'Organization default',
+      accountEmail: '',
+      calendarId,
+      organizerEmail: providerIdentities.googleCalendarOrganizer || calendarId,
+      calendarSummary: providerIdentities.googleCalendarOrganizer || calendarId,
+      primary: false,
+      accessRole: 'owner',
+    }
+  }, [
+    providerIdentities.googleCalendarId,
+    providerIdentities.googleCalendarOrganizer,
+    providerIdentities.googleCalendarSource,
+  ])
+  const unavailableCurrentMeetingCalendar = useMemo<MeetingCalendarChoice | null>(() => {
+    if (!meetingEditorOpen || !editorRecord) return null
+    const connectionId = fields.calendarConnectionId || textValue(editorRecord, 'calendarConnectionId')
+    const calendarId = fields.calendarId || textValue(editorRecord, 'calendarId')
+    if (!connectionId || !calendarId) return null
+    if (organizationDefaultMeetingCalendar?.calendarId === calendarId) return null
+    const key = meetingCalendarChoiceKey(connectionId, calendarId)
+    if (meetingCalendars.some((choice) => choice.key === key)) return null
+    const organizerEmail = textValue(editorRecord, 'calendarOrganizerEmail') || calendarId
+    return {
+      key,
+      source: 'unavailable-current',
+      connectionId,
+      connectionName: 'No longer linked',
+      accountEmail: textValue(editorRecord, 'calendarOwnerEmail'),
+      calendarId,
+      organizerEmail,
+      calendarSummary: organizerEmail,
+      primary: false,
+      accessRole: 'writer',
+    }
+  }, [
+    editorRecord,
+    fields.calendarConnectionId,
+    fields.calendarId,
+    meetingCalendars,
+    meetingEditorOpen,
+    organizationDefaultMeetingCalendar,
+  ])
+  const availableMeetingCalendars = useMemo(() => {
+    const organizationDefaultIsActorSelectable = Boolean(
+      organizationDefaultMeetingCalendar
+      && meetingCalendars.some((choice) => (
+        choice.calendarId === organizationDefaultMeetingCalendar.calendarId
+      )),
+    )
+    return [
+      ...(organizationDefaultMeetingCalendar && !organizationDefaultIsActorSelectable
+        ? [organizationDefaultMeetingCalendar]
+        : []),
+      ...meetingCalendars,
+      ...(unavailableCurrentMeetingCalendar ? [unavailableCurrentMeetingCalendar] : []),
+    ]
+  }, [meetingCalendars, organizationDefaultMeetingCalendar, unavailableCurrentMeetingCalendar])
 
   const load = useCallback(async (nextEntity: CrmEntity, nextQuery: string, nextNeedsReview = false) => {
     setLoading(true)
@@ -721,8 +1020,16 @@ export default function CrmSection() {
       setSuiteCrmUsername(payload.suiteCrmUsername || null)
       setSuiteCrmAdminPortalUrl(payload.suiteCrmAdminPortalUrl || null)
       setProviderIdentities({
-        googleMail: payload.providerIdentities?.googleMail || null,
-        googleCalendar: payload.providerIdentities?.googleCalendar || null,
+        googleMail: payload.providerIdentities?.googleMailSendAsEmail
+          || payload.providerIdentities?.googleMail
+          || null,
+        googleMailConnectionId: payload.providerIdentities?.googleMailConnectionId || null,
+        googleCalendarOrganizer: payload.providerIdentities?.googleCalendarOrganizer
+          || payload.providerIdentities?.googleCalendar
+          || null,
+        googleCalendarConnectionId: payload.providerIdentities?.googleCalendarConnectionId || null,
+        googleCalendarId: payload.providerIdentities?.googleCalendarId || null,
+        googleCalendarSource: payload.providerIdentities?.googleCalendarSource || null,
       })
       const reference = new URLSearchParams(window.location.search).get('crm')?.trim().toLowerCase() || ''
       const matched = reference && entityForReference(reference) === nextEntity
@@ -730,6 +1037,9 @@ export default function CrmSection() {
         : null
       if (matched && !deepLinkOpened.current) {
         deepLinkOpened.current = true
+        setEditorMeetingIdempotencyKey(nextEntity === 'meetings'
+          ? `crm-ui:meeting:update:${crypto.randomUUID()}`
+          : '')
         setEditorEntity(nextEntity)
         setEditorHistory([])
         setEditorRecord(matched)
@@ -750,7 +1060,11 @@ export default function CrmSection() {
           } else {
             const recordName = textValue(matched, 'fullName') || textValue(matched, 'name')
               || textValue(matched, 'referenceCode')
-            setActionFields({ subject: `Follow-up: ${recordName}`, text: '' })
+            setActionFields({
+              subject: `Follow-up: ${recordName}`,
+              text: '',
+              idempotencyKey: `crm-ui:send_email:${crypto.randomUUID()}`,
+            })
             setActionComposer({ type: 'send_email', record: matched })
           }
         }
@@ -853,6 +1167,119 @@ export default function CrmSection() {
   useEffect(() => {
     if (routeReady) void load(entity, routeQuery, needsReviewOnly)
   }, [entity, load, needsReviewOnly, routeQuery, routeReady])
+
+  useEffect(() => {
+    if (!meetingCalendarComposerOpen && !meetingEditorOpen) {
+      setMeetingCalendars([])
+      setMeetingCalendarsError('')
+      setMeetingCalendarsLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const controller = new AbortController()
+    setMeetingCalendars([])
+    setMeetingCalendarsError('')
+    setMeetingCalendarsLoading(true)
+
+    const loadMeetingCalendars = async () => {
+      try {
+        const response = await fetch('/api/integrations/communications', {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        const payload = await response.json().catch(() => ({})) as OrganizationCommunicationsPayload
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || 'Unable to load linked Google Calendars')
+        }
+        const normalized = meetingCalendarChoices(payload)
+        const choices = normalized.choices
+        if (cancelled) return
+        setMeetingCalendars(choices)
+        setMeetingCalendarsError(normalized.errors.join(' '))
+        const reconcileSelection = (current: Record<string, string>) => {
+          const explicitCurrentKey = current.calendarConnectionId && current.calendarId
+            ? meetingCalendarChoiceKey(current.calendarConnectionId, current.calendarId)
+            : ''
+          const currentKey = current.calendarChoiceKey || explicitCurrentKey
+          const verifiedCurrent = currentKey
+            ? choices.find((choice) => choice.key === currentKey)
+            : null
+          if (verifiedCurrent) {
+            return {
+              ...current,
+              calendarChoiceKey: verifiedCurrent.key,
+              calendarConnectionId: verifiedCurrent.connectionId,
+              calendarId: verifiedCurrent.calendarId,
+            }
+          }
+          const usesOrganizationDefault = organizationDefaultMeetingCalendar && (
+            currentKey === ORGANIZATION_DEFAULT_CALENDAR_KEY
+            || current.calendarId === organizationDefaultMeetingCalendar.calendarId
+            || !currentKey
+          )
+          if (usesOrganizationDefault) {
+            const actorOwnedDefault = choices.find((choice) => (
+              choice.calendarId === organizationDefaultMeetingCalendar.calendarId
+            ))
+            if (actorOwnedDefault) {
+              return {
+                ...current,
+                calendarChoiceKey: actorOwnedDefault.key,
+                calendarConnectionId: actorOwnedDefault.connectionId,
+                calendarId: actorOwnedDefault.calendarId,
+              }
+            }
+            return {
+              ...current,
+              calendarChoiceKey: ORGANIZATION_DEFAULT_CALENDAR_KEY,
+              calendarConnectionId: '',
+              calendarId: '',
+            }
+          }
+          if (currentKey) {
+            return {
+              ...current,
+              calendarChoiceKey: currentKey,
+            }
+          }
+          const firstVerified = choices.find((choice) => choice.primary) || choices[0]
+          return firstVerified
+            ? {
+                ...current,
+                calendarChoiceKey: firstVerified.key,
+                calendarConnectionId: firstVerified.connectionId,
+                calendarId: firstVerified.calendarId,
+              }
+            : {
+                ...current,
+                calendarChoiceKey: '',
+                calendarConnectionId: '',
+                calendarId: '',
+              }
+        }
+        if (meetingCalendarComposerOpen) setActionFields(reconcileSelection)
+        if (meetingEditorOpen) setFields(reconcileSelection)
+      } catch (calendarError) {
+        if (cancelled || controller.signal.aborted) return
+        setMeetingCalendarsError(calendarError instanceof Error
+          ? calendarError.message
+          : 'Unable to load linked Google Calendars')
+      } finally {
+        if (!cancelled) setMeetingCalendarsLoading(false)
+      }
+    }
+
+    void loadMeetingCalendars()
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [
+    meetingCalendarComposerOpen,
+    meetingEditorOpen,
+    organizationDefaultMeetingCalendar,
+  ])
 
   useEffect(() => {
     let cancelled = false
@@ -1083,19 +1510,76 @@ export default function CrmSection() {
       textValue(opportunity, 'id') === textValue(editorRecord, 'convertedOpportunityId')
     )) || null
   }, [editorRecord, opportunities])
+  const actionMeetingMode = meetingModeValue(actionFields.meetingMode)
+  const actionMeetingDuration = meetingDurationMinutes(actionFields.durationMinutes)
+  const actionMeetingEnd = meetingEndValue(actionFields.startsAt, actionFields.durationMinutes)
+  const actionMeetingCalendarKey = actionFields.calendarChoiceKey
+    || (actionFields.calendarConnectionId && actionFields.calendarId
+      ? meetingCalendarChoiceKey(actionFields.calendarConnectionId, actionFields.calendarId)
+      : '')
+  const actionMeetingCalendar = availableMeetingCalendars.find(
+    (choice) => choice.key === actionMeetingCalendarKey,
+  ) || null
+  const actionMeetingLocationReady = actionMeetingMode === 'in_person'
+    ? Boolean(actionFields.location?.trim())
+    : actionMeetingMode === 'custom_link'
+      ? validHttpsMeetingLink(actionFields.customJoinUrl)
+      : true
+  const actionMeetingTimingReady = validLocalDateTime(actionFields.startsAt)
+    && Boolean(actionMeetingDuration)
+    && Boolean(actionMeetingEnd)
+    && validTimeZone(actionFields.timezone)
   const actionReady = Boolean(actionComposer && (
     actionComposer.type === 'send_email'
-      ? actionFields.subject?.trim() && actionFields.text?.trim()
+      ? providerIdentities.googleMail && actionFields.subject?.trim() && actionFields.text?.trim()
       : actionComposer.type === 'log_call'
         ? actionFields.subject?.trim()
         : actionComposer.type === 'create_calendar_event'
-          ? actionFields.subject?.trim() && actionFields.startsAt && actionFields.endsAt
-          : actionFields.recipientReferences?.trim() && actionFields.subject?.trim() && actionFields.text?.trim()
+          ? !meetingCalendarsLoading
+            && actionMeetingCalendar
+            && actionMeetingCalendar.source !== 'unavailable-current'
+            && actionFields.subject?.trim()
+            && actionMeetingTimingReady
+            && actionMeetingLocationReady
+          : providerIdentities.googleMail
+            && actionFields.recipientReferences?.trim()
+            && actionFields.subject?.trim()
+            && actionFields.text?.trim()
   ))
+  const editorMeetingMode = meetingModeValue(fields.meetingMode)
+  const editorMeetingDuration = meetingDurationMinutes(fields.durationMinutes)
+  const editorMeetingEnd = meetingEndValue(fields.startsAt, fields.durationMinutes)
+  const editorMeetingCalendarKey = fields.calendarChoiceKey
+    || (fields.calendarConnectionId && fields.calendarId
+      ? meetingCalendarChoiceKey(fields.calendarConnectionId, fields.calendarId)
+      : '')
+  const editorMeetingCalendar = availableMeetingCalendars.find(
+    (choice) => choice.key === editorMeetingCalendarKey,
+  ) || null
+  const editorMeetingLocationReady = editorMeetingMode === 'in_person'
+    ? Boolean(fields.location?.trim())
+    : editorMeetingMode === 'custom_link'
+      ? validHttpsMeetingLink(fields.customJoinUrl)
+      : true
+  const editorMeetingTimingReady = validLocalDateTime(fields.startsAt)
+    && Boolean(editorMeetingDuration)
+    && Boolean(editorMeetingEnd)
+    && validTimeZone(fields.timezone)
+  const editorMeetingReady = editorEntity !== 'meetings' || (
+    !meetingCalendarsLoading
+    && editorMeetingCalendar
+    && editorMeetingCalendar.source !== 'unavailable-current'
+    && Boolean(fields.subject?.trim())
+    && editorMeetingTimingReady
+    && editorMeetingLocationReady
+  )
 
   function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
     if (!record && entity === 'products' && !currencyPreferenceReady) return
+    setEditorMeetingIdempotencyKey(entity === 'meetings'
+      ? `crm-ui:meeting:${record ? 'update' : 'create'}:${crypto.randomUUID()}`
+      : '')
     setEditorEntity(entity)
     setEditorHistory([])
     setEditorRecord(record)
@@ -1203,6 +1687,7 @@ export default function CrmSection() {
   function closeEditor() {
     if (busy) return
     setEditorRecord(undefined)
+    setEditorMeetingIdempotencyKey('')
     setUseOrganizationAddress(false)
     setEditorHistory([])
     setRelatedContactsLoading(false)
@@ -1274,47 +1759,93 @@ export default function CrmSection() {
       if (editorEntity === 'interactions' && fields.occurredAt && !occurredAt) {
         throw new Error('Interaction date is invalid in your profile timezone')
       }
+      const isMeeting = editorEntity === 'meetings'
+      if (isMeeting && !editorMeetingIdempotencyKey) {
+        throw new Error('Meeting request identity is unavailable; close and reopen the form')
+      }
+      let savedFields: Record<string, unknown>
+      if (isMeeting) {
+        if (!editorMeetingCalendar || editorMeetingCalendar.source === 'unavailable-current') {
+          throw new Error('Choose an available Calendar before saving this meeting')
+        }
+        if (!editorMeetingTimingReady || !editorMeetingEnd) {
+          throw new Error('Enter a valid start, duration, and timezone')
+        }
+        if (!editorMeetingLocationReady) {
+          throw new Error(editorMeetingMode === 'in_person'
+            ? 'Enter the physical address for this meeting'
+            : 'Enter a valid HTTPS meeting link')
+        }
+        const meetingFields: Record<string, unknown> = { ...fields }
+        for (const transientField of [
+          'durationPreset',
+          'durationMinutes',
+          'calendarChoiceKey',
+          'calendarConnectionId',
+          'calendarId',
+        ]) delete meetingFields[transientField]
+        savedFields = {
+          ...meetingFields,
+          startsAt: fields.startsAt,
+          endsAt: editorMeetingEnd,
+          timezone: fields.timezone.trim(),
+          meetingMode: editorMeetingMode,
+          location: editorMeetingMode === 'in_person' ? fields.location.trim() : '',
+          customJoinUrl: editorMeetingMode === 'custom_link' ? fields.customJoinUrl.trim() : '',
+          joinUrl: editorMeetingMode === 'custom_link' ? fields.customJoinUrl.trim() : '',
+          attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [],
+          ...(editorMeetingCalendar.source === 'actor-connection' ? {
+            calendarConnectionId: editorMeetingCalendar.connectionId,
+            calendarId: editorMeetingCalendar.calendarId,
+          } : {}),
+        }
+      } else if (editorEntity === 'interactions') {
+        savedFields = {
+          ...fields,
+          contactIds: idList(fields.contactIds),
+          contactId: idList(fields.contactIds)[0] || '',
+          agentEmail: interactionAgentEmail,
+          occurredAt,
+        }
+      } else if (editorEntity === 'opportunities') {
+        savedFields = {
+          ...fields,
+          contactIds: idList(fields.contactIds),
+          productIds: idList(fields.productIds),
+          value: Number(fields.value || 0),
+          probability: Number(fields.probability || 0),
+        }
+      } else if (editorEntity === 'products') {
+        savedFields = {
+          ...fields,
+          active: fields.active !== 'false',
+          price: Number(fields.price || 0),
+          cost: Number(fields.cost || 0),
+        }
+      } else if (editorEntity === 'contacts') {
+        savedFields = contactFieldsForSave(fields)
+      } else if (['organizations', 'leads'].includes(editorEntity)) {
+        savedFields = { ...fields, emailOptOut: fields.emailOptOut === 'true' }
+      } else {
+        savedFields = fields
+      }
       const response = await fetch('/api/crm', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(isMeeting ? { 'Idempotency-Key': editorMeetingIdempotencyKey } : {}),
+        },
         body: JSON.stringify({
           entity: editorEntity,
           id: editorRecord?.id,
-          fields: editorEntity === 'meetings'
-            ? { ...fields, attendeeEmails: fields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [] }
-            : editorEntity === 'interactions'
-              ? {
-                  ...fields,
-                  contactIds: idList(fields.contactIds),
-                  contactId: idList(fields.contactIds)[0] || '',
-                  agentEmail: interactionAgentEmail,
-                  occurredAt,
-                }
-              : editorEntity === 'opportunities'
-                ? {
-                    ...fields,
-                    contactIds: idList(fields.contactIds),
-                    productIds: idList(fields.productIds),
-                    value: Number(fields.value || 0),
-                    probability: Number(fields.probability || 0),
-                  }
-              : editorEntity === 'products'
-                ? {
-                    ...fields,
-                    active: fields.active !== 'false',
-                    price: Number(fields.price || 0),
-                    cost: Number(fields.cost || 0),
-                  }
-              : editorEntity === 'contacts'
-                ? contactFieldsForSave(fields)
-              : ['organizations', 'leads'].includes(editorEntity)
-                ? { ...fields, emailOptOut: fields.emailOptOut === 'true' }
-                : fields,
+          ...(isMeeting ? { idempotencyKey: editorMeetingIdempotencyKey } : {}),
+          fields: savedFields,
         }),
       })
       const payload = await response.json().catch(() => ({})) as CrmPayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'Unable to save CRM record')
       setEditorRecord(undefined)
+      setEditorMeetingIdempotencyKey('')
       setEditorHistory([])
       setNotice('Saved and queued for CRM sync')
       await load(entity, query, needsReviewOnly)
@@ -1362,24 +1893,47 @@ export default function CrmSection() {
   function openAction(type: CrmActionType, record: RecordValue) {
     const recordName = textValue(record, 'fullName') || textValue(record, 'name')
       || textValue(record, 'subject') || textValue(record, 'referenceCode')
+    const idempotencyKey = `crm-ui:${type}:${crypto.randomUUID()}`
     if (type === 'send_email') {
       if (!textValue(record, 'email') || emailOptedOut(record)) return
-      setActionFields({ subject: `Follow-up: ${recordName}`, text: '' })
+      setActionFields({ subject: `Follow-up: ${recordName}`, text: '', idempotencyKey })
     } else if (type === 'create_calendar_event') {
-      const timezone = textValue(record, 'timezone') || 'America/New_York'
+      setMeetingCalendarsLoading(true)
+      setMeetingCalendarsError('')
+      const timezone = textValue(record, 'timezone') || dateTimeSettings.timeZone
+      const durationMinutes = durationForMeetingRecord(record, timezone)
+      const durationPreset = MEETING_DURATION_PRESETS.some((value) => value === durationMinutes)
+        ? String(durationMinutes)
+        : 'custom'
+      const meetingMode = meetingModeValue(record.meetingMode)
+      const calendarConnectionId = textValue(record, 'calendarConnectionId')
+      const calendarId = textValue(record, 'calendarId')
+      const calendarChoiceKey = calendarConnectionId && calendarId
+        ? meetingCalendarChoiceKey(calendarConnectionId, calendarId)
+        : organizationDefaultMeetingCalendar?.key || ''
       setActionFields({
+        idempotencyKey,
         subject: textValue(record, 'subject') || `Meeting with ${recordName}`,
         description: textValue(record, 'description'),
         startsAt: dateTimeLocalValue(record.startsAt, timezone),
-        endsAt: dateTimeLocalValue(record.endsAt, timezone),
+        durationPreset,
+        durationMinutes: String(durationMinutes),
         timezone,
+        meetingMode,
+        calendarChoiceKey,
+        calendarConnectionId,
+        calendarId,
         location: textValue(record, 'location'),
+        customJoinUrl: meetingMode === 'custom_link'
+          ? textValue(record, 'customJoinUrl') || textValue(record, 'joinUrl')
+          : '',
         attendeeEmails: Array.isArray(record.attendeeEmails)
           ? record.attendeeEmails.map(String).join(', ')
           : textValue(record, 'email'),
       })
     } else if (type === 'log_call') {
       setActionFields({
+        idempotencyKey,
         subject: `Call ${recordName}`,
         notes: '',
         activityStatus: 'held',
@@ -1388,6 +1942,7 @@ export default function CrmSection() {
       })
     } else {
       setActionFields({
+        idempotencyKey,
         recipientReferences: '',
         subject: textValue(record, 'subjectTemplate'),
         text: textValue(record, 'bodyTemplate'),
@@ -1401,6 +1956,9 @@ export default function CrmSection() {
     setBusy(true)
     setError('')
     try {
+      if (!actionFields.idempotencyKey) {
+        throw new Error('CRM action request identity is unavailable; close and reopen the form')
+      }
       const payload = actionComposer.type === 'send_email'
         ? { subject: actionFields.subject, text: actionFields.text }
         : actionComposer.type === 'log_call'
@@ -1416,9 +1974,13 @@ export default function CrmSection() {
                 subject: actionFields.subject,
                 description: actionFields.description,
                 startsAt: actionFields.startsAt,
-                endsAt: actionFields.endsAt,
+                endsAt: actionMeetingEnd,
                 timezone: actionFields.timezone,
-                location: actionFields.location,
+                meetingMode: actionMeetingMode,
+                location: actionMeetingMode === 'in_person' ? actionFields.location?.trim() : '',
+                customJoinUrl: actionMeetingMode === 'custom_link'
+                  ? actionFields.customJoinUrl?.trim()
+                  : undefined,
                 attendeeEmails: actionFields.attendeeEmails?.split(',').map((email) => email.trim()).filter(Boolean) || [],
               }
             : {
@@ -1428,12 +1990,20 @@ export default function CrmSection() {
               }
       const response = await fetch('/api/crm/actions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': actionFields.idempotencyKey,
+        },
         body: JSON.stringify({
           actionType: actionComposer.type,
           referenceCode: textValue(actionComposer.record, 'referenceCode'),
           payload,
-          idempotencyKey: `crm-ui:${actionComposer.type}:${crypto.randomUUID()}`,
+          ...(actionComposer.type === 'create_calendar_event'
+            && actionMeetingCalendar?.source === 'actor-connection' ? {
+            calendarConnectionId: actionMeetingCalendar.connectionId,
+            calendarId: actionMeetingCalendar.calendarId,
+          } : {}),
+          idempotencyKey: actionFields.idempotencyKey,
           processNow: true,
         }),
       })
@@ -1444,7 +2014,13 @@ export default function CrmSection() {
       }
       const telUrl = String(result.action?.responseSummary?.telUrl || '')
       setActionComposer(null)
-      setNotice(result.action?.status === 'succeeded' ? 'CRM action completed and logged' : 'CRM action queued')
+      setNotice(actionComposer.type === 'create_calendar_event'
+        ? result.action?.status === 'succeeded'
+          ? 'Meeting delivered to Google Calendar'
+          : 'Calendar delivery pending'
+        : result.action?.status === 'succeeded'
+          ? 'CRM action completed and logged'
+          : 'CRM action queued')
       if (actionComposer.type === 'log_call' && /^tel:[0-9+*#,;]+$/.test(telUrl)) window.location.href = telUrl
       if (entity === 'interactions' || entity === 'meetings' || entity === 'campaigns') await load(entity, query, needsReviewOnly)
     } catch (actionError) {
@@ -1788,7 +2364,7 @@ export default function CrmSection() {
                     </Stack>
                   ) : label}
                 </TableCell>)}
-                <TableCell width={110}>Sync</TableCell>
+                <TableCell width={140}>{entity === 'meetings' ? 'SuiteCRM' : 'Sync'}</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
@@ -1847,6 +2423,15 @@ export default function CrmSection() {
                           )
                         : entity === 'opportunities' && key === 'value'
                           ? money(record[key])
+                        : entity === 'meetings' && key === 'status'
+                          ? (
+                            <Chip
+                              size="small"
+                              label={meetingCalendarStatusLabel(meetingCalendarDeliveryValue(record))}
+                              color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(record))}
+                              variant="outlined"
+                            />
+                          )
                         : entity === 'interactions' && key === 'crmRecord'
                           ? interactionCrmRecordLabel(record)
                         : displayValue(record, key, dateTimeSettings)}
@@ -1855,7 +2440,9 @@ export default function CrmSection() {
                   <TableCell>
                     <Chip
                       size="small"
-                      label={textValue(record, 'syncStatus') || 'pending'}
+                      label={entity === 'meetings'
+                        ? suiteCrmSyncStatusLabel(record.syncStatus)
+                        : textValue(record, 'syncStatus') || 'pending'}
                       color={record.syncStatus === 'failed' ? 'error' : record.syncStatus === 'synced' ? 'success' : 'default'}
                       variant="outlined"
                     />
@@ -1958,7 +2545,14 @@ export default function CrmSection() {
         <DialogContent>
           <Stack spacing={2} mt={0.5}>
             {actionComposer?.type === 'send_email' && <>
-              <TextField disabled label="From" value={providerIdentities.googleMail || 'Select Google Mail in Settings'} />
+              <TextField
+                disabled
+                label="Email sender"
+                value={providerIdentities.googleMail || 'Not connected for this organization'}
+                helperText={providerIdentities.googleMail
+                  ? 'Accepted Gmail send-as address'
+                  : 'Connect Gmail in Settings before sending.'}
+              />
               <TextField label="Subject" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} />
             </>}
@@ -1984,19 +2578,167 @@ export default function CrmSection() {
               <TextField label="Call notes" multiline minRows={5} value={actionFields.notes || ''} onChange={(event) => setActionFields({ ...actionFields, notes: event.target.value })} />
             </>}
             {actionComposer?.type === 'create_calendar_event' && <>
-              <TextField disabled label="Calendar organizer" value={providerIdentities.googleCalendar || 'Select Google Calendar in Settings'} />
-              <TextField label="Meeting" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
-                <TextField fullWidth label="Starts" type="datetime-local" required value={actionFields.startsAt || ''} onChange={(event) => setActionFields({ ...actionFields, startsAt: event.target.value })} InputLabelProps={{ shrink: true }} />
-                <TextField fullWidth label="Ends" type="datetime-local" required value={actionFields.endsAt || ''} onChange={(event) => setActionFields({ ...actionFields, endsAt: event.target.value })} InputLabelProps={{ shrink: true }} />
+                <TextField
+                  fullWidth
+                  label="Send from calendar"
+                  select
+                  required
+                  disabled={meetingCalendarsLoading && availableMeetingCalendars.length === 0}
+                  value={actionMeetingCalendarKey}
+                  onChange={(event) => {
+                    const choice = availableMeetingCalendars.find((candidate) => candidate.key === event.target.value)
+                    setActionFields({
+                      ...actionFields,
+                      calendarChoiceKey: choice?.key || '',
+                      calendarConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : '',
+                      calendarId: choice?.source === 'actor-connection' ? choice.calendarId : '',
+                    })
+                  }}
+                  helperText={meetingCalendarsLoading
+                    ? 'Loading linked writable calendars…'
+                    : actionMeetingCalendar
+                      ? actionMeetingCalendar.source === 'organization-default'
+                        ? `Invitation organizer: ${actionMeetingCalendar.organizerEmail} · Organization default`
+                        : `Invitation organizer: ${actionMeetingCalendar.organizerEmail} · Linked account: ${actionMeetingCalendar.accountEmail || 'Google account'}`
+                      : 'Choose the Google Calendar that sends this invitation.'}
+                >
+                  {availableMeetingCalendars.map((choice) => (
+                    <MenuItem
+                      key={choice.key}
+                      value={choice.key}
+                      disabled={choice.source === 'unavailable-current'}
+                    >
+                      {meetingCalendarChoiceLabel(choice)}
+                    </MenuItem>
+                  ))}
+                </TextField>
               </Stack>
-              <TextField label="Timezone" value={actionFields.timezone || ''} onChange={(event) => setActionFields({ ...actionFields, timezone: event.target.value })} />
+              {meetingCalendarsError ? (
+                <Alert severity={availableMeetingCalendars.length > 0 ? 'warning' : 'error'}>
+                  {meetingCalendarsError}
+                </Alert>
+              ) : null}
+              <TextField label="Meeting" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
+              <TextField
+                select
+                label="Meeting type"
+                value={actionMeetingMode}
+                onChange={(event) => {
+                  const meetingMode = meetingModeValue(event.target.value)
+                  setActionFields({
+                    ...actionFields,
+                    meetingMode,
+                    location: meetingMode === 'in_person' ? actionFields.location || '' : '',
+                    customJoinUrl: meetingMode === 'custom_link' ? actionFields.customJoinUrl || '' : '',
+                  })
+                }}
+              >
+                <MenuItem value="google_meet">Google Meet</MenuItem>
+                <MenuItem value="in_person">In person</MenuItem>
+                <MenuItem value="custom_link">Custom link</MenuItem>
+              </TextField>
+              {actionMeetingMode === 'in_person' ? (
+                <TextField
+                  label="Physical address"
+                  required
+                  value={actionFields.location || ''}
+                  onChange={(event) => setActionFields({ ...actionFields, location: event.target.value })}
+                  error={Boolean(actionFields.location) && !actionFields.location.trim()}
+                  helperText="Enter the address attendees should use."
+                />
+              ) : actionMeetingMode === 'custom_link' ? (
+                <TextField
+                  label="Meeting link"
+                  required
+                  type="url"
+                  value={actionFields.customJoinUrl || ''}
+                  onChange={(event) => setActionFields({ ...actionFields, customJoinUrl: event.target.value })}
+                  error={Boolean(actionFields.customJoinUrl) && !validHttpsMeetingLink(actionFields.customJoinUrl)}
+                  helperText={actionFields.customJoinUrl && !validHttpsMeetingLink(actionFields.customJoinUrl)
+                    ? 'Enter a valid HTTPS link.'
+                    : 'This link will be included in the invitation.'}
+                />
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  Google Meet will add the join link to the invitation.
+                </Typography>
+              )}
+              <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+                <TextField
+                  fullWidth
+                  label="Start"
+                  type="datetime-local"
+                  required
+                  value={actionFields.startsAt || ''}
+                  onChange={(event) => setActionFields({ ...actionFields, startsAt: event.target.value })}
+                  error={Boolean(actionFields.startsAt) && !validLocalDateTime(actionFields.startsAt)}
+                  InputLabelProps={{ shrink: true }}
+                />
+                <TextField
+                  fullWidth
+                  select
+                  label="Duration"
+                  value={actionFields.durationPreset || '30'}
+                  onChange={(event) => {
+                    const durationPreset = event.target.value
+                    setActionFields({
+                      ...actionFields,
+                      durationPreset,
+                      durationMinutes: durationPreset === 'custom'
+                        ? actionFields.durationMinutes || '30'
+                        : durationPreset,
+                    })
+                  }}
+                >
+                  {MEETING_DURATION_PRESETS.map((duration) => (
+                    <MenuItem key={duration} value={String(duration)}>{duration} minutes</MenuItem>
+                  ))}
+                  <MenuItem value="custom">Custom</MenuItem>
+                </TextField>
+              </Stack>
+              {actionFields.durationPreset === 'custom' ? (
+                <TextField
+                  label="Custom duration (minutes)"
+                  type="number"
+                  required
+                  inputProps={{ min: 1, max: 1440, step: 1 }}
+                  value={actionFields.durationMinutes || ''}
+                  onChange={(event) => setActionFields({ ...actionFields, durationMinutes: event.target.value })}
+                  error={actionFields.durationMinutes !== undefined && !actionMeetingDuration}
+                  helperText={!actionMeetingDuration ? 'Enter 1 to 1,440 minutes.' : ' '}
+                />
+              ) : null}
+              <TextField
+                label="Ends"
+                type="datetime-local"
+                value={actionMeetingEnd}
+                InputProps={{ readOnly: true }}
+                InputLabelProps={{ shrink: true }}
+                helperText="Calculated from the start time and duration."
+              />
+              <TextField
+                label="Timezone"
+                required
+                value={actionFields.timezone || ''}
+                onChange={(event) => setActionFields({ ...actionFields, timezone: event.target.value })}
+                error={Boolean(actionFields.timezone) && !validTimeZone(actionFields.timezone)}
+                helperText={actionFields.timezone && !validTimeZone(actionFields.timezone)
+                  ? 'Enter a valid IANA timezone, such as America/New_York.'
+                  : ' '}
+              />
               <TextField label="Attendee emails" value={actionFields.attendeeEmails || ''} onChange={(event) => setActionFields({ ...actionFields, attendeeEmails: event.target.value })} helperText="Separate addresses with commas" />
-              <TextField label="Location" value={actionFields.location || ''} onChange={(event) => setActionFields({ ...actionFields, location: event.target.value })} />
               <TextField label="Description" multiline minRows={4} value={actionFields.description || ''} onChange={(event) => setActionFields({ ...actionFields, description: event.target.value })} />
             </>}
             {actionComposer?.type === 'send_campaign' && <>
-              <TextField disabled label="From" value={providerIdentities.googleMail || 'Select Google Mail in Settings'} />
+              <TextField
+                disabled
+                label="Email sender"
+                value={providerIdentities.googleMail || 'Not connected for this organization'}
+                helperText={providerIdentities.googleMail
+                  ? 'Accepted Gmail send-as address'
+                  : 'Connect Gmail in Settings before sending.'}
+              />
               <TextField label="Recipient CRM IDs" required value={actionFields.recipientReferences || ''} onChange={(event) => setActionFields({ ...actionFields, recipientReferences: event.target.value })} helperText="Use gc or gl IDs, separated by commas or spaces" />
               <TextField label="Subject template" required value={actionFields.subject || ''} onChange={(event) => setActionFields({ ...actionFields, subject: event.target.value })} />
               <TextField label="Message template" required multiline minRows={8} value={actionFields.text || ''} onChange={(event) => setActionFields({ ...actionFields, text: event.target.value })} helperText="Merge fields: {{firstName}}, {{lastName}}, {{name}}, {{email}}, {{referenceCode}}" />
@@ -2692,9 +3434,106 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'meetings' && <>
             <TextField disabled={!recordEditable} label="Meeting" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
-            <TextField disabled={!recordEditable} select label="Status" value={fields.status || 'planned'} onChange={(event) => setFields({ ...fields, status: event.target.value })}>
+            {editorRecord ? (
+              <Box
+                component="section"
+                aria-label="Meeting delivery status"
+                sx={{ border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px', p: 1.5 }}
+              >
+                <Typography variant="subtitle2" fontWeight={700} mb={1}>Delivery status</Typography>
+                <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap>
+                  <Chip
+                    size="small"
+                    label={`Calendar: ${meetingCalendarStatusLabel(meetingCalendarDeliveryValue(editorRecord))}`}
+                    color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(editorRecord))}
+                    variant="outlined"
+                  />
+                  <Chip
+                    size="small"
+                    label={`SuiteCRM: ${suiteCrmSyncStatusLabel(editorRecord.syncStatus)}`}
+                    color={editorRecord.syncStatus === 'failed'
+                      ? 'error'
+                      : editorRecord.syncStatus === 'synced'
+                        ? 'success'
+                        : 'default'}
+                    variant="outlined"
+                  />
+                </Stack>
+                {textValue(editorRecord, 'calendarOrganizerEmail') ? (
+                  <Typography variant="caption" color="text.secondary" display="block" mt={1}>
+                    Organizer: {textValue(editorRecord, 'calendarOrganizerEmail')}
+                  </Typography>
+                ) : null}
+                {textValue(editorRecord, 'calendarId') ? (
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    Calendar: {textValue(editorRecord, 'calendarId')}
+                  </Typography>
+                ) : null}
+                {textValue(editorRecord, 'calendarDeliveryError') || textValue(editorRecord, 'calendarError') ? (
+                  <Typography variant="caption" color="error" display="block" mt={1}>
+                    Calendar: {textValue(editorRecord, 'calendarDeliveryError') || textValue(editorRecord, 'calendarError')}
+                  </Typography>
+                ) : null}
+                {textValue(editorRecord, 'syncError') ? (
+                  <Typography variant="caption" color="error" display="block" mt={1}>
+                    SuiteCRM: {textValue(editorRecord, 'syncError')}
+                  </Typography>
+                ) : null}
+                <Stack direction="row" spacing={1} mt={1} flexWrap="wrap" useFlexGap>
+                  {editorRecord.externalEventUrl ? (
+                    <Link href={textValue(editorRecord, 'externalEventUrl')} target="_blank" rel="noreferrer">
+                      Open Calendar event
+                    </Link>
+                  ) : null}
+                  {editorRecord.joinUrl ? (
+                    <Link href={textValue(editorRecord, 'joinUrl')} target="_blank" rel="noreferrer">
+                      Join meeting
+                    </Link>
+                  ) : null}
+                </Stack>
+              </Box>
+            ) : null}
+            <TextField
+              disabled={!recordEditable || (meetingCalendarsLoading && availableMeetingCalendars.length === 0)}
+              select
+              required
+              label="Send from calendar"
+              value={editorMeetingCalendarKey}
+              onChange={(event) => {
+                const choice = availableMeetingCalendars.find((candidate) => candidate.key === event.target.value)
+                setFields({
+                  ...fields,
+                  calendarChoiceKey: choice?.key || '',
+                  calendarConnectionId: choice?.source === 'actor-connection' ? choice.connectionId : '',
+                  calendarId: choice?.source === 'actor-connection' ? choice.calendarId : '',
+                })
+              }}
+              helperText={meetingCalendarsLoading
+                ? 'Loading calendars…'
+                : editorMeetingCalendar?.source === 'unavailable-current'
+                  ? 'This calendar is no longer linked. Choose another calendar.'
+                  : editorMeetingCalendar
+                    ? `Invitation organizer: ${editorMeetingCalendar.organizerEmail}`
+                    : 'No writable calendar selected.'}
+            >
+              {availableMeetingCalendars.map((choice) => (
+                <MenuItem
+                  key={choice.key}
+                  value={choice.key}
+                  disabled={choice.source === 'unavailable-current'}
+                >
+                  {meetingCalendarChoiceLabel(choice)}
+                </MenuItem>
+              ))}
+            </TextField>
+            {meetingCalendarsError ? (
+              <Alert severity={availableMeetingCalendars.length > 0 ? 'warning' : 'error'}>
+                {meetingCalendarsError}
+              </Alert>
+            ) : null}
+            <TextField disabled={!recordEditable} select label="Meeting status" value={fields.status || 'planned'} onChange={(event) => setFields({ ...fields, status: event.target.value })}>
               <MenuItem value="planned">Planned</MenuItem>
-              <MenuItem value="queued">Queued for calendar</MenuItem>
+              <MenuItem value="queued">Queued</MenuItem>
               <MenuItem value="scheduled">Scheduled</MenuItem>
               <MenuItem value="completed">Completed</MenuItem>
               <MenuItem value="cancelled">Cancelled</MenuItem>
@@ -2740,10 +3579,116 @@ export default function CrmSection() {
               {recordsForOrganization(opportunities, fields.organizationId || '')
                 .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{opportunityOptionLabel(record)}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} label="Starts" type="datetime-local" value={fields.startsAt || ''} onChange={(event) => setFields({ ...fields, startsAt: event.target.value })} InputLabelProps={{ shrink: true }} required />
-            <TextField disabled={!recordEditable} label="Ends" type="datetime-local" value={fields.endsAt || ''} onChange={(event) => setFields({ ...fields, endsAt: event.target.value })} InputLabelProps={{ shrink: true }} required />
-            <TextField disabled={!recordEditable} label="Timezone" value={fields.timezone || ''} onChange={(event) => setFields({ ...fields, timezone: event.target.value })} />
-            <TextField disabled={!recordEditable} label="Location" value={fields.location || ''} onChange={(event) => setFields({ ...fields, location: event.target.value })} />
+            <TextField
+              disabled={!recordEditable}
+              select
+              label="Meeting type"
+              value={editorMeetingMode}
+              onChange={(event) => {
+                const meetingMode = meetingModeValue(event.target.value)
+                setFields({
+                  ...fields,
+                  meetingMode,
+                  location: meetingMode === 'in_person' ? fields.location || '' : '',
+                  customJoinUrl: meetingMode === 'custom_link' ? fields.customJoinUrl || '' : '',
+                })
+              }}
+            >
+              <MenuItem value="google_meet">Google Meet</MenuItem>
+              <MenuItem value="in_person">In person</MenuItem>
+              <MenuItem value="custom_link">Custom link</MenuItem>
+            </TextField>
+            {editorMeetingMode === 'in_person' ? (
+              <TextField
+                disabled={!recordEditable}
+                label="Physical address"
+                required
+                value={fields.location || ''}
+                onChange={(event) => setFields({ ...fields, location: event.target.value })}
+                error={Boolean(fields.location) && !fields.location.trim()}
+              />
+            ) : editorMeetingMode === 'custom_link' ? (
+              <TextField
+                disabled={!recordEditable}
+                label="Meeting link"
+                required
+                type="url"
+                value={fields.customJoinUrl || ''}
+                onChange={(event) => setFields({ ...fields, customJoinUrl: event.target.value })}
+                error={Boolean(fields.customJoinUrl) && !validHttpsMeetingLink(fields.customJoinUrl)}
+                helperText={fields.customJoinUrl && !validHttpsMeetingLink(fields.customJoinUrl)
+                  ? 'Enter a valid HTTPS link.'
+                  : ' '}
+              />
+            ) : null}
+            <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
+              <TextField
+                fullWidth
+                disabled={!recordEditable}
+                label="Start"
+                type="datetime-local"
+                value={fields.startsAt || ''}
+                onChange={(event) => setFields({ ...fields, startsAt: event.target.value })}
+                error={Boolean(fields.startsAt) && !validLocalDateTime(fields.startsAt)}
+                InputLabelProps={{ shrink: true }}
+                required
+              />
+              <TextField
+                fullWidth
+                disabled={!recordEditable}
+                select
+                label="Duration"
+                value={fields.durationPreset || '30'}
+                onChange={(event) => {
+                  const durationPreset = event.target.value
+                  setFields({
+                    ...fields,
+                    durationPreset,
+                    durationMinutes: durationPreset === 'custom'
+                      ? fields.durationMinutes || '30'
+                      : durationPreset,
+                  })
+                }}
+              >
+                {MEETING_DURATION_PRESETS.map((duration) => (
+                  <MenuItem key={duration} value={String(duration)}>{duration} minutes</MenuItem>
+                ))}
+                <MenuItem value="custom">Custom</MenuItem>
+              </TextField>
+            </Stack>
+            {fields.durationPreset === 'custom' ? (
+              <TextField
+                disabled={!recordEditable}
+                label="Custom duration (minutes)"
+                type="number"
+                required
+                inputProps={{ min: 1, max: 1440, step: 1 }}
+                value={fields.durationMinutes || ''}
+                onChange={(event) => setFields({ ...fields, durationMinutes: event.target.value })}
+                error={fields.durationMinutes !== undefined && !editorMeetingDuration}
+                helperText={!editorMeetingDuration ? 'Enter 1 to 1,440 minutes.' : ' '}
+              />
+            ) : null}
+            <TextField
+              disabled={!recordEditable}
+              label="Ends"
+              type="datetime-local"
+              value={editorMeetingEnd}
+              InputProps={{ readOnly: true }}
+              InputLabelProps={{ shrink: true }}
+              helperText="Calculated from start and duration."
+            />
+            <TextField
+              disabled={!recordEditable}
+              label="Timezone"
+              value={fields.timezone || ''}
+              onChange={(event) => setFields({ ...fields, timezone: event.target.value })}
+              error={Boolean(fields.timezone) && !validTimeZone(fields.timezone)}
+              helperText={fields.timezone && !validTimeZone(fields.timezone)
+                ? 'Enter a valid IANA timezone, such as America/New_York.'
+                : ' '}
+              required
+            />
             <TextField disabled={!recordEditable} label="Attendee emails" value={fields.attendeeEmails || ''} onChange={(event) => setFields({ ...fields, attendeeEmails: event.target.value })} helperText="Separate addresses with commas" />
           </>}
           {editorEntity === 'interactions' && <>
@@ -3116,7 +4061,15 @@ export default function CrmSection() {
               )}
             </Box>
           )}
-          {recordEditable && <Button variant="contained" onClick={saveRecord} disabled={busy}>{busy ? 'Saving…' : 'Save'}</Button>}
+          {recordEditable && (
+            <Button
+              variant="contained"
+              onClick={saveRecord}
+              disabled={busy || !editorMeetingReady}
+            >
+              {busy ? 'Saving…' : 'Save'}
+            </Button>
+          )}
         </Stack>
       </Drawer>
       <Dialog open={productCategoryOpen} onClose={() => { if (!busy) setProductCategoryOpen(false) }} fullWidth maxWidth="sm">

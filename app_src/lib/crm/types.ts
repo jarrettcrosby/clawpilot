@@ -338,6 +338,14 @@ export type CrmMeeting = {
   externalEventId: string | null
   externalEventUrl: string | null
   joinUrl: string | null
+  calendarDeliveryStatus: 'not-configured' | 'queued' | 'sent' | 'failed' | 'cancelled' | null
+  calendarDeliveryError: string | null
+  calendarOwnerEmail: string | null
+  calendarConnectionId: string | null
+  calendarOrganizerEmail: string | null
+  calendarId: string | null
+  meetingMode: 'google_meet' | 'in_person' | 'custom_link'
+  customJoinUrl: string | null
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string
