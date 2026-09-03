@@ -198,7 +198,8 @@ assert.ok(
   'Email sender migration must gate both migrationsCurrent and public health errors',
 )
 const suiteCrmMeetingIngestion = read('app_src/lib/crm/suiteCrmMeetingIngestion.ts')
-assert.ok(suiteCrmMeetingIngestion.includes("error.code === 'CRM_COMMUNICATION_CONNECTION_REQUIRED'"))
+assert.ok(suiteCrmMeetingIngestion.includes('resolveRecordedCrmMeetingCalendarCommunication'))
+assert.ok(suiteCrmMeetingIngestion.includes("calendarDeliveryStatus === 'not-configured'"))
 
 class TestCrmIntegrationActionError extends Error {
   constructor(message, status = 400, code = 'CRM_ACTION_INVALID') {

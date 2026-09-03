@@ -1258,6 +1258,7 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
   clientRequestHash?: unknown
   communication: PipelineCommunicationSnapshot
   previousCalendar?: unknown
+  expectedMeetingSourceHash?: string
 }) {
   if (input.idempotencyKey === undefined || input.idempotencyKey === null || input.idempotencyKey === '') {
     throw new CrmIntegrationActionError(
@@ -1342,6 +1343,22 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
       }
     }
 
+    if (input.expectedMeetingSourceHash !== undefined) {
+      const current = await client.query<{ source_hash: string }>(
+        `SELECT source_hash FROM crm_meetings
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid
+           AND COALESCE(lower(crm_meetings.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+         FOR UPDATE`,
+        [pipelineId, stageInput.localId || null],
+      )
+      if (!input.expectedMeetingSourceHash || current.rows[0]?.source_hash !== input.expectedMeetingSourceHash) {
+        throw new CrmIntegrationActionError(
+          'The meeting changed during Calendar reconciliation; read it again before retrying',
+          409,
+          'CRM_CALENDAR_RECONCILIATION_STALE',
+        )
+      }
+    }
     const staged = await stageCrmRecordWithClient(client, stageInput)
     const inserted = await insertPreparedAction(client, {
       pipelineId,
@@ -1684,7 +1701,7 @@ function sameCommunicationSnapshot(
 }
 
 async function assertQueuedCommunicationAuthorization(
-  action: LeasedCrmIntegrationAction,
+  action: Pick<LeasedCrmIntegrationAction, 'pipelineId' | 'actorEmail' | 'communication'>,
   app: 'google-mail' | 'google-calendar',
 ) {
   if (!action.communication) {
@@ -1731,6 +1748,97 @@ async function assertQueuedCommunicationAuthorization(
       'The queued personal communication identity must belong to the action actor',
     )
   }
+  if (app === 'google-calendar') {
+    // Use interactive CRM's access projection/editor rule in the recorded
+    // workspace, without provisioning any default resources during a worker run.
+    try {
+      const { listPipelineSpaces, requireResourceEditor } = await import('@/lib/tenancy')
+      const pipelines = await listPipelineSpaces(
+        { email: action.actorEmail, organizationId: scope.organizationId },
+        { ensureDefaults: false },
+      )
+      const pipeline = pipelines.find((candidate) => candidate.id === action.pipelineId)
+      if (!pipeline) throw new Error('Pipeline access denied')
+      requireResourceEditor(pipeline)
+    } catch {
+      throw new PermanentCrmIntegrationActionError('The Calendar actor is no longer authorized to edit this pipeline')
+    }
+  }
+}
+
+/** Recover authority from a delivered action, never from today's default or
+ * from an unverified personal override synthesized from meeting metadata. */
+export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
+  pipelineId: string
+  meetingId: string
+  referenceCode: string
+  externalEventId: string | null
+  sourcePayload: JsonObject | null
+}) {
+  const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
+  const meetingId = normalizeUuid(input.meetingId, 'Meeting ID')
+  const referenceCode = normalizeReference(input.referenceCode)
+  const source = input.sourcePayload || {}
+  const previousCalendar = input.externalEventId
+    ? previousCalendarSnapshotFromSource(input.externalEventId, source)
+    : null
+  if (!previousCalendar || !previousCalendar.organizerEmail) {
+    throw new CrmIntegrationActionError(
+      'The meeting has no verified delivered Calendar identity; review it before syncing',
+      409,
+      'CRM_CALENDAR_RECONCILIATION_IDENTITY_REQUIRED',
+    )
+  }
+  const actionId = source.actionId === undefined || source.actionId === null
+    ? null
+    : normalizeUuid(source.actionId, 'Recorded Calendar action ID')
+  const result = await query<ActionRow>(
+    `SELECT * FROM crm_integration_actions
+     WHERE pipeline_id = $1::uuid
+       AND action_type = 'create_calendar_event' AND app = 'google-calendar'
+       AND status = 'succeeded' AND external_id = $2
+       AND communication_credential_owner_email = $3
+       AND communication_connection_id = $4
+       AND communication_calendar_id = $5
+       AND communication_identity_email = $6
+       AND ($7::uuid IS NULL OR id = $7::uuid)
+       AND (
+         (aggregate_type = 'crm_meeting' AND aggregate_id = $8::uuid AND reference_code = $9)
+         OR response_summary->>'meetingReferenceCode' = $9
+       )
+     ORDER BY processed_at DESC NULLS LAST, created_at DESC, id DESC
+     LIMIT 1`,
+    [pipelineId, previousCalendar.eventId, previousCalendar.credentialOwnerEmail,
+      previousCalendar.connectionId, previousCalendar.calendarId, previousCalendar.organizerEmail,
+      actionId, meetingId, referenceCode],
+  )
+  const original = result.rows[0]
+  const recorded = original ? actionView(original).communication : null
+  if (!original || !recorded) {
+    throw new CrmIntegrationActionError(
+      'The meeting has no matching successful reviewed Calendar action; review it before syncing',
+      409,
+      'CRM_CALENDAR_RECONCILIATION_IDENTITY_REQUIRED',
+    )
+  }
+  const actorEmail = normalizeEmail(original.actor_email, 'Recorded Calendar actor')
+  const communication = normalizeCalendarCommunicationSnapshot(recorded as PipelineCommunicationSnapshot, actorEmail)
+  if (source.communicationOrganizationId && source.communicationOrganizationId !== communication.organizationId) {
+    throw new CrmIntegrationActionError('The recorded Calendar organization no longer matches the meeting', 409)
+  }
+  await assertQueuedCommunicationAuthorization({ pipelineId, actorEmail, communication }, 'google-calendar')
+  const credential = await resolveUserMatonGatewayCredential({
+    ownerEmail: communication.credentialOwnerEmail,
+    app: 'google-calendar',
+    boundConnectionId: communication.connectionId,
+  })
+  if (
+    credential.connectionId !== communication.connectionId
+    || (credential.accountEmail && normalizeEmail(credential.accountEmail, 'Selected provider account') !== communication.accountEmail)
+  ) {
+    throw new CrmIntegrationActionError('The recorded Calendar connection no longer matches its reviewed identity', 409)
+  }
+  return { actorEmail, communication, previousCalendar }
 }
 
 async function selectedMatonConnection(

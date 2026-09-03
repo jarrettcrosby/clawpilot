@@ -160,6 +160,15 @@ const commonMocks = {
     globalIdPattern,
   },
   '@/lib/users': { normalizeUserEmail },
+  '@/lib/tenancy': {
+    listPipelineSpaces: async (_actor, options) => {
+      assert.equal(options.ensureDefaults, false)
+      return [{ id: PIPELINE_ID, accessRole: 'editor' }]
+    },
+    requireResourceEditor: (pipeline) => {
+      if (pipeline.accessRole === 'viewer') throw new Error('This resource is view-only')
+    },
+  },
   '@/lib/zonedDateTime': {
     zonedDateTimeToIso(value) {
       const parsed = new Date(String(value || ''))
