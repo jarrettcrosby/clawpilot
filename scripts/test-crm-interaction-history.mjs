@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import { annotateInteractionEventHistory } from '../app_src/lib/crm/interactionHistory.mjs'
+import './test-crm-email-preview.mjs'
 
 const records = annotateInteractionEventHistory([
   {

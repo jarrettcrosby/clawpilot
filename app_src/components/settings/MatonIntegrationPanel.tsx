@@ -62,6 +62,7 @@ type ApiCommunicationConnection = {
   gmailSendAsIdentities?: Array<{
     email?: string | null
     verificationStatus?: string | null
+    isPrimary?: boolean
     isDefault?: boolean
   }> | null
   calendars?: Array<{
@@ -106,6 +107,7 @@ type OrganizationCommunicationConnection = {
   gmailSendAsIdentities: Array<{
     email: string
     verificationStatus: string
+    isPrimary: boolean
     isDefault: boolean
   }>
   calendars: Array<{
@@ -284,6 +286,7 @@ async function requestOrganizationCommunications(
           return [{
             email,
             verificationStatus: String(identity.verificationStatus || '').trim().toLowerCase(),
+            isPrimary: identity.isPrimary === true,
             isDefault: identity.isDefault === true,
           }]
         }),
@@ -430,7 +433,7 @@ function communicationConnections(
 
 function verifiedGmailSendAsIdentities(connection: OrganizationCommunicationConnection | undefined) {
   return connection?.gmailSendAsIdentities.filter(
-    (identity) => identity.verificationStatus === 'accepted',
+    (identity) => identity.verificationStatus === 'accepted' || identity.isPrimary,
   ) || []
 }
 
@@ -1011,7 +1014,7 @@ export default function MatonIntegrationPanel({
                           ))}
                         </TextField>
                         {selectedConnection?.gmailSendAsIdentities
-                          .filter((identity) => identity.verificationStatus !== 'accepted')
+                          .filter((identity) => identity.verificationStatus !== 'accepted' && !identity.isPrimary)
                           .map((identity) => (
                             <Chip
                               key={identity.email}

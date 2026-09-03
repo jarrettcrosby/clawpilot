@@ -334,7 +334,8 @@ export async function upsertOrganizationCommunicationBindingInPostgres(input: {
       'stored provider account email',
     )
     if (
-      verifiedAccountEmail
+      app !== 'google-mail'
+      && verifiedAccountEmail
       && storedAccountEmail
       && verifiedAccountEmail !== storedAccountEmail
     ) {
@@ -344,7 +345,12 @@ export async function upsertOrganizationCommunicationBindingInPostgres(input: {
         'ORGANIZATION_COMMUNICATION_ACCOUNT_MISMATCH',
       )
     }
-    const accountEmail = storedAccountEmail ?? verifiedAccountEmail
+    // The Gmail service verifies this address against the live profile for
+    // this exact owned connection; registry labels can lag a domain rename.
+    // Never replace that verified identity with cached connection metadata.
+    const accountEmail = app === 'google-mail'
+      ? verifiedAccountEmail
+      : storedAccountEmail ?? verifiedAccountEmail
     if (!accountEmail) {
       throw new OrganizationCommunicationPersistenceError(
         'A verified provider account email is required',
@@ -548,7 +554,8 @@ export async function resolvePipelineCommunicationSnapshotInPostgres(input: {
            AND connection.status = 'ACTIVE'
            AND connection.source = 'maton'
            AND (
-             connection.account_email IS NULL
+             binding.app = 'google-mail'
+             OR connection.account_email IS NULL
              OR connection.account_email IS NOT DISTINCT FROM binding.account_email
            )
            AND binding.identity_email IS NOT NULL

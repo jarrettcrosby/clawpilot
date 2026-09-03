@@ -699,6 +699,11 @@ export default function ImportedOrderWorkingCopyDrawer({
                           <Typography variant="caption" color="text.secondary">
                             {providerEventTime(event.occurredAt)}
                           </Typography>
+                          {event.externalSubjectId ? (
+                            <Typography variant="caption" color="text.secondary" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                              Provider reference {event.externalSubjectId}
+                            </Typography>
+                          ) : null}
                         </Box>
                       ))}
                     </Stack>

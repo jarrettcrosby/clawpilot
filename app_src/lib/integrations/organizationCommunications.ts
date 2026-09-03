@@ -23,6 +23,7 @@ const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/
 type GmailSendAsIdentity = {
   email: string
   verificationStatus: string
+  isPrimary: boolean
   isDefault: boolean
 }
 
@@ -182,6 +183,7 @@ async function listGmailSendAsIdentities(input: {
         return [{
           email,
           verificationStatus,
+          isPrimary: item.isPrimary === true,
           isDefault: item.isDefault === true,
         }]
       } catch {
@@ -261,7 +263,10 @@ async function verifiedGmailIdentity(input: {
   const identityEmail = normalizeCommunicationIdentityEmail(input.requestedIdentityEmail, accountEmail)
   const sendAsIdentities = await listGmailSendAsIdentities(input)
   const selectedIdentity = sendAsIdentities.find((candidate) => candidate.email === identityEmail)
-  if (!selectedIdentity || selectedIdentity.verificationStatus !== 'accepted') {
+  if (!selectedIdentity || (
+    selectedIdentity.verificationStatus !== 'accepted'
+    && !(selectedIdentity.isPrimary && selectedIdentity.email === accountEmail)
+  )) {
     throw new OrganizationCommunicationRequestError(
       'The requested Gmail sender is not an accepted send-as identity',
       422,
@@ -407,12 +412,17 @@ export async function getOrganizationCommunicationState(input: {
       }
       try {
         if (connection.app === 'google-mail') {
+          const gmailSendAsIdentities = await listGmailSendAsIdentities({
+            ownerEmail: actorEmail,
+            connectionId: connection.connectionId,
+          })
           return {
             ...base,
-            gmailSendAsIdentities: await listGmailSendAsIdentities({
-              ownerEmail: actorEmail,
-              connectionId: connection.connectionId,
-            }),
+            // The provider's current primary address may differ from cached
+            // connection metadata after a Workspace domain/account rename.
+            accountEmail: gmailSendAsIdentities.find((identity) => identity.isPrimary)?.email
+              || base.accountEmail,
+            gmailSendAsIdentities,
           }
         }
         return {

@@ -679,7 +679,9 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
         return new Response(JSON.stringify({
           emailAddress: context.boundConnectionId === 'personal-mail-connection'
             ? 'jarrettcrosby@gmail.com'
-            : 'jarrett@suburbiasandwichco.com',
+            : providerMode === 'renamed-primary'
+              ? 'jarrett@bposupplychain.com'
+              : 'jarrett@suburbiasandwichco.com',
         }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -690,7 +692,7 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
           return new Response(JSON.stringify({ sendAs: [
             {
               sendAsEmail: 'jarrettcrosby@gmail.com',
-              verificationStatus: 'accepted',
+              isPrimary: true,
               isDefault: true,
             },
             {
@@ -705,10 +707,29 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
             },
           ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
         }
+        if (providerMode === 'renamed-primary') {
+          return new Response(JSON.stringify({ sendAs: [{
+            sendAsEmail: 'jarrett@bposupplychain.com',
+            isPrimary: true,
+            isDefault: true,
+          }, {
+            sendAsEmail: 'unverified@example.com',
+          }, {
+            sendAsEmail: 'pending@example.com',
+            verificationStatus: 'pending',
+          }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        if (providerMode === 'primary-profile-mismatch') {
+          return new Response(JSON.stringify({ sendAs: [{
+            sendAsEmail: 'unverified@example.com',
+            isPrimary: true,
+            isDefault: true,
+          }] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
         return new Response(JSON.stringify({ sendAs: [
           {
             sendAsEmail: 'jarrett@suburbiasandwichco.com',
-            verificationStatus: 'accepted',
+            isPrimary: true,
             isDefault: true,
           },
           {
@@ -792,8 +813,8 @@ assert.ok(providerRequests.every((request) => [
 assert.equal(
   JSON.stringify(gmailState.availableConnections.find((connection) => connection.connectionId === 'mail-connection')?.gmailSendAsIdentities),
   JSON.stringify([
-    { email: 'jarrett@suburbiasandwichco.com', verificationStatus: 'accepted', isDefault: true },
-    { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isDefault: false },
+    { email: 'jarrett@suburbiasandwichco.com', verificationStatus: '', isPrimary: true, isDefault: true },
+    { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isPrimary: false, isDefault: false },
   ]),
 )
 assert.equal(
@@ -811,15 +832,15 @@ assert.equal(
   JSON.stringify([{
     connectionId: 'mail-connection',
     identities: [
-      { email: 'jarrett@suburbiasandwichco.com', verificationStatus: 'accepted', isDefault: true },
-      { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isDefault: false },
+      { email: 'jarrett@suburbiasandwichco.com', verificationStatus: '', isPrimary: true, isDefault: true },
+      { email: 'jarrett@bposupplychain.com', verificationStatus: 'accepted', isPrimary: false, isDefault: false },
     ],
   }, {
     connectionId: 'personal-mail-connection',
     identities: [
-      { email: 'jarrettcrosby@gmail.com', verificationStatus: 'accepted', isDefault: true },
-      { email: 'pending@example.com', verificationStatus: 'pending', isDefault: false },
-      { email: 'stewards@eigenracing.com', verificationStatus: 'accepted', isDefault: false },
+      { email: 'jarrettcrosby@gmail.com', verificationStatus: '', isPrimary: true, isDefault: true },
+      { email: 'pending@example.com', verificationStatus: 'pending', isPrimary: false, isDefault: false },
+      { email: 'stewards@eigenracing.com', verificationStatus: 'accepted', isPrimary: false, isDefault: false },
     ],
   }]),
   'All linked Gmail accounts and provider-reported aliases must remain distinguishable for the UI',
@@ -864,11 +885,87 @@ assert.equal(stewardsEmailSelection.accountEmail, 'jarrettcrosby@gmail.com')
 assert.equal(stewardsEmailSelection.identityEmail, 'stewards@eigenracing.com')
 assert.equal(stewardsEmailSelection.connectionId, 'personal-mail-connection')
 assert.equal(stewardsEmailSelection.source, 'email-override')
+for (const [connectionId, senderEmail] of [
+  ['mail-connection', 'jarrett@suburbiasandwichco.com'],
+  ['personal-mail-connection', 'jarrettcrosby@gmail.com'],
+]) {
+  const primarySelection = await service.resolveVerifiedPipelineGmailSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId,
+    gmailSendAsEmail: senderEmail,
+  })
+  assert.equal(primarySelection.accountEmail, senderEmail)
+  assert.equal(primarySelection.identityEmail, senderEmail)
+  assert.equal(primarySelection.connectionId, connectionId)
+}
+providerMode = 'renamed-primary'
+const renamedState = await service.getOrganizationCommunicationState({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+})
+assert.equal(
+  renamedState.availableConnections.find((connection) => connection.connectionId === 'mail-connection').accountEmail,
+  'jarrett@bposupplychain.com',
+  'Live primary identity must label the mailbox without rewriting cached metadata',
+)
+const renamedPrimary = await service.resolveVerifiedPipelineGmailSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'mail-connection',
+  gmailSendAsEmail: 'jarrett@bposupplychain.com',
+})
+assert.equal(renamedPrimary.accountEmail, 'jarrett@bposupplychain.com')
+assert.equal(renamedPrimary.identityEmail, 'jarrett@bposupplychain.com')
+assert.equal(renamedPrimary.credentialOwnerEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(renamedPrimary.connectionId, 'mail-connection')
+for (const unavailableSender of [
+  'jarrett@suburbiasandwichco.com',
+  'unverified@example.com',
+  'pending@example.com',
+]) {
+  await assert.rejects(service.resolveVerifiedPipelineGmailSelection({
+    pipelineId: '22222222-2222-4222-8222-222222222222',
+    actorEmail: 'jarrett@suburbiasandwichco.com',
+    connectionId: 'mail-connection',
+    gmailSendAsEmail: unavailableSender,
+  }), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED')
+}
+providerMode = 'alias-accepted'
 assert.equal(
   writes.length,
   writesBeforeEmailSelections,
   'Per-send Gmail selection must not mutate the organization default binding',
 )
+providerMode = 'primary-profile-mismatch'
+const writesBeforePrimaryMismatch = writes.length
+await assert.rejects(service.bindOrganizationCommunication({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  app: 'google-mail',
+  connectionId: 'mail-connection',
+  identityEmail: 'unverified@example.com',
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED')
+await assert.rejects(service.resolveVerifiedPipelineGmailSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'mail-connection',
+  gmailSendAsEmail: 'unverified@example.com',
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_SENDER_NOT_VERIFIED')
+assert.equal(writes.length, writesBeforePrimaryMismatch, 'A false primary must never reach binding persistence')
+providerMode = 'renamed-primary'
+await service.bindOrganizationCommunication({
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  app: 'google-mail',
+  connectionId: 'mail-connection',
+  identityEmail: 'jarrett@bposupplychain.com',
+})
+assert.equal(writes.at(-1).accountEmail, 'jarrett@bposupplychain.com')
+assert.equal(writes.at(-1).identityEmail, 'jarrett@bposupplychain.com')
+assert.equal(writes.at(-1).connectionId, 'mail-connection')
+assert.equal(writes.at(-1).credentialOwnerEmail, 'jarrett@suburbiasandwichco.com')
+providerMode = 'alias-accepted'
 await assert.rejects(
   service.resolveVerifiedPipelineGmailSelection({
     pipelineId: '22222222-2222-4222-8222-222222222222',
@@ -895,9 +992,9 @@ await service.bindOrganizationCommunication({
   connectionId: 'calendar-connection',
   calendarId: 'jarrett@bposupplychain.com',
 })
-assert.equal(writes[1].identityEmail, 'jarrett@bposupplychain.com')
-assert.equal(writes[1].accountEmail, 'jarrett@suburbiasandwichco.com')
-assert.equal(writes[1].calendarId, 'jarrett@bposupplychain.com')
+assert.equal(writes.at(-1).identityEmail, 'jarrett@bposupplychain.com')
+assert.equal(writes.at(-1).accountEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(writes.at(-1).calendarId, 'jarrett@bposupplychain.com')
 
 await assert.rejects(
   service.bindOrganizationCommunication({
@@ -973,5 +1070,118 @@ await assert.rejects(
   }),
   (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID',
 )
+
+// Exercise the persistence boundary as well as provider validation: Maton's
+// registry can keep the former mailbox label after Gmail's primary changes.
+const bindingOwner = 'jarrett@suburbiasandwichco.com'
+const bindingOrganization = '11111111-1111-4111-8111-111111111111'
+let membershipStatus = 'active'
+let bindingConnectionAvailable = true
+let persistedBinding = null
+let resolvedBindingValid = true
+const bindingQueries = []
+const bindingAudits = []
+const bindingClient = {
+  async query(sql, parameters) {
+    bindingQueries.push({ sql, parameters })
+    if (sql.includes('SELECT membership.status')) {
+      return { rows: [{ status: membershipStatus }] }
+    }
+    if (sql.includes('SELECT connection.account_email')) {
+      for (const guard of [
+        'connection.owner_email = $1', 'connection.connection_id = $2',
+        'connection.app = $3', "connection.status = 'ACTIVE'",
+        "connection.source = 'maton'", 'FOR SHARE',
+      ]) assert.ok(sql.includes(guard), `Binding ownership guard missing: ${guard}`)
+      return { rows: bindingConnectionAvailable && parameters[0] === bindingOwner
+        && parameters[1] === 'mail-connection'
+        ? [{ account_email: bindingOwner }] : [] }
+    }
+    if (sql.includes('INSERT INTO organization_communication_bindings')) {
+      const [organization, app, owner, connection, account, identity, calendar, actor] = parameters
+      persistedBinding = {
+        organization_id: organization, app, credential_owner_email: owner,
+        maton_connection_id: connection, account_email: account,
+        identity_email: identity, calendar_id: calendar, status: 'active',
+        verified_at: '2026-09-03T12:00:00.000Z', verified_by: actor,
+        created_by: actor, updated_by: actor,
+        created_at: '2026-09-03T12:00:00.000Z', updated_at: '2026-09-03T12:00:00.000Z',
+      }
+      return { rows: [persistedBinding] }
+    }
+    throw new Error(`Unexpected binding query: ${sql}`)
+  },
+}
+const bindingPersistence = loadTypeScriptModule('app_src/lib/persistence/organizationCommunications.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: async (event) => bindingAudits.push(event) },
+  '@/lib/persistence/postgres': {
+    acquireTransactionAdvisoryLock: async (_client, key) => {
+      assert.ok(key.startsWith(`organization-communication-binding:${bindingOrganization}:`))
+    },
+    withTransaction: async (operation) => operation(bindingClient),
+    query: async (sql, parameters) => {
+      assert.match(sql, /binding\.app = 'google-mail'\s+OR connection\.account_email IS NULL\s+OR connection\.account_email IS NOT DISTINCT FROM binding\.account_email/)
+      assert.ok(sql.includes('connection.connection_id = binding.maton_connection_id'))
+      assert.ok(sql.includes('connection.owner_email = binding.credential_owner_email'))
+      assert.ok(sql.includes("owner_membership.status = 'active'"))
+      assert.ok(sql.includes('AND NOT EXISTS (SELECT 1 FROM configured_binding)'))
+      assert.equal(parameters[2], 'google-mail')
+      return { rows: [{
+        ...persistedBinding,
+        actor_membership_status: membershipStatus,
+        organization_binding_exists: true,
+        organization_binding_valid: resolvedBindingValid,
+        connection_id: persistedBinding.maton_connection_id,
+        source: 'organization',
+      }] }
+    },
+  },
+})
+const renamedBindingInput = {
+  organizationId: bindingOrganization,
+  app: 'google-mail',
+  credentialOwnerEmail: bindingOwner,
+  connectionId: 'mail-connection',
+  accountEmail: 'jarrett@bposupplychain.com',
+  identityEmail: 'jarrett@bposupplychain.com',
+  calendarId: null,
+  actorEmail: bindingOwner,
+}
+const savedRenamedBinding = await bindingPersistence.upsertOrganizationCommunicationBindingInPostgres(renamedBindingInput)
+assert.equal(savedRenamedBinding.accountEmail, renamedBindingInput.accountEmail)
+assert.equal(savedRenamedBinding.identityEmail, renamedBindingInput.identityEmail)
+assert.equal(savedRenamedBinding.connectionId, renamedBindingInput.connectionId)
+assert.equal(savedRenamedBinding.credentialOwnerEmail, bindingOwner)
+assert.equal(bindingAudits.length, 1)
+assert.equal(bindingQueries.some(({ sql }) => /(?:UPDATE|INSERT INTO) user_maton_connections/.test(sql)), false)
+await assert.rejects(bindingPersistence.upsertOrganizationCommunicationBindingInPostgres({
+  ...renamedBindingInput, accountEmail: undefined,
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_ACCOUNT_REQUIRED')
+await assert.rejects(bindingPersistence.upsertOrganizationCommunicationBindingInPostgres({
+  ...renamedBindingInput, app: 'google-calendar', calendarId: 'jarrett@bposupplychain.com',
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_ACCOUNT_MISMATCH')
+await assert.rejects(bindingPersistence.upsertOrganizationCommunicationBindingInPostgres({
+  ...renamedBindingInput, credentialOwnerEmail: 'other@example.com',
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID')
+bindingConnectionAvailable = false
+await assert.rejects(bindingPersistence.upsertOrganizationCommunicationBindingInPostgres(renamedBindingInput),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_INVALID')
+bindingConnectionAvailable = true
+membershipStatus = 'disabled'
+await assert.rejects(bindingPersistence.upsertOrganizationCommunicationBindingInPostgres(renamedBindingInput),
+  (error) => error?.code === 'ORGANIZATION_COMMUNICATION_MEMBERSHIP_REQUIRED')
+membershipStatus = 'active'
+assert.equal(bindingAudits.length, 1, 'Rejected binding changes must not persist or audit a successful update')
+const persistedSnapshot = await bindingPersistence.resolvePipelineCommunicationSnapshotInPostgres({
+  pipelineId: '22222222-2222-4222-8222-222222222222', actorEmail: bindingOwner, app: 'google-mail',
+})
+assert.equal(persistedSnapshot.accountEmail, renamedBindingInput.accountEmail)
+assert.equal(persistedSnapshot.identityEmail, renamedBindingInput.identityEmail)
+assert.equal(persistedSnapshot.connectionId, renamedBindingInput.connectionId)
+assert.equal(persistedSnapshot.source, 'organization')
+resolvedBindingValid = false
+await assert.rejects(bindingPersistence.resolvePipelineCommunicationSnapshotInPostgres({
+  pipelineId: '22222222-2222-4222-8222-222222222222', actorEmail: bindingOwner, app: 'google-mail',
+}), (error) => error?.code === 'ORGANIZATION_COMMUNICATION_BINDING_INVALID')
 
 console.log('organization communications contract tests passed')

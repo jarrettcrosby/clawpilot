@@ -16,6 +16,7 @@ import HistoryRounded from '@mui/icons-material/HistoryRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import { createCommerceOrderHistoryRequestFence } from '@/lib/integrations/commerceOrderHistoryRequestFence'
 import { commerceOrderQuantitySummary } from '@/lib/integrations/commerceOrderHistoryPresentation'
+import { presentCommerceOrderTimelineEvents } from '@/lib/operations/providerOrderHistory'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -623,16 +624,31 @@ export default function CommerceOrderHistoryPanel({
                             Showing the latest {timelineLimit} events for this order.
                           </Alert>
                         ) : null}
-                        {timeline.map((event) => {
+                        {presentCommerceOrderTimelineEvents(timeline).map((event) => {
                           const lines = timelineLines(event)
+                          const context = [
+                            typeof event.payload.externalSubjectId === 'string'
+                              ? `Provider reference ${event.payload.externalSubjectId}`
+                              : null,
+                            event.payload.trackingCarrier,
+                            event.payload.trackingNumber,
+                          ].filter((value): value is string => (
+                            typeof value === 'string' && value.trim().length > 0
+                          ))
                           return (
                           <Box key={`${event.evidenceSource}:${event.evidenceGlobalId}`}>
                             <Typography variant="body2" fontWeight={600}>
                               {label(event.eventKind)}
+                              {event.eventStatus ? ` · ${label(event.eventStatus)}` : ''}
                             </Typography>
                             <Typography variant="caption" color="text.secondary" display="block">
                               {timestamp(event.occurredAt)} · {event.evidenceSource === 'clawpilot' ? 'ClawPilot' : provider === 'shopify' ? 'Shopify' : 'Faire'}
                             </Typography>
+                            {context.length > 0 ? (
+                              <Typography variant="caption" color="text.secondary" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                                {context.join(' · ')}
+                              </Typography>
+                            ) : null}
                             {timelineAttribution(event) ? (
                               <Typography variant="caption" color="text.secondary" display="block">
                                 {timelineAttribution(event)}
