@@ -78,6 +78,8 @@ Email, Note, LinkedIn, and Campaign interactions project to SuiteCRM Notes and a
 
 Call interactions project to native SuiteCRM Calls. Unlinked `meeting` and legacy `In Person` interactions project to native Meetings; a `gi` history entry linked to a canonical `gm` Meeting has no separate SuiteCRM projection. Native Call direction is controlled as **Inbound** or **Outbound**. Activity status is controlled as `planned`, `held`, or `not_held`, and duration is a whole number from 1 through 1,440 minutes. New Calls default to 15 minutes and unlinked interaction-shaped Meetings default to 30 minutes. SuiteCRM displays **Planned** Calls and Meetings under **Activities**; **Held** and **Not Held** records appear under **History**. A completed call therefore belongs in History rather than being mislabeled as open work.
 
+Archived interactions remain excluded from active CRM views. Staging rechecks the existing interaction under its row lock and leaves an archived record unchanged, even when a synchronization worker read an older, active copy. That no-op preserves the original content, archive metadata and provider identity, creates no new synchronization action, and does not reactivate the record's short links. Ordinary staging is not an unarchive operation.
+
 ## CSV Data Transfer
 
 Pipeline owners and editors can export the selected CRM tab as a tenant-scoped CSV. Organizations, Contacts, Products, Leads, and Opportunities also expose a header-only template and support a two-phase import. Meetings, Interactions, and Campaigns are export-only so a historical data transfer cannot create Calendar events, send communications, queue campaigns, delete records, or archive records.
@@ -105,6 +107,8 @@ The duplicate sales-channel Product identity action is rendered only when the au
 Outbound CRM email always appends exact `%gslt<reference>` markers with no space after `gslt`. Organization and lead messages carry their target reference. Contact messages carry both the contact `gc` reference and its related organization `ga` reference so a reply is associated with both records through one CRM interaction.
 
 Inbound Gmail polling runs per active user's selected connection. It follows these rules:
+
+Before applying these association rules or storing message content, CRM skips confirmed ClawPilot sign-in-code notifications. Recognition requires one exact top-level sender address, the exact `Your ClawPilot sign-in code` subject, and either the producer's `X-ClawPilot-Message-Purpose: auth-magic-code` header or the complete legacy authentication template. Sender addresses come from `CLAWPILOT_MAIL_FROM`, `CLAWPILOT_AUTH_MAIL_FROM`, the historical `stewards@eigenracing.com` sender, and optional `CLAWPILOT_AUTH_MAIL_ADDITIONAL_SENDERS`. The additional-senders variable is a comma-separated list of exact addresses for other environments or historical senders; case and surrounding whitespace are normalized and invalid entries are ignored. It grants no email-sending authority. Replies, forwards, ordinary customer code discussions, and other messages from these senders remain eligible for normal association. Skips increment `authMessagesSkipped` without storing authentication content or changing the Gmail message; polling continues normally.
 
 1. The first case-insensitive `%xx` ends imported content; content after it is neither stored nor cataloged.
 2. Every exact `%gslt<reference>` before that boundary is resolved. One message may reference multiple CRM records.

@@ -179,7 +179,15 @@ function cleanHeader(value: string, field: string): string {
   return normalized
 }
 
-function buildMessage(input: { from: string; to: string; subject: string; text: string; html: string }): string {
+type MailContent = {
+  to: string
+  subject: string
+  text: string
+  html: string
+  messagePurpose?: 'auth-magic-code'
+}
+
+function buildMessage(input: MailContent & { from: string }): string {
   const boundary = `clawpilot-${crypto.randomUUID()}`
   const subject = cleanHeader(input.subject, 'Email subject')
   return [
@@ -187,6 +195,10 @@ function buildMessage(input: { from: string; to: string; subject: string; text: 
     `Reply-To: ClawPilot Stewards <${input.from}>`,
     `To: <${input.to}>`,
     `Subject: ${subject}`,
+    ...(input.messagePurpose === 'auth-magic-code' ? [
+      'X-ClawPilot-Message-Purpose: auth-magic-code',
+      'Auto-Submitted: auto-generated',
+    ] : []),
     'MIME-Version: 1.0',
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     '',
@@ -206,7 +218,7 @@ function buildMessage(input: { from: string; to: string; subject: string; text: 
 }
 
 async function sendMessage(
-  input: { to: string; subject: string; text: string; html: string },
+  input: MailContent,
   profile: MailProfile = 'platform',
 ) {
   const to = assertEmail(input.to)
@@ -290,7 +302,7 @@ function authMagicCodeContent(to: string, code: string) {
     '<p style="margin:0;color:#a9adb8">If you did not request this code, ignore this email.</p>',
     '</div></body></html>',
   ].join('')
-  return { to, subject: 'Your ClawPilot sign-in code', text, html }
+  return { to, subject: 'Your ClawPilot sign-in code', text, html, messagePurpose: 'auth-magic-code' as const }
 }
 
 export async function sendAuthMagicCodeEmail(

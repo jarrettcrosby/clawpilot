@@ -2227,6 +2227,22 @@ async function normalizeStageCrmRecordInput(
   return input
 }
 
+type StagedCrmRecord<SuiteCrmId = string> = {
+  id: string
+  suiteCrmId: SuiteCrmId
+  referenceCode: string
+  shortUrl: string | null
+  sourceHash: string
+}
+
+export function stageCrmRecordWithClient(
+  client: PoolClient,
+  rawInput: Exclude<StageCrmRecordInput, StageInteractionInput>,
+): Promise<StagedCrmRecord>
+export function stageCrmRecordWithClient(
+  client: PoolClient,
+  rawInput: StageCrmRecordInput,
+): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
   let input = await normalizeStageCrmRecordInput(client, rawInput)
   let contactAliases: ContactStageResolution['aliases'] = []
@@ -2268,11 +2284,17 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   )
     ? stableGlobalSuiteCrmId(input.entity, sourceKey)
     : stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
-  const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
   let previousSuiteCrmModule: SuiteCrmInteractionModule | null | undefined
   if (input.entity === 'interactions') {
-    const previous = await client.query<{ suitecrm_module: SuiteCrmInteractionModule | null }>(
-      `SELECT suitecrm_module
+    const previous = await client.query<{
+      id: string
+      suitecrm_id: string | null
+      reference_code: string
+      source_hash: string
+      source_payload: Record<string, unknown> | null
+      suitecrm_module: SuiteCrmInteractionModule | null
+    }>(
+      `SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module
        FROM crm_interactions
        WHERE pipeline_id = $1::uuid
          AND (
@@ -2283,8 +2305,23 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
        FOR UPDATE`,
       [input.pipelineId, input.localId || null, sourceKey],
     )
-    if (previous.rows[0]) previousSuiteCrmModule = previous.rows[0].suitecrm_module
+    const existing = previous.rows[0]
+    if (existing) {
+      previousSuiteCrmModule = existing.suitecrm_module
+      // A sync snapshot may predate an archive. Check the locked row, matching
+      // activeCrmRecordSql, before any upsert, outbox, or short-link reactivation.
+      if (['true', '1', 'yes'].includes(String(existing.source_payload?.archived ?? '').toLowerCase())) {
+        return {
+          id: existing.id,
+          suiteCrmId: existing.suitecrm_id,
+          referenceCode: existing.reference_code,
+          shortUrl: null,
+          sourceHash: existing.source_hash,
+        }
+      }
+    }
   }
+  const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
   let row: { id: string; suitecrm_id: string; reference_code: string }
   switch (input.entity) {
     case 'organizations':
@@ -2384,6 +2421,10 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   }
 }
 
+export function stageCrmRecordInPostgres(
+  input: Exclude<StageCrmRecordInput, StageInteractionInput>,
+): Promise<StagedCrmRecord>
+export function stageCrmRecordInPostgres(input: StageCrmRecordInput): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
   const staged = await withTransaction((client) => stageCrmRecordWithClient(client, input))
   if (input.entity === 'products') {
