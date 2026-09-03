@@ -39,6 +39,28 @@ assert.equal(safeEmailPreviewHref('tel:+16109301800'), 'tel:+16109301800')
 assert.deepEqual(emailBodyPreview('See https://example.test/report.'), [
   { text: 'See ' }, { text: 'https://example.test/report', href: 'https://example.test/report' }, { text: '.' },
 ])
+for (const [message, href] of [
+  ['See https://en.wikipedia.org/wiki/Function_(mathematics).', 'https://en.wikipedia.org/wiki/Function_(mathematics)'],
+  ['See (https://en.wikipedia.org/wiki/Function_(mathematics)).', 'https://en.wikipedia.org/wiki/Function_(mathematics)'],
+  ['See (https://example.test/report).', 'https://example.test/report'],
+  ['See https://example.test/function_(nested_(value)).', 'https://example.test/function_(nested_(value))'],
+  ['See [https://example.test/report[final]].', 'https://example.test/report[final]'],
+  ['See https://example.test/report?filter[status]=[open].', 'https://example.test/report?filter[status]=[open]'],
+  ['See [http://[2001:db8::1]].', 'http://[2001:db8::1]'],
+  ['See {https://example.test/report{final}}.', 'https://example.test/report{final}'],
+  ['See ([https://example.test/report_(final)]).', 'https://example.test/report_(final)'],
+  ['See https://example.test/report); then continue.', 'https://example.test/report'],
+  ['See https://example.test/report.,;!?', 'https://example.test/report'],
+  ['See https://example.test/report_(final.).', 'https://example.test/report_(final.)'],
+  ['See https://example.test/report)_(final).', 'https://example.test/report)_(final)'],
+  ['See https://example.test/report_%28final%29.', 'https://example.test/report_%28final%29'],
+]) {
+  assert.deepEqual(emailBodyPreview(message).filter((part) => part.href), [{ text: href, href }], message)
+  assert.equal(previewText(message), message, 'Link boundaries must preserve all original prose punctuation')
+}
+assert.deepEqual(emailBodyPreview('<a href="https://example.test/report.">Exact destination</a>'), [{
+  text: 'Exact destination', href: 'https://example.test/report.',
+}], 'Explicit HTML destinations must not use the prose punctuation heuristic')
 assert.equal(previewText('<p>&#0;0&#0; <a href="https://example.test">Safe</a></p>').includes('\u0000'), false)
 assert.deepEqual(emailBodyPreview(null), [])
 

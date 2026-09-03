@@ -33,6 +33,26 @@ function readableWhitespace(value) {
     .trim()
 }
 
+function proseUrlHref(value) {
+  const openingFor = { ')': '(', ']': '[', '}': '{' }
+  const balances = { '(': 0, '[': 0, '{': 0 }
+  const unmatchedClosings = new Set()
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]
+    if (Object.hasOwn(balances, character)) balances[character] += 1
+    else if (Object.hasOwn(openingFor, character)) {
+      const opening = openingFor[character]
+      if (balances[opening]) balances[opening] -= 1
+      else unmatchedClosings.add(index)
+    }
+  }
+  // A paired closer belongs to the URL (including IPv6 host brackets). Only
+  // unmatched trailing closers and adjacent prose punctuation stay outside it.
+  let end = value.length
+  while (end > 0 && (/[.,;!?]/u.test(value[end - 1]) || unmatchedClosings.has(end - 1))) end -= 1
+  return value.slice(0, end)
+}
+
 function decodedText(value) {
   // NUL is reserved for locally generated link placeholders, never provider text.
   return decodeHtmlEntities(value).replace(/\u0000/g, '')
@@ -129,7 +149,7 @@ export function emailBodyPreview(value) {
       if (link) parts.push(link)
     } else {
       // Avoid swallowing punctuation after a prose URL.
-      const href = match[0].replace(/[.,;!?)\]}]+$/u, '')
+      const href = proseUrlHref(match[0])
       parts.push({ text: href, href: safeEmailPreviewHref(href) })
       if (href.length < match[0].length) parts.push({ text: match[0].slice(href.length) })
     }
