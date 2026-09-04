@@ -1094,6 +1094,60 @@ export async function writeCommerceCredentialInPostgres(input: {
         'The commerce connection is permanently bound to its original provider account',
       )
     }
+    const migratedIdentity = existingAccount.rows[0]
+      ? await client.query<{
+          expected_external_account_id_sha256: string
+          reconnect_eligible: boolean
+          verification_state: 'awaiting_provider_identity' | 'verified'
+        }>(
+          `SELECT expected_external_account_id_sha256,
+                  reconnect_eligible,
+                  verification_state
+           FROM operations_commerce_migration_provider_identity_fences
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [input.organizationId, existingAccount.rows[0].id],
+        )
+      : { rows: [] }
+    if (migratedIdentity.rows[0]) {
+      const fence = migratedIdentity.rows[0]
+      const observedExternalAccountHash = createHash('sha256')
+        .update(input.externalAccountId)
+        .digest('hex')
+      if (!fence.reconnect_eligible) {
+        throw new Error(
+          'This migrated commerce placeholder is not approved for production reconnection',
+        )
+      }
+      if (observedExternalAccountHash !== fence.expected_external_account_id_sha256) {
+        throw new Error(
+          'The provider account does not match the identity approved for this migrated workspace',
+        )
+      }
+      const verifiedFence = await client.query(
+        `UPDATE operations_commerce_migration_provider_identity_fences
+         SET verification_state = 'verified',
+             verified_external_account_id_sha256 = $3,
+             verified_by = $4,
+             verified_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND expected_external_account_id_sha256 = $3
+           AND reconnect_eligible = true
+           AND verification_state = 'awaiting_provider_identity'`,
+        [
+          input.organizationId,
+          existingAccount.rows[0].id,
+          observedExternalAccountHash,
+          input.actorEmail,
+        ],
+      )
+      if (fence.verification_state === 'awaiting_provider_identity' && verifiedFence.rowCount !== 1) {
+        throw new Error('The migrated provider identity fence changed during reconnection')
+      }
+    }
     const accountResult = await client.query<{
       id: string
       global_id: string
@@ -1164,6 +1218,22 @@ export async function writeCommerceCredentialInPostgres(input: {
         input.actorEmail,
       ],
     )
+    if (migratedIdentity.rows[0]) {
+      await client.query(
+        `UPDATE operations_external_identifiers
+         SET status = 'active',
+             last_verified_at = clock_timestamp(),
+             match_evidence = match_evidence || jsonb_build_object(
+               'migrationProviderIdentityVerified', true,
+               'migrationProviderIdentityVerifiedAt', clock_timestamp()
+             )
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND status = 'stale'
+           AND match_evidence->>'migrationProviderIdentityFence' = 'true'`,
+        [input.organizationId, account.id],
+      )
+    }
     if (input.provider === 'shopify') {
       await ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
         organizationId: input.organizationId,

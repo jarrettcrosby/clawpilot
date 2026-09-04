@@ -15,6 +15,7 @@ import {
   WORKSPACES,
   buildCredentialFreePlaceholder,
   canonicalJson,
+  databaseEndpointFingerprint,
   datasetCounts,
   digest,
   manifestDigest,
@@ -54,6 +55,27 @@ const applyArgs = parseArguments([
 ])
 assert.equal(applyArgs.command, 'apply')
 assert.equal(applyArgs.confirmDigest, exampleDigest)
+const receiptExportArgs = parseArguments([
+  'receipt-export',
+  '--actor', CONFIRMED_OWNER_EMAIL,
+  '--manifest', '/tmp/example-plan.json',
+  '--confirm-digest', exampleDigest,
+  '--mapping-output', '/tmp/recovered-mapping.json',
+])
+assert.equal(receiptExportArgs.command, 'receipt-export')
+assert.equal(receiptExportArgs.mappingOutput, '/tmp/recovered-mapping.json')
+
+const endpointA = databaseEndpointFingerprint(
+  'postgresql://migration_user:first-secret@db.example.test:5432/source_db',
+)
+const endpointAWithRotatedSecret = databaseEndpointFingerprint(
+  'postgresql://migration_user:second-secret@db.example.test:5432/source_db',
+)
+const endpointB = databaseEndpointFingerprint(
+  'postgresql://migration_user:first-secret@db.example.test:5432/target_db',
+)
+assert.equal(endpointA, endpointAWithRotatedSecret)
+assert.notEqual(endpointA, endpointB)
 
 assert.throws(() => parseArguments([
   'plan', '--actor', FORBIDDEN_ALIAS_USER,
@@ -201,6 +223,10 @@ assert.equal(projected.crm_product_image_assets[0].content_bytes, undefined)
 assert.equal(datasetCounts(projected).crm_product_image_assets, 1)
 
 const source = fs.readFileSync(new URL('./migrate-commerce-workspaces-to-production.mjs', import.meta.url), 'utf8')
+const sourceSelection = source.slice(
+  source.indexOf('async function loadWorkspaceData'),
+  source.indexOf('async function sourceBlockers'),
+)
 for (const forbiddenSql of [
   'SELECT * FROM operations_integration_accounts',
   'FROM operations_commerce_credentials',
@@ -208,23 +234,50 @@ for (const forbiddenSql of [
   'FROM operations_commerce_sync_cursors',
   'FROM operations_orders',
   'FROM sync_outbox',
-]) assert.equal(source.includes(forbiddenSql), false, `forbidden source read: ${forbiddenSql}`)
+]) assert.equal(sourceSelection.includes(forbiddenSql), false, `forbidden source selection: ${forbiddenSql}`)
+assert.doesNotMatch(source, /\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b/iu)
 
 for (const requiredSanitization of [
   "encode(digest(coalesce(external_account_id, ''), 'sha256'), 'hex')",
+  'external_account_id IS NOT NULL AS external_account_id_present',
   "'dimension_confirmed_by'",
   "'rated_outer_dimension_confirmed_by'",
   'currency_code = EXCLUDED.currency_code',
   "AND mapping_purpose = 'catalog'",
-  'mapping: existing.payload.mapping',
+  'mapping: payload.mapping',
   'has a migration receipt from a different source state',
+  'receiptIdentityDigest',
+  'suiteCrmOutbox',
+  'sourceEndpointSha256',
 ]) assert.ok(source.includes(requiredSanitization), `missing sanitization contract: ${requiredSanitization}`)
 
 for (const required of [
   'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
   'BEGIN ISOLATION LEVEL SERIALIZABLE',
   'pg_advisory_xact_lock',
+  'LOCK TABLE',
+  'IN SHARE MODE NOWAIT',
+  'SOURCE_DATABASE_ENDPOINT_SHA256',
+  'TARGET_DATABASE_ENDPOINT_SHA256',
   'operations_commerce_store_sync_is_running',
+  'operations_commerce_workspace_migration_cutover_fences',
+  'operations_commerce_migration_provider_identity_fences',
+  "state IN ('held', 'queued', 'processing', 'failed', 'dead_letter')",
+  'dirty_version > reconciled_version',
+  'operations_shopify_catalog_refresh_states',
+  'operations_shopify_inventory_refresh_watermarks',
+  'operations_commerce_intake_read_intents',
+  'operations_commerce_intake_runs',
+  'operations_commerce_provider_attempts',
+  'operations_commerce_catalog_sync_jobs',
+  'operations_shopify_inventory_refresh_jobs',
+  'operations_commerce_product_image_import_jobs',
+  'operations_faire_inventory_poll_jobs',
+  'operations_commerce_order_revision_targets',
+  'targetConfigurationBaseline',
+  "command === 'receipt-export'",
+  'fs.fsyncSync(handle)',
+  'fs.renameSync(temporary, output)',
   'purge_operations_commerce_intake_read_payloads',
   'convert_operations_commerce_inventory_legacy_captures',
   'purge_operations_commerce_inventory_observation_aliases',
@@ -236,5 +289,50 @@ for (const required of [
   'external_account_id: null',
   'receipt_intake_enabled: false',
 ]) assert.ok(source.includes(required), `missing fail-closed contract: ${required}`)
+
+const safetyMigration = fs.readFileSync(
+  new URL('../db/migrations/0353_operations_commerce_workspace_migration_safety.sql', import.meta.url),
+  'utf8',
+)
+for (const required of [
+  'operations_commerce_workspace_migration_cutover_fences',
+  'operations_commerce_migration_provider_identity_fences',
+  'expected_external_account_id_sha256 text NOT NULL',
+  'source_database_endpoint_sha256 text NOT NULL',
+  'target_database_endpoint_sha256 text NOT NULL',
+  'Migrated provider identity fences are immutable',
+  'Migrated commerce account provider identity is not verified',
+  'Commerce workspace migration receipts are immutable',
+]) assert.ok(safetyMigration.includes(required), `missing 0353 safety contract: ${required}`)
+assert.doesNotMatch(safetyMigration, /\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b/iu)
+
+const commercePersistence = fs.readFileSync(
+  new URL('../app_src/lib/persistence/commerceIntegrations.ts', import.meta.url),
+  'utf8',
+)
+const fenceLookup = commercePersistence.indexOf(
+  'FROM operations_commerce_migration_provider_identity_fences',
+)
+const fenceVerification = commercePersistence.indexOf(
+  'UPDATE operations_commerce_migration_provider_identity_fences',
+)
+const accountUpsert = commercePersistence.indexOf(
+  'INSERT INTO operations_integration_accounts',
+  fenceVerification,
+)
+const identifierActivation = commercePersistence.indexOf(
+  'UPDATE operations_external_identifiers',
+)
+assert.ok(fenceLookup >= 0)
+assert.ok(fenceVerification > fenceLookup)
+assert.ok(accountUpsert > fenceVerification)
+assert.ok(identifierActivation > accountUpsert)
+for (const required of [
+  "createHash('sha256')",
+  'reconnect_eligible',
+  'expected_external_account_id_sha256',
+  'migrationProviderIdentityFence',
+  "status = 'active'",
+]) assert.ok(commercePersistence.includes(required), `missing reconnect fence contract: ${required}`)
 
 console.log('commerce workspace production migration contract: PASS')

@@ -50,9 +50,10 @@ count fingerprint and source-state digest, so drift is visible before apply.
 
 Every new UUID and Global ID is allocated in production. Foreign keys,
 source keys, identity keys, and safe JSON identifiers are remapped to those
-new identities. SuiteCRM IDs, sheet coordinates, SuiteCRM sync state, and
-candidate Global IDs are cleared; CRM rows enter production with `pending`
-projection state.
+new identities. Source SuiteCRM IDs, sheet coordinates, SuiteCRM sync state,
+and candidate Global IDs are not copied. Each CRM row receives a deterministic
+target SuiteCRM identity, a freshly computed canonical source hash, `pending`
+projection state, and exactly one idempotent target `sync_outbox` projection.
 
 ## Explicit exclusions
 
@@ -65,8 +66,9 @@ The tool never selects or copies:
 - canonical orders, order revisions, fulfillment history, inventory snapshot
   evidence, reservations, cartonization evidence, or immutable provider
   attempts/effects;
-- SuiteCRM native IDs, sync outbox work, meetings, interactions, opportunities,
-  leads, or campaigns;
+- source SuiteCRM native IDs and source outbox work, meetings, interactions,
+  opportunities, leads, or campaigns. Target CRM rows deliberately receive
+  new target SuiteCRM identities and queued target outbox projections;
 - carrier accounts, carrier credentials, printers, print agents, or shipping
   labels;
 - Shopify checkout-purpose pack mappings, which depend on an independently
@@ -86,44 +88,125 @@ Do not apply until all of these are true:
 2. History migrations 0349 and 0350 are present. New accounts use immutable
    `new_orders_only` history with a frozen ingestion floor unless an operator
    explicitly chooses a supported bounded history mode during reconnection.
-3. Storage guard migration 0351 is present. The tool checks the payload
+3. Storage guard migration 0351 and the append-only follow-up storage guard
+   are present. The tool checks the payload
    redaction column, history-exclusion columns, and all retention functions by
    capability rather than trusting migration filenames.
-4. A restorable production backup/PITR boundary is recorded.
-5. Every selected DEV store has an explicit Paused control, is effectively not
-   running, has no live read lease, no unexpired available continuation, no
-   actionable webhook, and no pending, claimed, or unknown external effect.
-6. Every target remains the exact existing empty organization/pipeline/board
-   scaffold and its owner membership is active.
-7. The reviewed plan reports `applyReady: true`.
+4. Migration safety migration 0353 is present in both databases. It supplies
+   the source cutover fences, target provider-identity fences, and immutable
+   receipt boundary.
+5. A restorable production backup/PITR boundary is recorded.
+6. Scale every DEV web and worker service that can write these workspaces to
+   zero, or stop those services through the approved Railway operator process.
+   Do not rely on Paused controls alone. Keep writers stopped through apply.
+7. Every selected DEV store has an explicit Paused control, is effectively not
+   running, and has a `frozen` v2 cutover fence. It must also have no live read
+   lease, unexpired available continuation, actionable webhook (including
+   `failed` or `dead_letter`), pending/claimed/unknown external effect, dirty
+   Shopify order, catalog, or inventory reconciliation target; active,
+   uncertain, failed, or dead-letter intake/provider attempt; held
+   catalog/image/inventory job; or non-current/pending order-revision work.
+8. Every target remains the exact existing organization/pipeline/board
+   scaffold with an active owner membership, contains zero scoped app-owned
+   CRM/operations/order/project/board data beyond that reviewed scaffold, and
+   has the exact configuration baseline recorded in the plan.
+9. Independent source and target endpoint SHA-256 bindings have been reviewed
+   and pinned in addition to the in-database deployment identities.
+10. The reviewed plan reports `applyReady: true`.
 
 At the September 4 reviewed snapshot, the source was **not** ready: four store
 controls were running, 304 AG Shopify webhook receipts were actionable, and
 two AG external effects needed resolution. No active read leases or unexpired
-available continuations remained. A plan is safe to run in this state; apply
-fails closed.
+available continuations remained. Treat that observation as stale until a new
+plan proves otherwise. A plan is read-only and safe to run in this state;
+apply fails closed.
+
+After DEV writers are stopped and all source work is drained or resolved, add
+one frozen fence per selected account in a single reviewed source transaction.
+Use the compiled source organization/account UUIDs from the script, the exact
+v2 migration name, the confirmed owner, and an operator reason. Do not release
+these fences until apply and postflight are complete:
+
+```sql
+BEGIN;
+INSERT INTO operations_commerce_workspace_migration_cutover_fences AS fence (
+  organization_id, integration_account_id, migration_name, state,
+  frozen_by, reason
+) VALUES
+  ('60832306-9876-4384-98e8-e179b427c3c1'::uuid,
+   '03696a20-aaf4-4049-b0e3-051d9b937749'::uuid,
+   'commerce-workspace-production-migration-v2', 'frozen',
+   'jarrett@suburbiasandwichco.com',
+   'DEV writers stopped; selective production migration cutover'),
+  ('60832306-9876-4384-98e8-e179b427c3c1'::uuid,
+   'da56c6d6-fddd-47c0-bf26-66cdfc42ae2c'::uuid,
+   'commerce-workspace-production-migration-v2', 'frozen',
+   'jarrett@suburbiasandwichco.com',
+   'DEV writers stopped; selective production migration cutover'),
+  ('ae747fcb-eb5f-426c-afff-ee56cf7aeb90'::uuid,
+   'c13e4e64-edae-4e73-9ae0-c116c1419688'::uuid,
+   'commerce-workspace-production-migration-v2', 'frozen',
+   'jarrett@suburbiasandwichco.com',
+   'DEV writers stopped; selective production migration cutover'),
+  ('c6c8e6e7-fffa-4969-9526-e99da0ab2754'::uuid,
+   '28038134-b624-4b52-8518-e9740785e5c3'::uuid,
+   'commerce-workspace-production-migration-v2', 'frozen',
+   'jarrett@suburbiasandwichco.com',
+   'DEV writers stopped; selective production migration cutover')
+ON CONFLICT (organization_id, integration_account_id) DO UPDATE
+SET migration_name = EXCLUDED.migration_name,
+    state = 'frozen',
+    frozen_by = EXCLUDED.frozen_by,
+    frozen_at = clock_timestamp(),
+    released_by = NULL,
+    released_at = NULL,
+    reason = EXCLUDED.reason,
+    updated_at = clock_timestamp()
+WHERE fence.migration_name = EXCLUDED.migration_name;
+
+SELECT organization_id, integration_account_id, migration_name, state,
+       frozen_by, frozen_at
+FROM operations_commerce_workspace_migration_cutover_fences
+WHERE migration_name = 'commerce-workspace-production-migration-v2'
+ORDER BY organization_id, integration_account_id;
+
+-- Commit only after this transaction shows the four exact frozen rows above.
+COMMIT;
+```
+
+Review these four literal identities against `WORKSPACES`, inspect the affected
+rows before commit, and rerun the plan. These fences are not a substitute for
+stopping DEV writers.
 
 ## Create and review a private plan
 
 Obtain the two database URLs through the approved Railway operator session.
-Do not paste or log them. Choose a secure local directory; the tool creates
-the output with mode `0600` and refuses to overwrite an existing file.
+Do not paste or log them. In a separate trusted review, calculate the endpoint
+fingerprint for each exact protocol/host/port/database/user tuple and pin the
+two different values. Passwords are excluded from this fingerprint, so normal
+credential rotation does not change it. The in-database identity remains a
+second, independent boundary. Choose a secure local directory; the tool writes
+the output atomically with mode `0600` and refuses to overwrite an existing
+file.
 
 ```bash
 SOURCE_DATABASE_URL='<development PostgreSQL URL>' \
 TARGET_DATABASE_URL='<production PostgreSQL URL>' \
+SOURCE_DATABASE_ENDPOINT_SHA256='<reviewed source endpoint fingerprint>' \
+TARGET_DATABASE_ENDPOINT_SHA256='<reviewed target endpoint fingerprint>' \
 node scripts/migrate-commerce-workspaces-to-production.mjs plan \
   --actor jarrett@suburbiasandwichco.com \
   --images current \
   --output '/secure/operator/path/commerce-migration-plan.json'
 ```
 
-Review the source and target identities, each table count, exclusions,
-account dispositions, source blockers, target emptiness, retention
+Review the source and target identities and endpoint bindings, each table
+count, exclusions, account dispositions, every source blocker, the exact
+target emptiness scan, target configuration baseline digest, retention
 capabilities, production database and commerce-evidence relation sizes, guard
-health, `countFingerprint`, and `manifestDigest`. The manifest contains
-only safe counts, digests, public integration metadata, and blocker summaries;
-it contains no row payload or credential.
+health, `countFingerprint`, and `manifestDigest`. The manifest contains only
+safe counts, digests, public integration metadata, and blocker summaries; it
+contains no row payload or credential.
 
 ## Apply the exact reviewed plan
 
@@ -134,6 +217,8 @@ the complete source-state digest before the first target insert.
 ```bash
 SOURCE_DATABASE_URL='<same development PostgreSQL URL>' \
 TARGET_DATABASE_URL='<same production PostgreSQL URL>' \
+SOURCE_DATABASE_ENDPOINT_SHA256='<same reviewed source endpoint fingerprint>' \
+TARGET_DATABASE_ENDPOINT_SHA256='<same reviewed target endpoint fingerprint>' \
 node scripts/migrate-commerce-workspaces-to-production.mjs apply \
   --actor jarrett@suburbiasandwichco.com \
   --manifest '/secure/operator/path/commerce-migration-plan.json' \
@@ -143,22 +228,31 @@ node scripts/migrate-commerce-workspaces-to-production.mjs apply \
 
 Each workspace is serialized with a production advisory lock and its own
 `SERIALIZABLE` transaction. The source remains in one repeatable-read,
-read-only transaction. The migration receipt and target-state digest commit
-with the workspace data. The receipt retains the safe source-to-target
-UUID/Global-ID mapping so a retry after an earlier workspace committed can
-produce a complete mapping artifact. An exact rerun returns `already_applied`
-only if the same reviewed manifest receipt exists and the selected target
-state still matches; partial or unreceipted target data fails closed.
+read-only transaction while NOWAIT share locks hold every selected and
+source-work table. The tool compares the target configuration to the reviewed
+plan immediately before insert, so target drift fails before that workspace is
+changed. The immutable migration receipt commits atomically with workspace
+data, provider fences, target SuiteCRM outbox rows, image hashes, and the safe
+source-to-target UUID/Global-ID mapping. An exact rerun returns
+`already_applied` only if the same reviewed receipt exists and its full
+materialization still validates; partial or unreceipted target data fails
+closed.
 
 ## Provider reconnection
 
 Apply creates four empty-configuration, disabled accounts with no external
 provider identity, no credential reference, credential generation zero,
-receipt intake off, and an explicit Paused store-sync control.
+receipt intake off, an explicit Paused store-sync control, and a durable
+provider-identity fence. Imported external identifiers remain `stale` until
+the corresponding eligible provider account is freshly verified.
 
 - French Florist Shopify production and AG Faire production may be reconnected
-  only through ClawPilot's supported connection workflow after the provider
-  account identity is freshly verified.
+  only through ClawPilot's supported connection workflow. The credential write
+  hashes the freshly observed provider external-account identity, locks and
+  verifies the migration fence, then writes and activates the account in the
+  same transaction. A missing identity, hash mismatch, provider/environment
+  mismatch, or ineligible fence rejects the reconnect before migrated mappings
+  become authoritative.
 - AG Shopify and Test Pro Bakery Bites Shopify are sandbox identities. Keep
   them disabled and disconnected in production unless provider evidence proves
   a production-capable identity. Never relabel a sandbox account as production.
@@ -173,7 +267,8 @@ receipt intake off, and an explicit Paused store-sync control.
 
 For each target:
 
-1. Confirm the migration receipt and its manifest and target-state digests.
+1. Confirm the immutable migration receipt and its manifest and receipt
+   identity digests.
 2. Confirm the migrated table counts match the mapping artifact.
 3. Confirm all placeholders are disabled, have no external account or
    credential reference, use generation zero, have receipt intake off, and are
@@ -182,9 +277,12 @@ For each target:
    connection workflow freezes one.
 5. Confirm the production owner remains
    `jarrett@suburbiasandwichco.com` and no BPO alias user was created.
-6. Validate representative image hashes and byte lengths and visually sample
+6. Confirm the exact target SuiteCRM outbox count and canonical CRM source
+   hashes match the receipt, then allow the ordinary outbox worker to project
+   them.
+7. Validate representative image hashes and byte lengths and visually sample
    each workspace's product, warehouse, and pack configuration.
-7. Before and after one controlled polling cycle, record
+8. Before and after one controlled polling cycle, record
    `operations_commerce_storage_bloat_health(...)`, intake backlog rows/bytes,
    legacy capture backlog, inventory alias backlog, inventory level backlog,
    level row estimate, and level storage bytes. Stop if backlogs grow without
@@ -229,8 +327,10 @@ LEFT JOIN operations_commerce_store_sync_controls control
 WHERE account.integration_type = 'commerce'
 ORDER BY account.organization_id, account.provider, account.environment;
 
-SELECT organization_id, event_key, payload->>'manifestDigest' AS manifest_digest,
-       payload#>>'{target,targetStateDigest}' AS target_state_digest
+SELECT organization_id, event_key,
+       payload->>'manifestDigest' AS manifest_digest,
+       payload->>'receiptIdentityDigest' AS receipt_identity_digest,
+       payload#>>'{source,sourceStateDigest}' AS source_state_digest
 FROM audit_events
 WHERE event_type = 'operations.commerce_workspace_migration.completed'
 ORDER BY organization_id;
@@ -290,9 +390,32 @@ apply because those figures are observational and can drift.
 ## Rollback and recovery
 
 A failure before a workspace commit rolls back that workspace, including
-allocated UUID/Global-ID registry rows and its receipt. If an earlier workspace
-has already committed, rerun only after understanding the failure; its exact
-receipt makes the completed workspace idempotent.
+allocated UUID/Global-ID registry rows, outbox rows, provider fences, and its
+receipt. Workspaces commit independently, so a later failure can leave earlier
+workspaces correctly committed. After understanding and correcting the cause,
+rerun the same exact manifest and digest: committed workspaces validate as
+`already_applied`, while the failed workspace is retried. Do not create a new
+plan merely to bypass a partial failure.
+
+If apply committed data but the mapping file was interrupted, recover it only
+from the immutable target receipts. This command needs no source URL, but it
+still requires the reviewed manifest/digest and independently pinned target
+endpoint:
+
+```bash
+TARGET_DATABASE_URL='<same production PostgreSQL URL>' \
+TARGET_DATABASE_ENDPOINT_SHA256='<same reviewed target endpoint fingerprint>' \
+node scripts/migrate-commerce-workspaces-to-production.mjs receipt-export \
+  --actor jarrett@suburbiasandwichco.com \
+  --manifest '/secure/operator/path/commerce-migration-plan.json' \
+  --confirm-digest '<reviewed manifestDigest>' \
+  --mapping-output '/secure/operator/path/recovered-commerce-mapping.json'
+```
+
+The recovered file is an atomic `0600` artifact and the command refuses to
+overwrite an existing path. It validates every receipt mapping, image,
+provider fence, target CRM identity, and SuiteCRM outbox projection before
+writing. Receipt rows cannot be updated or deleted.
 
 Do not manually delete migrated rows. Several image and operational tables are
 immutable, and ad-hoc deletion would destroy the audit boundary. After any
