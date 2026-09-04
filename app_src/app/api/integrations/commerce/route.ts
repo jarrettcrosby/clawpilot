@@ -361,6 +361,7 @@ export async function PATCH(req: NextRequest) {
         'shopDomain',
         'clientId',
         'clientSecret',
+        'orderHistoryMode',
         'confirmLiveAccess',
       ])
       if (body.confirmLiveAccess !== true) {
@@ -378,6 +379,7 @@ export async function PATCH(req: NextRequest) {
           shopDomain: body.shopDomain,
           clientId: body.clientId,
           clientSecret: body.clientSecret,
+          orderHistoryMode: body.orderHistoryMode,
           actorEmail: actor.email,
         }),
       )
@@ -513,6 +515,7 @@ export async function PATCH(req: NextRequest) {
         'applicationId',
         'applicationSecret',
         'scopeProfile',
+        'orderHistoryMode',
         'confirmLiveAccess',
       ])
       if (body.confirmLiveAccess !== true) {
@@ -531,6 +534,7 @@ export async function PATCH(req: NextRequest) {
         applicationId: body.applicationId,
         applicationSecret: body.applicationSecret,
         scopeProfile: body.scopeProfile,
+        orderHistoryMode: body.orderHistoryMode,
       })
       return json({
         ok: true,
@@ -543,6 +547,7 @@ export async function PATCH(req: NextRequest) {
         'action',
         'displayName',
         'accessToken',
+        'orderHistoryMode',
         'confirmLiveAccess',
       ])
       if (body.confirmLiveAccess !== true) {
@@ -557,6 +562,7 @@ export async function PATCH(req: NextRequest) {
           organizationId: organization,
           displayName: body.displayName,
           accessToken: body.accessToken,
+          orderHistoryMode: body.orderHistoryMode,
           actorEmail: actor.email,
         }),
       )

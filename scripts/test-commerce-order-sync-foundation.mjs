@@ -66,10 +66,17 @@ const nativeActivityRuntime = loadTypeScript(
   await read('app_src/lib/integrations/shopifyOrderNativeActivity.ts'),
   { '@/lib/crm/emailBodyPreview.mjs': { emailBodyPreview } },
 )
+const historyPolicySource = await read(
+  'app_src/lib/integrations/commerceOrderHistoryPolicy.ts',
+)
+const historyPolicyRuntime = loadTypeScript(
+  'app_src/lib/integrations/commerceOrderHistoryPolicy.ts',
+  historyPolicySource,
+)
 
 const [
   migration, persistence, history, capabilities, worker, processRoute,
-  commerceIntegrations,
+  commerceIntegrations, historyPolicyMigration,
 ] =
   await Promise.all([
   read('db/migrations/0276_operations_commerce_order_sync_foundation.sql'),
@@ -79,6 +86,7 @@ const [
   read('app_src/lib/commerceOrderHistoryWorker.ts'),
   read('app_src/app/api/integrations/commerce/orders/process/route.ts'),
   read('app_src/lib/persistence/commerceIntegrations.ts'),
+  read('db/migrations/0349_operations_commerce_order_history_policy.sql'),
 ])
 
 for (const table of [
@@ -123,7 +131,9 @@ assert.match(persistence, /SHOPIFY_READ_ORDERS_REQUIRED/u)
 assert.doesNotMatch(persistence, /SHOPIFY_READ_ALL_ORDERS_REQUIRED/u)
 assert.match(persistence, /readAllOrdersGranted/u)
 assert.match(persistence, /credential\.external_account_id = account\.external_account_id/u)
-assert.match(persistence, /60 \* 24 \* 60 \* 60 \* 1_000/u)
+assert.match(persistence, /commerceOrderHistoryWindow/u)
+assert.match(persistence, /const eligibleValues = values\.filter/u)
+assert.match(persistence, /createdAt >= ingestionFloor/u)
 assert.match(persistence, /providerWrites: 0 as const/u)
 assert.match(persistence, /lock_token = gen_random_uuid\(\)/u)
 assert.match(persistence, /LEFT JOIN LATERAL[\s\S]{0,400}operations_orders/u)
@@ -141,6 +151,81 @@ assert.match(
   /credential_external_account_id !== row\.external_account_id/u,
 )
 
+assert.match(
+  historyPolicyMigration,
+  /CREATE TABLE operations_commerce_order_history_policies/u,
+)
+assert.match(historyPolicyMigration, /history_mode = 'provider_all'/u)
+assert.match(historyPolicyMigration, /commerce order history policy is immutable/u)
+assert.match(
+  historyPolicyMigration,
+  /order_history_mode text NOT NULL DEFAULT 'new_orders_only'/u,
+)
+assert.match(
+  commerceIntegrations,
+  /operations_commerce_order_history_policies[\s\S]{0,800}ON CONFLICT \(organization_id, integration_account_id\) DO NOTHING/u,
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'new_orders_only',
+    'shopify',
+  ),
+  'new_orders_only',
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(undefined, 'shopify'),
+  'new_orders_only',
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(undefined, 'faire'),
+  'new_orders_only',
+)
+for (const mode of ['last_7_days', 'last_30_days', 'last_60_days']) {
+  assert.equal(
+    historyPolicyRuntime.normalizeCommerceOrderHistoryMode(mode, 'shopify'),
+    mode,
+  )
+  assert.equal(
+    historyPolicyRuntime.normalizeCommerceOrderHistoryMode(mode, 'faire'),
+    mode,
+  )
+}
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'provider_all',
+    'faire',
+  ),
+  'provider_all',
+)
+assert.equal(
+  historyPolicyRuntime.commerceOrderHistoryRequestedFrom(
+    'last_7_days',
+    new Date('2026-09-04T12:00:00.000Z'),
+  ).toISOString(),
+  '2026-08-28T12:00:00.000Z',
+)
+assert.equal(
+  historyPolicyRuntime.commerceOrderHistoryRequestedFrom(
+    'provider_all',
+    new Date('2026-09-04T12:00:00.000Z'),
+  ),
+  null,
+)
+assert.throws(
+  () => historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'provider_all',
+    'shopify',
+  ),
+  /invalid for shopify/u,
+)
+assert.throws(
+  () => historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'unbounded',
+    'faire',
+  ),
+  /invalid for faire/u,
+)
+
 assert.match(history, /status:any created_at:>='/u)
 assert.match(history, /created_at:<='/u)
 assert.match(history, /sortKey: \$\{sortKey\}, reverse: false/u)
@@ -152,7 +237,7 @@ assert.match(history, /readAllOrdersScopeObserved: readAllOrders/u)
 assert.match(history, /returnHistoryScopeObserved: readReturns/u)
 assert.match(history, /listFaireOrders\(options, \{/u)
 assert.match(history, /cursor: input\.providerCursor/u)
-assert.match(history, /updatedAtMin: input\.mode === 'continuous_poll'/u)
+assert.match(history, /updatedAtMin: requestedFrom/u)
 assert.doesNotMatch(history, /updateFaire|cancelFaire|moveFaire|updateShopify|mutation /u)
 assert.match(history, /attributionSource: 'unavailable'/u)
 assert.doesNotMatch(history, /providerActorFingerprint: staffFingerprint/u)
@@ -789,6 +874,14 @@ assert.throws(
     mode: 'continuous_poll',
   }),
   /requires an updated-at overlap start time/u,
+)
+assert.equal(
+  historyRuntime.faireOrderHistoryListWindow({
+    requestedFrom: '2026-08-06T00:00:00.000Z',
+    requestedThrough: '2026-08-13T00:00:00.000Z',
+    mode: 'historical_backfill',
+  }).updatedAtMin,
+  '2026-08-06T00:00:00.000Z',
 )
 assert.equal(
   historyRuntime.faireOrderHistoryListWindow({

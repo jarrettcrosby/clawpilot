@@ -1816,7 +1816,11 @@ export function faireOrderHistoryListWindow(input: {
   return {
     requestedFrom,
     requestedThrough,
-    updatedAtMin: input.mode === 'continuous_poll' ? requestedFrom : null,
+    // Every order created on or after a bounded ingestion floor must also
+    // have been updated on or after that floor. Applying the provider's
+    // updated-at filter avoids walking pre-cutover Faire history; the frozen
+    // creation-time floor is still enforced before persistence.
+    updatedAtMin: requestedFrom,
   }
 }
 

@@ -1101,7 +1101,7 @@ async function verify(databaseUrl, ids) {
       pool.query(invalidSessionBase, [
         ids.organization, ids.integration, 'shopify', 1, 1,
         'shopify_rolling_60_days',
-        new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString(),
+        new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString(),
         new Date().toISOString(), 'invalid-window-session',
         '6'.repeat(64), '7'.repeat(64), actorEmail,
       ]),
@@ -1658,6 +1658,55 @@ async function verify(databaseUrl, ids) {
       assert.ok(lease)
       return { ...lease, intentKey, intentFingerprintSha256 }
     }
+    const beforeFloorExternalOrderId = 'gid://shopify/Order/old-9402'
+    const beforeFloorLease = await createAdditionalManualLease(
+      'manual-exact-order-history-before-floor',
+    )
+    const beforeFloorAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        accountGlobalId: 'gia0009301',
+        provider: 'shopify',
+        credentialGeneration: 1,
+        externalOrderId: beforeFloorExternalOrderId,
+        providerReadLease: {
+          id: beforeFloorLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256:
+            beforeFloorLease.intentFingerprintSha256,
+          controlRevision: beforeFloorLease.control_revision,
+          activationRevision: beforeFloorLease.activation_revision,
+          expiresAt: beforeFloorLease.expires_at.toISOString(),
+        },
+        observation: {
+          ...manualObservation,
+          externalOrderId: beforeFloorExternalOrderId,
+          orderNumber: '#OLD-9402',
+          sourceRevision: 'manual-old-9402-v1',
+          providerCreatedAt: new Date(
+            Date.now() - 90 * 24 * 60 * 60 * 1_000,
+          ).toISOString(),
+          events: [],
+        },
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(beforeFloorAppend)), {
+      appended: 0,
+      preserved: 0,
+      linesAppended: 0,
+      eventsAppended: 0,
+      providerReads: 3,
+      providerWrites: 0,
+    })
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_order_observations
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3`,
+      [ids.organization, ids.integration, beforeFloorExternalOrderId],
+    )).rows[0].count), 0, 'Orders created before the frozen floor must not materialize')
     const sameFactLease = await createAdditionalManualLease(
       'manual-exact-order-history-same-facts',
     )

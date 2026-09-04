@@ -41,6 +41,12 @@ import {
   commerceStoreSyncProviderReadIntentFingerprint,
   type CommerceStoreSyncProviderReadLease,
 } from '@/lib/persistence/commerceStoreSync'
+import {
+  commerceOrderHistoryCompletionMeaning,
+  commerceOrderHistoryCoverageBasis,
+  commerceOrderHistoryRequestedFrom,
+  type CommerceOrderHistoryMode,
+} from '@/lib/integrations/commerceOrderHistoryPolicy'
 
 const POLICY_VERSION = 'commerce-order-sync-policy-v1'
 const BACKFILL_LEASE = '10 minutes'
@@ -954,11 +960,73 @@ async function appendObservationsWithClient(
   context: ObservationPersistenceContext,
   values: readonly NormalizedObservation[],
 ) {
+  await client.query(
+    `WITH frozen AS (
+       SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+     )
+     INSERT INTO operations_commerce_order_history_policies (
+       organization_id, integration_account_id, provider, history_mode,
+       ingestion_floor, frozen_at, configured_by
+     )
+     SELECT account.organization_id,
+            account.id,
+            account.provider,
+            CASE WHEN account.provider = 'shopify'
+              THEN 'last_60_days' ELSE 'provider_all' END,
+            CASE WHEN account.provider = 'shopify'
+              THEN frozen.at - interval '60 days' ELSE NULL END,
+            frozen.at,
+            NULL
+     FROM operations_integration_accounts account
+     CROSS JOIN frozen
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider = $3
+     ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
+    [context.organizationId, context.integrationAccountId, context.provider],
+  )
+  const historyPolicy = (
+    await client.query<{
+      history_mode: CommerceOrderHistoryMode
+      ingestion_floor: Date | null
+    }>(
+      `SELECT history_mode, ingestion_floor
+       FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND provider = $3
+       LIMIT 1`,
+      [context.organizationId, context.integrationAccountId, context.provider],
+    )
+  ).rows[0]
+  if (!historyPolicy) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+      'The immutable order-history policy is unavailable',
+      409,
+    )
+  }
+  const ingestionFloor = historyPolicy.ingestion_floor?.getTime() ?? null
+  const eligibleValues = values.filter((observation) => {
+    if (ingestionFloor === null) return true
+    const createdAt = observation.providerCreatedAt
+      ? new Date(observation.providerCreatedAt).getTime()
+      : Number.NaN
+    if (!Number.isFinite(createdAt)) {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
+        'Provider order creation time is required by the frozen history policy',
+        409,
+      )
+    }
+    return createdAt >= ingestionFloor
+  })
   let appended = 0
   let preserved = 0
   let linesAppended = 0
   let eventsAppended = 0
-  for (const observation of values) {
+  for (const observation of eligibleValues) {
     let observationWasPreserved = false
     // Serialize one provider order across scheduled and exact-read workers.
     // Content equality is compared only with the latest observation so a
@@ -1326,7 +1394,12 @@ async function appendObservationsWithClient(
     )
     await appendCommerceOrderNativeActivityWithClient(client, context, observation, observationRow.id, nativeSnapshots)
   }
-  return { appended, preserved, linesAppended, eventsAppended }
+  return {
+    appended,
+    preserved,
+    linesAppended,
+    eventsAppended,
+  }
 }
 
 /**
@@ -1569,6 +1642,9 @@ type AccountRow = {
   activation_state: string | null
   store_sync_running: boolean
   runtime_readable: boolean
+  order_history_mode: CommerceOrderHistoryMode
+  order_history_ingestion_floor: Date | null
+  order_history_frozen_at: Date
 }
 
 async function lockAccount(
@@ -1576,6 +1652,32 @@ async function lockAccount(
   organizationId: string,
   accountGlobalId: string,
 ) {
+  await client.query(
+    `WITH frozen AS (
+       SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+     )
+     INSERT INTO operations_commerce_order_history_policies (
+       organization_id, integration_account_id, provider, history_mode,
+       ingestion_floor, frozen_at, configured_by
+     )
+     SELECT account.organization_id,
+            account.id,
+            account.provider,
+            CASE WHEN account.provider = 'shopify'
+              THEN 'last_60_days' ELSE 'provider_all' END,
+            CASE WHEN account.provider = 'shopify'
+              THEN frozen.at - interval '60 days' ELSE NULL END,
+            frozen.at,
+            NULL
+     FROM operations_integration_accounts account
+     CROSS JOIN frozen
+     WHERE account.organization_id = $1::uuid
+       AND account.global_id = $2
+       AND account.integration_type = 'commerce'
+       AND account.provider IN ('shopify', 'faire')
+     ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
+    [organizationId, accountGlobalId],
+  )
   const result = await client.query<AccountRow>(
     `SELECT account.id::text AS integration_account_id,
             account.provider, account.status,
@@ -1588,7 +1690,10 @@ async function lockAccount(
             credential.credential_version,
             activation.state AS activation_state,
             ${STORE_SYNC_RUNNING_SQL} AS store_sync_running,
-            ${ORDER_READ_ACCOUNT_SQL} AS runtime_readable
+            ${ORDER_READ_ACCOUNT_SQL} AS runtime_readable,
+            history.history_mode AS order_history_mode,
+            history.ingestion_floor AS order_history_ingestion_floor,
+            history.frozen_at AS order_history_frozen_at
      FROM operations_integration_accounts account
      LEFT JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
@@ -1596,6 +1701,9 @@ async function lockAccount(
       AND credential.credential_version = account.commerce_credential_generation
      LEFT JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
+     JOIN operations_commerce_order_history_policies history
+       ON history.organization_id = account.organization_id
+      AND history.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
@@ -1627,6 +1735,23 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function commerceOrderHistoryWindow(account: AccountRow) {
+  const requestedFrom = account.order_history_ingestion_floor?.toISOString()
+    || commerceOrderHistoryRequestedFrom(
+      account.order_history_mode,
+      account.order_history_frozen_at,
+    )?.toISOString()
+    || null
+  return {
+    mode: account.order_history_mode,
+    requestedFrom,
+    coverageBasis: commerceOrderHistoryCoverageBasis(
+      account.provider,
+      account.order_history_mode,
+    ),
+  }
+}
+
 export async function requestCommerceOrderBackfillInPostgres(input: {
   organizationId: string
   accountGlobalId: string
@@ -1656,12 +1781,14 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
       `commerce-order-backfill-request:${organizationId}:${accountGlobalId}`,
     )
     const account = await lockAccount(client, organizationId, accountGlobalId)
+    const historyWindow = commerceOrderHistoryWindow(account)
     const requestHash = hash({
       policyVersion: POLICY_VERSION,
       accountGlobalId,
       provider: account.provider,
       credentialGeneration: account.commerce_credential_generation,
-      requestedWindowDays: account.provider === 'shopify' ? 60 : null,
+      orderHistoryMode: historyWindow.mode,
+      requestedFrom: historyWindow.requestedFrom,
       reason,
       authority: 'provider',
       providerWrites: 0,
@@ -1756,11 +1883,7 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
         `SELECT date_trunc('milliseconds', clock_timestamp()) AS now`,
       )
     ).rows[0].now.toISOString()
-    const requestedFrom = account.provider === 'shopify'
-      ? new Date(
-          new Date(clock).getTime() - 60 * 24 * 60 * 60 * 1_000,
-        ).toISOString()
-      : null
+    const requestedFrom = historyWindow.requestedFrom
     const policy = await client.query<{ revision: number }>(
       `INSERT INTO operations_commerce_order_sync_policies (
          organization_id, integration_account_id,
@@ -1819,7 +1942,7 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
       policyVersion: POLICY_VERSION,
       provider: account.provider,
       credentialGeneration: account.commerce_credential_generation,
-      coverageBasis: readiness.coverageBasis,
+      coverageBasis: historyWindow.coverageBasis,
       readAllOrdersConfigured:
         'readAllOrdersGranted' in readiness
           ? readiness.readAllOrdersGranted
@@ -1853,7 +1976,7 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
         account.provider,
         account.commerce_credential_generation,
         policy.rows[0].revision,
-        readiness.coverageBasis,
+        historyWindow.coverageBasis,
         blockerCode ? 'blocked' : 'pending',
         requestedFrom,
         clock,
@@ -1877,7 +2000,8 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
         provider: account.provider,
         status: inserted.rows[0].status,
         blockerCode,
-        coverageBasis: readiness.coverageBasis,
+        coverageBasis: historyWindow.coverageBasis,
+        orderHistoryMode: historyWindow.mode,
         readAllOrdersConfigured:
           'readAllOrdersGranted' in readiness
             ? readiness.readAllOrdersGranted
@@ -2115,6 +2239,7 @@ async function createCommerceOrderHistoricalRefreshWithClient(
     grantedScopes: stringArray(input.account.configuration.grantedScopes),
     requestedScopes: stringArray(input.account.configuration.requestedScopes),
   })
+  const historyWindow = commerceOrderHistoryWindow(input.account)
   const policyRevision = input.policy
     ? (
         await client.query<{ revision: number }>(
@@ -2170,11 +2295,7 @@ async function createCommerceOrderHistoricalRefreshWithClient(
     )
   }
   const requestedThrough = input.clock.toISOString()
-  const requestedFrom = input.account.provider === 'shopify'
-    ? new Date(
-        input.clock.getTime() - 60 * 24 * 60 * 60 * 1_000,
-      ).toISOString()
-    : null
+  const requestedFrom = historyWindow.requestedFrom
   const sessionIdempotencyKey =
     `refresh-all:${input.idempotencyKey}:${input.accountGlobalId}`
   const requestHash = hash({
@@ -2183,7 +2304,8 @@ async function createCommerceOrderHistoricalRefreshWithClient(
     accountGlobalId: input.accountGlobalId,
     provider: input.account.provider,
     credentialGeneration: input.account.commerce_credential_generation,
-    requestedWindowDays: input.account.provider === 'shopify' ? 60 : null,
+    orderHistoryMode: historyWindow.mode,
+    requestedFrom,
     authority: 'provider',
     providerWrites: 0,
   })
@@ -2191,7 +2313,7 @@ async function createCommerceOrderHistoricalRefreshWithClient(
     policyVersion: POLICY_VERSION,
     provider: input.account.provider,
     credentialGeneration: input.account.commerce_credential_generation,
-    coverageBasis: readiness.coverageBasis,
+    coverageBasis: historyWindow.coverageBasis,
     readAllOrdersConfigured:
       'readAllOrdersGranted' in readiness
         ? readiness.readAllOrdersGranted
@@ -2219,7 +2341,7 @@ async function createCommerceOrderHistoricalRefreshWithClient(
       input.account.provider,
       input.account.commerce_credential_generation,
       policyRevision,
-      readiness.coverageBasis,
+      historyWindow.coverageBasis,
       requestedFrom,
       requestedThrough,
       sessionIdempotencyKey,
@@ -2721,6 +2843,8 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
       continuous_high_watermark: Date
       created_by: string
       configuration: Record<string, unknown>
+      history_mode: CommerceOrderHistoryMode
+      ingestion_floor: Date | null
       clock: Date
     }>(
       `SELECT policy.organization_id::text,
@@ -2733,11 +2857,16 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
               policy.continuous_high_watermark,
               COALESCE(policy.updated_by, policy.created_by) AS created_by,
               account.configuration,
+              history.history_mode,
+              history.ingestion_floor,
               date_trunc('milliseconds', clock_timestamp()) AS clock
        FROM operations_commerce_order_sync_policies policy
        JOIN operations_integration_accounts account
          ON account.organization_id = policy.organization_id
         AND account.id = policy.integration_account_id
+       JOIN operations_commerce_order_history_policies history
+         ON history.organization_id = account.organization_id
+        AND history.integration_account_id = account.id
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
@@ -2794,9 +2923,7 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
       const overlapMs = candidate.provider === 'shopify'
         ? 15 * 60 * 1_000
         : 60 * 60 * 1_000
-      const earliest = candidate.provider === 'shopify'
-        ? candidate.clock.getTime() - 60 * 24 * 60 * 60 * 1_000
-        : 0
+      const earliest = candidate.ingestion_floor?.getTime() || 0
       const from = new Date(Math.max(highWatermark - overlapMs, earliest))
         .toISOString()
       const coverageBasis = candidate.provider === 'shopify'
@@ -3322,17 +3449,16 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       'Provider order history exceeded the absolute page limit',
     )
   }
-  if (!(
-    input.job.provider === 'faire'
-    && input.job.sessionKind === 'historical_backfill'
-  )) {
+  if (
+    input.job.sessionKind === 'continuous_poll'
+    || input.job.requestedFrom !== null
+  ) {
     const fromTime = input.job.requestedFrom
       ? new Date(input.job.requestedFrom).getTime()
       : Number.NaN
     const throughTime = new Date(input.job.requestedThrough).getTime()
     for (const observation of observations) {
-      const boundary = input.job.provider === 'shopify'
-        && input.job.sessionKind === 'historical_backfill'
+      const boundary = input.job.sessionKind === 'historical_backfill'
         ? observation.providerCreatedAt
         : observation.providerUpdatedAt
       const boundaryTime = boundary ? new Date(boundary).getTime() : Number.NaN
@@ -3388,6 +3514,8 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
         requested_through: Date
         read_all_orders_scope_observed: boolean | null
         return_history_state: string
+        history_mode: CommerceOrderHistoryMode
+        ingestion_floor: Date | null
       }>(
         `SELECT session.id::text, session.provider,
                 session.credential_generation, session.query_hash,
@@ -3396,11 +3524,17 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
                 session.integration_account_id::text,
                 session.requested_from, session.requested_through,
                 session.read_all_orders_scope_observed,
-                session.return_history_state
+                session.return_history_state,
+                history.history_mode,
+                history.ingestion_floor
          FROM operations_commerce_order_backfill_sessions session
          JOIN operations_commerce_order_sync_policies policy
            ON policy.organization_id = session.organization_id
           AND policy.integration_account_id = session.integration_account_id
+         JOIN operations_commerce_order_history_policies history
+           ON history.organization_id = session.organization_id
+          AND history.integration_account_id = session.integration_account_id
+          AND history.provider = session.provider
          JOIN operations_integration_accounts account
            ON account.organization_id = session.organization_id
           AND account.id = session.integration_account_id
@@ -3499,20 +3633,26 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       backfillSessionId: input.job.id,
       manualProviderReadLeaseId: null,
     }, observations)
+    const ingestionFloorTime = session.ingestion_floor?.getTime() ?? null
     const providerDates = observations
       .map((observation) => observation.providerCreatedAt)
       .filter((value): value is string => Boolean(value))
+      .filter((value) => (
+        ingestionFloorTime === null
+        || new Date(value).getTime() >= ingestionFloorTime
+      ))
       .sort()
     const status = input.hasNextPage ? 'pending' : 'succeeded'
     const completenessState = input.hasNextPage
       ? 'unknown'
       : input.job.sessionKind === 'continuous_poll'
         ? 'unknown'
-        : input.job.provider === 'shopify'
-        ? input.readAllOrdersScopeObserved
-          ? 'shopify_fixed_window_orders_complete'
-          : 'shopify_fixed_window_read_attempt_complete'
-        : 'faire_provider_available_orders_complete'
+        : commerceOrderHistoryCompletionMeaning({
+            provider: input.job.provider,
+            mode: session.history_mode,
+            readAllOrdersGranted:
+              input.readAllOrdersScopeObserved === true,
+          })
     const protectedCursor = input.nextProviderCursor
       ? encryptCommerceOrderSyncCursor(
           { orderCursor: input.nextProviderCursor },
@@ -3852,6 +3992,9 @@ export async function readCommerceOrderSyncStateFromPostgres(input: {
     requested_through: Date | null
     read_all_orders_scope_observed: boolean | null
     return_history_state: string | null
+    history_mode: CommerceOrderHistoryMode | null
+    ingestion_floor: Date | null
+    history_frozen_at: Date | null
   }>(
     `SELECT account.provider, credential.auth_mode, account.configuration,
             policy.revision AS policy_revision,
@@ -3871,7 +4014,10 @@ export async function readCommerceOrderSyncStateFromPostgres(input: {
             latest.completed_at AS last_completed_at,
             latest.requested_from, latest.requested_through,
             latest.read_all_orders_scope_observed,
-            latest.return_history_state
+            latest.return_history_state,
+            history.history_mode,
+            history.ingestion_floor,
+            history.frozen_at AS history_frozen_at
      FROM operations_integration_accounts account
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
@@ -3881,6 +4027,9 @@ export async function readCommerceOrderSyncStateFromPostgres(input: {
      LEFT JOIN operations_commerce_order_sync_policies policy
        ON policy.organization_id = account.organization_id
       AND policy.integration_account_id = account.id
+     LEFT JOIN operations_commerce_order_history_policies history
+       ON history.organization_id = account.organization_id
+      AND history.integration_account_id = account.id
      LEFT JOIN LATERAL (
        SELECT session.*
        FROM operations_commerce_order_backfill_sessions session
@@ -3909,6 +4058,14 @@ export async function readCommerceOrderSyncStateFromPostgres(input: {
     provider: row.provider,
     authority: 'provider' as const,
     readiness,
+    orderHistoryPolicy:
+      row.history_mode && row.history_frozen_at
+        ? {
+            mode: row.history_mode,
+            ingestionFloor: row.ingestion_floor?.toISOString() || null,
+            frozenAt: row.history_frozen_at.toISOString(),
+          }
+        : null,
     policy: row.policy_revision === null ? null : {
       revision: row.policy_revision,
       historicalObservationEnabled:

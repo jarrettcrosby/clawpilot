@@ -74,6 +74,12 @@ import {
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
+type CommerceOrderHistoryMode =
+  | 'new_orders_only'
+  | 'last_7_days'
+  | 'last_30_days'
+  | 'last_60_days'
+  | 'provider_all'
 
 type SyncCursor = {
   resource: string
@@ -108,6 +114,11 @@ type CommerceAccount = {
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
   webhookVerifiedAt: string | null
   configuration: Record<string, unknown>
+  orderHistoryPolicy: null | {
+    mode: CommerceOrderHistoryMode
+    ingestionFloor: string | null
+    frozenAt: string
+  }
   fulfillmentNotificationPolicy:
     | {
       mode: 'clawpilot_explicit'
@@ -419,6 +430,7 @@ type ShopifyForm = {
   clientId: string
   clientSecret: string
   confirmLiveAccess: boolean
+  orderHistoryMode: Exclude<CommerceOrderHistoryMode, 'provider_all'>
 }
 
 type FaireForm = {
@@ -429,6 +441,15 @@ type FaireForm = {
   applicationSecret: string
   scopeProfile: 'connection_test' | 'distributed_operations'
   confirmLiveAccess: boolean
+  orderHistoryMode: CommerceOrderHistoryMode
+}
+
+const ORDER_HISTORY_LABELS: Record<CommerceOrderHistoryMode, string> = {
+  new_orders_only: 'Only orders created after connection',
+  last_7_days: 'Orders from the prior 7 days',
+  last_30_days: 'Orders from the prior 30 days',
+  last_60_days: 'Orders from the prior 60 days',
+  provider_all: 'All history available from the provider',
 }
 
 const COMMERCE_PROVIDER_OPTIONS: readonly {
@@ -770,6 +791,7 @@ export default function CommerceIntegrationPanel({
     clientId: '',
     clientSecret: '',
     confirmLiveAccess: false,
+    orderHistoryMode: 'new_orders_only',
   })
   const [faire, setFaire] = useState<FaireForm>({
     authPath: 'brand_api_key',
@@ -779,6 +801,7 @@ export default function CommerceIntegrationPanel({
     applicationSecret: '',
     scopeProfile: 'connection_test',
     confirmLiveAccess: false,
+    orderHistoryMode: 'new_orders_only',
   })
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false)
   const [selectedSetupProvider, setSelectedSetupProvider] =
@@ -1173,6 +1196,7 @@ export default function CommerceIntegrationPanel({
           action: 'connect-faire-api-key',
           displayName: faire.displayName,
           accessToken: faire.apiKey,
+          orderHistoryMode: faire.orderHistoryMode,
           confirmLiveAccess: faire.confirmLiveAccess,
         },
         'Faire generated API key connected and verified. This connection authorizes automatic read-only product catalog sync with no second approval. ClawPilot initializes the resumed policy and queues work when product-read access, the development runtime, and the Operations product target are eligible. Order, inventory, fulfillment, and provider-write workflows remain separate.',
@@ -1201,6 +1225,7 @@ export default function CommerceIntegrationPanel({
           applicationId: faire.applicationId,
           applicationSecret: faire.applicationSecret,
           scopeProfile: faire.scopeProfile,
+          orderHistoryMode: faire.orderHistoryMode,
           confirmLiveAccess: faire.confirmLiveAccess,
         }),
       })
@@ -2323,6 +2348,37 @@ export default function CommerceIntegrationPanel({
                   <MenuItem value="production">Production store</MenuItem>
                 </Select>
               </FormControl>
+              <FormControl sx={fieldSx}>
+                <InputLabel id="shopify-order-history-label">
+                  Initial order history
+                </InputLabel>
+                <Select
+                  labelId="shopify-order-history-label"
+                  label="Initial order history"
+                  value={shopifyAccount?.orderHistoryPolicy?.mode
+                    && shopifyAccount.orderHistoryPolicy.mode !== 'provider_all'
+                    ? shopifyAccount.orderHistoryPolicy.mode
+                    : shopify.orderHistoryMode}
+                  disabled={Boolean(shopifyAccount?.orderHistoryPolicy)}
+                  onChange={(event) => setShopify((current) => ({
+                    ...current,
+                    orderHistoryMode: event.target
+                      .value as ShopifyForm['orderHistoryMode'],
+                  }))}
+                >
+                  <MenuItem value="new_orders_only">
+                    Only orders created after connection
+                  </MenuItem>
+                  <MenuItem value="last_7_days">Prior 7 days</MenuItem>
+                  <MenuItem value="last_30_days">Prior 30 days</MenuItem>
+                  <MenuItem value="last_60_days">Prior 60 days</MenuItem>
+                </Select>
+              </FormControl>
+              <Typography variant="caption" color="text.secondary">
+                This cutoff is frozen on the first connection and remains the
+                same if credentials are reconnected. Start history and Refresh
+                will never import orders created before it.
+              </Typography>
               <TextField
                 required
                 label="Shopify .myshopify.com domain"
@@ -2682,6 +2738,38 @@ export default function CommerceIntegrationPanel({
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
+              <FormControl sx={fieldSx}>
+                <InputLabel id="faire-order-history-label">
+                  Initial order history
+                </InputLabel>
+                <Select
+                  labelId="faire-order-history-label"
+                  label="Initial order history"
+                  value={faireAccount?.orderHistoryPolicy?.mode
+                    || faire.orderHistoryMode}
+                  disabled={Boolean(faireAccount?.orderHistoryPolicy)}
+                  onChange={(event) => setFaire((current) => ({
+                    ...current,
+                    orderHistoryMode: event.target
+                      .value as FaireForm['orderHistoryMode'],
+                  }))}
+                >
+                  <MenuItem value="new_orders_only">
+                    Only orders created after connection
+                  </MenuItem>
+                  <MenuItem value="last_7_days">Prior 7 days</MenuItem>
+                  <MenuItem value="last_30_days">Prior 30 days</MenuItem>
+                  <MenuItem value="last_60_days">Prior 60 days</MenuItem>
+                  <MenuItem value="provider_all">
+                    All provider-available history
+                  </MenuItem>
+                </Select>
+              </FormControl>
+              <Typography variant="caption" color="text.secondary">
+                This cutoff is frozen on the first connection and remains the
+                same if credentials are reconnected. Start history and Refresh
+                will never import orders created before it.
+              </Typography>
               {faire.authPath === 'brand_api_key' ? (
                 <TextField
                   required
@@ -2971,6 +3059,20 @@ export default function CommerceIntegrationPanel({
                             {providerLabel(account.provider)} · {accountName} ·{' '}
                             {account.environment} · {account.globalId}
                           </Typography>
+                          {account.orderHistoryPolicy ? (
+                            <Typography variant="caption" color="text.secondary">
+                              Order history: {ORDER_HISTORY_LABELS[
+                                account.orderHistoryPolicy.mode
+                              ]} · frozen {setupTimestamp(
+                                account.orderHistoryPolicy.frozenAt,
+                              )}
+                              {account.orderHistoryPolicy.ingestionFloor
+                                ? ` · floor ${setupTimestamp(
+                                  account.orderHistoryPolicy.ingestionFloor,
+                                )}`
+                                : ''}
+                            </Typography>
+                          ) : null}
                         </Box>
                         <Stack direction="row" spacing={1} flexWrap="wrap">
                           <Chip

@@ -246,6 +246,11 @@ export function loadTypeScriptModule(path, mocks = {}) {
           'app_src/lib/operations/orderListQuery.ts',
         )
       }
+      if (specifier === '@/lib/integrations/commerceOrderHistoryPolicy') {
+        return loadTypeScriptModule(
+          'app_src/lib/integrations/commerceOrderHistoryPolicy.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceStoreSync') {
         return {
           async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
