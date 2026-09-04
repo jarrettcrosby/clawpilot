@@ -60,7 +60,6 @@ const FAIRE_TRACKING_LIMIT = 20
 const PROVIDER_TIMEOUT_MS = 15_000
 const MAX_CURSOR_LENGTH = 4_096
 const SIXTY_DAYS_MS = 60 * 24 * 60 * 60 * 1_000
-const SHOPIFY_READ_ORDERS_QUEUE_SLA_MS = 10 * 60 * 1_000
 
 type JsonRecord = Record<string, unknown>
 
@@ -1086,10 +1085,13 @@ export function shopifyHistoricalOrderSearchWindow(input: {
   const from = requiredIso(input.requestedFrom, 'Shopify historical start time')
   const through = requiredIso(input.requestedThrough, 'Shopify historical end time')
   const duration = new Date(through).getTime() - new Date(from).getTime()
-  if (duration < 0 || duration > SIXTY_DAYS_MS) {
+  if (
+    duration < 0
+    || (input.mode === 'continuous_poll' && duration > SIXTY_DAYS_MS)
+  ) {
     historyError(
       'SHOPIFY_ORDER_HISTORY_WINDOW_INVALID',
-      'Shopify history v1 requires one fixed window of no more than 60 days',
+      'The Shopify provider-read window is invalid',
       400,
     )
   }
@@ -1098,27 +1100,55 @@ export function shopifyHistoricalOrderSearchWindow(input: {
     : `status:any created_at:>='${from}' created_at:<='${through}'`
 }
 
+export function shopifyOrderHistoryProviderRequestedFrom(input: {
+  requestedFrom: string
+  requestedThrough: string
+  observedAt: string
+  readAllOrdersGranted: boolean
+}): string | null {
+  const requestedFrom = new Date(requiredIso(
+    input.requestedFrom,
+    'Shopify history start',
+  ))
+  const requestedThrough = new Date(requiredIso(
+    input.requestedThrough,
+    'Shopify history end',
+  ))
+  const observedAt = new Date(requiredIso(
+    input.observedAt,
+    'Observation time',
+  ))
+  if (
+    requestedFrom.getTime() > requestedThrough.getTime()
+    || observedAt.getTime() < requestedThrough.getTime()
+  ) {
+    historyError(
+      'SHOPIFY_ORDER_HISTORY_WINDOW_INVALID',
+      'The sealed Shopify provider-read window is invalid',
+      400,
+    )
+  }
+  if (input.readAllOrdersGranted) return requestedFrom.toISOString()
+  // The frozen ingestion floor is an admission rule, not a promise that the
+  // standard read_orders scope can still query that date months later. Clamp
+  // each actual provider request to Shopify's current accessible 60-day
+  // horizon while leaving the sealed policy/session floor unchanged. The
+  // session is consequently reported as a read attempt, never as complete.
+  const readableFloor = observedAt.getTime() - SIXTY_DAYS_MS
+  if (readableFloor > requestedThrough.getTime()) return null
+  return new Date(Math.max(
+    requestedFrom.getTime(),
+    readableFloor,
+  )).toISOString()
+}
+
 export function assertShopifyOrderHistoryWindowAccessible(input: {
   requestedFrom: string
   requestedThrough: string
   observedAt: string
   readAllOrdersGranted: boolean
 }) {
-  if (input.readAllOrdersGranted) return
-  requiredIso(input.requestedFrom, 'Shopify history start')
-  const through = new Date(requiredIso(
-    input.requestedThrough,
-    'Shopify history end',
-  ))
-  const observed = new Date(requiredIso(input.observedAt, 'Observation time'))
-  const queueAge = observed.getTime() - through.getTime()
-  if (queueAge < 0 || queueAge > SHOPIFY_READ_ORDERS_QUEUE_SLA_MS) {
-    historyError(
-      'SHOPIFY_ORDER_HISTORY_READ_ORDERS_QUEUE_SLA_EXCEEDED',
-      'The exact 60-day Shopify read_orders attempt missed its bounded execution window',
-      409,
-    )
-  }
+  shopifyOrderHistoryProviderRequestedFrom(input)
 }
 
 export function shopifyOrderHistoryListQuery(
@@ -1836,7 +1866,6 @@ async function readShopifyHistoryPage(
       400,
     )
   }
-  const search = shopifyHistoricalOrderSearchWindow(input)
   const secret = decryptCommerceCredential(
     runtime.encrypted,
     runtime.organizationId,
@@ -1877,11 +1906,32 @@ async function readShopifyHistoryPage(
   ) && hasEffectiveShopifyScope(probe.grantedScopes, 'read_all_orders')
   const readReturns = hasEffectiveShopifyScope(grant.grantedScopes, 'read_returns')
     && hasEffectiveShopifyScope(probe.grantedScopes, 'read_returns')
-  assertShopifyOrderHistoryWindowAccessible({
+  const providerRequestedFrom = shopifyOrderHistoryProviderRequestedFrom({
     requestedFrom: input.requestedFrom,
     requestedThrough: input.requestedThrough,
     observedAt,
     readAllOrdersGranted: readAllOrders,
+  })
+  // A frozen read_orders session can wait long enough for its entire sealed
+  // range to age beyond Shopify's current 60-day horizon. Account and scope
+  // verification above still make this a real read attempt; do not issue an
+  // inaccessible zero-width order query or turn the immutable session into a
+  // permanent retry loop.
+  if (providerRequestedFrom === null) {
+    return {
+      provider: 'shopify',
+      observations: [],
+      nextProviderCursor: null,
+      providerRowsSeen: 0,
+      providerReads: 2,
+      providerWrites: 0,
+      readAllOrdersScopeObserved: readAllOrders,
+      returnHistoryScopeObserved: readReturns,
+    }
+  }
+  const search = shopifyHistoricalOrderSearchWindow({
+    ...input,
+    requestedFrom: providerRequestedFrom,
   })
   const listData = await shopifyAdminGraphql<JsonRecord>(credential, {
     query: shopifyOrderHistoryListQuery(input.mode),

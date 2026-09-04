@@ -1433,6 +1433,19 @@ async function executeTransfer(
       )
     ).rows[0]
     await client.query(
+      `WITH frozen AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       )
+       SELECT $1::uuid, $2::uuid, 'shopify', 'new_orders_only',
+              frozen.at, frozen.at, $3
+       FROM frozen`,
+      [targetOrganization.id, targetAccount.id, config.actorEmail],
+    )
+    await client.query(
       `INSERT INTO operations_commerce_credentials (
          organization_id, integration_account_id, external_account_id,
          auth_mode, credential_ciphertext, credential_iv, credential_tag,

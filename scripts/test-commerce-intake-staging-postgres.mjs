@@ -90,6 +90,14 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           },
         }
       }
+      if (
+        specifier
+        === '@/lib/persistence/commerceOrderHistoryAdmission'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/persistence/commerceOrderHistoryAdmission.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceStoreSync') {
         return {
           async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
@@ -221,7 +229,7 @@ function orderFixture(input) {
       value: `gid://shopify/Order/${input.key}`,
     }),
     orderNumber: `POSTGRES-${input.key}`,
-    providerCreatedAt: observedAt,
+    providerCreatedAt: input.providerCreatedAt ?? observedAt,
     providerProcessedAt: observedAt,
     providerUpdatedAt: observedAt,
     providerCancelledAt: null,
@@ -1514,6 +1522,26 @@ async function seedCapturedRead(client, ids, envelope) {
          'brand-9202', 1, $3, $3
        )`,
       [ids.faireIntegrationAccount, ids.organization, actorEmail],
+    )
+    await client.query(
+      `WITH policy_clock AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       ) VALUES
+         ($1::uuid, $2::uuid, 'shopify', 'last_60_days',
+          (SELECT value - interval '60 days' FROM policy_clock),
+          (SELECT value FROM policy_clock), $4),
+         ($1::uuid, $3::uuid, 'faire', 'provider_all', NULL,
+          (SELECT value FROM policy_clock), $4)`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.faireIntegrationAccount,
+        actorEmail,
+      ],
     )
     await client.query(
       `INSERT INTO operations_commerce_store_sync_controls (
@@ -9667,29 +9695,150 @@ async function verifyAcceptance(databaseUrl) {
   await verifyAutomaticShopifyCleanPromotion(pool, ids, counters)
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
   await verifyForcedScopedOrderReconciliationClaim(pool)
+
+  const historyBoundaryRead = {
+    providerAttemptId: randomUUID(),
+    providerAttemptGlobalId: 'gxa000000009299',
+    readIntentId: randomUUID(),
+    sessionId: randomUUID(),
+    idempotencyKey: 'commerce-staging-postgres-history-boundary',
+    responseHash: hash('commerce-staging-history-boundary-response'),
+  }
+  const historyBoundarySeed = await pool.connect()
+  try {
+    await seedAdditionalCapturedRead(
+      historyBoundarySeed,
+      ids,
+      historyBoundaryRead,
+    )
+  } finally {
+    historyBoundarySeed.release()
+  }
+  const beforeFrozenFloor = '2025-01-01T00:00:00.000Z'
+  const knownOldOrder = Object.freeze({
+    ...envelope.orders[2],
+    providerCreatedAt: beforeFrozenFloor,
+    providerUpdatedAt: '2026-08-01T00:00:00.000Z',
+    sourceHash: hash('commerce-staging-known-old-revision'),
+    lines: Object.freeze(envelope.orders[2].lines.map((line) => Object.freeze({
+      ...line,
+      sourceHash: hash('commerce-staging-known-old-line-revision'),
+    }))),
+  })
+  const unknownOldOrder = orderFixture({
+    key: 'unknown-before-floor',
+    variantId: 'gid://shopify/ProductVariant/unknown-before-floor',
+    unitPrice: money(100, 'USD'),
+    unfulfilledQuantity: 1,
+    providerCreatedAt: beforeFrozenFloor,
+  })
+  counters.expectedImageStage = {
+    idempotencyKey: historyBoundaryRead.idempotencyKey,
+    readIntentId: historyBoundaryRead.readIntentId,
+  }
+  const historyBoundaryStageInput = {
+    ...stageInput,
+    idempotencyKey: historyBoundaryRead.idempotencyKey,
+    envelope: Object.freeze({
+      ...envelope,
+      sourceHash: hash('commerce-staging-history-boundary-envelope'),
+      products: Object.freeze([]),
+      orders: Object.freeze([knownOldOrder, unknownOldOrder]),
+      rejections: Object.freeze([]),
+    }),
+    page: {
+      ...stageInput.page,
+      sessionId: historyBoundaryRead.sessionId,
+      providerRowsSeen: 2,
+      eligibleOrdersSeen: 2,
+    },
+    readIntentId: historyBoundaryRead.readIntentId,
+    capturedResponseHash: historyBoundaryRead.responseHash,
+  }
+  const historyBoundaryResult = await persistence
+    .stageCommerceNormalizationEnvelopeInPostgres(historyBoundaryStageInput)
+  assert.equal(historyBoundaryResult.ordersStaged, 1)
+  assert.equal(historyBoundaryResult.historyExcludedOrders, 1)
+  assert.equal(historyBoundaryResult.recordsStaged, 1)
+  assert.equal(historyBoundaryResult.recordsRejected, 0)
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence.stageCommerceNormalizationEnvelopeInPostgres(
+        historyBoundaryStageInput,
+      ),
+    )),
+    {
+      ...JSON.parse(JSON.stringify(historyBoundaryResult)),
+      replayed: true,
+    },
+    'A mixed admitted/excluded intake page must replay its exact result',
+  )
+  const historyBoundaryEvidence = (
+    await pool.query(
+      `SELECT
+         count(*) FILTER (
+           WHERE external_order_id = $3
+         )::integer AS known_candidate_count,
+         count(*) FILTER (
+           WHERE external_order_id = $4
+         )::integer AS unknown_candidate_count,
+         count(*) FILTER (
+           WHERE run_id = (
+             SELECT id
+             FROM operations_commerce_intake_runs
+             WHERE organization_id = $1::uuid
+               AND integration_account_id = $2::uuid
+               AND global_id = $5
+           )
+         )::integer AS admitted_in_boundary_run
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        knownOldOrder.identity.value,
+        unknownOldOrder.identity.value,
+        historyBoundaryResult.runGlobalId,
+      ],
+    )
+  ).rows[0]
+  assert.deepEqual(historyBoundaryEvidence, {
+    known_candidate_count: 2,
+    unknown_candidate_count: 0,
+    admitted_in_boundary_run: 1,
+  })
   await pool.end()
 }
 
 async function main() {
-  command('docker', ['info'], { timeout: 30_000 })
-  const container = (
-    `clawpilot-commerce-staging-${process.pid}-${randomUUID().slice(0, 8)}`
-  )
+  const externalDatabaseUrl = String(
+    process.env.CLAWPILOT_COMMERCE_STAGING_DATABASE_URL || '',
+  ).trim()
+  if (!externalDatabaseUrl) {
+    command('docker', ['info'], { timeout: 30_000 })
+  }
+  const container = externalDatabaseUrl
+    ? null
+    : `clawpilot-commerce-staging-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    command('docker', [
-      'run', '--rm', '-d', '--name', container,
-      '-e', 'POSTGRES_PASSWORD=clawpilot_commerce_staging',
-      '-e', 'POSTGRES_DB=clawpilot_commerce_staging',
-      '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
-    const portOutput = command('docker', ['port', container, '5432/tcp'])
-    const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
-    assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
-    const databaseUrl = (
-      'postgresql://postgres:clawpilot_commerce_staging@127.0.0.1:'
-      + `${port}/clawpilot_commerce_staging`
-    )
+    let databaseUrl = externalDatabaseUrl
+    if (!databaseUrl) {
+      command('docker', [
+        'run', '--rm', '-d', '--name', container,
+        '-e', 'POSTGRES_PASSWORD=clawpilot_commerce_staging',
+        '-e', 'POSTGRES_DB=clawpilot_commerce_staging',
+        '-p', '127.0.0.1::5432',
+        'pgvector/pgvector:pg16',
+      ], { timeout: 180_000 })
+      const portOutput = command('docker', ['port', container, '5432/tcp'])
+      const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
+      assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
+      databaseUrl = (
+        'postgresql://postgres:clawpilot_commerce_staging@127.0.0.1:'
+        + `${port}/clawpilot_commerce_staging`
+      )
+    }
     await waitForPostgres(databaseUrl)
     command('node', ['scripts/db-migrate.mjs'], {
       env: { ...process.env, DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
@@ -9697,11 +9846,13 @@ async function main() {
     })
     await verifyAcceptance(databaseUrl)
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 20_000,
-    })
+    if (container) {
+      spawnSync('docker', ['stop', '-t', '1', container], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 20_000,
+      })
+    }
   }
   console.log(
     'Commerce intake staging, scaled-whole zero-price promotion, fractional '

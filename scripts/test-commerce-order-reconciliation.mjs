@@ -1614,9 +1614,8 @@ assert.ok(
   'Order reconciliation must not present scanned provider rows as orders added',
 )
 assert.ok(
-  !intakeSource.includes('updatedAtMin: page.windowStart')
-    && !intakeSource.includes('initialWindowStart'),
-  'Fresh Faire automatic polls must start as full current-order scans',
+  intakeSource.includes('updatedAtMin: page.windowStart'),
+  'Faire automatic polls must carry the immutable first-admission boundary',
 )
 assert.ok(
   intakeSource.includes('Shopify must grant read_orders for current operational intake'),

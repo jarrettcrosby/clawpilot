@@ -95,6 +95,10 @@ function loadSubjects(withTransaction) {
     CommerceOrderSyncError: class extends Error {
       constructor(code, message) { super(message); this.code = code }
     },
+    assessCommerceOrderHistoryAdmissionWithClient: async () => ({
+      admitted: true,
+      reason: 'known_provider_identity',
+    }),
     appendObservationsWithClient: async () => { throw boundary },
   })
   return { ...store, ...intake, ...history }
@@ -229,6 +233,10 @@ async function schema(pool) {
     CREATE TABLE operations_commerce_order_sync_policies (organization_id uuid,
       integration_account_id uuid, authority text, historical_observation_enabled boolean,
       continuous_observation_enabled boolean, revision integer);
+    CREATE TABLE operations_commerce_order_history_policies (organization_id uuid,
+      integration_account_id uuid, provider text, history_mode text,
+      ingestion_floor timestamptz, frozen_at timestamptz,
+      PRIMARY KEY(organization_id,integration_account_id));
     CREATE TABLE operations_commerce_order_backfill_sessions (id uuid PRIMARY KEY, global_id text,
       organization_id uuid, integration_account_id uuid, provider text, credential_generation integer,
       query_hash text, page_count integer, lock_token uuid, session_kind text, policy_revision integer,
@@ -260,21 +268,32 @@ async function schema(pool) {
   [ids.intent, ids.organization, ids.account, requestHash, ids.attempt, ids.token])
   await pool.query("INSERT INTO operations_commerce_order_sync_policies VALUES ($1,$2,'provider',true,true,1)",
     [ids.organization, ids.account])
+  await pool.query(`INSERT INTO operations_commerce_order_history_policies VALUES
+    ($1,$2,'shopify','new_orders_only','2026-09-01','2026-09-01')`,
+  [ids.organization, ids.account])
   await pool.query(`INSERT INTO operations_commerce_order_backfill_sessions VALUES
     ($1,'gcob1234567',$2,$3,'shopify',1,$4,0,$5,'historical_backfill',1,
       '2026-01-01','2026-09-01',NULL,'unknown','processing',clock_timestamp()+interval '1 hour')`,
   [ids.session, ids.organization, ids.account, queryHash, ids.token])
 }
 
-const container = `clawpilot-order-lock-test-${process.pid}-${randomUUID().slice(0, 8)}`
+const externalDatabaseUrl = String(
+  process.env.CLAWPILOT_COMMERCE_ORDER_LOCK_DATABASE_URL || '',
+).trim()
+const container = externalDatabaseUrl
+  ? null
+  : `clawpilot-order-lock-test-${process.pid}-${randomUUID().slice(0, 8)}`
 let pool
 try {
-  execFileSync('docker', ['run', '--rm', '-d', '--name', container,
-    '-e', 'POSTGRES_PASSWORD=lock_order_test', '-e', 'POSTGRES_DB=lock_order_test',
-    '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 180_000, stdio: 'pipe' })
-  const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8' }).match(/:(\d+)\s*$/u)?.[1]
-  assert.ok(port)
-  const url = `postgresql://postgres:lock_order_test@127.0.0.1:${port}/lock_order_test`
+  let url = externalDatabaseUrl
+  if (!url) {
+    execFileSync('docker', ['run', '--rm', '-d', '--name', container,
+      '-e', 'POSTGRES_PASSWORD=lock_order_test', '-e', 'POSTGRES_DB=lock_order_test',
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 180_000, stdio: 'pipe' })
+    const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8' }).match(/:(\d+)\s*$/u)?.[1]
+    assert.ok(port)
+    url = `postgresql://postgres:lock_order_test@127.0.0.1:${port}/lock_order_test`
+  }
   await waitForPostgres(url)
   pool = new Pool({ connectionString: url, max: 4, statement_timeout: 10_000 })
   await schema(pool)
@@ -302,5 +321,7 @@ try {
   console.log('Commerce order account/control lock ordering and fail-closed lease regression passed')
 } finally {
   if (pool) await pool.end()
-  spawnSync('docker', ['stop', '-t', '1', container], { timeout: 30_000, stdio: 'pipe' })
+  if (container) {
+    spawnSync('docker', ['stop', '-t', '1', container], { timeout: 30_000, stdio: 'pipe' })
+  }
 }

@@ -1770,6 +1770,7 @@ async function faireEnvelope(
       }
     : await listFaireOrders(options, {
         cursor: page.orderCursor,
+        updatedAtMin: page.windowStart,
         limit: FAIRE_ORDER_PAGE_SIZE,
       })
   const orderNodes = faireCollection(providerPage, 'orders')

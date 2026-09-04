@@ -42,6 +42,10 @@ import {
   type CommerceStoreSyncProviderReadLease,
 } from '@/lib/persistence/commerceStoreSync'
 import {
+  assessCommerceOrderHistoryAdmissionWithClient,
+  lockCommerceOrderHistoryAdmissionWithClient,
+} from '@/lib/persistence/commerceOrderHistoryAdmission'
+import {
   commerceOrderHistoryCompletionMeaning,
   commerceOrderHistoryCoverageBasis,
   commerceOrderHistoryRequestedFrom,
@@ -960,86 +964,52 @@ async function appendObservationsWithClient(
   context: ObservationPersistenceContext,
   values: readonly NormalizedObservation[],
 ) {
-  await client.query(
-    `WITH frozen AS (
-       SELECT date_trunc('milliseconds', clock_timestamp()) AS at
-     )
-     INSERT INTO operations_commerce_order_history_policies (
-       organization_id, integration_account_id, provider, history_mode,
-       ingestion_floor, frozen_at, configured_by
-     )
-     SELECT account.organization_id,
-            account.id,
-            account.provider,
-            CASE WHEN account.provider = 'shopify'
-              THEN 'last_60_days' ELSE 'provider_all' END,
-            CASE WHEN account.provider = 'shopify'
-              THEN frozen.at - interval '60 days' ELSE NULL END,
-            frozen.at,
-            NULL
-     FROM operations_integration_accounts account
-     CROSS JOIN frozen
-     WHERE account.organization_id = $1::uuid
-       AND account.id = $2::uuid
-       AND account.integration_type = 'commerce'
-       AND account.provider = $3
-     ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
-    [context.organizationId, context.integrationAccountId, context.provider],
-  )
-  const historyPolicy = (
-    await client.query<{
-      history_mode: CommerceOrderHistoryMode
-      ingestion_floor: Date | null
-    }>(
-      `SELECT history_mode, ingestion_floor
-       FROM operations_commerce_order_history_policies
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND provider = $3
-       LIMIT 1`,
-      [context.organizationId, context.integrationAccountId, context.provider],
+  let appended = 0
+  let preserved = 0
+  let linesAppended = 0
+  let eventsAppended = 0
+  for (const observation of [...values].sort((left, right) => (
+    left.externalOrderId.localeCompare(right.externalOrderId)
+  ))) {
+    let observationWasPreserved = false
+    // Serialize first materialization across intake, scheduled, manual, and
+    // webhook paths. Existing identities remain eligible for later provider
+    // revisions even when the order predates the frozen admission floor.
+    await lockCommerceOrderHistoryAdmissionWithClient(client, {
+      organizationId: context.organizationId,
+      integrationAccountId: context.integrationAccountId,
+      provider: context.provider,
+      externalOrderId: observation.externalOrderId,
+    })
+    const admission = await assessCommerceOrderHistoryAdmissionWithClient(
+      client,
+      {
+        organizationId: context.organizationId,
+        integrationAccountId: context.integrationAccountId,
+        provider: context.provider,
+        externalOrderId: observation.externalOrderId,
+        providerCreatedAt: observation.providerCreatedAt,
+        locksHeld: true,
+      },
     )
-  ).rows[0]
-  if (!historyPolicy) {
-    throw new CommerceOrderSyncError(
-      'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
-      'The immutable order-history policy is unavailable',
-      409,
-    )
-  }
-  const ingestionFloor = historyPolicy.ingestion_floor?.getTime() ?? null
-  const eligibleValues = values.filter((observation) => {
-    if (ingestionFloor === null) return true
-    const createdAt = observation.providerCreatedAt
-      ? new Date(observation.providerCreatedAt).getTime()
-      : Number.NaN
-    if (!Number.isFinite(createdAt)) {
+    if (admission.reason === 'policy_missing') {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+        'The immutable order-history policy is unavailable',
+        409,
+      )
+    }
+    if (admission.reason === 'provider_created_at_required') {
       throw new CommerceOrderSyncError(
         'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
         'Provider order creation time is required by the frozen history policy',
         409,
       )
     }
-    return createdAt >= ingestionFloor
-  })
-  let appended = 0
-  let preserved = 0
-  let linesAppended = 0
-  let eventsAppended = 0
-  for (const observation of eligibleValues) {
-    let observationWasPreserved = false
-    // Serialize one provider order across scheduled and exact-read workers.
+    if (!admission.admitted) continue
     // Content equality is compared only with the latest observation so a
     // truthful A -> B -> A state cycle remains appendable, while an unchanged
     // poll at a later observation clock remains a no-op.
-    await client.query(
-      `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-      [
-        `commerce-order-observation:${context.organizationId}`
-          + `:${context.integrationAccountId}:${context.provider}`
-          + `:${observation.externalOrderId}`,
-      ],
-    )
     const latestObservationRow = (
       await client.query<{
         id: string
@@ -1494,6 +1464,71 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
       authorityKind: 'manual_read_only',
       readKind: 'order_history',
     })
+    const admission = await assessCommerceOrderHistoryAdmissionWithClient(
+      client,
+      {
+        organizationId: input.organizationId,
+        integrationAccountId: input.integrationAccountId,
+        provider: input.provider,
+        externalOrderId: observation.externalOrderId,
+        providerCreatedAt: observation.providerCreatedAt,
+      },
+    )
+    if (admission.reason === 'policy_missing') {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+        'The immutable order-history policy is unavailable',
+        409,
+      )
+    }
+    if (admission.reason === 'provider_created_at_required') {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
+        'Provider order creation time is required by the frozen history policy',
+        409,
+      )
+    }
+    if (!admission.admitted) {
+      const excluded = await client.query(
+        `UPDATE operations_commerce_store_sync_read_leases
+         SET history_exclusion_code =
+               'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+             history_excluded_external_order_id = $4,
+             history_excluded_provider_created_at = $5::timestamptz
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+           AND authority_kind = 'manual_read_only'
+           AND read_kind = 'order_history'
+           AND captured_at IS NOT NULL
+           AND released_at IS NULL
+         RETURNING id`,
+        [
+          input.organizationId,
+          input.integrationAccountId,
+          input.providerReadLease.id,
+          observation.externalOrderId,
+          observation.providerCreatedAt,
+        ],
+      )
+      if (!excluded.rows[0]) {
+        throw new CommerceOrderSyncError(
+          'COMMERCE_ORDER_HISTORY_REPLAY_INVALID',
+          'The exact order-history exclusion could not be retained',
+          500,
+        )
+      }
+      return Object.freeze({
+        status: 'excluded' as const,
+        code: 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED' as const,
+        appended: 0,
+        preserved: 0,
+        linesAppended: 0,
+        eventsAppended: 0,
+        providerReads: observation.providerReadCount,
+        providerWrites: 0 as const,
+      })
+    }
     const persisted = await appendObservationsWithClient(client, {
       organizationId: input.organizationId,
       integrationAccountId: input.integrationAccountId,
@@ -1511,7 +1546,7 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
 }
 
 export type CommerceOrderWorkbenchExactReadReplay = {
-  status: 'captured' | 'unavailable' | 'in_progress'
+  status: 'captured' | 'unavailable' | 'in_progress' | 'excluded'
   code: string | null
   providerReads: 0
   providerWrites: 0
@@ -1556,11 +1591,20 @@ export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
     release_reason: 'completed' | 'failed' | 'expired' | null
     observation_id: string | null
     observation_external_order_id: string | null
+    history_exclusion_code: string | null
+    history_excluded_external_order_id: string | null
   }>(
     `SELECT lease.captured_at, lease.released_at, lease.release_reason,
+            lease.history_exclusion_code,
+            lease.history_excluded_external_order_id,
             observation.id::text AS observation_id,
             observation.external_order_id AS observation_external_order_id
      FROM operations_commerce_store_sync_read_leases lease
+     JOIN operations_integration_accounts account
+       ON account.organization_id = lease.organization_id
+      AND account.id = lease.integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider = $4
      LEFT JOIN operations_commerce_order_observations observation
        ON observation.organization_id = lease.organization_id
       AND observation.integration_account_id = lease.integration_account_id
@@ -1584,6 +1628,23 @@ export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
   )
   const retained = result.rows[0]
   if (!retained) return null
+  if (retained.history_exclusion_code) {
+    if (
+      retained.history_exclusion_code
+        !== 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED'
+      || retained.history_excluded_external_order_id
+        !== input.externalOrderId
+      || !retained.captured_at
+    ) {
+      return null
+    }
+    return {
+      status: 'excluded',
+      code: retained.history_exclusion_code,
+      providerReads: 0,
+      providerWrites: 0,
+    }
+  }
   if (retained.observation_id) {
     if (retained.observation_external_order_id !== input.externalOrderId) {
       return null
@@ -1652,32 +1713,6 @@ async function lockAccount(
   organizationId: string,
   accountGlobalId: string,
 ) {
-  await client.query(
-    `WITH frozen AS (
-       SELECT date_trunc('milliseconds', clock_timestamp()) AS at
-     )
-     INSERT INTO operations_commerce_order_history_policies (
-       organization_id, integration_account_id, provider, history_mode,
-       ingestion_floor, frozen_at, configured_by
-     )
-     SELECT account.organization_id,
-            account.id,
-            account.provider,
-            CASE WHEN account.provider = 'shopify'
-              THEN 'last_60_days' ELSE 'provider_all' END,
-            CASE WHEN account.provider = 'shopify'
-              THEN frozen.at - interval '60 days' ELSE NULL END,
-            frozen.at,
-            NULL
-     FROM operations_integration_accounts account
-     CROSS JOIN frozen
-     WHERE account.organization_id = $1::uuid
-       AND account.global_id = $2
-       AND account.integration_type = 'commerce'
-       AND account.provider IN ('shopify', 'faire')
-     ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
-    [organizationId, accountGlobalId],
-  )
   const result = await client.query<AccountRow>(
     `SELECT account.id::text AS integration_account_id,
             account.provider, account.status,
@@ -1701,7 +1736,7 @@ async function lockAccount(
       AND credential.credential_version = account.commerce_credential_generation
      LEFT JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
-     JOIN operations_commerce_order_history_policies history
+     LEFT JOIN operations_commerce_order_history_policies history
        ON history.organization_id = account.organization_id
       AND history.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid
@@ -1718,6 +1753,13 @@ async function lockAccount(
       'COMMERCE_ORDER_SYNC_ACCOUNT_NOT_FOUND',
       'The commerce connection is unavailable',
       404,
+    )
+  }
+  if (!account.order_history_mode || !account.order_history_frozen_at) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+      'The immutable order-history policy is unavailable',
+      409,
     )
   }
   return account
@@ -2924,7 +2966,14 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
         ? 15 * 60 * 1_000
         : 60 * 60 * 1_000
       const earliest = candidate.ingestion_floor?.getTime() || 0
-      const from = new Date(Math.max(highWatermark - overlapMs, earliest))
+      const providerReadableFloor = candidate.provider === 'shopify'
+        ? candidate.clock.getTime() - 60 * 24 * 60 * 60 * 1_000
+        : 0
+      const from = new Date(Math.max(
+        highWatermark - overlapMs,
+        earliest,
+        providerReadableFloor,
+      ))
         .toISOString()
       const coverageBasis = candidate.provider === 'shopify'
         ? 'shopify_updated_at_overlap'

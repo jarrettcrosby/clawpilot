@@ -14,7 +14,7 @@ CREATE TABLE operations_commerce_order_history_policies (
   )),
   ingestion_floor timestamptz,
   frozen_at timestamptz NOT NULL,
-  configured_by text REFERENCES app_users(email) ON DELETE SET NULL,
+  configured_by text REFERENCES app_users(email) ON DELETE RESTRICT,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (organization_id, integration_account_id),
   CONSTRAINT commerce_order_history_policy_account_fkey
@@ -59,6 +59,9 @@ BEGIN
 END;
 $$;
 
+ALTER FUNCTION protect_commerce_order_history_policy()
+  SET search_path = pg_catalog, public, pg_temp;
+
 CREATE TRIGGER commerce_order_history_policy_guard
 BEFORE INSERT OR UPDATE OR DELETE ON operations_commerce_order_history_policies
 FOR EACH ROW EXECUTE FUNCTION protect_commerce_order_history_policy();
@@ -73,10 +76,8 @@ INSERT INTO operations_commerce_order_history_policies (
 SELECT account.organization_id,
        account.id,
        account.provider,
-       CASE WHEN account.provider = 'shopify'
-         THEN 'last_60_days' ELSE 'provider_all' END,
-       CASE WHEN account.provider = 'shopify'
-         THEN frozen.at - interval '60 days' ELSE NULL END,
+       'new_orders_only',
+       frozen.at,
        frozen.at,
        NULL
 FROM operations_integration_accounts account
@@ -154,7 +155,7 @@ ALTER TABLE operations_commerce_order_backfill_sessions
       'faire_configured_history_window',
       'shopify_updated_at_overlap',
       'faire_updated_at_overlap_unfenced'
-    )),
+    )) NOT VALID,
   ADD CONSTRAINT commerce_order_backfill_completeness_state_check
     CHECK (completeness_state IN (
       'unknown',
@@ -164,7 +165,7 @@ ALTER TABLE operations_commerce_order_backfill_sessions
       'shopify_configured_window_read_attempt_complete',
       'faire_provider_available_orders_complete',
       'faire_configured_window_orders_complete'
-    )),
+    )) NOT VALID,
   ADD CONSTRAINT commerce_order_backfill_window_valid CHECK (
     (session_kind = 'historical_backfill'
       AND coverage_basis IN (
@@ -180,7 +181,7 @@ ALTER TABLE operations_commerce_order_backfill_sessions
     OR (session_kind = 'continuous_poll'
       AND requested_from IS NOT NULL
       AND requested_from <= requested_through)
-  ),
+  ) NOT VALID,
   ADD CONSTRAINT commerce_order_backfill_kind_valid CHECK (
     (provider = 'shopify' AND session_kind = 'historical_backfill'
       AND coverage_basis IN (
@@ -194,7 +195,7 @@ ALTER TABLE operations_commerce_order_backfill_sessions
       ))
     OR (provider = 'faire' AND session_kind = 'continuous_poll'
       AND coverage_basis = 'faire_updated_at_overlap_unfenced')
-  ),
+  ) NOT VALID,
   ADD CONSTRAINT commerce_order_backfill_completeness_valid CHECK (
     (completeness_state IN (
         'shopify_fixed_window_orders_complete',
@@ -220,4 +221,11 @@ ALTER TABLE operations_commerce_order_backfill_sessions
       AND session_kind = 'historical_backfill'
       AND status = 'succeeded')
     OR completeness_state = 'unknown'
-  );
+  ) NOT VALID;
+
+ALTER TABLE operations_commerce_order_backfill_sessions
+  VALIDATE CONSTRAINT commerce_order_backfill_coverage_basis_check,
+  VALIDATE CONSTRAINT commerce_order_backfill_completeness_state_check,
+  VALIDATE CONSTRAINT commerce_order_backfill_window_valid,
+  VALIDATE CONSTRAINT commerce_order_backfill_kind_valid,
+  VALIDATE CONSTRAINT commerce_order_backfill_completeness_valid;

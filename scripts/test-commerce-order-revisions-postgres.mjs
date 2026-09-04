@@ -173,6 +173,12 @@ export function loadTypeScriptModule(path, mocks = {}) {
       if (specifier === '@/lib/persistence/commerceOrderNativeActivity') {
         return loadTypeScriptModule('app_src/lib/persistence/commerceOrderNativeActivity.ts', mocks)
       }
+      if (specifier === '@/lib/persistence/commerceOrderHistoryAdmission') {
+        return loadTypeScriptModule(
+          'app_src/lib/persistence/commerceOrderHistoryAdmission.ts',
+          mocks,
+        )
+      }
       if (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits') {
         return loadTypeScriptModule('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts', mocks)
       }
@@ -2412,23 +2418,33 @@ async function verifyAcceptance(databaseUrl, ids, hashes) {
 }
 
 async function main() {
-  command('docker', ['info'], { timeout: 30_000 })
-  const container = `clawpilot-order-revision-${process.pid}-${randomUUID().slice(0, 8)}`
+  const externalDatabaseUrl = String(
+    process.env.CLAWPILOT_COMMERCE_ORDER_REVISIONS_DATABASE_URL || '',
+  ).trim()
+  if (!externalDatabaseUrl) {
+    command('docker', ['info'], { timeout: 30_000 })
+  }
+  const container = externalDatabaseUrl
+    ? null
+    : `clawpilot-order-revision-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    command('docker', [
-      'run', '--rm', '-d', '--name', container,
-      '-e', 'POSTGRES_PASSWORD=commerce_order_revision',
-      '-e', 'POSTGRES_DB=commerce_order_revision',
-      '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
-    const portOutput = command('docker', ['port', container, '5432/tcp'])
-    const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
-    assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
-    const databaseUrl = (
-      'postgresql://postgres:commerce_order_revision@127.0.0.1:'
-      + `${port}/commerce_order_revision`
-    )
+    let databaseUrl = externalDatabaseUrl
+    if (!databaseUrl) {
+      command('docker', [
+        'run', '--rm', '-d', '--name', container,
+        '-e', 'POSTGRES_PASSWORD=commerce_order_revision',
+        '-e', 'POSTGRES_DB=commerce_order_revision',
+        '-p', '127.0.0.1::5432',
+        'pgvector/pgvector:pg16',
+      ], { timeout: 180_000 })
+      const portOutput = command('docker', ['port', container, '5432/tcp'])
+      const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
+      assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
+      databaseUrl = (
+        'postgresql://postgres:commerce_order_revision@127.0.0.1:'
+        + `${port}/commerce_order_revision`
+      )
+    }
     await waitForPostgres(databaseUrl)
     const pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const client = await pool.connect()
@@ -2458,11 +2474,13 @@ async function main() {
     }
     await verifyAcceptance(databaseUrl, ids, hashes)
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 20_000,
-    })
+    if (container) {
+      spawnSync('docker', ['stop', '-t', '1', container], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 20_000,
+      })
+    }
   }
   console.log('Commerce order revision disposable-PostgreSQL acceptance passed')
 }

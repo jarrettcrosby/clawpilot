@@ -223,6 +223,19 @@ async function verifyAllAccountHistoryRefreshScheduling(pool, persistence) {
         actorEmail,
       ],
     )
+    await pool.query(
+      `WITH policy_clock AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       )
+       SELECT $1::uuid, $2::uuid, $3, 'new_orders_only',
+              policy_clock.value, policy_clock.value, $4
+       FROM policy_clock`,
+      [organizationId, fixture.id, fixture.provider, actorEmail],
+    )
   }
 
   const resume = fixtures.find((fixture) => fixture.key === 'resume')
@@ -1009,6 +1022,27 @@ async function verify(databaseUrl, ids) {
   const lockTwo = randomUUID()
   try {
     await verifyHistoryFollowupMigrationSchema(pool)
+    const historyPolicyFixture = await pool.connect()
+    try {
+      await historyPolicyFixture.query('BEGIN')
+      await historyPolicyFixture.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      await historyPolicyFixture.query(
+        `UPDATE operations_commerce_order_history_policies
+         SET history_mode = 'last_60_days',
+             ingestion_floor = frozen_at - interval '60 days'
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [ids.organization, ids.integration],
+      )
+      await historyPolicyFixture.query('COMMIT')
+    } catch (error) {
+      await historyPolicyFixture.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      historyPolicyFixture.release()
+    }
     await pool.query(
       `INSERT INTO app_user_organization_memberships (
          user_email, organization_id, role, status, is_default,
@@ -1058,6 +1092,19 @@ async function verify(databaseUrl, ids) {
          ($1::uuid, $3::uuid, true, true, 'scheduled_poll',
           'processor_pending', 1, $4, $4)`,
       [ids.organization, ids.integration, accountTwo, actorEmail],
+    )
+    await pool.query(
+      `WITH policy_clock AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       )
+       SELECT $1::uuid, $2::uuid, 'faire', 'last_60_days',
+              policy_clock.value - interval '60 days', policy_clock.value, $3
+       FROM policy_clock`,
+      [ids.organization, accountTwo, actorEmail],
     )
     const invalidSessionBase = `INSERT INTO operations_commerce_order_backfill_sessions (
       organization_id, integration_account_id, provider, session_kind,
@@ -1692,6 +1739,8 @@ async function verify(databaseUrl, ids) {
         },
       })
     assert.deepEqual(JSON.parse(JSON.stringify(beforeFloorAppend)), {
+      status: 'excluded',
+      code: 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
       appended: 0,
       preserved: 0,
       linesAppended: 0,
@@ -1707,6 +1756,114 @@ async function verify(databaseUrl, ids) {
          AND external_order_id = $3`,
       [ids.organization, ids.integration, beforeFloorExternalOrderId],
     )).rows[0].count), 0, 'Orders created before the frozen floor must not materialize')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+          organizationId: ids.organization,
+          integrationAccountId: ids.integration,
+          provider: 'shopify',
+          externalOrderId: beforeFloorExternalOrderId,
+          intentKey: beforeFloorLease.intentKey,
+        }),
+      )),
+      {
+        status: 'excluded',
+        code: 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+        providerReads: 0,
+        providerWrites: 0,
+      },
+      'A history-floor exclusion must replay without another provider read',
+    )
+    assert.equal(
+      await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        provider: 'shopify',
+        externalOrderId: `${beforeFloorExternalOrderId}-different`,
+        intentKey: beforeFloorLease.intentKey,
+      }),
+      null,
+      'A retained exclusion must remain bound to the exact provider order',
+    )
+    assert.equal(
+      await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        provider: 'faire',
+        externalOrderId: beforeFloorExternalOrderId,
+        intentKey: beforeFloorLease.intentKey,
+      }),
+      null,
+      'A retained exclusion must remain bound to the account provider',
+    )
+    await rejection(
+      pool.query(
+        `UPDATE operations_commerce_store_sync_read_leases
+         SET history_excluded_external_order_id = $2
+         WHERE id = $1::uuid`,
+        [beforeFloorLease.id, `${beforeFloorExternalOrderId}-forged`],
+      ),
+      /Order-history exclusion evidence is immutable/u,
+    )
+    const knownOldLease = await createAdditionalManualLease(
+      'manual-exact-order-history-known-before-floor-update',
+    )
+    const knownOldObservedAt = new Date().toISOString()
+    const knownOldAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        accountGlobalId: 'gia0009301',
+        provider: 'shopify',
+        credentialGeneration: 1,
+        externalOrderId: manualExternalOrderId,
+        providerReadLease: {
+          id: knownOldLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256: knownOldLease.intentFingerprintSha256,
+          controlRevision: knownOldLease.control_revision,
+          activationRevision: knownOldLease.activation_revision,
+          expiresAt: knownOldLease.expires_at.toISOString(),
+        },
+        observation: {
+          ...manualObservation,
+          sourceRevision: 'known-before-floor-provider-revision-v2',
+          sourceHash: evidenceHash(
+            'known-before-floor-provider-revision-v2',
+          ),
+          providerCreatedAt: new Date(
+            Date.now() - 90 * 24 * 60 * 60 * 1_000,
+          ).toISOString(),
+          providerUpdatedAt: knownOldObservedAt,
+          providerClosedAt: knownOldObservedAt,
+          observedAt: knownOldObservedAt,
+          lines: [{
+            ...manualObservation.lines[0],
+            currentQuantity: 4,
+            fulfilledQuantity: 4,
+          }],
+          events: [{
+            externalEventId: 'manual-9402-tracking-v2',
+            externalSubjectId: 'manual-9402-shipment',
+            eventKind: 'tracking_updated',
+            eventStatus: 'delivered',
+            inventoryEffectKind: 'none',
+            attributionSource: 'provider_system',
+            trackingCarrier: 'USPS',
+            trackingNumber: '9400111899223856928505',
+            occurredAt: knownOldObservedAt,
+          }],
+        },
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(knownOldAppend)), {
+      appended: 1,
+      preserved: 0,
+      linesAppended: 1,
+      eventsAppended: 1,
+      providerReads: 3,
+      providerWrites: 0,
+    }, 'A known provider identity must retain later facts even when created before the floor')
     const sameFactLease = await createAdditionalManualLease(
       'manual-exact-order-history-same-facts',
     )
@@ -1814,7 +1971,12 @@ async function verify(databaseUrl, ids) {
          ORDER BY manual_provider_read_lease_id::text`,
         [ids.organization, ids.integration, manualExternalOrderId],
       )).rows.map((row) => row.lease_id),
-      [manualLease.id, sameFactLease.id, delayedOlderLease.id].sort(),
+      [
+        manualLease.id,
+        knownOldLease.id,
+        sameFactLease.id,
+        delayedOlderLease.id,
+      ].sort(),
       'Every exact command must retain one independently replayable observation',
     )
     const faireManualIntentKey = 'manual-exact-faire-order-history'
@@ -2088,8 +2250,8 @@ async function verify(databaseUrl, ids) {
       fulfilledQuantity: line.fulfilledQuantity,
     })), [{
       originalQuantity: 7,
-      currentQuantity: 5,
-      fulfilledQuantity: 5,
+      currentQuantity: 4,
+      fulfilledQuantity: 4,
     }], 'Workbench history must stay anchored to the latest exact observation')
     assert.equal(
       exactTimeline.items.some(
@@ -2328,16 +2490,40 @@ async function verify(databaseUrl, ids) {
       }),
       /wrong observation kind/u,
     )
-    await persistence.appendCommerceOrderBackfillPageInPostgres({
-      job: continuousJob,
-      pageNumber: 1,
-      providerRecordsSeen: 1,
-      observations: [historyOnlyObservation],
-      hasNextPage: false,
-      nextProviderCursor: null,
-      readAllOrdersScopeObserved: null,
-      returnHistoryScopeObserved: null,
-    })
+    const knownOldContinuousObservation = {
+      ...faireObservation,
+      observationKind: 'scheduled_poll',
+      sourceRevision: 'known-before-floor-continuous-revision-v2',
+      sourceHash: evidenceHash(
+        'known-before-floor-continuous-revision-v2',
+      ),
+      providerCreatedAt: new Date(
+        Date.now() - 90 * 24 * 60 * 60 * 1_000,
+      ).toISOString(),
+      providerUpdatedAt: sessionTwo.requested_through.toISOString(),
+      providerClosedAt: sessionTwo.requested_through.toISOString(),
+      observedAt: sessionTwo.requested_through.toISOString(),
+      events: [],
+    }
+    const continuousPage = await persistence
+      .appendCommerceOrderBackfillPageInPostgres({
+        job: continuousJob,
+        pageNumber: 1,
+        providerRecordsSeen: 2,
+        observations: [
+          historyOnlyObservation,
+          knownOldContinuousObservation,
+        ],
+        hasNextPage: false,
+        nextProviderCursor: null,
+        readAllOrdersScopeObserved: null,
+        returnHistoryScopeObserved: null,
+      })
+    assert.equal(
+      continuousPage.appended,
+      2,
+      'Scheduled polling must retain changed known orders before the floor',
+    )
     const faireHistoricalSession = (await pool.query(
       `INSERT INTO operations_commerce_order_backfill_sessions (
          organization_id, integration_account_id, provider, session_kind,
@@ -3951,6 +4137,19 @@ async function verify(databaseUrl, ids) {
           account.credentialGeneration,
         ],
       )
+      await pool.query(
+        `WITH policy_clock AS (
+           SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+         )
+         INSERT INTO operations_commerce_order_history_policies (
+           organization_id, integration_account_id, provider, history_mode,
+           ingestion_floor, frozen_at, configured_by
+         )
+         SELECT $1::uuid, $2::uuid, $3, 'new_orders_only',
+                policy_clock.value, policy_clock.value, $4
+         FROM policy_clock`,
+        [ids.organization, account.id, account.provider, actorEmail],
+      )
       if (account.webhookAvailable) {
         await pool.query(
           `INSERT INTO operations_commerce_order_sync_policies (
@@ -4033,19 +4232,29 @@ async function verify(databaseUrl, ids) {
 }
 
 async function main() {
-  command('docker', ['info'], { timeout: 30_000 })
-  const container = `clawpilot-order-sync-${process.pid}-${randomUUID().slice(0, 8)}`
+  const externalDatabaseUrl = String(
+    process.env.CLAWPILOT_COMMERCE_ORDER_SYNC_DATABASE_URL || '',
+  ).trim()
+  if (!externalDatabaseUrl) {
+    command('docker', ['info'], { timeout: 30_000 })
+  }
+  const container = externalDatabaseUrl
+    ? null
+    : `clawpilot-order-sync-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    command('docker', [
-      'run', '--rm', '-d', '--name', container,
-      '-e', 'POSTGRES_PASSWORD=commerce_order_sync',
-      '-e', 'POSTGRES_DB=commerce_order_sync',
-      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
-    const portOutput = command('docker', ['port', container, '5432/tcp'])
-    const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
-    assert.ok(port > 0)
-    const databaseUrl = `postgresql://postgres:commerce_order_sync@127.0.0.1:${port}/commerce_order_sync`
+    let databaseUrl = externalDatabaseUrl
+    if (!databaseUrl) {
+      command('docker', [
+        'run', '--rm', '-d', '--name', container,
+        '-e', 'POSTGRES_PASSWORD=commerce_order_sync',
+        '-e', 'POSTGRES_DB=commerce_order_sync',
+        '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
+      ], { timeout: 180_000 })
+      const portOutput = command('docker', ['port', container, '5432/tcp'])
+      const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
+      assert.ok(port > 0)
+      databaseUrl = `postgresql://postgres:commerce_order_sync@127.0.0.1:${port}/commerce_order_sync`
+    }
     await waitForPostgres(databaseUrl)
     const pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const client = await pool.connect()
@@ -4070,9 +4279,11 @@ async function main() {
     }
     await verify(databaseUrl, ids)
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root, encoding: 'utf8', timeout: 20_000,
-    })
+    if (container) {
+      spawnSync('docker', ['stop', '-t', '1', container], {
+        cwd: root, encoding: 'utf8', timeout: 20_000,
+      })
+    }
   }
   console.log('Commerce order sync disposable-PostgreSQL acceptance passed')
 }

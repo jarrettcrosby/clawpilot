@@ -1600,8 +1600,13 @@ export default function CommerceIntegrationPanel({
   }
 
   const shopifyAccount = integrations.accounts.find(
-    (account) => account.provider === 'shopify' && account.configured,
-  ) || integrations.accounts.find((account) => account.provider === 'shopify')
+    (account) => account.provider === 'shopify'
+      && account.environment === shopify.environment
+      && account.configured,
+  ) || integrations.accounts.find((account) => (
+    account.provider === 'shopify'
+    && account.environment === shopify.environment
+  ))
   const faireAccount = integrations.accounts.find(
     (account) => account.provider === 'faire' && account.configured,
   ) || integrations.accounts.find((account) => account.provider === 'faire')
@@ -2377,7 +2382,8 @@ export default function CommerceIntegrationPanel({
               <Typography variant="caption" color="text.secondary">
                 This cutoff is frozen on the first connection and remains the
                 same if credentials are reconnected. Start history and Refresh
-                will never import orders created before it.
+                will not first import unknown orders created before it;
+                already-retained orders can still receive provider updates.
               </Typography>
               <TextField
                 required
@@ -2768,7 +2774,8 @@ export default function CommerceIntegrationPanel({
               <Typography variant="caption" color="text.secondary">
                 This cutoff is frozen on the first connection and remains the
                 same if credentials are reconnected. Start history and Refresh
-                will never import orders created before it.
+                will not first import unknown orders created before it;
+                already-retained orders can still receive provider updates.
               </Typography>
               {faire.authPath === 'brand_api_key' ? (
                 <TextField
