@@ -33,10 +33,26 @@ import {
   purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
 import {
+  commerceStorageMaintenanceFailureResult,
   maintainCommerceStorageInPostgres,
 } from '@/lib/persistence/commerceStorageMaintenance'
 
 const PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE = 250
+
+async function maintainOrderCommerceStorageSafely() {
+  try {
+    return await maintainCommerceStorageInPostgres({
+      intakeLimit: 1000,
+      legacyCaptureLimit: 25,
+      inventorySnapshotLimit: 250,
+      inventoryAliasLimit: 5000,
+      inventoryLevelLimit: 10000,
+      workerId: 'commerce-order-reconciliation',
+    })
+  } catch (error) {
+    return commerceStorageMaintenanceFailureResult(error)
+  }
+}
 
 function deterministicRunUuid(input: {
   organizationId: string
@@ -302,11 +318,7 @@ export async function processCommerceOrderReconciliation(input: {
     await purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres({
       limit: PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE,
     })
-  const commerceStorageMaintenance = await maintainCommerceStorageInPostgres({
-    intakeLimit: 1000,
-    legacyCaptureLimit: 25,
-    inventoryLevelLimit: 10000,
-  })
+  const commerceStorageMaintenance = await maintainOrderCommerceStorageSafely()
   if (!commerceReadRuntimeAvailable()) {
     return {
       skipped: true,

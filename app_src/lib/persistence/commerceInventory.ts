@@ -1329,7 +1329,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
        ON CONFLICT (
          organization_id, integration_account_id, provider_location_id,
          adapter_version, snapshot_hash
-       ) DO NOTHING`,
+       ) WHERE snapshot_content IS NOT NULL DO NOTHING`,
       [
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
@@ -1352,6 +1352,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
          AND provider_location_id = $4
          AND snapshot_hash = $5
          AND level_count = $6
+         AND payload_purged_at IS NULL
          AND snapshot_content = $7::jsonb
          AND content_bytes = $8
        LIMIT 1`,

@@ -85,8 +85,25 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           async maintainCommerceStorageInPostgres() {
             return {
               schemaAvailable: true,
+              executed: false,
+              status: 'not_due',
+              errorCode: null,
               intakePayloads: { rows: 0, bytes: 0 },
               legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+          commerceStorageMaintenanceFailureResult(error) {
+            return {
+              schemaAvailable: false,
+              executed: false,
+              status: 'failed',
+              errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
               inventoryObservationAliases: { rows: 0, bytes: 0 },
               inventoryLevels: { rows: 0, bytes: 0 },
             }
@@ -957,10 +974,27 @@ const worker = loadTypeScriptModule(
           trace.storageMaintenance.push(input)
           return {
             schemaAvailable: true,
+            executed: true,
+            status: 'completed',
+            errorCode: null,
             intakePayloads: { rows: 1000, bytes: 8192 },
             legacyInventoryCaptures: { rows: 25, bytes: 4096 },
+            inventorySnapshotPayloads: { rows: 250, bytes: 16384 },
             inventoryObservationAliases: { rows: 1000, bytes: 4096 },
             inventoryLevels: { rows: 5000, bytes: 65536 },
+          }
+        },
+        commerceStorageMaintenanceFailureResult(error) {
+          return {
+            schemaAvailable: false,
+            executed: false,
+            status: 'failed',
+            errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
           }
         },
       },
@@ -1004,15 +1038,25 @@ assert.deepEqual(JSON.parse(JSON.stringify(trace.storageMaintenance)), [
   {
     intakeLimit: 1000,
     legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
     inventoryLevelLimit: 10000,
+    workerId: 'worker-one:commerce-storage',
   },
   {
     intakeLimit: 1000,
     legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
     inventoryLevelLimit: 10000,
+    workerId: 'worker-one:commerce-storage',
   },
 ])
 assert.equal(completed.commerceStorageMaintenance.inventoryLevels.rows, 10000)
+assert.equal(
+  completed.commerceStorageMaintenance.inventorySnapshotPayloads.rows,
+  500,
+)
 assert.equal(trace.sync.length, 1)
 assert.equal(trace.claim.length, 1)
 assert.equal(trace.claim[0].limit, 1)
@@ -1145,6 +1189,61 @@ assert.equal(leaseTrace.fail.length, 1)
 assert.equal(
   leaseTrace.fail[0].error.code,
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+)
+
+let claimsAfterMaintenanceFailure = 0
+const maintenanceFailureWorker = loadTypeScriptModule(
+  'app_src/lib/shopifyInventoryRefreshWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceInventory': {
+        async syncShopifyInventory() {
+          assert.fail('no job should be available in this scenario')
+        },
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres() {
+          const error = new Error('simulated maintenance failure')
+          error.code = 'SIMULATED_STORAGE_FAILURE'
+          throw error
+        },
+        commerceStorageMaintenanceFailureResult(error) {
+          return {
+            schemaAvailable: false,
+            executed: false,
+            status: 'failed',
+            errorCode: error.code,
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
+          }
+        },
+      },
+      '@/lib/persistence/shopifyInventoryRefresh': {
+        async queueAutomaticShopifyInventoryRefreshesInPostgres() {
+          return { queued: 0, cancelled: 0 }
+        },
+        async claimShopifyInventoryRefreshJobsInPostgres() {
+          claimsAfterMaintenanceFailure += 1
+          return []
+        },
+      },
+    },
+  },
+)
+const maintenanceIsolated =
+  await maintenanceFailureWorker.processShopifyInventoryRefreshOutbox({
+    limit: 1,
+    workerId: 'worker-maintenance-failure',
+  })
+assert.equal(claimsAfterMaintenanceFailure, 1)
+assert.equal(maintenanceIsolated.claimed, 0)
+assert.equal(maintenanceIsolated.commerceStorageMaintenance.status, 'failed')
+assert.equal(
+  maintenanceIsolated.commerceStorageMaintenance.errorCode,
+  'SIMULATED_STORAGE_FAILURE',
 )
 
 const route = read(

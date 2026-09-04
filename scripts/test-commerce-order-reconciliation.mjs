@@ -90,8 +90,25 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
             commerceStorageMaintenanceTrace.push(input)
             return {
               schemaAvailable: true,
+              executed: false,
+              status: 'not_due',
+              errorCode: null,
               intakePayloads: { rows: 0, bytes: 0 },
               legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+          commerceStorageMaintenanceFailureResult(error) {
+            return {
+              schemaAvailable: false,
+              executed: false,
+              status: 'failed',
+              errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
               inventoryObservationAliases: { rows: 0, bytes: 0 },
               inventoryLevels: { rows: 0, bytes: 0 },
             }
@@ -1701,7 +1718,10 @@ assert.deepEqual(
   {
     intakeLimit: 1000,
     legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
     inventoryLevelLimit: 10000,
+    workerId: 'commerce-order-reconciliation',
   },
   'Permanent commerce storage maintenance must run every reconciliation cycle',
 )

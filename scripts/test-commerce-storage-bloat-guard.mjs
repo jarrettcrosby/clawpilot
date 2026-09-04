@@ -16,6 +16,18 @@ for (const contract of [
   'FOR UPDATE SKIP LOCKED',
   'level_set_hash',
   'source_level_set_run_id',
+  'operations_provider_commitment_current_support',
+  'latest_run.source_level_set_run_id, latest_run.id',
+  'payload_purged_at',
+  'purge_operations_commerce_inventory_snapshot_payloads',
+  'operations_commerce_inventory_snapshot_content_is_purgeable',
+  'inventorySnapshotPayloadBacklogRows',
+  'inventorySnapshotContentStorageBytes',
+  'inventorySnapshotLivePayloadHardCapPerAccountLocation',
+  'inventorySnapshotLivePayloadSoftCapAfter30Days',
+  'operations_commerce_storage_maintenance_lanes',
+  'claim_operations_commerce_storage_maintenance',
+  'complete_operations_commerce_storage_maintenance',
   'purge_operations_commerce_inventory_observation_aliases',
   'purge_operations_commerce_inventory_level_evidence',
   'convert_operations_commerce_inventory_legacy_captures',
@@ -43,6 +55,14 @@ assert.match(
 assert.match(
   migration,
   /ranked\.evidence_rank > 128[\s\S]*DELETE FROM operations_commerce_inventory_levels/,
+)
+assert.match(
+  migration,
+  /payload_rank > 32[\s\S]*snapshot_content = NULL,[\s\S]*payload_purged_at = now\(\)/,
+)
+assert.match(
+  migration,
+  /latest_run\.id[\s\S]*level\.sync_run_id = COALESCE\([\s\S]*latest_run\.source_level_set_run_id, latest_run\.id/,
 )
 
 const intake = read('app_src/lib/persistence/commerceIntake.ts')
@@ -88,15 +108,33 @@ for (const worker of [
 }
 assert.match(maintenance, /inventoryLevelLimit,[\s\S]*10000/)
 assert.match(maintenance, /input\.inventoryLevelLimit,[\s\S]*10000,[\s\S]*10000/)
+assert.match(maintenance, /LEVEL_PURGE_PASSES_PER_LEASE = 12/)
+assert.match(maintenance, /claim_operations_commerce_storage_maintenance/)
+assert.match(maintenance, /purge_operations_commerce_inventory_snapshot_payloads/)
+assert.match(maintenance, /status: 'failed'/)
 
 const inventoryRefreshWorker = read(
   'app_src/lib/shopifyInventoryRefreshWorker.ts',
 )
 assert.match(
   inventoryRefreshWorker,
-  /syncShopifyInventory\([\s\S]*await maintainCommerceStorageInPostgres/,
+  /syncShopifyInventory\([\s\S]*await maintainInventoryCommerceStorageSafely/,
   'Inventory refresh must run bounded storage maintenance after a committed snapshot',
 )
+
+const canonicalPlanningPostgres = read(
+  'scripts/test-canonical-fulfillment-planning-postgres.mjs',
+)
+for (const contract of [
+  'appendUnchangedShopifyInventoryObservation',
+  'source_level_set_run_id',
+  "SET status = 'consumed', released_at = now()",
+]) {
+  assert.ok(
+    canonicalPlanningPostgres.includes(contract),
+    `Canonical provider-commitment acceptance is missing ${contract}`,
+  )
+}
 
 const operations = read('app_src/lib/persistence/operations.ts')
 for (const contract of [
@@ -110,9 +148,12 @@ for (const contract of [
     `Operations planning is missing alias/source evidence contract ${contract}`,
   )
 }
-assert.ok(
-  read('app_src/app/api/health/route.ts')
-    .includes('readCommerceStorageBloatHealthFromPostgres'),
+const healthRoute = read('app_src/app/api/health/route.ts')
+assert.ok(healthRoute.includes('readCommerceStorageBloatHealthFromPostgres'))
+assert.match(
+  healthRoute,
+  /const backlog = \[[\s\S]*inventorySnapshotPayloadBacklogRows[\s\S]*commerceStorage\.status/,
+  'Health readiness must count raw inventory snapshot payload backlog',
 )
 
 console.log('commerce storage bloat guard contracts passed')

@@ -487,6 +487,576 @@ BEFORE INSERT ON operations_commerce_inventory_levels
 FOR EACH ROW EXECUTE FUNCTION
   reject_operations_commerce_inventory_level_for_alias();
 
+-- Provider commitments continue to use the newest observation for freshness,
+-- but an unchanged observation owns no duplicate levels. Resolve the effective
+-- immutable level-set run while returning the alias run as the latest proof.
+CREATE OR REPLACE FUNCTION operations_provider_commitment_current_support(
+  p_organization_id uuid,
+  p_reservation_id uuid,
+  p_position_id uuid DEFAULT NULL,
+  p_order_id uuid DEFAULT NULL,
+  p_order_line_id uuid DEFAULT NULL,
+  p_quantity numeric DEFAULT NULL,
+  p_status text DEFAULT NULL,
+  p_provider_inventory_sync_run_id uuid DEFAULT NULL,
+  p_provider_inventory_level_id uuid DEFAULT NULL
+)
+RETURNS TABLE (
+  reservation_id uuid,
+  latest_inventory_sync_run_id uuid,
+  latest_inventory_sync_run_global_id text,
+  latest_inventory_level_global_ids text[],
+  latest_provider_committed_quantity numeric(20,6),
+  active_claimed_quantity numeric(20,6),
+  position_on_hand_quantity numeric(20,6),
+  position_reserved_quantity numeric(20,6),
+  supported boolean,
+  reason_code text
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  stored_reservation operations_reservations%ROWTYPE;
+  source_order operations_orders%ROWTYPE;
+  source_line operations_order_lines%ROWTYPE;
+  source_position operations_inventory_positions%ROWTYPE;
+  source_run operations_commerce_inventory_sync_runs%ROWTYPE;
+  source_level operations_commerce_inventory_levels%ROWTYPE;
+  latest_run operations_commerce_inventory_sync_runs%ROWTYPE;
+  context_position_id uuid;
+  context_order_id uuid;
+  context_order_line_id uuid;
+  context_quantity numeric(20,6);
+  context_status text;
+  context_sync_run_id uuid;
+  context_level_id uuid;
+  candidate_level_count integer := 0;
+  valid_level_count integer := 0;
+  invalid_level_count integer := 0;
+  latest_committed numeric(20,6) := 0;
+  latest_available numeric(20,6) := 0;
+  other_active_claims numeric(20,6) := 0;
+  total_active_claims numeric(20,6) := 0;
+  latest_level_global_ids text[] := ARRAY[]::text[];
+  result_supported boolean := false;
+  result_reason text := 'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_MISSING';
+BEGIN
+  SELECT * INTO stored_reservation
+  FROM operations_reservations reservation
+  WHERE reservation.organization_id = p_organization_id
+    AND reservation.id = p_reservation_id;
+
+  IF stored_reservation.id IS NOT NULL THEN
+    IF stored_reservation.reservation_authority
+         IS DISTINCT FROM 'provider_commitment' THEN
+      RETURN QUERY SELECT
+        p_reservation_id, NULL::uuid, NULL::text, ARRAY[]::text[],
+        0::numeric(20,6), 0::numeric(20,6),
+        NULL::numeric(20,6), NULL::numeric(20,6), false,
+        'SHOPIFY_INVENTORY_NOT_PROVIDER_COMMITMENT'::text;
+      RETURN;
+    END IF;
+    context_position_id := stored_reservation.position_id;
+    context_order_id := stored_reservation.order_id;
+    context_order_line_id := stored_reservation.order_line_id;
+    context_quantity := stored_reservation.quantity;
+    context_status := stored_reservation.status;
+    context_sync_run_id :=
+      stored_reservation.provider_inventory_sync_run_id;
+    context_level_id := stored_reservation.provider_inventory_level_id;
+  ELSE
+    context_position_id := p_position_id;
+    context_order_id := p_order_id;
+    context_order_line_id := p_order_line_id;
+    context_quantity := p_quantity;
+    context_status := p_status;
+    context_sync_run_id := p_provider_inventory_sync_run_id;
+    context_level_id := p_provider_inventory_level_id;
+  END IF;
+
+  IF context_position_id IS NULL
+     OR context_order_id IS NULL
+     OR context_order_line_id IS NULL
+     OR context_quantity IS NULL
+     OR context_quantity <= 0
+     OR context_status IS NULL
+     OR context_sync_run_id IS NULL
+     OR context_level_id IS NULL THEN
+    RETURN QUERY SELECT
+      p_reservation_id, NULL::uuid, NULL::text, ARRAY[]::text[],
+      0::numeric(20,6), 0::numeric(20,6),
+      NULL::numeric(20,6), NULL::numeric(20,6), false,
+      result_reason;
+    RETURN;
+  END IF;
+
+  SELECT * INTO source_position
+  FROM operations_inventory_positions position
+  WHERE position.organization_id = p_organization_id
+    AND position.id = context_position_id;
+  SELECT * INTO source_order
+  FROM operations_orders source
+  WHERE source.organization_id = p_organization_id
+    AND source.id = context_order_id;
+  SELECT * INTO source_line
+  FROM operations_order_lines line
+  WHERE line.organization_id = p_organization_id
+    AND line.id = context_order_line_id;
+  SELECT * INTO source_run
+  FROM operations_commerce_inventory_sync_runs run
+  WHERE run.organization_id = p_organization_id
+    AND run.id = context_sync_run_id;
+  SELECT * INTO source_level
+  FROM operations_commerce_inventory_levels level
+  WHERE level.organization_id = p_organization_id
+    AND level.sync_run_id = context_sync_run_id
+    AND level.id = context_level_id
+    AND level.inventory_position_id = context_position_id;
+
+  IF source_position.id IS NULL
+     OR source_order.id IS NULL
+     OR source_line.id IS NULL
+     OR source_run.id IS NULL
+     OR source_level.id IS NULL
+     OR source_line.order_id IS DISTINCT FROM context_order_id
+     OR source_line.product_id IS DISTINCT FROM source_position.product_id
+     OR source_position.source_authority IS DISTINCT FROM 'shopify'
+     OR source_order.source_provider IS DISTINCT FROM 'shopify'
+     OR source_run.status IS DISTINCT FROM 'succeeded'
+     OR source_run.provider IS DISTINCT FROM 'shopify'
+     OR source_run.integration_account_id
+          IS DISTINCT FROM source_order.integration_account_id
+     OR source_level.projection_state IS DISTINCT FROM 'projected'
+     OR source_level.mapping_state IS DISTINCT FROM 'mapped'
+     OR source_level.tracked IS DISTINCT FROM true
+     OR source_level.equation_matches IS DISTINCT FROM true
+     OR source_level.product_id IS DISTINCT FROM source_line.product_id
+     OR source_level.pipeline_id IS DISTINCT FROM source_line.pipeline_id THEN
+    result_reason := 'SHOPIFY_INVENTORY_PROVIDER_EVIDENCE_INVALID';
+    RETURN QUERY SELECT
+      p_reservation_id, NULL::uuid, NULL::text, ARRAY[]::text[],
+      0::numeric(20,6), 0::numeric(20,6),
+      source_position.on_hand_quantity,
+      source_position.reserved_quantity,
+      false, result_reason;
+    RETURN;
+  END IF;
+
+  SELECT newer.* INTO latest_run
+  FROM operations_commerce_inventory_sync_runs newer
+  WHERE newer.organization_id = p_organization_id
+    AND newer.integration_account_id = source_run.integration_account_id
+    AND newer.provider_location_id = source_run.provider_location_id
+    AND newer.provider = 'shopify'
+    AND newer.status = 'succeeded'
+  ORDER BY newer.completed_at DESC, newer.id DESC
+  LIMIT 1;
+
+  IF latest_run.id IS NULL THEN
+    result_reason := 'SHOPIFY_INVENTORY_LATEST_RUN_MISSING';
+  ELSE
+    SELECT
+      count(*)::integer,
+      count(*) FILTER (
+        WHERE level.mapping_state = 'mapped'
+          AND level.projection_state = 'projected'
+          AND level.tracked = true
+          AND level.equation_matches = true
+          AND level.product_id = source_line.product_id
+          AND level.pipeline_id = source_line.pipeline_id
+          AND level.inventory_position_id = context_position_id
+      )::integer,
+      count(*) FILTER (
+        WHERE NOT (
+          level.mapping_state = 'mapped'
+          AND level.projection_state = 'projected'
+          AND level.tracked = true
+          AND level.equation_matches = true
+          AND level.product_id = source_line.product_id
+          AND level.pipeline_id = source_line.pipeline_id
+          AND level.inventory_position_id = context_position_id
+        )
+      )::integer,
+      COALESCE(sum(level.provider_committed_quantity) FILTER (
+        WHERE level.mapping_state = 'mapped'
+          AND level.projection_state = 'projected'
+          AND level.tracked = true
+          AND level.equation_matches = true
+          AND level.product_id = source_line.product_id
+          AND level.pipeline_id = source_line.pipeline_id
+          AND level.inventory_position_id = context_position_id
+      ), 0),
+      COALESCE(sum(level.operational_available_quantity) FILTER (
+        WHERE level.mapping_state = 'mapped'
+          AND level.projection_state = 'projected'
+          AND level.tracked = true
+          AND level.equation_matches = true
+          AND level.product_id = source_line.product_id
+          AND level.pipeline_id = source_line.pipeline_id
+          AND level.inventory_position_id = context_position_id
+      ), 0),
+      COALESCE(array_agg(level.global_id ORDER BY level.global_id) FILTER (
+        WHERE level.mapping_state = 'mapped'
+          AND level.projection_state = 'projected'
+          AND level.tracked = true
+          AND level.equation_matches = true
+          AND level.product_id = source_line.product_id
+          AND level.pipeline_id = source_line.pipeline_id
+          AND level.inventory_position_id = context_position_id
+      ), ARRAY[]::text[])
+    INTO candidate_level_count, valid_level_count, invalid_level_count,
+         latest_committed, latest_available, latest_level_global_ids
+    FROM operations_commerce_inventory_levels level
+    WHERE level.organization_id = p_organization_id
+      AND level.sync_run_id = COALESCE(
+        latest_run.source_level_set_run_id, latest_run.id
+      )
+      AND level.provider_location_id = source_run.provider_location_id
+      AND (
+        level.product_id = source_line.product_id
+        OR level.external_inventory_item_id
+             = source_level.external_inventory_item_id
+      );
+
+    SELECT COALESCE(sum(reservation.quantity), 0)
+      INTO other_active_claims
+    FROM operations_reservations reservation
+    WHERE reservation.organization_id = p_organization_id
+      AND reservation.position_id = context_position_id
+      AND reservation.reservation_authority = 'provider_commitment'
+      AND reservation.status = 'active'
+      AND reservation.id IS DISTINCT FROM p_reservation_id;
+
+    total_active_claims := other_active_claims + CASE
+      WHEN context_status = 'active' THEN context_quantity
+      ELSE 0::numeric
+    END;
+
+    IF candidate_level_count = 0 OR valid_level_count = 0 THEN
+      result_reason := 'SHOPIFY_INVENTORY_PRODUCT_EVIDENCE_MISSING';
+    ELSIF invalid_level_count > 0 THEN
+      result_reason := 'SHOPIFY_INVENTORY_PRODUCT_EVIDENCE_INVALID';
+    ELSIF source_position.reserved_quantity
+            IS DISTINCT FROM latest_committed
+       OR source_position.on_hand_quantity
+            IS DISTINCT FROM latest_available + latest_committed THEN
+      result_reason := 'SHOPIFY_INVENTORY_POSITION_MISMATCH';
+    ELSIF total_active_claims > latest_committed THEN
+      result_reason :=
+        'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT';
+    ELSE
+      result_supported := true;
+      result_reason := 'OK';
+    END IF;
+  END IF;
+
+  RETURN QUERY SELECT
+    p_reservation_id,
+    latest_run.id,
+    latest_run.global_id,
+    latest_level_global_ids,
+    latest_committed,
+    total_active_claims,
+    source_position.on_hand_quantity,
+    source_position.reserved_quantity,
+    result_supported,
+    result_reason;
+END;
+$$;
+
+-- Raw inventory snapshots are replay aids, not the durable quantity ledger.
+-- Keep their immutable hash, original byte count, level count, capture, run,
+-- and projected levels forever, while bounding the optional wide JSON. A
+-- purged hash may later recur, so uniqueness applies only to live payloads;
+-- the new observation receives a new content row and can again be replayed.
+-- Only the newest successful observation keeps mandatory replay JSON. Older
+-- reservation, cartonization, and watermark proofs remain intact through
+-- their immutable capture/run/level rows and the content tombstone's hash,
+-- byte count, and level count; those references do not defeat the hard cap.
+ALTER TABLE operations_commerce_inventory_snapshot_contents
+  ADD COLUMN IF NOT EXISTS payload_purged_at timestamptz,
+  ALTER COLUMN snapshot_content DROP NOT NULL,
+  DROP CONSTRAINT IF EXISTS
+    operations_commerce_inventory_snapshot_contents_hash_unique,
+  DROP CONSTRAINT IF EXISTS
+    operations_commerce_inventory_snapshot_contents_payload_valid,
+  ADD CONSTRAINT
+    operations_commerce_inventory_snapshot_contents_payload_valid CHECK (
+      (
+        snapshot_content IS NOT NULL
+        AND jsonb_typeof(snapshot_content) = 'object'
+        AND NOT snapshot_content ? 'fetchedAt'
+        AND NOT snapshot_content ? 'pageCount'
+        AND snapshot_content->>'snapshotHash' = snapshot_hash
+        AND snapshot_content#>>'{location,id}' = provider_location_id
+        AND jsonb_typeof(snapshot_content->'levels') = 'array'
+        AND jsonb_array_length(snapshot_content->'levels') = level_count
+        AND payload_purged_at IS NULL
+      )
+      OR (
+        snapshot_content IS NULL
+        AND payload_purged_at IS NOT NULL
+        AND payload_purged_at >= created_at
+      )
+    ) NOT VALID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+  operations_commerce_inventory_snapshot_contents_hash_unique
+  ON operations_commerce_inventory_snapshot_contents (
+    organization_id, integration_account_id, provider_location_id,
+    adapter_version, snapshot_hash
+  ) WHERE snapshot_content IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS
+  operations_commerce_inventory_snapshot_payload_retention_idx
+  ON operations_commerce_inventory_snapshot_contents (
+    organization_id, integration_account_id, provider_location_id,
+    created_at DESC, id DESC
+  ) WHERE snapshot_content IS NOT NULL;
+
+CREATE OR REPLACE VIEW
+  operations_commerce_inventory_snapshot_payload_retention
+AS
+WITH latest_observation AS (
+  SELECT DISTINCT ON (
+    run.organization_id,
+    run.integration_account_id,
+    run.provider_location_id
+  )
+    run.organization_id,
+    run.integration_account_id,
+    run.provider_location_id,
+    capture.snapshot_content_id
+  FROM operations_commerce_inventory_sync_runs run
+  LEFT JOIN operations_commerce_inventory_captures capture
+    ON capture.organization_id = run.organization_id
+   AND capture.integration_account_id = run.integration_account_id
+   AND capture.id = run.capture_id
+  WHERE run.status = 'succeeded'
+  ORDER BY
+    run.organization_id,
+    run.integration_account_id,
+    run.provider_location_id,
+    run.completed_at DESC,
+    run.id DESC
+)
+SELECT
+  content.id,
+  content.organization_id,
+  content.integration_account_id,
+  content.provider_location_id,
+  content.created_at,
+  COALESCE(latest.snapshot_content_id = content.id, false)
+    AS current_payload,
+  row_number() OVER (
+    PARTITION BY content.organization_id,
+                 content.integration_account_id,
+                 content.provider_location_id
+    ORDER BY
+      COALESCE(latest.snapshot_content_id = content.id, false) DESC,
+      content.created_at DESC,
+      content.id DESC
+  ) AS payload_rank
+FROM operations_commerce_inventory_snapshot_contents content
+LEFT JOIN latest_observation latest
+  ON latest.organization_id = content.organization_id
+ AND latest.integration_account_id = content.integration_account_id
+ AND latest.provider_location_id = content.provider_location_id
+WHERE content.snapshot_content IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION
+  operations_commerce_inventory_snapshot_content_is_purgeable(
+    p_organization_id uuid,
+    p_integration_account_id uuid,
+    p_content_id uuid
+  )
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT COALESCE((
+    SELECT (
+      ranked.payload_rank > 32
+      OR (
+        ranked.payload_rank > 8
+        AND ranked.created_at < now() - interval '30 days'
+      )
+    ) AND NOT ranked.current_payload
+    FROM operations_commerce_inventory_snapshot_payload_retention ranked
+    WHERE ranked.organization_id = p_organization_id
+      AND ranked.integration_account_id = p_integration_account_id
+      AND ranked.id = p_content_id
+  ), false);
+$$;
+
+CREATE OR REPLACE FUNCTION
+  purge_operations_commerce_inventory_snapshot_payloads(
+    p_limit integer DEFAULT 100
+  )
+RETURNS TABLE (purged_rows integer, purged_bytes bigint)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF p_limit < 1 OR p_limit > 1000 THEN
+    RAISE EXCEPTION 'commerce inventory snapshot payload limit is invalid';
+  END IF;
+  PERFORM set_config(
+    'clawpilot.commerce_inventory_snapshot_payload_compaction', 'on', true
+  );
+  RETURN QUERY
+  WITH due AS (
+    SELECT content.id, content.organization_id,
+           content.integration_account_id,
+           content.content_bytes::bigint AS row_bytes
+    FROM operations_commerce_inventory_snapshot_contents content
+    JOIN operations_commerce_inventory_snapshot_payload_retention ranked
+      ON ranked.organization_id = content.organization_id
+     AND ranked.integration_account_id = content.integration_account_id
+     AND ranked.id = content.id
+    WHERE (
+      ranked.payload_rank > 32
+      OR (
+        ranked.payload_rank > 8
+        AND ranked.created_at < now() - interval '30 days'
+      )
+    )
+      AND NOT ranked.current_payload
+      AND operations_commerce_inventory_snapshot_content_is_purgeable(
+        content.organization_id, content.integration_account_id, content.id
+      )
+    ORDER BY content.created_at, content.id
+    FOR UPDATE OF content SKIP LOCKED
+    LIMIT p_limit
+  ), purged AS (
+    UPDATE operations_commerce_inventory_snapshot_contents content
+    SET snapshot_content = NULL,
+        payload_purged_at = now()
+    FROM due
+    WHERE content.organization_id = due.organization_id
+      AND content.integration_account_id = due.integration_account_id
+      AND content.id = due.id
+    RETURNING due.row_bytes
+  )
+  SELECT count(*)::integer, COALESCE(sum(row_bytes), 0)::bigint
+  FROM purged;
+END;
+$$;
+
+-- Both foreground workers may offer to maintain storage every ten seconds.
+-- This persisted singleton makes that offer a cheap, atomic lease instead of
+-- duplicating global ranked scans. Each purge statement remains bounded.
+CREATE TABLE IF NOT EXISTS operations_commerce_storage_maintenance_lanes (
+  lane_name text PRIMARY KEY CHECK (lane_name = 'commerce-storage'),
+  next_run_at timestamptz NOT NULL DEFAULT now(),
+  lease_token uuid,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  last_started_at timestamptz,
+  last_completed_at timestamptz,
+  last_failed_at timestamptz,
+  last_error_code text,
+  last_result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (
+    jsonb_typeof(last_result) = 'object'
+  ),
+  row_version bigint NOT NULL DEFAULT 0 CHECK (row_version >= 0),
+  CHECK (
+    (lease_token IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL)
+    OR (
+      lease_token IS NOT NULL
+      AND length(btrim(lease_owner)) BETWEEN 1 AND 160
+      AND lease_expires_at IS NOT NULL
+    )
+  )
+);
+
+INSERT INTO operations_commerce_storage_maintenance_lanes (lane_name)
+VALUES ('commerce-storage')
+ON CONFLICT (lane_name) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION claim_operations_commerce_storage_maintenance(
+  p_lease_owner text,
+  p_cadence_seconds integer DEFAULT 10,
+  p_lease_seconds integer DEFAULT 120
+)
+RETURNS uuid
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  claimed_token uuid;
+BEGIN
+  IF p_lease_owner IS NULL
+     OR length(btrim(p_lease_owner)) NOT BETWEEN 1 AND 160
+     OR p_cadence_seconds NOT BETWEEN 5 AND 3600
+     OR p_lease_seconds NOT BETWEEN 30 AND 900 THEN
+    RAISE EXCEPTION 'commerce storage maintenance lease is invalid';
+  END IF;
+  UPDATE operations_commerce_storage_maintenance_lanes lane
+  SET lease_token = gen_random_uuid(),
+      lease_owner = btrim(p_lease_owner),
+      lease_expires_at = clock_timestamp()
+        + make_interval(secs => p_lease_seconds),
+      next_run_at = clock_timestamp()
+        + make_interval(secs => p_cadence_seconds),
+      last_started_at = clock_timestamp(),
+      last_error_code = NULL,
+      row_version = lane.row_version + 1
+  WHERE lane.lane_name = 'commerce-storage'
+    AND lane.next_run_at <= clock_timestamp()
+    AND (
+      lane.lease_token IS NULL
+      OR lane.lease_expires_at <= clock_timestamp()
+    )
+  RETURNING lane.lease_token INTO claimed_token;
+  RETURN claimed_token;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION complete_operations_commerce_storage_maintenance(
+  p_lease_token uuid,
+  p_result jsonb,
+  p_error_code text DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  completed boolean;
+BEGIN
+  IF p_lease_token IS NULL
+     OR p_result IS NULL
+     OR jsonb_typeof(p_result) <> 'object'
+     OR (p_error_code IS NOT NULL AND (
+       length(btrim(p_error_code)) NOT BETWEEN 1 AND 160
+       OR p_error_code ~ '[[:cntrl:]]'
+     )) THEN
+    RAISE EXCEPTION 'commerce storage maintenance completion is invalid';
+  END IF;
+  UPDATE operations_commerce_storage_maintenance_lanes lane
+  SET lease_token = NULL,
+      lease_owner = NULL,
+      lease_expires_at = NULL,
+      last_completed_at = CASE
+        WHEN p_error_code IS NULL THEN clock_timestamp()
+        ELSE lane.last_completed_at
+      END,
+      last_failed_at = CASE
+        WHEN p_error_code IS NULL THEN lane.last_failed_at
+        ELSE clock_timestamp()
+      END,
+      last_error_code = NULLIF(btrim(p_error_code), ''),
+      last_result = p_result,
+      next_run_at = CASE
+        WHEN p_error_code IS NULL THEN lane.next_run_at
+        ELSE clock_timestamp() + interval '10 seconds'
+      END,
+      row_version = lane.row_version + 1
+  WHERE lane.lane_name = 'commerce-storage'
+    AND lane.lease_token = p_lease_token
+  RETURNING true INTO completed;
+  RETURN COALESCE(completed, false);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION
   convert_operations_commerce_inventory_legacy_captures(
     p_limit integer DEFAULT 25
@@ -553,7 +1123,7 @@ BEGIN
     ON CONFLICT (
       organization_id, integration_account_id, provider_location_id,
       adapter_version, snapshot_hash
-    ) DO NOTHING
+    ) WHERE snapshot_content IS NOT NULL DO NOTHING
     RETURNING id INTO content_id;
     IF content_id IS NULL THEN
       SELECT content.id INTO content_id
@@ -565,6 +1135,7 @@ BEGIN
         AND content.adapter_version = capture_row.adapter_version
         AND content.snapshot_hash = capture_row.snapshot_hash
         AND content.level_count = capture_row.level_count
+        AND content.payload_purged_at IS NULL
         AND content.snapshot_content = content_json;
     END IF;
     IF content_id IS NULL THEN
@@ -592,6 +1163,27 @@ DECLARE
   evidence_rank bigint;
   completed_at timestamptz;
 BEGIN
+  IF TG_OP = 'UPDATE'
+     AND TG_TABLE_NAME =
+       'operations_commerce_inventory_snapshot_contents' THEN
+    IF current_setting(
+         'clawpilot.commerce_inventory_snapshot_payload_compaction', true
+       ) = 'on'
+       AND OLD.snapshot_content IS NOT NULL
+       AND OLD.payload_purged_at IS NULL
+       AND NEW.snapshot_content IS NULL
+       AND NEW.payload_purged_at IS NOT NULL
+       AND (
+         to_jsonb(NEW) - ARRAY['snapshot_content', 'payload_purged_at']
+       ) IS NOT DISTINCT FROM (
+         to_jsonb(OLD) - ARRAY['snapshot_content', 'payload_purged_at']
+       )
+       AND operations_commerce_inventory_snapshot_content_is_purgeable(
+         OLD.organization_id, OLD.integration_account_id, OLD.id
+       ) THEN
+      RETURN NEW;
+    END IF;
+  END IF;
   IF TG_OP = 'UPDATE'
      AND TG_TABLE_NAME = 'operations_commerce_inventory_captures' THEN
     IF current_setting(
@@ -891,6 +1483,12 @@ DECLARE
   capture_rows integer;
   capture_bytes bigint;
   capture_truncated boolean;
+  snapshot_backlog_rows integer;
+  snapshot_backlog_bytes bigint;
+  snapshot_backlog_truncated boolean;
+  snapshot_live_rows integer;
+  snapshot_live_bytes bigint;
+  snapshot_live_truncated boolean;
   alias_rows integer;
   alias_bytes bigint;
   alias_truncated boolean;
@@ -938,6 +1536,55 @@ BEGIN
          ), 0)::bigint,
          count(*) > p_sample_limit
   INTO capture_rows, capture_bytes, capture_truncated
+  FROM (
+    SELECT row_bytes, row_number() OVER () AS ordinal FROM sample
+  ) counted;
+
+  WITH sample AS (
+    SELECT content.content_bytes::bigint AS row_bytes
+    FROM operations_commerce_inventory_snapshot_contents content
+    JOIN operations_commerce_inventory_snapshot_payload_retention ranked
+      ON ranked.organization_id = content.organization_id
+     AND ranked.integration_account_id = content.integration_account_id
+     AND ranked.id = content.id
+    WHERE (
+      ranked.payload_rank > 32
+      OR (
+        ranked.payload_rank > 8
+        AND ranked.created_at < now() - interval '30 days'
+      )
+    )
+      AND NOT ranked.current_payload
+      AND operations_commerce_inventory_snapshot_content_is_purgeable(
+        content.organization_id, content.integration_account_id, content.id
+      )
+    ORDER BY content.created_at, content.id
+    LIMIT p_sample_limit + 1
+  )
+  SELECT LEAST(count(*), p_sample_limit)::integer,
+         COALESCE(sum(row_bytes) FILTER (
+           WHERE ordinal <= p_sample_limit
+         ), 0)::bigint,
+         count(*) > p_sample_limit
+  INTO snapshot_backlog_rows, snapshot_backlog_bytes,
+       snapshot_backlog_truncated
+  FROM (
+    SELECT row_bytes, row_number() OVER () AS ordinal FROM sample
+  ) counted;
+
+  WITH sample AS (
+    SELECT content.content_bytes::bigint AS row_bytes
+    FROM operations_commerce_inventory_snapshot_contents content
+    WHERE content.snapshot_content IS NOT NULL
+    ORDER BY content.created_at DESC, content.id DESC
+    LIMIT p_sample_limit + 1
+  )
+  SELECT LEAST(count(*), p_sample_limit)::integer,
+         COALESCE(sum(row_bytes) FILTER (
+           WHERE ordinal <= p_sample_limit
+         ), 0)::bigint,
+         count(*) > p_sample_limit
+  INTO snapshot_live_rows, snapshot_live_bytes, snapshot_live_truncated
   FROM (
     SELECT row_bytes, row_number() OVER () AS ordinal FROM sample
   ) counted;
@@ -1063,6 +1710,21 @@ BEGIN
     'legacyInventoryCaptureBacklogRows', capture_rows,
     'legacyInventoryCaptureBacklogBytes', capture_bytes,
     'legacyInventoryCaptureBacklogTruncated', capture_truncated,
+    'inventorySnapshotPayloadBacklogRows', snapshot_backlog_rows,
+    'inventorySnapshotPayloadBacklogBytes', snapshot_backlog_bytes,
+    'inventorySnapshotPayloadBacklogTruncated',
+      snapshot_backlog_truncated,
+    'inventorySnapshotLivePayloadRows', snapshot_live_rows,
+    'inventorySnapshotLivePayloadBytes', snapshot_live_bytes,
+    'inventorySnapshotLivePayloadTruncated', snapshot_live_truncated,
+    'inventorySnapshotContentStorageBytes', pg_total_relation_size(
+      'operations_commerce_inventory_snapshot_contents'
+    ),
+    'inventorySnapshotContentRowEstimate', COALESCE((
+      SELECT reltuples::bigint FROM pg_class
+      WHERE oid =
+        'operations_commerce_inventory_snapshot_contents'::regclass
+    ), 0),
     'inventoryObservationAliasBacklogRows', alias_rows,
     'inventoryObservationAliasBacklogBytes', alias_bytes,
     'inventoryObservationAliasBacklogTruncated', alias_truncated,
@@ -1078,6 +1740,23 @@ BEGIN
     'inventoryObservationHardCapPerAccountLocation', 128,
     'inventoryFullLevelSetHardCapPerAccountLocation', 128,
     'inventoryFullLevelSetSoftCapAfter90Days', 32,
+    'inventorySnapshotLivePayloadHardCapPerAccountLocation', 32,
+    'inventorySnapshotLivePayloadSoftCapAfter30Days', 8,
+    'storageMaintenance', COALESCE((
+      SELECT jsonb_build_object(
+        'nextRunAt', lane.next_run_at,
+        'leaseOwner', lane.lease_owner,
+        'leaseExpiresAt', lane.lease_expires_at,
+        'lastStartedAt', lane.last_started_at,
+        'lastCompletedAt', lane.last_completed_at,
+        'lastFailedAt', lane.last_failed_at,
+        'lastErrorCode', lane.last_error_code,
+        'lastResult', lane.last_result,
+        'rowVersion', lane.row_version
+      )
+      FROM operations_commerce_storage_maintenance_lanes lane
+      WHERE lane.lane_name = 'commerce-storage'
+    ), '{}'::jsonb),
     'checkedAt', now()
   );
 END;
@@ -1089,3 +1768,6 @@ COMMENT ON COLUMN operations_commerce_inventory_sync_runs.level_set_hash IS
   'Content hash of the projected immutable level set, excluding observation freshness.';
 COMMENT ON COLUMN operations_commerce_inventory_sync_runs.source_level_set_run_id IS
   'For an unchanged poll, the prior full immutable run whose level rows are reused; this run retains current attempt, capture, metrics, and freshness without duplicating the level set.';
+COMMENT ON COLUMN
+  operations_commerce_inventory_snapshot_contents.payload_purged_at IS
+  'One-way proof that bounded maintenance removed replay-only raw JSON while retaining its immutable hash, original byte count, level count, captures, runs, and projected level evidence.';

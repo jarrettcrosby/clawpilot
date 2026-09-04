@@ -10392,6 +10392,7 @@ export async function GET() {
         const backlog = [
           'intakePayloadBacklogRows',
           'legacyInventoryCaptureBacklogRows',
+          'inventorySnapshotPayloadBacklogRows',
           'inventoryObservationAliasBacklogRows',
           'inventoryLevelBacklogRows',
         ].reduce((total, key) => (
