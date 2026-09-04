@@ -76,6 +76,15 @@ if (!['127.0.0.1', 'localhost', '::1'].includes(parsedUrl.hostname)) {
     'Commerce storage guard PostgreSQL test only runs against local disposable databases.',
   )
 }
+const databaseName = decodeURIComponent(parsedUrl.pathname.replace(/^\//u, ''))
+if (!(
+  databaseName === 'commerce_guard'
+  || /^clawpilot_storage_[a-z0-9_]+$/u.test(databaseName)
+)) {
+  throw new Error(
+    'Commerce storage guard PostgreSQL test requires a dedicated disposable database.',
+  )
+}
 
 const pool = new Pool({
   connectionString: parsedUrl.toString(),
@@ -91,14 +100,11 @@ async function testConcurrentPreparedCaptureAndPurge() {
   const locationId = randomUUID()
   const captureId = randomUUID()
   const contentIds = Array.from({ length: 40 }, () => randomUUID())
-  const globalSuffix = String(
-    1_000_000 + Number.parseInt(randomUUID().slice(0, 6), 16) % 9_000_000,
-  )
+  const fixtureSuffix = randomUUID()
   const setup = await pool.connect()
   let oldestContent
   try {
     await setup.query('BEGIN')
-    await setup.query(`SET LOCAL session_replication_role = 'replica'`)
     await setup.query(
       `INSERT INTO workspace_organizations (id, name)
        VALUES ($1::uuid, 'Concurrent storage guard fixture')`,
@@ -106,35 +112,51 @@ async function testConcurrentPreparedCaptureAndPurge() {
     )
     await setup.query(
       `INSERT INTO operations_integration_accounts (
-         id, global_id, organization_id, provider, integration_type,
+         id, organization_id, provider, integration_type,
          environment, display_name, status, configuration,
          external_account_id, commerce_credential_generation
        ) VALUES (
-         $1::uuid, $2, $3::uuid, 'shopify', 'commerce', 'sandbox',
+         $1::uuid, $2::uuid, 'shopify', 'commerce', 'sandbox',
          'Concurrent storage guard account', 'active', '{}'::jsonb,
-         $4, 1
+         $3, 1
        )`,
       [
         integrationAccountId,
-        `gia${globalSuffix}`,
         organizationId,
-        `gid://shopify/Shop/${globalSuffix}`,
+        `gid://shopify/Shop/${fixtureSuffix}`,
       ],
     )
     await setup.query(
+      `INSERT INTO operations_warehouses (
+         id, organization_id, code, name, timezone, address, status
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, 'Concurrent storage guard warehouse',
+         'America/New_York', '{}'::jsonb, 'active'
+       )`,
+      [warehouseId, organizationId, `GUARD-${fixtureSuffix}`],
+    )
+    await setup.query(
+      `INSERT INTO operations_locations (
+         id, organization_id, warehouse_id, code, zone, location_type,
+         pick_sequence, active
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, 'STORAGE', 'storage', 0, true
+       )`,
+      [locationId, organizationId, warehouseId, `BIN-${fixtureSuffix}`],
+    )
+    await setup.query(
       `INSERT INTO operations_commerce_provider_attempts (
-         id, global_id, organization_id, integration_account_id,
+         id, organization_id, integration_account_id,
          action, adapter_version, idempotency_key, request_hash,
          redacted_request, lease_token, lease_expires_at
        ) VALUES (
-         $1::uuid, $2, $3::uuid, $4::uuid, 'inventory.levels.read',
-         'guard-concurrency-v1', $5, repeat('a', 64),
+         $1::uuid, $2::uuid, $3::uuid, 'inventory.levels.read',
+         'guard-concurrency-v1', $4, repeat('a', 64),
          '{"resource":"inventory","readOnly":true}'::jsonb,
          gen_random_uuid(), clock_timestamp() + interval '20 minutes'
        )`,
       [
         providerAttemptId,
-        `gxa${globalSuffix}`,
         organizationId,
         integrationAccountId,
         `guard-concurrency-${providerAttemptId}`,
@@ -188,6 +210,8 @@ async function testConcurrentPreparedCaptureAndPurge() {
 
   const captureClient = await pool.connect()
   const purgeClient = await pool.connect()
+  let purgePromise = null
+  let captureTransactionOpen = false
   try {
     const identityKey = [
       'commerce-inventory-snapshot-content',
@@ -199,28 +223,82 @@ async function testConcurrentPreparedCaptureAndPurge() {
       oldestContent.snapshot_hash,
     ].join(':')
     await captureClient.query('BEGIN')
-    await captureClient.query(`SET LOCAL session_replication_role = 'replica'`)
+    captureTransactionOpen = true
+    await captureClient.query(`SET LOCAL statement_timeout = '5s'`)
+    const productionEnforcement = await captureClient.query(`
+      SELECT current_setting('session_replication_role') AS replication_role,
+             EXISTS (
+               SELECT 1
+               FROM pg_trigger
+               WHERE tgrelid =
+                 'operations_commerce_inventory_captures'::regclass
+                 AND tgname =
+                   'validate_operations_commerce_inventory_capture_content_insert'
+                 AND tgenabled = 'O'
+             ) AS validation_trigger_enabled,
+             EXISTS (
+               SELECT 1
+               FROM pg_constraint
+               WHERE conrelid =
+                 'operations_commerce_inventory_captures'::regclass
+                 AND conname =
+                   'operations_commerce_inventory_captures_snapshot_content_fkey'
+             ) AS snapshot_content_fkey_exists
+    `)
+    assert.deepEqual(productionEnforcement.rows[0], {
+      replication_role: 'origin',
+      validation_trigger_enabled: true,
+      snapshot_content_fkey_exists: true,
+    })
     await captureClient.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
       [identityKey],
     )
-    await captureClient.query(
+    const purgeBackend = await purgeClient.query(
+      'SELECT pg_backend_pid()::integer AS pid',
+    )
+    await purgeClient.query(`SET statement_timeout = '8s'`)
+    purgePromise = purgeClient.query(
+      `SELECT *
+       FROM purge_operations_commerce_inventory_snapshot_payloads(1000)`,
+    )
+    let purgeWaitingOnIdentity = false
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const activity = await captureClient.query(
+        `SELECT wait_event_type, wait_event
+         FROM pg_stat_activity
+         WHERE pid = $1::integer`,
+        [purgeBackend.rows[0].pid],
+      )
+      purgeWaitingOnIdentity = (
+        activity.rows[0]?.wait_event_type === 'Lock'
+        && activity.rows[0]?.wait_event === 'advisory'
+      )
+      if (purgeWaitingOnIdentity) break
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+    }
+    assert.equal(
+      purgeWaitingOnIdentity,
+      true,
+      'Purge must reach the shared identity lock before capture inserts',
+    )
+    const insertedCapture = await captureClient.query(
       `INSERT INTO operations_commerce_inventory_captures (
-         id, global_id, organization_id, integration_account_id,
+         id, organization_id, integration_account_id,
          provider_attempt_id, warehouse_id, location_id, provider,
          adapter_version, credential_version, request_hash, snapshot_hash,
          provider_location_id, provider_fetched_at, level_count,
          captured_snapshot, snapshot_content_id, provider_page_count,
          snapshot_bytes
        ) VALUES (
-         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
-         'shopify', 'guard-concurrency-v1', 1, repeat('a', 64), $8,
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+         'shopify', 'guard-concurrency-v1', 1, repeat('a', 64), $7,
          'guard-concurrency-location', clock_timestamp(), 0,
-         NULL, $9::uuid, 1, $10
-       )`,
+         NULL, $8::uuid, 1, $9
+       )
+       RETURNING global_id`,
       [
         captureId,
-        `gisc${globalSuffix}`,
         organizationId,
         integrationAccountId,
         providerAttemptId,
@@ -231,24 +309,19 @@ async function testConcurrentPreparedCaptureAndPurge() {
         oldestContent.content_bytes,
       ],
     )
-    let purgeSettled = false
-    const purgePromise = purgeClient.query(
-      `SELECT *
-       FROM purge_operations_commerce_inventory_snapshot_payloads(1000)`,
-    )
-    purgePromise.then(
-      () => { purgeSettled = true },
-      () => { purgeSettled = true },
-    )
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150))
-    assert.equal(
-      purgeSettled,
-      false,
-      'Purge must wait for the in-flight capture identity lock',
+    assert.match(
+      insertedCapture.rows[0]?.global_id || '',
+      /^gisc(?:[0-9]{7}|[0-9a-v]{12})$/,
     )
     await captureClient.query('COMMIT')
+    captureTransactionOpen = false
     const purged = await purgePromise
-    assert.equal(purged.rows[0]?.purged_rows, 7)
+    purgePromise = null
+    assert.equal(
+      purged.rows[0]?.purged_rows,
+      7,
+      'Purge must preserve the newly committed prepared capture payload',
+    )
     const retained = await purgeClient.query(
       `SELECT content.snapshot_content IS NOT NULL AS payload_live,
               content.payload_purged_at IS NULL AS not_tombstoned,
@@ -271,44 +344,15 @@ async function testConcurrentPreparedCaptureAndPurge() {
       state: 'prepared',
     })
   } finally {
-    await captureClient.query('ROLLBACK').catch(() => {})
+    if (captureTransactionOpen) {
+      await captureClient.query('ROLLBACK').catch(() => {})
+    }
+    await purgePromise?.catch(() => {})
     captureClient.release()
     purgeClient.release()
-    const cleanup = await pool.connect()
-    try {
-      await cleanup.query('BEGIN')
-      await cleanup.query(`SET LOCAL session_replication_role = 'replica'`)
-      await cleanup.query(
-        `DELETE FROM operations_commerce_inventory_captures
-         WHERE organization_id = $1::uuid`,
-        [organizationId],
-      )
-      await cleanup.query(
-        `DELETE FROM operations_commerce_inventory_snapshot_contents
-         WHERE organization_id = $1::uuid`,
-        [organizationId],
-      )
-      await cleanup.query(
-        `DELETE FROM operations_commerce_provider_attempts
-         WHERE organization_id = $1::uuid`,
-        [organizationId],
-      )
-      await cleanup.query(
-        `DELETE FROM operations_integration_accounts
-         WHERE organization_id = $1::uuid`,
-        [organizationId],
-      )
-      await cleanup.query(
-        `DELETE FROM workspace_organizations WHERE id = $1::uuid`,
-        [organizationId],
-      )
-      await cleanup.query('COMMIT')
-    } catch (error) {
-      await cleanup.query('ROLLBACK').catch(() => {})
-      throw error
-    } finally {
-      cleanup.release()
-    }
+    // Attempts and captures are production-immutable by design. The enclosing
+    // database is therefore required to be disposable and is destroyed by the
+    // test-owned container path or its external test harness.
   }
 }
 
@@ -932,7 +976,12 @@ try {
     SELECT id::text, snapshot_hash, snapshot_content,
            payload_purged_at IS NOT NULL AS purged
     FROM operations_commerce_inventory_snapshot_contents
-    WHERE payload_purged_at IS NOT NULL
+    WHERE organization_id =
+          '10000000-0000-4000-8000-000000000001'::uuid
+      AND integration_account_id =
+          '10000000-0000-4000-8000-000000000002'::uuid
+      AND provider_location_id = 'guard-location'
+      AND payload_purged_at IS NOT NULL
     ORDER BY created_at, id
     LIMIT 1
   `)

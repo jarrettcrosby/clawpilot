@@ -952,12 +952,13 @@ BEGIN
         content.organization_id, content.integration_account_id, content.id
       )
     ORDER BY content.created_at, content.id
-    FOR UPDATE OF content SKIP LOCKED
     LIMIT p_limit
   LOOP
-    -- Capture and purge serialize on the immutable provider-content identity.
-    -- The UPDATE is a fresh statement after this lock, so a capture committed
-    -- while we waited is visible to the prepared-attempt recheck.
+    -- Capture and purge acquire the immutable provider-content identity lock
+    -- before either can lock the content row. Taking FOR UPDATE while selecting
+    -- candidates would invert the production capture order (advisory lock,
+    -- then FK key-share) and can deadlock. The UPDATE obtains the row lock only
+    -- after this advisory lock and freshly rechecks prepared-attempt evidence.
     PERFORM pg_advisory_xact_lock(hashtextextended(
       'commerce-inventory-snapshot-content:'
       || content_row.organization_id::text || ':'

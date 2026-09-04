@@ -68,6 +68,69 @@ assert.match(
 )
 assert.ok(migration.includes('pg_advisory_xact_lock(hashtextextended('))
 assert.ok(migration.includes('commerce-inventory-snapshot-content:'))
+const snapshotPayloadPurgeStart = migration.indexOf(
+  'CREATE OR REPLACE FUNCTION\n  purge_operations_commerce_inventory_snapshot_payloads',
+)
+const snapshotPayloadPurgeEnd = migration.indexOf(
+  '-- Both foreground workers may offer to maintain storage every ten seconds.',
+)
+assert.ok(
+  snapshotPayloadPurgeStart >= 0
+    && snapshotPayloadPurgeEnd > snapshotPayloadPurgeStart,
+)
+const snapshotPayloadPurge = migration.slice(
+  snapshotPayloadPurgeStart,
+  snapshotPayloadPurgeEnd,
+)
+assert.doesNotMatch(
+  snapshotPayloadPurge,
+  /FOR (?:NO KEY )?UPDATE OF content/,
+  'Snapshot purge candidates must not row-lock before the identity lock',
+)
+const snapshotPayloadAdvisoryLock = snapshotPayloadPurge.indexOf(
+  'pg_advisory_xact_lock(hashtextextended(',
+)
+const snapshotPayloadRowLock = snapshotPayloadPurge.indexOf(
+  'UPDATE operations_commerce_inventory_snapshot_contents content',
+)
+assert.ok(
+  snapshotPayloadAdvisoryLock >= 0
+    && snapshotPayloadRowLock > snapshotPayloadAdvisoryLock,
+  'Snapshot purge must take the identity lock before its content-row lock',
+)
+const postgresAcceptance = read(
+  'scripts/test-commerce-storage-bloat-guard-postgres.mjs',
+)
+const concurrencyAcceptanceStart = postgresAcceptance.indexOf(
+  'async function testConcurrentPreparedCaptureAndPurge()',
+)
+const concurrencyAcceptanceEnd = postgresAcceptance.indexOf(
+  '\nconst client = await pool.connect()',
+)
+assert.ok(
+  concurrencyAcceptanceStart >= 0
+    && concurrencyAcceptanceEnd > concurrencyAcceptanceStart,
+)
+const concurrencyAcceptance = postgresAcceptance.slice(
+  concurrencyAcceptanceStart,
+  concurrencyAcceptanceEnd,
+)
+assert.doesNotMatch(
+  concurrencyAcceptance,
+  /session_replication_role\s*=\s*'replica'/,
+  'The lock-order acceptance fixture must keep production triggers and FKs on',
+)
+for (const contract of [
+  "replication_role: 'origin'",
+  'validation_trigger_enabled: true',
+  'snapshot_content_fkey_exists: true',
+  "activity.rows[0]?.wait_event === 'advisory'",
+]) {
+  assert.ok(
+    concurrencyAcceptance.includes(contract),
+    `The production lock-order acceptance test is missing ${contract}`,
+  )
+}
 assert.equal(
   (migration.match(/LANGUAGE (?:plpgsql|sql)/gu) || []).length,
   (migration.match(/SET search_path = pg_catalog, public/gu) || []).length,
