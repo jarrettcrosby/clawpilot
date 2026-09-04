@@ -60,7 +60,7 @@ function nativeEvent(value: unknown, orderId: string, observedAt: string) {
     || typeof node.id !== 'string'
     || !/^gid:\/\/shopify\/(?:BasicEvent|CommentEvent)\/[1-9][0-9]*$/u.test(node.id)
     || !node.id.startsWith(`gid://shopify/${node.__typename}/`)
-    || typeof node.action !== 'string' || !/^[a-zA-Z0-9_.:-]{1,255}$/u.test(node.action)
+    || typeof node.action !== 'string' || !/^[a-zA-Z0-9_.:-]{1,128}$/u.test(node.action)
     || typeof node.createdAt !== 'string' || !Number.isFinite(Date.parse(node.createdAt))
     || Date.parse(node.createdAt) > Date.parse(observedAt)
     || typeof node.message !== 'string'

@@ -462,6 +462,36 @@ const shopifyObservation = historyRuntime.commerceOrderHistoryObservation(
   3,
   'manual_exact_read',
 )
+// Optional native fields must respect the unchanged core event-status limit.
+// Oversized activity is omitted with explicit partial coverage, not allowed
+// to turn a valid order and its lines into a normalization failure.
+for (const actionLength of [128, 129, 255, 256]) {
+  const nativeOrderId = shopifyObservation.externalOrderId
+  const activity = await nativeActivityRuntime.readShopifyOrderNativeActivity({
+    externalOrderId: nativeOrderId, observedAt, includeStaffAuthors: false,
+    readPage: async () => ({ order: { id: nativeOrderId, events: {
+      nodes: ['updated', 'x'.repeat(actionLength)].map((action, index) => ({
+        __typename: 'BasicEvent', id: `gid://shopify/BasicEvent/${index + 1}`,
+        subjectId: nativeOrderId, action, createdAt: '2026-08-13T00:00:00.000Z',
+        message: 'Provider activity', actor: 'Provider operator',
+        attributeToUser: true, attributeToApp: false,
+      })), pageInfo: { hasNextPage: false, endCursor: null },
+    } } }),
+  })
+  assert.equal(activity.nativeActivityFetchedCount, 2)
+  assert.equal(activity.providerReads, 1)
+  assert.equal(activity.nativeActivityState, actionLength === 128 ? 'complete' : 'partial')
+  assert.equal(activity.nativeActivityReason, actionLength === 128 ? null : 'invalid_provider_event')
+  assert.equal(activity.events.length, actionLength === 128 ? 2 : 1)
+  const withActivity = historyRuntime.commerceOrderHistoryObservation(
+    'shopify', historyOrder('shopify', [shopifyHistoryLine]),
+    { fulfillments: [], refunds: [], nativeActivity: activity }, observedAt, 4, 'manual_exact_read',
+  )
+  const retained = persistenceRuntime.normalizeCommerceOrderObservationInput(withActivity)
+  assert.equal(retained.lines.length, shopifyObservation.lines.length)
+  assert.equal(retained.providerReadCount, 4)
+  assert.equal(retained.nativeActivityState, activity.nativeActivityState)
+}
 assert.deepEqual(
   JSON.parse(JSON.stringify(shopifyObservation.lines[0])),
   {
