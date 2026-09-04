@@ -119,6 +119,14 @@ export async function readShopifyOrderNativeActivity(input: {
     events: [], nativeActivityState: 'unavailable', nativeActivityReason: null,
     nativeActivityFetchedCount: 0, providerReads: 0,
   }
+  const observedAtMillis = Date.parse(input.observedAt)
+  if (!Number.isFinite(observedAtMillis)) {
+    result.nativeActivityReason = 'invalid_capture_time'
+    return result
+  }
+  // Shopify search syntax treats unquoted colons as delimiters. Only insert a
+  // canonical timestamp, never the original caller string, into this filter.
+  const observedAt = new Date(observedAtMillis).toISOString()
   const seen = new Set<string>()
   let cursor: string | null = null
   let partialReason: string | null = null
@@ -130,7 +138,7 @@ export async function readShopifyOrderNativeActivity(input: {
         query: shopifyOrderNativeActivityQuery(input.includeStaffAuthors),
         operationName: 'ClawPilotShopifyOrderNativeActivity',
         variables: { id: input.externalOrderId, after: cursor,
-          query: `comments:true created_at:<=${input.observedAt}` },
+          query: `comments:true created_at:<='${observedAt}'` },
       })
     } catch {
       result.nativeActivityState = result.nativeActivityFetchedCount ? 'partial' : 'unavailable'
@@ -149,7 +157,7 @@ export async function readShopifyOrderNativeActivity(input: {
     }
     for (const value of connection.nodes) {
       result.nativeActivityFetchedCount += 1
-      const normalized = nativeEvent(value, input.externalOrderId, input.observedAt)
+      const normalized = nativeEvent(value, input.externalOrderId, observedAt)
       if (!normalized) { partialReason ||= 'invalid_provider_event'; continue }
       if (seen.has(normalized.event.externalEventId)) {
         partialReason ||= 'duplicate_provider_event'

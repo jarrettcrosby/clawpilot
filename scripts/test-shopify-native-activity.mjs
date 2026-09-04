@@ -57,8 +57,21 @@ assert.equal(complete.result.events[0].attributionSource, 'unavailable')
 assert.equal(complete.result.providerReads, 1)
 assert.match(complete.requests[0].query, /first: 250/)
 assert.doesNotMatch(complete.requests[0].query, /staffAuthor/)
-assert.match(complete.requests[0].variables.query, /comments:true created_at:<=2026-09-03T20:00:00.000Z/)
+assert.equal(complete.requests[0].variables.query, "comments:true created_at:<='2026-09-03T20:00:00.000Z'")
 checked += 1
+
+const offsetCapture = await read([page([basic(1)])], { observedAt: '2026-09-03T16:00:00-04:00' })
+assert.equal(offsetCapture.requests[0].variables.query, "comments:true created_at:<='2026-09-03T20:00:00.000Z'")
+assert.equal(offsetCapture.result.nativeActivityState, 'complete')
+checked += 1
+for (const invalidCapture of ['', 'not-a-date', "2026-09-03T20:00:00.000Z' OR created_at:>'2027-01-01'"]) {
+  const invalid = await read([], { observedAt: invalidCapture })
+  assert.equal(invalid.result.nativeActivityState, 'unavailable')
+  assert.equal(invalid.result.nativeActivityReason, 'invalid_capture_time')
+  assert.equal(invalid.result.providerReads, 0)
+  assert.equal(invalid.requests.length, 0, 'Invalid capture time must not reach the provider query')
+  checked += 1
+}
 
 const controlledActor = await read([page([basic(3, { actor: 'Store\u0000\u0085\noperator' })])])
 assert.equal(controlledActor.result.events[0].providerActorDisplayName, 'Store operator')
@@ -79,6 +92,8 @@ checked += 1
 const two = await read([page([basic(1)], true, 'cursor-one'), page([basic(2)])])
 assert.equal(two.result.nativeActivityState, 'complete')
 assert.equal(two.requests[1].variables.after, 'cursor-one')
+assert.equal(two.requests[1].variables.query, complete.requests[0].variables.query,
+  'Every page retains the same quoted capture boundary')
 assert.equal(two.result.providerReads, 2)
 assert.equal(two.result.nativeActivityFetchedCount, 2)
 checked += 1
@@ -166,10 +181,10 @@ const html = renderToStaticMarkup(React.createElement(components.NativeActivityT
 assert.doesNotMatch(html, /<img src=x|<script>bad|<svg onload/)
 assert.match(html, /&lt;img/)
 const notice = (coverage) => renderToStaticMarkup(React.createElement(components.NativeActivityCoverageNotice, { coverage }))
-assert.match(notice({ state: 'complete', reason: null, fetchedCount: 47, displayTruncated: false }), /47 provider-available/)
-assert.match(notice({ state: 'complete', reason: null, fetchedCount: 500, displayTruncated: true }), /not the complete Shopify Admin timeline/)
-assert.match(notice({ state: 'unavailable', reason: 'provider_unavailable', fetchedCount: 0, displayTruncated: false }), /Order and fulfillment details remain available/)
-assert.match(notice(undefined), /not yet been captured/)
+assert.match(notice({ state: 'complete', reason: null, fetchedCount: 47, displayTruncated: false }), /47 available Shopify events loaded/)
+assert.match(notice({ state: 'complete', reason: null, fetchedCount: 500, displayTruncated: true }), /Partial Shopify history.*Only the latest events are shown here/)
+assert.match(notice({ state: 'unavailable', reason: 'provider_unavailable', fetchedCount: 0, displayTruncated: false }), /Order and fulfillment details are still available/)
+assert.match(notice(undefined), /Refresh from Shopify to load order activity/)
 checked += 5
 
 const presenter = load('app_src/lib/operations/providerOrderHistory.ts')
