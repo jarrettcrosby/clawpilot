@@ -456,6 +456,7 @@ assert.equal(railwayConfig.deploy.preDeployCommand, 'bash scripts/predeploy-rail
 const railwayPredeploy = read('scripts/predeploy-railway.sh')
 for (const fragment of [
   'npm run mail:verify',
+  'npm run db:preflight:commerce-storage',
   'npm run db:migrate',
   'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
@@ -465,6 +466,11 @@ for (const fragment of [
 }
 assert.ok(!railwayPredeploy.includes('CLAWPILOT_DEMO_MODE'))
 assert.ok(!railwayPredeploy.includes('RAILWAY_ENVIRONMENT_NAME'))
+assert.ok(
+  railwayPredeploy.indexOf('npm run db:preflight:commerce-storage')
+    < railwayPredeploy.indexOf('npm run db:migrate'),
+  'commerce storage preflight must run before online migrations',
+)
 assert.ok(
   railwayPredeploy.indexOf('npm run db:migrate') < railwayPredeploy.indexOf('npm run demo:seed'),
   'demo data must only be seeded after migrations complete',
@@ -501,6 +507,7 @@ for (const fragment of [
 for (const forbiddenMigrationPath of [
   'db-migrate.mjs',
   'db:migrate',
+  'db:preflight:commerce-storage',
   'predeploy-railway.sh',
 ]) {
   assert.ok(

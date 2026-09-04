@@ -27,6 +27,7 @@ for (const contract of [
   'inventorySnapshotLivePayloadSoftCapAfter30Days',
   'operations_commerce_storage_maintenance_lanes',
   'claim_operations_commerce_storage_maintenance',
+  'renew_operations_commerce_storage_maintenance',
   'complete_operations_commerce_storage_maintenance',
   'purge_operations_commerce_inventory_observation_aliases',
   'purge_operations_commerce_inventory_level_evidence',
@@ -62,6 +63,18 @@ assert.match(
 )
 assert.match(
   migration,
+  /capture\.snapshot_content_id = ranked\.id[\s\S]*attempt\.state = 'prepared'/,
+  'Prepared provider attempts must pin replayable inventory payloads',
+)
+assert.ok(migration.includes('pg_advisory_xact_lock(hashtextextended('))
+assert.ok(migration.includes('commerce-inventory-snapshot-content:'))
+assert.equal(
+  (migration.match(/LANGUAGE (?:plpgsql|sql)/gu) || []).length,
+  (migration.match(/SET search_path = pg_catalog, public/gu) || []).length,
+  'Every storage-guard function must pin its search path',
+)
+assert.match(
+  migration,
   /latest_run\.id[\s\S]*level\.sync_run_id = COALESCE\([\s\S]*latest_run\.source_level_set_run_id, latest_run\.id/,
 )
 
@@ -78,6 +91,8 @@ for (const contract of [
   'run.source_level_set_run_id IS NULL',
   'if (evidenceRows.length && !reusableLevelSet)',
   'COALESCE(source_level_set_run_id, id)',
+  'commerce-inventory-snapshot-content',
+  'acquireTransactionAdvisoryLock',
 ]) {
   assert.ok(inventory.includes(contract), `Inventory writer is missing ${contract}`)
 }
@@ -110,8 +125,52 @@ assert.match(maintenance, /inventoryLevelLimit,[\s\S]*10000/)
 assert.match(maintenance, /input\.inventoryLevelLimit,[\s\S]*10000,[\s\S]*10000/)
 assert.match(maintenance, /LEVEL_PURGE_PASSES_PER_LEASE = 12/)
 assert.match(maintenance, /claim_operations_commerce_storage_maintenance/)
+assert.match(maintenance, /renew_operations_commerce_storage_maintenance/)
 assert.match(maintenance, /purge_operations_commerce_inventory_snapshot_payloads/)
 assert.match(maintenance, /status: 'failed'/)
+assert.match(maintenance, /status: 'lease_lost'/)
+assert.doesNotMatch(
+  maintenance,
+  /operations_commerce_storage_bloat_health\(/,
+  'Runtime liveness must use persisted maintenance state, not ranked scans',
+)
+
+const onlineMigration = read(
+  'db/migrations/0352_operations_commerce_storage_bloat_guard_online.sql',
+)
+assert.ok(onlineMigration.startsWith('-- clawpilot:migration-mode=nontransactional'))
+assert.match(onlineMigration, /CREATE UNIQUE INDEX CONCURRENTLY/)
+assert.equal((onlineMigration.match(/^CREATE (?:UNIQUE )?INDEX CONCURRENTLY/gmu) || []).length, 6)
+assert.equal((onlineMigration.match(/^DROP INDEX CONCURRENTLY/gmu) || []).length, 6)
+assert.match(
+  onlineMigration,
+  /VALIDATE CONSTRAINT operations_commerce_inventory_level_set_source_fkey/,
+)
+assert.match(
+  migration,
+  /operations_commerce_inventory_level_set_source_fkey[\s\S]*ON DELETE RESTRICT NOT VALID/,
+)
+const migrator = read('scripts/db-migrate.mjs')
+for (const contract of [
+  'clawpilot:migration-mode=nontransactional',
+  'clawpilot:migration-statement-break',
+  "SET lock_timeout = '5s'",
+  'SET statement_timeout = 0',
+  'query_timeout: 0',
+  'recordAppliedMigration',
+]) {
+  assert.ok(migrator.includes(contract), `Online migration runner is missing ${contract}`)
+}
+const preflight = read('scripts/preflight-commerce-storage-guard.mjs')
+for (const contract of [
+  'pg_total_relation_size',
+  'pg_stat_activity',
+  'pg_locks',
+  "interval '5 minutes'",
+  'invalidIndexes',
+]) {
+  assert.ok(preflight.includes(contract), `Storage preflight is missing ${contract}`)
+}
 
 const inventoryRefreshWorker = read(
   'app_src/lib/shopifyInventoryRefreshWorker.ts',
@@ -150,10 +209,26 @@ for (const contract of [
 }
 const healthRoute = read('app_src/app/api/health/route.ts')
 assert.ok(healthRoute.includes('readCommerceStorageBloatHealthFromPostgres'))
-assert.match(
-  healthRoute,
-  /const backlog = \[[\s\S]*inventorySnapshotPayloadBacklogRows[\s\S]*commerceStorage\.status/,
-  'Health readiness must count raw inventory snapshot payload backlog',
+assert.ok(healthRoute.includes("maintenanceDegraded ? 'degraded' : 'ready'"))
+assert.ok(healthRoute.includes('Commerce storage maintenance has an expired lease.'))
+assert.ok(healthRoute.includes('Commerce storage maintenance recently failed'))
+assert.ok(!healthRoute.includes("'inventorySnapshotPayloadBacklogRows',"))
+
+const ordersProcessRoute = read(
+  'app_src/app/api/integrations/commerce/orders/process/route.ts',
+)
+assert.ok(
+  ordersProcessRoute.indexOf('const commerceStorageMaintenance =')
+    < ordersProcessRoute.indexOf('if (!commerceReadRuntimeAvailable())'),
+  'Order-route storage maintenance must run before its provider-disabled guard',
+)
+const inventoryProcessRoute = read(
+  'app_src/app/api/integrations/commerce/inventory/process/route.ts',
+)
+assert.ok(
+  inventoryProcessRoute.indexOf('const commerceStorageMaintenance =')
+    < inventoryProcessRoute.indexOf('const shopifyEnabled ='),
+  'Inventory-route storage maintenance must run before provider-disabled guards',
 )
 
 console.log('commerce storage bloat guard contracts passed')

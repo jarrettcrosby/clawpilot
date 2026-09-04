@@ -96,15 +96,15 @@ ALTER TABLE operations_commerce_intake_read_intents
     )
   ) NOT VALID;
 
-CREATE INDEX IF NOT EXISTS commerce_intake_read_intents_payload_purge_idx
-  ON operations_commerce_intake_read_intents (
-    intent_state, expires_at, updated_at, id
-  )
-  WHERE response_ciphertext IS NOT NULL;
+-- Production-sized indexes are built online by the nontransactional 0352
+-- companion migration. Keeping them out of this transactional schema phase
+-- prevents the deploy migrator's 30-second query budget from turning a large
+-- table scan into an all-or-nothing release failure.
 
 CREATE OR REPLACE FUNCTION protect_operations_commerce_intake_read_intent()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   attempt_action text;
@@ -299,6 +299,7 @@ CREATE OR REPLACE FUNCTION purge_operations_commerce_intake_read_payloads(
 )
 RETURNS TABLE (purged_rows integer, purged_bytes bigint)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
   IF p_limit < 1 OR p_limit > 5000 THEN
@@ -381,29 +382,12 @@ ALTER TABLE operations_commerce_inventory_sync_runs
       organization_id, integration_account_id, source_level_set_run_id
     ) REFERENCES operations_commerce_inventory_sync_runs(
       organization_id, integration_account_id, id
-    ) ON DELETE RESTRICT;
-
-CREATE INDEX IF NOT EXISTS operations_commerce_inventory_level_set_reuse_idx
-  ON operations_commerce_inventory_sync_runs (
-    organization_id, integration_account_id, location_mapping_id,
-    level_set_hash, completed_at DESC, id DESC
-  )
-  WHERE status = 'succeeded' AND level_set_hash IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS operations_commerce_inventory_level_set_source_idx
-  ON operations_commerce_inventory_sync_runs (
-    organization_id, integration_account_id, source_level_set_run_id
-  ) WHERE source_level_set_run_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS operations_commerce_inventory_retention_idx
-  ON operations_commerce_inventory_sync_runs (
-    organization_id, integration_account_id, location_mapping_id,
-    completed_at DESC, id DESC
-  ) WHERE status = 'succeeded';
+    ) ON DELETE RESTRICT NOT VALID;
 
 CREATE OR REPLACE FUNCTION validate_operations_commerce_inventory_level_set_alias()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   source_run operations_commerce_inventory_sync_runs%ROWTYPE;
@@ -463,6 +447,7 @@ CREATE OR REPLACE FUNCTION
   reject_operations_commerce_inventory_level_for_alias()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
   IF EXISTS (
@@ -514,6 +499,7 @@ RETURNS TABLE (
   reason_code text
 )
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   stored_reservation operations_reservations%ROWTYPE;
@@ -800,20 +786,6 @@ ALTER TABLE operations_commerce_inventory_snapshot_contents
       )
     ) NOT VALID;
 
-CREATE UNIQUE INDEX IF NOT EXISTS
-  operations_commerce_inventory_snapshot_contents_hash_unique
-  ON operations_commerce_inventory_snapshot_contents (
-    organization_id, integration_account_id, provider_location_id,
-    adapter_version, snapshot_hash
-  ) WHERE snapshot_content IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS
-  operations_commerce_inventory_snapshot_payload_retention_idx
-  ON operations_commerce_inventory_snapshot_contents (
-    organization_id, integration_account_id, provider_location_id,
-    created_at DESC, id DESC
-  ) WHERE snapshot_content IS NOT NULL;
-
 CREATE OR REPLACE VIEW
   operations_commerce_inventory_snapshot_payload_retention
 AS
@@ -865,6 +837,36 @@ LEFT JOIN latest_observation latest
 WHERE content.snapshot_content IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION
+  validate_operations_commerce_inventory_capture_content()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.snapshot_content_id IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM operations_commerce_inventory_snapshot_contents content
+      WHERE content.organization_id = NEW.organization_id
+        AND content.integration_account_id = NEW.integration_account_id
+        AND content.id = NEW.snapshot_content_id
+        AND content.provider = NEW.provider
+        AND content.adapter_version = NEW.adapter_version
+        AND content.provider_location_id = NEW.provider_location_id
+        AND content.snapshot_hash = NEW.snapshot_hash
+        AND content.level_count = NEW.level_count
+        AND content.snapshot_content IS NOT NULL
+        AND content.payload_purged_at IS NULL
+    ) THEN
+      RAISE EXCEPTION
+        'Commerce inventory capture content does not match live replay evidence';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION
   operations_commerce_inventory_snapshot_content_is_purgeable(
     p_organization_id uuid,
     p_integration_account_id uuid,
@@ -873,6 +875,7 @@ CREATE OR REPLACE FUNCTION
 RETURNS boolean
 LANGUAGE sql
 STABLE
+SET search_path = pg_catalog, public
 AS $$
   SELECT COALESCE((
     SELECT (
@@ -881,7 +884,25 @@ AS $$
         ranked.payload_rank > 8
         AND ranked.created_at < now() - interval '30 days'
       )
-    ) AND NOT ranked.current_payload
+    )
+      AND NOT ranked.current_payload
+      -- A captured prepared attempt is an exact crash/retry boundary. Its
+      -- content remains replayable until projection either succeeds or the
+      -- attempt reaches a terminal state.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM operations_commerce_inventory_captures capture
+        JOIN operations_commerce_provider_attempts attempt
+          ON attempt.organization_id = capture.organization_id
+         AND attempt.integration_account_id =
+             capture.integration_account_id
+         AND attempt.id = capture.provider_attempt_id
+        WHERE capture.organization_id = ranked.organization_id
+          AND capture.integration_account_id =
+              ranked.integration_account_id
+          AND capture.snapshot_content_id = ranked.id
+          AND attempt.state = 'prepared'
+      )
     FROM operations_commerce_inventory_snapshot_payload_retention ranked
     WHERE ranked.organization_id = p_organization_id
       AND ranked.integration_account_id = p_integration_account_id
@@ -895,7 +916,13 @@ CREATE OR REPLACE FUNCTION
   )
 RETURNS TABLE (purged_rows integer, purged_bytes bigint)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
+DECLARE
+  content_row record;
+  current_bytes bigint;
+  total_rows integer := 0;
+  total_bytes bigint := 0;
 BEGIN
   IF p_limit < 1 OR p_limit > 1000 THEN
     RAISE EXCEPTION 'commerce inventory snapshot payload limit is invalid';
@@ -903,11 +930,11 @@ BEGIN
   PERFORM set_config(
     'clawpilot.commerce_inventory_snapshot_payload_compaction', 'on', true
   );
-  RETURN QUERY
-  WITH due AS (
+  FOR content_row IN
     SELECT content.id, content.organization_id,
-           content.integration_account_id,
-           content.content_bytes::bigint AS row_bytes
+           content.integration_account_id, content.provider,
+           content.adapter_version, content.provider_location_id,
+           content.snapshot_hash
     FROM operations_commerce_inventory_snapshot_contents content
     JOIN operations_commerce_inventory_snapshot_payload_retention ranked
       ON ranked.organization_id = content.organization_id
@@ -927,18 +954,38 @@ BEGIN
     ORDER BY content.created_at, content.id
     FOR UPDATE OF content SKIP LOCKED
     LIMIT p_limit
-  ), purged AS (
+  LOOP
+    -- Capture and purge serialize on the immutable provider-content identity.
+    -- The UPDATE is a fresh statement after this lock, so a capture committed
+    -- while we waited is visible to the prepared-attempt recheck.
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+      'commerce-inventory-snapshot-content:'
+      || content_row.organization_id::text || ':'
+      || content_row.integration_account_id::text || ':'
+      || content_row.provider || ':'
+      || content_row.adapter_version || ':'
+      || content_row.provider_location_id || ':'
+      || content_row.snapshot_hash,
+      0
+    ));
+    current_bytes := NULL;
     UPDATE operations_commerce_inventory_snapshot_contents content
     SET snapshot_content = NULL,
         payload_purged_at = now()
-    FROM due
-    WHERE content.organization_id = due.organization_id
-      AND content.integration_account_id = due.integration_account_id
-      AND content.id = due.id
-    RETURNING due.row_bytes
-  )
-  SELECT count(*)::integer, COALESCE(sum(row_bytes), 0)::bigint
-  FROM purged;
+    WHERE content.organization_id = content_row.organization_id
+      AND content.integration_account_id = content_row.integration_account_id
+      AND content.id = content_row.id
+      AND content.snapshot_content IS NOT NULL
+      AND operations_commerce_inventory_snapshot_content_is_purgeable(
+        content.organization_id, content.integration_account_id, content.id
+      )
+    RETURNING content.content_bytes::bigint INTO current_bytes;
+    IF current_bytes IS NOT NULL THEN
+      total_rows := total_rows + 1;
+      total_bytes := total_bytes + current_bytes;
+    END IF;
+  END LOOP;
+  RETURN QUERY SELECT total_rows, total_bytes;
 END;
 $$;
 
@@ -980,6 +1027,7 @@ CREATE OR REPLACE FUNCTION claim_operations_commerce_storage_maintenance(
 )
 RETURNS uuid
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   claimed_token uuid;
@@ -998,7 +1046,6 @@ BEGIN
       next_run_at = clock_timestamp()
         + make_interval(secs => p_cadence_seconds),
       last_started_at = clock_timestamp(),
-      last_error_code = NULL,
       row_version = lane.row_version + 1
   WHERE lane.lane_name = 'commerce-storage'
     AND lane.next_run_at <= clock_timestamp()
@@ -1018,6 +1065,7 @@ CREATE OR REPLACE FUNCTION complete_operations_commerce_storage_maintenance(
 )
 RETURNS boolean
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   completed boolean;
@@ -1052,8 +1100,36 @@ BEGIN
       row_version = lane.row_version + 1
   WHERE lane.lane_name = 'commerce-storage'
     AND lane.lease_token = p_lease_token
+    AND lane.lease_expires_at > clock_timestamp()
   RETURNING true INTO completed;
   RETURN COALESCE(completed, false);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION renew_operations_commerce_storage_maintenance(
+  p_lease_token uuid,
+  p_lease_seconds integer DEFAULT 120
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  renewed boolean;
+BEGIN
+  IF p_lease_token IS NULL
+     OR p_lease_seconds NOT BETWEEN 30 AND 900 THEN
+    RAISE EXCEPTION 'commerce storage maintenance renewal is invalid';
+  END IF;
+  UPDATE operations_commerce_storage_maintenance_lanes lane
+  SET lease_expires_at = clock_timestamp()
+        + make_interval(secs => p_lease_seconds),
+      row_version = lane.row_version + 1
+  WHERE lane.lane_name = 'commerce-storage'
+    AND lane.lease_token = p_lease_token
+    AND lane.lease_expires_at > clock_timestamp()
+  RETURNING true INTO renewed;
+  RETURN COALESCE(renewed, false);
 END;
 $$;
 
@@ -1063,6 +1139,7 @@ CREATE OR REPLACE FUNCTION
   )
 RETURNS TABLE (converted_rows integer, converted_bytes bigint)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   capture_row operations_commerce_inventory_captures%ROWTYPE;
@@ -1103,6 +1180,16 @@ BEGIN
           THEN 400
         ELSE 1
       END
+    ));
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+      'commerce-inventory-snapshot-content:'
+      || capture_row.organization_id::text || ':'
+      || capture_row.integration_account_id::text || ':'
+      || capture_row.provider || ':'
+      || capture_row.adapter_version || ':'
+      || capture_row.provider_location_id || ':'
+      || capture_row.snapshot_hash,
+      0
     ));
     INSERT INTO operations_commerce_inventory_snapshot_contents (
       organization_id, integration_account_id, provider,
@@ -1158,6 +1245,7 @@ $$;
 CREATE OR REPLACE FUNCTION protect_operations_commerce_inventory_evidence()
 RETURNS trigger
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   evidence_rank bigint;
@@ -1320,6 +1408,7 @@ CREATE OR REPLACE FUNCTION
   )
 RETURNS TABLE (purged_rows integer, purged_bytes bigint)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
   IF p_limit < 1 OR p_limit > 5000 THEN
@@ -1388,6 +1477,7 @@ CREATE OR REPLACE FUNCTION purge_operations_commerce_inventory_level_evidence(
 )
 RETURNS TABLE (purged_rows integer, purged_bytes bigint)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
   IF p_limit < 1 OR p_limit > 10000 THEN
@@ -1475,6 +1565,7 @@ CREATE OR REPLACE FUNCTION operations_commerce_storage_bloat_health(
 RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   intake_rows integer;

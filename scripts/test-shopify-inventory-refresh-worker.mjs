@@ -231,6 +231,15 @@ assert.match(
   /DO UPDATE SET[\s\S]*?requested_dirty_version = EXCLUDED\.requested_dirty_version[\s\S]*?status = 'pending'[\s\S]*?available_at = now\(\)[\s\S]*?EXCLUDED\.requested_dirty_version >[\s\S]*?operations_shopify_inventory_refresh_jobs[\s\S]*?\.requested_dirty_version/,
   'Automatic scheduling may only expedite a failed refresh for a newer webhook dirty version',
 )
+
+const inventoryWorkerSource = read(
+  'app_src/lib/shopifyInventoryRefreshWorker.ts',
+)
+assert.match(
+  inventoryWorkerSource,
+  /left\.status === 'lease_lost' \|\| right\.status === 'lease_lost'[\s\S]*?\? 'lease_lost'[\s\S]*?left\.status === 'failed'/,
+  'A lost storage-maintenance lease must not be masked by a later completed pass',
+)
 assert.match(
   persistence,
   /const PERMANENT_ERROR_CODES = new Set\(\[[\s\S]*?'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'[\s\S]*?\]\)/,
@@ -1244,6 +1253,100 @@ assert.equal(maintenanceIsolated.commerceStorageMaintenance.status, 'failed')
 assert.equal(
   maintenanceIsolated.commerceStorageMaintenance.errorCode,
   'SIMULATED_STORAGE_FAILURE',
+)
+
+let disabledRouteMaintenanceCalls = 0
+let disabledRouteProviderCalls = 0
+const disabledRouteModule = loadTypeScriptModule(
+  'app_src/app/api/integrations/commerce/inventory/process/route.ts',
+  {
+    mocks: {
+      'next/server': {
+        NextRequest: class NextRequest {},
+        NextResponse: {
+          json(body, init = {}) {
+            return { body, status: init.status || 200 }
+          },
+        },
+      },
+      '@/lib/integrations/commerceInventory': {
+        shopifyInventoryRuntimeAvailable: () => false,
+      },
+      '@/lib/persistence/config': {
+        isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres(input) {
+          disabledRouteMaintenanceCalls += 1
+          assert.equal(input.workerId, 'commerce-inventory-process-route')
+          return {
+            schemaAvailable: true,
+            executed: false,
+            status: 'not_due',
+            errorCode: null,
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
+          }
+        },
+        commerceStorageMaintenanceFailureResult() {
+          assert.fail('disabled-route maintenance must not fail')
+        },
+      },
+      '@/lib/persistence/shopifyInventoryRefresh': {
+        async recordShopifyInventoryRefreshWorkerHeartbeatInPostgres() {
+          assert.fail('disabled Shopify lane must not write a heartbeat')
+        },
+      },
+      '@/lib/persistence/faireInventoryPolling': {
+        async recordFaireInventoryPollWorkerHeartbeatInPostgres() {
+          assert.fail('disabled Faire lane must not write a heartbeat')
+        },
+      },
+      '@/lib/faireInventoryPollingWorker': {
+        faireInventoryPollingRuntimeAvailable: () => false,
+        async processFaireInventoryPollOutbox() {
+          disabledRouteProviderCalls += 1
+        },
+      },
+      '@/lib/shopifyInventoryRefreshWorker': {
+        async processShopifyInventoryRefreshOutbox() {
+          disabledRouteProviderCalls += 1
+        },
+      },
+    },
+  },
+)
+const routeSecretBefore = process.env.PIPELINE_OUTBOX_WORKER_SECRET
+const disabledRouteSecret = 'i'.repeat(40)
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = disabledRouteSecret
+let disabledRouteResponse
+try {
+  disabledRouteResponse = await disabledRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${disabledRouteSecret}`
+          : null
+      },
+    },
+  })
+} finally {
+  if (routeSecretBefore === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = routeSecretBefore
+  }
+}
+assert.equal(disabledRouteResponse.status, 200)
+assert.equal(disabledRouteResponse.body.skipped, true)
+assert.equal(disabledRouteMaintenanceCalls, 1)
+assert.equal(disabledRouteProviderCalls, 0)
+assert.equal(
+  disabledRouteResponse.body.commerceStorageMaintenance.status,
+  'not_due',
 )
 
 const route = read(

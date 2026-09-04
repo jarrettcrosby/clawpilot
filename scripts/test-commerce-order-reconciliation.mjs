@@ -3181,6 +3181,8 @@ assert.equal(completedRouteHeartbeats.at(-1).phase, 'completed')
 let disabledRoutePurgeCalls = 0
 let disabledRouteRedactionCalls = 0
 let disabledRouteWorkerCalls = 0
+const disabledRouteMaintenanceCallsBefore =
+  commerceStorageMaintenanceTrace.length
 const disabledRouteModule = loadTypeScriptModule(
   'app_src/app/api/integrations/commerce/orders/process/route.ts',
   {
@@ -3276,6 +3278,19 @@ assert.equal(
 assert.equal(disabledRoutePurgeCalls, 1)
 assert.equal(disabledRouteRedactionCalls, 1)
 assert.equal(disabledRouteWorkerCalls, 0)
+assert.equal(
+  commerceStorageMaintenanceTrace.length,
+  disabledRouteMaintenanceCallsBefore + 1,
+  'Disabled order processing must still offer permanent storage maintenance',
+)
+assert.equal(
+  commerceStorageMaintenanceTrace.at(-1)?.workerId,
+  'commerce-orders-process-route',
+)
+assert.equal(
+  disabledRouteResponse.body.commerceStorageMaintenance.status,
+  'not_due',
+)
 assert.equal(
   disabledRouteResponse.body.orderSensitiveEvidenceRedaction.providerWrites,
   0,

@@ -41,12 +41,13 @@ if (!databaseUrl) {
   // random suffix keeps parallel local/CI runs extremely unlikely to collide.
   const port = 55_000 + Number.parseInt(randomUUID().slice(0, 4), 16) % 9_000
   command('docker', [
-    'run', '--rm', '-d', '--name', disposableContainer,
+    'create', '--name', disposableContainer,
     '-e', 'POSTGRES_PASSWORD=commerce_guard',
     '-e', 'POSTGRES_DB=commerce_guard',
     '-p', `127.0.0.1:${port}:5432`,
     'pgvector/pgvector:pg16',
-  ], { timeout: 180_000 })
+  ], { timeout: 60_000 })
+  command('docker', ['start', disposableContainer], { timeout: 60_000 })
   databaseUrl = (
     `postgresql://postgres:commerce_guard@127.0.0.1:${port}/commerce_guard`
   )
@@ -79,8 +80,237 @@ if (!['127.0.0.1', 'localhost', '::1'].includes(parsedUrl.hostname)) {
 const pool = new Pool({
   connectionString: parsedUrl.toString(),
   application_name: 'clawpilot-commerce-storage-bloat-guard-test',
-  max: 1,
+  max: 4,
 })
+
+async function testConcurrentPreparedCaptureAndPurge() {
+  const organizationId = randomUUID()
+  const integrationAccountId = randomUUID()
+  const providerAttemptId = randomUUID()
+  const warehouseId = randomUUID()
+  const locationId = randomUUID()
+  const captureId = randomUUID()
+  const contentIds = Array.from({ length: 40 }, () => randomUUID())
+  const globalSuffix = String(
+    1_000_000 + Number.parseInt(randomUUID().slice(0, 6), 16) % 9_000_000,
+  )
+  const setup = await pool.connect()
+  let oldestContent
+  try {
+    await setup.query('BEGIN')
+    await setup.query(`SET LOCAL session_replication_role = 'replica'`)
+    await setup.query(
+      `INSERT INTO workspace_organizations (id, name)
+       VALUES ($1::uuid, 'Concurrent storage guard fixture')`,
+      [organizationId],
+    )
+    await setup.query(
+      `INSERT INTO operations_integration_accounts (
+         id, global_id, organization_id, provider, integration_type,
+         environment, display_name, status, configuration,
+         external_account_id, commerce_credential_generation
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, 'shopify', 'commerce', 'sandbox',
+         'Concurrent storage guard account', 'active', '{}'::jsonb,
+         $4, 1
+       )`,
+      [
+        integrationAccountId,
+        `gia${globalSuffix}`,
+        organizationId,
+        `gid://shopify/Shop/${globalSuffix}`,
+      ],
+    )
+    await setup.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         id, global_id, organization_id, integration_account_id,
+         action, adapter_version, idempotency_key, request_hash,
+         redacted_request, lease_token, lease_expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, 'inventory.levels.read',
+         'guard-concurrency-v1', $5, repeat('a', 64),
+         '{"resource":"inventory","readOnly":true}'::jsonb,
+         gen_random_uuid(), clock_timestamp() + interval '20 minutes'
+       )`,
+      [
+        providerAttemptId,
+        `gxa${globalSuffix}`,
+        organizationId,
+        integrationAccountId,
+        `guard-concurrency-${providerAttemptId}`,
+      ],
+    )
+    for (const [index, contentId] of contentIds.entries()) {
+      const inserted = await setup.query(
+        `WITH identity AS (
+           SELECT encode(digest($6, 'sha256'), 'hex') AS snapshot_hash
+         ), payload AS (
+           SELECT snapshot_hash,
+                  jsonb_build_object(
+                    'location', jsonb_build_object('id', $5::text),
+                    'levels', '[]'::jsonb,
+                    'enrichment', '{}'::jsonb,
+                    'snapshotHash', snapshot_hash
+                  ) AS snapshot_content
+           FROM identity
+         )
+         INSERT INTO operations_commerce_inventory_snapshot_contents (
+           id, organization_id, integration_account_id, provider,
+           adapter_version, provider_location_id, snapshot_hash,
+           level_count, snapshot_content, content_bytes, created_at
+         )
+         SELECT $1::uuid, $2::uuid, $3::uuid, 'shopify', $4, $5::text,
+                snapshot_hash, 0, snapshot_content,
+                octet_length(convert_to(snapshot_content::text, 'UTF8')),
+                clock_timestamp() - interval '1 hour'
+                  + $7::integer * interval '1 second'
+         FROM payload
+         RETURNING id::text, snapshot_hash, content_bytes`,
+        [
+          contentId,
+          organizationId,
+          integrationAccountId,
+          'guard-concurrency-v1',
+          'guard-concurrency-location',
+          `guard-concurrency-payload-${index}`,
+          index,
+        ],
+      )
+      if (index === 0) oldestContent = inserted.rows[0]
+    }
+    await setup.query('COMMIT')
+  } catch (error) {
+    await setup.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    setup.release()
+  }
+
+  const captureClient = await pool.connect()
+  const purgeClient = await pool.connect()
+  try {
+    const identityKey = [
+      'commerce-inventory-snapshot-content',
+      organizationId,
+      integrationAccountId,
+      'shopify',
+      'guard-concurrency-v1',
+      'guard-concurrency-location',
+      oldestContent.snapshot_hash,
+    ].join(':')
+    await captureClient.query('BEGIN')
+    await captureClient.query(`SET LOCAL session_replication_role = 'replica'`)
+    await captureClient.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+      [identityKey],
+    )
+    await captureClient.query(
+      `INSERT INTO operations_commerce_inventory_captures (
+         id, global_id, organization_id, integration_account_id,
+         provider_attempt_id, warehouse_id, location_id, provider,
+         adapter_version, credential_version, request_hash, snapshot_hash,
+         provider_location_id, provider_fetched_at, level_count,
+         captured_snapshot, snapshot_content_id, provider_page_count,
+         snapshot_bytes
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::uuid,
+         'shopify', 'guard-concurrency-v1', 1, repeat('a', 64), $8,
+         'guard-concurrency-location', clock_timestamp(), 0,
+         NULL, $9::uuid, 1, $10
+       )`,
+      [
+        captureId,
+        `gisc${globalSuffix}`,
+        organizationId,
+        integrationAccountId,
+        providerAttemptId,
+        warehouseId,
+        locationId,
+        oldestContent.snapshot_hash,
+        oldestContent.id,
+        oldestContent.content_bytes,
+      ],
+    )
+    let purgeSettled = false
+    const purgePromise = purgeClient.query(
+      `SELECT *
+       FROM purge_operations_commerce_inventory_snapshot_payloads(1000)`,
+    )
+    purgePromise.then(
+      () => { purgeSettled = true },
+      () => { purgeSettled = true },
+    )
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150))
+    assert.equal(
+      purgeSettled,
+      false,
+      'Purge must wait for the in-flight capture identity lock',
+    )
+    await captureClient.query('COMMIT')
+    const purged = await purgePromise
+    assert.equal(purged.rows[0]?.purged_rows, 7)
+    const retained = await purgeClient.query(
+      `SELECT content.snapshot_content IS NOT NULL AS payload_live,
+              content.payload_purged_at IS NULL AS not_tombstoned,
+              attempt.state
+       FROM operations_commerce_inventory_captures capture
+       JOIN operations_commerce_inventory_snapshot_contents content
+         ON content.organization_id = capture.organization_id
+        AND content.integration_account_id = capture.integration_account_id
+        AND content.id = capture.snapshot_content_id
+       JOIN operations_commerce_provider_attempts attempt
+         ON attempt.organization_id = capture.organization_id
+        AND attempt.integration_account_id = capture.integration_account_id
+        AND attempt.id = capture.provider_attempt_id
+       WHERE capture.id = $1::uuid`,
+      [captureId],
+    )
+    assert.deepEqual(retained.rows[0], {
+      payload_live: true,
+      not_tombstoned: true,
+      state: 'prepared',
+    })
+  } finally {
+    await captureClient.query('ROLLBACK').catch(() => {})
+    captureClient.release()
+    purgeClient.release()
+    const cleanup = await pool.connect()
+    try {
+      await cleanup.query('BEGIN')
+      await cleanup.query(`SET LOCAL session_replication_role = 'replica'`)
+      await cleanup.query(
+        `DELETE FROM operations_commerce_inventory_captures
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      await cleanup.query(
+        `DELETE FROM operations_commerce_inventory_snapshot_contents
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      await cleanup.query(
+        `DELETE FROM operations_commerce_provider_attempts
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      await cleanup.query(
+        `DELETE FROM operations_integration_accounts
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      await cleanup.query(
+        `DELETE FROM workspace_organizations WHERE id = $1::uuid`,
+        [organizationId],
+      )
+      await cleanup.query('COMMIT')
+    } catch (error) {
+      await cleanup.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      cleanup.release()
+    }
+  }
+}
 
 const client = await pool.connect()
 try {
@@ -91,6 +321,44 @@ try {
      ) AS applied`,
   )
   assert.equal(migration.rows[0]?.applied, true, 'migration 0351 must be applied')
+  const onlineMigration = await client.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM schema_migrations
+       WHERE filename =
+         '0352_operations_commerce_storage_bloat_guard_online.sql'
+     ) AS applied`,
+  )
+  assert.equal(
+    onlineMigration.rows[0]?.applied,
+    true,
+    'online migration 0352 must be applied',
+  )
+  const onlineSchema = await client.query(`
+    SELECT
+      count(*) FILTER (WHERE index.indisvalid)::integer AS valid_indexes,
+      bool_and(index.indisready) AS all_ready,
+      (
+        SELECT constraint_record.convalidated
+        FROM pg_constraint constraint_record
+        WHERE constraint_record.conname =
+          'operations_commerce_inventory_level_set_source_fkey'
+      ) AS source_fkey_validated
+    FROM pg_index index
+    JOIN pg_class index_class ON index_class.oid = index.indexrelid
+    WHERE index_class.relname = ANY(ARRAY[
+      'commerce_intake_read_intents_payload_purge_idx',
+      'operations_commerce_inventory_level_set_reuse_idx',
+      'operations_commerce_inventory_level_set_source_idx',
+      'operations_commerce_inventory_retention_idx',
+      'operations_commerce_inventory_snapshot_contents_hash_unique',
+      'operations_commerce_inventory_snapshot_payload_retention_idx'
+    ])
+  `)
+  assert.deepEqual(onlineSchema.rows[0], {
+    valid_indexes: 6,
+    all_ready: true,
+    source_fkey_validated: true,
+  })
 
   await client.query('BEGIN')
   const registryBefore = await client.query(
@@ -517,6 +785,23 @@ try {
       now() - interval '1 hour' + snapshot_number * interval '1 second'
     FROM payloads
   `)
+  await client.query(`
+    INSERT INTO operations_commerce_provider_attempts (
+      id, organization_id, integration_account_id, action, adapter_version,
+      idempotency_key, request_hash, redacted_request,
+      lease_token, lease_expires_at, created_by
+    ) VALUES (
+      '20000000-0000-4000-8000-000000000042'::uuid,
+      '10000000-0000-4000-8000-000000000001'::uuid,
+      '10000000-0000-4000-8000-000000000002'::uuid,
+      'inventory.levels.read', 'guard-test-v1',
+      'guard-prepared-replay', repeat('f', 64),
+      '{"resource":"inventory","readOnly":true}'::jsonb,
+      '20000000-0000-4000-8000-000000000043'::uuid,
+      clock_timestamp() + interval '20 minutes',
+      'guard-test@example.com'
+    )
+  `)
   await client.query(`SET LOCAL session_replication_role = 'replica'`)
   await client.query(`
     INSERT INTO operations_commerce_inventory_captures (
@@ -541,14 +826,79 @@ try {
     FROM operations_commerce_inventory_snapshot_contents content
     WHERE content.id = md5('guard-snapshot-content-1')::uuid
   `)
+  await client.query(`
+    INSERT INTO operations_commerce_inventory_captures (
+      id, organization_id, integration_account_id, provider_attempt_id,
+      warehouse_id, location_id, provider, adapter_version,
+      credential_version, request_hash, snapshot_hash,
+      provider_location_id, provider_fetched_at, level_count,
+      captured_snapshot, snapshot_content_id, provider_page_count,
+      snapshot_bytes, created_by
+    )
+    SELECT
+      '20000000-0000-4000-8000-000000000044'::uuid,
+      '10000000-0000-4000-8000-000000000001'::uuid,
+      '10000000-0000-4000-8000-000000000002'::uuid,
+      '20000000-0000-4000-8000-000000000042'::uuid,
+      '10000000-0000-4000-8000-000000000004'::uuid,
+      '10000000-0000-4000-8000-000000000005'::uuid,
+      'shopify', 'guard-test-v1', 1, repeat('f', 64),
+      content.snapshot_hash, 'guard-location', now(), 0,
+      NULL, content.id, 1, content.content_bytes,
+      'guard-test@example.com'
+    FROM operations_commerce_inventory_snapshot_contents content
+    WHERE content.id = md5('guard-snapshot-content-2')::uuid
+  `)
   await client.query(`SET LOCAL session_replication_role = 'origin'`)
 
   const snapshotPurged = await client.query(
     `SELECT *
      FROM purge_operations_commerce_inventory_snapshot_payloads(1000)`,
   )
-  assert.equal(snapshotPurged.rows[0]?.purged_rows, 8)
+  assert.equal(
+    snapshotPurged.rows[0]?.purged_rows,
+    7,
+    'A capture owned by a prepared attempt must retain exact replay payload',
+  )
   assert.ok(Number(snapshotPurged.rows[0]?.purged_bytes) > 0)
+  const crashRetryReplay = await client.query(`
+    SELECT content.snapshot_content, content.payload_purged_at
+    FROM operations_commerce_inventory_captures capture
+    JOIN operations_commerce_provider_attempts attempt
+      ON attempt.organization_id = capture.organization_id
+     AND attempt.integration_account_id = capture.integration_account_id
+     AND attempt.id = capture.provider_attempt_id
+    JOIN operations_commerce_inventory_snapshot_contents content
+      ON content.organization_id = capture.organization_id
+     AND content.integration_account_id = capture.integration_account_id
+     AND content.id = capture.snapshot_content_id
+    WHERE capture.id = '20000000-0000-4000-8000-000000000044'::uuid
+      AND attempt.state = 'prepared'
+  `)
+  assert.equal(crashRetryReplay.rowCount, 1)
+  assert.equal(crashRetryReplay.rows[0]?.payload_purged_at, null)
+  assert.equal(
+    crashRetryReplay.rows[0]?.snapshot_content?.location?.id,
+    'guard-location',
+  )
+  await client.query(`
+    UPDATE operations_commerce_provider_attempts
+    SET state = 'succeeded',
+        redacted_response = '{"inventoryApplied":true}'::jsonb,
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        completed_at = clock_timestamp()
+    WHERE id = '20000000-0000-4000-8000-000000000042'::uuid
+  `)
+  const terminalSnapshotPurge = await client.query(
+    `SELECT *
+     FROM purge_operations_commerce_inventory_snapshot_payloads(1000)`,
+  )
+  assert.equal(
+    terminalSnapshotPurge.rows[0]?.purged_rows,
+    1,
+    'Terminal attempts may release old optional replay payloads',
+  )
   const snapshotProof = await client.query(`
     SELECT
       count(*) FILTER (WHERE snapshot_content IS NOT NULL)::integer
@@ -679,6 +1029,13 @@ try {
      )::text AS token`,
   )
   assert.equal(competingLease.rows[0]?.token, null)
+  const renewedLease = await client.query(
+    `SELECT renew_operations_commerce_storage_maintenance(
+       $1::uuid, 120
+     ) AS renewed`,
+    [firstLease.rows[0].token],
+  )
+  assert.equal(renewedLease.rows[0]?.renewed, true)
   const completedLease = await client.query(
     `SELECT complete_operations_commerce_storage_maintenance(
        $1::uuid, '{"status":"completed"}'::jsonb, NULL
@@ -693,6 +1050,36 @@ try {
     [firstLease.rows[0].token],
   )
   assert.equal(staleCompletion.rows[0]?.completed, false)
+  await client.query(`
+    UPDATE operations_commerce_storage_maintenance_lanes
+    SET next_run_at = clock_timestamp()
+    WHERE lane_name = 'commerce-storage'
+  `)
+  const expiringLease = await client.query(
+    `SELECT claim_operations_commerce_storage_maintenance(
+       'guard-postgres-expiring', 10, 120
+     )::text AS token`,
+  )
+  await client.query(`
+    UPDATE operations_commerce_storage_maintenance_lanes
+    SET lease_expires_at = clock_timestamp() - interval '1 second'
+    WHERE lane_name = 'commerce-storage'
+      AND lease_token = $1::uuid
+  `, [expiringLease.rows[0].token])
+  const expiredRenewal = await client.query(
+    `SELECT renew_operations_commerce_storage_maintenance(
+       $1::uuid, 120
+     ) AS renewed`,
+    [expiringLease.rows[0].token],
+  )
+  assert.equal(expiredRenewal.rows[0]?.renewed, false)
+  const expiredCompletion = await client.query(
+    `SELECT complete_operations_commerce_storage_maintenance(
+       $1::uuid, '{"status":"completed"}'::jsonb, NULL
+     ) AS completed`,
+    [expiringLease.rows[0].token],
+  )
+  assert.equal(expiredCompletion.rows[0]?.completed, false)
   await client.query(`
     UPDATE operations_commerce_storage_maintenance_lanes
     SET next_run_at = clock_timestamp()
@@ -733,6 +1120,16 @@ try {
        'guard-postgres-recovery', 10, 120
      )::text AS token`,
   )
+  const recoveringLaneState = await client.query(
+    `SELECT last_error_code
+     FROM operations_commerce_storage_maintenance_lanes
+     WHERE lane_name = 'commerce-storage'`,
+  )
+  assert.equal(
+    recoveringLaneState.rows[0]?.last_error_code,
+    'SIMULATED_STORAGE_FAILURE',
+    'A recent failure must remain visible until recovery completes',
+  )
   const recoveryCompletion = await client.query(
     `SELECT complete_operations_commerce_storage_maintenance(
        $1::uuid, '{"status":"completed"}'::jsonb, NULL
@@ -740,6 +1137,12 @@ try {
     [recoveryLease.rows[0].token],
   )
   assert.equal(recoveryCompletion.rows[0]?.completed, true)
+  const recoveredLaneState = await client.query(
+    `SELECT last_error_code
+     FROM operations_commerce_storage_maintenance_lanes
+     WHERE lane_name = 'commerce-storage'`,
+  )
+  assert.equal(recoveredLaneState.rows[0]?.last_error_code, null)
 
   const aliasesPurged = await client.query(
     `SELECT *
@@ -853,8 +1256,9 @@ try {
   )
 
   await client.query('ROLLBACK')
+  await testConcurrentPreparedCaptureAndPurge()
   console.log(
-    'commerce storage guard PostgreSQL acceptance passed: staged and expired intake payloads purge one-way while retry-window payloads remain, raw snapshots retain at most 32 live payloads with one-way tombstones and recurring-hash support, maintenance is persisted single-flight, aliases are bounded, a 10,000-level poll drains plus follow-up backlog, current alias resolves to retained evidence, and public ID reservations remain',
+    'commerce storage guard PostgreSQL acceptance passed: staged and expired intake payloads purge one-way while retry-window payloads remain, prepared captures survive crash/retry and concurrent purge, raw snapshots retain at most 32 live payloads with one-way tombstones and recurring-hash support, maintenance renews and rejects stale completion, online indexes and deferred FK validation are ready, aliases are bounded, a 10,000-level poll drains plus follow-up backlog, current alias resolves to retained evidence, and public ID reservations remain',
   )
 } catch (error) {
   await client.query('ROLLBACK').catch(() => {})

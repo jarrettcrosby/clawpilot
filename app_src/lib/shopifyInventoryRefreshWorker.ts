@@ -44,15 +44,23 @@ function mergeCommerceStorageMaintenance(
     rows: leftMetric.rows + rightMetric.rows,
     bytes: leftMetric.bytes + rightMetric.bytes,
   })
-  return Object.freeze({
-    schemaAvailable: left.schemaAvailable || right.schemaAvailable,
-    executed: left.executed || right.executed,
-    status: left.status === 'failed' || right.status === 'failed'
+  const status = left.status === 'lease_lost' || right.status === 'lease_lost'
+    ? 'lease_lost'
+    : left.status === 'failed' || right.status === 'failed'
       ? 'failed'
       : left.status === 'completed' || right.status === 'completed'
         ? 'completed'
-        : right.status,
-    errorCode: right.errorCode || left.errorCode,
+        : right.status
+  const statusErrorCode = right.status === status
+    ? right.errorCode
+    : left.status === status
+      ? left.errorCode
+      : null
+  return Object.freeze({
+    schemaAvailable: left.schemaAvailable || right.schemaAvailable,
+    executed: left.executed || right.executed,
+    status,
+    errorCode: statusErrorCode || right.errorCode || left.errorCode,
     intakePayloads: mergeMetric(left.intakePayloads, right.intakePayloads),
     legacyInventoryCaptures: mergeMetric(
       left.legacyInventoryCaptures,

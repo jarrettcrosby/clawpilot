@@ -10389,21 +10389,30 @@ export async function GET() {
     if (storage === 'postgres') {
       try {
         commerceStorage = await readCommerceStorageBloatHealthFromPostgres()
-        const backlog = [
-          'intakePayloadBacklogRows',
-          'legacyInventoryCaptureBacklogRows',
-          'inventorySnapshotPayloadBacklogRows',
-          'inventoryObservationAliasBacklogRows',
-          'inventoryLevelBacklogRows',
-        ].reduce((total, key) => (
-          total + Number(commerceStorage[key] || 0)
-        ), 0)
-        commerceStorage.status = commerceStorage.schemaAvailable === true
-          ? (backlog > 0 ? 'draining' : 'ready')
-          : 'migration-pending'
-        if (backlog > 0) {
+        const maintenance = commerceStorage.storageMaintenance
+          && typeof commerceStorage.storageMaintenance === 'object'
+          ? commerceStorage.storageMaintenance as Record<string, unknown>
+          : null
+        const leaseExpired = maintenance?.leaseExpired === true
+        const lastErrorCode = typeof maintenance?.lastErrorCode === 'string'
+          ? maintenance.lastErrorCode
+          : null
+        const maintenanceDegraded = commerceStorage.schemaAvailable === true
+          && (!maintenance || leaseExpired || Boolean(lastErrorCode))
+        commerceStorage.status = commerceStorage.schemaAvailable !== true
+          ? 'migration-pending'
+          : maintenanceDegraded ? 'degraded' : 'ready'
+        if (!maintenance && commerceStorage.schemaAvailable === true) {
           warnings.push(
-            'Bounded commerce storage maintenance has a drainable backlog.',
+            'Commerce storage maintenance state is missing.',
+          )
+        }
+        if (leaseExpired) {
+          warnings.push('Commerce storage maintenance has an expired lease.')
+        }
+        if (lastErrorCode) {
+          warnings.push(
+            `Commerce storage maintenance recently failed (${lastErrorCode}).`,
           )
         }
       } catch (error) {

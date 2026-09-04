@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = requireFromApp('pg')
+const NONTRANSACTIONAL_DIRECTIVE = '-- clawpilot:migration-mode=nontransactional'
+const STATEMENT_BREAK = '-- clawpilot:migration-statement-break'
 
 function fail(message) {
   console.error(`db:migrate failed: ${message}`)
@@ -34,6 +36,69 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000,
   query_timeout: 30000,
 })
+
+function parseNontransactionalStatements(file, sql) {
+  if (!sql.trimStart().startsWith(NONTRANSACTIONAL_DIRECTIVE)) return null
+  const statements = sql.split(STATEMENT_BREAK).map((statement) => (
+    statement.trim()
+  )).filter(Boolean)
+  if (statements.length === 0) {
+    throw new Error(`nontransactional migration ${file} has no statements`)
+  }
+  for (const statement of statements) {
+    const executable = statement
+      .replace(/^\s*--.*$/gmu, '')
+      .trim()
+      .replace(/;\s*$/u, '')
+    if (!executable || executable.includes(';')) {
+      throw new Error(
+        `nontransactional migration ${file} must separate every SQL statement with ${STATEMENT_BREAK}`,
+      )
+    }
+    if (/\b(?:BEGIN|COMMIT|ROLLBACK)\b/iu.test(executable)) {
+      throw new Error(
+        `nontransactional migration ${file} cannot control transactions`,
+      )
+    }
+  }
+  return statements
+}
+
+async function recordAppliedMigration(client, file, checksum) {
+  await client.query('BEGIN')
+  try {
+    await client.query(
+      'INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)',
+      [file, checksum],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  }
+}
+
+async function applyNontransactionalMigration(
+  client,
+  file,
+  checksum,
+  statements,
+) {
+  await client.query({ text: `SET lock_timeout = '5s'`, query_timeout: 0 })
+  await client.query({ text: `SET statement_timeout = 0`, query_timeout: 0 })
+  try {
+    for (const [index, statement] of statements.entries()) {
+      console.log(`apply ${file} statement ${index + 1}/${statements.length}`)
+      await client.query({ text: statement, query_timeout: 0 })
+    }
+    await recordAppliedMigration(client, file, checksum)
+  } finally {
+    await client.query({ text: 'RESET statement_timeout', query_timeout: 0 })
+      .catch(() => undefined)
+    await client.query({ text: 'RESET lock_timeout', query_timeout: 0 })
+      .catch(() => undefined)
+  }
+}
 
 async function main() {
   const client = await pool.connect()
@@ -69,6 +134,19 @@ async function main() {
       }
 
       console.log(`apply ${file}`)
+      const nontransactionalStatements = parseNontransactionalStatements(
+        file,
+        sql,
+      )
+      if (nontransactionalStatements) {
+        await applyNontransactionalMigration(
+          client,
+          file,
+          checksum,
+          nontransactionalStatements,
+        )
+        continue
+      }
       await client.query('BEGIN')
       try {
         await client.query(sql)

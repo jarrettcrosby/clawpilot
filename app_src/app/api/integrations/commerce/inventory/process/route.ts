@@ -17,6 +17,10 @@ import {
 import {
   processShopifyInventoryRefreshOutbox,
 } from '@/lib/shopifyInventoryRefreshWorker'
+import {
+  commerceStorageMaintenanceFailureResult,
+  maintainCommerceStorageInPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -32,6 +36,16 @@ function authorized(req: NextRequest) {
     left.length === right.length
     && crypto.timingSafeEqual(left, right)
   )
+}
+
+async function maintainRouteCommerceStorageSafely() {
+  try {
+    return await maintainCommerceStorageInPostgres({
+      workerId: 'commerce-inventory-process-route',
+    })
+  } catch (error) {
+    return commerceStorageMaintenanceFailureResult(error)
+  }
 }
 
 async function runShopifyLane(input: {
@@ -100,6 +114,10 @@ export async function POST(req: NextRequest) {
       { status: 401 },
     )
   }
+  const postgresEnabled = isPostgresStorageEnabled()
+  const commerceStorageMaintenance = postgresEnabled
+    ? await maintainRouteCommerceStorageSafely()
+    : null
   const shopifyEnabled = shopifyInventoryRuntimeAvailable()
   const faireEnabled = faireInventoryPollingRuntimeAvailable()
   if (!shopifyEnabled && !faireEnabled) {
@@ -107,9 +125,10 @@ export async function POST(req: NextRequest) {
       ok: true,
       skipped: true,
       reason: 'shopify-inventory-disabled',
+      commerceStorageMaintenance,
     })
   }
-  if (!isPostgresStorageEnabled()) {
+  if (!postgresEnabled) {
     return NextResponse.json(
       {
         ok: false,
@@ -149,6 +168,7 @@ export async function POST(req: NextRequest) {
         reason: 'shopify-inventory-disabled',
       },
       faire,
+      routeCommerceStorageMaintenance: commerceStorageMaintenance,
       heartbeatAt: faireLane.value?.heartbeatAt || null,
     })
   }
@@ -162,6 +182,7 @@ export async function POST(req: NextRequest) {
       skipped: true,
       reason: 'faire-inventory-disabled',
     },
+    routeCommerceStorageMaintenance: commerceStorageMaintenance,
     heartbeatAt: shopifyLane.value?.heartbeatAt || null,
   })
 }

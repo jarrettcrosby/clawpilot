@@ -1,7 +1,9 @@
 import { query } from '@/lib/persistence/postgres'
 
 const COMMERCE_STORAGE_GUARD_MIGRATION =
-  '0351_operations_commerce_storage_bloat_guard.sql'
+  '0352_operations_commerce_storage_bloat_guard_online.sql'
+const COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST =
+  'COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST'
 const LEVEL_PURGE_PASSES_PER_LEASE = 12
 const SNAPSHOT_PURGE_PASSES_PER_LEASE = 4
 const ALIAS_PURGE_PASSES_PER_LEASE = 4
@@ -19,7 +21,12 @@ type StorageMetric = Readonly<{ rows: number; bytes: number }>
 export type CommerceStorageMaintenanceResult = Readonly<{
   schemaAvailable: boolean
   executed: boolean
-  status: 'completed' | 'not_due' | 'migration_pending' | 'failed'
+  status:
+    | 'completed'
+    | 'not_due'
+    | 'migration_pending'
+    | 'failed'
+    | 'lease_lost'
   errorCode: string | null
   intakePayloads: StorageMetric
   legacyInventoryCaptures: StorageMetric
@@ -65,6 +72,7 @@ async function sumBoundedPurge(input: {
   passes: number
   limit: number
   run: () => Promise<StorageMetric>
+  afterPass: () => Promise<void>
 }) {
   let rows = 0
   let bytes = 0
@@ -72,6 +80,7 @@ async function sumBoundedPurge(input: {
     const current = await input.run()
     rows += current.rows
     bytes += current.bytes
+    await input.afterPass()
     if (current.rows < input.limit) break
   }
   return { rows, bytes }
@@ -82,12 +91,29 @@ async function completeMaintenanceLease(input: {
   result: Record<string, unknown>
   errorCode: string | null
 }) {
-  await query(
+  const result = await query<{ completed: boolean }>(
     `SELECT complete_operations_commerce_storage_maintenance(
        $1::uuid, $2::jsonb, $3
      ) AS completed`,
     [input.leaseToken, JSON.stringify(input.result), input.errorCode],
   )
+  return result.rows[0]?.completed === true
+}
+
+async function renewMaintenanceLease(leaseToken: string) {
+  const result = await query<{ renewed: boolean }>(
+    `SELECT renew_operations_commerce_storage_maintenance(
+       $1::uuid, 120
+     ) AS renewed`,
+    [leaseToken],
+  )
+  if (result.rows[0]?.renewed !== true) {
+    const error = new Error(
+      'Commerce storage maintenance authority expired during a purge pass',
+    ) as Error & { code?: string }
+    error.code = COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST
+    throw error
+  }
 }
 
 /**
@@ -157,10 +183,12 @@ export async function maintainCommerceStorageInPostgres(input: {
         errorCode: null,
       })
     }
+    const renewLease = () => renewMaintenanceLease(leaseToken as string)
 
     const intake = await sumBoundedPurge({
       passes: 1,
       limit: intakeLimit,
+      afterPass: renewLease,
       run: async () => {
         const result = await query<{
           purged_rows: number
@@ -179,6 +207,7 @@ export async function maintainCommerceStorageInPostgres(input: {
     const capture = await sumBoundedPurge({
       passes: LEGACY_CAPTURE_PASSES_PER_LEASE,
       limit: legacyCaptureLimit,
+      afterPass: renewLease,
       run: async () => {
         const result = await query<{
           converted_rows: number
@@ -197,6 +226,7 @@ export async function maintainCommerceStorageInPostgres(input: {
     const snapshot = await sumBoundedPurge({
       passes: SNAPSHOT_PURGE_PASSES_PER_LEASE,
       limit: inventorySnapshotLimit,
+      afterPass: renewLease,
       run: async () => {
         const result = await query<{
           purged_rows: number
@@ -215,6 +245,7 @@ export async function maintainCommerceStorageInPostgres(input: {
     const aliases = await sumBoundedPurge({
       passes: ALIAS_PURGE_PASSES_PER_LEASE,
       limit: inventoryAliasLimit,
+      afterPass: renewLease,
       run: async () => {
         const result = await query<{
           purged_rows: number
@@ -233,6 +264,7 @@ export async function maintainCommerceStorageInPostgres(input: {
     const inventory = await sumBoundedPurge({
       passes: LEVEL_PURGE_PASSES_PER_LEASE,
       limit: inventoryLevelLimit,
+      afterPass: renewLease,
       run: async () => {
         const result = await query<{
           purged_rows: number
@@ -259,20 +291,42 @@ export async function maintainCommerceStorageInPostgres(input: {
       inventoryObservationAliases: aliases,
       inventoryLevels: inventory,
     })
-    await completeMaintenanceLease({
+    const leaseCompleted = await completeMaintenanceLease({
       leaseToken,
       result: completed,
       errorCode: null,
     })
+    if (!leaseCompleted) {
+      return Object.freeze({
+        ...completed,
+        status: 'lease_lost',
+        errorCode: COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST,
+      })
+    }
     return completed
   } catch (error) {
     const errorCode = maintenanceErrorCode(error)
+    let completionAccepted = false
     if (leaseToken) {
-      await completeMaintenanceLease({
+      completionAccepted = await completeMaintenanceLease({
         leaseToken,
         result: { status: 'failed', errorCode },
         errorCode,
-      }).catch(() => {})
+      }).catch(() => false)
+    }
+    if (
+      leaseToken
+      && (
+        errorCode === COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST
+        || !completionAccepted
+      )
+    ) {
+      return emptyResult({
+        schemaAvailable: true,
+        executed: true,
+        status: 'lease_lost',
+        errorCode: COMMERCE_STORAGE_MAINTENANCE_LEASE_LOST,
+      })
     }
     return Object.freeze({
       ...commerceStorageMaintenanceFailureResult(error),
@@ -292,11 +346,46 @@ export async function readCommerceStorageBloatHealthFromPostgres() {
   if (readiness.rows[0]?.migration_applied !== true) {
     return { schemaAvailable: false }
   }
-  const result = await query<{ health: Record<string, unknown> }>(
-    `SELECT operations_commerce_storage_bloat_health(1000) AS health`,
+  const result = await query<{
+    next_run_at: string
+    lease_owner: string | null
+    lease_expires_at: string | null
+    lease_active: boolean
+    lease_expired: boolean
+    last_started_at: string | null
+    last_completed_at: string | null
+    last_failed_at: string | null
+    last_error_code: string | null
+    last_result: Record<string, unknown>
+    row_version: string
+  }>(
+    `SELECT next_run_at::text, lease_owner, lease_expires_at::text,
+            lease_token IS NOT NULL
+              AND lease_expires_at > clock_timestamp() AS lease_active,
+            lease_token IS NOT NULL
+              AND lease_expires_at <= clock_timestamp() AS lease_expired,
+            last_started_at::text, last_completed_at::text,
+            last_failed_at::text, last_error_code, last_result,
+            row_version::text
+     FROM operations_commerce_storage_maintenance_lanes
+     WHERE lane_name = 'commerce-storage'`,
   )
+  const lane = result.rows[0]
   return {
     schemaAvailable: true,
-    ...(result.rows[0]?.health || {}),
+    diagnosticsMode: 'persisted-maintenance',
+    storageMaintenance: lane ? {
+      nextRunAt: lane.next_run_at,
+      leaseOwner: lane.lease_owner,
+      leaseExpiresAt: lane.lease_expires_at,
+      leaseActive: lane.lease_active,
+      leaseExpired: lane.lease_expired,
+      lastStartedAt: lane.last_started_at,
+      lastCompletedAt: lane.last_completed_at,
+      lastFailedAt: lane.last_failed_at,
+      lastErrorCode: lane.last_error_code,
+      lastResult: lane.last_result || {},
+      rowVersion: Number(lane.row_version || 0),
+    } : null,
   }
 }

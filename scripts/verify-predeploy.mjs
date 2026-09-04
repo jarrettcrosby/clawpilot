@@ -873,6 +873,7 @@ if (String(railway?.deploy?.preDeployCommand || '') !== 'bash scripts/predeploy-
 const railwayPredeploy = readFileSync(resolve(root, 'scripts/predeploy-railway.sh'), 'utf8')
 for (const requiredCommand of [
   'npm run mail:verify',
+  'npm run db:preflight:commerce-storage',
   'npm run db:migrate',
   'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
@@ -881,6 +882,12 @@ for (const requiredCommand of [
   if (!railwayPredeploy.includes(requiredCommand)) {
     fail(`scripts/predeploy-railway.sh must run "${requiredCommand}"`)
   }
+}
+if (
+  railwayPredeploy.indexOf('npm run db:preflight:commerce-storage')
+    >= railwayPredeploy.indexOf('npm run db:migrate')
+) {
+  fail('Commerce storage preflight must run before database migrations')
 }
 const revisionEvidenceKeyGatePosition = railwayPredeploy.indexOf(
   'npm run verify:commerce-order-revision-evidence-keys',

@@ -1317,6 +1317,18 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         409,
       )
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'commerce-inventory-snapshot-content',
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        'shopify',
+        SHOPIFY_INVENTORY_ADAPTER_VERSION,
+        input.snapshot.location.id,
+        input.snapshot.snapshotHash,
+      ].join(':'),
+    )
     await client.query(
       `INSERT INTO operations_commerce_inventory_snapshot_contents (
          organization_id, integration_account_id, provider, adapter_version,
