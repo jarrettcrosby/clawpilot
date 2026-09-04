@@ -314,7 +314,7 @@ function inventorySnapshot(location, label, input) {
   }
 }
 
-async function applyInventorySnapshot(input) {
+async function applyInventorySnapshotResult(input) {
   const requestHash = sha(`request:${input.label}`)
   const idempotencyKey = `shopify-zeroing-${input.label}`
   const attempt = await input.persistence.prepareShopifyInventoryReadInPostgres({
@@ -331,11 +331,11 @@ async function applyInventorySnapshot(input) {
       target: input.target,
       attempt,
       requestHash,
-      snapshot: inventorySnapshot(
-        input.providerLocation,
-        input.label,
-        input.state,
-      ),
+      snapshot: input.snapshot || inventorySnapshot(
+          input.providerLocation,
+          input.label,
+          input.state,
+        ),
       actorEmail,
       providerReadLease: {
         id: randomUUID(),
@@ -360,7 +360,232 @@ async function applyInventorySnapshot(input) {
       requestHash,
       actorEmail,
     })
-  return applied.runGlobalId
+  return applied
+}
+
+async function applyInventorySnapshot(input) {
+  return (await applyInventorySnapshotResult(input)).runGlobalId
+}
+
+async function exerciseLevelSetReuse(input) {
+  const stableSnapshot = inventorySnapshot(
+    input.providerLocation,
+    'storage-guard-stable',
+    {
+      tracked: true,
+      available: 14,
+      committed: 2,
+      onHand: 16,
+      equationMatches: true,
+      minute: 20,
+    },
+  )
+  const before = await input.pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_commerce_inventory_levels
+        WHERE organization_id = $1::uuid) AS levels,
+       (SELECT count(*)::integer
+        FROM crm_reference_registry
+        WHERE reference_code LIKE 'giil%') AS level_ids`,
+    [ids.organization],
+  )
+  const full = await applyInventorySnapshotResult({
+    ...input,
+    label: 'storage-guard-full',
+    snapshot: stableSnapshot,
+  })
+  assert.equal(full.levelSetReused, false)
+  const afterFull = await input.pool.query(
+    `SELECT count(*)::integer AS levels
+     FROM operations_commerce_inventory_levels
+     WHERE organization_id = $1::uuid`,
+    [ids.organization],
+  )
+  assert.equal(afterFull.rows[0].levels, before.rows[0].levels + 1)
+
+  const firstReuse = await applyInventorySnapshotResult({
+    ...input,
+    label: 'storage-guard-reuse-1',
+    snapshot: {
+      ...stableSnapshot,
+      fetchedAt: '2026-08-14T12:21:00.000Z',
+    },
+  })
+  const secondReuse = await applyInventorySnapshotResult({
+    ...input,
+    label: 'storage-guard-reuse-2',
+    snapshot: {
+      ...stableSnapshot,
+      fetchedAt: '2026-08-14T12:22:00.000Z',
+    },
+  })
+  assert.equal(firstReuse.levelSetReused, true)
+  assert.equal(secondReuse.levelSetReused, true)
+  const afterReuse = await input.pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_commerce_inventory_levels
+        WHERE organization_id = $1::uuid) AS levels,
+       (SELECT count(*)::integer
+        FROM crm_reference_registry
+        WHERE reference_code LIKE 'giil%') AS level_ids,
+       (SELECT count(*)::integer
+        FROM operations_commerce_inventory_sync_runs
+        WHERE organization_id = $1::uuid
+          AND source_level_set_run_id IS NOT NULL) AS aliases,
+       (SELECT count(*)::integer
+        FROM operations_commerce_inventory_levels level
+        WHERE level.sync_run_id = (
+          SELECT COALESCE(source_level_set_run_id, id)
+          FROM operations_commerce_inventory_sync_runs
+          WHERE organization_id = $1::uuid
+            AND global_id = $2
+        )) AS resolved_levels`,
+    [ids.organization, secondReuse.runGlobalId],
+  )
+  assert.equal(afterReuse.rows[0].levels, afterFull.rows[0].levels)
+  assert.equal(afterReuse.rows[0].level_ids, before.rows[0].level_ids + 1)
+  assert.equal(afterReuse.rows[0].aliases, 2)
+  assert.equal(afterReuse.rows[0].resolved_levels, 1)
+
+  const changed = await applyInventorySnapshotResult({
+    ...input,
+    label: 'storage-guard-changed',
+    state: {
+      tracked: true,
+      available: 15,
+      committed: 2,
+      onHand: 17,
+      equationMatches: true,
+      minute: 23,
+    },
+  })
+  assert.equal(changed.levelSetReused, false)
+  const afterChange = await input.pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_commerce_inventory_levels
+        WHERE organization_id = $1::uuid) AS levels,
+       (SELECT count(*)::integer
+        FROM crm_reference_registry
+        WHERE reference_code LIKE 'giil%') AS level_ids`,
+    [ids.organization],
+  )
+  assert.equal(afterChange.rows[0].levels, afterFull.rows[0].levels + 1)
+  assert.equal(afterChange.rows[0].level_ids, before.rows[0].level_ids + 2)
+
+  // Rebuild one legacy inline capture from the canonical content. Conversion
+  // must reuse that content row even though PostgreSQL's jsonb serialization
+  // byte count can differ from the original JavaScript JSON byte count.
+  const canonical = await input.pool.query(
+    `SELECT capture.*, content.snapshot_content,
+            capture.snapshot_content_id AS expected_content_id
+     FROM operations_commerce_inventory_sync_runs run
+     JOIN operations_commerce_inventory_captures capture
+       ON capture.organization_id = run.organization_id
+      AND capture.integration_account_id = run.integration_account_id
+      AND capture.id = run.capture_id
+     JOIN operations_commerce_inventory_snapshot_contents content
+       ON content.organization_id = capture.organization_id
+      AND content.integration_account_id = capture.integration_account_id
+      AND content.id = capture.snapshot_content_id
+     WHERE run.organization_id = $1::uuid
+       AND run.global_id = $2`,
+    [ids.organization, full.runGlobalId],
+  )
+  assert.equal(canonical.rowCount, 1)
+  const legacyCaptureId = randomUUID()
+  const legacyAttemptId = randomUUID()
+  const client = await input.pool.connect()
+  try {
+    await client.query(`SET session_replication_role = 'replica'`)
+    await client.query(
+      `INSERT INTO operations_commerce_inventory_captures (
+         id, organization_id, integration_account_id, provider_attempt_id,
+         warehouse_id, location_id, provider, adapter_version,
+         credential_version, request_hash, snapshot_hash,
+         provider_location_id, provider_fetched_at, level_count,
+         captured_snapshot, snapshot_bytes, created_by, created_at
+       )
+       SELECT
+         $1::uuid, capture.organization_id, capture.integration_account_id,
+         $2::uuid, capture.warehouse_id, capture.location_id,
+         capture.provider, capture.adapter_version,
+         capture.credential_version, $3, capture.snapshot_hash,
+         capture.provider_location_id, capture.provider_fetched_at,
+         capture.level_count,
+         content.snapshot_content || jsonb_build_object(
+           'fetchedAt', capture.provider_fetched_at,
+           'pageCount', 999999999999::numeric
+         ),
+         octet_length(convert_to((
+           content.snapshot_content || jsonb_build_object(
+             'fetchedAt', capture.provider_fetched_at,
+             'pageCount', 999999999999::numeric
+           )
+         )::text, 'UTF8')),
+         capture.created_by, now() - interval '1 day'
+       FROM operations_commerce_inventory_captures capture
+       JOIN operations_commerce_inventory_snapshot_contents content
+         ON content.organization_id = capture.organization_id
+        AND content.integration_account_id = capture.integration_account_id
+        AND content.id = capture.snapshot_content_id
+       WHERE capture.id = $4::uuid`,
+      [
+        legacyCaptureId,
+        legacyAttemptId,
+        sha('storage-guard-legacy-request'),
+        canonical.rows[0].id,
+      ],
+    )
+  } finally {
+    await client.query(`SET session_replication_role = 'origin'`)
+    client.release()
+  }
+  const contentCountBefore = await input.pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_inventory_snapshot_contents
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND id = $3::uuid`,
+    [
+      ids.organization,
+      ids.account,
+      canonical.rows[0].expected_content_id,
+    ],
+  )
+  const conversion = await input.pool.query(
+    `SELECT converted_rows, converted_bytes::text
+     FROM convert_operations_commerce_inventory_legacy_captures(25)`,
+  )
+  assert.ok(conversion.rows[0].converted_rows >= 1)
+  assert.ok(Number(conversion.rows[0].converted_bytes) > 0)
+  const legacyAfter = await input.pool.query(
+    `SELECT captured_snapshot, snapshot_content_id, provider_page_count
+     FROM operations_commerce_inventory_captures
+     WHERE id = $1::uuid`,
+    [legacyCaptureId],
+  )
+  assert.equal(legacyAfter.rows[0].captured_snapshot, null)
+  assert.equal(
+    legacyAfter.rows[0].snapshot_content_id,
+    canonical.rows[0].expected_content_id,
+  )
+  assert.equal(legacyAfter.rows[0].provider_page_count, 400)
+  const contentCountAfter = await input.pool.query(
+    `SELECT count(*)::integer AS count
+     FROM operations_commerce_inventory_snapshot_contents
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND id = $3::uuid`,
+    [
+      ids.organization,
+      ids.account,
+      canonical.rows[0].expected_content_id,
+    ],
+  )
+  assert.deepEqual(contentCountAfter.rows[0], contentCountBefore.rows[0])
 }
 
 async function exerciseProjectionZeroing(input) {
@@ -745,6 +970,12 @@ async function exercise(pool) {
     target,
     providerLocation: firstLocation,
   })
+  await exerciseLevelSetReuse({
+    pool,
+    persistence,
+    target,
+    providerLocation: firstLocation,
+  })
 
   await assert.rejects(
     persistence.mapShopifyInventoryLocationInPostgres({
@@ -1032,6 +1263,23 @@ async function exercise(pool) {
 }
 
 async function main() {
+  const suppliedDatabaseUrl = String(process.env.DATABASE_URL || '').trim()
+  if (suppliedDatabaseUrl) {
+    const parsed = new URL(suppliedDatabaseUrl)
+    assert.ok(
+      ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname),
+      'Supplied mapping-test database must be a local disposable database',
+    )
+    await waitForPostgres(suppliedDatabaseUrl)
+    const pool = new Pool({ connectionString: suppliedDatabaseUrl, max: 4 })
+    try {
+      await exercise(pool)
+    } finally {
+      await pool.end()
+    }
+    console.log('Shopify multi-location mapping PostgreSQL tests passed')
+    return
+  }
   command('docker', ['info'], { timeout: 30_000 })
   const container = (
     `clawpilot-shopify-location-map-${process.pid}-`

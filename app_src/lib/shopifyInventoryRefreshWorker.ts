@@ -8,6 +8,42 @@ import {
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
   renewShopifyInventoryRefreshJobLeaseInPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  maintainCommerceStorageInPostgres,
+  type CommerceStorageMaintenanceResult,
+} from '@/lib/persistence/commerceStorageMaintenance'
+
+const STORAGE_MAINTENANCE_INPUT = Object.freeze({
+  intakeLimit: 1000,
+  legacyCaptureLimit: 25,
+  inventoryLevelLimit: 10000,
+})
+
+function mergeCommerceStorageMaintenance(
+  left: CommerceStorageMaintenanceResult,
+  right: CommerceStorageMaintenanceResult,
+): CommerceStorageMaintenanceResult {
+  const mergeMetric = (
+    leftMetric: { rows: number; bytes: number },
+    rightMetric: { rows: number; bytes: number },
+  ) => ({
+    rows: leftMetric.rows + rightMetric.rows,
+    bytes: leftMetric.bytes + rightMetric.bytes,
+  })
+  return Object.freeze({
+    schemaAvailable: left.schemaAvailable || right.schemaAvailable,
+    intakePayloads: mergeMetric(left.intakePayloads, right.intakePayloads),
+    legacyInventoryCaptures: mergeMetric(
+      left.legacyInventoryCaptures,
+      right.legacyInventoryCaptures,
+    ),
+    inventoryObservationAliases: mergeMetric(
+      left.inventoryObservationAliases,
+      right.inventoryObservationAliases,
+    ),
+    inventoryLevels: mergeMetric(left.inventoryLevels, right.inventoryLevels),
+  })
+}
 
 function inventoryRefreshIdempotencyKey(jobId: string) {
   return `shopify-inventory-refresh:${jobId}`
@@ -25,6 +61,9 @@ export async function processShopifyInventoryRefreshOutbox(input: {
   limit?: number
   workerId: string
 }) {
+  let commerceStorageMaintenance = await maintainCommerceStorageInPostgres(
+    STORAGE_MAINTENANCE_INPUT,
+  )
   const automatic = await queueAutomaticShopifyInventoryRefreshesInPostgres()
   let followUpQueued = 0
   const requestedLimit = Math.max(
@@ -97,6 +136,10 @@ export async function processShopifyInventoryRefreshOutbox(input: {
         expectedRefreshFence,
         onProgress: progress,
       })
+      commerceStorageMaintenance = mergeCommerceStorageMaintenance(
+        commerceStorageMaintenance,
+        await maintainCommerceStorageInPostgres(STORAGE_MAINTENANCE_INPUT),
+      )
       const completion =
         await completeShopifyInventoryRefreshJobInPostgres({
           job,
@@ -141,5 +184,6 @@ export async function processShopifyInventoryRefreshOutbox(input: {
     readOnly: true,
     providerWrites: 0,
     orderQuantityAdjustment: 0,
+    commerceStorageMaintenance,
   }
 }

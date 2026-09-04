@@ -49,6 +49,9 @@ import {
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
 import {
+  readCommerceStorageBloatHealthFromPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
+import {
   readShopifyWebhookReceiptHealthFromPostgres,
 } from '@/lib/persistence/shopifyWebhookReceiptHealth'
 import {
@@ -2980,6 +2983,10 @@ export async function GET() {
     let shopifyInventoryRefreshWorker: Record<string, unknown> = {
       status: 'disabled',
       runtimeAuthority: commerceReadReconciliation,
+    }
+    let commerceStorage: Record<string, unknown> = {
+      schemaAvailable: false,
+      status: 'migration-pending',
     }
     let shopifyWebhookReceipts: Record<string, unknown> = {
       status: 'disabled',
@@ -10379,6 +10386,37 @@ export async function GET() {
       errors.push('Hosted runtime database is not configured.')
     }
 
+    if (storage === 'postgres') {
+      try {
+        commerceStorage = await readCommerceStorageBloatHealthFromPostgres()
+        const backlog = [
+          'intakePayloadBacklogRows',
+          'legacyInventoryCaptureBacklogRows',
+          'inventoryObservationAliasBacklogRows',
+          'inventoryLevelBacklogRows',
+        ].reduce((total, key) => (
+          total + Number(commerceStorage[key] || 0)
+        ), 0)
+        commerceStorage.status = commerceStorage.schemaAvailable === true
+          ? (backlog > 0 ? 'draining' : 'ready')
+          : 'migration-pending'
+        if (backlog > 0) {
+          warnings.push(
+            'Bounded commerce storage maintenance has a drainable backlog.',
+          )
+        }
+      } catch (error) {
+        commerceStorage = {
+          schemaAvailable: false,
+          status: 'unavailable',
+        }
+        console.error('[health] Commerce storage health check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        warnings.push('Commerce storage bloat health could not be verified.')
+      }
+    }
+
     if (process.env.CAREER_SITE_LINKEDIN_ENABLED === '1' && storage === 'postgres') {
       try {
         const databaseReadiness = await getCareerSiteLinkedInDatabaseReadiness()
@@ -10482,6 +10520,7 @@ export async function GET() {
       shopifyOrderManagement,
       shopifyReversalFixture,
       shopifyInventoryRefreshWorker,
+      commerceStorage,
       shopifyWebhookReceipts,
       faireInventoryPollWorker,
       commerceProductImageImportWorker,

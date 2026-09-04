@@ -32,6 +32,9 @@ import {
 import {
   purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
+import {
+  maintainCommerceStorageInPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
 
 const PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE = 250
 
@@ -299,6 +302,11 @@ export async function processCommerceOrderReconciliation(input: {
     await purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres({
       limit: PROTECTED_SNAPSHOT_PURGE_LIMIT_PER_CYCLE,
     })
+  const commerceStorageMaintenance = await maintainCommerceStorageInPostgres({
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventoryLevelLimit: 10000,
+  })
   if (!commerceReadRuntimeAvailable()) {
     return {
       skipped: true,
@@ -316,6 +324,7 @@ export async function processCommerceOrderReconciliation(input: {
       canonicalOrderWrites: 0,
       inventoryWrites: 0,
       protectedSnapshotPurge,
+      commerceStorageMaintenance,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -1141,6 +1150,7 @@ export async function processCommerceOrderReconciliation(input: {
     canonicalOrderWrites: shopifyOrdersPromoted + faireOrdersPromoted,
     inventoryWrites: 0,
     protectedSnapshotPurge,
+    commerceStorageMaintenance,
     automaticCustomerResolution: {
       matched: customersMatched,
       created: customersCreated,

@@ -80,6 +80,19 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/commerceStorageMaintenance') {
+        return {
+          async maintainCommerceStorageInPostgres() {
+            return {
+              schemaAvailable: true,
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -913,6 +926,7 @@ assert.equal(
   'A replayed pre-claim provider capture must not acknowledge a newer webhook dirty version',
 )
 const trace = {
+  storageMaintenance: [],
   claim: [],
   renew: [],
   heartbeat: [],
@@ -935,6 +949,18 @@ const worker = loadTypeScriptModule(
             replayed: false,
             effectiveIdempotencyKey: 'manager-owned-overlap-key',
             inventoryRunGlobalId: 'gir1234567',
+          }
+        },
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres(input) {
+          trace.storageMaintenance.push(input)
+          return {
+            schemaAvailable: true,
+            intakePayloads: { rows: 1000, bytes: 8192 },
+            legacyInventoryCaptures: { rows: 25, bytes: 4096 },
+            inventoryObservationAliases: { rows: 1000, bytes: 4096 },
+            inventoryLevels: { rows: 5000, bytes: 65536 },
           }
         },
       },
@@ -974,6 +1000,19 @@ assert.equal(completed.claimed, 1)
 assert.equal(completed.completed, 1)
 assert.equal(completed.providerWrites, 0)
 assert.equal(completed.orderQuantityAdjustment, 0)
+assert.deepEqual(JSON.parse(JSON.stringify(trace.storageMaintenance)), [
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventoryLevelLimit: 10000,
+  },
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventoryLevelLimit: 10000,
+  },
+])
+assert.equal(completed.commerceStorageMaintenance.inventoryLevels.rows, 10000)
 assert.equal(trace.sync.length, 1)
 assert.equal(trace.claim.length, 1)
 assert.equal(trace.claim[0].limit, 1)

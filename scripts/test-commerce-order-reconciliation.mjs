@@ -9,6 +9,7 @@ const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
+const commerceStorageMaintenanceTrace = []
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -79,6 +80,20 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
               purged: 0,
               expiredProtectedReadBacklog: null,
               backlogTruncated: false,
+            }
+          },
+        }
+      }
+      if (specifier === '@/lib/persistence/commerceStorageMaintenance') {
+        return {
+          async maintainCommerceStorageInPostgres(input) {
+            commerceStorageMaintenanceTrace.push(input)
+            return {
+              schemaAvailable: true,
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
             }
           },
         }
@@ -1681,6 +1696,16 @@ assert.equal(
   'Protected snapshot retention must run even when commerce intake is disabled',
 )
 assert.equal(disabledSummary.protectedSnapshotPurge.purged, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(commerceStorageMaintenanceTrace.at(-1))),
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventoryLevelLimit: 10000,
+  },
+  'Permanent commerce storage maintenance must run every reconciliation cycle',
+)
+assert.equal(disabledSummary.commerceStorageMaintenance.schemaAvailable, true)
 const currentFaireGateHealth = JSON.parse(JSON.stringify(
   fairePromotionPolicy.faireAutomaticOrderPromotionGateHealth(),
 ))

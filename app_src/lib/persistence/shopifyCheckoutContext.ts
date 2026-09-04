@@ -925,7 +925,8 @@ async function readLatestInventory(
     global_id: string
     provider_fetched_at: Date | string
   }>(
-    `SELECT id::text, global_id, provider_fetched_at
+    `SELECT COALESCE(source_level_set_run_id, id)::text AS id,
+            global_id, provider_fetched_at
      FROM operations_commerce_inventory_sync_runs
      WHERE organization_id = $1::uuid
        AND integration_account_id = $2::uuid

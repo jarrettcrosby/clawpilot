@@ -1,0 +1,586 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const { Pool } = requireFromApp('pg')
+
+function command(file, args, options = {}) {
+  return execFileSync(file, args, {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+    ...options,
+  }).trim()
+}
+
+let disposableContainer = null
+function stopDisposableContainer() {
+  if (!disposableContainer) return
+  try {
+    command('docker', ['rm', '-f', disposableContainer], { timeout: 30_000 })
+  } catch {}
+  disposableContainer = null
+}
+process.once('exit', stopDisposableContainer)
+
+let databaseUrl = String(process.env.DATABASE_URL || '').trim()
+if (!databaseUrl) {
+  command('docker', ['info'], { timeout: 30_000 })
+  disposableContainer = (
+    `clawpilot-commerce-storage-guard-${process.pid}-`
+    + randomUUID().slice(0, 8)
+  )
+  // Docker Desktop can leave `docker run` waiting in Created state when the
+  // host port is omitted. Pick an explicit high loopback port instead. The
+  // random suffix keeps parallel local/CI runs extremely unlikely to collide.
+  const port = 55_000 + Number.parseInt(randomUUID().slice(0, 4), 16) % 9_000
+  command('docker', [
+    'run', '--rm', '-d', '--name', disposableContainer,
+    '-e', 'POSTGRES_PASSWORD=commerce_guard',
+    '-e', 'POSTGRES_DB=commerce_guard',
+    '-p', `127.0.0.1:${port}:5432`,
+    'pgvector/pgvector:pg16',
+  ], { timeout: 180_000 })
+  databaseUrl = (
+    `postgresql://postgres:commerce_guard@127.0.0.1:${port}/commerce_guard`
+  )
+  let ready = false
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    try {
+      command('docker', [
+        'exec', disposableContainer, 'pg_isready',
+        '-U', 'postgres', '-d', 'commerce_guard',
+      ])
+      ready = true
+      break
+    } catch {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
+    }
+  }
+  assert.equal(ready, true, 'Disposable PostgreSQL did not become ready')
+  command('npm', ['run', 'db:migrate'], {
+    env: { ...process.env, DATABASE_URL: databaseUrl },
+    timeout: 180_000,
+  })
+}
+const parsedUrl = new URL(databaseUrl)
+if (!['127.0.0.1', 'localhost', '::1'].includes(parsedUrl.hostname)) {
+  throw new Error(
+    'Commerce storage guard PostgreSQL test only runs against local disposable databases.',
+  )
+}
+
+const pool = new Pool({
+  connectionString: parsedUrl.toString(),
+  application_name: 'clawpilot-commerce-storage-bloat-guard-test',
+  max: 1,
+})
+
+const client = await pool.connect()
+try {
+  const migration = await client.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM schema_migrations
+       WHERE filename = '0351_operations_commerce_storage_bloat_guard.sql'
+     ) AS applied`,
+  )
+  assert.equal(migration.rows[0]?.applied, true, 'migration 0351 must be applied')
+
+  await client.query('BEGIN')
+  const registryBefore = await client.query(
+    `SELECT count(*)::integer AS count
+     FROM crm_reference_registry
+     WHERE reference_code LIKE 'giil%'`,
+  )
+
+  // The fixture deliberately bypasses unrelated organization/provider foreign
+  // keys. Normal trigger behavior is restored before exercising maintenance.
+  await client.query(`SET LOCAL session_replication_role = 'replica'`)
+  await client.query(`
+    DO $$
+    DECLARE
+      fixture_org uuid := '10000000-0000-4000-8000-000000000001';
+      fixture_account uuid := '10000000-0000-4000-8000-000000000002';
+      fixture_mapping uuid := '10000000-0000-4000-8000-000000000003';
+      fixture_warehouse uuid := '10000000-0000-4000-8000-000000000004';
+      fixture_location uuid := '10000000-0000-4000-8000-000000000005';
+      fixture_pool uuid := '10000000-0000-4000-8000-000000000006';
+      base_time timestamptz := now() - interval '1 hour';
+      run_id uuid;
+      run_hash text;
+      run_number integer;
+    BEGIN
+      FOR run_number IN 1..131 LOOP
+        run_id := md5('guard-full-' || run_number::text)::uuid;
+        run_hash := encode(
+          digest('guard-state-' || run_number::text, 'sha256'),
+          'hex'
+        );
+        INSERT INTO operations_commerce_inventory_sync_runs (
+          id, organization_id, integration_account_id, provider_attempt_id,
+          capture_id, location_mapping_id, warehouse_id, location_id,
+          inventory_pool_id, provider, adapter_version, credential_version,
+          idempotency_key, request_hash, snapshot_hash, status,
+          provider_location_id, provider_location_name, provider_fetched_at,
+          levels_seen, levels_mapped, levels_projected, levels_unmapped,
+          levels_untracked, negative_available_levels,
+          equation_mismatch_levels, provider_available_quantity,
+          provider_committed_quantity, provider_on_hand_quantity,
+          operational_available_quantity, positions_created,
+          positions_updated, positions_zeroed, provider_writes,
+          order_quantity_adjustment, created_at, completed_at,
+          level_set_hash, source_level_set_run_id
+        ) VALUES (
+          run_id, fixture_org, fixture_account,
+          md5('guard-attempt-' || run_number::text)::uuid,
+          md5('guard-capture-' || run_number::text)::uuid,
+          fixture_mapping, fixture_warehouse, fixture_location, fixture_pool,
+          'shopify', 'guard-test-v1', 1,
+          'guard-full-' || run_number::text, repeat('a', 64),
+          repeat('b', 64), 'succeeded', 'guard-location', 'Guard location',
+          base_time + run_number * interval '1 second',
+          CASE WHEN run_number = 1 THEN 10000 ELSE 1 END,
+          0, 0, CASE WHEN run_number = 1 THEN 10000 ELSE 1 END, 0, 0, 0,
+          10 + run_number, 0, 10 + run_number, 0,
+          0, 0, 0, 0, 0,
+          base_time + run_number * interval '1 second',
+          base_time + run_number * interval '1 second',
+          run_hash, NULL
+        );
+        INSERT INTO operations_commerce_inventory_levels (
+          organization_id, sync_run_id, integration_account_id,
+          location_mapping_id, warehouse_id, location_id, inventory_pool_id,
+          provider_location_id, external_inventory_item_id, tracked,
+          mapping_state, projection_state, provider_available_quantity,
+          provider_incoming_quantity, provider_committed_quantity,
+          provider_damaged_quantity, provider_on_hand_quantity,
+          provider_quality_control_quantity, provider_reserved_quantity,
+          provider_safety_stock_quantity, provider_quantity_evidence,
+          operational_available_quantity, equation_matches,
+          product_snapshot, source_hash, created_at
+        ) VALUES (
+          fixture_org, run_id, fixture_account, fixture_mapping,
+          fixture_warehouse, fixture_location, fixture_pool, 'guard-location',
+          'inventory-item-' || run_number::text, true, 'unmapped', 'unmapped',
+          10 + run_number, 0, 0, 0, 10 + run_number, 0, 0, 0,
+          jsonb_build_object('available', 10 + run_number),
+          0, true, '{}'::jsonb, repeat('c', 64),
+          base_time + run_number * interval '1 second'
+        );
+        IF run_number = 1 THEN
+          INSERT INTO operations_commerce_inventory_levels (
+            organization_id, sync_run_id, integration_account_id,
+            location_mapping_id, warehouse_id, location_id,
+            inventory_pool_id, provider_location_id,
+            external_inventory_item_id, tracked, mapping_state,
+            projection_state, provider_available_quantity,
+            provider_incoming_quantity, provider_committed_quantity,
+            provider_damaged_quantity, provider_on_hand_quantity,
+            provider_quality_control_quantity, provider_reserved_quantity,
+            provider_safety_stock_quantity, provider_quantity_evidence,
+            operational_available_quantity, equation_matches,
+            product_snapshot, source_hash, created_at
+          )
+          SELECT
+            fixture_org, run_id, fixture_account, fixture_mapping,
+            fixture_warehouse, fixture_location, fixture_pool,
+            'guard-location', 'inventory-item-1-' || level_number::text,
+            true, 'unmapped', 'unmapped', level_number, 0, 0, 0,
+            level_number, 0, 0, 0,
+            jsonb_build_object('available', level_number),
+            0, true, '{}'::jsonb, repeat('d', 64), base_time
+          FROM generate_series(2, 10000) AS generated(level_number);
+        END IF;
+      END LOOP;
+
+      -- Old A and B observations pin the first two full sets until the alias
+      -- maintenance pass removes observations outside the hard 128-run cap.
+      INSERT INTO operations_commerce_inventory_sync_runs (
+        id, organization_id, integration_account_id, provider_attempt_id,
+        capture_id, location_mapping_id, warehouse_id, location_id,
+        inventory_pool_id, provider, adapter_version, credential_version,
+        idempotency_key, request_hash, snapshot_hash, status,
+        provider_location_id, provider_location_name, provider_fetched_at,
+        levels_seen, levels_mapped, levels_projected, levels_unmapped,
+        levels_untracked, negative_available_levels,
+        equation_mismatch_levels, provider_available_quantity,
+        provider_committed_quantity, provider_on_hand_quantity,
+        operational_available_quantity, positions_created,
+        positions_updated, positions_zeroed, provider_writes,
+        order_quantity_adjustment, created_at, completed_at,
+        level_set_hash, source_level_set_run_id
+      )
+      SELECT
+        md5('guard-alias-' || source_number::text)::uuid,
+        source.organization_id, source.integration_account_id,
+        md5('guard-alias-attempt-' || source_number::text)::uuid,
+        md5('guard-alias-capture-' || source_number::text)::uuid,
+        source.location_mapping_id, source.warehouse_id, source.location_id,
+        source.inventory_pool_id, source.provider, source.adapter_version,
+        source.credential_version, 'guard-alias-' || source_number::text,
+        source.request_hash, source.snapshot_hash, source.status,
+        source.provider_location_id, source.provider_location_name,
+        base_time + (source_number + 0.5) * interval '1 second',
+        source.levels_seen, source.levels_mapped, source.levels_projected,
+        source.levels_unmapped, source.levels_untracked,
+        source.negative_available_levels, source.equation_mismatch_levels,
+        source.provider_available_quantity, source.provider_committed_quantity,
+        source.provider_on_hand_quantity,
+        source.operational_available_quantity, 0, 0, 0, 0, 0,
+        base_time + (source_number + 0.5) * interval '1 second',
+        base_time + (source_number + 0.5) * interval '1 second',
+        source.level_set_hash, source.id
+      FROM unnest(ARRAY[1, 2]) AS selected(source_number)
+      JOIN operations_commerce_inventory_sync_runs source
+        ON source.id = md5('guard-full-' || source_number::text)::uuid;
+
+      -- The current observation is an alias of the newest full set. Readers
+      -- must retain current freshness while resolving levels from its source.
+      INSERT INTO operations_commerce_inventory_sync_runs (
+        id, organization_id, integration_account_id, provider_attempt_id,
+        capture_id, location_mapping_id, warehouse_id, location_id,
+        inventory_pool_id, provider, adapter_version, credential_version,
+        idempotency_key, request_hash, snapshot_hash, status,
+        provider_location_id, provider_location_name, provider_fetched_at,
+        levels_seen, levels_mapped, levels_projected, levels_unmapped,
+        levels_untracked, negative_available_levels,
+        equation_mismatch_levels, provider_available_quantity,
+        provider_committed_quantity, provider_on_hand_quantity,
+        operational_available_quantity, positions_created,
+        positions_updated, positions_zeroed, provider_writes,
+        order_quantity_adjustment, created_at, completed_at,
+        level_set_hash, source_level_set_run_id
+      )
+      SELECT
+        md5('guard-current-alias')::uuid,
+        source.organization_id, source.integration_account_id,
+        md5('guard-current-attempt')::uuid,
+        md5('guard-current-capture')::uuid,
+        source.location_mapping_id, source.warehouse_id, source.location_id,
+        source.inventory_pool_id, source.provider, source.adapter_version,
+        source.credential_version, 'guard-current-alias', source.request_hash,
+        source.snapshot_hash, source.status, source.provider_location_id,
+        source.provider_location_name, base_time + interval '132 seconds',
+        source.levels_seen, source.levels_mapped, source.levels_projected,
+        source.levels_unmapped, source.levels_untracked,
+        source.negative_available_levels, source.equation_mismatch_levels,
+        source.provider_available_quantity, source.provider_committed_quantity,
+        source.provider_on_hand_quantity,
+        source.operational_available_quantity, 0, 0, 0, 0, 0,
+        base_time + interval '132 seconds', base_time + interval '132 seconds',
+        source.level_set_hash, source.id
+      FROM operations_commerce_inventory_sync_runs source
+      WHERE source.id = md5('guard-full-131')::uuid;
+    END;
+    $$;
+  `)
+  await client.query(`
+    INSERT INTO workspace_organizations (id, name) VALUES (
+      '10000000-0000-4000-8000-000000000001',
+      'Commerce storage guard fixture'
+    );
+    INSERT INTO app_users (email, role, status) VALUES (
+      'guard-test@example.com', 'admin', 'active'
+    );
+    INSERT INTO pipeline_spaces (
+      id, name, owner_email, workspace_organization_id, is_default
+    ) VALUES (
+      '20000000-0000-4000-8000-000000000002',
+      'Commerce storage guard pipeline', 'guard-test@example.com',
+      '10000000-0000-4000-8000-000000000001', true
+    );
+    INSERT INTO operations_integration_accounts (
+      id, global_id, organization_id, provider, integration_type,
+      environment, display_name, status, configuration,
+      external_account_id, commerce_credential_generation
+    ) VALUES (
+      '10000000-0000-4000-8000-000000000002', 'gia9999001',
+      '10000000-0000-4000-8000-000000000001',
+      'shopify', 'commerce', 'sandbox', 'Commerce storage guard account',
+      'active', '{}'::jsonb, 'gid://shopify/Shop/9999001', 1
+    );
+    INSERT INTO operations_commerce_provider_attempts (
+      id, global_id, organization_id, integration_account_id,
+      action, adapter_version, idempotency_key, request_hash,
+      state, completed_at, created_by
+    ) VALUES
+    (
+      '20000000-0000-4000-8000-000000000003', 'gxa9999001',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      'commerce.intake.read', 'guard-test-v1', 'guard-staged',
+      repeat('1', 64), 'succeeded', now(), 'guard-test@example.com'
+    ),
+    (
+      '20000000-0000-4000-8000-000000000022', 'gxa9999002',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      'commerce.intake.read', 'guard-test-v1', 'guard-expired',
+      repeat('4', 64), 'succeeded', now(), 'guard-test@example.com'
+    ),
+    (
+      '20000000-0000-4000-8000-000000000032', 'gxa9999003',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      'commerce.intake.read', 'guard-test-v1', 'guard-retry-window',
+      repeat('7', 64), 'succeeded', now(), 'guard-test@example.com'
+    );
+
+    INSERT INTO operations_commerce_intake_runs (
+      id, global_id, organization_id, integration_account_id, pipeline_id,
+      provider, resource, credential_version, provider_api_version,
+      normalizer_version, idempotency_key, request_hash,
+      provider_attempt_id, window_end, workflow_state,
+      records_seen, records_staged, created_by, updated_by,
+      created_at, updated_at, expires_at
+    ) VALUES (
+      '20000000-0000-4000-8000-000000000001', 'gcir9999001',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      '20000000-0000-4000-8000-000000000002',
+      'shopify', 'products_and_orders', 1, 'guard-test-v1',
+      'guard-test-v1', 'guard-staged', repeat('1', 64),
+      '20000000-0000-4000-8000-000000000003',
+      now() - interval '2 days', 'held', 1, 1,
+      'guard-test@example.com', 'guard-test@example.com',
+      now() - interval '1 hour', now() - interval '1 hour',
+      now() + interval '6 days'
+    );
+
+    INSERT INTO operations_commerce_intake_read_intents (
+      id, organization_id, integration_account_id, pipeline_id,
+      provider, resource, intake_action, idempotency_key, request_hash,
+      credential_version, target_kind, session_id, batch_number,
+      window_end, query_hash, intent_state, provider_attempt_id,
+      response_ciphertext, response_iv, response_tag, response_hash,
+      response_bytes, response_encryption_version, staged_run_id,
+      row_version, created_by, updated_by, created_at, updated_at, expires_at
+    ) VALUES
+    (
+      '20000000-0000-4000-8000-000000000010',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      '20000000-0000-4000-8000-000000000002',
+      'shopify', 'orders', 'fetch', 'guard-staged', repeat('1', 64),
+      1, 'none', '20000000-0000-4000-8000-000000000011', 1,
+      now() - interval '2 days', repeat('2', 64), 'staged',
+      '20000000-0000-4000-8000-000000000003',
+      decode('aabb', 'hex'), decode(repeat('11', 12), 'hex'),
+      decode(repeat('22', 16), 'hex'), repeat('3', 64), 2, 1,
+      '20000000-0000-4000-8000-000000000001', 5,
+      'guard-test@example.com', 'guard-test@example.com',
+      now() - interval '1 hour', now() - interval '1 hour',
+      now() + interval '6 days'
+    ),
+    (
+      '20000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      '20000000-0000-4000-8000-000000000002',
+      'shopify', 'orders', 'fetch', 'guard-expired', repeat('4', 64),
+      1, 'none', '20000000-0000-4000-8000-000000000021', 1,
+      now() - interval '3 days', repeat('5', 64), 'captured',
+      '20000000-0000-4000-8000-000000000022',
+      decode('ccdd', 'hex'), decode(repeat('33', 12), 'hex'),
+      decode(repeat('44', 16), 'hex'), repeat('6', 64), 2, 1,
+      NULL, 3, 'guard-test@example.com', 'guard-test@example.com',
+      now() - interval '2 days', now() - interval '2 days',
+      now() - interval '1 day'
+    ),
+    (
+      '20000000-0000-4000-8000-000000000030',
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      '20000000-0000-4000-8000-000000000002',
+      'shopify', 'orders', 'fetch', 'guard-retry-window', repeat('7', 64),
+      1, 'none', '20000000-0000-4000-8000-000000000031', 1,
+      now(), repeat('8', 64), 'captured',
+      '20000000-0000-4000-8000-000000000032',
+      decode('eeff', 'hex'), decode(repeat('55', 12), 'hex'),
+      decode(repeat('66', 16), 'hex'), repeat('9', 64), 2, 1,
+      NULL, 2, 'guard-test@example.com', 'guard-test@example.com',
+      now() - interval '1 hour', now() - interval '1 hour',
+      now() + interval '1 day'
+    );
+  `)
+  await client.query(`SET LOCAL session_replication_role = 'origin'`)
+
+  const intakePurged = await client.query(
+    `SELECT * FROM purge_operations_commerce_intake_read_payloads(5000)`,
+  )
+  assert.deepEqual(intakePurged.rows[0], {
+    purged_rows: 2,
+    purged_bytes: '4',
+  })
+  const intakeProof = await client.query(`
+    SELECT id, intent_state, response_ciphertext IS NOT NULL AS encrypted,
+           response_hash, response_bytes, response_encryption_version,
+           response_purged_at IS NOT NULL AS purged,
+           staged_run_id, row_version, last_error_code
+    FROM operations_commerce_intake_read_intents
+    WHERE id IN (
+      '20000000-0000-4000-8000-000000000010',
+      '20000000-0000-4000-8000-000000000020',
+      '20000000-0000-4000-8000-000000000030'
+    )
+    ORDER BY id
+  `)
+  assert.deepEqual(intakeProof.rows.map((row) => ({
+    state: row.intent_state,
+    encrypted: row.encrypted,
+    hash: row.response_hash,
+    bytes: row.response_bytes,
+    encryptionVersion: row.response_encryption_version,
+    purged: row.purged,
+    stagedRunId: row.staged_run_id,
+    rowVersion: Number(row.row_version),
+    lastErrorCode: row.last_error_code,
+  })), [
+    {
+      state: 'staged', encrypted: false, hash: '3'.repeat(64), bytes: 2,
+      encryptionVersion: 1, purged: true,
+      stagedRunId: '20000000-0000-4000-8000-000000000001',
+      rowVersion: 6, lastErrorCode: null,
+    },
+    {
+      state: 'expired', encrypted: false, hash: '6'.repeat(64), bytes: 2,
+      encryptionVersion: 1, purged: true, stagedRunId: null,
+      rowVersion: 4,
+      lastErrorCode: 'COMMERCE_INTAKE_READ_INTENT_EXPIRED',
+    },
+    {
+      state: 'captured', encrypted: true, hash: '9'.repeat(64), bytes: 2,
+      encryptionVersion: 1, purged: false, stagedRunId: null,
+      rowVersion: 2, lastErrorCode: null,
+    },
+  ])
+  await client.query('SAVEPOINT restore_purged_payload')
+  await assert.rejects(
+    client.query(`
+      UPDATE operations_commerce_intake_read_intents
+      SET response_ciphertext = decode('aabb', 'hex'),
+          response_iv = decode(repeat('11', 12), 'hex'),
+          response_tag = decode(repeat('22', 16), 'hex'),
+          response_purged_at = NULL,
+          row_version = row_version + 1,
+          updated_by = 'guard-test@example.com',
+          updated_at = now()
+      WHERE id = '20000000-0000-4000-8000-000000000010'
+    `),
+    /Purged commerce intake response evidence is immutable/,
+  )
+  await client.query('ROLLBACK TO SAVEPOINT restore_purged_payload')
+
+  const aliasesPurged = await client.query(
+    `SELECT *
+     FROM purge_operations_commerce_inventory_observation_aliases(5000)`,
+  )
+  assert.equal(aliasesPurged.rows[0]?.purged_rows, 2)
+
+  const levelsPurged = await client.query(
+    `SELECT * FROM purge_operations_commerce_inventory_level_evidence(10000)`,
+  )
+  assert.equal(
+    levelsPurged.rows[0]?.purged_rows,
+    10000,
+    'One bounded pass must drain one maximum-size Shopify level set',
+  )
+  const levelsPurgedFollowUp = await client.query(
+    `SELECT * FROM purge_operations_commerce_inventory_level_evidence(10000)`,
+  )
+  assert.equal(
+    levelsPurgedFollowUp.rows[0]?.purged_rows,
+    2,
+    'The post-sync pass must drain backlog beyond the current poll maximum',
+  )
+
+  const proof = await client.query(`
+    WITH latest AS (
+      SELECT id, COALESCE(source_level_set_run_id, id) AS effective_run_id,
+             source_level_set_run_id
+      FROM operations_commerce_inventory_sync_runs
+      WHERE organization_id = '10000000-0000-4000-8000-000000000001'
+      ORDER BY completed_at DESC, id DESC
+      LIMIT 1
+    )
+    SELECT
+      (SELECT count(*)::integer
+       FROM operations_commerce_inventory_sync_runs
+       WHERE organization_id = '10000000-0000-4000-8000-000000000001'
+         AND source_level_set_run_id IS NOT NULL) AS remaining_aliases,
+      (SELECT count(*)::integer
+       FROM operations_commerce_inventory_levels
+       WHERE organization_id = '10000000-0000-4000-8000-000000000001')
+        AS remaining_levels,
+      (SELECT count(*)::integer
+       FROM operations_commerce_inventory_levels
+       WHERE sync_run_id IN (
+         md5('guard-full-1')::uuid,
+         md5('guard-full-2')::uuid,
+         md5('guard-full-3')::uuid
+       )) AS obsolete_levels,
+      (SELECT source_level_set_run_id IS NOT NULL FROM latest)
+        AS latest_is_alias,
+      (SELECT count(*)::integer
+       FROM operations_commerce_inventory_levels level
+       JOIN latest ON latest.effective_run_id = level.sync_run_id)
+        AS latest_effective_levels,
+      (SELECT count(*)::integer
+       FROM crm_reference_registry
+       WHERE reference_code LIKE 'giil%') AS registry_after
+  `)
+  assert.deepEqual(
+    {
+      remainingAliases: proof.rows[0]?.remaining_aliases,
+      remainingLevels: proof.rows[0]?.remaining_levels,
+      obsoleteLevels: proof.rows[0]?.obsolete_levels,
+      latestIsAlias: proof.rows[0]?.latest_is_alias,
+      latestEffectiveLevels: proof.rows[0]?.latest_effective_levels,
+      registryDelta:
+        proof.rows[0]?.registry_after - registryBefore.rows[0]?.count,
+    },
+    {
+      remainingAliases: 1,
+      remainingLevels: 128,
+      obsoleteLevels: 0,
+      latestIsAlias: true,
+      latestEffectiveLevels: 1,
+      registryDelta: 10130,
+    },
+  )
+
+  const secondPass = await client.query(
+    `SELECT
+       (SELECT purged_rows
+        FROM purge_operations_commerce_inventory_observation_aliases(5000))
+          AS aliases,
+       (SELECT purged_rows
+        FROM purge_operations_commerce_inventory_level_evidence(10000))
+          AS levels`,
+  )
+  assert.deepEqual(secondPass.rows[0], { aliases: 0, levels: 0 })
+
+  const health = await client.query(
+    `SELECT operations_commerce_storage_bloat_health(1000) AS health`,
+  )
+  assert.equal(health.rows[0]?.health.inventoryObservationAliasBacklogRows, 0)
+  assert.equal(health.rows[0]?.health.inventoryLevelBacklogRows, 0)
+
+  await client.query('ROLLBACK')
+  console.log(
+    'commerce storage guard PostgreSQL acceptance passed: staged and expired intake payloads purge one-way while retry-window payloads remain, aliases are bounded, a 10,000-level poll drains plus follow-up backlog, current alias resolves to retained evidence, and public ID reservations remain',
+  )
+} catch (error) {
+  await client.query('ROLLBACK').catch(() => {})
+  throw error
+} finally {
+  client.release()
+  await pool.end()
+  stopDisposableContainer()
+}

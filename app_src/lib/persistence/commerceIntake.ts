@@ -7308,6 +7308,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       `UPDATE operations_commerce_intake_read_intents
        SET intent_state = 'staged',
            staged_run_id = $2::uuid,
+           response_ciphertext = NULL,
+           response_iv = NULL,
+           response_tag = NULL,
+           response_purged_at = now(),
            row_version = row_version + 1,
            updated_by = $3,
            updated_at = now()
