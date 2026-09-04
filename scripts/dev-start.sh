@@ -2,6 +2,8 @@
 set -euo pipefail
 
 PORT="4002"
+PUBLIC_URL="${CLAWPILOT_LOCAL_PUBLIC_URL:-http://localhost:${PORT}}"
+BIND_HOST="${CLAWPILOT_LOCAL_BIND_HOST:-0.0.0.0}"
 LOG_FILE="/tmp/clawd-app-dev.log"
 LOG_ROTATE_BYTES=$((5 * 1024 * 1024))
 PID_FILE="/tmp/clawd-app-dev.pid"
@@ -136,6 +138,8 @@ rotate_dev_log_if_needed
 echo "====================================="
 echo "CLAWPILOT DEV RUNTIME"
 echo "Port: 4002"
+echo "Public URL: $PUBLIC_URL"
+echo "Bind host: $BIND_HOST"
 echo "Root: $DEV_REPO"
 echo "Data root: data-dev/"
 echo "Logs: /tmp/clawd-app-dev.log"
@@ -160,6 +164,7 @@ echo "built_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$BUILD_STAMP"
 PORT="$PORT" \
 RUNTIME_LANE="dev" \
 RUNTIME_PORT="$PORT" \
+CLAWPILOT_PUBLIC_URL="$PUBLIC_URL" \
 CLAWPILOT_REPO_ROOT="$DEV_REPO" \
 CLAWPILOT_STORAGE="file" \
 APP_AUTH_REQUIRED="0" \
@@ -171,7 +176,7 @@ PIPELINE_LOG_PATH="$DEV_DATA_ROOT/logs/pipeline-events.jsonl" \
 PIPELINE_DROPDOWN_CACHE_PATH="$DEV_DATA_ROOT/pipeline/dropdowns/catalog.json" \
 AGENT_THREADS_PATH="$DEV_DATA_ROOT/agents/threads.json" \
 AGENT_ASSIGNMENTS_PATH="$DEV_DATA_ROOT/agents/assignments.json" \
-nohup npm run start -- --port "$PORT" --hostname 0.0.0.0 > "$LOG_FILE" 2>&1 &
+nohup npm run start -- --port "$PORT" --hostname "$BIND_HOST" > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
 cleanup_failed_start() {

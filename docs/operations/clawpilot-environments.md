@@ -29,6 +29,36 @@ Start the isolated local runtime from the repository root:
 
 Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths; normal validation must not use a plain `npm run dev`. When `APP_AUTH_REQUIRED=0` on a non-hosted runtime, API requests use a synthetic local operator so the isolated file-backed workspace remains testable without weakening Railway or Vercel session enforcement. Keep a tool-managed startup shell alive while browser testing so its child process is not cleaned up.
 
+After the hosted Railway development environment is retired, this Mac may keep
+the familiar development origin without exposing the local runtime publicly:
+
+```bash
+brew install caddy mkcert
+./scripts/manage-local-development-domain.sh prepare
+./scripts/manage-local-development-domain.sh enable
+```
+
+`enable` requests one macOS administrator authorization, maps
+`dev.aiapp.eigenracing.com` to loopback only, trusts a local certificate, runs a
+loopback-bound HTTPS proxy, and starts the isolated runtime bound to
+`127.0.0.1:4002`. It
+does not change public DNS or Railway. Do not enable the override until the
+final hosted-development acceptance pass is complete, because the local
+mapping would otherwise make browser checks bypass Railway. Before recreating
+a hosted development environment, run
+`./scripts/manage-local-development-domain.sh disable` so the browser resumes
+using public DNS. The `dev` branch, Railway service definitions, append-only
+migrations, and a verified development database archive are retained for that
+future restoration.
+
+After a reboot, rerun `./scripts/manage-local-development-domain.sh enable` to
+start the isolated app again; the command is idempotent. Use `status` to verify
+the hosts override, proxy, and HTTPS health together.
+
+The loopback override applies only to this Mac. An iPhone or Watch requires a
+separately trusted certificate and LAN or VPN DNS path to the Mac; do not expose
+the unauthenticated local fixture runtime to the public internet.
+
 ## Hosted Topology
 
 | Surface | Production |
