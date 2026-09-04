@@ -3158,6 +3158,67 @@ test('retained unavailable candidates stay visible but cannot be edited or impor
   expect(capture.providerMutationRequests).toEqual([])
 })
 
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+  test(`tracking summary retains all six package snapshots on expansion at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    await page.clock.setFixedTime('2026-09-07T18:05:00.000Z')
+    const events = Array.from({ length: 6 }, (_, index) => ({
+      globalId: `gcoe765433${index}`,
+      kind: 'tracking_updated',
+      status: index === 5 ? 'delivered' : 'in_transit',
+      occurredAt: `2026-09-0${index + 1}T17:00:00.000Z`,
+      externalSubjectId: 'gid://shopify/Fulfillment/77101',
+      quantity: null,
+      amountMinor: null,
+      currency: null,
+      trackingCarrier: 'USPS',
+      trackingNumber: 'TEST-PACKAGE-1',
+      trackingUrl: `https://tracking.example.test/snapshot-${index}`,
+      trackingRedacted: false,
+    }))
+    const original = JSON.stringify(events)
+    const capture = await installImportedWorkbenchRoutes(page, {
+      historyRefreshStatus: 'captured',
+      providerState: {
+        lifecycle: 'closed', fulfillment: 'fulfilled',
+        observedAt: '2026-09-07T18:00:00.000Z', source: 'history',
+      },
+      providerHistory: {
+        ...importedWorkbenchOrder(true).providerHistory,
+        observedAt: '2026-09-07T18:00:00.000Z',
+        events,
+      },
+    })
+    await gotoApp(page, '/#operations')
+    await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+    const summary = page.getByTestId('order-tracking-summary')
+    await expect(summary.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(1)
+    await expect(summary).toContainText('delivered')
+    await expect(summary.getByRole('link', { name: 'Track shipment' }))
+      .toHaveAttribute('href', 'https://tracking.example.test/snapshot-5')
+    const expand = page.getByRole('button', { name: 'Tracking history (6)' })
+    await expect(expand).toHaveAttribute('aria-expanded', 'false')
+    await expect(page.getByTestId('order-tracking-history')).toHaveCount(0)
+    await expand.click()
+    await expect(expand).toHaveAttribute('aria-expanded', 'true')
+    const history = page.getByTestId('order-tracking-history')
+    await expect(history).toBeVisible()
+    await expect(history.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(6)
+    const historicalLinks = history.getByRole('link', { name: 'Track shipment' })
+    await expect(historicalLinks).toHaveCount(6)
+    for (let index = 0; index < events.length; index += 1) {
+      await expect(historicalLinks.nth(index)).toHaveAttribute('href', events[index].trackingUrl)
+    }
+    await expand.click()
+    await expect(page.getByTestId('order-tracking-history')).toHaveCount(0)
+    await expect(summary.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(1)
+    expect(JSON.stringify(events)).toBe(original)
+    expect(capture.patchRequests).toEqual([])
+    expect(capture.acceptRequests).toEqual([])
+    expect(capture.providerMutationRequests).toEqual([])
+  })
+}
+
 test('provider-terminal candidates remain visible with current external status and cannot be imported', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.clock.setFixedTime('2026-08-31T18:05:00.000Z')

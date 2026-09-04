@@ -2,6 +2,9 @@
 
 import { useMemo, useState } from 'react'
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Alert,
   Box,
   Button,
@@ -23,13 +26,16 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
+import ExpandMoreRounded from '@mui/icons-material/ExpandMoreRounded'
 import { NativeActivityCoverageNotice, NativeActivityText } from '@/components/operations/CommerceNativeActivity'
 import type {
   OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderWorkingCopyDraft,
   OperationsImportedOrderWorkingCopy,
+  OperationsProviderOrderHistory,
 } from '@/lib/operations/types'
+import { currentOrderTrackingEvents } from '@/lib/operations/orderTrackingSummary'
 import {
   normalizeOrderShipToDraft,
   orderShipToReadiness,
@@ -162,6 +168,33 @@ function providerEventMoney(amountMinor: number | null, currency: string | null)
   }
 }
 
+function TrackingEventDetails({ event }: {
+  event: OperationsProviderOrderHistory['events'][number]
+}) {
+  return (
+    <Box>
+      <Typography variant="body2">
+        {[event.trackingCarrier, event.trackingNumber]
+          .filter(Boolean).join(' · ')
+          || (event.trackingRedacted
+            ? 'Tracking number expired from retained evidence'
+            : 'Tracking number not supplied')}
+      </Typography>
+      <Typography variant="caption" color="text.secondary">
+        {[event.status, providerEventTime(event.occurredAt)]
+          .filter(Boolean).join(' · ')}
+      </Typography>
+      {event.trackingUrl ? (
+        <Typography variant="body2">
+          <Link href={event.trackingUrl} target="_blank" rel="noreferrer">
+            Track shipment
+          </Link>
+        </Typography>
+      ) : null}
+    </Box>
+  )
+}
+
 function providerOrderStatus(order: OperationsImportedOrderWorkingCopy) {
   if (
     order.providerState.lifecycle === 'cancelled'
@@ -292,12 +325,7 @@ export default function ImportedOrderWorkingCopyDrawer({
   const trackingHistory = (order?.providerHistory.events || []).filter((event) => (
     event.kind === 'tracking_updated'
   ))
-  const trackingDetails = trackingHistory.filter((event) => (
-    event.trackingNumber || event.trackingUrl || event.trackingRedacted
-  ))
-  const trackingEvents = trackingDetails.length
-    ? trackingDetails
-    : trackingHistory.slice(-1)
+  const trackingEvents = currentOrderTrackingEvents(trackingHistory)
   const fulfillmentEvents = (order?.providerHistory.events || []).filter((event) => (
     ['fulfillment_created', 'fulfillment_updated', 'shipment_created']
       .includes(event.kind)
@@ -675,32 +703,9 @@ export default function ImportedOrderWorkingCopyDrawer({
                     Tracking
                   </Typography>
                   {trackingEvents.length ? (
-                    <Stack spacing={0.75}>
+                    <Stack spacing={0.75} data-testid="order-tracking-summary">
                       {trackingEvents.map((event) => (
-                        <Box key={event.globalId}>
-                          <Typography variant="body2">
-                            {[event.trackingCarrier, event.trackingNumber]
-                              .filter(Boolean).join(' · ')
-                              || (event.trackingRedacted
-                                ? 'Tracking number expired from retained evidence'
-                                : 'Tracking number not supplied')}
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary">
-                            {[event.status, providerEventTime(event.occurredAt)]
-                              .filter(Boolean).join(' · ')}
-                          </Typography>
-                          {event.trackingUrl ? (
-                            <Typography variant="body2">
-                              <Link
-                                href={event.trackingUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                Track shipment
-                              </Link>
-                            </Typography>
-                          ) : null}
-                        </Box>
+                        <TrackingEventDetails key={event.globalId} event={event} />
                       ))}
                     </Stack>
                   ) : order?.providerHistory.observedAt ? (
@@ -709,6 +714,24 @@ export default function ImportedOrderWorkingCopyDrawer({
                     </Typography>
                   ) : null}
                 </Box>
+
+                {trackingHistory.length ? (
+                  <Accordion key={order.globalId} disableGutters
+                    slotProps={{ transition: { unmountOnExit: true } }}>
+                    <AccordionSummary expandIcon={<ExpandMoreRounded />}>
+                      <Typography variant="body2" fontWeight={700}>
+                        Tracking history ({trackingHistory.length})
+                      </Typography>
+                    </AccordionSummary>
+                    <AccordionDetails>
+                      <Stack spacing={1} data-testid="order-tracking-history">
+                        {trackingHistory.map((event) => (
+                          <TrackingEventDetails key={event.globalId} event={event} />
+                        ))}
+                      </Stack>
+                    </AccordionDetails>
+                  </Accordion>
+                ) : null}
 
                 {fulfillmentEvents.length ? (
                   <Box>
