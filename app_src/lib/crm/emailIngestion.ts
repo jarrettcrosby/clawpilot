@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import { globalIdFragment } from '@/lib/globalIds.mjs'
+import { captureEmailAddressHeaders, type EmailAddressHeaders } from '@/lib/crm/emailAddressHeaders'
 import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
@@ -63,6 +64,7 @@ export type ParsedGmailMessage = {
   historyId: string | null
   labelIds: string[]
   sizeEstimate: number | null
+  emailAddressHeaders: EmailAddressHeaders
 }
 
 export type EmailIngestionCounts = {
@@ -352,6 +354,7 @@ export function parseGmailMessage(message: GmailMessage): ParsedGmailMessage {
       ? message.labelIds.map((label) => cleanSingleLine(label, 100)).filter(Boolean)
       : [],
     sizeEstimate: Number.isFinite(sizeEstimate) && sizeEstimate >= 0 ? sizeEstimate : null,
+    emailAddressHeaders: captureEmailAddressHeaders(message.payload?.headers),
   }
 }
 
@@ -524,6 +527,7 @@ async function storeInboundMessage(input: {
   const message = input.message
   const rawMetadata = {
     provider: 'gmail',
+    emailAddressHeaders: message.emailAddressHeaders,
     historyId: message.historyId,
     labelIds: message.labelIds,
     sizeEstimate: message.sizeEstimate,

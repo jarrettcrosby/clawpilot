@@ -10,6 +10,7 @@ import {
   stableSuiteCrmId,
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
+import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
 import {
   DEFAULT_WORKSPACE_CURRENCY_CODE,
   isIso4217CurrencyCode,
@@ -774,6 +775,34 @@ async function enqueueSuiteCrmRecord(
     return deleted.rows[0]?.idempotency_key || null
   }
   const relationships = await suiteCrmRelationships(client, { ...input, localId })
+  let emailAddressAttributes: Record<string, string> = {}
+  if (input.entity === 'interactions' && suiteCrmModule === 'Emails'
+    && input.fields.metadata?.source === 'gmail-inbound'
+    && uniqueUuidList([input.fields.metadata.inboundMessageId]).length === 1 && input.fields.providerMessageId) {
+    // Recipient categories are not recoverable from legacy recipient_emails,
+    // which also contains delivery/forwarding aliases. Only use retained typed
+    // top-level evidence belonging to this exact owned message. Ingestion stores
+    // receipts in the owner's default pipeline, then can match another pipeline
+    // owned by that same actor; shared-pipeline editors cannot borrow the receipt.
+    const retained = await client.query<{ email_address_headers: unknown }>(
+      `SELECT message.raw_metadata->'emailAddressHeaders' AS email_address_headers
+       FROM crm_inbound_messages message
+       JOIN pipeline_spaces source_pipeline ON source_pipeline.id = message.pipeline_id
+         AND source_pipeline.owner_email = message.owner_email
+       JOIN pipeline_spaces target_pipeline ON target_pipeline.id = $2::uuid
+         AND target_pipeline.owner_email = message.owner_email
+       WHERE message.id = $1::uuid AND message.owner_email = $5
+         AND message.external_message_id = $3
+         AND message.external_thread_id IS NOT DISTINCT FROM $4::text
+         AND message.raw_metadata->>'provider' = 'gmail'
+       LIMIT 2`,
+      [input.fields.metadata.inboundMessageId, input.pipelineId,
+        input.fields.providerMessageId, input.fields.providerThreadId || null, clean(input.actorEmail).toLowerCase()],
+    )
+    if (retained.rows.length === 1) {
+      emailAddressAttributes = suiteCrmEmailAddressAttributes(retained.rows[0].email_address_headers)
+    }
+  }
   const payload: SuiteCrmOutboxRecord = {
     entity: input.entity,
     pipelineId: input.pipelineId,
@@ -783,7 +812,7 @@ async function enqueueSuiteCrmRecord(
     ...(moduleTransition && previousSuiteCrmModule
       ? { previousSuiteCrmModule }
       : {}),
-    attributes: suiteCrmAttributes(input, referenceCode),
+    attributes: { ...suiteCrmAttributes(input, referenceCode), ...emailAddressAttributes },
     ...(input.entity === 'products'
       ? {
         currencyCode: normalizeCurrencyCode(
