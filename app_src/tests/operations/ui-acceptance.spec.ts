@@ -72,13 +72,18 @@ const selectedOrder = {
     },
   ],
   warehouseName: 'Primary Warehouse',
+  warehouseProvenance: 'fulfillment_plan' as const,
   promisedDeliveryAt: '2026-08-04T21:00:00.000Z',
+  requestedDeliveryAt: '2026-08-04T18:00:00.000Z',
   lineCount: 2,
+  providerLineCount: null,
   exceptionCount: 1,
+  orderValueMinor: '1335',
   expectedCostMinor: '1066',
   expectedRevenueMinor: '1335',
   expectedMarginMinor: '269',
   trackingNumber: null,
+  orderedAt: '2026-07-22T17:00:00.000Z',
   updatedAt: '2026-07-22T18:00:00.000Z',
   externalOrderId: 'mock-1042',
   currency: 'USD',
@@ -121,6 +126,7 @@ const selectedOrder = {
     editBlockedReason: 'Address is sealed after planning.',
     providerWrites: 0,
   },
+  providerHistory: null,
   lines: [{
     globalId: 'gol1234567',
     productGlobalId: 'gp1234567',
@@ -288,7 +294,23 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
       unbilledMinor: '1335',
     },
     orders: [currentOrder],
+    orderPage: {
+      total: 1,
+      returned: 1,
+      pageSize: 250,
+      nextCursor: null,
+      complete: true,
+      truncated: false,
+    },
     importedOrders: [],
+    importedOrderPage: {
+      total: 0,
+      returned: 0,
+      pageSize: 250,
+      nextCursor: null,
+      complete: true,
+      truncated: false,
+    },
     selectedOrder: currentOrder,
     exceptions: [currentException],
     warehouses: [{ id: 'warehouse-id', globalId: 'gwh1234567', name: 'Primary Warehouse' }],
@@ -301,6 +323,127 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
     },
     generatedAt: '2026-07-22T18:00:00.000Z',
   }
+}
+
+type UnifiedCanonicalOrderFixture = {
+  globalId: string
+  orderNumber: string
+  customerName?: string | null
+  sourceProvider: string
+  status: string
+  externallyFulfilled?: boolean
+  trackingNumber?: string | null
+  orderedAt?: string
+  updatedAt: string
+}
+
+async function installUnifiedOrdersRoute(
+  page: Page,
+  rows: () => {
+    canonical: UnifiedCanonicalOrderFixture[]
+    imported: OperationsImportedOrderWorkingCopy[]
+  },
+  onRequest?: (requestUrl: URL) => void,
+) {
+  await page.route(
+    (url) => url.pathname === '/api/operations/orders/unified',
+    async (route) => {
+      const requestUrl = new URL(route.request().url())
+      onRequest?.(requestUrl)
+      const pageSize = Number(requestUrl.searchParams.get('pageSize') || 50)
+      const pageNumber = Number(requestUrl.searchParams.get('page') || 1)
+      const provider = requestUrl.searchParams.get('provider') || ''
+      const tracking = requestUrl.searchParams.get('tracking') || 'all'
+      const status = requestUrl.searchParams.get('status') || ''
+      const search = (requestUrl.searchParams.get('search') || '').toLowerCase()
+      const sort = requestUrl.searchParams.get('sort') || 'updated'
+      const direction = requestUrl.searchParams.get('direction') || 'desc'
+      const source = rows()
+      const unified = [
+        ...source.imported.map((order) => ({
+          kind: 'imported' as const,
+          key: `imported:${order.candidateGlobalId}`,
+          order,
+        })),
+        ...source.canonical.map((order) => ({
+          kind: 'canonical' as const,
+          key: `canonical:${order.globalId}`,
+          order,
+        })),
+      ].filter((row) => {
+        const rowProvider = row.kind === 'imported'
+          ? row.order.provider
+          : row.order.sourceProvider.toLowerCase()
+        if (provider && rowProvider !== provider) return false
+        const trackingNumber = row.order.trackingNumber || ''
+        if (tracking === 'present' && !trackingNumber) return false
+        if (tracking === 'missing' && trackingNumber) return false
+        if (status) {
+          if (row.kind === 'canonical') {
+            if (
+              status === 'fulfilled_externally'
+                ? !row.order.externallyFulfilled
+                : row.order.status !== status
+            ) return false
+          } else {
+            const externallyFulfilled = row.order.providerState.fulfillment === 'fulfilled'
+            const externallyClosed = row.order.providerState.lifecycle === 'closed'
+            const cancelled = row.order.providerState.lifecycle === 'cancelled'
+            const matches = status === 'fulfilled_externally'
+              ? externallyFulfilled
+              : status === 'closed_externally'
+                ? externallyClosed && !externallyFulfilled
+                : status === 'cancelled'
+                  ? cancelled
+                  : status === 'imported' && !externallyFulfilled && !externallyClosed && !cancelled
+            if (!matches) return false
+          }
+        }
+        if (!search) return true
+        return [
+          row.kind === 'imported' ? row.order.orderNumber : row.order.orderNumber,
+          row.order.customerName || '',
+          trackingNumber,
+        ].some((value) => value.toLowerCase().includes(search))
+      })
+      unified.sort((left, right) => {
+        const value = (row: (typeof unified)[number]) => sort === 'order_number'
+          ? row.order.orderNumber.toLowerCase()
+          : sort === 'customer'
+            ? (row.order.customerName || '').toLowerCase()
+            : sort === 'order_date'
+              ? row.order.orderedAt || row.order.updatedAt
+              : row.order.updatedAt
+        const comparison = value(left).localeCompare(value(right))
+          || left.key.localeCompare(right.key)
+        return direction === 'asc' ? comparison : -comparison
+      })
+      const requestedOffset = Math.max(0, (pageNumber - 1) * pageSize)
+      const lastOffset = unified.length === 0
+        ? 0
+        : Math.floor((unified.length - 1) / pageSize) * pageSize
+      const offset = Math.min(requestedOffset, lastOffset)
+      const pageRows = unified.slice(offset, offset + pageSize)
+      const nextOffset = offset + pageRows.length
+      const complete = nextOffset >= unified.length
+      await route.fulfill({
+        json: {
+          ok: true,
+          rows: pageRows,
+          page: {
+            total: unified.length,
+            returned: pageRows.length,
+            pageSize,
+            offset,
+            nextCursor: null,
+            complete,
+            truncated: !complete,
+            snapshot: 'acceptance-snapshot-v1',
+          },
+        },
+      })
+    },
+  )
 }
 
 async function installOperationsRoutes(page: Page) {
@@ -372,6 +515,755 @@ async function installOperationsRoutes(page: Page) {
     }
     return route.fulfill({ json: { ok: true, operations: workspace(exceptionStatus, lifecycle) } })
   })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = workspace(exceptionStatus, lifecycle)
+    return { canonical: current.orders, imported: current.importedOrders }
+  })
+}
+
+async function installOrderStatusSyncRoutes(
+  page: Page,
+  options: {
+    delayFinalWorkspace?: boolean
+    delaySecondBatch?: boolean
+    discoveryContinuationBatches?: number
+    discoveryRunning?: boolean
+    discoveryRunningResponses?: number
+    releasedReconciliation?: boolean
+    eligibleOrderCount?: number
+    failedStatusOrderGlobalIds?: string[]
+    providerHistoryScheduleEvidence?: 'valid' | 'invalid_counts' | 'invalid_writes'
+    providerHistoryDeferredAccounts?: number
+    canManage?: boolean
+    importedHistoryOutcomes?: Array<'captured' | 'unavailable' | 'hard_failure'>
+    currentImportedHistoryIndexes?: number[]
+    importedHistorySourceUpdatedAt?: string
+    importedHistoryRefreshedAt?: string
+    terminalImportedHistoryIndexes?: number[]
+    returnDetailedImportedHistoryOnRefresh?: boolean
+  } = {},
+) {
+  const releasedReconciliation = options.releasedReconciliation === true
+  const eligibleOrderGlobalIds = Array.from(
+    { length: options.eligibleOrderCount || 1 },
+    (_, index) => `gor${7654321 + index}`,
+  )
+  let providerFulfilled = releasedReconciliation
+  const syncRequests: Array<{
+    idempotencyKey: string
+    body: {
+      excludeOrderGlobalIds: string[]
+      orderGlobalIds?: string[]
+    }
+    search: string
+  }> = []
+  const reconciliationScheduleRequests: Array<{
+    idempotencyKey: string
+    body: { excludeOrderGlobalIds?: string[] }
+  }> = []
+  const orderHistorySyncRequests: Array<{
+    idempotencyKey: string
+    body: { orderKeys?: string[] }
+  }> = []
+  const discoveryRequests: Array<{
+    idempotencyKey: string
+    body: { accountGlobalId: string }
+  }> = []
+  const importedHistoryRefreshRequests: Array<{
+    idempotencyKey: string
+    body: {
+      action: string
+      candidateGlobalId: string
+      expectedRowVersion: number
+    }
+  }> = []
+  const operationsStatusFilters: Array<string | null> = []
+  const unifiedStatusFilters: Array<string | null> = []
+  const refreshRequestOrder: string[] = []
+  let markSecondBatchStarted: () => void = () => undefined
+  let releaseSecondBatch: () => void = () => undefined
+  let markFinalWorkspaceStarted: () => void = () => undefined
+  let releaseFinalWorkspace: () => void = () => undefined
+  const secondBatchStarted = new Promise<void>((resolve) => {
+    markSecondBatchStarted = resolve
+  })
+  const secondBatchRelease = new Promise<void>((resolve) => {
+    releaseSecondBatch = resolve
+  })
+  const finalWorkspaceStarted = new Promise<void>((resolve) => {
+    markFinalWorkspaceStarted = resolve
+  })
+  const finalWorkspaceRelease = new Promise<void>((resolve) => {
+    releaseFinalWorkspace = resolve
+  })
+  const order = () => ({
+    ...selectedOrder,
+    id: 'external-order-id',
+    globalId: 'gor7654321',
+    orderNumber: '#1005',
+    customerName: 'AG Alchemy customer',
+    customerGlobalId: 'ga7654321',
+    sourceProvider: 'shopify',
+    externalOrderId: 'gid://shopify/Order/1005',
+    status: releasedReconciliation ? 'released' : 'imported',
+    externallyFulfilled: providerFulfilled,
+    warehouseName: providerFulfilled ? 'Current mapped warehouse' : null,
+    warehouseProvenance: providerFulfilled
+      ? 'provider_location_mapping' as const
+      : null,
+    promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
+    providerPromisedDeliveryAt: providerFulfilled
+      ? '2026-09-04T17:00:00.000Z'
+      : null,
+    providerDeliveryCoverage: providerFulfilled ? 'partial' as const : null,
+    providerDeliverySource: providerFulfilled
+      ? 'fulfillment_order.deliveryMethod' as const
+      : null,
+    providerLineCount: providerFulfilled ? 1 : null,
+    planStatus: releasedReconciliation ? 'released' : null,
+    waveStatus: releasedReconciliation ? 'released' : null,
+    packageCount: 0,
+    plannedPackageCount: 0,
+    packedPackageCount: 0,
+    pickTaskCount: 0,
+    readyPickTaskCount: 0,
+    pickedPickTaskCount: 0,
+    shopifyExternalFulfillmentReconciliationRequired: releasedReconciliation,
+    availableActions: releasedReconciliation ? [{
+      action: 'reconcile_external_fulfillment',
+      label: 'Reconcile Shopify fulfillment',
+      enabled: true,
+      blockedReason: null,
+    }, {
+      action: 'confirm_picks',
+      label: 'Confirm all picks',
+      enabled: false,
+      blockedReason: 'Reconcile the external Shopify fulfillment first.',
+    }] : [{
+      action: 'release_to_warehouse',
+      label: 'Release to warehouse',
+      enabled: true,
+      blockedReason: null,
+    }],
+    packages: [],
+    rates: [],
+    billableEvents: [],
+    events: [],
+    shipments: [],
+    externalFulfillment: null,
+    trackingObservations: [],
+    printArtifacts: [],
+    commerceExports: [],
+    labelAttempts: [],
+    labelPrintJobs: [],
+    planningPreparation: null,
+    sandboxCommerceE2eAuthorization: null,
+    providerHistory: providerFulfilled ? {
+      observedAt: '2026-09-01T12:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/1005-provider',
+        externalProductId: 'gid://shopify/Product/1005-provider',
+        externalVariantId: 'gid://shopify/ProductVariant/1005-provider',
+        sku: 'PROVIDER-1005',
+        titleSnapshot: 'Bakery Bites Variety Case',
+        variantTitleSnapshot: '20 lb case',
+        vendorSnapshot: 'AG Alchemy',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        returnedQuantity: 1,
+        requiresShipping: true,
+        unitPriceCurrency: 'USD',
+        unitPriceMinor: '1000',
+        subtotalCurrency: 'USD',
+        subtotalMinor: '3000',
+        discountCurrency: 'USD',
+        discountMinor: '500',
+        taxCurrency: 'USD',
+        taxMinor: '0',
+      }],
+      events: [{
+        globalId: 'gcoe1005refund',
+        kind: 'refund_created',
+        status: 'succeeded',
+        occurredAt: '2026-09-01T11:45:00.000Z',
+        externalSubjectId: 'gid://shopify/Refund/1005',
+        quantity: 1,
+        amountMinor: 1250,
+        currency: 'USD',
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }],
+      providerWrites: 0 as const,
+    } : null,
+  })
+  const currentWorkspace = (
+    selected = false,
+    importedOrders: OperationsImportedOrderWorkingCopy[] = [],
+  ) => {
+    const base = workspace()
+    const currentOrder = order()
+    return {
+      ...base,
+      capabilities: {
+        ...base.capabilities,
+        canManage: options.canManage !== false,
+        canExecute: options.canManage !== false,
+      },
+      summary: {
+        ...base.summary,
+        openOrders: providerFulfilled ? 0 : 1,
+      },
+      orders: [currentOrder],
+      selectedOrder: selected ? currentOrder : null,
+      importedOrders,
+      importedOrderPage: {
+        total: importedOrders.length,
+        returned: importedOrders.length,
+        pageSize: 250,
+        nextCursor: null,
+        complete: true,
+        truncated: false,
+      },
+      exceptions: [],
+    }
+  }
+  const terminalImportedHistoryIndexes = new Set(
+    options.terminalImportedHistoryIndexes || [0],
+  )
+  const importedHistoryOrders = (options.importedHistoryOutcomes || []).map(
+    (_, index) => {
+      const sourceUpdatedAt = options.importedHistorySourceUpdatedAt
+        || '2026-08-31T18:00:00.000Z'
+      const identifiers = [
+        { candidateGlobalId: 'gcoc6662001', orderNumber: '#6662' },
+        { candidateGlobalId: 'gcoc6682001', orderNumber: '#6682' },
+        { candidateGlobalId: 'gcoc6690001', orderNumber: '#6690' },
+      ][index] || {
+        candidateGlobalId: `gcoc${String(7_000_001 + index)}`,
+        orderNumber: `#${7_000 + index}`,
+      }
+      return {
+        ...importedWorkbenchOrder(false),
+        globalId: identifiers.candidateGlobalId,
+        candidateGlobalId: identifiers.candidateGlobalId,
+        externalOrderId: `gid://shopify/Order/${identifiers.orderNumber.slice(1)}`,
+        orderNumber: identifiers.orderNumber,
+        rowVersion: index + 2,
+        providerState: terminalImportedHistoryIndexes.has(index)
+          ? {
+              lifecycle: 'closed' as const,
+              fulfillment: 'fulfilled' as const,
+              observedAt: '2026-08-31T18:00:00.000Z',
+              source: 'history' as const,
+            }
+          : importedWorkbenchOrder(false).providerState,
+        sourceUpdatedAt,
+        providerHistory: {
+          observedAt: options.currentImportedHistoryIndexes?.includes(index)
+            ? sourceUpdatedAt
+            : null,
+          currency: null,
+          providerTotalMinor: null,
+          currentLines: [],
+          events: [],
+          providerWrites: 0 as const,
+        },
+      }
+    },
+  )
+  const detailedImportedHistoryOrder = (
+    order: OperationsImportedOrderWorkingCopy,
+    outcome: 'captured' | 'unavailable' | 'hard_failure' | undefined,
+  ): OperationsImportedOrderWorkingCopy => {
+    const details = importedWorkbenchOrder(true)
+    return {
+      ...order,
+      resolutionDetailsLoaded: true,
+      customer: details.customer,
+      lines: details.lines,
+      productOptions: details.productOptions,
+      providerHistory: outcome === 'captured'
+        ? {
+            observedAt: options.importedHistoryRefreshedAt
+              || new Date().toISOString(),
+            currency: 'USD',
+            providerTotalMinor: '2500',
+            currentLines: [{
+              externalLineId: details.lines[0].externalLineId,
+              externalProductId: 'gid://shopify/Product/66821',
+              externalVariantId: 'gid://shopify/ProductVariant/66821',
+              sku: details.lines[0].sku,
+              orderedQuantity: details.lines[0].orderedQuantity,
+              currentQuantity: details.lines[0].currentQuantity,
+              fulfilledQuantity: details.lines[0].fulfilledQuantity,
+              unfulfilledQuantity: details.lines[0].unfulfilledQuantity,
+              returnedQuantity: details.lines[0].returnedQuantity,
+              requiresShipping: details.lines[0].requiresShipping,
+            }],
+            events: [{
+              globalId: 'gcoe6682001',
+              kind: 'tracking_updated',
+              status: 'in_transit',
+              occurredAt: '2026-09-01T11:55:00.000Z',
+              externalSubjectId: 'gid://shopify/Fulfillment/66821',
+              quantity: null,
+              amountMinor: null,
+              currency: null,
+              trackingCarrier: 'UPS',
+              trackingNumber: '1Z6682LATEST',
+              trackingUrl: 'https://www.ups.com/track?tracknum=1Z6682LATEST',
+              trackingRedacted: false,
+            }],
+            providerWrites: 0,
+          }
+        : order.providerHistory,
+    }
+  }
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-discovery',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as { accountGlobalId: string }
+      discoveryRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+      })
+      const discoveryRequestNumber = discoveryRequests.length
+      const alreadyRunning = options.discoveryRunning === true
+        || discoveryRequestNumber <= (options.discoveryRunningResponses || 0)
+      const continuationBatch = !alreadyRunning
+        && discoveryRequestNumber
+          <= (options.discoveryContinuationBatches || 0)
+      const hasNextBatch = alreadyRunning || continuationBatch
+      const continuationFixture =
+        (options.discoveryContinuationBatches || 0) > 0
+      const providerRowsSeen = continuationFixture
+        ? continuationBatch ? 125 : 25
+        : 0
+      return route.fulfill({
+        status: hasNextBatch ? 202 : 200,
+        json: {
+          ok: true,
+          result: {
+            accountGlobalId: body.accountGlobalId,
+            displayName: 'Pro Bakery Bites',
+            provider: 'shopify',
+            counts: {
+              providerRowsSeen,
+              eligibleOrdersSeen: providerRowsSeen,
+              ordersStaged: providerRowsSeen,
+              ordersPreserved: 0,
+              ordersSkippedCanonical: 0,
+              recordsRejected: 0,
+              canonicalOrdersCreated: 0,
+            },
+            pagination: {
+              batchNumber: continuationFixture
+                ? continuationBatch ? 5 : 1
+                : 0,
+              continuationRunGlobalId: null,
+              hasNextBatch,
+              sessionComplete: !hasNextBatch,
+            },
+            refresh: {
+              claimed: alreadyRunning ? 0 : 1,
+              failed: 0,
+              failureCodes: {},
+              reset: false,
+              status: hasNextBatch ? 'running' : 'succeeded',
+              resumable: continuationBatch,
+            },
+            providerWrites: 0,
+          },
+        },
+      })
+    },
+  )
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-reconciliation-schedule',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        excludeOrderGlobalIds?: string[]
+      }
+      refreshRequestOrder.push('background-schedule')
+      reconciliationScheduleRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+      })
+      const invalidProviderHistoryCounts =
+        options.providerHistoryScheduleEvidence === 'invalid_counts'
+      const invalidProviderHistoryWrites =
+        options.providerHistoryScheduleEvidence === 'invalid_writes'
+      const deferredAccounts = options.providerHistoryDeferredAccounts || 0
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            totalEligible: 111,
+            scheduled: 110,
+            alreadyScheduled: 1,
+            providerWrites: 0,
+            providerHistory: {
+              totalEligibleAccounts: 2 + deferredAccounts,
+              scheduledAccounts: invalidProviderHistoryCounts ? 2 : 1,
+              alreadyScheduledAccounts: 1,
+              deferredAccounts,
+              newSessions: 1,
+              resumedSessions: 0,
+              newDeferredRefreshes: deferredAccounts,
+              alreadyDeferredRefreshes: 0,
+              providerWrites: invalidProviderHistoryWrites ? 1 : 0,
+            },
+          },
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-status-sync',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        excludeOrderGlobalIds: string[]
+        orderGlobalIds?: string[]
+      }
+      refreshRequestOrder.push('visible-canonical-status')
+      syncRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+        search: new URL(request.url()).search,
+      })
+      if (options.delaySecondBatch && syncRequests.length === 1) {
+        markSecondBatchStarted()
+        await secondBatchRelease
+      }
+      const excluded = new Set(body.excludeOrderGlobalIds)
+      const targets = body.orderGlobalIds
+        ? new Set(body.orderGlobalIds)
+        : null
+      const remaining = eligibleOrderGlobalIds.filter((globalId) => (
+        !excluded.has(globalId) && (!targets || targets.has(globalId))
+      ))
+      const batch = remaining.slice(0, 10)
+      const failedStatusOrderGlobalIds = new Set(
+        options.failedStatusOrderGlobalIds || [],
+      )
+      const successfulBatch = batch.filter((orderGlobalId) => (
+        !failedStatusOrderGlobalIds.has(orderGlobalId)
+      ))
+      const failedBatch = batch.filter((orderGlobalId) => (
+        failedStatusOrderGlobalIds.has(orderGlobalId)
+      ))
+      if (successfulBatch.length > 0) providerFulfilled = true
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            status: failedBatch.length === 0
+              ? 'succeeded'
+              : successfulBatch.length > 0
+                ? 'partial'
+                : 'failed',
+            batchLimit: 10,
+            totalEligible: remaining.length,
+            counts: {
+              selected: batch.length,
+              attempted: batch.length,
+              refreshed: successfulBatch.length,
+              changed: successfulBatch.length,
+              current: 0,
+              providerFulfilled: successfulBatch.length,
+              providerCancelled: 0,
+              reviewRequired: 0,
+              failed: failedBatch.length,
+              providerReads: batch.length,
+            },
+            failedByCode: failedBatch.length > 0
+              ? { SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED: failedBatch.length }
+              : {},
+            outcomes: batch.map((orderGlobalId) => ({
+              orderGlobalId,
+              provider: 'shopify',
+              outcome: failedStatusOrderGlobalIds.has(orderGlobalId)
+                ? 'failed'
+                : 'provider_fulfilled',
+              code: failedStatusOrderGlobalIds.has(orderGlobalId)
+                ? 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED'
+                : null,
+            })),
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+          },
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-history-sync',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      refreshRequestOrder.push('visible-history')
+      orderHistorySyncRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body: request.postDataJSON() as { orderKeys?: string[] },
+      })
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            status: 'succeeded',
+            batchLimit: 10,
+            totalEligible: 0,
+            remaining: 0,
+            hasMore: false,
+            continuation: null,
+            counts: {
+              selected: 0,
+              attempted: 0,
+              refreshed: 0,
+              changed: 0,
+              unavailable: 0,
+              providerReads: 0,
+            },
+            failedByCode: {},
+            outcomes: [],
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+          },
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      const request = route.request()
+      if (request.method() === 'GET') {
+        const params = new URL(request.url()).searchParams
+        const candidateGlobalId = params.get('candidate')
+        if (candidateGlobalId) {
+          const orderIndex = importedHistoryOrders.findIndex((order) => (
+            order.candidateGlobalId === candidateGlobalId
+          ))
+          expect(orderIndex).toBeGreaterThanOrEqual(0)
+          const outcome = options.importedHistoryOutcomes?.[orderIndex]
+          return route.fulfill({
+            json: {
+              ok: true,
+              orders: [detailedImportedHistoryOrder(
+                importedHistoryOrders[orderIndex],
+                outcome,
+              )],
+            },
+          })
+        }
+        expect(params.get('limit')).toBe('250')
+        expect(params.get('cursor')).toBeNull()
+        expect(params.get('search')).toBeNull()
+        return route.fulfill({
+          json: {
+            ok: true,
+            orders: importedHistoryOrders,
+            page: {
+              total: importedHistoryOrders.length,
+              returned: importedHistoryOrders.length,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          },
+        })
+      }
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        action: string
+        candidateGlobalId: string
+        expectedRowVersion: number
+      }
+      const captured = {
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+      }
+      importedHistoryRefreshRequests.push(captured)
+      const orderIndex = importedHistoryOrders.findIndex((order) => (
+        order.candidateGlobalId === body.candidateGlobalId
+      ))
+      expect(orderIndex).toBeGreaterThanOrEqual(0)
+      const order = importedHistoryOrders[orderIndex]
+      expect(body).toEqual({
+        action: 'refresh',
+        candidateGlobalId: order.candidateGlobalId,
+        expectedRowVersion: order.rowVersion,
+      })
+      const outcome = options.importedHistoryOutcomes?.[orderIndex]
+      if (outcome === 'hard_failure') {
+        return route.fulfill({
+          status: 500,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_IMPORTED_ORDER_REQUEST_FAILED',
+            error: 'Imported order could not be loaded or saved',
+          },
+        })
+      }
+      return route.fulfill({
+        json: {
+          ok: true,
+          refreshResult: {
+            previousCandidateGlobalId: order.candidateGlobalId,
+            candidateGlobalId: order.candidateGlobalId,
+            rowVersion: order.rowVersion,
+            status: 'current',
+            providerChangedFields: [],
+            preservedLocalFields: [],
+            preservedLineDrafts: [],
+            providerWrites: 0,
+            providerWriteIntentCreated: false,
+            replayed: false,
+          },
+          historyRefresh: {
+            status: outcome,
+            code: outcome === 'unavailable'
+              ? 'SHOPIFY_ORDER_HISTORY_UNAVAILABLE'
+              : null,
+            providerReads: outcome === 'captured' ? 3 : null,
+            providerWrites: 0,
+          },
+          order: options.returnDetailedImportedHistoryOnRefresh
+            ? detailedImportedHistoryOrder(order, outcome)
+            : order,
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-revisions',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: 'gor7654321',
+          orderRowVersion: 0,
+          orderStatus: 'imported',
+          state: {
+            observationGlobalId: 'gco7654321',
+            readGlobalId: 'gcr7654321',
+            sourceHash: 'a'.repeat(64),
+            revisionHash: 'b'.repeat(64),
+            materialState: 'provider_fulfilled',
+            capturedAt: '2026-08-31T16:00:00.000Z',
+            fresh: true,
+            changed: true,
+            applyEligible: false,
+            applyBlockedCode: 'COMMERCE_ORDER_REVISION_NOT_APPLICABLE',
+            cancellationEligible: false,
+            providerReads: 1,
+            providerWrites: 0,
+            applicationGlobalId: null,
+            exceptionGlobalId: null,
+          },
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/shopify-order-management',
+    async (route) => route.fulfill({
+      status: 503,
+      json: {
+        ok: false,
+        code: 'NOT_REQUIRED_FOR_STATUS_SYNC_ACCEPTANCE',
+        error: 'Provider editing is outside this read-only status sync test',
+      },
+    }),
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    expect(route.request().method()).toBe('GET')
+    const requestUrl = new URL(route.request().url())
+    const statusFilter = requestUrl.searchParams.get('status')
+    operationsStatusFilters.push(statusFilter)
+    const selected = requestUrl.searchParams.get('order') === 'gor7654321'
+    let responseWorkspace = currentWorkspace(selected, importedHistoryOrders)
+    if (
+      options.delayFinalWorkspace
+      && providerFulfilled
+      && statusFilter === null
+      && operationsStatusFilters.length > 1
+    ) {
+      responseWorkspace = {
+        ...responseWorkspace,
+        orders: responseWorkspace.orders.map((item) => ({
+          ...item,
+          orderNumber: '#STALE',
+        })),
+      }
+      markFinalWorkspaceStarted()
+      await finalWorkspaceRelease
+    } else if (options.delayFinalWorkspace && statusFilter === 'fulfilled_externally') {
+      responseWorkspace = {
+        ...responseWorkspace,
+        orders: responseWorkspace.orders.map((item) => ({
+          ...item,
+          orderNumber: '#FILTERED',
+        })),
+      }
+    }
+    return route.fulfill({
+      json: { ok: true, operations: responseWorkspace },
+    })
+  })
+  await installUnifiedOrdersRoute(
+    page,
+    () => {
+      const current = currentWorkspace(false, importedHistoryOrders)
+      const canonical = options.delayFinalWorkspace
+        && unifiedStatusFilters.at(-1) === 'fulfilled_externally'
+        ? current.orders.map((item) => ({
+            ...item,
+            orderNumber: '#FILTERED',
+          }))
+        : current.orders
+      return {
+        canonical,
+        imported: current.importedOrders,
+      }
+    },
+    (requestUrl) => {
+      unifiedStatusFilters.push(requestUrl.searchParams.get('status'))
+    },
+  )
+
+  return {
+    operationsStatusFilters,
+    refreshRequestOrder,
+    unifiedStatusFilters,
+    finalWorkspaceStarted,
+    releaseFinalWorkspace,
+    releaseSecondBatch,
+    secondBatchStarted,
+    discoveryRequests,
+    importedHistoryRefreshRequests,
+    orderHistorySyncRequests,
+    reconciliationScheduleRequests,
+    syncRequests,
+  }
 }
 
 async function installOrderLabelPrintRoutes(
@@ -568,6 +1460,13 @@ async function installOrderLabelPrintRoutes(
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
     await route.fulfill({ json: { ok: true, operations: response() } })
   })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = response()
+    return {
+      canonical: current.orders,
+      imported: current.importedOrders,
+    }
+  })
   return {
     requests,
     sourceLabelGlobalId,
@@ -613,6 +1512,12 @@ function importedWorkbenchOrder(
     externalOrderId: 'gid://shopify/Order/7710',
     orderNumber: '#7710',
     status: 'imported',
+    providerState: {
+      lifecycle: 'open',
+      fulfillment: 'unfulfilled',
+      observedAt: '2026-08-21T18:00:00.000Z',
+      source: 'operational',
+    },
     needsInfo: true,
     blockerCodes: [
       'customer_resolution_required',
@@ -623,9 +1528,17 @@ function importedWorkbenchOrder(
       'ship_to_postal_code_required',
     ],
     customerName: 'Northstar Receiving',
+    warehouseName: null,
     lineCount: 1,
     sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
+    orderedAt: '2026-08-21T17:00:00.000Z',
+    updatedAt: '2026-08-21T18:00:00.000Z',
+    trackingNumber: null,
+    orderValueMinor: '2000',
+    currency: 'USD',
     candidateRowVersion: 4,
+    workflowState: 'held',
+    actionAvailable: true,
     rowVersion: 0,
     providerVersionChanged: false,
     resolutionDetailsLoaded: details,
@@ -647,9 +1560,17 @@ function importedWorkbenchOrder(
     },
     lines: details ? [{
       globalId: workbenchLineGlobalId,
+      externalLineId: 'gid://shopify/LineItem/77101',
       title: 'Trail Pack retail unit',
       sku: 'TRAIL-PROVIDER-001',
       quantity: 2,
+      orderedQuantity: 2,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 0,
+      fulfilledQuantity: 0,
+      unfulfilledQuantity: 2,
+      returnedQuantity: 0,
+      providerStatus: 'open',
       unitMultiplier: 1,
       requiresShipping: true,
       mappingStatus: 'unresolved',
@@ -664,6 +1585,14 @@ function importedWorkbenchOrder(
         'line_price_required',
       ],
     }] : [],
+    providerHistory: {
+      observedAt: null,
+      currency: null,
+      providerTotalMinor: null,
+      currentLines: [],
+      events: [],
+      providerWrites: 0,
+    },
     productOptions: details ? [{
       globalId: workbenchProductGlobalId,
       name: 'Trail Pack',
@@ -707,7 +1636,9 @@ function promotedWorkbenchOrder() {
     availableActions: [],
     warehouseName: null,
     promisedDeliveryAt: '2026-08-30T15:30:00.000Z',
+    requestedDeliveryAt: '2026-08-30T15:30:00.000Z',
     lineCount: 1,
+    orderValueMinor: '2500',
     expectedCostMinor: '0',
     expectedRevenueMinor: '2500',
     expectedMarginMinor: '2500',
@@ -757,7 +1688,21 @@ type ImportedWorkbenchRouteRequest = {
 
 async function installImportedWorkbenchRoutes(
   page: Page,
-  options: { refreshConflict?: boolean } = {},
+  options: {
+    refreshConflict?: boolean
+    refreshNetworkFailureOnce?: boolean
+    historyRefreshStatus?: 'captured' | 'unavailable'
+    providerState?: OperationsImportedOrderWorkingCopy['providerState']
+    lines?: OperationsImportedOrderWorkingCopy['lines']
+    providerHistory?: OperationsImportedOrderWorkingCopy['providerHistory']
+    rowVersion?: number
+    providerVersionChanged?: boolean
+    sourceUpdatedAt?: string
+    canManage?: boolean
+    workflowState?: OperationsImportedOrderWorkingCopy['workflowState']
+    actionAvailable?: boolean
+    omitImportedFromWorkspace?: boolean
+  } = {},
 ) {
   const capture = {
     patchRequests: [] as ImportedWorkbenchRouteRequest[],
@@ -767,9 +1712,39 @@ async function installImportedWorkbenchRoutes(
     refreshRequests: [] as ImportedWorkbenchRouteRequest[],
     providerMutationRequests: [] as string[],
     canonicalWorkspaceReads: 0,
+    detailReads: 0,
   }
   let promoted = false
   let detailedOrder = importedWorkbenchOrder(true)
+
+  if (options.providerState) {
+    detailedOrder = { ...detailedOrder, providerState: options.providerState }
+  }
+  if (options.lines) detailedOrder = { ...detailedOrder, lines: options.lines }
+  if (options.providerHistory) {
+    detailedOrder = { ...detailedOrder, providerHistory: options.providerHistory }
+  }
+  if (options.rowVersion !== undefined) {
+    detailedOrder = { ...detailedOrder, rowVersion: options.rowVersion }
+  }
+  if (options.providerVersionChanged !== undefined) {
+    detailedOrder = {
+      ...detailedOrder,
+      providerVersionChanged: options.providerVersionChanged,
+    }
+  }
+  if (options.sourceUpdatedAt) {
+    detailedOrder = {
+      ...detailedOrder,
+      sourceUpdatedAt: options.sourceUpdatedAt,
+    }
+  }
+  if (options.workflowState) {
+    detailedOrder = { ...detailedOrder, workflowState: options.workflowState }
+  }
+  if (options.actionAvailable !== undefined) {
+    detailedOrder = { ...detailedOrder, actionAvailable: options.actionAvailable }
+  }
 
   if (options.refreshConflict) {
     detailedOrder = {
@@ -842,6 +1817,7 @@ async function installImportedWorkbenchRoutes(
     async (route) => {
       const request = route.request()
       if (request.method() === 'GET') {
+        capture.detailReads += 1
         expect(new URL(request.url()).searchParams.get('candidate'))
           .toBe(detailedOrder.candidateGlobalId)
         return route.fulfill({ json: { ok: true, orders: [detailedOrder] } })
@@ -954,11 +1930,25 @@ async function installImportedWorkbenchRoutes(
           },
         })
       }
-      if (request.method() !== 'POST' || !options.refreshConflict) {
+      if (
+        request.method() !== 'POST'
+        || captured.body.action !== 'refresh'
+        || (
+          !options.refreshConflict
+          && !options.refreshNetworkFailureOnce
+          && !options.historyRefreshStatus
+        )
+      ) {
         throw new Error(`Unexpected order-workbench request: ${request.method()}`)
       }
       capture.refreshRequests.push(captured)
-      if (capture.refreshRequests.length === 1) {
+      if (
+        options.refreshNetworkFailureOnce
+        && capture.refreshRequests.length === 1
+      ) {
+        return route.abort('failed')
+      }
+      if (options.refreshConflict && capture.refreshRequests.length === 1) {
         return route.fulfill({
           status: 409,
           json: {
@@ -979,7 +1969,7 @@ async function installImportedWorkbenchRoutes(
           },
         })
       }
-      detailedOrder = {
+      detailedOrder = options.refreshConflict ? {
         ...detailedOrder,
         globalId: workbenchLatestCandidateGlobalId,
         candidateGlobalId: workbenchLatestCandidateGlobalId,
@@ -997,22 +1987,36 @@ async function installImportedWorkbenchRoutes(
           syncStatus: 'local_only',
           issues: [],
         },
-      }
+      } : detailedOrder
       return route.fulfill({
         json: {
           ok: true,
           refreshResult: {
             previousCandidateGlobalId: workbenchCandidateGlobalId,
-            candidateGlobalId: workbenchLatestCandidateGlobalId,
-            rowVersion: 1,
-            status: 'rebased',
-            providerChangedFields: ['line1', 'postalCode'],
-            preservedLocalFields: ['line1'],
+            candidateGlobalId: detailedOrder.candidateGlobalId,
+            rowVersion: detailedOrder.rowVersion,
+            status: options.refreshConflict ? 'rebased' : 'current',
+            providerChangedFields: options.refreshConflict
+              ? ['line1', 'postalCode']
+              : [],
+            preservedLocalFields: options.refreshConflict ? ['line1'] : [],
             preservedLineDrafts: [],
             providerWrites: 0,
             providerWriteIntentCreated: false,
             replayed: false,
           },
+          ...(options.historyRefreshStatus ? {
+            historyRefresh: {
+              status: options.historyRefreshStatus,
+              code: options.historyRefreshStatus === 'unavailable'
+                ? 'SHOPIFY_ORDER_HISTORY_UNAVAILABLE'
+                : null,
+              providerReads: options.historyRefreshStatus === 'captured'
+                ? 3
+                : null,
+              providerWrites: 0,
+            },
+          } : {}),
           order: detailedOrder,
         },
       })
@@ -1030,20 +2034,40 @@ async function installImportedWorkbenchRoutes(
         ok: true,
         operations: {
           ...workspace(),
+          capabilities: {
+            ...workspace().capabilities,
+            canManage: options.canManage ?? workspace().capabilities.canManage,
+          },
           activation: { ...workspace().activation, state: 'read_only' },
           summary: {
             ...workspace().summary,
             openOrders: 1,
             exceptions: 0,
           },
-          importedOrders: promoted ? [] : [{
+          importedOrders: promoted || options.omitImportedFromWorkspace ? [] : [{
             ...detailedOrder,
             resolutionDetailsLoaded: false,
             customer: { ...detailedOrder.customer, options: [] },
             lines: [],
             productOptions: [],
           }],
+          importedOrderPage: {
+            total: promoted ? 0 : 1,
+            returned: promoted || options.omitImportedFromWorkspace ? 0 : 1,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
           orders: canonical ? [canonical] : [],
+          orderPage: {
+            total: canonical ? 1 : 0,
+            returned: canonical ? 1 : 0,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
           selectedOrder: canonical,
           exceptions: [],
           shipping: { sandboxCarrierAccounts: [] },
@@ -1051,6 +2075,18 @@ async function installImportedWorkbenchRoutes(
       },
     })
   })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: promoted
+      ? [promotedWorkbenchOrder()]
+      : [],
+    imported: promoted ? [] : [{
+      ...detailedOrder,
+      resolutionDetailsLoaded: false,
+      customer: { ...detailedOrder.customer, options: [] },
+      lines: [],
+      productOptions: [],
+    }],
+  }))
 
   return capture
 }
@@ -1081,6 +2117,7 @@ async function installImportedOrderPreparationRoutes(
     planStatus: null,
     waveStatus: null,
     promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
     packageCount: 0,
     plannedPackageCount: 0,
     packedPackageCount: 0,
@@ -1565,6 +2602,10 @@ async function installImportedOrderPreparationRoutes(
       },
     })
   })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: [importedOrder],
+    imported: [],
+  }))
   return { unitWeightRequests }
 }
 
@@ -1586,6 +2627,10 @@ async function installOperationsNavigationRoute(page: Page) {
         },
       },
     })
+  })
+  await installUnifiedOrdersRoute(page, () => {
+    const current = workspace()
+    return { canonical: current.orders, imported: current.importedOrders }
   })
 }
 
@@ -1950,6 +2995,23 @@ async function installReplayRoutes(page: Page) {
   })
 }
 
+test('direct imported-order link hydrates drawer details beyond the bounded workspace list', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    omitImportedFromWorkspace: true,
+  })
+
+  await gotoApp(
+    page,
+    `/?operationsOrder=${workbenchCandidateGlobalId}#operations`,
+  )
+
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  expect(capture.detailReads).toBe(1)
+})
+
 test('incomplete imported order saves locally before explicit acceptance into canonical Orders', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const capture = await installImportedWorkbenchRoutes(page)
@@ -1967,7 +3029,8 @@ test('incomplete imported order saves locally before explicit acceptance into ca
     .toBeVisible()
   await expect(page.getByText('Ship-to incomplete for rates')).toBeVisible()
   await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
-  await expect(page.getByText('Quantity 2')).toBeVisible()
+  await expect(page.getByText('Ordered 2')).toBeVisible()
+  await expect(page.getByText('Remaining 2')).toBeVisible()
 
   const customer = page.getByRole('combobox', { name: 'Customer' })
   await expect(customer).toBeEnabled()
@@ -2064,6 +3127,372 @@ test('incomplete imported order saves locally before explicit acceptance into ca
   expect(capture.providerMutationRequests).toEqual([])
 })
 
+test('retained unavailable candidates stay visible but cannot be edited or imported', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    workflowState: 'failed',
+    actionAvailable: false,
+  })
+  await gotoApp(page, '/#operations')
+
+  const importedRow = page.getByTestId(
+    `imported-order-${workbenchCandidateGlobalId}`,
+  )
+  await expect(importedRow).toContainText('Refresh needed')
+  await importedRow.click()
+
+  await expect(page.getByText(
+    'This retained provider copy is no longer eligible for edits or import. Refresh it to fetch a current provider revision.',
+  )).toBeVisible()
+  await expect(page.getByRole('combobox', { name: 'Customer' })).toBeDisabled()
+  await expect(page.getByRole('button', {
+    name: 'Accept & import',
+    exact: true,
+  })).toBeDisabled()
+  await expect(page.getByRole('button', {
+    name: 'Save',
+    exact: true,
+  })).toBeDisabled()
+  expect(capture.patchRequests).toEqual([])
+  expect(capture.acceptRequests).toEqual([])
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+  test(`tracking summary retains all six package snapshots on expansion at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport)
+    await page.clock.setFixedTime('2026-09-07T18:05:00.000Z')
+    const events = Array.from({ length: 6 }, (_, index) => ({
+      globalId: `gcoe765433${index}`,
+      kind: 'tracking_updated',
+      status: index === 5 ? 'delivered' : 'in_transit',
+      occurredAt: `2026-09-0${index + 1}T17:00:00.000Z`,
+      externalSubjectId: 'gid://shopify/Fulfillment/77101',
+      quantity: null,
+      amountMinor: null,
+      currency: null,
+      trackingCarrier: 'USPS',
+      trackingNumber: 'TEST-PACKAGE-1',
+      trackingUrl: `https://tracking.example.test/snapshot-${index}`,
+      trackingRedacted: false,
+    }))
+    const original = JSON.stringify(events)
+    const capture = await installImportedWorkbenchRoutes(page, {
+      historyRefreshStatus: 'captured',
+      providerState: {
+        lifecycle: 'closed', fulfillment: 'fulfilled',
+        observedAt: '2026-09-07T18:00:00.000Z', source: 'history',
+      },
+      providerHistory: {
+        ...importedWorkbenchOrder(true).providerHistory,
+        observedAt: '2026-09-07T18:00:00.000Z',
+        events,
+      },
+    })
+    await gotoApp(page, '/#operations')
+    await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+    const summary = page.getByTestId('order-tracking-summary')
+    await expect(summary.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(1)
+    await expect(summary).toContainText('delivered')
+    await expect(summary.getByRole('link', { name: 'Track shipment' }))
+      .toHaveAttribute('href', 'https://tracking.example.test/snapshot-5')
+    const expand = page.getByRole('button', { name: 'Tracking history (6)' })
+    await expect(expand).toHaveAttribute('aria-expanded', 'false')
+    await expect(page.getByTestId('order-tracking-history')).toHaveCount(0)
+    await expand.click()
+    await expect(expand).toHaveAttribute('aria-expanded', 'true')
+    const history = page.getByTestId('order-tracking-history')
+    await expect(history).toBeVisible()
+    await expect(history.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(6)
+    const historicalLinks = history.getByRole('link', { name: 'Track shipment' })
+    await expect(historicalLinks).toHaveCount(6)
+    for (let index = 0; index < events.length; index += 1) {
+      await expect(historicalLinks.nth(index)).toHaveAttribute('href', events[index].trackingUrl)
+    }
+    await expand.click()
+    await expect(page.getByTestId('order-tracking-history')).toHaveCount(0)
+    await expect(summary.getByText('USPS · TEST-PACKAGE-1', { exact: true })).toHaveCount(1)
+    expect(JSON.stringify(events)).toBe(original)
+    expect(capture.patchRequests).toEqual([])
+    expect(capture.acceptRequests).toEqual([])
+    expect(capture.providerMutationRequests).toEqual([])
+  })
+}
+
+test('provider-terminal candidates remain visible with current external status and cannot be imported', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.clock.setFixedTime('2026-08-31T18:05:00.000Z')
+  const capture = await installImportedWorkbenchRoutes(page, {
+    historyRefreshStatus: 'captured',
+    providerState: {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: '2026-08-31T18:00:00.000Z',
+      source: 'history',
+    },
+    lines: [{
+      ...importedWorkbenchOrder(true).lines[0],
+      quantity: 0,
+      orderedQuantity: 3,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 1,
+      fulfilledQuantity: 2,
+      unfulfilledQuantity: 0,
+      returnedQuantity: 1,
+      providerStatus: 'returned',
+    }],
+    providerHistory: {
+      observedAt: '2026-08-31T18:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/77101',
+        externalProductId: 'gid://shopify/Product/77101',
+        externalVariantId: 'gid://shopify/ProductVariant/77101',
+        sku: 'TRAIL-PROVIDER-001',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        returnedQuantity: 1,
+        requiresShipping: true,
+      }],
+      events: [{
+        globalId: 'gcoe7654321',
+        kind: 'tracking_updated',
+        status: 'delivered',
+        occurredAt: '2026-08-31T17:00:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: null,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: 'USPS',
+        trackingNumber: '9400111899223856928499',
+        trackingUrl: 'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+        trackingRedacted: false,
+      }, {
+        globalId: 'gcoe7654322',
+        kind: 'fulfillment_updated',
+        status: 'delivered',
+        occurredAt: '2026-08-31T17:00:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: 2,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }, {
+        globalId: 'gcoe7654323',
+        kind: 'refund_created',
+        status: 'succeeded',
+        occurredAt: '2026-08-31T17:30:00.000Z',
+        externalSubjectId: 'gid://shopify/Refund/77101',
+        quantity: 1,
+        amountMinor: 1250,
+        currency: 'USD',
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }],
+      providerWrites: 0,
+    },
+  })
+  await gotoApp(page, '/#operations')
+
+  const importedRow = page.getByTestId(
+    `imported-order-${workbenchCandidateGlobalId}`,
+  )
+  await expect(importedRow).toBeVisible()
+  await expect(importedRow).toContainText('Fulfilled externally')
+  await importedRow.click()
+
+  await expect(page.getByText(
+    'Shopify reports this order as fulfilled externally. It remains visible for provider history and is not eligible for a new ClawPilot fulfillment.',
+  )).toBeVisible()
+  await expect(page.getByText('Ordered 3')).toBeVisible()
+  await expect(page.getByText('Current 2')).toBeVisible()
+  await expect(page.getByText('Fulfilled 2')).toBeVisible()
+  await expect(page.getByText('Remaining 0')).toBeVisible()
+  await expect(page.getByText('Removed or refunded 1')).toBeVisible()
+  await expect(page.getByText('Returned 1')).toBeVisible()
+  await expect(page.getByText('USPS · 9400111899223856928499'))
+    .toBeVisible()
+  await expect(page.getByRole('link', { name: 'Track shipment' }))
+    .toHaveAttribute('href', /tools\.usps\.com/)
+  await expect(page.getByText('Fulfillment Updated · delivered · 2 units'))
+    .toBeVisible()
+  await expect(page.getByText('Refund Created · succeeded · 1 units · $12.50'))
+    .toBeVisible()
+  await expect(page.getByText(/No line-item snapshot was supplied/)).toHaveCount(0)
+  await expect(page.getByText('Latest line quantities reported by Shopify.'))
+    .toBeVisible()
+  await expect(page.getByText('Latest provider shipping address')).toBeVisible()
+  await expect(page.getByText('Provider snapshot', { exact: true }))
+    .toBeVisible()
+  await expect(page.getByLabel('Customer')).toBeDisabled()
+  await expect(page.getByLabel('Requested delivery')).toBeDisabled()
+  for (const label of [
+    'Recipient name',
+    'Address',
+    'Apartment, suite, etc.',
+    'City',
+    'State / province',
+    'Postal code',
+    'Country code',
+  ]) {
+    await expect(page.getByLabel(label)).toBeDisabled()
+  }
+  await expect(page.getByLabel('ClawPilot product')).toHaveCount(0)
+  await expect(page.getByLabel(/Unit price/)).toHaveCount(0)
+  await expect(page.getByText(/cartonization chooses outbound packaging/i))
+    .toHaveCount(0)
+  await expect(page.getByRole('button', {
+    name: 'Accept & import',
+    exact: true,
+  })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Save', exact: true }))
+    .toBeDisabled()
+  const refresh = page.getByRole('button', { name: 'Refresh from Shopify' })
+  await expect(refresh).toBeEnabled()
+  await refresh.click()
+  await expect(page.getByText('Order #7710 refreshed from Shopify'))
+    .toBeVisible()
+  expect(capture.refreshRequests).toHaveLength(1)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+  })
+  expect(capture.refreshRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('opening another stale externally fulfilled order refreshes exact Shopify history automatically', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  const sourceUpdatedAt = '2026-08-31T18:00:00.000Z'
+  await page.clock.setFixedTime(refreshNow)
+  const capture = await installImportedWorkbenchRoutes(page, {
+    historyRefreshStatus: 'captured',
+    rowVersion: 4,
+    providerVersionChanged: true,
+    sourceUpdatedAt,
+    providerState: {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: sourceUpdatedAt,
+      source: 'history',
+    },
+    lines: [{
+      ...importedWorkbenchOrder(true).lines[0],
+      quantity: 0,
+      orderedQuantity: 3,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 1,
+      fulfilledQuantity: 2,
+      unfulfilledQuantity: 0,
+      returnedQuantity: 1,
+      providerStatus: 'returned',
+    }],
+    providerHistory: {
+      observedAt: '2026-08-31T17:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/77101',
+        externalProductId: 'gid://shopify/Product/77101',
+        externalVariantId: 'gid://shopify/ProductVariant/77101',
+        sku: 'TRAIL-PROVIDER-001',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        returnedQuantity: 1,
+        requiresShipping: true,
+      }],
+      events: [{
+        globalId: 'gcoe7654999',
+        kind: 'tracking_updated',
+        status: 'in_transit',
+        occurredAt: '2026-08-31T17:30:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: null,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: 'UPS',
+        trackingNumber: '1Z999AA10123456784',
+        trackingUrl: 'https://www.ups.com/track?tracknum=1Z999AA10123456784',
+        trackingRedacted: false,
+      }],
+      providerWrites: 0,
+    },
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+
+  await expect.poll(() => capture.refreshRequests.length).toBe(1)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 4,
+  })
+  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  expect(capture.refreshRequests[0].idempotencyKey).toBe(
+    `operations-imported-drawer-history:${workbenchCandidateGlobalId}:4:${
+      Date.parse(sourceUpdatedAt)
+    }:${refreshEpoch}`,
+  )
+  await expect(page.getByText('UPS · 1Z999AA10123456784')).toBeVisible()
+  await expect(page.getByText('Returned 1')).toBeVisible()
+  await expect(page.getByText(/No line-item snapshot was supplied/)).toHaveCount(0)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect.poll(() => capture.refreshRequests.length).toBe(2)
+  expect(capture.refreshRequests[1].idempotencyKey)
+    .toBe(capture.refreshRequests[0].idempotencyKey)
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('opening stale external history stays read-only for a viewer without manage permission', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    canManage: false,
+    historyRefreshStatus: 'captured',
+    sourceUpdatedAt: '2026-08-31T18:00:00.000Z',
+    providerState: {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: '2026-08-31T18:00:00.000Z',
+      source: 'history',
+    },
+    providerHistory: {
+      observedAt: '2026-08-31T17:00:00.000Z',
+      currency: 'USD',
+      providerTotalMinor: '2500',
+      currentLines: [],
+      events: [],
+      providerWrites: 0,
+    },
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+
+  await expect(page.getByText(
+    'Shopify reports this order as fulfilled externally. It remains visible for provider history and is not eligible for a new ClawPilot fulfillment.',
+  )).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Refresh from Shopify' }))
+    .toHaveCount(0)
+  expect(capture.refreshRequests).toEqual([])
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
 test('imported order provider refresh resolves each address conflict explicitly', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const capture = await installImportedWorkbenchRoutes(page, {
@@ -2130,6 +3559,954 @@ test('imported order provider refresh resolves each address conflict explicitly'
   expect(capture.providerMutationRequests).toEqual([])
 })
 
+test('imported order provider refresh reuses its UUID after a lost response', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    refreshNetworkFailureOnce: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+  const refresh = page.getByRole('button', { name: 'Refresh from Shopify' })
+  await refresh.click()
+  await expect(page.getByText('Failed to fetch')).toBeVisible()
+
+  await refresh.click()
+  await expect(page.getByText('Order #7710 is current')).toBeVisible()
+
+  expect(capture.refreshRequests).toHaveLength(2)
+  expect(capture.refreshRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.refreshRequests[1].idempotencyKey)
+    .toBe(capture.refreshRequests[0].idempotencyKey)
+})
+
+test('orders workbench globally filters and sorts both order sources', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const base = workspace()
+  const readyOrder = {
+    ...base.orders[0],
+    globalId: 'gor7000001',
+    orderNumber: '#7001',
+    status: 'imported' as const,
+    exceptionCount: 0,
+    updatedAt: '2026-08-21T12:00:00.000Z',
+  }
+  const attentionOrder = {
+    ...importedWorkbenchOrder(false),
+    candidateGlobalId: 'gcoc7000002',
+    globalId: 'gcoc7000002',
+    orderNumber: '#7002',
+    updatedAt: '2026-08-22T12:00:00.000Z',
+  }
+  const fulfilledOrder = {
+    ...importedWorkbenchOrder(false),
+    candidateGlobalId: 'gcoc7000003',
+    globalId: 'gcoc7000003',
+    orderNumber: '#7003',
+    providerState: {
+      lifecycle: 'closed' as const,
+      fulfillment: 'fulfilled' as const,
+      observedAt: '2026-08-23T12:00:00.000Z',
+      source: 'history' as const,
+    },
+    updatedAt: '2026-08-23T12:00:00.000Z',
+    trackingNumber: '1Z7003',
+  }
+  const unifiedQueries: URLSearchParams[] = []
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (url.pathname === '/api/operations/orders/unified') {
+      unifiedQueries.push(url.searchParams)
+    }
+  })
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    return route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...base,
+          orders: [readyOrder],
+          orderPage: {
+            total: 1,
+            returned: 1,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          importedOrders: [attentionOrder, fulfilledOrder],
+          importedOrderPage: {
+            total: 2,
+            returned: 2,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          selectedOrder: null,
+          exceptions: [],
+        },
+      },
+    })
+  })
+  await installUnifiedOrdersRoute(page, () => ({
+    canonical: [readyOrder],
+    imported: [attentionOrder, fulfilledOrder],
+  }))
+
+  await gotoApp(page, '/#operations')
+  await expect(page.getByRole('combobox', { name: 'Filter orders by status' }))
+    .toHaveText('All statuses')
+  await expect(page.getByRole('combobox', { name: 'Filter orders by sales channel' }))
+    .toHaveText('All sales channels')
+  await expect(page.getByRole('combobox', { name: 'Filter orders by warehouse' }))
+    .toHaveCount(0)
+  await expect(page.getByRole('button', { name: /All orders/u })).toHaveCount(0)
+  await expect(page.locator('tbody tr')).toHaveCount(3)
+  await expect(page.locator('tbody tr').nth(0)).toContainText('#7003')
+  await expect(page.locator('tbody tr').nth(1)).toContainText('#7002')
+  await expect(page.locator('tbody tr').nth(2)).toContainText('#7001')
+
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+  await expect(page.locator('tbody tr')).toHaveCount(1)
+  await expect(page.locator('tbody tr')).toContainText('#7003')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('status'))
+    .toBe('fulfilled_externally')
+
+  await page.getByRole('button', { name: 'Clear filters' }).click()
+  await page.getByRole('combobox', { name: 'Filter orders by sales channel' }).click()
+  await page.getByRole('option', { name: 'Shopify' }).click()
+  await expect.poll(() => unifiedQueries.at(-1)?.get('provider')).toBe('shopify')
+  await page.getByRole('combobox', { name: 'Filter orders by tracking state' }).click()
+  await page.getByRole('option', { name: 'Has tracking' }).click()
+  await expect(page.locator('tbody tr')).toHaveCount(1)
+  await expect(page.locator('tbody tr')).toContainText('#7003')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('tracking')).toBe('present')
+
+  await page.getByRole('button', { name: 'Clear filters' }).click()
+  await page.getByRole('combobox', { name: 'Sort operations orders' }).click()
+  await page.getByRole('option', {
+    name: 'Order number: lowest by channel',
+  }).click()
+  await expect(page.locator('tbody tr').nth(0)).toContainText('#7001')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('sort')).toBe('order_number')
+  await expect.poll(() => unifiedQueries.at(-1)?.get('direction')).toBe('asc')
+})
+
+test('orders refresh reads Shopify status and projects external fulfillment without local shipment evidence', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Imported')
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    'Checked 1 of 1 connected store for new orders and found 0 eligible provider orders. Visible provider history: no orders were stale enough for an exact detail refresh. Visible canonical status: checked 1 sales-channel order. 1 provider status change was detected. Connected-store provider history: scheduled background scans for 1 of 2 eligible stores. 1 store was already queued or in progress. Background canonical status: queued 110 active ClawPilot orders for an exact background status check. 1 order was already queued or in progress.',
+  )).toBeVisible()
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText(
+    'Provider window · scope-filtered',
+  )
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+  await expect.poll(() => capture.unifiedStatusFilters.at(-1))
+    .toBe('fulfilled_externally')
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toEqual([{
+    idempotencyKey: expect.stringMatching(
+      /^operations-order-reconciliation:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: { excludeOrderGlobalIds: ['gor7654321'] },
+  }])
+  expect(capture.discoveryRequests).toEqual([{
+    idempotencyKey: expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: { accountGlobalId: 'gia9286799' },
+  }])
+  expect(capture.syncRequests[0]).toEqual({
+    idempotencyKey: expect.stringMatching(
+      /^operations-order-status-sync:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: {
+      excludeOrderGlobalIds: [],
+      orderGlobalIds: ['gor7654321'],
+    },
+    search: '',
+  })
+  expect(capture.orderHistorySyncRequests).toHaveLength(1)
+  expect(capture.orderHistorySyncRequests[0].body.orderKeys).toEqual([
+    'canonical:gor7654321',
+  ])
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
+
+  await page.getByRole('row', { name: /#1005/ }).click()
+  await expect(page.getByRole('heading', { name: 'Order #1005' })).toBeVisible()
+  await expect(page.getByText('Provider delivery window', { exact: true }))
+    .toBeVisible()
+  await expect(page.getByTestId('order-derived-fulfillment-status'))
+    .toHaveText('Fulfilled externally')
+  await expect(page.getByText(
+    'Fulfilled in Shopify outside ClawPilot. No ClawPilot shipment or label was created.',
+  )).toBeVisible()
+  await expect(page.getByText(
+    'Shopify reports this order fulfilled outside ClawPilot. Its provider status is shown here; local fulfillment actions are unavailable.',
+  )).toBeVisible()
+  await expect(page.getByTestId('canonical-provider-history')).toContainText(
+    'Ordered 3 · Current 2 · Fulfilled 2 · Unfulfilled 0 · Returned 1 · Removed 1',
+  )
+  await expect(page.getByText('ClawPilot fulfillment lines (2)')).toBeVisible()
+  await expect(page.getByText('Current location mapping').last()).toBeVisible()
+  await expect(page.getByText(/Use Reconcile external fulfillment/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Release to warehouse' })).toHaveCount(0)
+})
+
+test('orders refresh explains a durable full-history follow-up behind an active provider poll', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOrderStatusSyncRoutes(page, {
+    providerHistoryDeferredAccounts: 1,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /1 store will begin its full-history scan automatically after the current provider poll finishes\./,
+  )).toBeVisible()
+})
+
+test('orders refresh leaves imported history reads on demand', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured', 'unavailable'],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Visible provider history: no orders were stale enough for an exact detail refresh/,
+  ))
+    .toBeVisible()
+  expect(capture.importedHistoryRefreshRequests).toEqual([])
+})
+
+test('opening another stale terminal Shopify order refreshes its exact history once per mount', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  await page.clock.setFixedTime(refreshNow)
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured', 'captured'],
+    currentImportedHistoryIndexes: [0],
+    terminalImportedHistoryIndexes: [0, 1],
+    importedHistoryRefreshedAt: new Date(refreshNow).toISOString(),
+    returnDetailedImportedHistoryOnRefresh: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId('imported-order-gcoc6682001').click()
+
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByText('UPS · 1Z6682LATEST')).toBeVisible()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(1)
+  expect(capture.importedHistoryRefreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: 'gcoc6682001',
+    expectedRowVersion: 3,
+  })
+  const sourceRevision = Date.parse('2026-08-31T18:00:00.000Z')
+  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  const firstIdempotencyKey =
+    `operations-imported-drawer-history:gcoc6682001:3:${sourceRevision}:${refreshEpoch}`
+  expect(capture.importedHistoryRefreshRequests[0].idempotencyKey)
+    .toBe(firstIdempotencyKey)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(2)
+  expect(capture.importedHistoryRefreshRequests[1].idempotencyKey)
+    .toBe(firstIdempotencyKey)
+})
+
+test('opening terminal Shopify history as a view-only user keeps stored details without a forbidden refresh', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    canManage: false,
+    importedHistoryOutcomes: ['captured', 'unavailable'],
+    currentImportedHistoryIndexes: [0],
+    terminalImportedHistoryIndexes: [0, 1],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId('imported-order-gcoc6682001').click()
+
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Refresh from Shopify' }))
+    .toHaveCount(0)
+  expect(capture.importedHistoryRefreshRequests).toEqual([])
+})
+
+test('orders refresh scopes provider status reads to visible canonical rows', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    eligibleOrderCount: 15,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  expect(capture.discoveryRequests).toHaveLength(1)
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.syncRequests[0].body.orderGlobalIds).toEqual(['gor7654321'])
+  expect(capture.syncRequests[0].body.excludeOrderGlobalIds).toEqual([])
+  expect(capture.orderHistorySyncRequests).toHaveLength(1)
+  expect(capture.orderHistorySyncRequests[0].body.orderKeys).toEqual([
+    'canonical:gor7654321',
+  ])
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: ['gor7654321'],
+  })
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
+})
+
+test('orders refresh never starts an unscoped synchronous status scan', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    eligibleOrderCount: 111,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.syncRequests.every((request) => (
+    request.body.orderGlobalIds?.length === 1
+    && request.body.orderGlobalIds[0] === 'gor7654321'
+  ))).toBe(true)
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: ['gor7654321'],
+  })
+})
+
+test('orders refresh excludes only successful visible canonical checks from background scheduling', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    eligibleOrderCount: 111,
+    failedStatusOrderGlobalIds: ['gor7654321'],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Visible canonical status: checked 1 sales-channel order\. No provider status changes were detected\./,
+  )).toBeVisible()
+  await expect(page.getByText(
+    /1 existing sales-channel order could not be checked/,
+  )).toBeVisible()
+  expect(capture.reconciliationScheduleRequests).toHaveLength(1)
+  expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+    excludeOrderGlobalIds: [],
+  })
+  expect(capture.refreshRequestOrder).toEqual([
+    'visible-history',
+    'visible-canonical-status',
+    'background-schedule',
+  ])
+})
+
+for (const evidence of ['invalid_counts', 'invalid_writes'] as const) {
+  test(`orders refresh rejects provider-history schedule ${evidence.replace('_', ' ')}`, async ({ page }) => {
+    await page.setViewportSize({ width: 1366, height: 900 })
+    const capture = await installOrderStatusSyncRoutes(page, {
+      providerHistoryScheduleEvidence: evidence,
+    })
+    await gotoApp(page, '/#operations')
+
+    await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+    await expect(page.getByText(
+      'Historical sales-channel order refresh returned invalid evidence',
+    )).toBeVisible()
+    await expect(page.getByText(
+      /Connected-store provider history: background refresh was not scheduled\./,
+    )).toBeVisible()
+    expect(capture.reconciliationScheduleRequests[0].body).toEqual({
+      excludeOrderGlobalIds: ['gor7654321'],
+    })
+    expect(capture.refreshRequestOrder).toEqual([
+      'visible-history',
+      'visible-canonical-status',
+      'background-schedule',
+    ])
+  })
+}
+
+test('Orders pane supports direct URL-backed pages and preserves the page while an order opens', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const orders = Array.from({ length: 111 }, (_, index) => ({
+    id: `canonical-order-${index + 1}`,
+    globalId: `gor${String(2_000_000 + index)}`,
+    orderNumber: `#${7_000 + index}`,
+    customerName: `Canonical customer ${index + 1}`,
+    customerGlobalId: `ga${String(2_000_000 + index)}`,
+    sourceProvider: 'shopify',
+    currency: 'USD',
+    status: 'imported',
+    externallyFulfilled: false,
+    warehouseName: null,
+    promisedDeliveryAt: null,
+    requestedDeliveryAt: null,
+    lineCount: 1,
+    exceptionCount: 0,
+    orderValueMinor: '1000',
+    expectedCostMinor: null,
+    expectedRevenueMinor: '1000',
+    expectedMarginMinor: null,
+    trackingNumber: null,
+    orderedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
+    updatedAt: new Date(Date.UTC(2026, 7, 31, 12, 0, 0, index)).toISOString(),
+  }))
+  const pageTwoFaireCandidateGlobalId = 'gcoc2000051'
+  const pageTwoFaireOrder: OperationsImportedOrderWorkingCopy = {
+    ...importedWorkbenchOrder(true),
+    globalId: pageTwoFaireCandidateGlobalId,
+    candidateGlobalId: pageTwoFaireCandidateGlobalId,
+    integrationAccountGlobalId: 'gia2000051',
+    integrationAccountName: 'Faire Page Two',
+    provider: 'faire',
+    externalOrderId: 'WXVFX9CS9C',
+    orderNumber: 'WXVFX9CS9C',
+    customerName: 'Faire page-two customer',
+    sourceUpdatedAt: '2026-08-31T12:00:51.000Z',
+    orderedAt: '2026-08-31T12:00:51.000Z',
+    updatedAt: '2026-08-31T12:00:51.000Z',
+  }
+  const pageTwoFaireSummary: OperationsImportedOrderWorkingCopy = {
+    ...pageTwoFaireOrder,
+    resolutionDetailsLoaded: false,
+    customer: {
+      ...pageTwoFaireOrder.customer,
+      options: [],
+    },
+    lines: [],
+    productOptions: [],
+  }
+  const unifiedPageRequests: Array<{ page: number; snapshot: string | null }> = []
+  const unifiedPageQueryStrings: string[] = []
+  let pageTwoFaireDetailReads = 0
+  let failLastPageOnce = true
+  let driftPageOnce: number | null = null
+  let rejectFreshSnapshotOnce = false
+  let nextDriftSnapshot = 'orders-snapshot-v2'
+  let currentSnapshot = 'orders-snapshot-v1'
+  await page.route(
+    (url) => url.pathname === '/api/operations/orders/unified',
+    async (route) => {
+      const params = new URL(route.request().url()).searchParams
+      const requestedPageSize = Number(params.get('pageSize'))
+      expect([25, 50]).toContain(requestedPageSize)
+      expect(params.get('cursor')).toBeNull()
+      const requestedPage = Number(params.get('page') || 1)
+      const requestSnapshot = params.get('snapshot')
+      unifiedPageRequests.push({ page: requestedPage, snapshot: requestSnapshot })
+      unifiedPageQueryStrings.push(params.toString())
+      if (
+        requestedPage === driftPageOnce
+        || (!requestSnapshot && rejectFreshSnapshotOnce)
+      ) {
+        if (!requestSnapshot) rejectFreshSnapshotOnce = false
+        driftPageOnce = null
+        currentSnapshot = nextDriftSnapshot
+        await route.fulfill({
+          status: 409,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED',
+            error: 'The order result set changed',
+          },
+        })
+        return
+      }
+      if (requestedPage === 3 && failLastPageOnce) {
+        failLastPageOnce = false
+        await route.fulfill({
+          status: 503,
+          json: { ok: false, error: 'Temporary unified-page failure' },
+        })
+        return
+      }
+      const requestedOffset = (requestedPage - 1) * requestedPageSize
+      const offset = Math.min(
+        requestedOffset,
+        Math.floor((orders.length - 1) / requestedPageSize) * requestedPageSize,
+      )
+      const rows = orders.slice(offset, offset + requestedPageSize).map((order, index) => (
+        offset === requestedPageSize && index === 1
+          ? {
+              kind: 'imported' as const,
+              key: `imported:${pageTwoFaireCandidateGlobalId}`,
+              order: pageTwoFaireSummary,
+            }
+          : {
+              kind: 'canonical' as const,
+              key: `canonical:${order.globalId}`,
+              order,
+            }
+      ))
+      const nextOffset = offset + rows.length
+      const complete = nextOffset >= orders.length
+      await route.fulfill({
+        json: {
+          ok: true,
+          rows,
+          page: {
+            total: orders.length,
+            returned: rows.length,
+            pageSize: requestedPageSize,
+            offset,
+            nextCursor: null,
+            complete,
+            truncated: !complete,
+            snapshot: currentSnapshot,
+          },
+        },
+      })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    const params = new URL(route.request().url()).searchParams
+    expect(params.get('includeOrderSummaries')).toBe('false')
+    const base = workspace()
+    await route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...base,
+          orders: [],
+          orderPage: {
+            total: 0,
+            returned: 0,
+            pageSize: 1,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          importedOrders: [],
+          importedOrderPage: {
+            total: 0,
+            returned: 0,
+            pageSize: 1,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          selectedOrder: null,
+          exceptions: [],
+        },
+      },
+    })
+  })
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      expect(route.request().method()).toBe('GET')
+      expect(new URL(route.request().url()).searchParams.get('candidate'))
+        .toBe(pageTwoFaireCandidateGlobalId)
+      pageTwoFaireDetailReads += 1
+      await route.fulfill({
+        json: {
+          ok: true,
+          orders: [pageTwoFaireOrder],
+        },
+      })
+    },
+  )
+
+  await gotoApp(page, '/#operations')
+
+  await expect(page.locator('[data-testid^="canonical-order-"]')).toHaveCount(50)
+  await expect(page.getByText('1–50 of 111 orders')).toBeVisible()
+  expect(unifiedPageRequests).toEqual([{ page: 1, snapshot: null }])
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+
+  await page.getByRole('button', { name: 'Go to page 2' }).click()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7050/u })).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7000/u })).toHaveCount(0)
+  expect(unifiedPageRequests).toEqual([
+    { page: 1, snapshot: null },
+    { page: 2, snapshot: 'orders-snapshot-v1' },
+  ])
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+
+  await page.getByRole('button', { name: 'Open order #7050' }).click()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/operationsOrder=gor2000050/u)
+  expect(unifiedPageRequests).toHaveLength(2)
+
+  await page.getByRole('button', { name: 'Close order details' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
+
+  await page.getByRole('button', { name: 'Open order WXVFX9CS9C' }).click()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(pageTwoFaireDetailReads).toBe(1)
+
+  await page.getByRole('button', { name: 'Close imported order' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
+
+  await page.getByRole('textbox', { name: 'Go to order page' }).fill('3')
+  await page.getByRole('button', { name: 'Go', exact: true }).click()
+  await expect(page.getByText('Temporary unified-page failure')).toBeVisible()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v1/u)
+  await expect(page.getByRole('textbox', { name: 'Go to order page' }))
+    .toHaveValue('2')
+  await page.getByRole('textbox', { name: 'Go to order page' }).fill('3')
+  await page.getByRole('button', { name: 'Go', exact: true }).click()
+  await expect(page.getByText('101–111 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7100/u })).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=3/u)
+  expect(unifiedPageRequests.slice(0, 4)).toEqual([
+    { page: 1, snapshot: null },
+    { page: 2, snapshot: 'orders-snapshot-v1' },
+    { page: 3, snapshot: 'orders-snapshot-v1' },
+    { page: 3, snapshot: 'orders-snapshot-v1' },
+  ])
+
+  await page.reload()
+  await expect(page.getByText('101–111 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('row', { name: /#7100/u })).toBeVisible()
+  expect(unifiedPageRequests.at(-1)).toEqual({
+    page: 3,
+    snapshot: 'orders-snapshot-v1',
+  })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  const pagination = page.getByTestId('order-pagination-controls')
+  await expect(pagination).toBeVisible()
+  const paginationBox = await pagination.boundingBox()
+  expect(paginationBox).not.toBeNull()
+  expect((paginationBox?.x || 0) + (paginationBox?.width || 0)).toBeLessThanOrEqual(391)
+  await expect(page.getByRole('button', { name: 'Go to first page' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Go to last page' })).toHaveCount(0)
+  expect(await page.evaluate(() => document.documentElement.scrollWidth))
+    .toBeLessThanOrEqual(390)
+
+  driftPageOnce = 2
+  await page.getByRole('button', { name: 'Go to previous page' }).click()
+  await expect(page.getByText(
+    'Orders changed. Refreshed page 2 with current results.',
+  )).toBeVisible()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v2/u)
+  expect(unifiedPageRequests.slice(-2)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-v1' },
+    { page: 2, snapshot: null },
+  ])
+
+  driftPageOnce = 2
+  nextDriftSnapshot = 'orders-snapshot-v3'
+  await page.evaluate(() => {
+    const url = new URL(window.location.href)
+    url.searchParams.set('orderSnapshot', 'orders-snapshot-stale')
+    url.searchParams.set('operationsOrder', 'gcoc2000051')
+    window.history.replaceState(window.history.state, '', url)
+  })
+  await page.reload()
+  await expect(page.getByText(
+    'Orders changed. Refreshed page 2 with current results.',
+  )).toBeVisible()
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(unifiedPageRequests.slice(-2)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
+  ])
+  expect(pageTwoFaireDetailReads).toBe(2)
+
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await gotoApp(
+    page,
+    `/?orderPage=2&orderSnapshot=orders-snapshot-v3&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
+  )
+  await expect(page.getByText('51–100 of 111 orders')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(pageTwoFaireDetailReads).toBe(3)
+
+  await page.getByRole('button', { name: 'Close imported order' }).click()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v3/u)
+  await expect(page).not.toHaveURL(/operationsOrder=/u)
+
+  // A second conflict must surface an error, not retry indefinitely or erase
+  // the requested page, filters, snapshot, or open drawer from the reload URL.
+  driftPageOnce = 2
+  rejectFreshSnapshotOnce = true
+  nextDriftSnapshot = 'orders-snapshot-v4'
+  const beforeFailedRecovery = unifiedPageRequests.length
+  await gotoApp(
+    page,
+    `/?orderPage=2&orderPageSize=25&orderSearch=page-two&orderStatus=imported&orderSort=order_asc&orderProvider=faire&orderTracking=present&orderSnapshot=orders-snapshot-stale&operationsOrder=${pageTwoFaireCandidateGlobalId}#operations`,
+  )
+  await expect(page.getByText(
+    'The order result set changed [OPERATIONS_ORDER_PAGE_SNAPSHOT_CHANGED]',
+    { exact: true },
+  )).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-stale/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  expect(unifiedPageRequests.slice(beforeFailedRecovery)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
+  ])
+  const failedRecoveryQueries = unifiedPageQueryStrings.slice(-2).map(
+    (query) => new URLSearchParams(query),
+  )
+  failedRecoveryQueries[0].delete('snapshot')
+  expect(failedRecoveryQueries[0].toString())
+    .toBe(failedRecoveryQueries[1].toString())
+  expect(Object.fromEntries(failedRecoveryQueries[1])).toMatchObject({
+    page: '2',
+    pageSize: '25',
+    search: 'page-two',
+    status: 'imported',
+    sort: 'order_number',
+    direction: 'asc',
+    provider: 'faire',
+    tracking: 'present',
+  })
+
+  driftPageOnce = 2
+  await page.reload()
+  await expect(page.getByText('26–50 of 111 orders')).toBeVisible()
+  await expect(page).toHaveURL(/orderPage=2/u)
+  await expect(page).toHaveURL(/orderPageSize=25/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v4/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  expect(unifiedPageRequests.slice(-2)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-stale' },
+    { page: 2, snapshot: null },
+  ])
+
+  // Only a no-longer-existing page may be clamped; the selected order remains
+  // addressable even when it is no longer part of the visible list page.
+  orders.splice(20)
+  driftPageOnce = 2
+  nextDriftSnapshot = 'orders-snapshot-v5'
+  await page.reload()
+  await expect(page.getByText('1–20 of 20 orders')).toBeVisible()
+  await expect(page.getByText(
+    'Page 2 is no longer available. Showing page 1.',
+  )).toBeVisible()
+  await expect(page).not.toHaveURL(/orderPage=/u)
+  await expect(page).toHaveURL(/orderPageSize=25/u)
+  await expect(page).toHaveURL(/orderSnapshot=orders-snapshot-v5/u)
+  await expect(page).toHaveURL(/operationsOrder=gcoc2000051/u)
+  await expect(page.getByRole('heading', { name: 'Order WXVFX9CS9C' }))
+    .toBeVisible()
+  await expect.poll(() => unifiedPageRequests.slice(-3)).toEqual([
+    { page: 2, snapshot: 'orders-snapshot-v4' },
+    { page: 2, snapshot: null },
+    { page: 1, snapshot: 'orders-snapshot-v5' },
+  ])
+})
+test('orders refresh leaves provider continuation for the next manager action', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    discoveryContinuationBatches: 1,
+  })
+  await gotoApp(page, '/#operations')
+  const workspaceReadsBeforeRefresh = capture.operationsStatusFilters.length
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Checked 0 of 1 connected store for new orders and found 125 eligible provider orders\. 1 store still has provider pages after this bounded refresh\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  await expect(page.getByText(
+    'Pro Bakery Bites still has provider pages after the safe per-click limit; refresh again to continue.',
+  )).toBeVisible()
+  expect(capture.discoveryRequests).toEqual([{
+    idempotencyKey: expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: { accountGlobalId: 'gia9286799' },
+  }])
+  await expect.poll(() => capture.operationsStatusFilters.length)
+    .toBeGreaterThan(workspaceReadsBeforeRefresh)
+})
+
+test('orders refresh reloads the current filter after a delayed provider batch', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    delaySecondBatch: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+  await capture.secondBatchStarted
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+  await expect.poll(() => capture.unifiedStatusFilters.at(-1))
+    .toBe('fulfilled_externally')
+  const requestsBeforeFinalReload = capture.unifiedStatusFilters.length
+
+  capture.releaseSecondBatch()
+  await expect(page.getByText(
+    /Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  await expect.poll(() => capture.unifiedStatusFilters.length)
+    .toBeGreaterThan(requestsBeforeFinalReload)
+  expect(
+    capture.unifiedStatusFilters
+      .slice(requestsBeforeFinalReload)
+      .every((value) => value === 'fulfilled_externally'),
+  ).toBe(true)
+})
+
+test('an older post-refresh reload cannot overwrite a newer status filter', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    delayFinalWorkspace: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+  await capture.finalWorkspaceStarted
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+
+  await expect(page.getByRole('row', { name: /#FILTERED/ })).toBeVisible()
+  capture.releaseFinalWorkspace()
+  await expect(page.getByRole('row', { name: /#STALE/ })).toHaveCount(0)
+  await expect(page.getByRole('row', { name: /#FILTERED/ })).toBeVisible()
+})
+
+test('orders refresh reports an already-running provider scan without claiming completion', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    discoveryRunning: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Checked 0 of 1 connected store for new orders and found 0 eligible provider orders\. 1 store is already refreshing\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  await expect(page.getByText(
+    'Pro Bakery Bites is already refreshing. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.',
+  )).toBeVisible()
+  expect(capture.discoveryRequests).toHaveLength(1)
+  expect(capture.syncRequests).toHaveLength(1)
+})
+
+test('orders refresh does not poll an already-running provider scan', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    discoveryRunningResponses: 2,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(
+    /Checked 0 of 1 connected store for new orders and found 0 eligible provider orders\. 1 store is already refreshing\..*Visible canonical status: checked 1 sales-channel order\. 1 provider status change was detected\./,
+  )).toBeVisible()
+  expect(capture.discoveryRequests).toHaveLength(1)
+  expect(capture.syncRequests).toHaveLength(1)
+})
+
+test('released Shopify fulfillment keeps the required reconciliation action ahead of ordinary work', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOrderStatusSyncRoutes(page, { releasedReconciliation: true })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1005/ }).click()
+  await expect(page.getByTestId('order-derived-fulfillment-status'))
+    .toHaveText('Fulfilled externally')
+  await expect(page.getByTestId('canonical-provider-total')).toContainText(
+    'Latest sales-channel total',
+  )
+  await expect(page.getByTestId('canonical-provider-total')).toContainText('$25.00')
+  const providerLineId = 'gid://shopify/LineItem/1005-provider'
+  await expect(page.getByTestId(`canonical-provider-line-title-${providerLineId}`))
+    .toHaveText('Bakery Bites Variety Case')
+  await expect(page.getByTestId(`canonical-provider-line-metadata-${providerLineId}`))
+    .toHaveText('SKU PROVIDER-1005 · Variant 20 lb case · Vendor AG Alchemy')
+  await expect(page.getByTestId(`canonical-provider-line-financials-${providerLineId}`))
+    .toHaveText(
+      'Unit price $10.00 · Subtotal $30.00 · Discount $5.00 · Tax $0.00',
+    )
+  await page.getByText('Sales-channel activity (1)').click()
+  await expect(page.getByTestId('canonical-provider-event-details-gcoe1005refund'))
+    .toContainText(
+      'Provider reference gid://shopify/Refund/1005 · Quantity 1 · Amount $12.50',
+    )
+  await expect(page.getByText(
+    'Shopify reports external fulfillment. Use Reconcile external fulfillment instead of updating this order.',
+  )).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reconcile Shopify fulfillment' }))
+    .toBeVisible()
+  await expect(page.getByRole('button', { name: 'Confirm all picks' })).toHaveCount(0)
+})
+
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
   await installOperationsRoutes(page)
@@ -2162,13 +4539,13 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Picks complete').locator('..').getByText('2 / 2')).toBeVisible()
   await page.getByRole('button', { name: 'Close order details' }).click()
 
-  await page.getByRole('tab', { name: 'Exceptions (1)' }).click()
+  await page.getByRole('tab', { name: 'Exceptions (1 active)' }).click()
   await expect(page.getByRole('table', { name: 'Operations exceptions' })).toBeVisible()
   await page.getByRole('row', { name: /Inventory reservation is short/ }).click()
   await expect(page.getByRole('heading', { name: 'Inventory reservation is short' })).toBeVisible()
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
-  await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Exceptions (1 active)' })).toBeVisible()
 })
 
 test('shipped order independently confirms original and reprint paper output', async ({ page }) => {
@@ -2537,7 +4914,7 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
   await expect(page.getByText('Order PROOF-1042')).toBeVisible()
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
-  await page.getByRole('tab', { name: 'Exceptions (1)' }).click()
+  await page.getByRole('tab', { name: 'Exceptions (1 active)' }).click()
   await page.getByRole('button', { name: /Inventory reservation is short/ }).click()
   await expect(page.getByRole('heading', { name: 'Inventory reservation is short' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Acknowledge' })).toBeVisible()

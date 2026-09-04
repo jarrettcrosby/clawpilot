@@ -1593,7 +1593,10 @@ includes(intakeWorkflowSource, [
   'retained order',
   'retained provider',
   'Order candidates (',
-  'Exceptions (',
+  'Needs action (',
+  'Observed history',
+  'No import records need action',
+  'commerceIntakeCandidateIsHistoricalOutcome',
   'Scanned rows are provider order rows checked, not ClawPilot',
   'filters ineligible rows and',
   'deduplicates already-known orders',
@@ -2024,6 +2027,8 @@ const shopifyWorker = loadTypeScriptModule(
               providerWrites: 0,
               syncCursorAdvanced: false,
               ordersStaged: 4,
+              ordersPreserved: 2,
+              ordersSkippedCanonical: 1,
               recordsRejected: 0,
               automaticCustomerResolution: {
                 matched: 1,
@@ -2056,7 +2061,7 @@ const shopifyWorker = loadTypeScriptModule(
               pagination: {
                 batchNumber: 1,
                 runGlobalId: 'gcir0000200',
-                providerRowsSeen: 4,
+                providerRowsSeen: 7,
                 hasNextBatch: false,
               },
             },
@@ -2083,7 +2088,7 @@ const shopifyWorker = loadTypeScriptModule(
           return {
             leaseLost: false,
             startedAt: '2026-08-01T12:00:01.000Z',
-            recordsSeen: 4,
+            recordsSeen: 7,
             recordsHeld: 4,
             continuationBatchNumber: 1,
             providerCursorRepeated: false,
@@ -2106,6 +2111,10 @@ const shopifyWorker = loadTypeScriptModule(
 const shopifySummary = await shopifyWorker
   .processCommerceOrderReconciliation({ limit: 1 })
 assert.equal(shopifySummary.canonicalOrderWrites, 1)
+assert.equal(shopifySummary.providerRecordsSeen, 7)
+assert.equal(shopifySummary.staged, 4)
+assert.equal(shopifySummary.preserved, 2)
+assert.equal(shopifySummary.skippedCanonical, 1)
 assert.deepEqual(
   JSON.parse(JSON.stringify(
     shopifySummary.automaticShopifyOrderPromotion,

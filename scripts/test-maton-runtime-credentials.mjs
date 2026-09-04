@@ -92,7 +92,8 @@ for (const fragment of [
 assert.ok(!matonSource.includes('console.'))
 
 const mailSource = read('app_src/lib/matonMail.ts')
-assert.ok(!mailSource.includes('MATON_GMAIL_CONNECTION_ID'))
+assert.ok(mailSource.includes('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID'))
+assert.ok(!mailSource.includes('CLAWPILOT_AUTH_MAIL_FROM must differ from CLAWPILOT_MAIL_FROM'))
 assert.ok(!mailSource.includes("'Maton-Connection'"))
 assert.ok(mailSource.includes('mailFromAddress'))
 assert.ok(mailSource.includes('matonPlatformMailFetch'))
@@ -105,6 +106,8 @@ const originalEnv = {
   MATON_API_KEY_FILE: process.env.MATON_API_KEY_FILE,
   MATON_BASE_URL: process.env.MATON_BASE_URL,
   MATON_GMAIL_CONNECTION_ID: process.env.MATON_GMAIL_CONNECTION_ID,
+  MATON_AUTH_GMAIL_CONNECTION_ID: process.env.MATON_AUTH_GMAIL_CONNECTION_ID,
+  CLAWPILOT_AUTH_MAIL_FROM: process.env.CLAWPILOT_AUTH_MAIL_FROM,
 }
 
 try {
@@ -229,6 +232,8 @@ try {
   process.env.MATON_BASE_URL = 'https://gateway.maton.ai'
   process.env.MATON_API_KEY = 'legacy-platform-key'
   process.env.MATON_GMAIL_CONNECTION_ID = 'legacy-gmail-connection'
+  delete process.env.MATON_AUTH_GMAIL_CONNECTION_ID
+  delete process.env.CLAWPILOT_AUTH_MAIL_FROM
   delete process.env.MATON_API_KEY_FILE
 
   assert.equal(matonModule.inferMatonGatewayApp('/google-calendar/calendar/v3/calendars/primary/events'), 'google-calendar')
@@ -263,6 +268,43 @@ try {
   await matonModule.matonPlatformMailFetch('/google-mail/gmail/v1/users/me/messages/send', { method: 'POST' })
   assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
   assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), 'legacy-gmail-connection')
+
+  await matonModule.matonAuthMailFetch('/google-mail/gmail/v1/users/me/messages/send', { method: 'POST' })
+  assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
+  assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), 'legacy-gmail-connection')
+
+  const callsBeforeConnectionOnly = fetchCalls.length
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'dedicated-auth-gmail-connection'
+  await assert.rejects(
+    matonModule.matonAuthMailFetch('/google-mail/gmail/v1/users/me/messages/send'),
+    /MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together/,
+  )
+  assert.equal(fetchCalls.length, callsBeforeConnectionOnly)
+
+  delete process.env.MATON_AUTH_GMAIL_CONNECTION_ID
+  process.env.CLAWPILOT_AUTH_MAIL_FROM = 'jarrettcrosby@gmail.com'
+  const callsBeforeSenderOnly = fetchCalls.length
+  await assert.rejects(
+    matonModule.matonAuthMailFetch('/google-mail/gmail/v1/users/me/messages/send'),
+    /MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together/,
+  )
+  assert.equal(fetchCalls.length, callsBeforeSenderOnly)
+
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'legacy-gmail-connection'
+  await assert.rejects(
+    matonModule.matonAuthMailFetch('/google-mail/gmail/v1/users/me/messages/send'),
+    /MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID/,
+  )
+  assert.equal(fetchCalls.length, callsBeforeSenderOnly)
+
+  process.env.MATON_AUTH_GMAIL_CONNECTION_ID = 'dedicated-auth-gmail-connection'
+  await matonModule.matonAuthMailFetch('/google-mail/gmail/v1/users/me/messages/send', { method: 'POST' })
+  assert.equal(fetchCalls.at(-1).init.headers.get('Authorization'), 'Bearer legacy-platform-key')
+  assert.equal(fetchCalls.at(-1).init.headers.get('Maton-Connection'), 'dedicated-auth-gmail-connection')
+  await assert.rejects(
+    matonModule.matonAuthMailFetch('/google-calendar/calendar/v3/calendars/primary/events'),
+    /Authentication mail requests must use the Google Mail gateway/,
+  )
 
   platformCredential = null
   await matonModule.matonFetch('/google-sheets/v4/spreadsheets/sheet-2')

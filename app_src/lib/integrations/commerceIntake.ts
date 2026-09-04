@@ -120,6 +120,7 @@ const SHOPIFY_ORDER_PAGE_SIZE = 25
 const SHOPIFY_PRODUCT_VARIANT_PAGE_SIZE = 50
 const SHOPIFY_PRODUCT_IMAGE_PAGE_SIZE = 50
 const SHOPIFY_ORDER_LINE_PAGE_SIZE = 250
+const SHOPIFY_ORDER_FULFILLMENT_PAGE_SIZE = 20
 const SHOPIFY_MAX_ORDER_LINE_PAGES = 2
 const SHOPIFY_MAX_NESTED_LINE_REQUESTS = 2
 const SHOPIFY_MAX_BATCH_ORDER_LINES = 1_000
@@ -132,6 +133,26 @@ const FAIRE_MAX_PRODUCT_VARIANTS = 500
 const FAIRE_MAX_BATCH_PRODUCT_VARIANTS = 1_000
 const FAIRE_INVENTORY_SELECTOR_LIMIT = 50
 const FAIRE_MAX_INVENTORY_REQUESTS = 20
+const SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES = [
+  'read_merchant_managed_fulfillment_orders',
+  'read_third_party_fulfillment_orders',
+  'read_assigned_fulfillment_orders',
+  'read_marketplace_fulfillment_orders',
+] as const
+
+function effectiveShopifyFulfillmentOrderReadScopes(
+  grantedScopes: readonly string[],
+  probedScopes: readonly string[],
+) {
+  // Shopify accepts any fulfillment-order read partition here and filters the
+  // returned connection to the partitions the app can access. Requiring every
+  // partition would suppress merchant-managed delivery windows for otherwise
+  // valid order-management connections such as AG Alchemy.
+  return SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES.filter((scope) => (
+    hasEffectiveShopifyScope(grantedScopes, scope)
+    && hasEffectiveShopifyScope(probedScopes, scope)
+  ))
+}
 
 const SHOPIFY_LINE_ITEM_FIELDS = `
   id
@@ -285,13 +306,35 @@ const SHOPIFY_ORDER_FIELDS = `
   }
 `
 
-function shopifyOrderFields(includeCustomerIdentity: boolean) {
+function shopifyOrderFields(
+  includeCustomerIdentity: boolean,
+  includeFulfillmentDeliveryPromise: boolean,
+) {
   return `${SHOPIFY_ORDER_FIELDS}${
+    includeFulfillmentDeliveryPromise ? `
+  fulfillmentOrders(first: ${SHOPIFY_ORDER_FULFILLMENT_PAGE_SIZE}, displayable: true) {
+    nodes {
+      id
+      status
+      deliveryMethod {
+        minDeliveryDateTime
+        maxDeliveryDateTime
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+` : ''}${
     includeCustomerIdentity ? SHOPIFY_CUSTOMER_IDENTITY_FIELDS : ''
   }`
 }
 
-function shopifyOrdersQuery(includeCustomerIdentity: boolean) {
+function shopifyOrdersQuery(
+  includeCustomerIdentity: boolean,
+  includeFulfillmentDeliveryPromise: boolean,
+) {
   return `query ClawPilotCommerceOrders(
   $after: String
   $query: String!
@@ -304,7 +347,10 @@ function shopifyOrdersQuery(includeCustomerIdentity: boolean) {
     reverse: true
   ) {
     nodes {
-      ${shopifyOrderFields(includeCustomerIdentity)}
+      ${shopifyOrderFields(
+        includeCustomerIdentity,
+        includeFulfillmentDeliveryPromise,
+      )}
     }
     pageInfo {
       hasNextPage
@@ -314,10 +360,16 @@ function shopifyOrdersQuery(includeCustomerIdentity: boolean) {
 }`
 }
 
-function shopifyOrderQuery(includeCustomerIdentity: boolean) {
+function shopifyOrderQuery(
+  includeCustomerIdentity: boolean,
+  includeFulfillmentDeliveryPromise: boolean,
+) {
   return `query ClawPilotCommerceOrder($id: ID!) {
   order(id: $id) {
-    ${shopifyOrderFields(includeCustomerIdentity)}
+    ${shopifyOrderFields(
+      includeCustomerIdentity,
+      includeFulfillmentDeliveryPromise,
+    )}
   }
 }`
 }
@@ -959,26 +1011,19 @@ type OperationalPageResult = {
   }
 }
 
-function operationalOrders(envelope: CommerceNormalizationEnvelope) {
-  return envelope.orders.filter((order) => (
-    order.canonicalStates.lifecycle !== 'cancelled'
-    && order.canonicalStates.lifecycle !== 'closed'
-    && order.canonicalStates.fulfillment !== 'fulfilled'
-  ))
-}
-
 function envelopeWith(
   envelope: CommerceNormalizationEnvelope,
   input: {
     rejections?: readonly CommerceNormalizationRejection[]
-    operationalOnly?: boolean
   },
 ): CommerceNormalizationEnvelope {
   return Object.freeze({
     ...envelope,
-    orders: Object.freeze(
-      input.operationalOnly ? operationalOrders(envelope) : envelope.orders,
-    ),
+    // Terminal provider rows remain durable intake evidence. They are shown in
+    // the Orders pane and can update an older candidate's provider state, but
+    // the automatic-promotion gates below still reject them as having no
+    // fulfillment demand.
+    orders: Object.freeze(envelope.orders),
     rejections: Object.freeze([
       ...envelope.rejections,
       ...(input.rejections || []),
@@ -1412,9 +1457,23 @@ async function shopifyEnvelope(
     probe.grantedScopes,
     'read_customers',
   )
+  const effectiveFulfillmentOrderScopes =
+    effectiveShopifyFulfillmentOrderReadScopes(
+      grant.grantedScopes,
+      probe.grantedScopes,
+    )
+  const includeFulfillmentDeliveryPromise =
+    effectiveFulfillmentOrderScopes.length > 0
+  const fulfillmentOrderReadCoverage = Object.freeze({
+    effectiveScopes: Object.freeze([...effectiveFulfillmentOrderScopes]),
+    complete: effectiveFulfillmentOrderScopes.length
+      === SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES.length,
+  })
   // `read_orders` grants Shopify's current-order window. Keep unattended
-  // reads explicitly inside that window; historical backfill is separate and
-  // may require `read_all_orders` when introduced as its own workflow.
+  // reads explicitly inside that window, but include every lifecycle state so
+  // the Orders pane can reconcile orders closed, cancelled, or fulfilled in
+  // Shopify. Historical backfill outside this window remains separate and may
+  // require `read_all_orders`.
   const currentOrderWindow = page.windowStart
     ? ` updated_at:>='${page.windowStart}'`
     : ''
@@ -1422,7 +1481,10 @@ async function shopifyEnvelope(
     ? await shopifyAdminGraphql<Record<string, unknown>>(
         providerCredential,
         {
-          query: shopifyOrderQuery(includeCustomerIdentity),
+          query: shopifyOrderQuery(
+            includeCustomerIdentity,
+            includeFulfillmentDeliveryPromise,
+          ),
           operationName: 'ClawPilotCommerceOrder',
           variables: { id: targetExternalOrderId },
         },
@@ -1431,11 +1493,14 @@ async function shopifyEnvelope(
     : await shopifyAdminGraphql<Record<string, unknown>>(
         providerCredential,
         {
-          query: shopifyOrdersQuery(includeCustomerIdentity),
+          query: shopifyOrdersQuery(
+            includeCustomerIdentity,
+            includeFulfillmentDeliveryPromise,
+          ),
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `${testOrderSearchConstraint}status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
+            query: `${testOrderSearchConstraint}status:any${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1480,7 +1545,14 @@ async function shopifyEnvelope(
       order,
       budget: lineBudget,
     })
-    if (result.order) orders.push(result.order)
+    if (result.order) {
+      orders.push({
+        ...result.order,
+        // Local read-coverage evidence. It is intentionally included in the
+        // normalized source hash so a scope change creates a new revision.
+        clawPilotFulfillmentOrderReadCoverage: fulfillmentOrderReadCoverage,
+      })
+    }
     if (result.rejection) rejections.push(result.rejection)
   }
   const normalized = envelopeWith(normalizeShopifyCommerce({
@@ -1490,7 +1562,6 @@ async function shopifyEnvelope(
     },
     shopDomain,
   }, normalizationContext(runtime)), {
-    operationalOnly: !targetExternalOrderId,
     rejections,
   })
   return {
@@ -1715,7 +1786,6 @@ async function faireEnvelope(
     runtime,
     targetExternalOrderId ? 'current' : 'stale',
   )), {
-    operationalOnly: !targetExternalOrderId,
     rejections: bounded.rejections,
   })
   return {

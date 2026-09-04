@@ -26,6 +26,15 @@ function persistenceFor(pool) {
   const orderShipTo = loadTypeScriptModule(
     'app_src/lib/operations/orderShipTo.ts',
   )
+  const orderListQuery = loadTypeScriptModule(
+    'app_src/lib/operations/orderListQuery.ts',
+  )
+  const providerOrderMoney = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderMoney.ts',
+  )
+  const providerOrderHistory = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderHistory.ts',
+  )
   class RevisionGateError extends Error {}
   class NamedBoundaryError extends Error {}
   const noOp = async () => undefined
@@ -89,7 +98,10 @@ function persistenceFor(pool) {
     },
     '@/lib/operations/adapters': {},
     '@/lib/operations/domain': domain,
+    '@/lib/operations/orderListQuery': orderListQuery,
     '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/operations/providerOrderMoney': providerOrderMoney,
+    '@/lib/operations/providerOrderHistory': providerOrderHistory,
     '@/lib/operations/packingSlip': {
       PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION: 'test-pack-work-v1',
       PACKING_SLIP_TEMPLATE_VERSION: 'test-packing-slip-v1',
@@ -107,7 +119,26 @@ function persistenceFor(pool) {
     '@/lib/persistence/crm': {},
     '@/lib/persistence/cartonizationRateEvidence': {},
     '@/lib/persistence/commerceOrderWorkbench': {
-      readCommerceOrderWorkbenchFromPostgres: async () => [],
+      readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+        orders: [],
+        page: {
+          total: 0,
+          returned: 0,
+          pageSize: 250,
+          nextCursor: null,
+          complete: true,
+          truncated: false,
+        },
+      }),
+    },
+    '@/lib/persistence/commerceOrderSync': {
+      readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres:
+        async () => ({
+          items: [],
+          truncated: false,
+          limit: 500,
+          providerWrites: 0,
+        }),
     },
     '@/lib/persistence/commerceProviderWrites': {
       CommerceProviderWriteControlError: class extends Error {},

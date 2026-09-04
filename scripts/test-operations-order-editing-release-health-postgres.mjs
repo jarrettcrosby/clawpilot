@@ -16,6 +16,10 @@ import {
   OPERATIONS_COMMERCE_ORDER_WORKBENCH_FINGERPRINT_SQL,
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
   OPERATIONS_ORDER_SHIPMENT_ADDRESS_FINGERPRINT_SQL,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL,
   OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_FINGERPRINT_SQL,
 } from '../app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts'
 
@@ -28,6 +32,13 @@ const root = process.cwd()
 async function health(client) {
   const result = await client.query(
     `SELECT (${OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL}) AS ready`,
+  )
+  return result.rows[0]?.ready === true
+}
+
+async function exactHistoryHealth(client) {
+  const result = await client.query(
+    `SELECT (${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}) AS ready`,
   )
   return result.rows[0]?.ready === true
 }
@@ -245,6 +256,142 @@ async function verifyNegativeCases(client) {
   })
 }
 
+async function verifyExactHistoryNegativeCases(client) {
+  for (const mutation of [
+    {
+      name: 'weakened returned-quantity constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          DROP CONSTRAINT commerce_order_observation_line_returned_quantity_valid;
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          ADD CONSTRAINT commerce_order_observation_line_returned_quantity_valid
+          CHECK (true)
+      `,
+    },
+    {
+      name: 'weakened provider-line money constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          DROP CONSTRAINT commerce_order_observation_line_money_valid;
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          ADD CONSTRAINT commerce_order_observation_line_money_valid
+          CHECK (true)
+      `,
+    },
+    {
+      name: 'weakened provider-line snapshot constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          DROP CONSTRAINT commerce_order_observation_line_snapshots_valid;
+        ALTER TABLE public.operations_commerce_order_observation_lines
+          ADD CONSTRAINT commerce_order_observation_line_snapshots_valid
+          CHECK (true)
+      `,
+    },
+    {
+      name: 'weakened tracking-URL constraint',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_event_observations
+          DROP CONSTRAINT commerce_order_event_tracking_url_valid;
+        ALTER TABLE public.operations_commerce_order_event_observations
+          ADD CONSTRAINT commerce_order_event_tracking_url_valid CHECK (true)
+      `,
+    },
+    {
+      name: 'unfiltered manual-read index',
+      sql: `
+        DROP INDEX public.idx_commerce_order_observation_manual_read;
+        CREATE INDEX idx_commerce_order_observation_manual_read
+          ON public.operations_commerce_order_observations (
+            organization_id,
+            integration_account_id,
+            manual_provider_read_lease_id
+          )
+      `,
+    },
+    {
+      name: 'disabled tracking-URL guard trigger',
+      sql: `
+        ALTER TABLE public.operations_commerce_order_event_observations
+          DISABLE TRIGGER commerce_order_event_tracking_url_guard
+      `,
+    },
+    {
+      name: 'weakened tracking-URL guard function',
+      sql: `
+        CREATE OR REPLACE FUNCTION
+          public.protect_commerce_order_event_tracking_url()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog, public, pg_temp
+        AS $function$
+        BEGIN
+          RETURN NEW;
+        END;
+        $function$
+      `,
+    },
+  ]) {
+    await inRollback(client, async () => {
+      await client.query(mutation.sql)
+      assert.equal(
+        await exactHistoryHealth(client),
+        false,
+        `${mutation.name} must fail exact-history health`,
+      )
+    })
+  }
+
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0340_operations_order_workbench_exact_history.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await exactHistoryHealth(client),
+      false,
+      'Wrong 0340 checksum must fail exact-history health',
+    )
+  })
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0341_operations_faire_order_workbench_exact_history.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await exactHistoryHealth(client),
+      false,
+      'Wrong 0341 checksum must fail exact-history health',
+    )
+  })
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0342_operations_order_history_line_fidelity.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await exactHistoryHealth(client),
+      false,
+      'Wrong 0342 checksum must fail exact-history health',
+    )
+  })
+}
+
 async function main() {
   command('docker', ['info'], { timeout: 30_000 })
   const container = (
@@ -284,8 +431,22 @@ async function main() {
         false,
         'The frozen pre-0307 phase must not satisfy current release health',
       )
+      let exactHistoryInstalled = false
       for (const file of files.slice(workbenchIndex)) {
         await applyMigration(client, file)
+        exactHistoryInstalled ||= (
+          file ===
+            '0348_operations_commerce_native_activity_evidence.sql'
+        )
+        if (!process.argv.includes('--print-fingerprints')) {
+          assert.equal(
+            await exactHistoryHealth(client),
+            exactHistoryInstalled,
+            exactHistoryInstalled
+              ? `${file} must preserve exact-history health after 0348`
+              : `${file} must not prematurely satisfy exact-history health`,
+          )
+        }
         if (
           file === '0307_operations_commerce_order_workbench.sql'
           || file === '0308_operations_commerce_provider_write_controls.sql'
@@ -345,6 +506,10 @@ async function main() {
           client,
           OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_FINGERPRINT_SQL,
         ),
+        orderWorkbenchExactHistory: await fingerprint(
+          client,
+          OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL,
+        ),
       }
       if (process.argv.includes('--print-fingerprints')) {
         console.log(JSON.stringify(fingerprints, null, 2))
@@ -355,7 +520,22 @@ async function main() {
         true,
         'Fresh current migrations must pass order-editing release health',
       )
+      assert.deepEqual(
+        fingerprints.orderWorkbenchExactHistory,
+        {
+          artifact_count:
+            OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT,
+          artifact_hash: OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH,
+        },
+        'Fresh 0342 artifacts must match the reviewed exact fingerprint',
+      )
+      assert.equal(
+        await exactHistoryHealth(client),
+        true,
+        'Fresh current migrations must pass exact-history health',
+      )
       await verifyNegativeCases(client)
+      await verifyExactHistoryNegativeCases(client)
     } finally {
       client.release()
       await pool.end()

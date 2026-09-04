@@ -1,18 +1,24 @@
 import crypto from 'node:crypto'
+import type { PoolClient } from 'pg'
+import { resolveRecordedCrmMeetingCalendarCommunication } from '@/lib/crm/integrationActions'
 import type { CrmMeeting } from '@/lib/crm/types'
 import { globalIdFragment, globalIdPattern } from '@/lib/globalIds.mjs'
 import { matonFetch } from '@/lib/maton'
 import {
-  stageCrmRecordInPostgres,
+  stageCrmRecordWithClient,
   type StageMeetingInput,
 } from '@/lib/persistence/crm'
-import { query } from '@/lib/persistence/postgres'
+import { query, withTransaction } from '@/lib/persistence/postgres'
 import { zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 const CALENDAR_APP = 'google-calendar'
 const CALENDAR_EVENTS_PATH = '/google-calendar/calendar/v3/calendars/primary/events'
 const CALENDAR_PAGE_SIZE = 250
 const MAX_PAGES_PER_CALENDAR = 10
+const MAX_RECORDED_MEETINGS_PER_CALENDAR = 50
+// Same active-row semantics as persistence/crm.ts activeCrmRecordSql.
+const ACTIVE_MEETING_SQL = "COALESCE(lower(meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')"
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000
 const POLL_OVERLAP_MS = 5 * 60 * 1000
 const MAX_SUBJECT_CHARS = 300
@@ -49,6 +55,9 @@ type PollCursor = {
   pageToken?: string
 }
 
+type RecordedPollCursor = { afterMeetingId: string }
+type RecordedCommunication = Awaited<ReturnType<typeof resolveRecordedCrmMeetingCalendarCommunication>>
+
 type MeetingRow = {
   id: string
   pipeline_id: string
@@ -57,6 +66,7 @@ type MeetingRow = {
   lead_id: string | null
   opportunity_id: string | null
   source_key: string
+  source_hash: string
   reference_code: string
   subject: string
   description: string | null
@@ -80,6 +90,7 @@ type MeetingRow = {
 type ReconciliationResult = {
   matched: boolean
   staged: boolean
+  deferred?: boolean
 }
 
 export type CalendarIngestionCounts = {
@@ -93,6 +104,10 @@ export type CalendarIngestionCounts = {
   unchangedMeetings: number
   unmatchedEvents: number
   errors: number
+  recordedCalendars: number
+  recordedMeetingsPolled: number
+  pendingRecordedCalendars: number
+  deferredMeetings: number
 }
 
 class SafeCalendarIngestionError extends Error {
@@ -181,7 +196,7 @@ async function readCursor(ownerEmail: string, key: string): Promise<CursorRow | 
 async function writeCursor(input: {
   ownerEmail: string
   key: string
-  state: PollCursor | null
+  state: PollCursor | RecordedPollCursor | null
   lastPolledAt: string
   error: string | null
 }): Promise<void> {
@@ -216,6 +231,13 @@ async function selectedCalendars(): Promise<SelectedCalendar[]> {
        AND connection.status = 'ACTIVE'
        AND connection.source = 'maton'
        AND connection.is_selected
+       AND EXISTS (
+         SELECT 1 FROM crm_meetings meeting
+         JOIN pipeline_spaces pipeline ON pipeline.id = meeting.pipeline_id
+         WHERE lower(COALESCE(NULLIF(meeting.source_payload->>'calendarOwnerEmail', ''), pipeline.owner_email)) = app_user.email
+           AND ${ACTIVE_MEETING_SQL}
+           AND ${LEGACY_MEETING_SELECTION}
+       )
      ORDER BY app_user.email ASC`,
     [CALENDAR_APP],
   )
@@ -311,13 +333,7 @@ function calendarMeetingReference(event: JsonObject): string | null {
   return MEETING_REFERENCE_PATTERN.test(value) ? value : null
 }
 
-async function ownedMeetingForEvent(input: {
-  ownerEmail: string
-  eventId: string
-  referenceCode: string | null
-}): Promise<MeetingRow | null> {
-  const result = await query<MeetingRow>(
-    `SELECT
+const MEETING_SELECT = `SELECT
        meeting.id::text,
        meeting.pipeline_id::text,
        meeting.organization_id::text,
@@ -325,6 +341,7 @@ async function ownedMeetingForEvent(input: {
        meeting.lead_id::text,
        meeting.opportunity_id::text,
        meeting.source_key,
+       meeting.source_hash,
        meeting.reference_code,
        meeting.subject,
        meeting.description,
@@ -352,11 +369,32 @@ async function ownedMeetingForEvent(input: {
      LEFT JOIN crm_leads lead
        ON lead.pipeline_id = meeting.pipeline_id AND lead.id = meeting.lead_id
      LEFT JOIN crm_opportunities opportunity
-       ON opportunity.pipeline_id = meeting.pipeline_id AND opportunity.id = meeting.opportunity_id
+       ON opportunity.pipeline_id = meeting.pipeline_id AND opportunity.id = meeting.opportunity_id`
+
+// Owner-only metadata predates calendar selection. Partial/new selection metadata
+// must never fall back to whichever calendar happens to be selected today.
+const LEGACY_MEETING_SELECTION = `NOT (COALESCE(meeting.source_payload, '{}'::jsonb)
+  ?| ARRAY['calendarConnectionId', 'calendarId', 'calendarOrganizerEmail', 'communicationOrganizationId'])`
+
+function hasRecordedSelection(meeting: MeetingRow): boolean {
+  const source = asRecord(meeting.source_payload) || {}
+  return ['calendarConnectionId', 'calendarId', 'calendarOrganizerEmail', 'communicationOrganizationId']
+    .some((key) => Object.prototype.hasOwnProperty.call(source, key))
+}
+
+async function ownedMeetingForEvent(input: {
+  ownerEmail: string
+  eventId: string
+  referenceCode: string | null
+}): Promise<MeetingRow | null> {
+  const result = await query<MeetingRow>(
+    `${MEETING_SELECT}
      WHERE lower(COALESCE(
          NULLIF(meeting.source_payload->>'calendarOwnerEmail', ''),
          pipeline.owner_email
        )) = $1
+       AND ${ACTIVE_MEETING_SQL}
+       AND ${LEGACY_MEETING_SELECTION}
        AND (
          meeting.external_event_id = $2
          OR ($3::text IS NOT NULL AND meeting.reference_code = $3)
@@ -380,6 +418,143 @@ async function ownedMeetingForEvent(input: {
     throw new SafeCalendarIngestionError('Google Calendar event identifiers resolved inconsistently')
   }
   return externalMatches[0] || referenceMatches[0] || null
+}
+
+async function lockedMeeting(client: PoolClient, meeting: MeetingRow): Promise<MeetingRow | null> {
+  const result = await client.query<MeetingRow>(
+    `${MEETING_SELECT}
+     WHERE meeting.id = $1::uuid AND meeting.pipeline_id = $2::uuid
+       AND ${ACTIVE_MEETING_SQL}
+     FOR UPDATE OF meeting`,
+    [meeting.id, meeting.pipeline_id],
+  )
+  const current = result.rows[0]
+  return current && isActiveMeeting(current) ? current : null
+}
+
+function isActiveMeeting(meeting: MeetingRow): boolean {
+  return !['true', '1', 'yes'].includes(String(asRecord(meeting.source_payload)?.archived ?? 'false').toLowerCase())
+}
+
+function sameRecordedIdentity(previous: MeetingRow, current: MeetingRow): boolean {
+  const before = asRecord(previous.source_payload) || {}
+  const after = asRecord(current.source_payload) || {}
+  return previous.id === current.id
+    && previous.pipeline_id === current.pipeline_id
+    && previous.source_key === current.source_key
+    && previous.source_hash === current.source_hash
+    && previous.reference_code === current.reference_code
+    && previous.external_event_id === current.external_event_id
+    && ['calendarOwnerEmail', 'calendarConnectionId', 'calendarId', 'calendarOrganizerEmail',
+      'communicationOrganizationId', 'actionId'].every((key) => before[key] === after[key])
+}
+
+function assertEventIdentity(event: JsonObject, meeting: MeetingRow): void {
+  const marker = asRecord(asRecord(event.extendedProperties)?.private)?.clawpilotMeetingReference
+  if (marker !== undefined && marker !== null && marker !== '') {
+    if (calendarMeetingReference(event) !== meeting.reference_code.toLowerCase()) {
+      throw new SafeCalendarIngestionError('Google Calendar event meeting reference does not match')
+    }
+  }
+  if (meeting.external_event_id && calendarEventId(event) !== meeting.external_event_id) {
+    throw new SafeCalendarIngestionError('Google Calendar event identifier does not match')
+  }
+}
+
+function recordedAuthority(meeting: MeetingRow): Promise<RecordedCommunication> {
+  return resolveRecordedCrmMeetingCalendarCommunication({
+    pipelineId: meeting.pipeline_id,
+    meetingId: meeting.id,
+    referenceCode: meeting.reference_code,
+    externalEventId: meeting.external_event_id,
+    sourcePayload: meeting.source_payload,
+  })
+}
+
+async function hasUnresolvedCalendarAction(
+  meeting: MeetingRow,
+  client?: PoolClient,
+): Promise<boolean> {
+  const source = asRecord(meeting.source_payload) || {}
+  const identity = ['calendarOwnerEmail', 'calendarConnectionId', 'calendarId', 'calendarOrganizerEmail']
+    .map((key) => typeof source[key] === 'string' ? source[key].trim() : '')
+  if (identity.some((value) => !value) || !meeting.external_event_id) return false
+  // Failed/dead actions still represent unsent local intent. Do not silently
+  // discard it because a retry is delayed or needs operator review. Only an
+  // explicit terminal success/cancellation releases that action's hold.
+  const sql = `SELECT 1 FROM crm_integration_actions action
+    WHERE action.pipeline_id = $1::uuid
+      AND action.aggregate_type = 'crm_meeting' AND action.aggregate_id = $2
+      AND action.reference_code = $3
+      AND action.app = 'google-calendar' AND action.action_type = 'create_calendar_event'
+      AND action.status IN ('queued', 'processing', 'failed', 'dead')
+      AND (
+        (
+          action.payload #>> '{previousCalendar,credentialOwnerEmail}' = $4
+          AND action.payload #>> '{previousCalendar,connectionId}' = $5
+          AND action.payload #>> '{previousCalendar,calendarId}' = $6
+          AND action.payload #>> '{previousCalendar,organizerEmail}' = $7
+          AND action.payload #>> '{previousCalendar,eventId}' = $8
+        ) OR (
+          action.communication_credential_owner_email = $4
+          AND action.communication_connection_id = $5
+          AND action.communication_calendar_id = $6
+          AND action.communication_identity_email = $7
+          AND (action.external_id = $8 OR action.payload #>> '{previousCalendar,eventId}' = $8)
+        )
+      )
+    LIMIT 1`
+  const values = [meeting.pipeline_id, meeting.id, meeting.reference_code,
+    identity[0].toLowerCase(), identity[1], identity[2], identity[3].toLowerCase(), meeting.external_event_id]
+  // No action-row locks: enqueue owns the meeting lock first, while dispatch
+  // may hold an action row before it materializes the meeting.
+  const result = client ? await client.query(sql, values) : await query(sql, values)
+  return result.rows.length > 0
+}
+
+async function recordedCalendars(): Promise<SelectedCalendar[]> {
+  const result = await query<SelectedCalendar>(
+    `SELECT DISTINCT connection.owner_email, connection.connection_id
+     FROM crm_meetings meeting
+     JOIN user_maton_connections connection
+       ON connection.owner_email = lower(meeting.source_payload->>'calendarOwnerEmail')
+      AND connection.connection_id = meeting.source_payload->>'calendarConnectionId'
+     JOIN app_users app_user ON app_user.email = connection.owner_email
+     WHERE connection.app = $1 AND connection.status = 'ACTIVE' AND connection.source = 'maton'
+       AND ${ACTIVE_MEETING_SQL}
+       AND app_user.status = 'active'
+       AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
+       AND NULLIF(meeting.external_event_id, '') IS NOT NULL
+     ORDER BY connection.owner_email, connection.connection_id`,
+    [CALENDAR_APP],
+  )
+  return result.rows
+}
+
+function parseRecordedCursor(value: string | null): string | null {
+  if (!value) return null
+  try {
+    const id = asRecord(JSON.parse(value))?.afterMeetingId
+    return typeof id === 'string' && UUID_PATTERN.test(id) ? id : null
+  } catch {
+    return null
+  }
+}
+
+async function recordedMeetingPage(calendar: SelectedCalendar, afterMeetingId: string | null): Promise<MeetingRow[]> {
+  const result = await query<MeetingRow>(
+    `${MEETING_SELECT}
+     WHERE lower(meeting.source_payload->>'calendarOwnerEmail') = $1
+       AND ${ACTIVE_MEETING_SQL}
+       AND meeting.source_payload->>'calendarConnectionId' = $2
+       AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
+       AND NULLIF(meeting.external_event_id, '') IS NOT NULL
+       AND ($3::uuid IS NULL OR meeting.id > $3::uuid)
+     ORDER BY meeting.id ASC
+     LIMIT $4`,
+    [calendar.owner_email, calendar.connection_id, afterMeetingId, MAX_RECORDED_MEETINGS_PER_CALENDAR + 1],
+  )
+  return result.rows
 }
 
 function normalizedTimezone(value: unknown, fallback: string): string {
@@ -563,32 +738,28 @@ function suiteCrmRelationships(meeting: MeetingRow): Pick<
   }
 }
 
-async function reconcileEvent(input: {
-  ownerEmail: string
-  event: JsonObject
-  eventStatus: CalendarEventStatus
-}): Promise<ReconciliationResult> {
-  const eventId = calendarEventId(input.event)
-  const meeting = await ownedMeetingForEvent({
-    ownerEmail: input.ownerEmail,
-    eventId,
-    referenceCode: calendarMeetingReference(input.event),
-  })
-  if (!meeting) return { matched: false, staged: false }
-
-  const fields = eventMeetingFields(input.event, eventId, input.eventStatus, meeting)
+async function stageReconciledMeeting(
+  client: PoolClient,
+  meeting: MeetingRow,
+  event: JsonObject,
+  eventStatus: CalendarEventStatus,
+  actorEmail: string,
+  ownerEmail: string,
+): Promise<ReconciliationResult> {
+  assertEventIdentity(event, meeting)
+  const fields = eventMeetingFields(event, calendarEventId(event), eventStatus, meeting)
   if (!meetingHasMeaningfulChanges(meeting, fields)) return { matched: true, staged: false }
 
-  await stageCrmRecordInPostgres({
+  await stageCrmRecordWithClient(client, {
     entity: 'meetings',
     pipelineId: meeting.pipeline_id,
     localId: meeting.id,
     sourceKey: meeting.source_key,
     sourcePayload: {
       ...(asRecord(meeting.source_payload) || {}),
-      calendarOwnerEmail: input.ownerEmail,
+      calendarOwnerEmail: ownerEmail,
     },
-    actorEmail: input.ownerEmail,
+    actorEmail,
     fields: {
       organizationId: meeting.organization_id,
       contactId: meeting.contact_id,
@@ -599,6 +770,66 @@ async function reconcileEvent(input: {
     },
   })
   return { matched: true, staged: true }
+}
+
+async function reconcileEvent(input: {
+  calendar: SelectedCalendar
+  event: JsonObject
+  eventStatus: CalendarEventStatus
+}): Promise<ReconciliationResult> {
+  const meeting = await ownedMeetingForEvent({
+    ownerEmail: input.calendar.owner_email,
+    eventId: calendarEventId(input.event),
+    referenceCode: calendarMeetingReference(input.event),
+  })
+  if (!meeting || hasRecordedSelection(meeting)) return { matched: false, staged: false }
+  return withTransaction(async (client) => {
+    const current = await lockedMeeting(client, meeting)
+    if (!current || hasRecordedSelection(current) || !sameRecordedIdentity(meeting, current)) {
+      return { matched: false, staged: false }
+    }
+    // Legacy rows have no reviewed action snapshot. Keep their existing primary
+    // scope, but do not reconcile after access or the selected connection changes.
+    const access = await client.query(
+      `SELECT 1 FROM crm_meetings meeting
+       JOIN pipeline_spaces pipeline ON pipeline.id = meeting.pipeline_id
+       JOIN app_users actor ON actor.email = $2 AND actor.status = 'active'
+       JOIN app_user_organization_memberships membership
+         ON membership.user_email = actor.email
+        AND membership.organization_id = pipeline.workspace_organization_id AND membership.status = 'active'
+       JOIN user_maton_connections connection ON connection.owner_email = actor.email
+         AND connection.connection_id = $3 AND connection.app = $4
+         AND connection.status = 'ACTIVE' AND connection.source = 'maton' AND connection.is_selected
+       WHERE meeting.id = $1::uuid
+         AND pipeline.reference_access_disabled = false
+         AND lower(COALESCE(NULLIF(meeting.source_payload->>'calendarOwnerEmail', ''), pipeline.owner_email)) = $2
+         AND (pipeline.owner_email = $2 OR EXISTS (
+           SELECT 1 FROM pipeline_space_members member
+           WHERE member.pipeline_id = pipeline.id AND member.user_email = $2 AND member.access_role = 'editor'
+         ))`,
+      [current.id, input.calendar.owner_email, input.calendar.connection_id, CALENDAR_APP],
+    )
+    if (!access.rows.length) return { matched: false, staged: false }
+    return stageReconciledMeeting(client, current, input.event, input.eventStatus,
+      input.calendar.owner_email, input.calendar.owner_email)
+  })
+}
+
+async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): Promise<ReconciliationResult> {
+  assertEventIdentity(event, meeting)
+  const status = calendarEventStatus(event)
+  return withTransaction(async (client) => {
+    const current = await lockedMeeting(client, meeting)
+    if (!current || !sameRecordedIdentity(meeting, current)) return { matched: false, staged: false }
+    // Re-read authority after the row lock: an in-flight provider response must
+    // not overwrite a moved meeting or survive revoked organization access.
+    if (await hasUnresolvedCalendarAction(current, client)) {
+      return { matched: true, staged: false, deferred: true }
+    }
+    const authority = await recordedAuthority(current)
+    return stageReconciledMeeting(client, current, event, status,
+      authority.actorEmail, authority.communication.credentialOwnerEmail)
+  })
 }
 
 export function sanitizeCalendarIngestionError(error: unknown): string {
@@ -619,6 +850,10 @@ function newCounts(activeCalendars: number): CalendarIngestionCounts {
     unchangedMeetings: 0,
     unmatchedEvents: 0,
     errors: 0,
+    recordedCalendars: 0,
+    recordedMeetingsPolled: 0,
+    pendingRecordedCalendars: 0,
+    deferredMeetings: 0,
   }
 }
 
@@ -656,7 +891,7 @@ async function pollCalendar(
         const eventStatus = calendarEventStatus(event)
         if (eventStatus === 'cancelled') counts.cancelledEvents += 1
         const result = await reconcileEvent({
-          ownerEmail: calendar.owner_email,
+          calendar,
           event,
           eventStatus,
         })
@@ -704,9 +939,69 @@ async function pollCalendar(
   }
 }
 
+async function pollRecordedCalendar(calendar: SelectedCalendar, counts: CalendarIngestionCounts): Promise<void> {
+  const key = `recorded-${cursorKey(calendar.connection_id)}`
+  let afterMeetingId = parseRecordedCursor((await readCursor(calendar.owner_email, key))?.cursor_value || null)
+  let meetings = await recordedMeetingPage(calendar, afterMeetingId)
+  // A deleted tail must not prevent wrapping to earlier existing meetings.
+  if (!meetings.length && afterMeetingId) {
+    afterMeetingId = null
+    meetings = await recordedMeetingPage(calendar, null)
+  }
+  const hasMore = meetings.length > MAX_RECORDED_MEETINGS_PER_CALENDAR
+  let lastError: string | null = null
+  for (const meeting of meetings.slice(0, MAX_RECORDED_MEETINGS_PER_CALENDAR)) {
+    try {
+      // A pending move may already store the destination selection but still
+      // have the original event ID. Defer before requiring a delivered snapshot
+      // for that destination; no provider access or CRM writes occur on this path.
+      if (await hasUnresolvedCalendarAction(meeting)) {
+        counts.deferredMeetings += 1
+      } else {
+        const authority = await recordedAuthority(meeting)
+        const selection = authority.previousCalendar
+        // Exact event reads only. Never enumerate another personal calendar,
+        // infer an event ID from a subject, or turn a 404/410 into cancellation.
+        if (selection.credentialOwnerEmail !== calendar.owner_email || selection.connectionId !== calendar.connection_id) {
+          throw new SafeCalendarIngestionError('The recorded Google Calendar connection does not match')
+        }
+        const event = await calendarJson(calendar,
+          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(selection.calendarId)}/events/${encodeURIComponent(selection.eventId)}`)
+        counts.recordedMeetingsPolled += 1
+        const result = await reconcileRecordedEvent(meeting, event)
+        if (calendarEventStatus(event) === 'cancelled') counts.cancelledEvents += 1
+        if (result.deferred) counts.deferredMeetings += 1
+        else if (!result.matched) counts.unmatchedEvents += 1
+        else {
+          counts.meetingsMatched += 1
+          if (result.staged) counts.meetingsStaged += 1
+          else counts.unchangedMeetings += 1
+        }
+      }
+    } catch (error) {
+      counts.errors += 1
+      lastError = sanitizeCalendarIngestionError(error)
+    }
+    // Advance even on a denied/missing event, so one bad record cannot starve
+    // the rest. The next sweep retries it; only confirmed event data is staged.
+    afterMeetingId = meeting.id
+    await writeCursor({ ownerEmail: calendar.owner_email, key,
+      state: { afterMeetingId }, lastPolledAt: new Date().toISOString(), error: lastError })
+  }
+  await writeCursor({ ownerEmail: calendar.owner_email, key,
+    state: hasMore && afterMeetingId ? { afterMeetingId } : null,
+    lastPolledAt: new Date().toISOString(), error: lastError })
+  if (hasMore) counts.pendingRecordedCalendars += 1
+}
+
 export async function processCalendarIngestion(): Promise<CalendarIngestionCounts> {
   const calendars = await selectedCalendars()
-  const counts = newCounts(calendars.length)
+  const recorded = await recordedCalendars()
+  const activeConnections = new Set([...calendars, ...recorded]
+    .map((calendar) => JSON.stringify([calendar.owner_email, calendar.connection_id])))
+  const counts = newCounts(activeConnections.size)
   for (const calendar of calendars) await pollCalendar(calendar, counts)
+  counts.recordedCalendars = recorded.length
+  for (const calendar of recorded) await pollRecordedCalendar(calendar, counts)
   return counts
 }

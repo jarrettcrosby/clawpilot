@@ -857,9 +857,9 @@ function loadCommerceStagingService(pool, counters, options = {}) {
         commerceCatalogCredentialSupportsProducts: mustNotRun(
           'commerceCatalogCredentialSupportsProducts',
         ),
-        readCommerceCatalogSyncStateWithClient: mustNotRun(
-          'readCommerceCatalogSyncStateWithClient',
-        ),
+        readCommerceCatalogSyncStateWithClient: options.allowIntakeStateRead
+          ? async () => null
+          : mustNotRun('readCommerceCatalogSyncStateWithClient'),
       },
       '@/lib/persistence/productChannelStates': productChannelStates,
       '@/lib/persistence/shopifyCheckoutRating': options
@@ -1024,6 +1024,15 @@ function loadOperationalWarehouseServices(pool) {
   const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
     'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
   )
+  const orderListQuery = loadTypeScriptModule(
+    'app_src/lib/operations/orderListQuery.ts',
+  )
+  const providerOrderMoney = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderMoney.ts',
+  )
+  const providerOrderHistory = loadTypeScriptModule(
+    'app_src/lib/operations/providerOrderHistory.ts',
+  )
   const operations = loadTypeScriptModule(
     'app_src/lib/persistence/operations.ts',
     {
@@ -1104,10 +1113,36 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/domain': domain,
       '@/lib/operations/pickManagement': pickManagement,
       '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/operations/orderListQuery': orderListQuery,
       '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/operations/providerOrderMoney': providerOrderMoney,
+      '@/lib/operations/providerOrderHistory': providerOrderHistory,
+      '@/lib/persistence/commerceOrderSync': {
+        async readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres() {
+          return {
+            items: [],
+            truncated: false,
+            limit: 500,
+            providerWrites: 0,
+          }
+        },
+      },
       '@/lib/persistence/commerceOrderWorkbench': {
         async readCommerceOrderWorkbenchFromPostgres() {
           return []
+        },
+        async readCommerceOrderWorkbenchPageFromPostgres() {
+          return {
+            orders: [],
+            page: {
+              total: 0,
+              returned: 0,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          }
         },
       },
       '@/lib/persistence/commerceProviderWrites': {
@@ -2452,6 +2487,142 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(promoted.providerWrites, 0)
   assert.equal(promoted.fulfillmentWrites, 0)
   assert.equal(promoted.shipmentWrites, 0)
+  const intakeReader = loadCommerceStagingService(
+    pool,
+    counters,
+    { allowIntakeStateRead: true },
+  )
+  const intakeAfterPromotion = await intakeReader
+    .readCommerceIntakeStateFromPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    intakeAfterPromotion.candidates.some(
+      (candidate) => candidate.globalId === promotableCandidate.global_id,
+    ),
+    false,
+    'A canonical order must leave the retained Order candidates projection',
+  )
+
+  const canonicalIdentity = (await pool.query(
+    `SELECT candidate.external_order_id,
+            candidate.promotion_command_receipt_id::text,
+            candidate.promotion_idempotency_key,
+            candidate.promotion_request_hash,
+            candidate.promoted_at,
+            canonical.id::text AS canonical_order_id
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_orders canonical
+       ON canonical.organization_id = candidate.organization_id
+      AND canonical.id = candidate.canonical_order_id
+     JOIN operations_external_identifiers external
+       ON external.organization_id = candidate.organization_id
+      AND external.integration_account_id = candidate.integration_account_id
+      AND external.entity_type = 'operations.order'
+      AND external.status = 'active'
+      AND external.external_id = candidate.external_order_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, promotableCandidate.global_id],
+  )).rows[0]
+  assert.ok(
+    canonicalIdentity,
+    'Promotion must retain an active external order identity',
+  )
+  const aliasFixture = await pool.connect()
+  try {
+    await aliasFixture.query('BEGIN')
+    await aliasFixture.query('SET LOCAL session_replication_role = replica')
+    await aliasFixture.query(
+      `UPDATE operations_orders
+       SET external_order_id = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        ids.organization,
+        canonicalIdentity.canonical_order_id,
+        `${canonicalIdentity.external_order_id}-canonical-fixture`,
+      ],
+    )
+    await aliasFixture.query(
+      `UPDATE operations_commerce_order_candidates
+       SET workflow_state = 'held', canonical_order_id = NULL,
+           promotion_command_receipt_id = NULL,
+           promotion_idempotency_key = NULL,
+           promotion_request_hash = NULL,
+           promoted_at = NULL,
+           row_version = row_version + 1,
+           updated_by = $3, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, promotableCandidate.global_id, actorEmail],
+    )
+    await aliasFixture.query('COMMIT')
+  } catch (error) {
+    await aliasFixture.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    aliasFixture.release()
+  }
+  const intakeWithCanonicalAlias = await intakeReader
+    .readCommerceIntakeStateFromPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    intakeWithCanonicalAlias.candidates.some(
+      (candidate) => candidate.globalId === promotableCandidate.global_id,
+    ),
+    false,
+    'An active external order identity must suppress its staged alias',
+  )
+  const restoreCanonicalFixture = await pool.connect()
+  try {
+    await restoreCanonicalFixture.query('BEGIN')
+    await restoreCanonicalFixture.query(
+      'SET LOCAL session_replication_role = replica',
+    )
+    await restoreCanonicalFixture.query(
+      `UPDATE operations_orders
+       SET external_order_id = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        ids.organization,
+        canonicalIdentity.canonical_order_id,
+        canonicalIdentity.external_order_id,
+      ],
+    )
+    await restoreCanonicalFixture.query(
+      `UPDATE operations_commerce_order_candidates
+       SET workflow_state = 'promoted', canonical_order_id = $3::uuid,
+           promotion_command_receipt_id = $4::uuid,
+           promotion_idempotency_key = $5,
+           promotion_request_hash = $6,
+           promoted_at = $7::timestamptz,
+           row_version = row_version + 1,
+           updated_by = $8, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [
+        ids.organization,
+        promotableCandidate.global_id,
+        canonicalIdentity.canonical_order_id,
+        canonicalIdentity.promotion_command_receipt_id,
+        canonicalIdentity.promotion_idempotency_key,
+        canonicalIdentity.promotion_request_hash,
+        canonicalIdentity.promoted_at,
+        actorEmail,
+      ],
+    )
+    await restoreCanonicalFixture.query('COMMIT')
+  } catch (error) {
+    await restoreCanonicalFixture.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    restoreCanonicalFixture.release()
+  }
 
   const destination = {
     name: 'Jarrett Crosby',
@@ -4899,6 +5070,7 @@ async function verifyAutomaticShopifyCleanPromotion(
     missing: 'gid://shopify/Order/mismatch-positive',
     ambiguous: 'gid://shopify/Order/negative-positive',
     expired: 'gid://shopify/Order/fulfilled-missing',
+    terminal: 'gid://shopify/Order/missing-positive',
   }
   const sourceTimestamp = new Date().toISOString()
   const requestedDeliveryAt = new Date(
@@ -5158,7 +5330,17 @@ async function verifyAutomaticShopifyCleanPromotion(
         candidateKeys.success,
       ],
     )
-    assert.equal(updatedCandidates.rowCount, 4)
+    assert.equal(updatedCandidates.rowCount, 5)
+    await setup.query(
+      `UPDATE operations_commerce_order_candidates
+       SET provider_order_status_raw = 'CLOSED',
+           provider_fulfillment_status_raw = 'FULFILLED',
+           normalized_order_status = 'closed',
+           normalized_fulfillment_status = 'fulfilled'
+       WHERE organization_id = $1::uuid
+         AND external_order_id = $2`,
+      [ids.organization, candidateKeys.terminal],
+    )
     const updatedLines = await setup.query(
       `UPDATE operations_commerce_order_candidate_lines line
        SET external_product_id = 'gid://shopify/Product/mapped-zero',
@@ -5245,7 +5427,7 @@ async function verifyAutomaticShopifyCleanPromotion(
         sourceTimestamp,
       ],
     )
-    assert.equal(updatedLines.rowCount, 4)
+    assert.equal(updatedLines.rowCount, 5)
   } finally {
     await setup.query('SET session_replication_role = origin').catch(() => {})
     setup.release()
@@ -5457,6 +5639,7 @@ async function verifyAutomaticShopifyCleanPromotion(
   const missingCandidate = byExternalId.get(candidateKeys.missing)
   const ambiguousCandidate = byExternalId.get(candidateKeys.ambiguous)
   const expiredCandidate = byExternalId.get(candidateKeys.expired)
+  const terminalCandidate = byExternalId.get(candidateKeys.terminal)
   assert.equal(successCandidate.delivery_resolution_state, 'not_supplied')
   assert.equal(successCandidate.provider_requested_delivery_at, null)
   assert.equal(successCandidate.requested_delivery_at, null)
@@ -5578,6 +5761,11 @@ async function verifyAutomaticShopifyCleanPromotion(
     assert.equal(
       targetByCandidate.get(expiredCandidate.global_id)?.reason,
       'checkout_rate_lineage_expired',
+    )
+    assert.equal(
+      targetByCandidate.get(terminalCandidate.global_id)?.reason,
+      'order_terminal_no_demand',
+      'A staged provider-terminal row must remain visible but ineligible for automatic fulfillment demand',
     )
 
     await assert.rejects(
@@ -5859,7 +6047,12 @@ async function verifyAutomaticShopifyCleanPromotion(
          AND external_order_id = ANY($2::text[])`,
       [
         ids.organization,
-        [candidateKeys.missing, candidateKeys.expired, candidateKeys.ambiguous],
+        [
+          candidateKeys.missing,
+          candidateKeys.expired,
+          candidateKeys.ambiguous,
+          candidateKeys.terminal,
+        ],
       ],
     )).rows[0].count)
     assert.equal(heldCanonicalCount, 0)
@@ -7861,6 +8054,201 @@ async function verifyAutomaticFaireExactRefreshLineage(
   assert.equal(packListStage.providerWrites, 0)
 }
 
+async function verifyForcedScopedOrderReconciliationClaim(pool) {
+  const persistence = loadCommerceOrderReconciliationPersistence(pool)
+  const fixtures = {
+    requestedTenant: {
+      organizationId: randomUUID(),
+      pipelineId: randomUUID(),
+      name: 'Forced order refresh requested tenant',
+    },
+    otherTenant: {
+      organizationId: randomUUID(),
+      pipelineId: randomUUID(),
+      name: 'Forced order refresh other tenant',
+    },
+  }
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    for (const fixture of Object.values(fixtures)) {
+      await client.query(
+        `INSERT INTO workspace_organizations (
+           id, name, organization_type, created_by, updated_by
+         ) VALUES ($1::uuid, $2, 'member', $3, $3)`,
+        [fixture.organizationId, fixture.name, actorEmail],
+      )
+      await client.query(
+        `INSERT INTO pipeline_spaces (
+           id, name, owner_email, is_default, workspace_organization_id
+         ) VALUES ($1::uuid, $2, $3, false, $4::uuid)`,
+        [
+          fixture.pipelineId,
+          fixture.name,
+          actorEmail,
+          fixture.organizationId,
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_activation_scopes (
+           organization_id, data_pipeline_id, state, revision, updated_by
+         ) VALUES ($1::uuid, $2::uuid, 'shadow', 1, $3)`,
+        [fixture.organizationId, fixture.pipelineId, actorEmail],
+      )
+    }
+
+    async function seedAccount(fixture, environment, displayName) {
+      const accountId = randomUUID()
+      const externalAccountId = `gid://shopify/Shop/${accountId}`
+      const account = (await client.query(
+        `INSERT INTO operations_integration_accounts (
+           id, organization_id, provider, integration_type, environment,
+           display_name, status, configuration, external_account_id,
+           commerce_credential_generation, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, 'shopify', 'commerce', $3, $4, 'active',
+           '{"grantedScopes":["read_orders"]}'::jsonb, $5, 1, $6, $6
+         ) RETURNING id::text, global_id`,
+        [
+          accountId,
+          fixture.organizationId,
+          environment,
+          displayName,
+          externalAccountId,
+          actorEmail,
+        ],
+      )).rows[0]
+      await client.query(
+        `INSERT INTO operations_commerce_credentials (
+           organization_id, integration_account_id, external_account_id,
+           auth_mode, credential_ciphertext, credential_iv, credential_tag,
+           credential_version, credential_identifier_last_four,
+           verification_status, verified_at, webhook_verification_status,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, 'shopify_client_credentials',
+           decode('01', 'hex'), decode(repeat('02', 12), 'hex'),
+           decode(repeat('03', 16), 'hex'), 1, 'test', 'verified', now(),
+           'unverified', $4, $4
+         )`,
+        [fixture.organizationId, account.id, externalAccountId, actorEmail],
+      )
+      await client.query(
+        `INSERT INTO operations_commerce_sync_cursors (
+           organization_id, integration_account_id, resource,
+           reconciliation_status, records_seen, records_applied,
+           records_held, consecutive_failures, last_started_at,
+           last_completed_at
+         ) VALUES (
+           $1::uuid, $2::uuid, 'orders', 'succeeded', 0, 0, 0, 0,
+           now(), now()
+         )`,
+        [fixture.organizationId, account.id],
+      )
+      return account
+    }
+
+    fixtures.requestedAccount = await seedAccount(
+      fixtures.requestedTenant,
+      'sandbox',
+      'Forced order refresh requested account',
+    )
+    fixtures.unrequestedAccount = await seedAccount(
+      fixtures.requestedTenant,
+      'production',
+      'Forced order refresh unrequested account',
+    )
+    fixtures.otherTenantAccount = await seedAccount(
+      fixtures.otherTenant,
+      'sandbox',
+      'Forced order refresh other tenant account',
+    )
+
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const crossTenantOnly = await persistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({
+      limit: 5,
+      organizationId: fixtures.requestedTenant.organizationId,
+      accountGlobalIds: [fixtures.otherTenantAccount.global_id],
+      force: true,
+    })
+  assert.equal(
+    crossTenantOnly.length,
+    0,
+    'A forced account filter must not cross the requested organization',
+  )
+
+  const coolingDown = await persistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({
+      limit: 5,
+      organizationId: fixtures.requestedTenant.organizationId,
+      accountGlobalIds: [fixtures.requestedAccount.global_id],
+      force: false,
+    })
+  assert.equal(
+    coolingDown.length,
+    0,
+    'A recent successful account must remain on cooldown without force',
+  )
+
+  const forced = await persistence
+    .claimCommerceOrderReconciliationTargetsInPostgres({
+      limit: 5,
+      organizationId: fixtures.requestedTenant.organizationId,
+      accountGlobalIds: [
+        fixtures.requestedAccount.global_id,
+        fixtures.otherTenantAccount.global_id,
+      ],
+      force: true,
+    })
+  assert.equal(forced.length, 1)
+  assert.equal(
+    forced[0].organizationId,
+    fixtures.requestedTenant.organizationId,
+  )
+  assert.equal(forced[0].integrationAccountId, fixtures.requestedAccount.id)
+  assert.equal(forced[0].accountGlobalId, fixtures.requestedAccount.global_id)
+
+  const cursorStates = (await pool.query(
+    `SELECT account.global_id, cursor.reconciliation_status
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_sync_cursors cursor
+       ON cursor.organization_id = account.organization_id
+      AND cursor.integration_account_id = account.id
+      AND cursor.resource = 'orders'
+     WHERE account.global_id = ANY($1::text[])
+     ORDER BY account.global_id`,
+    [[
+      fixtures.requestedAccount.global_id,
+      fixtures.unrequestedAccount.global_id,
+      fixtures.otherTenantAccount.global_id,
+    ]],
+  )).rows
+  const statusByAccount = new Map(cursorStates.map((row) => [
+    row.global_id,
+    row.reconciliation_status,
+  ]))
+  assert.equal(statusByAccount.get(fixtures.requestedAccount.global_id), 'running')
+  assert.equal(
+    statusByAccount.get(fixtures.unrequestedAccount.global_id),
+    'succeeded',
+    'Force must not claim an unrequested account in the requested organization',
+  )
+  assert.equal(
+    statusByAccount.get(fixtures.otherTenantAccount.global_id),
+    'succeeded',
+    'Force must not mutate the same account identifier from another tenant',
+  )
+}
+
 async function verifyAcceptance(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -9278,6 +9666,7 @@ async function verifyAcceptance(databaseUrl) {
   )
   await verifyAutomaticShopifyCleanPromotion(pool, ids, counters)
   await verifyCustomerPrefetchBinding(pool, ids, persistence, counters)
+  await verifyForcedScopedOrderReconciliationClaim(pool)
   await pool.end()
 }
 

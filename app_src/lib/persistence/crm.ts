@@ -2227,6 +2227,22 @@ async function normalizeStageCrmRecordInput(
   return input
 }
 
+type StagedCrmRecord<SuiteCrmId = string> = {
+  id: string
+  suiteCrmId: SuiteCrmId
+  referenceCode: string
+  shortUrl: string | null
+  sourceHash: string
+}
+
+export function stageCrmRecordWithClient(
+  client: PoolClient,
+  rawInput: Exclude<StageCrmRecordInput, StageInteractionInput>,
+): Promise<StagedCrmRecord>
+export function stageCrmRecordWithClient(
+  client: PoolClient,
+  rawInput: StageCrmRecordInput,
+): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
   let input = await normalizeStageCrmRecordInput(client, rawInput)
   let contactAliases: ContactStageResolution['aliases'] = []
@@ -2268,11 +2284,17 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   )
     ? stableGlobalSuiteCrmId(input.entity, sourceKey)
     : stableSuiteCrmId(input.pipelineId, input.entity, sourceKey)
-  const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
   let previousSuiteCrmModule: SuiteCrmInteractionModule | null | undefined
   if (input.entity === 'interactions') {
-    const previous = await client.query<{ suitecrm_module: SuiteCrmInteractionModule | null }>(
-      `SELECT suitecrm_module
+    const previous = await client.query<{
+      id: string
+      suitecrm_id: string | null
+      reference_code: string
+      source_hash: string
+      source_payload: Record<string, unknown> | null
+      suitecrm_module: SuiteCrmInteractionModule | null
+    }>(
+      `SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module
        FROM crm_interactions
        WHERE pipeline_id = $1::uuid
          AND (
@@ -2283,8 +2305,23 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
        FOR UPDATE`,
       [input.pipelineId, input.localId || null, sourceKey],
     )
-    if (previous.rows[0]) previousSuiteCrmModule = previous.rows[0].suitecrm_module
+    const existing = previous.rows[0]
+    if (existing) {
+      previousSuiteCrmModule = existing.suitecrm_module
+      // A sync snapshot may predate an archive. Check the locked row, matching
+      // activeCrmRecordSql, before any upsert, outbox, or short-link reactivation.
+      if (['true', '1', 'yes'].includes(String(existing.source_payload?.archived ?? '').toLowerCase())) {
+        return {
+          id: existing.id,
+          suiteCrmId: existing.suitecrm_id,
+          referenceCode: existing.reference_code,
+          shortUrl: null,
+          sourceHash: existing.source_hash,
+        }
+      }
+    }
   }
+  const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
   let row: { id: string; suitecrm_id: string; reference_code: string }
   switch (input.entity) {
     case 'organizations':
@@ -2384,6 +2421,10 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   }
 }
 
+export function stageCrmRecordInPostgres(
+  input: Exclude<StageCrmRecordInput, StageInteractionInput>,
+): Promise<StagedCrmRecord>
+export function stageCrmRecordInPostgres(input: StageCrmRecordInput): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
   const staged = await withTransaction((client) => stageCrmRecordWithClient(client, input))
   if (input.entity === 'products') {
@@ -3603,6 +3644,10 @@ function interactionFromRow(
   row: Record<string, unknown>,
   contacts: CrmInteraction['contacts'] = [],
 ): CrmInteraction {
+  const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? row.metadata as Record<string, unknown>
+    : {}
+  const communicationBindingSource = clean(metadata.communicationBindingSource)
   const fallbackContact = row.contact_id ? [{
     id: String(row.contact_id),
     referenceCode: clean(row.contact_reference_code),
@@ -3635,7 +3680,13 @@ function interactionFromRow(
     occurredAt: row.occurred_at ? String(row.occurred_at) : null,
     description: clean(row.description), direction: (row.direction || 'internal') as CrmInteraction['direction'],
     deliveryStatus: clean(row.delivery_status), providerMessageId: nullable(row.provider_message_id),
-    providerThreadId: nullable(row.provider_thread_id), syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
+    providerThreadId: nullable(row.provider_thread_id),
+    senderEmail: nullable(metadata.senderEmail),
+    senderAccountEmail: nullable(metadata.senderAccountEmail),
+    communicationBindingSource: ['organization', 'user-default', 'email-override'].includes(communicationBindingSource)
+      ? communicationBindingSource as CrmInteraction['communicationBindingSource']
+      : null,
+    syncStatus: row.sync_status as CrmInteraction['syncStatus'], syncError: nullable(row.sync_error),
     updatedAt: String(row.updated_at),
   }
 }
@@ -3812,6 +3863,17 @@ function leadFromRow(row: Record<string, unknown>): CrmLead {
 }
 
 function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
+  const sourcePayload = row.source_payload && typeof row.source_payload === 'object' && !Array.isArray(row.source_payload)
+    ? row.source_payload as Record<string, unknown>
+    : {}
+  const rawCalendarDeliveryStatus = clean(sourcePayload.calendarDeliveryStatus)
+  const calendarDeliveryStatus = ['not-configured', 'queued', 'sent', 'failed', 'cancelled'].includes(rawCalendarDeliveryStatus)
+    ? rawCalendarDeliveryStatus as CrmMeeting['calendarDeliveryStatus']
+    : null
+  const rawMeetingMode = clean(sourcePayload.meetingMode)
+  const meetingMode = ['google_meet', 'in_person', 'custom_link'].includes(rawMeetingMode)
+    ? rawMeetingMode as CrmMeeting['meetingMode']
+    : 'google_meet'
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
@@ -3823,6 +3885,11 @@ function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
       ? row.attendee_emails.map(clean).filter(Boolean) : [],
     status: row.status as CrmMeeting['status'], provider: clean(row.provider), externalEventId: nullable(row.external_event_id),
     externalEventUrl: nullable(row.external_event_url), joinUrl: nullable(row.join_url),
+    calendarDeliveryStatus, calendarDeliveryError: nullable(sourcePayload.calendarDeliveryError),
+    calendarOwnerEmail: nullable(sourcePayload.calendarOwnerEmail),
+    calendarConnectionId: nullable(sourcePayload.calendarConnectionId),
+    calendarOrganizerEmail: nullable(sourcePayload.calendarOrganizerEmail), calendarId: nullable(sourcePayload.calendarId), meetingMode,
+    customJoinUrl: nullable(sourcePayload.customJoinUrl),
     syncStatus: row.sync_status as CrmMeeting['syncStatus'], syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
   }
 }

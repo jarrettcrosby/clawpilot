@@ -1,11 +1,17 @@
 import crypto from 'crypto'
-import { matonPlatformMailFetch } from '@/lib/maton'
+import { matonAuthMailFetch, matonPlatformMailFetch } from '@/lib/maton'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 const GMAIL_SEND_PATH = '/google-mail/gmail/v1/users/me/messages/send'
+const GMAIL_PROFILE_PATH = '/google-mail/gmail/v1/users/me/profile'
 const SENDER_VERIFICATION_TTL_MS = 5 * 60 * 1000
-let verifiedSender: { email: string; expiresAt: number } | null = null
+const verifiedSenders = new Map<string, number>()
+const senderVerificationFlights = new Map<string, Promise<void>>()
+type MailProfile = 'auth' | 'platform'
+type VerifiedMailbox = { email: string; expiresAt: number }
+const verifiedMailboxes = new Map<string, VerifiedMailbox>()
+const mailboxVerificationFlights = new Map<string, Promise<string>>()
 export type SendAuthMagicCodeEmailInput = {
   to: string
   code: string
@@ -43,6 +49,107 @@ export function mailFromAddress(): string {
   return assertEmail(configured || 'stewards@eigenracing.com').toLowerCase()
 }
 
+function authMailFromAddress(): string {
+  const connectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+  const configuredSender = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim()
+  if (Boolean(connectionId) !== Boolean(configuredSender)) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID and CLAWPILOT_AUTH_MAIL_FROM must be configured together')
+  }
+  if (connectionId && connectionId === String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()) {
+    throw new Error('MATON_AUTH_GMAIL_CONNECTION_ID must differ from MATON_GMAIL_CONNECTION_ID')
+  }
+  return configuredSender ? assertEmail(configuredSender).toLowerCase() : mailFromAddress()
+}
+
+function mailConnectionId(profile: MailProfile): string {
+  const platformConnectionId = String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()
+  return profile === 'auth'
+    ? String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim() || platformConnectionId
+    : platformConnectionId
+}
+
+function mailFetch(profile: MailProfile) {
+  return profile === 'auth' ? matonAuthMailFetch : matonPlatformMailFetch
+}
+
+function mailProfileLabel(profile: MailProfile): string {
+  return profile === 'auth' ? 'Authentication' : 'Platform'
+}
+
+async function gmailMailboxEmail(profile: MailProfile): Promise<string> {
+  const connectionId = mailConnectionId(profile)
+  const cacheKey = `${profile}:${connectionId}`
+  const cached = verifiedMailboxes.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) return cached.email
+  const inFlight = mailboxVerificationFlights.get(cacheKey)
+  if (inFlight) return inFlight
+
+  const verification = (async () => {
+    const response = await mailFetch(profile)(GMAIL_PROFILE_PATH, {
+      headers: { Accept: 'application/json' },
+    })
+    const profileLabel = mailProfileLabel(profile)
+    if (!response.ok) throw new Error(`${profileLabel} Gmail profile is not available`)
+    const data = await response.json().catch(() => ({})) as { emailAddress?: unknown }
+    const email = String(data.emailAddress || '').trim().toLowerCase()
+    if (
+      !email
+      || email.length > 254
+      || /[\r\n]/.test(email)
+      || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ) {
+      throw new Error(`${profileLabel} Gmail profile is invalid`)
+    }
+    verifiedMailboxes.set(cacheKey, {
+      email,
+      expiresAt: Date.now() + SENDER_VERIFICATION_TTL_MS,
+    })
+    return email
+  })()
+  mailboxVerificationFlights.set(cacheKey, verification)
+  try {
+    return await verification
+  } finally {
+    if (mailboxVerificationFlights.get(cacheKey) === verification) {
+      mailboxVerificationFlights.delete(cacheKey)
+    }
+  }
+}
+
+function gmailDeliveryIdentity(value: string): string {
+  const email = String(value || '').trim().toLowerCase()
+  const atIndex = email.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex === email.length - 1) return email
+
+  const domain = email.slice(atIndex + 1)
+  const consumerGmail = domain === 'gmail.com' || domain === 'googlemail.com'
+  const normalizedDomain = consumerGmail ? 'gmail.com' : domain
+  const local = email.slice(0, atIndex)
+  const plusIndex = local.indexOf('+')
+  const withoutPlus = plusIndex >= 0 ? local.slice(0, plusIndex) : local
+  const normalizedLocal = consumerGmail ? withoutPlus.replace(/\./g, '') : withoutPlus
+  return `${normalizedLocal}@${normalizedDomain}`
+}
+
+function isSameGmailDeliveryMailbox(left: string, right: string): boolean {
+  return gmailDeliveryIdentity(left) === gmailDeliveryIdentity(right)
+}
+
+async function authMailProfileForRecipient(recipient: string): Promise<MailProfile> {
+  authMailFromAddress()
+  const hasDedicatedAuthMail = Boolean(String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim())
+  if (!hasDedicatedAuthMail) return 'auth'
+
+  const [platformMailbox, authMailbox] = await Promise.all([
+    gmailMailboxEmail('platform'),
+    gmailMailboxEmail('auth'),
+  ])
+  if (isSameGmailDeliveryMailbox(platformMailbox, authMailbox)) {
+    throw new Error('Authentication Gmail account must differ from platform Gmail account')
+  }
+  return isSameGmailDeliveryMailbox(recipient, authMailbox) ? 'platform' : 'auth'
+}
+
 function assertCode(value: string): string {
   const code = String(value || '')
   if (!/^\d{6}$/.test(code)) throw new Error('A six-digit sign-in code is required')
@@ -72,15 +179,79 @@ function cleanHeader(value: string, field: string): string {
   return normalized
 }
 
-function buildMessage(input: { to: string; subject: string; text: string; html: string }): string {
+type MailContent = {
+  to: string
+  subject: string
+  text: string
+  html: string
+  messagePurpose?: 'auth-magic-code'
+}
+
+type AuthInboxPlacement = 'not-applicable' | 'confirmed' | 'unconfirmed'
+
+async function authSelfDeliveryRequested(profile: MailProfile, recipient: string): Promise<boolean> {
+  const raw = String(process.env.CLAWPILOT_AUTH_SELF_DELIVERY || '').trim()
+  if (!raw) return false
+  let value: { connectionId?: unknown; mailboxEmail?: unknown; recipientEmails?: unknown }
+  try {
+    if (raw.length > 4096) throw new Error('oversize')
+    value = JSON.parse(raw)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('shape')
+  } catch {
+    throw new Error('CLAWPILOT_AUTH_SELF_DELIVERY must be an account-bound JSON configuration')
+  }
+  const connectionId = String(value.connectionId || '').trim()
+  const validEmail = (email: unknown): email is string => typeof email === 'string'
+    && email.length <= 254 && /^[\x21-\x7e]+$/.test(email) && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email)
+  if (!connectionId || !/^[a-zA-Z0-9-]{1,100}$/.test(connectionId)
+    || !validEmail(value.mailboxEmail) || !Array.isArray(value.recipientEmails)
+    || value.recipientEmails.length < 1 || value.recipientEmails.length > 30
+    || !value.recipientEmails.every(validEmail)) {
+    throw new Error('CLAWPILOT_AUTH_SELF_DELIVERY is invalid')
+  }
+  // This is an operator-reviewed list of aliases belonging to one exact sending
+  // mailbox, not a domain-wide match or a user-controlled sender preference.
+  if (connectionId !== mailConnectionId(profile)
+    || !value.recipientEmails.some((email) => email.toLowerCase() === recipient.toLowerCase())) return false
+  if ((await gmailMailboxEmail(profile)) !== value.mailboxEmail.toLowerCase()) {
+    throw new Error('Authentication self-delivery mailbox identity changed')
+  }
+  return true
+}
+
+async function placeAuthSelfDeliveryInInbox(profile: MailProfile, messageId: string | null): Promise<AuthInboxPlacement> {
+  // The ID comes only from this just-completed send. Never search or relabel
+  // historic mail, and never create another copy of an authentication message.
+  if (!messageId || !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) return 'unconfirmed'
+  try {
+    const response = await mailFetch(profile)(`/google-mail/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}/modify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ addLabelIds: ['INBOX', 'UNREAD'] }),
+    })
+    if (!response.ok) return 'unconfirmed'
+    const receipt = await response.json() as { id?: unknown; labelIds?: unknown }
+    return receipt.id === messageId && Array.isArray(receipt.labelIds) && receipt.labelIds.includes('INBOX')
+      ? 'confirmed' : 'unconfirmed'
+  } catch {
+    // Sending already succeeded. A label failure must not invalidate the code
+    // the recipient has, or trigger another send through a different identity.
+    return 'unconfirmed'
+  }
+}
+
+function buildMessage(input: MailContent & { from: string }): string {
   const boundary = `clawpilot-${crypto.randomUUID()}`
-  const from = mailFromAddress()
   const subject = cleanHeader(input.subject, 'Email subject')
   return [
-    `From: ClawPilot Stewards <${from}>`,
-    `Reply-To: ClawPilot Stewards <${from}>`,
+    `From: ClawPilot Stewards <${input.from}>`,
+    `Reply-To: ClawPilot Stewards <${input.from}>`,
     `To: <${input.to}>`,
     `Subject: ${subject}`,
+    ...(input.messagePurpose === 'auth-magic-code' ? [
+      'X-ClawPilot-Message-Purpose: auth-magic-code',
+      'Auto-Submitted: auto-generated',
+    ] : []),
     'MIME-Version: 1.0',
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     '',
@@ -99,11 +270,17 @@ function buildMessage(input: { to: string; subject: string; text: string; html: 
   ].join('\r\n')
 }
 
-async function sendMessage(input: { to: string; subject: string; text: string; html: string }) {
+async function sendMessage(
+  input: MailContent,
+  profile: MailProfile = 'platform',
+) {
   const to = assertEmail(input.to)
-  await verifyPlatformSender()
-  const raw = base64Url(buildMessage({ ...input, to }))
-  const response = await matonPlatformMailFetch(GMAIL_SEND_PATH, {
+  const from = profile === 'auth' ? authMailFromAddress() : mailFromAddress()
+  const selfDelivery = input.messagePurpose === 'auth-magic-code'
+    && await authSelfDeliveryRequested(profile, to)
+  await verifySender(profile, from)
+  const raw = base64Url(buildMessage({ ...input, from, to }))
+  const response = await mailFetch(profile)(GMAIL_SEND_PATH, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -116,28 +293,48 @@ async function sendMessage(input: { to: string; subject: string; text: string; h
     id?: unknown
     message?: { id?: unknown }
   }
-  return { messageId: String(data.id || data.message?.id || '').trim() || null }
+  const messageId = String(data.id || data.message?.id || '').trim() || null
+  const inboxPlacement: AuthInboxPlacement = selfDelivery
+    ? await placeAuthSelfDeliveryInInbox(profile, messageId) : 'not-applicable'
+  return { messageId, inboxPlacement }
 }
 
-async function verifyPlatformSender() {
-  const sender = mailFromAddress()
-  if (verifiedSender?.email === sender && verifiedSender.expiresAt > Date.now()) return
-  const response = await matonPlatformMailFetch(
-    `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(sender)}`,
-    { headers: { Accept: 'application/json' } },
-  )
-  if (!response.ok) throw new Error('ClawPilot mail sender is not available')
-  const data = await response.json().catch(() => ({})) as {
-    sendAsEmail?: unknown
-    verificationStatus?: unknown
+async function verifySender(profile: MailProfile, sender: string) {
+  const connectionId = mailConnectionId(profile)
+  const cacheKey = `${profile}:${connectionId}:${sender}`
+  if ((verifiedSenders.get(cacheKey) || 0) > Date.now()) return
+  const inFlight = senderVerificationFlights.get(cacheKey)
+  if (inFlight) return inFlight
+
+  const verification = (async () => {
+    const response = await mailFetch(profile)(
+      `/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(sender)}`,
+      { headers: { Accept: 'application/json' } },
+    )
+    const profileLabel = mailProfileLabel(profile)
+    if (!response.ok) throw new Error(`${profileLabel} mail sender is not available`)
+    const data = await response.json().catch(() => ({})) as {
+      isPrimary?: unknown
+      sendAsEmail?: unknown
+      verificationStatus?: unknown
+    }
+    const verificationStatus = String(data.verificationStatus || '').trim().toLowerCase()
+    if (
+      String(data.sendAsEmail || '').trim().toLowerCase() !== sender
+      || (verificationStatus !== 'accepted' && data.isPrimary !== true)
+    ) {
+      throw new Error(`${profileLabel} mail sender is not verified`)
+    }
+    verifiedSenders.set(cacheKey, Date.now() + SENDER_VERIFICATION_TTL_MS)
+  })()
+  senderVerificationFlights.set(cacheKey, verification)
+  try {
+    await verification
+  } finally {
+    if (senderVerificationFlights.get(cacheKey) === verification) {
+      senderVerificationFlights.delete(cacheKey)
+    }
   }
-  if (
-    String(data.sendAsEmail || '').trim().toLowerCase() !== sender
-    || String(data.verificationStatus || '').trim().toLowerCase() !== 'accepted'
-  ) {
-    throw new Error('ClawPilot mail sender is not verified')
-  }
-  verifiedSender = { email: sender, expiresAt: Date.now() + SENDER_VERIFICATION_TTL_MS }
 }
 
 function authMagicCodeContent(to: string, code: string) {
@@ -163,15 +360,15 @@ function authMagicCodeContent(to: string, code: string) {
     '<p style="margin:0;color:#a9adb8">If you did not request this code, ignore this email.</p>',
     '</div></body></html>',
   ].join('')
-  return { to, subject: 'Your ClawPilot sign-in code', text, html }
+  return { to, subject: 'Your ClawPilot sign-in code', text, html, messagePurpose: 'auth-magic-code' as const }
 }
 
 export async function sendAuthMagicCodeEmail(
   input: SendAuthMagicCodeEmailInput,
-): Promise<{ messageId: string | null }> {
+): Promise<{ messageId: string | null; inboxPlacement: AuthInboxPlacement }> {
   const to = assertEmail(input.to)
   const code = assertCode(input.code)
-  return sendMessage(authMagicCodeContent(to, code))
+  return sendMessage(authMagicCodeContent(to, code), await authMailProfileForRecipient(to))
 }
 
 export async function sendInvitationEmail(input: SendInvitationEmailInput): Promise<{ messageId: string | null }> {

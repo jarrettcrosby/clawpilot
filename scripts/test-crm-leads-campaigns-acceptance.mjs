@@ -7,7 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -17,6 +17,16 @@ const contractsOnly = process.argv.includes('--contracts-only')
 const actorEmail = 'crm.acceptance@example.test'
 const shortLinkOrigin = 'https://links.acceptance.example.test'
 const sessionSecret = 'crm-acceptance-session-secret-00000000000000000000'
+const testMatonKey = 'crm-acceptance-maton-key-0000000000000000'
+
+function encryptedTestMatonKey(ownerEmail) {
+  const iv = crypto.randomBytes(12)
+  const key = crypto.createHash('sha256').update(sessionSecret).digest()
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(Buffer.from(`clawpilot:maton:${ownerEmail}:api-key:v1`, 'utf8'))
+  const ciphertext = Buffer.concat([cipher.update(testMatonKey, 'utf8'), cipher.final()])
+  return { ciphertext, iv, tag: cipher.getAuthTag() }
+}
 
 const FIXTURES = Object.freeze({
   account: {
@@ -290,6 +300,43 @@ async function seedTenant(pool) {
        ) VALUES ($1, $2::uuid, 'owner', $3::jsonb, 'active', true, $1, $1)`,
       [actorEmail, organizationId, JSON.stringify(permissions)],
     )
+    const encryptedCredential = encryptedTestMatonKey(actorEmail)
+    await client.query(
+      `INSERT INTO user_maton_credentials (
+         owner_email, login_email, api_key_ciphertext, api_key_iv, api_key_tag,
+         api_key_last_four, api_key_version, key_rotated_at
+       ) VALUES ($1, $1, $2, $3, $4, $5, 1, now())`,
+      [
+        actorEmail,
+        encryptedCredential.ciphertext,
+        encryptedCredential.iv,
+        encryptedCredential.tag,
+        testMatonKey.slice(-4),
+      ],
+    )
+    await client.query(
+      `INSERT INTO user_maton_connections (
+         owner_email, connection_id, name, app, status, account_email,
+         is_selected, source, last_refreshed_at
+       ) VALUES
+         ($1, 'crm-acceptance-gmail', 'CRM acceptance Gmail',
+          'google-mail', 'ACTIVE', $1, true, 'maton', now()),
+         ($1, 'crm-acceptance-calendar', 'CRM acceptance Calendar',
+          'google-calendar', 'ACTIVE', $1, true, 'maton', now())`,
+      [actorEmail],
+    )
+    await client.query(
+      `INSERT INTO organization_communication_bindings (
+         organization_id, app, credential_owner_email, maton_connection_id,
+         account_email, identity_email, calendar_id, status, verified_at,
+         verified_by, created_by, updated_by
+       ) VALUES
+         ($2::uuid, 'google-mail', $1, 'crm-acceptance-gmail',
+          $1, $1, NULL, 'active', now(), $1, $1, $1),
+         ($2::uuid, 'google-calendar', $1, 'crm-acceptance-calendar',
+          $1, $1, 'primary', 'active', now(), $1, $1, $1)`,
+      [actorEmail, organizationId],
+    )
     await client.query(
       `UPDATE workspace_organizations SET created_by = $2, updated_by = $2 WHERE id = $1::uuid`,
       [organizationId, actorEmail],
@@ -341,7 +388,7 @@ function fields(entity, fixture, relationships = {}) {
   return { entity, fields: { ...fixture, ...relationships } }
 }
 
-async function runApiAcceptance(baseUrl, token, pool) {
+async function runApiAcceptance(baseUrl, token, pool, organizationId) {
   await apiJson(baseUrl, token, '/api/crm?entity=leads&limit=10')
   const initialProfile = await pool.query(
     `SELECT contact.id::text, contact.pipeline_id::text, contact.organization_id::text,
@@ -420,14 +467,19 @@ async function runApiAcceptance(baseUrl, token, pool) {
       contactIds: [contact.id],
     })),
   })).record
+  const meetingSaveIdempotencyKey = '9c70c0a4-f551-4a6f-9d50-257ae76dc26b'
   const meeting = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST',
-    body: JSON.stringify(fields('meetings', FIXTURES.meeting, {
-      organizationId: account.id,
-      contactId: contact.id,
-      leadId: lead.id,
-      opportunityId: opportunity.id,
-    })),
+    headers: { 'Idempotency-Key': meetingSaveIdempotencyKey },
+    body: JSON.stringify({
+      ...fields('meetings', FIXTURES.meeting, {
+        organizationId: account.id,
+        contactId: contact.id,
+        leadId: lead.id,
+        opportunityId: opportunity.id,
+      }),
+      idempotencyKey: meetingSaveIdempotencyKey,
+    }),
   })).record
   const campaign = (await apiJson(baseUrl, token, '/api/crm', {
     method: 'POST', body: JSON.stringify(fields('campaigns', FIXTURES.campaign)),
@@ -573,6 +625,20 @@ async function runApiAcceptance(baseUrl, token, pool) {
     campaignAction.action.status,
     'succeeded',
     `Campaign expansion failed: ${JSON.stringify(campaignAction.action)}`,
+  )
+  assert.deepEqual(
+    {
+      organizationId: campaignAction.action.communication?.organizationId,
+      accountEmail: campaignAction.action.communication?.accountEmail,
+      identityEmail: campaignAction.action.communication?.identityEmail,
+      source: campaignAction.action.communication?.source,
+    },
+    {
+      organizationId,
+      accountEmail: actorEmail,
+      identityEmail: actorEmail,
+      source: 'organization',
+    },
   )
   const callAction = await apiJson(baseUrl, token, '/api/crm/actions', {
     method: 'POST',
@@ -947,6 +1013,12 @@ async function main() {
         APP_AUTH_REQUIRED: '1',
         APP_LOGIN_EMAIL: actorEmail,
         APP_SESSION_SECRET: sessionSecret,
+        AGENT_CREDENTIAL_ENCRYPTION_KEY: sessionSecret,
+        MATON_BASE_URL: 'https://crm-acceptance.gateway.maton.ai',
+        NODE_OPTIONS: [
+          process.env.NODE_OPTIONS,
+          `--import=${pathToFileURL(path.join(root, 'scripts', 'fixtures', 'mock-crm-acceptance-maton-fetch.mjs')).href}`,
+        ].filter(Boolean).join(' '),
         CLAWPILOT_PUBLIC_URL: 'https://acceptance.clawpilot.test',
         SHORTLINK_PUBLIC_ORIGIN: shortLinkOrigin,
         NEXT_PUBLIC_APP_URL: baseUrl,
@@ -956,7 +1028,7 @@ async function main() {
     app.stdout.on('data', (chunk) => { logs = `${logs}${chunk}`.slice(-20_000) })
     app.stderr.on('data', (chunk) => { logs = `${logs}${chunk}`.slice(-20_000) })
     await waitForHttp(`${baseUrl}/api/health`, () => logs)
-    const records = await runApiAcceptance(baseUrl, tenant.token, pool)
+    const records = await runApiAcceptance(baseUrl, tenant.token, pool, tenant.organizationId)
     await runMobileAcceptance(baseUrl, tenant.token, records, () => logs)
     console.log('CRM Leads/Campaigns disposable acceptance passed')
     console.log('validated: create edit archive search Global-ID short-link SuiteCRM conversion activity campaign-membership mobile')

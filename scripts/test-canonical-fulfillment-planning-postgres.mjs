@@ -2966,6 +2966,15 @@ async function verifyCanonicalPlanning(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const orderListQuery = loadTypeScriptModule(
+      'app_src/lib/operations/orderListQuery.ts',
+    )
+    const providerOrderMoney = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderMoney.ts',
+    )
+    const providerOrderHistory = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderHistory.ts',
+    )
     const operationsOrderShipmentAddress = loadTypeScriptModule(
       'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
       {
@@ -3306,11 +3315,33 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
+          '@/lib/operations/orderListQuery': orderListQuery,
           '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/operations/providerOrderMoney': providerOrderMoney,
+          '@/lib/operations/providerOrderHistory': providerOrderHistory,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
           '@/lib/persistence/commerceOrderWorkbench': {
-            readCommerceOrderWorkbenchFromPostgres: async () => [],
+            readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+              orders: [],
+              page: {
+                total: 0,
+                returned: 0,
+                pageSize: 250,
+                nextCursor: null,
+                complete: true,
+                truncated: false,
+              },
+            }),
+          },
+          '@/lib/persistence/commerceOrderSync': {
+            readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres:
+              async () => ({
+                items: [],
+                truncated: false,
+                limit: 500,
+                providerWrites: 0,
+              }),
           },
           '@/lib/persistence/orderUnitWeightEvidence': {
             assertCurrentOrderUnitWeightEvidence: async () => {},

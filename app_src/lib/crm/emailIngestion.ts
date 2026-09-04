@@ -71,6 +71,7 @@ export type EmailIngestionCounts = {
   pendingMailboxes: number
   messagesListed: number
   messagesFetched: number
+  authMessagesSkipped: number
   messagesStored: number
   duplicateMessages: number
   markerReferences: number
@@ -280,6 +281,38 @@ export function extractGmailMessageBody(payload: GmailMessagePart | null | undef
     .replace(/\u0000/g, '')
     .replace(/\r\n?/g, '\n')
     .trim()
+}
+
+/** Authentication notifications are not customer correspondence or CRM records. */
+export function isClawPilotAuthEmail(message: GmailMessage): boolean {
+  const subjects = headerValues(message.payload, 'subject')
+  if (subjects.length !== 1 || subjects[0].trim().toLowerCase() !== 'your clawpilot sign-in code') return false
+
+  // Use the actual top-level From address, never a matching Reply-To, quoted
+  // message header, display-name address, or CRM contact identity.
+  const fromHeaders = headerValues(message.payload, 'from')
+  if (fromHeaders.length !== 1) return false
+  const fromHeader = fromHeaders[0].trim()
+  const namedAddress = fromHeader.match(/^(?:"[^"]*"\s*|[^<>,"]*)<([^<>]+)>$/)
+  const from = (namedAddress?.[1] || fromHeader).trim().toLowerCase()
+  const senders = new Set([
+    process.env.CLAWPILOT_MAIL_FROM,
+    process.env.CLAWPILOT_AUTH_MAIL_FROM,
+    ...String(process.env.CLAWPILOT_AUTH_MAIL_ADDITIONAL_SENDERS || '').split(','),
+    // Preserve recognition of messages issued before a configured sender change.
+    'stewards@eigenracing.com',
+  ].map((value) => String(value || '').trim().toLowerCase()).filter((value) => EMAIL_PATTERN.test(value)))
+  if (!EMAIL_PATTERN.test(from) || !senders.has(from)) return false
+
+  const purposes = headerValues(message.payload, 'x-clawpilot-message-purpose')
+  if (purposes.length > 0) {
+    return purposes.length === 1 && purposes[0].trim().toLowerCase() === 'auth-magic-code'
+  }
+
+  // Older notifications lack the purpose header. Match the entire original
+  // template, not a keyword or a quoted code inside a customer's discussion.
+  const body = extractGmailMessageBody(message.payload).replace(/\s+/g, ' ').trim()
+  return /^ClawPilot sign-in (?:Your sign-in code is:|Use this code to sign in:) \d{6} This code expires in 15 minutes and can be used once\. If you did not request this code, ignore this email\.$/.test(body)
 }
 
 function receivedAt(message: GmailMessage): string {
@@ -1011,6 +1044,7 @@ function newCounts(activeMailboxes: number): EmailIngestionCounts {
     pendingMailboxes: 0,
     messagesListed: 0,
     messagesFetched: 0,
+    authMessagesSkipped: 0,
     messagesStored: 0,
     duplicateMessages: 0,
     markerReferences: 0,
@@ -1064,6 +1098,10 @@ async function pollMailbox(mailbox: SelectedMailbox, counts: EmailIngestionCount
           throw new SafeEmailIngestionError('Gmail returned a mismatched message identifier')
         }
         counts.messagesFetched += 1
+        if (isClawPilotAuthEmail(rawMessage)) {
+          counts.authMessagesSkipped += 1
+          continue
+        }
         const processed = await processMessage({
           ownerEmail: mailbox.owner_email,
           mailboxEmail: mailbox.account_email,

@@ -34,7 +34,9 @@ function loadWorker(mocks) {
   vm.runInNewContext(output.outputText, {
     exports: loaded.exports,
     module: loaded,
-    require: (specifier) => mocks[specifier] || {},
+    require: (specifier) => mocks[specifier]
+      || (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits'
+        ? { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS: 6 } : {}),
     Date,
     Error,
     Math,
@@ -89,7 +91,7 @@ async function runDrainScenario({ finalPage }) {
             ? null
             : `sealed-cursor-${pageCount + 1}`,
           providerRowsSeen: 0,
-          providerReads: 8,
+          providerReads: 6,
           providerWrites: 0,
           readAllOrdersScopeObserved: true,
           returnHistoryScopeObserved: false,
@@ -99,6 +101,9 @@ async function runDrainScenario({ finalPage }) {
     '@/lib/persistence/commerceOrderSync': {
       async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
         return { redacted: 0, providerWrites: 0 }
+      },
+      async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+        return { materialized: 0, skipped: 0, providerWrites: 0 }
       },
       async ensureContinuousCommerceOrderPollsInPostgres() {
         return { scheduled: 0, providerWrites: 0 }
@@ -155,11 +160,21 @@ assert.equal(completedDrain.result.claimWaves, 12)
 assert.equal(completedDrain.result.pageAttempts, 12)
 assert.equal(completedDrain.result.continued, 11)
 assert.equal(completedDrain.result.succeeded, 1)
-assert.equal(completedDrain.result.providerReads, 96)
-assert.equal(completedDrain.result.providerReadReservations, 96)
+assert.equal(completedDrain.result.providerReads, 72)
+assert.equal(completedDrain.result.providerReadReservations, 72)
 assert.equal(completedDrain.result.drainStopReason, 'terminal')
 assert.equal(completedDrain.result.providerWrites, 0)
 assert.equal(completedDrain.result.operationsOrderWrites, 0)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(completedDrain.result.deferredHistoricalRefreshes)),
+  {
+    beforeClaim: 0,
+    afterDrain: 0,
+    materialized: 0,
+    skipped: 0,
+    providerWrites: 0,
+  },
+)
 assert.equal(
   completedDrain.runtime.commerceOrderHistoryWorkerLimits
     .providerDrainClaimWindowMs,
@@ -180,8 +195,8 @@ assert.equal(boundedDrain.claimCalls, 24)
 assert.equal(boundedDrain.result.claimed, 24)
 assert.equal(boundedDrain.result.continued, 24)
 assert.equal(boundedDrain.result.succeeded, 0)
-assert.equal(boundedDrain.result.providerReads, 192)
-assert.equal(boundedDrain.result.providerReadReservations, 192)
+assert.equal(boundedDrain.result.providerReads, 144)
+assert.equal(boundedDrain.result.providerReadReservations, 144)
 assert.equal(boundedDrain.result.drainStopReason, 'page_limit')
 assert.equal(boundedDrain.result.providerWrites, 0)
 
@@ -210,6 +225,9 @@ const isolatedFailureRuntime = loadWorker({
   '@/lib/persistence/commerceOrderSync': {
     async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
       return { redacted: 0, providerWrites: 0 }
+    },
+    async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+      return { materialized: 0, skipped: 0, providerWrites: 0 }
     },
     async ensureContinuousCommerceOrderPollsInPostgres() {
       return { scheduled: 0, providerWrites: 0 }
@@ -262,7 +280,7 @@ assert.equal(isolatedFailure.pageAttempts, 2)
 assert.equal(isolatedFailure.succeeded, 1)
 assert.equal(isolatedFailure.failurePersistenceErrors, 1)
 assert.equal(isolatedFailure.providerReads, 3)
-assert.equal(isolatedFailure.providerReadReservations, 16)
+assert.equal(isolatedFailure.providerReadReservations, 12)
 assert.equal(isolatedFailure.drainStopReason, 'terminal')
 assert.equal(isolatedFailure.providerWrites, 0)
 

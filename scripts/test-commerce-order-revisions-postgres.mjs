@@ -167,6 +167,15 @@ export function loadTypeScriptModule(path, mocks = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/persistence/commerceOrderTrackingUrlEvidence') {
+        return loadTypeScriptModule('app_src/lib/persistence/commerceOrderTrackingUrlEvidence.ts', mocks)
+      }
+      if (specifier === '@/lib/persistence/commerceOrderNativeActivity') {
+        return loadTypeScriptModule('app_src/lib/persistence/commerceOrderNativeActivity.ts', mocks)
+      }
+      if (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits') {
+        return loadTypeScriptModule('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts', mocks)
+      }
       if (specifier === '@/lib/integrations/commerceOrderRevisionEvidence') {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceOrderRevisionEvidence.ts',
@@ -230,6 +239,11 @@ export function loadTypeScriptModule(path, mocks = {}) {
       if (specifier === '@/lib/operations/commerceStoreSync') {
         return loadTypeScriptModule(
           'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/operations/orderListQuery') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/orderListQuery.ts',
         )
       }
       if (specifier === '@/lib/persistence/commerceStoreSync') {

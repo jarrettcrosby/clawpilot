@@ -36,6 +36,9 @@ function loadTypeScriptModule(path, mocks = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits') {
+        return loadTypeScriptModule('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts')
+      }
       return requireFromApp(specifier)
     },
   }, { filename: path })
@@ -154,12 +157,12 @@ assert.equal(result.claimed, 2)
 assert.equal(result.succeeded, 1)
 assert.equal(result.failed, 1)
 assert.equal(result.providerReads, 3)
-assert.equal(result.providerReadReservations, 6)
+assert.equal(result.providerReadReservations, 10)
 assert.equal(result.providerWrites, 0)
 assert.equal(result.operationsOrderWrites, 0)
 assert.equal(result.eventDrivenDrainCadenceSeconds, 60)
 assert.equal(result.scheduledPollBackstopMinutes, 30)
-assert.equal(result.limits.maxProviderReadReservationsPerRun, 15)
+assert.equal(result.limits.maxProviderReadReservationsPerRun, 25)
 
 const route = readFileSync(
   'app_src/app/api/integrations/commerce/orders/process/route.ts',

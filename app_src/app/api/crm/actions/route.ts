@@ -1,12 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   CrmIntegrationActionError,
+  crmIntegrationClientRequestHash,
   enqueueCrmIntegrationAction,
   processCrmIntegrationActionNow,
   readCrmIntegrationAction,
+  replayCrmIntegrationActionByIdempotencyKey,
+  retryCrmIntegrationAction,
 } from '@/lib/crm/integrationActions'
+import {
+  resolveVerifiedPipelineCalendarSelection,
+  resolveVerifiedPipelineGmailSelection,
+} from '@/lib/integrations/organizationCommunications'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { requireRequestUser } from '@/lib/requestUser'
+import { requestSession, requireRequestUser } from '@/lib/requestUser'
 import {
   PIPELINE_SELECTION_COOKIE,
   requireResourceEditor,
@@ -35,6 +42,10 @@ function errorResponse(error: unknown) {
   }
   if (error instanceof Error && /view-only|access denied/i.test(error.message)) {
     return json({ ok: false, error: 'CRM actions require editor access', code: 'CRM_ACTION_FORBIDDEN' }, 403)
+  }
+  const shaped = error as { status?: unknown; code?: unknown; message?: unknown }
+  if (Number.isInteger(shaped?.status) && typeof shaped?.code === 'string' && typeof shaped?.message === 'string') {
+    return json({ ok: false, error: shaped.message, code: shaped.code }, Number(shaped.status))
   }
   return json({ ok: false, error: 'CRM action request failed', code: 'CRM_ACTION_INTERNAL_ERROR' }, 500)
 }
@@ -76,10 +87,22 @@ function requireOnlyFields(body: Record<string, unknown>) {
     'payload',
     'idempotencyKey',
     'processNow',
+    'calendarConnectionId',
+    'calendarId',
+    'gmailConnectionId',
+    'gmailSendAsEmail',
   ]
   const unsupported = Object.keys(body).find((key) => !allowed.includes(key))
   if (unsupported) {
     throw new CrmIntegrationActionError(`Unsupported CRM action request field: ${unsupported}`)
+  }
+}
+
+function requireRetryOnlyFields(body: Record<string, unknown>) {
+  const allowed = ['actionId', 'reason', 'reviewed', 'processNow']
+  const unsupported = Object.keys(body).find((key) => !allowed.includes(key))
+  if (unsupported) {
+    throw new CrmIntegrationActionError(`Unsupported CRM retry request field: ${unsupported}`)
   }
 }
 
@@ -96,7 +119,17 @@ function aliasedValue(body: Record<string, unknown>, primary: string, alias: str
   return primaryValue ?? aliasValue
 }
 
-async function requestContext(req: NextRequest) {
+async function requestContext(req: NextRequest, options: { write?: boolean } = {}) {
+  if (options.write) {
+    const session = await requestSession(req)
+    if (session?.impersonating || (session && session.authenticatedUser !== session.effectiveUser)) {
+      throw new CrmIntegrationActionError(
+        'Exit user view before changing CRM integration actions',
+        403,
+        'CRM_ACTION_IMPERSONATION_FORBIDDEN',
+      )
+    }
+  }
   const actor = await requireRequestUser(req)
   const selected = req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selected })
@@ -127,7 +160,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     requirePostgresStorage()
-    const { actor, pipeline } = await requestContext(req)
+    const { actor, pipeline } = await requestContext(req, { write: true })
     const body = await requestBody(req)
     requireOnlyFields(body)
     if (body.processNow !== undefined && typeof body.processNow !== 'boolean') {
@@ -142,13 +175,122 @@ export async function POST(req: NextRequest) {
       throw new CrmIntegrationActionError('Idempotency key fields do not match')
     }
 
+    const actionType = aliasedValue(body, 'actionType', 'action', 'CRM action type')
+    const referenceCode = aliasedValue(body, 'referenceCode', 'reference', 'CRM reference')
+    const idempotencyKey = body.idempotencyKey ?? headerIdempotencyKey
+    const calendarConnectionSupplied = body.calendarConnectionId !== undefined
+    const calendarIdSupplied = body.calendarId !== undefined
+    const gmailConnectionSupplied = body.gmailConnectionId !== undefined
+    const gmailSendAsSupplied = body.gmailSendAsEmail !== undefined
+    if (calendarConnectionSupplied !== calendarIdSupplied) {
+      throw new CrmIntegrationActionError(
+        'Per-meeting Calendar selection requires both calendarConnectionId and calendarId',
+        400,
+        'CRM_CALENDAR_SELECTION_INCOMPLETE',
+      )
+    }
+    if (calendarConnectionSupplied && actionType !== 'create_calendar_event') {
+      throw new CrmIntegrationActionError(
+        'Per-meeting Calendar selection is only supported for Calendar event actions',
+        400,
+        'CRM_CALENDAR_SELECTION_INVALID',
+      )
+    }
+    if (gmailConnectionSupplied !== gmailSendAsSupplied) {
+      throw new CrmIntegrationActionError(
+        'Per-send Gmail selection requires both gmailConnectionId and gmailSendAsEmail',
+        400,
+        'CRM_GMAIL_SELECTION_INCOMPLETE',
+      )
+    }
+    if (gmailConnectionSupplied && actionType !== 'send_email' && actionType !== 'send_campaign') {
+      throw new CrmIntegrationActionError(
+        'Per-send Gmail selection is only supported for email and campaign actions',
+        400,
+        'CRM_GMAIL_SELECTION_INVALID',
+      )
+    }
+    if (calendarConnectionSupplied && gmailConnectionSupplied) {
+      throw new CrmIntegrationActionError(
+        'Choose either a Gmail sender or a Google Calendar, not both',
+        400,
+        'CRM_COMMUNICATION_SELECTION_INVALID',
+      )
+    }
+    const clientRequestHash = actionType === 'create_calendar_event'
+      ? crmIntegrationClientRequestHash({
+          contract: 'crm-calendar-action-v1',
+          pipelineId: pipeline.id,
+          actorEmail: actor.email,
+          actionType: 'create_calendar_event',
+          referenceCode: String(referenceCode ?? '').trim().toLowerCase(),
+          payload: body.payload ?? null,
+          calendarSelection: calendarConnectionSupplied
+            ? {
+                connectionId: String(body.calendarConnectionId ?? '').trim(),
+                calendarId: String(body.calendarId ?? '').trim(),
+              }
+            : null,
+        })
+      : actionType === 'send_email' || actionType === 'send_campaign'
+        ? crmIntegrationClientRequestHash({
+            contract: 'crm-gmail-action-v1',
+            pipelineId: pipeline.id,
+            actorEmail: actor.email,
+            actionType,
+            referenceCode: String(referenceCode ?? '').trim().toLowerCase(),
+            payload: body.payload ?? null,
+            gmailSelection: gmailConnectionSupplied
+              ? {
+                  connectionId: String(body.gmailConnectionId ?? '').trim(),
+                  gmailSendAsEmail: String(body.gmailSendAsEmail ?? '').trim().toLowerCase(),
+                }
+              : null,
+          })
+        : undefined
+    if (clientRequestHash && idempotencyKey !== undefined) {
+      const replay = await replayCrmIntegrationActionByIdempotencyKey({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        idempotencyKey,
+        clientRequestHash,
+        actionType,
+        referenceCode,
+      })
+      if (replay) {
+        return json({
+          ok: true,
+          created: false,
+          attemptedSynchronously: false,
+          action: replay.action,
+        })
+      }
+    }
+    const communicationOverride = calendarConnectionSupplied
+      ? await resolveVerifiedPipelineCalendarSelection({
+          pipelineId: pipeline.id,
+          actorEmail: actor.email,
+          connectionId: body.calendarConnectionId,
+          calendarId: body.calendarId,
+        })
+      : gmailConnectionSupplied
+        ? await resolveVerifiedPipelineGmailSelection({
+            pipelineId: pipeline.id,
+            actorEmail: actor.email,
+            connectionId: body.gmailConnectionId,
+            gmailSendAsEmail: body.gmailSendAsEmail,
+          })
+        : undefined
+
     const queued = await enqueueCrmIntegrationAction({
       pipelineId: pipeline.id,
       actorEmail: actor.email,
-      actionType: aliasedValue(body, 'actionType', 'action', 'CRM action type'),
-      referenceCode: aliasedValue(body, 'referenceCode', 'reference', 'CRM reference'),
+      actionType,
+      referenceCode,
       payload: body.payload,
-      idempotencyKey: body.idempotencyKey ?? headerIdempotencyKey,
+      idempotencyKey,
+      clientRequestHash,
+      communicationOverride,
     })
     const attemptedSynchronously = queued.created && body.processNow !== false
     let action = queued.action
@@ -174,6 +316,43 @@ export async function POST(req: NextRequest) {
       attemptedSynchronously,
       action,
     }, queued.created ? 201 : 200)
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  try {
+    requirePostgresStorage()
+    const { actor, pipeline } = await requestContext(req, { write: true })
+    const body = await requestBody(req)
+    requireRetryOnlyFields(body)
+    if (body.reviewed !== true) {
+      throw new CrmIntegrationActionError(
+        'CRM action retry requires explicit review',
+        409,
+        'CRM_ACTION_RETRY_REVIEW_REQUIRED',
+      )
+    }
+    if (body.processNow !== undefined && typeof body.processNow !== 'boolean') {
+      throw new CrmIntegrationActionError('processNow must be a boolean')
+    }
+    let action = await retryCrmIntegrationAction({
+      actionId: body.actionId,
+      pipelineId: pipeline.id,
+      actorEmail: actor.email,
+      reviewed: true,
+      reason: body.reason,
+    })
+    const attemptedSynchronously = body.processNow !== false
+    if (attemptedSynchronously) {
+      action = await processCrmIntegrationActionNow({
+        actionId: action.id,
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+      })
+    }
+    return json({ ok: true, attemptedSynchronously, action })
   } catch (error) {
     return errorResponse(error)
   }

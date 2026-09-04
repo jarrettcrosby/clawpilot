@@ -41,6 +41,9 @@ function loadTypeScriptModule(path, mocks = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits') {
+        return loadTypeScriptModule('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts')
+      }
       return requireFromApp(specifier)
     },
   }, { filename: path })
@@ -542,7 +545,7 @@ assert.match(
 )
 assert.match(
   persistenceSource,
-  /commerce-order-observation:[\s\S]+?ORDER BY observed_at DESC, id DESC[\s\S]+?external_order_id, observed_at, source_hash/u,
+  /commerce-order-observation:[\s\S]+?ORDER BY observed_at DESC, id DESC[\s\S]+?ON CONFLICT \([\s\S]+?external_order_id, observation_kind, observed_at, source_hash,[\s\S]+?backfill_session_id, webhook_target_id, webhook_dirty_version,[\s\S]+?manual_provider_read_lease_id[\s\S]+?\) DO NOTHING/u,
 )
 assert.match(
   persistenceSource,

@@ -208,6 +208,30 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
         CASE WHEN EXISTS (
           SELECT 1 FROM public.schema_migrations
           WHERE filename =
+            '0348_operations_commerce_native_activity_evidence.sql'
+            AND checksum =
+              '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'
+        ) THEN
+          '895eb8a49a4c574608eb78a4c7b81d6120153139cc1fc9e568fbffc09f2d1db5'
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0341_operations_faire_order_workbench_exact_history.sql'
+            AND checksum =
+              '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1'
+        ) THEN
+          '354a02eca72636fc7f298f7a7438bbd043340072507503a11dd12e949185304e'
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0340_operations_order_workbench_exact_history.sql'
+            AND checksum =
+              '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e'
+        ) THEN
+          '83c2a275eacb5131cad13fc4f6c296b24fde4a56e1eda5d3f0e8057ffa0f1b81'
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
             '0314_operations_local_work_independent_activation.sql'
             AND checksum =
               '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'

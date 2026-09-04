@@ -1304,6 +1304,9 @@ async function verifyRouteBehavior() {
   const shadowTraining = loadTypeScriptModule(
     'app_src/lib/operations/shadowTraining.ts',
   )
+  const orderListQuery = loadTypeScriptModule(
+    'app_src/lib/operations/orderListQuery.ts',
+  )
   const physicalOutputAttestationAuthorization = loadTypeScriptModule(
     'app_src/lib/operations/physicalOutputAttestationAuthorization.ts',
     {
@@ -1356,6 +1359,7 @@ async function verifyRouteBehavior() {
       '@/lib/operations/physicalOutputAttestationAuthorization': (
         physicalOutputAttestationAuthorization
       ),
+      '@/lib/operations/orderListQuery': orderListQuery,
       '@/lib/operations/types': {
         canRequestOperationsPickHandoff: (capabilities) => (
           capabilities.canView && capabilities.canExecute
@@ -1683,7 +1687,16 @@ async function verifyRouteBehavior() {
   assert.equal(invalidStatus.status, 400)
   assert.equal((await payload(invalidStatus)).code, 'OPERATIONS_STATUS_INVALID')
 
-  const validRead = await route.GET(request('http://localhost/api/operations?status=shipped&exceptionStatus=open&search=proof&order=gor1234567'))
+  const invalidOrderSummaryMode = await route.GET(request(
+    'http://localhost/api/operations?includeOrderSummaries=legacy',
+  ))
+  assert.equal(invalidOrderSummaryMode.status, 400)
+  assert.equal(
+    (await payload(invalidOrderSummaryMode)).code,
+    'OPERATIONS_ORDER_SUMMARY_MODE_INVALID',
+  )
+
+  const validRead = await route.GET(request('http://localhost/api/operations?status=shipped&exceptionStatus=open&search=proof&order=gor1234567&includeOrderSummaries=false'))
   assert.equal(validRead.status, 200)
   assert.equal(validRead.headers.get('cache-control'), 'private, no-store')
   assert.equal(calls.reads.length, 1)
@@ -1695,9 +1708,22 @@ async function verifyRouteBehavior() {
     canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
+    sort: 'updated',
+    direction: 'desc',
+    provider: null,
+    tracking: null,
+    updatedAfter: null,
+    includeOrderSummaries: false,
     exceptionStatus: 'open',
     selectedOrderGlobalId: 'gor1234567',
   })
+
+  const externalFulfillmentRead = await route.GET(request(
+    'http://localhost/api/operations?status=fulfilled_externally',
+  ))
+  assert.equal(externalFulfillmentRead.status, 200)
+  assert.equal(calls.reads[1].status, 'fulfilled_externally')
+  assert.equal(calls.reads[1].includeOrderSummaries, true)
 
   const impersonatedRead = await route.GET(request(
     'http://localhost/api/operations?order=gor1234567',
@@ -4031,6 +4057,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const orderListQuery = loadTypeScriptModule(
+      'app_src/lib/operations/orderListQuery.ts',
+    )
     const operationsOrderShipmentAddress = loadTypeScriptModule(
       'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
       {
@@ -4119,6 +4148,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
       },
     )
+    const providerOrderMoney = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderMoney.ts',
+    )
+    const providerOrderHistory = loadTypeScriptModule(
+      'app_src/lib/operations/providerOrderHistory.ts',
+    )
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -4193,11 +4228,33 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
+        '@/lib/operations/orderListQuery': orderListQuery,
         '@/lib/operations/orderShipTo': orderShipTo,
+        '@/lib/operations/providerOrderMoney': providerOrderMoney,
+        '@/lib/operations/providerOrderHistory': providerOrderHistory,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
+        '@/lib/persistence/commerceOrderSync': {
+          readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres:
+            async () => ({
+              items: [],
+              truncated: false,
+              limit: 500,
+              providerWrites: 0,
+            }),
+        },
         '@/lib/persistence/commerceOrderWorkbench': {
-          readCommerceOrderWorkbenchFromPostgres: async () => [],
+          readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+            orders: [],
+            page: {
+              total: 0,
+              returned: 0,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          }),
         },
         '@/lib/persistence/commerceProviderWrites': {
           CommerceProviderWriteControlError: class extends Error {},
@@ -4583,6 +4640,48 @@ async function verifyPostgresAcceptance(databaseUrl) {
     assert.equal(workspace.summary.availableUnits, 0)
     assert.equal(workspace.summary.reservedUnits, 0)
     assert.equal(workspace.summary.unbilledMinor, '1472')
+
+    const workspaceWithoutOrderSummaries =
+      await persistence.readOperationsWorkspaceFromPostgres({
+        organizationId: primary.organizationId,
+        capabilities: { canView: true, canManage: true, canExecute: true },
+        selectedOrderGlobalId: first.orderGlobalId,
+        includeOrderSummaries: false,
+      })
+    assert.equal(workspaceWithoutOrderSummaries.orders.length, 0)
+    assert.equal(workspaceWithoutOrderSummaries.importedOrders.length, 0)
+    assert.deepEqual(JSON.parse(JSON.stringify(
+      workspaceWithoutOrderSummaries.orderPage,
+    )), {
+      total: 0,
+      returned: 0,
+      pageSize: 1,
+      nextCursor: null,
+      complete: true,
+      truncated: false,
+    })
+    assert.deepEqual(JSON.parse(JSON.stringify(
+      workspaceWithoutOrderSummaries.importedOrderPage,
+    )), {
+      total: 0,
+      returned: 0,
+      pageSize: 1,
+      nextCursor: null,
+      complete: true,
+      truncated: false,
+    })
+    assert.equal(
+      workspaceWithoutOrderSummaries.selectedOrder.globalId,
+      first.orderGlobalId,
+    )
+    assert.deepEqual(
+      workspaceWithoutOrderSummaries.warehouses,
+      workspace.warehouses,
+    )
+    assert.deepEqual(
+      workspaceWithoutOrderSummaries.summary,
+      workspace.summary,
+    )
 
     const multiExternalOrderId = `multi-${randomUUID()}`
     const multiProof = proofInput(primary, multiExternalOrderId, { executionMode: 'shipped' })

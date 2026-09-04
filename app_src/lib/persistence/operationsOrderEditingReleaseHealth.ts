@@ -27,6 +27,313 @@ export const OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM =
 export const OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM =
   'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87'
 
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM =
+  '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e'
+
+export const OPERATIONS_FAIRE_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM =
+  '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1'
+
+export const OPERATIONS_ORDER_HISTORY_LINE_FIDELITY_MIGRATION_CHECKSUM =
+  '5d292963a5a8e4b117ff8a5388a660ed87e090d6e0239b3288bed9e506e8cc8d'
+
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL = String.raw`
+  artifacts(kind, identity, definition) AS (
+    SELECT 'column'::text,
+           installed_table.relname || '.' || installed_column.attnum::text
+             || '.' || installed_column.attname,
+           pg_catalog.concat_ws('|',
+             pg_catalog.format_type(
+               installed_column.atttypid, installed_column.atttypmod
+             ),
+             installed_column.attnotnull::text,
+             COALESCE(pg_catalog.pg_get_expr(
+               installed_default.adbin, installed_default.adrelid
+             ), ''),
+             installed_column.attidentity::text,
+             installed_column.attgenerated::text,
+             COALESCE(installed_collation.collname, '')
+           )
+    FROM (VALUES
+      (
+        'operations_commerce_order_observations',
+        'manual_provider_read_lease_id'
+      ),
+      (
+        'operations_commerce_order_event_observations',
+        'tracking_url'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'returned_quantity'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'title_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'variant_title_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'vendor_snapshot'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'unit_price_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'unit_price_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'subtotal_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'subtotal_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'discount_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'discount_minor'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'tax_currency'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'tax_minor'
+      )
+    ) required_column(table_name, column_name)
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = pg_catalog.to_regclass(
+        'public.' || required_column.table_name
+      )
+    JOIN pg_catalog.pg_attribute installed_column
+      ON installed_column.attrelid = installed_table.oid
+     AND installed_column.attname = required_column.column_name
+     AND installed_column.attnum > 0
+     AND NOT installed_column.attisdropped
+    LEFT JOIN pg_catalog.pg_attrdef installed_default
+      ON installed_default.adrelid = installed_column.attrelid
+     AND installed_default.adnum = installed_column.attnum
+    LEFT JOIN pg_catalog.pg_collation installed_collation
+      ON installed_collation.oid = installed_column.attcollation
+
+    UNION ALL
+    SELECT 'constraint'::text,
+           installed_table.relname || '.' || installed_constraint.conname,
+           pg_catalog.concat_ws('|',
+             installed_constraint.contype::text,
+             installed_constraint.convalidated::text,
+             installed_constraint.connoinherit::text,
+             installed_constraint.condeferrable::text,
+             installed_constraint.condeferred::text,
+             installed_constraint.confdeltype::text,
+             installed_constraint.confupdtype::text,
+             pg_catalog.pg_get_constraintdef(installed_constraint.oid, false)
+           )
+    FROM (VALUES
+      (
+        'operations_commerce_order_observations',
+        'commerce_order_observation_manual_read_lease_fkey'
+      ),
+      (
+        'operations_commerce_order_observations',
+        'commerce_order_observation_kind_v3_valid'
+      ),
+      (
+        'operations_commerce_order_observations',
+        'commerce_order_observation_source_lineage_valid'
+      ),
+      (
+        'operations_commerce_order_event_observations',
+        'commerce_order_event_tracking_url_valid'
+      ),
+      (
+        'operations_commerce_order_event_observations',
+        'commerce_order_event_sensitive_retention_valid'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'commerce_order_observation_line_returned_quantity_valid'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'commerce_order_observation_line_snapshots_valid'
+      ),
+      (
+        'operations_commerce_order_observation_lines',
+        'commerce_order_observation_line_money_valid'
+      )
+    ) required_constraint(table_name, constraint_name)
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = pg_catalog.to_regclass(
+        'public.' || required_constraint.table_name
+      )
+    JOIN pg_catalog.pg_constraint installed_constraint
+      ON installed_constraint.conrelid = installed_table.oid
+     AND installed_constraint.conname = required_constraint.constraint_name
+
+    UNION ALL
+    SELECT 'index'::text,
+           installed_table.relname || '.' || installed_index.relname,
+           pg_catalog.concat_ws('|',
+             installed_index_metadata.indisunique::text,
+             installed_index_metadata.indisprimary::text,
+             installed_index_metadata.indisvalid::text,
+             installed_index_metadata.indisready::text,
+             pg_catalog.pg_get_indexdef(installed_index.oid)
+           )
+    FROM pg_catalog.pg_class installed_index
+    JOIN pg_catalog.pg_index installed_index_metadata
+      ON installed_index_metadata.indexrelid = installed_index.oid
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = installed_index_metadata.indrelid
+    WHERE installed_index.oid = ANY(ARRAY[
+      pg_catalog.to_regclass(
+        'public.idx_commerce_order_observation_manual_read'
+      ),
+      pg_catalog.to_regclass(
+        'public.commerce_order_observation_source_lineage_unique'
+      )
+    ]::oid[])
+
+    UNION ALL
+    SELECT 'function'::text,
+           required_function.signature,
+           pg_catalog.concat_ws('|',
+             installed_namespace.nspname,
+             installed_language.lanname,
+             installed_function.prokind::text,
+             installed_function.provolatile::text,
+             installed_function.proparallel::text,
+             installed_function.proisstrict::text,
+             installed_function.prosecdef::text,
+             installed_function.proleakproof::text,
+             pg_catalog.pg_get_function_result(installed_function.oid),
+             installed_function.pronargs::text,
+             installed_function.pronargdefaults::text,
+             COALESCE(pg_catalog.array_to_string(
+               installed_function.proconfig, ','
+             ), ''),
+             pg_catalog.btrim(pg_catalog.regexp_replace(
+               installed_function.prosrc, '[[:space:]]+', ' ', 'g'
+             ))
+           )
+    FROM (VALUES
+      ('public.protect_commerce_order_observation_lineage()'),
+      ('public.commerce_order_observation_accepts_children(uuid,uuid)'),
+      ('public.protect_commerce_order_event_tracking_url()'),
+      ('public.reject_commerce_order_sync_evidence_mutation()'),
+      ('public.redact_expired_commerce_order_sensitive_evidence(integer)')
+    ) required_function(signature)
+    JOIN pg_catalog.pg_proc installed_function
+      ON installed_function.oid = pg_catalog.to_regprocedure(
+        required_function.signature
+      )
+    JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed_function.pronamespace
+    JOIN pg_catalog.pg_language installed_language
+      ON installed_language.oid = installed_function.prolang
+
+    UNION ALL
+    SELECT 'trigger'::text,
+           installed_table.relname || '.' || installed_trigger.tgname,
+           pg_catalog.concat_ws('|',
+             installed_trigger.tgtype::text,
+             installed_trigger.tgenabled::text,
+             installed_trigger.tgisinternal::text,
+             installed_trigger.tgconstraint::text,
+             function_namespace.nspname || '.' || trigger_function.proname
+               || '(' || pg_catalog.pg_get_function_identity_arguments(
+                 trigger_function.oid
+               ) || ')',
+             COALESCE(pg_catalog.pg_get_expr(
+               installed_trigger.tgqual, installed_trigger.tgrelid
+             ), ''),
+             pg_catalog.btrim(pg_catalog.regexp_replace(
+               pg_catalog.pg_get_triggerdef(installed_trigger.oid),
+               '[[:space:]]+', ' ', 'g'
+             ))
+           )
+    FROM pg_catalog.pg_trigger installed_trigger
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = installed_trigger.tgrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = installed_table.relnamespace
+    JOIN pg_catalog.pg_proc trigger_function
+      ON trigger_function.oid = installed_trigger.tgfoid
+    JOIN pg_catalog.pg_namespace function_namespace
+      ON function_namespace.oid = trigger_function.pronamespace
+    WHERE table_namespace.nspname = 'public'
+      AND installed_table.relname =
+        'operations_commerce_order_event_observations'
+      AND installed_trigger.tgname =
+        'commerce_order_event_tracking_url_guard'
+      AND NOT installed_trigger.tgisinternal
+  )
+`
+
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL =
+  String.raw`
+  WITH ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH =
+  '638fe20619a607f2e9009c7eecf230cbaad9ce255476134005ebed67a5f64840'
+
+const orderWorkbenchBaseExactHistoryHealthSql = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0340_operations_order_workbench_exact_history.sql'
+      AND checksum =
+        '${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM}'
+  )
+  AND EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0341_operations_faire_order_workbench_exact_history.sql'
+      AND checksum =
+        '${OPERATIONS_FAIRE_ORDER_WORKBENCH_EXACT_HISTORY_MIGRATION_CHECKSUM}'
+  )
+  AND EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0342_operations_order_history_line_fidelity.sql'
+      AND checksum =
+        '${OPERATIONS_ORDER_HISTORY_LINE_FIDELITY_MIGRATION_CHECKSUM}'
+  )
+  AND (
+    WITH ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACTS_SQL}
+    SELECT pg_catalog.count(*) =
+             ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT}
+      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+        pg_catalog.string_agg(
+          kind || '|' || identity || '|' || definition,
+          pg_catalog.chr(10) ORDER BY kind, identity
+        ), 'UTF8'
+      ), 'sha256'), 'hex') =
+        '${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH}'
+    FROM artifacts
+  )
+`
+
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
          installed_namespace.nspname || '.' || installed_table.relname
@@ -185,6 +492,141 @@ const tableTriggerArtifacts = (tableName: string) => String.raw`
   WHERE installed_namespace.nspname = 'public'
     AND installed_table.relname = '${tableName}'
     AND NOT installed_trigger.tgisinternal
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_MIGRATION_CHECKSUM =
+  '54dc59d7d00d225139341171066ce4f1b1b640a6c77d6d5aee5db845cac4a6b4'
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT = 42
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_HASH =
+  '5b448cb504fbc42d6dfe2f8ecef643bb0a5576255b30658f598d2be21a20a800'
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL = String.raw`
+  artifacts(kind, identity, definition) AS (
+    ${tableRelationArtifact('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableIndexArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${functionArtifacts([
+      'public.protect_commerce_order_tracking_url_evidence()',
+      'public.reject_commerce_order_tracking_url_evidence_mutation()',
+      'public.redact_expired_commerce_order_tracking_url_evidence(integer)',
+    ])}
+    UNION ALL
+    ${tableTriggerArtifacts('operations_commerce_order_tracking_url_evidence')}
+  )
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_FINGERPRINT_SQL = String.raw`
+  WITH ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0347_operations_commerce_order_tracking_url_evidence.sql'
+      AND checksum = '${OPERATIONS_TRACKING_URL_EVIDENCE_MIGRATION_CHECKSUM}'
+  ) AND (
+    WITH ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL}
+    SELECT pg_catalog.count(*) = ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT}
+      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+        pg_catalog.string_agg(
+          kind || '|' || identity || '|' || definition,
+          pg_catalog.chr(10) ORDER BY kind, identity
+        ), 'UTF8'
+      ), 'sha256'), 'hex') = '${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_HASH}'
+    FROM artifacts
+  )
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_MIGRATION_CHECKSUM =
+  '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT = 47
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH =
+  '2134de8f34c8e6d644363498fc46e06df25880d21aee29eeb6f1eb4ff4365c93'
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL = String.raw`
+  artifacts(kind, identity, definition) AS (
+    ${tableRelationArtifact('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableIndexArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${functionArtifacts([
+      'public.protect_commerce_order_native_activity_evidence()',
+      'public.reject_commerce_order_native_activity_evidence_mutation()',
+      'public.redact_expired_commerce_order_native_activity_evidence(integer)',
+      'public.protect_commerce_order_observation_lineage()',
+      'public.protect_shopify_order_webhook_read()',
+      'public.protect_shopify_order_webhook_target()',
+    ])}
+    UNION ALL
+    ${tableTriggerArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_observations')}
+      AND installed_column.attname IN (
+        'native_activity_state', 'native_activity_reason', 'native_activity_fetched_count'
+      )
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_observations')}
+      AND installed_constraint.conname = 'commerce_order_observation_native_activity_valid'
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_event_observations')}
+      AND installed_constraint.conname = 'commerce_order_event_kind_native_activity_valid'
+    UNION ALL
+    ${tableConstraintArtifacts('operations_shopify_order_webhook_reads')}
+      AND installed_constraint.conname = 'shopify_order_webhook_read_count_native_activity_valid'
+  )
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_FINGERPRINT_SQL = String.raw`
+  WITH ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0348_operations_commerce_native_activity_evidence.sql'
+      AND checksum = '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_MIGRATION_CHECKSUM}'
+  ) AND (
+    WITH ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL}
+    SELECT pg_catalog.count(*) = ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT}
+      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+        pg_catalog.string_agg(
+          kind || '|' || identity || '|' || definition,
+          pg_catalog.chr(10) ORDER BY kind, identity
+        ), 'UTF8'
+      ), 'sha256'), 'hex') = '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH}'
+    FROM artifacts
+  )
+`
+
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL = String.raw`
+  (${orderWorkbenchBaseExactHistoryHealthSql})
+  AND (${OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL})
+  AND (${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL})
 `
 
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACTS_SQL = String.raw`

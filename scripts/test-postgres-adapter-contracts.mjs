@@ -952,7 +952,7 @@ const crmSuiteCrmMeetingIngestion = read('app_src/lib/crm/suiteCrmMeetingIngesti
 assertIncludes(crmSuiteCrmMeetingIngestion, 'listSuiteCrmMeetingsUpdatedSince', 'native SuiteCRM meeting polling')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'hasMeaningfulChanges', 'SuiteCRM meeting echo prevention')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'crm:suitecrm-meeting-calendar:', 'SuiteCRM to Calendar update idempotency')
-assertIncludes(crmSuiteCrmMeetingIngestion, 'meetingCalendarOwnerEmail', 'original Calendar organizer routing')
+assertIncludes(crmSuiteCrmMeetingIngestion, 'resolveRecordedCrmMeetingCalendarCommunication', 'original reviewed Calendar routing')
 
 const crmSuiteCrmCallIngestion = read('app_src/lib/crm/suiteCrmCallIngestion.ts')
 assertIncludes(crmSuiteCrmCallIngestion, 'listSuiteCrmCallsUpdatedSince', 'native SuiteCRM Call polling')
@@ -995,8 +995,39 @@ assertIncludes(crmActionsRoute, 'requireResourceEditor', 'CRM action editor auth
 assertIncludes(crmActionsRoute, 'idempotency-key', 'CRM action idempotency header')
 
 const crmWriteRoute = read('app_src/app/api/crm/route.ts')
-assertIncludes(crmWriteRoute, 'enqueueCrmIntegrationAction', 'CRM meeting Calendar synchronization enqueue')
-assertIncludes(crmWriteRoute, 'crm:meeting-calendar-sync:', 'idempotent CRM meeting Calendar synchronization')
+assertIncludes(
+  crmWriteRoute,
+  'replayCrmMeetingSaveByIdempotencyKey',
+  'CRM meeting lost-response replay preflight',
+)
+assertIncludes(
+  crmWriteRoute,
+  'stageCrmMeetingAndEnqueueCalendarAction',
+  'atomic CRM meeting and Calendar action persistence',
+)
+assertIncludes(
+  crmWriteRoute,
+  "meetingSaveKey('calendar', pipeline.id, actor.email, meetingIdempotencyKey)",
+  'actor- and pipeline-scoped CRM meeting Calendar idempotency',
+)
+assertIncludes(
+  crmWriteRoute,
+  'clientRequestHash: meetingClientRequestHash as string',
+  'immutable CRM meeting replay-intent hash persistence',
+)
+assert.ok(
+  !crmWriteRoute.includes('enqueueCrmIntegrationAction'),
+  'CRM meeting route must not bypass atomic meeting and Calendar action persistence',
+)
+const crmMeetingReplayCall = crmWriteRoute.indexOf('const replay = await replayCrmMeetingSaveByIdempotencyKey')
+const crmMeetingHierarchyResolution = crmWriteRoute.indexOf('const hierarchy = await ensurePipelineCrmHierarchy')
+const crmMeetingCalendarResolution = crmWriteRoute.indexOf('let calendarCommunication:', crmMeetingReplayCall)
+assert.ok(
+  crmMeetingReplayCall >= 0
+    && crmMeetingHierarchyResolution > crmMeetingReplayCall
+    && crmMeetingCalendarResolution > crmMeetingReplayCall,
+  'CRM meeting replay must run before mutable hierarchy and Calendar resolution',
+)
 assertIncludes(crmWriteRoute, 'providerIdentities', 'visible CRM provider identities')
 assertIncludes(crmWriteRoute, 'calendarOwnerEmail', 'meeting Calendar organizer persistence')
 

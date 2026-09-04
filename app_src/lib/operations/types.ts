@@ -643,6 +643,61 @@ export type OperationsSummary = {
   unbilledMinor: string
 }
 
+export type OperationsNativeActivityCoverage = {
+  state: 'complete' | 'partial' | 'unavailable'
+  reason: string | null
+  fetchedCount: number
+  displayTruncated: boolean
+}
+
+export type OperationsProviderOrderHistory = {
+  observedAt: string | null
+  currency: string | null
+  providerTotalMinor: string | null
+  nativeActivity?: OperationsNativeActivityCoverage
+  currentLines: Array<{
+    externalLineId: string
+    externalProductId: string | null
+    externalVariantId: string | null
+    sku: string | null
+    titleSnapshot: string | null
+    variantTitleSnapshot: string | null
+    vendorSnapshot: string | null
+    orderedQuantity: number
+    currentQuantity: number | null
+    fulfilledQuantity: number | null
+    unfulfilledQuantity: number | null
+    returnedQuantity: number | null
+    requiresShipping: boolean | null
+    unitPriceCurrency: string | null
+    unitPriceMinor: string | null
+    subtotalCurrency: string | null
+    subtotalMinor: string | null
+    discountCurrency: string | null
+    discountMinor: string | null
+    taxCurrency: string | null
+    taxMinor: string | null
+  }>
+  events: Array<{
+    globalId: string
+    kind: string
+    status: string | null
+    occurredAt: string
+    externalSubjectId: string | null
+    quantity: number | null
+    amountMinor: number | null
+    currency: string | null
+    trackingCarrier: string | null
+    trackingNumber: string | null
+    trackingUrl: string | null
+    trackingRedacted: boolean
+    providerMessage?: string | null
+    providerActorDisplayName?: string | null
+    nativeActivityRedacted?: boolean
+  }>
+  providerWrites: 0
+}
+
 export type OperationsOrderListItem = {
   id: string
   globalId: string
@@ -650,16 +705,31 @@ export type OperationsOrderListItem = {
   customerName: string
   customerGlobalId: string
   sourceProvider: string
+  currency: string
   status: OperationsOrderStatus
   externallyFulfilled: boolean
   warehouseName: string | null
   promisedDeliveryAt: string | null
+  requestedDeliveryAt: string | null
+  providerPromisedDeliveryAt: string | null
+  providerDeliveryCoverage: 'complete' | 'partial' | 'unavailable' | null
+  providerDeliverySource:
+    | 'order.requestedDeliveryAt'
+    | 'fulfillment_order.deliveryMethod'
+    | 'unavailable'
+    | null
+  warehouseProvenance: 'fulfillment_plan' | 'provider_location_mapping' | null
   lineCount: number
+  /** Exact current sales-channel line count; local fulfillment demand stays in lineCount. */
+  providerLineCount: number | null
   exceptionCount: number
+  orderValueMinor: string | null
   expectedCostMinor: string | null
   expectedRevenueMinor: string | null
   expectedMarginMinor: string | null
   trackingNumber: string | null
+  /** Sales-channel creation time, falling back to ClawPilot intake time. */
+  orderedAt: string
   updatedAt: string
 }
 
@@ -798,6 +868,11 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     }
   shipTo: Address
   shipmentShipTo: OperationsOrderShipmentAddress
+  /**
+   * Current exact sales-channel evidence. This is read-only history and never
+   * replaces the immutable ClawPilot fulfillment demand in `lines`.
+   */
+  providerHistory: OperationsProviderOrderHistory | null
   lines: Array<{
     globalId: string
     productGlobalId: string
@@ -1016,7 +1091,9 @@ export type OperationsWorkspace = {
   storeSync: import('@/lib/operations/commerceStoreSync').CommerceStoreSyncControl[]
   summary: OperationsSummary
   importedOrders: OperationsImportedOrderWorkingCopy[]
+  importedOrderPage: OperationsImportedOrderPage
   orders: OperationsOrderListItem[]
+  orderPage: OperationsOrderPage
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
   warehouses: Array<{
@@ -1148,6 +1225,24 @@ export type OperationsWorkspace = {
   generatedAt: string
 }
 
+export type OperationsImportedOrderPage = {
+  total: number
+  returned: number
+  pageSize: number
+  nextCursor: string | null
+  complete: boolean
+  truncated: boolean
+}
+
+export type OperationsOrderPage = {
+  total: number
+  returned: number
+  pageSize: number
+  nextCursor: string | null
+  complete: boolean
+  truncated: boolean
+}
+
 export type OperationsImportedOrderWorkingCopy = {
   kind: 'imported_working_copy'
   globalId: string
@@ -1159,12 +1254,35 @@ export type OperationsImportedOrderWorkingCopy = {
   externalOrderId: string
   orderNumber: string
   status: 'imported'
+  providerState: {
+    lifecycle: 'open' | 'closed' | 'cancelled' | 'unknown'
+    fulfillment:
+      | 'unfulfilled'
+      | 'partial'
+      | 'fulfilled'
+      | 'on_hold'
+      | 'scheduled'
+      | 'cancelled'
+      | 'unknown'
+    observedAt: string
+    source: 'operational' | 'history' | 'retained'
+  }
   needsInfo: boolean
   blockerCodes: string[]
   customerName: string | null
+  /** Current active provider-location mapping, not fulfillment history. */
+  warehouseName: string | null
   lineCount: number
   sourceUpdatedAt: string
+  /** Sales-channel creation time, falling back to first observed time. */
+  orderedAt: string
+  updatedAt: string
+  trackingNumber: string | null
+  orderValueMinor: string | null
+  currency: string
   candidateRowVersion: number
+  workflowState: 'held' | 'resolving' | 'ready' | 'promoted' | 'failed' | 'expired'
+  actionAvailable: boolean
   rowVersion: number
   providerVersionChanged: boolean
   resolutionDetailsLoaded: boolean
@@ -1192,9 +1310,18 @@ export type OperationsImportedOrderWorkingCopy = {
   }
   lines: Array<{
     globalId: string
+    externalLineId: string
     title: string
     sku: string | null
+    /** Remaining provider quantity retained for existing fulfillment actions. */
     quantity: number
+    orderedQuantity: number
+    currentQuantity: number
+    cancelledOrRemovedQuantity: number
+    fulfilledQuantity: number
+    unfulfilledQuantity: number
+    returnedQuantity: number
+    providerStatus: 'open' | 'cancelled' | 'fulfilled' | 'returned' | 'unknown'
     unitMultiplier: number
     requiresShipping: boolean
     mappingStatus:
@@ -1211,6 +1338,7 @@ export type OperationsImportedOrderWorkingCopy = {
     packageProfileGlobalId: string | null
     blockerCodes: string[]
   }>
+  providerHistory: OperationsProviderOrderHistory
   productOptions: Array<{
     globalId: string
     name: string

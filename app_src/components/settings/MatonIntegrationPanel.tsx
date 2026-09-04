@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import Alert from '@mui/material/Alert'
 import Autocomplete from '@mui/material/Autocomplete'
 import Box from '@mui/material/Box'
@@ -12,6 +12,7 @@ import DialogActions from '@mui/material/DialogActions'
 import DialogContent from '@mui/material/DialogContent'
 import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
+import MenuItem from '@mui/material/MenuItem'
 import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
@@ -36,6 +37,92 @@ type ApiPayload = {
   authorizationUrl?: string
   credential?: ApiMatonCredential
   platformCredentialAvailable?: boolean
+}
+
+type CommunicationApp = 'google-mail' | 'google-calendar'
+
+type ApiCommunicationBinding = {
+  organizationId?: string | null
+  app?: string | null
+  connectionId?: string | null
+  accountEmail?: string | null
+  identityEmail?: string | null
+  calendarId?: string | null
+  status?: string | null
+  verifiedAt?: string | null
+}
+
+type ApiCommunicationConnection = {
+  connectionId?: string | null
+  name?: string | null
+  app?: string | null
+  accountEmail?: string | null
+  selectedForUser?: boolean
+  selectionError?: string | null
+  gmailSendAsIdentities?: Array<{
+    email?: string | null
+    verificationStatus?: string | null
+    isPrimary?: boolean
+    isDefault?: boolean
+  }> | null
+  calendars?: Array<{
+    id?: string | null
+    summary?: string | null
+    primary?: boolean
+    accessRole?: string | null
+  }> | null
+}
+
+type ApiCommunicationState = {
+  organizationId?: string | null
+  bindings?: ApiCommunicationBinding[] | null
+  availableConnections?: ApiCommunicationConnection[] | null
+}
+
+type ApiCommunicationPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  canManage?: boolean
+  communication?: ApiCommunicationState
+}
+
+type OrganizationCommunicationBinding = {
+  app: CommunicationApp
+  connectionId: string
+  accountEmail: string
+  identityEmail: string
+  calendarId: string | null
+  status: string
+  verifiedAt: string | null
+}
+
+type OrganizationCommunicationConnection = {
+  connectionId: string
+  name: string
+  app: CommunicationApp
+  accountEmail: string
+  selectedForUser: boolean
+  selectionError: string
+  gmailSendAsIdentities: Array<{
+    email: string
+    verificationStatus: string
+    isPrimary: boolean
+    isDefault: boolean
+  }>
+  calendars: Array<{
+    id: string
+    summary: string
+    primary: boolean
+    accessRole: string
+  }>
+}
+
+type OrganizationCommunicationState = {
+  canManage: boolean
+  organizationId: string
+  bindings: OrganizationCommunicationBinding[]
+  availableConnections: OrganizationCommunicationConnection[]
 }
 
 type ApiMatonConnection = {
@@ -116,6 +203,10 @@ const CONNECTIONS: ConnectionDefinition[] = [
 ]
 
 const CONNECTION_OPTIONS = CONNECTIONS.filter(({ app }) => app !== 'google-sheets' && app !== 'google-drive')
+const COMMUNICATION_APPS = [
+  { app: 'google-mail' as const, label: 'Gmail', identityLabel: 'Gmail send-as address' },
+  { app: 'google-calendar' as const, label: 'Google Calendar', identityLabel: 'Calendar organizer' },
+]
 const MATON_APP_PATTERN = /^[a-z][a-z0-9-]{0,63}$/
 
 const fieldSx = {
@@ -138,6 +229,80 @@ async function requestMaton(init?: RequestInit): Promise<ApiPayload> {
   const result = await response.json().catch(() => ({})) as ApiPayload
   if (!response.ok || !result.ok) throw new Error(result.error || 'Maton request failed')
   return result
+}
+
+async function requestOrganizationCommunications(
+  init?: RequestInit,
+  app?: CommunicationApp,
+  canManageFallback = false,
+): Promise<OrganizationCommunicationState> {
+  const path = app
+    ? `/api/integrations/communications?app=${encodeURIComponent(app)}`
+    : '/api/integrations/communications'
+  const response = await fetch(path, init)
+  const result = await response.json().catch(() => ({})) as ApiCommunicationPayload
+  if (!response.ok || !result.ok || !result.communication) {
+    throw new Error(result.error || 'Unable to load organization communication identities')
+  }
+  const bindings = Array.isArray(result.communication.bindings)
+    ? result.communication.bindings
+    : []
+  const availableConnections = Array.isArray(result.communication.availableConnections)
+    ? result.communication.availableConnections
+    : []
+  return {
+    canManage: typeof result.canManage === 'boolean' ? result.canManage : canManageFallback,
+    organizationId: String(result.communication.organizationId || '').trim(),
+    bindings: bindings.flatMap((binding) => {
+      const app = String(binding.app || '').trim().toLowerCase()
+      const connectionId = String(binding.connectionId || '').trim()
+      if ((app !== 'google-mail' && app !== 'google-calendar') || !connectionId) return []
+      return [{
+        app,
+        connectionId,
+        accountEmail: String(binding.accountEmail || '').trim(),
+        identityEmail: String(binding.identityEmail || '').trim(),
+        calendarId: binding.calendarId ? String(binding.calendarId) : null,
+        status: String(binding.status || 'disabled').trim().toLowerCase(),
+        verifiedAt: binding.verifiedAt ? String(binding.verifiedAt) : null,
+      } satisfies OrganizationCommunicationBinding]
+    }),
+    availableConnections: availableConnections.flatMap((connection) => {
+      const app = String(connection.app || '').trim().toLowerCase()
+      const connectionId = String(connection.connectionId || '').trim()
+      if ((app !== 'google-mail' && app !== 'google-calendar') || !connectionId) return []
+      return [{
+        connectionId,
+        name: String(connection.name || '').trim() || appDisplayLabel(app),
+        app,
+        accountEmail: String(connection.accountEmail || '').trim(),
+        selectedForUser: connection.selectedForUser === true,
+        selectionError: String(connection.selectionError || '').trim(),
+        gmailSendAsIdentities: (Array.isArray(connection.gmailSendAsIdentities)
+          ? connection.gmailSendAsIdentities
+          : []).flatMap((identity) => {
+          const email = String(identity.email || '').trim().toLowerCase()
+          if (!isEmail(email)) return []
+          return [{
+            email,
+            verificationStatus: String(identity.verificationStatus || '').trim().toLowerCase(),
+            isPrimary: identity.isPrimary === true,
+            isDefault: identity.isDefault === true,
+          }]
+        }),
+        calendars: (Array.isArray(connection.calendars) ? connection.calendars : []).flatMap((calendar) => {
+          const id = String(calendar.id || '').trim()
+          if (!id) return []
+          return [{
+            id,
+            summary: String(calendar.summary || '').trim() || id,
+            primary: calendar.primary === true,
+            accessRole: String(calendar.accessRole || '').trim().toLowerCase(),
+          }]
+        }),
+      } satisfies OrganizationCommunicationConnection]
+    }),
+  }
 }
 
 function maskConnectionId(value: unknown) {
@@ -248,6 +413,42 @@ function statusColor(status: string): 'default' | 'success' | 'warning' | 'error
   return 'default'
 }
 
+function communicationConnectionLabel(connection: OrganizationCommunicationConnection) {
+  return [connection.name, connection.accountEmail].filter(Boolean).join(' · ')
+}
+
+function communicationBinding(
+  state: OrganizationCommunicationState | null,
+  app: CommunicationApp,
+) {
+  return state?.bindings.find((binding) => binding.app === app) || null
+}
+
+function communicationConnections(
+  state: OrganizationCommunicationState | null,
+  app: CommunicationApp,
+) {
+  return state?.availableConnections.filter((connection) => connection.app === app) || []
+}
+
+function verifiedGmailSendAsIdentities(connection: OrganizationCommunicationConnection | undefined) {
+  return connection?.gmailSendAsIdentities.filter(
+    (identity) => identity.verificationStatus === 'accepted' || identity.isPrimary,
+  ) || []
+}
+
+function gmailSendAsStatusLabel(value: string) {
+  if (value === 'accepted') return 'Verified'
+  if (value === 'pending') return 'Pending'
+  if (value === 'failed' || value === 'rejected') return 'Failed'
+  return cleanStatus(value, false)
+}
+
+function calendarOptionLabel(calendar: OrganizationCommunicationConnection['calendars'][number]) {
+  const suffix = calendar.primary ? 'Primary' : calendar.id
+  return `${calendar.summary} · ${suffix}`
+}
+
 function validHttpsUrl(value: string) {
   try {
     return new URL(value).protocol === 'https:'
@@ -265,6 +466,20 @@ export default function MatonIntegrationPanel({
 }) {
   const dateTimeSettings = useUserDateTime()
   const [integration, setIntegration] = useState<MatonIntegration | null>(null)
+  const [communication, setCommunication] = useState<OrganizationCommunicationState | null>(null)
+  const [communicationLoading, setCommunicationLoading] = useState(true)
+  const [communicationError, setCommunicationError] = useState('')
+  const [communicationAttemptErrors, setCommunicationAttemptErrors] = useState<Partial<Record<CommunicationApp, string>>>({})
+  const [communicationConnectionsByApp, setCommunicationConnectionsByApp] = useState<Record<CommunicationApp, string>>({
+    'google-mail': '',
+    'google-calendar': '',
+  })
+  const communicationConnectionsRef = useRef<Record<CommunicationApp, string>>({
+    'google-mail': '',
+    'google-calendar': '',
+  })
+  const [gmailIdentity, setGmailIdentity] = useState('')
+  const [calendarId, setCalendarId] = useState('')
   const [loginEmail, setLoginEmail] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [connectionApp, setConnectionApp] = useState('')
@@ -287,24 +502,83 @@ export default function MatonIntegrationPanel({
       || integration?.connections.length,
   )
 
+  const applyCommunicationState = useCallback((next: OrganizationCommunicationState) => {
+    setCommunication(next)
+    const nextConnectionIds = { ...communicationConnectionsRef.current }
+    for (const { app } of COMMUNICATION_APPS) {
+      const available = communicationConnections(next, app)
+      const bound = communicationBinding(next, app)
+      const existingStillAvailable = available.some(
+        (connection) => connection.connectionId === communicationConnectionsRef.current[app],
+      )
+      nextConnectionIds[app] = existingStillAvailable
+        ? communicationConnectionsRef.current[app]
+        : bound?.connectionId
+          || available.find((connection) => connection.selectedForUser)?.connectionId
+          || available[0]?.connectionId
+          || ''
+    }
+    communicationConnectionsRef.current = nextConnectionIds
+    setCommunicationConnectionsByApp(nextConnectionIds)
+
+    const gmailBinding = communicationBinding(next, 'google-mail')
+    const selectedGmail = communicationConnections(next, 'google-mail').find(
+      (connection) => connection.connectionId === nextConnectionIds['google-mail'],
+    )
+    const verifiedSendAs = verifiedGmailSendAsIdentities(selectedGmail)
+    setGmailIdentity(
+      gmailBinding?.connectionId === nextConnectionIds['google-mail']
+        ? gmailBinding.identityEmail
+        : verifiedSendAs.find((identity) => identity.isDefault)?.email
+          || verifiedSendAs[0]?.email
+          || '',
+    )
+
+    const calendarBinding = communicationBinding(next, 'google-calendar')
+    const selectedCalendarConnection = communicationConnections(next, 'google-calendar').find(
+      (connection) => connection.connectionId === nextConnectionIds['google-calendar'],
+    )
+    setCalendarId(
+      calendarBinding?.connectionId === nextConnectionIds['google-calendar']
+        ? calendarBinding.calendarId || ''
+        : selectedCalendarConnection?.calendars.find((calendar) => calendar.primary)?.id
+          || selectedCalendarConnection?.calendars[0]?.id
+          || '',
+    )
+  }, [])
+
   useEffect(() => {
     let active = true
     setLoading(true)
+    setCommunicationLoading(true)
     setError('')
-    getIntegration()
-      .then((next) => {
+    setCommunicationError('')
+    Promise.allSettled([getIntegration(), requestOrganizationCommunications()])
+      .then(([integrationResult, communicationResult]) => {
         if (!active) return
-        setIntegration(next)
-        setLoginEmail(next.loginEmail)
-      })
-      .catch((loadError) => {
-        if (active) setError(messageFrom(loadError, 'Unable to load Maton settings'))
+        if (integrationResult.status === 'fulfilled') {
+          setIntegration(integrationResult.value)
+          setLoginEmail(integrationResult.value.loginEmail)
+        } else {
+          setError(messageFrom(integrationResult.reason, 'Unable to load Maton settings'))
+        }
+        if (communicationResult.status === 'fulfilled') {
+          applyCommunicationState(communicationResult.value)
+        } else {
+          setCommunicationError(messageFrom(
+            communicationResult.reason,
+            'Unable to load organization communication identities',
+          ))
+        }
       })
       .finally(() => {
-        if (active) setLoading(false)
+        if (active) {
+          setLoading(false)
+          setCommunicationLoading(false)
+        }
       })
     return () => { active = false }
-  }, [])
+  }, [applyCommunicationState])
 
   function startAction(key: string) {
     setPendingAction(key)
@@ -368,11 +642,25 @@ export default function MatonIntegrationPanel({
   }
 
   async function refreshConnections() {
-    await patchIntegration(
+    const next = await patchIntegration(
       'refresh-connections',
       { action: 'refresh-connections' },
       'Maton connections refreshed.',
     )
+    if (!next) return
+    setCommunicationLoading(true)
+    setCommunicationError('')
+    try {
+      applyCommunicationState(await requestOrganizationCommunications())
+      setCommunicationAttemptErrors({})
+    } catch (refreshError) {
+      setCommunicationError(messageFrom(
+        refreshError,
+        'Unable to refresh organization communication identities',
+      ))
+    } finally {
+      setCommunicationLoading(false)
+    }
   }
 
   async function importPlatformCredential() {
@@ -428,6 +716,60 @@ export default function MatonIntegrationPanel({
       { action: 'select-connection', connectionId: connection.connectionId },
       'Default Maton connection updated.',
     )
+  }
+
+  async function bindCommunication(app: CommunicationApp) {
+    const connectionId = communicationConnectionsByApp[app]
+    const identityEmail = gmailIdentity.trim()
+    if (
+      busy
+      || !connectionId
+      || (app === 'google-mail' && !isEmail(identityEmail))
+      || (app === 'google-calendar' && !calendarId)
+    ) return
+    startAction(`bind-communication:${app}`)
+    setCommunicationAttemptErrors((current) => ({ ...current, [app]: undefined }))
+    try {
+      const next = await requestOrganizationCommunications({
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'bind',
+          app,
+          connectionId,
+          ...(app === 'google-mail' ? { gmailSendAsEmail: identityEmail } : {}),
+          ...(app === 'google-calendar' ? { calendarId } : {}),
+        }),
+      }, undefined, communication?.canManage === true)
+      applyCommunicationState(next)
+      setNotice(`${appDisplayLabel(app)} connected to the active organization.`)
+    } catch (bindError) {
+      const message = messageFrom(bindError, `Unable to connect ${appDisplayLabel(app)}`)
+      setCommunicationAttemptErrors((current) => ({ ...current, [app]: message }))
+      setCommunicationError(message)
+    } finally {
+      finishAction()
+    }
+  }
+
+  async function disconnectCommunication(app: CommunicationApp) {
+    if (busy) return
+    startAction(`disconnect-communication:${app}`)
+    setCommunicationAttemptErrors((current) => ({ ...current, [app]: undefined }))
+    try {
+      const next = await requestOrganizationCommunications({
+        method: 'DELETE',
+        headers: { Accept: 'application/json' },
+      }, app, communication?.canManage === true)
+      applyCommunicationState(next)
+      setNotice(`${appDisplayLabel(app)} disconnected from the active organization.`)
+    } catch (disconnectError) {
+      const message = messageFrom(disconnectError, `Unable to disconnect ${appDisplayLabel(app)}`)
+      setCommunicationAttemptErrors((current) => ({ ...current, [app]: message }))
+      setCommunicationError(message)
+    } finally {
+      finishAction()
+    }
   }
 
   async function disconnect() {
@@ -499,6 +841,292 @@ export default function MatonIntegrationPanel({
             Disconnect
           </Button>
         </Stack>
+      </Box>
+
+      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+
+      <Box component="section" aria-labelledby="organization-communications-heading">
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          spacing={1}
+          alignItems={{ xs: 'stretch', sm: 'center' }}
+          justifyContent="space-between"
+          mb={1.5}
+        >
+          <Box minWidth={0}>
+            <Typography id="organization-communications-heading" variant="subtitle1" color="text.primary" fontWeight={700}>
+              Organization communication identities
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Choose the Gmail sender and Calendar organizer independently for the active organization.
+            </Typography>
+          </Box>
+          <Button
+            variant="outlined"
+            startIcon={pendingAction === 'refresh-connections' ? <CircularProgress size={16} /> : <RefreshRounded />}
+            onClick={() => { void refreshConnections() }}
+            disabled={busy || !hasApiKey}
+            sx={commandButtonSx}
+          >
+            Refresh status
+          </Button>
+        </Stack>
+
+        {communicationError ? (
+          <Alert
+            severity="error"
+            onClose={() => setCommunicationError('')}
+            sx={{ mb: 1.5, borderRadius: '8px' }}
+          >
+            {communicationError}
+          </Alert>
+        ) : null}
+
+        {communicationLoading ? (
+          <Box display="grid" sx={{ minHeight: 120, placeItems: 'center' }}>
+            <CircularProgress size={24} aria-label="Loading organization communication identities" />
+          </Box>
+        ) : communication?.canManage ? (
+          <Stack spacing={1.5} aria-live="polite">
+            {COMMUNICATION_APPS.map(({ app, label, identityLabel }) => {
+              const binding = communicationBinding(communication, app)
+              const connections = communicationConnections(communication, app)
+              const selectedConnectionId = communicationConnectionsByApp[app]
+              const selectedConnection = connections.find(
+                (connection) => connection.connectionId === selectedConnectionId,
+              )
+              const verifiedSendAs = verifiedGmailSendAsIdentities(selectedConnection)
+              const calendars = selectedConnection?.calendars || []
+              const pending = pendingAction === `bind-communication:${app}`
+                || pendingAction === `disconnect-communication:${app}`
+              const failed = communicationAttemptErrors[app]
+              const status = pending
+                ? 'Pending'
+                : failed || selectedConnection?.selectionError
+                  ? 'Failed'
+                  : binding?.status === 'active'
+                    ? 'Active'
+                    : binding
+                      ? 'Disabled'
+                      : 'Not connected'
+              return (
+                <Box
+                  key={app}
+                  sx={{
+                    border: '1px solid rgba(255,255,255,0.09)',
+                    borderRadius: '8px',
+                    p: 1.5,
+                    backgroundColor: '#171720',
+                  }}
+                >
+                  <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" mb={1.25}>
+                    <Stack direction="row" spacing={0.75} alignItems="center">
+                      {app === 'google-mail'
+                        ? <EmailRounded sx={{ fontSize: 20, color: 'primary.main' }} />
+                        : <ExtensionRounded sx={{ fontSize: 20, color: 'primary.main' }} />}
+                      <Typography variant="subtitle2" color="text.primary" fontWeight={700}>{label}</Typography>
+                    </Stack>
+                    <Chip
+                      size="small"
+                      label={status}
+                      color={pending ? 'warning' : failed ? 'error' : statusColor(status)}
+                      variant="outlined"
+                    />
+                  </Stack>
+
+                  <Stack spacing={1.25}>
+                    {selectedConnection?.selectionError ? (
+                      <Alert severity="error" sx={{ borderRadius: '8px' }}>
+                        {selectedConnection.selectionError}
+                      </Alert>
+                    ) : null}
+                    <TextField
+                      select
+                      size="small"
+                      label={`${label} connection`}
+                      value={selectedConnectionId}
+                      onChange={(event) => {
+                        const connectionId = event.target.value
+                        const nextConnectionIds = {
+                          ...communicationConnectionsRef.current,
+                          [app]: connectionId,
+                        }
+                        communicationConnectionsRef.current = nextConnectionIds
+                        setCommunicationConnectionsByApp(nextConnectionIds)
+                        if (app === 'google-mail') {
+                          const selected = connections.find((connection) => connection.connectionId === connectionId)
+                          const identities = verifiedGmailSendAsIdentities(selected)
+                          setGmailIdentity(
+                            identities.find((identity) => identity.isDefault)?.email
+                              || identities[0]?.email
+                              || '',
+                          )
+                        } else {
+                          const selected = connections.find((connection) => connection.connectionId === connectionId)
+                          setCalendarId(
+                            selected?.calendars.find((calendar) => calendar.primary)?.id
+                              || selected?.calendars[0]?.id
+                              || '',
+                          )
+                        }
+                      }}
+                      disabled={busy || connections.length === 0}
+                      helperText={connections.length === 0
+                        ? `No active ${label} connections. Add or refresh one below.`
+                        : binding
+                          ? `Bound account: ${binding.accountEmail}`
+                          : 'Choose the provider account for this organization.'}
+                      sx={fieldSx}
+                    >
+                      {binding && !connections.some((connection) => connection.connectionId === binding.connectionId) ? (
+                        <MenuItem value={binding.connectionId} disabled>Current connection unavailable</MenuItem>
+                      ) : null}
+                      {connections.map((connection) => (
+                        <MenuItem key={connection.connectionId} value={connection.connectionId}>
+                          {communicationConnectionLabel(connection)}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+
+                    {app === 'google-mail' ? (
+                      <Stack spacing={1}>
+                        <TextField
+                          select
+                          size="small"
+                          label={identityLabel}
+                          value={gmailIdentity}
+                          onChange={(event) => setGmailIdentity(event.target.value)}
+                          helperText={verifiedSendAs.length > 0
+                            ? 'Used for email sent by this organization.'
+                            : 'No verified Gmail send-as addresses are available on this connection.'}
+                          disabled={busy || verifiedSendAs.length === 0}
+                          sx={fieldSx}
+                        >
+                          {binding?.connectionId === selectedConnectionId
+                            && binding.identityEmail
+                            && !verifiedSendAs.some((identity) => identity.email === binding.identityEmail) ? (
+                              <MenuItem value={binding.identityEmail} disabled>Current sender unavailable</MenuItem>
+                            ) : null}
+                          {verifiedSendAs.map((identity) => (
+                            <MenuItem key={identity.email} value={identity.email}>
+                              {identity.email}{identity.isDefault ? ' · Default' : ''}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        {selectedConnection?.gmailSendAsIdentities
+                          .filter((identity) => identity.verificationStatus !== 'accepted' && !identity.isPrimary)
+                          .map((identity) => (
+                            <Chip
+                              key={identity.email}
+                              size="small"
+                              variant="outlined"
+                              color={identity.verificationStatus === 'pending' ? 'warning' : 'error'}
+                              label={`${identity.email} · ${gmailSendAsStatusLabel(identity.verificationStatus)}`}
+                              sx={{ alignSelf: 'flex-start', maxWidth: '100%' }}
+                            />
+                          ))}
+                        <Typography variant="caption" color="text.secondary">
+                          Gmail send-as applies to email. Calendar invitations use the organizer calendar below.
+                        </Typography>
+                      </Stack>
+                    ) : (
+                      <Stack spacing={1.25}>
+                        <TextField
+                          select
+                          size="small"
+                          label="Organizer calendar"
+                          value={calendarId}
+                          onChange={(event) => setCalendarId(event.target.value)}
+                          helperText={calendars.length > 0
+                            ? 'New invitations are created on this calendar.'
+                            : 'No writable calendars are available on this connection.'}
+                          disabled={busy || calendars.length === 0}
+                          sx={fieldSx}
+                        >
+                          {binding?.connectionId === selectedConnectionId
+                            && binding.calendarId
+                            && !calendars.some((calendar) => calendar.id === binding.calendarId) ? (
+                              <MenuItem value={binding.calendarId} disabled>Current calendar unavailable</MenuItem>
+                            ) : null}
+                          {calendars.map((calendar) => (
+                            <MenuItem key={calendar.id} value={calendar.id}>
+                              {calendarOptionLabel(calendar)}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        <TextField
+                          size="small"
+                          label={identityLabel}
+                          value={binding?.status === 'active'
+                            && binding.connectionId === selectedConnectionId
+                            && binding.calendarId === calendarId
+                            ? binding.identityEmail
+                            : 'Verified when connected'}
+                          helperText={binding?.status === 'active'
+                            && binding.connectionId === selectedConnectionId
+                            && binding.calendarId === calendarId
+                            ? `Connected account: ${binding.accountEmail}`
+                            : 'The selected calendar determines the Google invitation organizer.'}
+                          disabled
+                          sx={fieldSx}
+                        />
+                      </Stack>
+                    )}
+
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="flex-end">
+                      {binding ? (
+                        <Button
+                          size="small"
+                          color="error"
+                          variant="text"
+                          onClick={() => { void disconnectCommunication(app) }}
+                          disabled={busy}
+                          sx={commandButtonSx}
+                        >
+                          Disconnect
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="small"
+                        variant="contained"
+                        startIcon={pendingAction === `bind-communication:${app}` ? <CircularProgress size={16} color="inherit" /> : <CheckRounded />}
+                        onClick={() => { void bindCommunication(app) }}
+                        disabled={
+                          busy
+                          || !selectedConnectionId
+                          || (app === 'google-mail' && !isEmail(gmailIdentity))
+                          || (app === 'google-calendar' && !calendarId)
+                        }
+                        sx={commandButtonSx}
+                      >
+                        {binding ? `Update ${label}` : `Connect ${label}`}
+                      </Button>
+                    </Stack>
+                    {failed ? <Typography variant="caption" color="error">{failed}</Typography> : null}
+                    {binding?.verifiedAt ? (
+                      <Typography variant="caption" color="text.disabled">
+                        Verified {formatUpdatedAt(binding.verifiedAt, dateTimeSettings)}
+                      </Typography>
+                    ) : null}
+                  </Stack>
+                </Box>
+              )
+            })}
+            {communication.organizationId ? (
+              <Typography variant="caption" color="text.disabled" sx={{ overflowWrap: 'anywhere' }}>
+                Active organization ID: {communication.organizationId}
+              </Typography>
+            ) : null}
+          </Stack>
+        ) : communication ? (
+          <Alert severity="info" sx={{ borderRadius: '8px' }}>
+            Organization defaults can only be changed by an organization owner or access administrator.
+          </Alert>
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            Organization communication identities are not available for this role.
+          </Typography>
+        )}
       </Box>
 
       <Box sx={{ mt: 2 }}>
@@ -672,7 +1300,7 @@ export default function MatonIntegrationPanel({
 
       <Box component="section" aria-labelledby="maton-connections-heading">
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.25}>
-          <Typography id="maton-connections-heading" variant="subtitle2" color="text.primary" fontWeight={700}>Connections</Typography>
+          <Typography id="maton-connections-heading" variant="subtitle2" color="text.primary" fontWeight={700}>Personal Maton connections</Typography>
         </Box>
 
         {!hasApiKey ? (

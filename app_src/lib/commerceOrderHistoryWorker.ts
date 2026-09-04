@@ -1,9 +1,11 @@
 import { readCommerceOrderHistoryPage } from '@/lib/integrations/commerceOrderHistory'
+import { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS } from '@/lib/integrations/commerceOrderHistoryReadLimits'
 import {
   appendCommerceOrderBackfillPageInPostgres,
   claimCommerceOrderBackfillsInPostgres,
   ensureContinuousCommerceOrderPollsInPostgres,
   failCommerceOrderBackfillInPostgres,
+  materializeDeferredCommerceOrderHistoryRefreshesInPostgres,
   parkCommerceOrderBackfillForStoreSyncPauseInPostgres,
   readCommerceOrderBackfillCursorFromPostgres,
   readCommerceOrderSyncCursorKeyReadinessFromPostgres,
@@ -14,10 +16,10 @@ import {
   withCommerceStoreSyncProviderReadFenceInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 
-// One Shopify page is bounded to token + identity + list + five exact-order
-// reads. Failed page attempts reserve that entire envelope because the adapter
+// One Shopify page is bounded to token + identity + list + one exact order
+// and two optional native-activity pages. Failed attempts reserve the envelope because the adapter
 // cannot report how many provider reads completed before it rejected.
-const MAX_PROVIDER_READS_PER_PAGE = 8
+const MAX_PROVIDER_READS_PER_PAGE = SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS
 const MAX_PAGE_ATTEMPTS_PER_RUN = 24
 const MAX_PROVIDER_READ_RESERVATIONS_PER_RUN =
   MAX_PROVIDER_READS_PER_PAGE * MAX_PAGE_ATTEMPTS_PER_RUN
@@ -69,6 +71,11 @@ export async function processCommerceOrderHistory(input: {
   const limit = Math.max(1, Math.min(Number(input.limit || 1), 2))
   const sensitiveEvidenceRedaction =
     await redactExpiredCommerceOrderSensitiveEvidenceInPostgres({ limit: 250 })
+  // Full-history intent has priority over opening a new continuous-poll slot.
+  // The second pass below consumes an intent released by a poll that reaches a
+  // terminal state during this same drain.
+  const deferredBeforeClaim =
+    await materializeDeferredCommerceOrderHistoryRefreshesInPostgres({ limit })
   const continuousScheduling =
     await ensureContinuousCommerceOrderPollsInPostgres({ limit })
   let succeeded = 0
@@ -213,12 +220,22 @@ export async function processCommerceOrderHistory(input: {
     })
     if (!jobs.length) drainStopReason = 'queue_empty'
   }
+  const deferredAfterDrain =
+    await materializeDeferredCommerceOrderHistoryRefreshesInPostgres({ limit })
   const [health, cursorKeyReadiness] = await Promise.all([
     readCommerceOrderSyncHealthFromPostgres(),
     readCommerceOrderSyncCursorKeyReadinessFromPostgres(),
   ])
   return {
     scheduled: continuousScheduling.scheduled,
+    deferredHistoricalRefreshes: {
+      beforeClaim: deferredBeforeClaim.materialized,
+      afterDrain: deferredAfterDrain.materialized,
+      materialized:
+        deferredBeforeClaim.materialized + deferredAfterDrain.materialized,
+      skipped: deferredBeforeClaim.skipped + deferredAfterDrain.skipped,
+      providerWrites: 0 as const,
+    },
     claimed,
     claimWaves,
     pageAttempts,

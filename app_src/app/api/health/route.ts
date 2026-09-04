@@ -109,6 +109,7 @@ import {
 } from '@/lib/persistence/operationsPrintPhysicalOutputHealth'
 import {
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL,
 } from '@/lib/persistence/operationsOrderEditingReleaseHealth'
 import {
   reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
@@ -3078,6 +3079,21 @@ export async function GET() {
     if (String(process.env.MATON_GMAIL_CONNECTION_ID || '').length < 8) {
       errors.push('Hosted runtime Maton Gmail connection is not configured.')
     }
+    const authGmailConnectionId = String(process.env.MATON_AUTH_GMAIL_CONNECTION_ID || '').trim()
+    const authMailFrom = String(process.env.CLAWPILOT_AUTH_MAIL_FROM || '').trim()
+    if (Boolean(authGmailConnectionId) !== Boolean(authMailFrom)) {
+      errors.push('Hosted runtime authentication Gmail connection and sender must be configured together.')
+    } else if (authGmailConnectionId) {
+      if (authGmailConnectionId.length < 8 || authGmailConnectionId.length > 512 || !/^[\x21-\x7e]+$/.test(authGmailConnectionId)) {
+        errors.push('Hosted runtime authentication Gmail connection is invalid.')
+      }
+      if (authGmailConnectionId === String(process.env.MATON_GMAIL_CONNECTION_ID || '').trim()) {
+        errors.push('Hosted runtime authentication Gmail connection must differ from the platform Gmail connection.')
+      }
+      if (authMailFrom.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authMailFrom) || /[\r\n]/.test(authMailFrom)) {
+        errors.push('Hosted runtime authentication mail sender is invalid.')
+      }
+    }
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
     }
@@ -3251,6 +3267,7 @@ export async function GET() {
           crm_identity_hierarchy_migration_applied: boolean
           pipeline_sheet_links_migration_applied: boolean
           crm_integrations_migration_applied: boolean
+          organization_email_sender_selection_applied: boolean
           crm_board_projection_migration_applied: boolean
           account_membership_migration_applied: boolean
           suitecrm_inbound_sync_migration_applied: boolean
@@ -3431,6 +3448,8 @@ export async function GET() {
           operations_commerce_order_revision_apply_applied: boolean
           operations_one_off_carrier_selection_applied: boolean
           operations_commerce_order_sync_foundation_applied: boolean
+          operations_commerce_order_history_followups_applied: boolean
+          operations_order_workbench_exact_history_applied: boolean
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
@@ -3563,6 +3582,26 @@ export async function GET() {
                 FROM schema_migrations
                 WHERE filename = '0023_crm_modules_references_and_integrations.sql'
               ) AS crm_integrations_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM public.schema_migrations
+                WHERE filename = '0346_organization_email_sender_selection.sql'
+                  AND checksum =
+                    '2c10df72a620bd2f78ed472846b56841c77ba69836e61fd13b8533590e154e81'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_constraint installed_email_sender_constraint
+                WHERE installed_email_sender_constraint.conrelid =
+                    pg_catalog.to_regclass('public.crm_integration_actions')
+                  AND installed_email_sender_constraint.conname =
+                    'crm_integration_actions_communication_snapshot_valid'
+                  AND installed_email_sender_constraint.contype = 'c'
+                  AND installed_email_sender_constraint.convalidated
+                  AND pg_catalog.pg_get_constraintdef(
+                    installed_email_sender_constraint.oid
+                  ) LIKE '%email-override%'
+              ) AS organization_email_sender_selection_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -5520,6 +5559,96 @@ export async function GET() {
                 )
               )
                 AS operations_commerce_order_sync_foundation_applied,
+              EXISTS (
+                SELECT 1
+                FROM public.schema_migrations
+                WHERE filename =
+                  '0343_operations_commerce_order_history_followups.sql'
+                  AND checksum =
+                    '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (
+                  VALUES
+                    (
+                      'historical_refresh_requested_at',
+                      'timestamp with time zone',
+                      'YES'
+                    ),
+                    ('historical_refresh_requested_by', 'text', 'YES'),
+                    ('historical_refresh_idempotency_key', 'text', 'YES')
+                ) AS required_history_followup_column(
+                  column_name, data_type, is_nullable
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM information_schema.columns installed_followup_column
+                  WHERE installed_followup_column.table_schema = 'public'
+                    AND installed_followup_column.table_name =
+                      'operations_commerce_order_sync_policies'
+                    AND installed_followup_column.column_name =
+                      required_history_followup_column.column_name
+                    AND installed_followup_column.data_type =
+                      required_history_followup_column.data_type
+                    AND installed_followup_column.is_nullable =
+                      required_history_followup_column.is_nullable
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint installed_followup_constraint
+                WHERE installed_followup_constraint.conrelid = to_regclass(
+                    'public.operations_commerce_order_sync_policies'
+                  )
+                  AND installed_followup_constraint.conname =
+                    'commerce_order_sync_policy_history_request_valid'
+                  AND installed_followup_constraint.contype = 'c'
+                  AND installed_followup_constraint.convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_class installed_followup_index_class
+                JOIN pg_index installed_followup_index
+                  ON installed_followup_index.indexrelid =
+                    installed_followup_index_class.oid
+                WHERE installed_followup_index_class.relname =
+                  'idx_commerce_order_history_refresh_followups'
+                  AND installed_followup_index.indrelid = to_regclass(
+                    'public.operations_commerce_order_sync_policies'
+                  )
+                  AND installed_followup_index.indisvalid
+                  AND installed_followup_index.indisready
+                  AND pg_get_indexdef(
+                    installed_followup_index.indexrelid
+                  ) LIKE '%(historical_refresh_requested_at, organization_id, integration_account_id)%'
+                  AND pg_get_expr(
+                    installed_followup_index.indpred,
+                    installed_followup_index.indrelid
+                  ) = '(historical_refresh_requested_at IS NOT NULL)'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_class installed_stream_head_index_class
+                JOIN pg_index installed_stream_head_index
+                  ON installed_stream_head_index.indexrelid =
+                    installed_stream_head_index_class.oid
+                WHERE installed_stream_head_index_class.relname =
+                  'idx_commerce_order_backfill_stream_head'
+                  AND installed_stream_head_index.indrelid = to_regclass(
+                    'public.operations_commerce_order_backfill_sessions'
+                  )
+                  AND installed_stream_head_index.indisvalid
+                  AND installed_stream_head_index.indisready
+                  AND pg_get_indexdef(
+                    installed_stream_head_index.indexrelid
+                  ) LIKE '%(organization_id, integration_account_id, session_kind, created_at DESC, id DESC)%'
+              )
+                AS operations_commerce_order_history_followups_applied,
+              (
+                ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}
+              )
+                AS operations_order_workbench_exact_history_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8165,6 +8294,8 @@ export async function GET() {
             : null
         const orderHistoryHealth =
           row?.operations_commerce_order_sync_foundation_applied
+          && row?.operations_commerce_order_history_followups_applied
+          && row?.operations_order_workbench_exact_history_applied
             ? await Promise.all([
                 readCommerceOrderSyncHealthFromPostgres(),
                 readCommerceOrderSyncCursorKeyReadinessFromPostgres(),
@@ -8200,6 +8331,7 @@ export async function GET() {
             && row?.crm_identity_hierarchy_migration_applied
             && row?.pipeline_sheet_links_migration_applied
             && row?.crm_integrations_migration_applied
+            && row?.organization_email_sender_selection_applied
             && row?.crm_board_projection_migration_applied
             && row?.account_membership_migration_applied
             && row?.suitecrm_inbound_sync_migration_applied
@@ -8368,6 +8500,8 @@ export async function GET() {
             && row?.operations_commerce_order_revision_apply_applied
             && row?.operations_one_off_carrier_selection_applied
             && row?.operations_commerce_order_sync_foundation_applied
+            && row?.operations_commerce_order_history_followups_applied
+            && row?.operations_order_workbench_exact_history_applied
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
@@ -8416,6 +8550,7 @@ export async function GET() {
           },
           orderEditing: {
             status: row?.operations_order_editing_release_applied
+              && row?.operations_order_workbench_exact_history_applied
               ? 'ready'
               : 'migration-structure-or-ledger-pending',
           },
@@ -8539,6 +8674,8 @@ export async function GET() {
             failed: durable.failed,
             blocked: durable.blocked,
             dead: durable.dead,
+            historicalDead: durable.historicalDead,
+            historicalBlocked: durable.historicalBlocked,
             overduePolls: durable.overduePolls,
             expiredSensitiveEvidence: durable.expiredSensitiveEvidence,
             cursorKeysReady: cursorKeys.ready === true,
@@ -8748,6 +8885,7 @@ export async function GET() {
           || !row?.crm_identity_hierarchy_migration_applied
           || !row?.pipeline_sheet_links_migration_applied
           || !row?.crm_integrations_migration_applied
+          || !row?.organization_email_sender_selection_applied
           || !row?.crm_board_projection_migration_applied
           || !row?.account_membership_migration_applied
           || !row?.suitecrm_inbound_sync_migration_applied
@@ -8916,6 +9054,8 @@ export async function GET() {
           || !row?.operations_commerce_order_revision_apply_applied
           || !row?.operations_one_off_carrier_selection_applied
           || !row?.operations_commerce_order_sync_foundation_applied
+          || !row?.operations_commerce_order_history_followups_applied
+          || !row?.operations_order_workbench_exact_history_applied
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied

@@ -8,7 +8,13 @@ import {
   type SuiteCrmInteractionModule,
 } from '@/lib/crm/types'
 import { isIso4217CurrencyCode } from '@/lib/currency'
-import { enqueueCrmIntegrationAction } from '@/lib/crm/integrationActions'
+import {
+  CrmIntegrationActionError,
+  crmIntegrationClientRequestHash,
+  replayCrmMeetingSaveByIdempotencyKey,
+  stageCrmMeetingAndEnqueueCalendarAction,
+} from '@/lib/crm/integrationActions'
+import { resolveVerifiedPipelineCalendarSelection } from '@/lib/integrations/organizationCommunications'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 import {
   archiveCrmRecordInPostgres,
@@ -27,10 +33,13 @@ import {
 import { listWorkspaceOrganizationHierarchy, workspaceOrganizationById } from '@/lib/organizations'
 import { suiteCrmAdminPortalUrl, suiteCrmAdminUsername } from '@/lib/crm/suiteCrmPublicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { readMatonCredentialStateFromPostgres } from '@/lib/persistence/matonCredentials'
+import {
+  OrganizationCommunicationPersistenceError,
+  resolvePipelineCommunicationSnapshotInPostgres,
+} from '@/lib/persistence/organizationCommunications'
 import { readMeasurementPreferences } from '@/lib/persistence/measurementPreferences'
 import { operationsCapabilities } from '@/lib/operations/authorization'
-import { requireRequestUser } from '@/lib/requestUser'
+import { requestSession, requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 import {
   PIPELINE_SELECTION_COOKIE,
@@ -150,10 +159,69 @@ async function selectedPipeline(req: NextRequest, actor: AppUser) {
     .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
 }
 
+async function exactRequestActor(req: NextRequest) {
+  const session = await requestSession(req)
+  if (session?.impersonating || (session && session.authenticatedUser !== session.effectiveUser)) {
+    throw Object.assign(new Error('Exit user view before changing CRM records'), {
+      status: 403,
+      code: 'CRM_IMPERSONATION_FORBIDDEN',
+    })
+  }
+  return requireRequestUser(req)
+}
+
+function meetingSaveIdempotencyKey(req: NextRequest, body: Record<string, unknown>) {
+  const bodyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : ''
+  const headerKey = (req.headers.get('idempotency-key') || '').trim()
+  if (body.idempotencyKey !== undefined && typeof body.idempotencyKey !== 'string') {
+    throw new CrmIntegrationActionError(
+      'Meeting save idempotency key is invalid',
+      400,
+      'CRM_MEETING_IDEMPOTENCY_INVALID',
+    )
+  }
+  if (bodyKey && headerKey && bodyKey !== headerKey) {
+    throw new CrmIntegrationActionError(
+      'Meeting save idempotency key fields do not match',
+      400,
+      'CRM_MEETING_IDEMPOTENCY_MISMATCH',
+    )
+  }
+  const key = bodyKey || headerKey
+  if (key.length < 8 || key.length > 200 || /\s|[\u0000-\u001f\u007f]/.test(key)) {
+    throw new CrmIntegrationActionError(
+      'Meeting save requires a valid idempotency key',
+      400,
+      'CRM_MEETING_IDEMPOTENCY_REQUIRED',
+    )
+  }
+  return key
+}
+
+function meetingSaveKey(namespace: string, pipelineId: string, actorEmail: string, idempotencyKey: string) {
+  const digest = crypto.createHash('sha256')
+    .update(`${pipelineId}\n${actorEmail}\n${idempotencyKey}`)
+    .digest('hex')
+  return `crm:meeting-${namespace}:${digest}`
+}
+
 function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : 'CRM request failed'
-  const status = message === 'Unauthorized' ? 401 : /view-only|denied/i.test(message) ? 403 : /not found/i.test(message) ? 404 : 400
-  return NextResponse.json({ ok: false, error: message }, { status })
+  const shaped = error as { status?: unknown; code?: unknown }
+  const status = Number.isInteger(shaped?.status)
+    ? Number(shaped.status)
+    : message === 'Unauthorized'
+      ? 401
+      : /view-only|denied/i.test(message)
+        ? 403
+        : /not found/i.test(message)
+          ? 404
+          : 400
+  return NextResponse.json({
+    ok: false,
+    error: message,
+    ...(typeof shaped?.code === 'string' ? { code: shaped.code } : {}),
+  }, { status })
 }
 
 export async function GET(req: NextRequest) {
@@ -184,7 +252,15 @@ export async function GET(req: NextRequest) {
       })
     }
     await ensurePipelineCrmReferenceLinks(pipeline.id)
-    const [records, summary, workspaceHierarchy, matonCredential, pipelineUsers, campaignRecipients] = await Promise.all([
+    const [
+      records,
+      summary,
+      workspaceHierarchy,
+      googleMailIdentity,
+      googleCalendarIdentity,
+      pipelineUsers,
+      campaignRecipients,
+    ] = await Promise.all([
       listCrmRecordsInPostgres({
         pipelineId: pipeline.id,
         entity,
@@ -196,17 +272,21 @@ export async function GET(req: NextRequest) {
       }),
       readCrmSummaryFromPostgres(pipeline.id),
       listWorkspaceOrganizationHierarchy(actor),
-      readMatonCredentialStateFromPostgres(actor.email),
+      resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        app: 'google-mail',
+      }).catch(() => null),
+      resolvePipelineCommunicationSnapshotInPostgres({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        app: 'google-calendar',
+      }).catch(() => null),
       listCrmPipelineUsersInPostgres(pipeline.id),
       relatedEntity === 'campaigns' && relatedId
         ? listCrmCampaignRecipientsInPostgres({ pipelineId: pipeline.id, campaignId: relatedId })
         : Promise.resolve([]),
     ])
-    const selectedProviderEmail = (app: string) => matonCredential.connections.find((connection) => (
-      connection.app === app
-      && connection.status === 'ACTIVE'
-      && connection.selected
-    ))?.accountEmail || null
     return NextResponse.json({
       ok: true,
       entity,
@@ -226,8 +306,16 @@ export async function GET(req: NextRequest) {
       canManageHierarchy: organizationRole === 'owner' || organizationRole === 'admin',
       canManageProductIdentities: operationsCapabilities(actor).canManage,
       providerIdentities: {
-        googleMail: selectedProviderEmail('google-mail'),
-        googleCalendar: selectedProviderEmail('google-calendar'),
+        googleMail: googleMailIdentity?.identityEmail || null,
+        googleCalendar: googleCalendarIdentity?.identityEmail || null,
+        googleMailSendAsEmail: googleMailIdentity?.identityEmail || null,
+        googleMailConnectionId: googleMailIdentity?.connectionId || null,
+        googleMailAccountEmail: googleMailIdentity?.accountEmail || null,
+        googleCalendarOrganizer: googleCalendarIdentity?.identityEmail || null,
+        googleCalendarConnectionId: googleCalendarIdentity?.connectionId || null,
+        googleCalendarId: googleCalendarIdentity?.calendarId || null,
+        googleMailSource: googleMailIdentity?.source || null,
+        googleCalendarSource: googleCalendarIdentity?.source || null,
       },
       suiteCrmPunchoutUrl: canOpenSuiteCrm ? '/api/crm/punchout' : null,
       suiteCrmUsername: canOpenSuiteCrm ? suiteCrmAdminUsername() : null,
@@ -241,14 +329,49 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   try {
-    const actor = await requireRequestUser(req)
+    const actor = await exactRequestActor(req)
     const pipeline = await selectedPipeline(req, actor)
     requireResourceEditor(pipeline)
-    const hierarchy = await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
     const body = await req.json()
     const entity = entityValue(body?.entity)
     const fields = objectValue(body?.fields)
-    let sourceKey = `app:${entity}:${crypto.randomUUID()}`
+    const meetingIdempotencyKey = entity === 'meetings'
+      ? meetingSaveIdempotencyKey(req, body as Record<string, unknown>)
+      : null
+    const meetingCalendarActionKey = meetingIdempotencyKey
+      ? meetingSaveKey('calendar', pipeline.id, actor.email, meetingIdempotencyKey)
+      : null
+    const meetingClientRequestHash = meetingIdempotencyKey
+      ? crmIntegrationClientRequestHash({
+          contract: 'crm-meeting-save-v1',
+          pipelineId: pipeline.id,
+          actorEmail: actor.email,
+          entity: 'meetings',
+          id: body?.id ?? null,
+          fields,
+        })
+      : null
+    if (meetingCalendarActionKey && meetingClientRequestHash) {
+      const replay = await replayCrmMeetingSaveByIdempotencyKey({
+        pipelineId: pipeline.id,
+        actorEmail: actor.email,
+        idempotencyKey: meetingCalendarActionKey,
+        clientRequestHash: meetingClientRequestHash,
+      })
+      if (replay) {
+        return NextResponse.json({
+          ok: true,
+          queued: ['queued', 'processing', 'failed'].includes(replay.action.status),
+          record: replay.staged,
+          calendarAction: replay.action,
+          calendarActionUnavailable: null,
+        })
+      }
+    }
+    const hierarchy = await ensurePipelineCrmHierarchy({ pipelineId: pipeline.id, actorEmail: actor.email })
+    let sourceKey = meetingIdempotencyKey
+      ? meetingSaveKey('record', pipeline.id, actor.email, meetingIdempotencyKey)
+      : `app:${entity}:${crypto.randomUUID()}`
     let current: Awaited<ReturnType<typeof readCrmRecordReference>> | null = null
     if (body?.id) {
       current = await readCrmRecordReference({ pipelineId: pipeline.id, entity, id: String(body.id) })
@@ -465,14 +588,77 @@ export async function POST(req: NextRequest) {
       const meetingStatus = ['planned', 'queued', 'scheduled', 'completed', 'cancelled', 'failed'].includes(String(fields.status))
         ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
         : 'planned'
-      const storedCalendarOwner = validEmail(current?.sourcePayload?.calendarOwnerEmail)
-      const calendarOwnerEmail = storedCalendarOwner || actor.email
-      const staged = await stageCrmRecordInPostgres({
+      const meetingMode = stringValue(fields.meetingMode, 32) || 'google_meet'
+      if (!['google_meet', 'in_person', 'custom_link'].includes(meetingMode)) {
+        throw new Error('Meeting mode must be Google Meet, in person, or custom link')
+      }
+      const meetingLocation = stringValue(fields.location, 500)
+      const customJoinUrlInput = stringValue(fields.customJoinUrl, 2000)
+      let customJoinUrl = ''
+      if (customJoinUrlInput) {
+        try {
+          const parsed = new URL(customJoinUrlInput)
+          if (parsed.protocol !== 'https:') throw new Error('not HTTPS')
+          customJoinUrl = parsed.toString()
+        } catch {
+          throw new Error('Custom meeting URL must be a valid HTTPS URL')
+        }
+      }
+      if (meetingMode === 'in_person' && !meetingLocation) {
+        throw new Error('An in-person meeting requires a location')
+      }
+      if (meetingMode === 'custom_link' && !customJoinUrl) {
+        throw new Error('A custom-link meeting requires a valid HTTPS meeting URL')
+      }
+      const calendarConnectionId = stringValue(fields.calendarConnectionId, 512)
+      const selectedCalendarId = stringValue(fields.calendarId, 1024)
+      const hasCalendarOverride = Boolean(calendarConnectionId || selectedCalendarId)
+      if (Boolean(calendarConnectionId) !== Boolean(selectedCalendarId)) {
+        throw new Error('Per-meeting Calendar selection requires both a connection and writable calendar')
+      }
+      let calendarCommunication: Awaited<ReturnType<typeof resolvePipelineCommunicationSnapshotInPostgres>> | null = null
+      let calendarActionUnavailable: { code: string; message: string } | null = null
+      try {
+        calendarCommunication = hasCalendarOverride
+          ? await resolveVerifiedPipelineCalendarSelection({
+              pipelineId: pipeline.id,
+              actorEmail: actor.email,
+              connectionId: calendarConnectionId,
+              calendarId: selectedCalendarId,
+            })
+          : await resolvePipelineCommunicationSnapshotInPostgres({
+              pipelineId: pipeline.id,
+              actorEmail: actor.email,
+              app: 'google-calendar',
+            })
+      } catch (error) {
+        if (
+          error instanceof OrganizationCommunicationPersistenceError
+          && error.code === 'ORGANIZATION_COMMUNICATION_CONNECTION_REQUIRED'
+        ) {
+          calendarActionUnavailable = {
+            code: 'CRM_COMMUNICATION_CONNECTION_REQUIRED',
+            message: 'Configure an active Google Calendar connection for this organization',
+          }
+        } else {
+          throw error
+        }
+      }
+      const calendarOwnerEmail = calendarCommunication?.credentialOwnerEmail || actor.email
+      const meetingStageInput = {
         entity, pipelineId: pipeline.id, localId: current?.id, sourceKey, actorEmail: actor.email,
         sourcePayload: {
           ...(current?.sourcePayload || {}),
           source: 'clawpilot',
           calendarOwnerEmail,
+          calendarConnectionId: calendarCommunication?.connectionId || null,
+          calendarOrganizerEmail: calendarCommunication?.identityEmail || null,
+          calendarId: calendarCommunication?.calendarId || null,
+          calendarDeliveryStatus: calendarCommunication ? 'queued' : 'not-configured',
+          calendarDeliveryError: null,
+          calendarDeliveryFailure: null,
+          meetingMode,
+          customJoinUrl: customJoinUrl || null,
         },
         fields: {
           organizationId: resolvedOrganization?.id || null,
@@ -480,35 +666,62 @@ export async function POST(req: NextRequest) {
           contactId: contact?.id || null, leadId: lead?.id || null, opportunityId: opportunity?.id || null,
           parentSuiteCrmId, parentSuiteCrmType, subject,
           description: stringValue(fields.description, 10_000), startsAt, endsAt,
-          timezone: meetingTimezone, location: stringValue(fields.location, 500),
+          timezone: meetingTimezone, location: meetingLocation,
           attendeeEmails: meetingAttendees,
           status: meetingStatus,
           provider: stringValue(fields.provider, 100), externalEventId: stringValue(fields.externalEventId, 500) || null,
-          externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null, joinUrl: stringValue(fields.joinUrl, 2000) || null,
+          externalEventUrl: stringValue(fields.externalEventUrl, 2000) || null,
+          joinUrl: customJoinUrl || stringValue(fields.joinUrl, 2000) || null,
         },
-      })
-      const calendarAction = await enqueueCrmIntegrationAction({
-          pipelineId: pipeline.id,
-          actorEmail: calendarOwnerEmail,
-          actionType: 'create_calendar_event',
-          referenceCode: staged.referenceCode,
-          payload: {
-            subject,
-            description: stringValue(fields.description, 10_000),
-            startsAt,
-            endsAt,
-            timezone: meetingTimezone,
-            location: stringValue(fields.location, 500),
-            attendeeEmails: meetingAttendees,
-            meetingStatus,
-          },
-          idempotencyKey: `crm:meeting-calendar-sync:${staged.referenceCode}:${staged.sourceHash}`,
+      } as const
+      const calendarPayload = {
+        subject,
+        description: stringValue(fields.description, 10_000),
+        startsAt,
+        endsAt,
+        timezone: meetingTimezone,
+        location: meetingLocation,
+        attendeeEmails: meetingAttendees,
+        meetingStatus,
+        meetingMode,
+        customJoinUrl: customJoinUrl || null,
+      }
+      const previousCalendarSource = current?.sourcePayload || {}
+      const previousCalendar = current?.externalEventId
+        && typeof previousCalendarSource.calendarOwnerEmail === 'string'
+        && typeof previousCalendarSource.calendarConnectionId === 'string'
+        && typeof previousCalendarSource.calendarId === 'string'
+        ? {
+            eventId: current.externalEventId,
+            credentialOwnerEmail: previousCalendarSource.calendarOwnerEmail,
+            connectionId: previousCalendarSource.calendarConnectionId,
+            calendarId: previousCalendarSource.calendarId,
+            organizerEmail: typeof previousCalendarSource.calendarOrganizerEmail === 'string'
+              ? previousCalendarSource.calendarOrganizerEmail
+              : null,
+          }
+        : undefined
+      let staged: Awaited<ReturnType<typeof stageCrmRecordInPostgres>>
+      let calendarAction: Awaited<ReturnType<typeof stageCrmMeetingAndEnqueueCalendarAction>> | null = null
+      if (calendarCommunication) {
+        calendarAction = await stageCrmMeetingAndEnqueueCalendarAction({
+          stageInput: meetingStageInput,
+          payload: calendarPayload,
+          idempotencyKey: meetingCalendarActionKey as string,
+          clientRequestHash: meetingClientRequestHash as string,
+          communication: calendarCommunication,
+          previousCalendar,
         })
+        staged = calendarAction.staged
+      } else {
+        staged = await stageCrmRecordInPostgres(meetingStageInput)
+      }
       return NextResponse.json({
         ok: true,
-        queued: true,
+        queued: Boolean(calendarAction && ['queued', 'processing', 'failed'].includes(calendarAction.action.status)),
         record: staged,
         calendarAction: calendarAction?.action || null,
+        calendarActionUnavailable,
       }, { status: body?.id ? 200 : 201 })
     }
 
@@ -612,7 +825,7 @@ export async function POST(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   try {
-    const actor = await requireRequestUser(req)
+    const actor = await exactRequestActor(req)
     const pipeline = await selectedPipeline(req, actor)
     requireResourceEditor(pipeline)
     const body = await req.json()

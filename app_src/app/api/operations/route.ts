@@ -7,6 +7,13 @@ import {
 import {
   canUsePhysicalOutputAttestationBrowserSession,
 } from '@/lib/operations/physicalOutputAttestationAuthorization'
+import {
+  isOperationsOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+} from '@/lib/operations/orderListQuery'
 import type {
   Address,
   MockOperationsProofInput,
@@ -141,7 +148,10 @@ const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
-const ORDER_STATUSES = new Set<OperationsOrderStatus>([
+const EXTERNAL_FULFILLMENT_STATUS = 'fulfilled_externally' as const
+type OperationsOrderFilter = OperationsOrderStatus | typeof EXTERNAL_FULFILLMENT_STATUS
+const ORDER_STATUSES = new Set<OperationsOrderFilter>([
+  EXTERNAL_FULFILLMENT_STATUS,
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
 ])
@@ -1092,7 +1102,7 @@ export async function GET(req: NextRequest) {
       }, 403)
     }
     const statusValue = String(req.nextUrl.searchParams.get('status') || '').trim()
-    if (statusValue && !ORDER_STATUSES.has(statusValue as OperationsOrderStatus)) {
+    if (statusValue && !ORDER_STATUSES.has(statusValue as OperationsOrderFilter)) {
       requestError('OPERATIONS_STATUS_INVALID', 'Order status is invalid')
     }
     const exceptionStatusValue = String(req.nextUrl.searchParams.get('exceptionStatus') || '').trim()
@@ -1107,6 +1117,69 @@ export async function GET(req: NextRequest) {
     if (search.length > 100 || /[\u0000-\u001f\u007f]/.test(search)) {
       requestError('OPERATIONS_SEARCH_INVALID', 'Order search is invalid')
     }
+    const sortValue = String(
+      req.nextUrl.searchParams.get('sort') || 'updated',
+    ).trim()
+    if (!isOperationsOrderSort(sortValue)) {
+      requestError('OPERATIONS_ORDER_SORT_INVALID', 'Order sort is invalid')
+    }
+    const directionValue = String(
+      req.nextUrl.searchParams.get('direction') || 'desc',
+    ).trim()
+    if (!isOperationsOrderSortDirection(directionValue)) {
+      requestError(
+        'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+        'Order sort direction is invalid',
+      )
+    }
+    const providerValue = String(
+      req.nextUrl.searchParams.get('provider') || '',
+    ).trim()
+    if (providerValue && !isOperationsOrderProviderFilter(providerValue)) {
+      requestError(
+        'OPERATIONS_ORDER_PROVIDER_INVALID',
+        'Order provider is invalid',
+      )
+    }
+    const trackingValue = String(
+      req.nextUrl.searchParams.get('tracking') || '',
+    ).trim()
+    if (
+      trackingValue
+      && !isOperationsOrderTrackingFilter(trackingValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+        'Order tracking filter is invalid',
+      )
+    }
+    const tracking = isOperationsOrderTrackingFilter(trackingValue)
+      ? trackingValue
+      : null
+    const updatedAfterValue = String(
+      req.nextUrl.searchParams.get('updatedAfter') || '',
+    ).trim()
+    if (
+      updatedAfterValue
+      && !isOperationsOrderUpdatedAfter(updatedAfterValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+        'Order updated-after value is invalid',
+      )
+    }
+    const includeOrderSummariesValue = String(
+      req.nextUrl.searchParams.get('includeOrderSummaries') || '',
+    ).trim()
+    if (
+      includeOrderSummariesValue
+      && !['true', 'false'].includes(includeOrderSummariesValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_SUMMARY_MODE_INVALID',
+        'Order summary mode is invalid',
+      )
+    }
     const operations = await readOperationsWorkspaceFromPostgres({
       organizationId,
       actorEmail: actor.email,
@@ -1120,7 +1193,13 @@ export async function GET(req: NextRequest) {
       canPurchaseLivePostage:
         shippingCapabilities(actor).canPurchaseLivePostage,
       search,
-      status: statusValue || null,
+      status: (statusValue as OperationsOrderFilter) || null,
+      sort: sortValue,
+      direction: directionValue,
+      provider: providerValue || null,
+      tracking,
+      updatedAfter: updatedAfterValue || null,
+      includeOrderSummaries: includeOrderSummariesValue !== 'false',
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })

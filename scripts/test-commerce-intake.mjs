@@ -981,6 +981,10 @@ includes(shopifyQuerySource, [
   'phone',
   'shippingAddress',
   'shippingLine',
+  'fulfillmentOrders(first: ${SHOPIFY_ORDER_FULFILLMENT_PAGE_SIZE}, displayable: true)',
+  'deliveryMethod {',
+  'minDeliveryDateTime',
+  'maxDeliveryDateTime',
   'customer {',
   'purchasingEntity {',
   'taxable',
@@ -1026,9 +1030,20 @@ assert.doesNotMatch(
 includes(serviceSource, [
   "hasEffectiveShopifyScope(\n    grant.grantedScopes,\n    'read_customers'",
   "hasEffectiveShopifyScope(\n    probe.grantedScopes,\n    'read_customers'",
-  'shopifyOrderQuery(includeCustomerIdentity)',
-  'shopifyOrdersQuery(includeCustomerIdentity)',
+  'includeFulfillmentDeliveryPromise',
+  'shopifyOrderQuery(',
+  'shopifyOrdersQuery(',
+  'effectiveShopifyFulfillmentOrderReadScopes(',
+  "'read_merchant_managed_fulfillment_orders'",
+  "'read_third_party_fulfillment_orders'",
+  "'read_assigned_fulfillment_orders'",
+  "'read_marketplace_fulfillment_orders'",
 ], 'Shopify protected customer-data query gating')
+assert.match(
+  serviceSource,
+  /SHOPIFY_FULFILLMENT_ORDER_READ_SCOPES\.filter\(\(scope\) =>/,
+  'Shopify delivery windows retain the exact mutually partitioned fulfillment-order scopes that are effective',
+)
 includes(serviceSource, [
   "hasEffectiveShopifyScope(grant.grantedScopes, 'read_products')",
   "hasEffectiveShopifyScope(probe.grantedScopes, 'read_products')",
@@ -1137,6 +1152,17 @@ for (const providerWrite of [
 }
 
 const persistenceSource = read('app_src/lib/persistence/commerceIntake.ts')
+const shopifyAutomaticPromotionPolicy = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
+)
+assert.equal(
+  shopifyAutomaticPromotionPolicy
+    .automaticShopifyPromotionHoldRequiresAttention(
+      'order_terminal_no_demand',
+    ),
+  false,
+  'A provider-terminal Shopify order is retained as status evidence without creating operator promotion work',
+)
 const productChannelStateSource = read(
   'app_src/lib/persistence/productChannelStates.ts',
 )
@@ -1376,6 +1402,16 @@ const productCandidateReadSource = persistenceSource.slice(
   ),
 )
 includes(productCandidateReadSource, [
+  "candidate.workflow_state <> 'promoted'",
+  'candidate.canonical_order_id IS NULL',
+  'FROM operations_orders canonical',
+  'canonical.external_order_id = candidate.external_order_id',
+  'FROM operations_external_identifiers external',
+  "external.entity_type = 'operations.order'",
+  "external.status = 'active'",
+  'external.external_id = candidate.external_order_id',
+  'FROM operations_commerce_order_candidates promoted_history',
+  "promoted_history.workflow_state = 'promoted'",
   "candidate.mapping_state <> 'resolved'",
   "IN ('held', 'resolving', 'ready')",
   "WHERE latest.mapping_state <> 'resolved'\n               AND latest.workflow_state IN ('held', 'resolving')",
@@ -2183,9 +2219,15 @@ includes(persistenceSource, [
 assert.equal(
   persistenceSource.match(/await lockCommerceOrderIdentity\(client, \{/gu)
     ?.length,
-  3,
-  'Staging, attention marking, and promotion must share the same order identity lock',
+  2,
+  'Staging and attention marking must share the order identity lock',
 )
+includes(persistenceSource, [
+  'assertCommerceOrderProviderNonterminalWithClient',
+  'await lockCommerceOrderIdentity(client, input)',
+  "'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL'",
+  '`commerce-order-observation:${input.organizationId}`',
+], 'Promotion terminal-evidence guard shares staging and observation locks')
 includes(persistenceSource, [
   "rejection.resourceType === 'order'",
   'rejection.externalId === refreshTarget.rows[0].external_order_id',
@@ -2959,13 +3001,26 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/shopifyCommerceNormalizer': {
         SHOPIFY_COMMERCE_NORMALIZER_VERSION:
-          'shopify-commerce-normalizer-v5',
+          'shopify-commerce-normalizer-v6',
         normalizeShopifyCommerce(source) {
           normalizedSources.shopify = source
           const result = envelope(
             'shopify',
             source.data.orders.nodes.map((order) => order.id),
           )
+          result.orders = result.orders.map((order, index) => ({
+            ...order,
+            canonicalStates: {
+              lifecycle: source.data.orders.nodes[index]?.closed
+                ? 'closed'
+                : 'open',
+              fulfillment:
+                source.data.orders.nodes[index]?.displayFulfillmentStatus
+                  === 'FULFILLED'
+                  ? 'fulfilled'
+                  : 'unfulfilled',
+            },
+          }))
           result.products = source.data.products.nodes.map((product) => ({
             identity: { value: product.id },
             sourceHash: product.id.endsWith('/1')
@@ -3010,6 +3065,7 @@ const service = loadTypeScriptModule(
               'read_all_orders',
               'read_orders',
               'read_products',
+              'read_merchant_managed_fulfillment_orders',
             ],
           }
         },
@@ -3021,6 +3077,7 @@ const service = loadTypeScriptModule(
               'read_all_orders',
               'read_orders',
               'read_products',
+              'read_merchant_managed_fulfillment_orders',
             ],
           }
         },
@@ -3028,7 +3085,12 @@ const service = loadTypeScriptModule(
           providerReads.shopifyGraphql += 1
           assert.doesNotMatch(request.query, /\bmutation\b/i)
           if (request.operationName === 'ClawPilotCommerceOrders') {
-            assert.match(request.variables.query, /^status:open/)
+            assert.match(
+              request.query,
+              /fulfillmentOrders\(first: 20, displayable: true\)/,
+            )
+            assert.match(request.query, /maxDeliveryDateTime/)
+            assert.match(request.variables.query, /^status:any/)
             assert.doesNotMatch(request.variables.query, /\btest:false\b/)
             if (!request.variables.after) {
               return {
@@ -3036,6 +3098,9 @@ const service = loadTypeScriptModule(
                   nodes: [{
                     id: 'gid://shopify/Order/1',
                     test: true,
+                    closed: true,
+                    displayFulfillmentStatus: 'FULFILLED',
+                    updatedAt: '2026-07-26T11:59:00.000Z',
                     lineItems: {
                       nodes: [{ id: 'gid://shopify/LineItem/1' }],
                       pageInfo: {
@@ -3066,9 +3131,14 @@ const service = loadTypeScriptModule(
             }
           }
           if (request.operationName === 'ClawPilotCommerceOrder') {
+            assert.match(
+              request.query,
+              /fulfillmentOrders\(first: 20, displayable: true\)/,
+            )
             return {
               order: {
                 id: request.variables.id,
+                updatedAt: '2026-07-26T11:59:00.000Z',
                 lineItems: {
                   nodes: [],
                   pageInfo: { hasNextPage: false, endCursor: null },
@@ -3082,6 +3152,7 @@ const service = loadTypeScriptModule(
             return {
               order: {
                 id: request.variables.id,
+                updatedAt: '2026-07-26T11:59:00.000Z',
                 lineItems: {
                   nodes: [{ id: 'gid://shopify/LineItem/2' }],
                   pageInfo: { hasNextPage: false, endCursor: null },
@@ -3820,6 +3891,24 @@ try {
     providerReads,
     readsAfterDurableCapture,
     'Retry after durable capture must stage the identical response without another provider read',
+  )
+  const terminalShopifyStage = stageAttempts.find(
+    (attempt) => attempt.idempotencyKey === shopifyFetchKey,
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      terminalShopifyStage.envelope.orders.map((order) => ({
+        externalOrderId: order.identity.value,
+        lifecycle: order.canonicalStates.lifecycle,
+        fulfillment: order.canonicalStates.fulfillment,
+      })),
+    )),
+    [{
+      externalOrderId: 'gid://shopify/Order/1',
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+    }],
+    'Bounded operational discovery must stage terminal provider rows for Orders-pane status visibility',
   )
   const shopifyContinuationKey = nextKey()
   failStageOnceForKey = shopifyContinuationKey
@@ -4931,7 +5020,7 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'shopify'
-      && reservation.adapterVersion === 'shopify-commerce-normalizer-v5'
+      && reservation.adapterVersion === 'shopify-commerce-normalizer-v6'
     )),
     'Shopify provider-attempt evidence must record its current normalizer',
   )

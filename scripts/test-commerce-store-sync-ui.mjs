@@ -91,11 +91,21 @@ assert.match(autoCreatePolicy, /!canManage/u)
 assert.match(autoCreatePolicy, /!localReviewCommandsAllowed/u)
 assert.doesNotMatch(autoCreatePolicy, /!providerMirrorAllowed/u)
 
-assert.match(
+const canonicalCandidateGate = section(
   intake,
-  /const candidateLocked = Boolean\(unavailableReason\)[\s\S]{0,80}!operatorCommandsAllowed[\s\S]{0,120}const localReviewLocked = Boolean\(unavailableReason\)[\s\S]{0,80}!localReviewCommandsAllowed/u,
-  'canonical execution and local review must retain distinct candidate gates',
+  'const candidateLocked =',
+  'const localReviewLocked =',
 )
+assert.match(canonicalCandidateGate, /!operatorCommandsAllowed/u)
+assert.doesNotMatch(canonicalCandidateGate, /!localReviewCommandsAllowed/u)
+const localReviewCandidateGate = section(
+  intake,
+  'const localReviewLocked =',
+  'const refreshLocked =',
+)
+assert.match(localReviewCandidateGate, /historicalOutcome/u)
+assert.match(localReviewCandidateGate, /!localReviewCommandsAllowed/u)
+assert.doesNotMatch(localReviewCandidateGate, /!operatorCommandsAllowed/u)
 assert.match(
   intake,
   /const refreshLocked = \([\s\S]{0,80}!manualProviderReadsAllowed/u,

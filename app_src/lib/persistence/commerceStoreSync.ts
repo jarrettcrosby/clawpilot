@@ -103,6 +103,23 @@ function requestHash(input: Record<string, unknown>) {
     .digest('hex')
 }
 
+export function commerceStoreSyncProviderReadIntentFingerprint(input: {
+  organizationId: string
+  integrationAccountId: string
+  authorityKind: CommerceStoreSyncProviderReadAuthority
+  readKind: CommerceStoreSyncProviderReadKind
+  intentKey: string
+}) {
+  return requestHash({
+    version: 'commerce-store-sync-provider-read-v1',
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+    authorityKind: input.authorityKind,
+    readKind: input.readKind,
+    intentKey: input.intentKey,
+  })
+}
+
 async function acquireProviderReadLease(input: {
   organizationId: string
   integrationAccountId: string
@@ -112,15 +129,19 @@ async function acquireProviderReadLease(input: {
   acquiredBy: string
 }): Promise<CommerceStoreSyncProviderReadLease> {
   const id = randomUUID()
-  const intentFingerprintSha256 = requestHash({
-    version: 'commerce-store-sync-provider-read-v1',
-    organizationId: input.organizationId,
-    integrationAccountId: input.integrationAccountId,
-    authorityKind: input.authorityKind,
-    readKind: input.readKind,
-    intentKey: input.intentKey,
-  })
+  const intentFingerprintSha256 =
+    commerceStoreSyncProviderReadIntentFingerprint(input)
   return withTransaction(async (client) => {
+    // Establish the account-first order explicitly before touching leases or
+    // controls. The authority query below retains its original SHARE locks
+    // and all eligibility checks; no provider I/O runs in this transaction.
+    await client.query(
+      `SELECT id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       FOR SHARE`,
+      [input.organizationId, input.integrationAccountId],
+    )
     await client.query(
       `UPDATE operations_commerce_store_sync_read_leases
        SET released_at = date_trunc('milliseconds', clock_timestamp()),

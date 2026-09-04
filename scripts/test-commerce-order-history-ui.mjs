@@ -26,6 +26,34 @@ const health = await readFile(
   new URL('app_src/app/api/health/route.ts', root),
   'utf8',
 )
+const orderEditingReleaseHealth = await readFile(
+  new URL(
+    'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
+    root,
+  ),
+  'utf8',
+)
+const faireExactHistoryMigration = await readFile(
+  new URL(
+    'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+    root,
+  ),
+  'utf8',
+)
+const lineFidelityMigration = await readFile(
+  new URL(
+    'db/migrations/0342_operations_order_history_line_fidelity.sql',
+    root,
+  ),
+  'utf8',
+)
+const historyFollowupsMigration = await readFile(
+  new URL(
+    'db/migrations/0343_operations_commerce_order_history_followups.sql',
+    root,
+  ),
+  'utf8',
+)
 const predeploy = await readFile(
   new URL('scripts/verify-predeploy.mjs', root),
   'utf8',
@@ -79,6 +107,67 @@ assert.equal(
   '3 ordered · 0 fulfilled',
   'An exact provider zero remains visible as zero',
 )
+const providerHistorySource = await readFile(
+  new URL('app_src/lib/operations/providerOrderHistory.ts', root), 'utf8',
+)
+const providerHistoryModule = { exports: {} }
+vm.runInNewContext(ts.transpileModule(providerHistorySource, {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, {
+  exports: providerHistoryModule.exports, module: providerHistoryModule,
+})
+const {
+  presentCommerceOrderTimelineEvents,
+  operationsProviderHistoryFromTimeline,
+} = providerHistoryModule.exports
+const trackingEvent = (id, payload = {}, changes = {}) => ({
+  evidenceSource: 'provider', evidenceGlobalId: id, eventKind: 'tracking_updated',
+  eventStatus: 'SUCCESS', occurredAt: '2026-09-02T14:50:44.000Z',
+  locationReference: null, attributionSource: 'unavailable', actorEmail: null,
+  payload: { externalSubjectId: 'gid://shopify/Fulfillment/123', ...payload },
+  ...changes,
+})
+const genericTracking = trackingEvent('generic')
+const packageA = trackingEvent('package-a', { trackingNumber: 'TEST-PACKAGE-A' })
+const visibleIds = (events) => Array.from(
+  presentCommerceOrderTimelineEvents(events), (event) => event.evidenceGlobalId,
+)
+assert.deepEqual(visibleIds([genericTracking, packageA]), ['package-a'],
+  'One fulfillment with generic and concrete tracking renders one tracking entry')
+const packageB = trackingEvent('package-b', { trackingNumber: 'TEST-PACKAGE-B' })
+const otherGeneric = trackingEvent('other-generic', { externalSubjectId: 'gid://shopify/Fulfillment/456' })
+const otherPackage = trackingEvent('other-package', {
+  externalSubjectId: 'gid://shopify/Fulfillment/456', trackingNumber: 'TEST-PACKAGE-C',
+})
+assert.deepEqual(visibleIds([genericTracking, packageA, packageB, otherGeneric, otherPackage]),
+  ['package-a', 'package-b', 'other-package'],
+  'Distinct tracking numbers and fulfillment subjects must all remain visible')
+const laterGeneric = trackingEvent('later-generic', {}, { occurredAt: '2026-09-03T14:50:44.000Z' })
+assert.deepEqual(visibleIds([packageA, laterGeneric]), ['package-a', 'later-generic'],
+  'A later status change cannot be hidden by earlier tracking evidence')
+assert.deepEqual(visibleIds([genericTracking]), ['generic'], 'Standalone tracking status remains visible')
+const redactedTracking = trackingEvent('redacted', { sensitiveEvidenceRedactedAt: '2026-09-03T00:00:00Z' })
+assert.deepEqual(visibleIds([redactedTracking, packageA]), ['redacted', 'package-a'],
+  'Redacted retained evidence is not a redundant generic row')
+const changedStatus = trackingEvent('changed-status', {}, { eventStatus: 'DELIVERED' })
+const changedLocation = trackingEvent('changed-location', {}, { locationReference: 'location-2' })
+const unscoped = trackingEvent('unscoped', { externalSubjectId: null })
+const orderChange = trackingEvent('order-change', {}, { eventKind: 'order_updated' })
+const localAction = trackingEvent('local-action', {}, { evidenceSource: 'clawpilot' })
+assert.deepEqual(visibleIds([packageA, changedStatus, changedLocation, unscoped, orderChange, localAction]),
+  ['package-a', 'changed-status', 'changed-location', 'unscoped', 'order-change', 'local-action'],
+  'Status/location changes, unscoped events, order changes and local audit actions are never collapsed')
+const retainedTimeline = { items: [genericTracking, packageA], truncated: false, limit: 500, providerWrites: 0 }
+const beforePresentation = JSON.stringify(retainedTimeline)
+const projectedHistory = operationsProviderHistoryFromTimeline(retainedTimeline)
+assert.deepEqual(Array.from(projectedHistory.events, (event) => event.globalId), ['package-a'],
+  'The shared canonical/imported drawer projection uses the same presentation rule')
+assert.equal(JSON.stringify(retainedTimeline), beforePresentation,
+  'Presentation must not mutate retained provider or audit rows')
+assert.ok(panel.includes('presentCommerceOrderTimelineEvents(timeline).map'),
+  'The raw history panel shares the tracking presentation rule')
+assert.ok(panel.includes('Provider reference ${event.payload.externalSubjectId}'),
+  'Repeated-looking fulfillment activity includes its distinct provider subject')
 const compiledRequestFence = ts.transpileModule(requestFenceSource, {
   compilerOptions: {
     module: ts.ModuleKind.CommonJS,
@@ -193,6 +282,8 @@ const cleanDurable = {
   failed: 0,
   blocked: 0,
   dead: 0,
+  historicalDead: 7,
+  historicalBlocked: 5,
   overduePolls: 0,
   expiredSensitiveEvidence: 0,
   cursorKeysReady: true,
@@ -205,6 +296,10 @@ assert.equal(commerceOrderHistoryDurableDegraded({
 assert.equal(commerceOrderHistoryDurableDegraded({
   ...cleanDurable,
   blocked: 1,
+}), true)
+assert.equal(commerceOrderHistoryDurableDegraded({
+  ...cleanDurable,
+  dead: 1,
 }), true)
 
 assert.match(route, /operationsCapabilities\(actor\)\.canManage/)
@@ -272,11 +367,36 @@ assert.match(imports, /<CommerceAuthoritySummaryPanel/)
 assert.match(imports, /provider=\{selectedAccount\.provider\}/)
 assert.match(imports, /onOpenOrder=\{onOpenOrder\}/)
 
+const runtimeHealthAuthority = [
+  health,
+  orderEditingReleaseHealth,
+  orderEditingReleaseHealth.replaceAll('public.', ''),
+].join('\n')
 for (const contract of [
   '0276_operations_commerce_order_sync_foundation.sql',
+  '0340_operations_order_workbench_exact_history.sql',
+  '0343_operations_commerce_order_history_followups.sql',
+  '0347_operations_commerce_order_tracking_url_evidence.sql',
+  '0348_operations_commerce_native_activity_evidence.sql',
+  'OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL',
+  'OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL',
+  'operations_commerce_order_tracking_url_evidence',
+  'operations_commerce_order_native_activity_evidence',
   '0277_operations_commerce_authority_policies.sql',
   '0278_operations_shopify_order_webhook_signals.sql',
   'operations_commerce_order_sync_foundation_applied',
+  'operations_commerce_order_history_followups_applied',
+  'operations_order_workbench_exact_history_applied',
+  '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e',
+  '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628',
+  "'manual_provider_read_lease_id'",
+  "'tracking_url'",
+  "'commerce_order_observation_manual_read_lease_fkey'",
+  "'commerce_order_observation_kind_v3_valid'",
+  "'commerce_order_observation_source_lineage_valid'",
+  "'commerce_order_event_tracking_url_valid'",
+  "'commerce_order_event_sensitive_retention_valid'",
+  "'public.idx_commerce_order_observation_manual_read'",
   'operations_commerce_authority_policies_applied',
   'operations_shopify_order_webhook_signals_applied',
   'readCommerceOrderSyncHealthFromPostgres',
@@ -294,6 +414,7 @@ for (const contract of [
   'The latest commerce order history worker cycle was degraded.',
   'failed: durable.failed',
   'blocked: durable.blocked',
+  'historicalBlocked: durable.historicalBlocked',
   'Commerce order history has failed or blocked provider-read sessions.',
   "'operations_commerce_order_sync_policies'",
   "'operations_commerce_order_observation_lines'",
@@ -304,6 +425,9 @@ for (const contract of [
   "'commerce_order_observation_accepts_children(uuid,uuid)'",
   "'protect_commerce_order_observation_line_lineage()'",
   "'protect_commerce_order_event_lineage()'",
+  "'protect_commerce_order_event_tracking_url()'",
+  "'public.reject_commerce_order_sync_evidence_mutation()'",
+  "'public.redact_expired_commerce_order_sensitive_evidence(integer)'",
   "'reject_commerce_order_sync_evidence_mutation()'",
   "'operations_shopify_order_webhook_signals'",
   "'operations_shopify_order_webhook_targets'",
@@ -323,15 +447,61 @@ for (const contract of [
   "'commerce_order_observations_immutable'",
   "'commerce_order_observation_lines_immutable'",
   "'commerce_order_event_observations_immutable'",
+  "'commerce_order_event_tracking_url_guard'",
   "installed_history_trigger.tgenabled IN ('O', 'A')",
   'installed_history_trigger.tgfoid = to_regprocedure',
 ]) {
-  assert.ok(health.includes(contract), `Health is missing ${contract}`)
+  assert.ok(
+    runtimeHealthAuthority.includes(contract),
+    `Runtime health authority is missing ${contract}`,
+  )
+}
+assert.equal(
+  (
+    health.match(
+      /\$\{OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL\}/gu,
+    ) || []
+  ).length,
+  1,
+  'Runtime health must use one centralized exact-history attestation',
+)
+assert.ok(
+  !health.includes('0340_operations_order_workbench_exact_history.sql'),
+  'Runtime health must not duplicate the centralized exact-history attestation',
+)
+assert.ok(
+  !health.includes('0a94308fcea248c267ef2d6c83f06875f3c646adb565db0b0a8a8d177e460c79'),
+  'Runtime health must not retain stale pre-Faire function fingerprints',
+)
+for (const contract of [
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
+  '638fe20619a607f2e9009c7eecf230cbaad9ce255476134005ebed67a5f64840',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
+  '0341_operations_faire_order_workbench_exact_history.sql',
+  '10fc19cc5a8b52d9ee8d48bde8d2773a6ead8325182d8c64ad2c852815529eb1',
+  '0342_operations_order_history_line_fidelity.sql',
+  '5d292963a5a8e4b117ff8a5388a660ed87e090d6e0239b3288bed9e506e8cc8d',
+]) {
+  assert.ok(
+    orderEditingReleaseHealth.includes(contract),
+    `Exact-history release health is missing ${contract}`,
+  )
 }
 assert.ok(
   (health.match(/operations_commerce_order_sync_foundation_applied/gu) || [])
     .length >= 4,
   'Order-history migration must gate database readiness and health errors',
+)
+assert.ok(
+  (health.match(/operations_commerce_order_history_followups_applied/gu) || [])
+    .length >= 5,
+  'History follow-up migration must gate database readiness and health errors',
+)
+assert.ok(
+  (health.match(/operations_order_workbench_exact_history_applied/gu) || [])
+    .length >= 5,
+  'Exact order history must gate database, history, and order-editing readiness',
 )
 assert.ok(
   (health.match(/operations_commerce_authority_policies_applied/gu) || [])
@@ -340,6 +510,10 @@ assert.ok(
 )
 for (const contract of [
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',
+  'db/migrations/0340_operations_order_workbench_exact_history.sql',
+  'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
+  'db/migrations/0342_operations_order_history_line_fidelity.sql',
+  'db/migrations/0343_operations_commerce_order_history_followups.sql',
   'db/migrations/0277_operations_commerce_authority_policies.sql',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',
@@ -356,6 +530,49 @@ for (const contract of [
   'scripts/test-commerce-order-history-worker-drain.mjs',
 ]) {
   assert.ok(predeploy.includes(contract), `Predeploy is missing ${contract}`)
+}
+for (const contract of [
+  'historical_refresh_requested_at',
+  'historical_refresh_requested_by',
+  'historical_refresh_idempotency_key',
+  'commerce_order_sync_policy_history_request_valid',
+  'idx_commerce_order_history_refresh_followups',
+  'idx_commerce_order_backfill_stream_head',
+]) {
+  assert.ok(
+    historyFollowupsMigration.includes(contract),
+    `History follow-up migration is missing ${contract}`,
+  )
+}
+assert.match(
+  faireExactHistoryMigration,
+  /observation\.provider IN \('shopify', 'faire'\)/u,
+  'Faire exact-history children must retain an exact provider fence',
+)
+assert.match(
+  faireExactHistoryMigration,
+  /NEW\.provider_read_count <> \([\s\S]*WHEN NEW\.provider = 'shopify' THEN 3[\s\S]*ELSE 2/u,
+  'Faire exact-history lineage must pin its two-read provider evidence',
+)
+for (const contract of [
+  'title_snapshot text',
+  'variant_title_snapshot text',
+  'vendor_snapshot text',
+  'unit_price_currency text',
+  'unit_price_minor bigint',
+  'subtotal_currency text',
+  'subtotal_minor bigint',
+  'discount_currency text',
+  'discount_minor bigint',
+  'tax_currency text',
+  'tax_minor bigint',
+  'commerce_order_observation_line_snapshots_valid',
+  'commerce_order_observation_line_money_valid',
+]) {
+  assert.ok(
+    lineFidelityMigration.includes(contract),
+    `Line-fidelity migration is missing ${contract}`,
+  )
 }
 
 console.log('Commerce order history API and UI contracts passed')

@@ -1,28 +1,54 @@
-import { createHash } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
+import {
+  exactFaireOrderHistoryProviderReads,
+  exactShopifyOrderHistoryProviderReads,
+  readExactFaireOrderHistoryObservation,
+  readExactShopifyOrderHistoryObservation,
+} from '@/lib/integrations/commerceOrderHistory'
 import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
+import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
 import {
+  derivedOrderWorkbenchIdempotencyKey,
+} from '@/lib/operations/orderWorkbenchIdempotency'
+import {
   ORDER_SHIP_TO_FIELDS,
   type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
+import {
+  isOperationsImportedOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+} from '@/lib/operations/orderListQuery'
 import type {
   OperationsImportedOrderResolutionDraft,
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  appendCommerceOrderWorkbenchExactReadInPostgres,
+  CommerceOrderSyncError,
+  readCommerceOrderWorkbenchExactReadReplayInPostgres,
+} from '@/lib/persistence/commerceOrderSync'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   acceptCommerceOrderWorkbenchInPostgres,
   CommerceOrderWorkbenchError,
   readCommerceOrderWorkbenchRefreshTargetFromPostgres,
   readCommerceOrderWorkbenchFromPostgres,
+  readCommerceOrderWorkbenchPageFromPostgres,
   rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres,
   updateCommerceOrderWorkbenchShipToInPostgres,
   type CommerceOrderWorkbenchLineRefreshResolution,
@@ -42,7 +68,16 @@ const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u
 const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
+const MAX_PAGE_SIZE = 250
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
+const DEGRADABLE_EXACT_HISTORY_CODES = new Set([
+  'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
+  'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
+  'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
+  'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+  'FAIRE_READ_ORDERS_REQUIRED',
+  'SHOPIFY_READ_ORDERS_REQUIRED',
+])
 const REFRESH_FIELDS = new Set<string>([
   ...ORDER_SHIP_TO_FIELDS,
   'requestedDeliveryAt',
@@ -81,6 +116,27 @@ function response(payload: Record<string, unknown>, status = 200) {
 
 function requestError(code: string, message: string, status = 400): never {
   throw new CommerceOrderWorkbenchApiError(code, message, status)
+}
+
+function exactHistoryUnavailableCode(error: unknown) {
+  if (
+    error instanceof ShopifyCommerceClientError
+    || error instanceof FaireCommerceClientError
+  ) return error.code
+  if (
+    error instanceof CommerceOrderSyncError
+    && DEGRADABLE_EXACT_HISTORY_CODES.has(error.code)
+  ) return error.code
+  return null
+}
+
+function exactHistoryProviderReads(
+  provider: 'shopify' | 'faire',
+  error: unknown,
+) {
+  return provider === 'shopify'
+    ? exactShopifyOrderHistoryProviderReads(error)
+    : exactFaireOrderHistoryProviderReads(error)
 }
 
 function requirePostgres() {
@@ -327,21 +383,6 @@ function lineRefreshResolutionsValue(
   return resolutions
 }
 
-function derivedIdempotencyKey(input: {
-  organizationId: string
-  idempotencyKey: string
-  candidateGlobalId: string
-  purpose: 'provider' | 'rebase'
-}) {
-  const digest = createHash('sha256').update([
-    input.organizationId,
-    input.idempotencyKey,
-    input.candidateGlobalId,
-    input.purpose,
-  ].join(':')).digest('hex')
-  return `order-workbench-${input.purpose}:${digest}`
-}
-
 async function requestBody(req: NextRequest) {
   const contentType = String(req.headers.get('content-type') || '').toLowerCase()
   if (!/^application\/json(?:\s*;|$)/u.test(contentType)) {
@@ -386,6 +427,7 @@ function errorResponse(error: unknown) {
   if (
     error instanceof CommerceOrderWorkbenchApiError
     || error instanceof CommerceOrderWorkbenchError
+    || error instanceof CommerceOrderSyncError
   ) {
     return response({
       ok: false,
@@ -433,15 +475,95 @@ export async function GET(req: NextRequest) {
     const candidateValue = String(
       req.nextUrl.searchParams.get('candidate') || '',
     ).trim()
-    const orders = await readCommerceOrderWorkbenchFromPostgres({
+    const sortValue = String(
+      req.nextUrl.searchParams.get('sort') || 'updated',
+    ).trim()
+    if (!isOperationsOrderSort(sortValue)) {
+      requestError('OPERATIONS_ORDER_SORT_INVALID', 'Order sort is invalid')
+    }
+    const directionValue = String(
+      req.nextUrl.searchParams.get('direction') || 'desc',
+    ).trim()
+    if (!isOperationsOrderSortDirection(directionValue)) {
+      requestError(
+        'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+        'Order sort direction is invalid',
+      )
+    }
+    const providerValue = String(
+      req.nextUrl.searchParams.get('provider') || '',
+    ).trim()
+    if (
+      providerValue
+      && !isOperationsImportedOrderProviderFilter(providerValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_PROVIDER_INVALID',
+        'Imported-order provider is invalid',
+      )
+    }
+    const trackingValue = String(
+      req.nextUrl.searchParams.get('tracking') || '',
+    ).trim()
+    if (
+      trackingValue
+      && !isOperationsOrderTrackingFilter(trackingValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+        'Order tracking filter is invalid',
+      )
+    }
+    const tracking = isOperationsOrderTrackingFilter(trackingValue)
+      ? trackingValue
+      : null
+    const updatedAfterValue = String(
+      req.nextUrl.searchParams.get('updatedAfter') || '',
+    ).trim()
+    if (
+      updatedAfterValue
+      && !isOperationsOrderUpdatedAfter(updatedAfterValue)
+    ) {
+      requestError(
+        'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+        'Order updated-after value is invalid',
+      )
+    }
+    const cursor = String(
+      req.nextUrl.searchParams.get('cursor') || '',
+    ).trim()
+    const limitValue = String(
+      req.nextUrl.searchParams.get('limit') || MAX_PAGE_SIZE,
+    ).trim()
+    if (!/^\d{1,3}$/u.test(limitValue)) {
+      requestError('OPERATIONS_PAGE_SIZE_INVALID', 'Order page size is invalid')
+    }
+    const pageSize = Number(limitValue)
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
+      requestError('OPERATIONS_PAGE_SIZE_INVALID', 'Order page size is invalid')
+    }
+    if (candidateValue && cursor) {
+      requestError(
+        'OPERATIONS_PAGE_CURSOR_INVALID',
+        'A single-order read cannot use an order-page cursor',
+      )
+    }
+    const result = await readCommerceOrderWorkbenchPageFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       search,
       candidateGlobalId: candidateValue
         ? candidateGlobalIdValue(candidateValue)
         : null,
       includeResolutionDetails: Boolean(candidateValue),
+      sort: sortValue,
+      direction: directionValue,
+      provider: providerValue || null,
+      tracking,
+      updatedAfter: updatedAfterValue || null,
+      cursor: cursor || null,
+      pageSize: candidateValue ? 1 : pageSize,
     })
-    return response({ ok: true, orders })
+    return response({ ok: true, orders: result.orders, page: result.page })
   } catch (error) {
     return errorResponse(error)
   }
@@ -561,6 +683,17 @@ export async function POST(req: NextRequest) {
       )
     }
     const requestKey = idempotencyKeyValue(req)
+    let historyRefresh: {
+      status: 'not_applicable' | 'captured' | 'unavailable'
+      code: string | null
+      providerReads: number | null
+      providerWrites: 0
+    } = {
+      status: 'not_applicable',
+      code: null,
+      providerReads: 0,
+      providerWrites: 0,
+    }
     if (!resolvingConflict) {
       const target = await readCommerceOrderWorkbenchRefreshTargetFromPostgres({
         organizationId,
@@ -570,19 +703,108 @@ export async function POST(req: NextRequest) {
         organizationId,
         accountGlobalId: target.accountGlobalId,
         actorEmail: actor.email,
-        idempotencyKey: derivedIdempotencyKey({
+        idempotencyKey: derivedOrderWorkbenchIdempotencyKey({
           organizationId,
           idempotencyKey: requestKey,
           candidateGlobalId,
           purpose: 'provider',
         }),
-        candidateGlobalId: target.candidateGlobalId,
+        candidateGlobalId,
       })
+      if (target.provider === 'shopify' || target.provider === 'faire') {
+        const historyIntentKey = [
+          'order-workbench-history',
+          requestKey,
+          candidateGlobalId,
+        ].join(':')
+        const replay =
+          await readCommerceOrderWorkbenchExactReadReplayInPostgres({
+            organizationId,
+            integrationAccountId: target.integrationAccountId,
+            provider: target.provider,
+            externalOrderId: target.externalOrderId,
+            intentKey: historyIntentKey,
+          })
+        if (replay?.status === 'in_progress') {
+          requestError(
+            'OPERATIONS_IMPORTED_ORDER_REFRESH_IN_PROGRESS',
+            'This order refresh is still in progress',
+            409,
+          )
+        }
+        const captured = replay ||
+          await withCommerceStoreSyncProviderReadFenceInPostgres({
+            organizationId,
+            integrationAccountId: target.integrationAccountId,
+            authorityKind: 'manual_read_only',
+            readKind: 'order_history',
+            intentKey: historyIntentKey,
+            acquiredBy: actor.email,
+            read: async (providerReadLease) => {
+              try {
+                const exact = target.provider === 'shopify'
+                  ? await readExactShopifyOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
+                  : await readExactFaireOrderHistoryObservation({
+                      organizationId,
+                      accountGlobalId: target.accountGlobalId,
+                      expectedCredentialGeneration: target.credentialGeneration,
+                      externalOrderId: target.externalOrderId,
+                      observationKind: 'manual_exact_read',
+                    })
+                return appendCommerceOrderWorkbenchExactReadInPostgres({
+                  organizationId,
+                  integrationAccountId: target.integrationAccountId,
+                  accountGlobalId: target.accountGlobalId,
+                  provider: target.provider,
+                  credentialGeneration: target.credentialGeneration,
+                  externalOrderId: target.externalOrderId,
+                  providerReadLease,
+                  observation: exact.observation,
+                })
+              } catch (error) {
+                const code = exactHistoryUnavailableCode(error)
+                if (!code) throw error
+                return {
+                  status: 'unavailable' as const,
+                  code,
+                  providerReads:
+                    exactHistoryProviderReads(target.provider, error),
+                  providerWrites: 0 as const,
+                }
+              }
+            },
+          })
+        if ('status' in captured && captured.status === 'unavailable') {
+          historyRefresh = {
+            status: 'unavailable',
+            code: captured.code,
+            providerReads: captured.providerReads,
+            providerWrites: 0,
+          }
+          console.warn('[operations-order-workbench] exact history unavailable', {
+            code: captured.code,
+            candidateGlobalId,
+          })
+        } else {
+          historyRefresh = {
+            status: 'captured',
+            code: null,
+            providerReads: captured.providerReads,
+            providerWrites: 0,
+          }
+        }
+      }
     }
     const result = await rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
       organizationId,
       actorEmail: actor.email,
-      idempotencyKey: derivedIdempotencyKey({
+      idempotencyKey: derivedOrderWorkbenchIdempotencyKey({
         organizationId,
         idempotencyKey: requestKey,
         candidateGlobalId,
@@ -606,7 +828,12 @@ export async function POST(req: NextRequest) {
         500,
       )
     }
-    return response({ ok: true, refreshResult: result, order })
+    return response({
+      ok: true,
+      refreshResult: result,
+      historyRefresh,
+      order,
+    })
   } catch (error) {
     return errorResponse(error)
   }

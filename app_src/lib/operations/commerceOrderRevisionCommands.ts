@@ -12,6 +12,7 @@ import {
   failManagerCommerceOrderRevisionRefreshInPostgres,
   prepareManagerCommerceOrderRevisionRefreshInPostgres,
   readManagerCommerceOrderRevisionStateFromPostgres,
+  type CommerceOrderRevisionCaptureResult,
 } from '@/lib/persistence/commerceOrderRevisions'
 import {
   CommerceStoreSyncProviderReadFenceError,
@@ -44,8 +45,16 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
 }) {
   const prepared = await prepareManagerCommerceOrderRevisionRefreshInPostgres(input)
   if (prepared.replayed) {
+    if (!prepared.replayedCapture) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_REFRESH_RESULT_INVALID',
+        'The retained provider refresh result is invalid',
+        500,
+      )
+    }
     return {
       replayed: true,
+      capture: prepared.replayedCapture,
       revision: await readManagerCommerceOrderRevisionStateFromPostgres({
         organizationId: input.organizationId,
         orderGlobalId: input.orderGlobalId,
@@ -61,6 +70,7 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
     )
   }
   try {
+    let retainedCapture: CommerceOrderRevisionCaptureResult | null = null
     const readFence = {
       organizationId: claim.organizationId,
       integrationAccountId: claim.integrationAccountId,
@@ -78,7 +88,7 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
       if (evidence.providerWrites !== 0) {
         throw new Error('Provider refresh crossed its provider-write fence')
       }
-      await captureCommerceOrderRevisionObservationInPostgres({
+      retainedCapture = await captureCommerceOrderRevisionObservationInPostgres({
         claim,
         providerReadLease,
         sourceRevision: evidence.sourceRevision,
@@ -109,8 +119,16 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
           read: capture,
         })
     )
+    if (!retainedCapture) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_REVISION_REFRESH_RESULT_INVALID',
+        'The exact provider refresh result was not retained',
+        500,
+      )
+    }
     return {
       replayed: false,
+      capture: retainedCapture,
       revision: await readManagerCommerceOrderRevisionStateFromPostgres({
         organizationId: input.organizationId,
         orderGlobalId: input.orderGlobalId,
