@@ -21,6 +21,16 @@ Each group may be provisioned independently before its ClawPilot feature flag is
 
 The ClawPilot service reaches SuiteCRM over Railway's private network and exposes only the environment's canonical `https://crm.eigenracing.com` or `https://dev.crm.eigenracing.com` browser origin. Credentials stay in Railway variables. MariaDB and the SuiteCRM volume must be backed up and restored as one checkpoint.
 
+## Email search presentation
+
+Boot installs owned `custom/modules/Home/Search.php` and `UnifiedSearch.php` entry overrides plus `custom/include/ClawPilot/EmailSearch.php` and its result template. The native Basic/Elastic engines retain their search, permissions, filters and pagination; request-local subclasses only change result presentation. Email results show the original subject, From, Global ID and dates. The subject opens the SuiteCRM 8 email detail route, not the metadata-only edit form. Other modules retain the native result template. Native Email list/Studio metadata is not rewritten.
+
+The installer preflights all destinations, refuses unmanaged overrides or symlinked destinations/parents, and converges only its own marked files. Review existing custom Home actions before deployment. Capture their original presence/bytes alongside the deployment's recovery checkpoint: an image rollback does not remove already installed volume-backed overrides.
+
+Run `npm run test:suitecrm-email-search` from the repository root for isolated PHP 8.3 / Smarty 4.5.6 rendering and installer tests (Docker required). CI runs this gate independently of the application tests. Validate the native signed-in DEV search and detail link before promoting to PROD; a successful build is not that validation.
+
+New Gmail intake retains exact top-level From/To/CC/BCC evidence for native Email projection. Unavailable historical headers remain unavailable; flattened delivery recipients are not used to invent To/CC/BCC. Historical repair requires a separately reviewed exact-message header reread, not email resend or duplicate import.
+
 See the [SuiteCRM Railway runbook](../../docs/operations/suitecrm.md) for topology, variables, first install, Global ID backfill, upgrades, and rollback.
 
 SuiteCRM is licensed under AGPL-3.0 with additional notices. The image downloads the unmodified official release and verifies its published SHA-256 digest during the build.

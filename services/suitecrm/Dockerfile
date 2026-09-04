@@ -30,6 +30,8 @@ COPY supervisord.conf /etc/supervisor/conf.d/suitecrm.conf
 COPY entrypoint.sh scheduler-loop.sh messenger-loop.sh /usr/local/bin/
 COPY bootstrap-client.php /opt/clawpilot/bootstrap-client.php
 COPY bootstrap-global-id.php /opt/clawpilot/bootstrap-global-id.php
+COPY install-email-search.php /opt/clawpilot/install-email-search.php
+COPY email-search /opt/clawpilot/email-search
 COPY bootstrap-image-principals.php /opt/clawpilot/bootstrap-image-principals.php
 
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/scheduler-loop.sh /usr/local/bin/messenger-loop.sh \

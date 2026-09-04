@@ -17,6 +17,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  suitecrm-email-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: SuiteCRM Email search PHP and Smarty behavioral tests
+        run: npm run test:suitecrm-email-search
+
   validate:
     runs-on: ubuntu-latest
     # Leave room for the full PostgreSQL and browser contract matrix on a slow
