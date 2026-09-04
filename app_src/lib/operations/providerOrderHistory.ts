@@ -1,5 +1,5 @@
 import type { CommerceOrderEvidenceTimelinePage } from '@/lib/persistence/commerceOrderSync'
-import type { OperationsProviderOrderHistory } from './types'
+import type { OperationsNativeActivityCoverage, OperationsProviderOrderHistory } from './types'
 
 type PresentableTimelineEvent = {
   evidenceSource: string
@@ -57,6 +57,18 @@ function optionalTimelineInteger(value: unknown) {
     : null
 }
 
+export function nativeActivityCoverageFromPayload(
+  payload: Record<string, unknown> | undefined,
+  truncated = false,
+): OperationsNativeActivityCoverage | undefined {
+  const state = payload?.nativeActivityState
+  const count = optionalTimelineInteger(payload?.nativeActivityFetchedCount)
+  if ((state !== 'complete' && state !== 'partial' && state !== 'unavailable')
+    || count === null || count < 0 || count > 500) return undefined
+  return { state, reason: optionalTimelineText(payload?.nativeActivityReason),
+    fetchedCount: count, displayTruncated: truncated }
+}
+
 function optionalTimelineMinor(value: unknown) {
   if (typeof value === 'number' && Number.isSafeInteger(value)) {
     return String(value)
@@ -98,6 +110,7 @@ export function operationsProviderHistoryFromTimeline(
   const rawLines = Array.isArray(lineSnapshot?.payload.lines)
     ? lineSnapshot.payload.lines
     : []
+  const nativeActivity = nativeActivityCoverageFromPayload(lineSnapshot?.payload, timeline.truncated)
   const currentLines = rawLines.flatMap((value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return []
     const line = value as Record<string, unknown>
@@ -134,6 +147,7 @@ export function operationsProviderHistoryFromTimeline(
     observedAt: optionalTimelineText(lineSnapshot?.payload.observedAt),
     currency: null,
     providerTotalMinor: null,
+    ...(nativeActivity ? { nativeActivity } : {}),
     currentLines,
     events: providerEvents.flatMap((event) => {
       if (event.eventKind === 'order_lines_snapshot') return []
@@ -159,6 +173,11 @@ export function operationsProviderHistoryFromTimeline(
           && optionalTimelineText(
             event.payload.sensitiveEvidenceRedactedAt,
           ) !== null,
+        ...(event.eventKind === 'provider_activity' ? {
+          providerMessage: optionalTimelineText(event.payload.providerMessage),
+          providerActorDisplayName: optionalTimelineText(event.payload.providerActorDisplayName),
+          nativeActivityRedacted: event.payload.nativeActivityRedacted === true,
+        } : {}),
       }]
     }),
     providerWrites: 0,

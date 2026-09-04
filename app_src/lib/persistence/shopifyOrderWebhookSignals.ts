@@ -1,6 +1,14 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
 import type { PoolClient } from 'pg'
 import {
+  inspectCommerceOrderNativeActivityWithClient,
+  appendCommerceOrderNativeActivityWithClient,
+} from '@/lib/persistence/commerceOrderNativeActivity'
+import {
+  appendCommerceOrderTrackingUrlEvidenceWithClient,
+  inspectCommerceOrderTrackingUrlEvidenceWithClient,
+} from '@/lib/persistence/commerceOrderTrackingUrlEvidence'
+import {
   shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery,
   type ShopifyOrderWebhookSignalEvidence,
 } from '@/lib/integrations/shopifyOrderWebhook'
@@ -981,68 +989,18 @@ export async function assertShopifyOrderWebhookClaimCurrentForProviderReadInPost
   }
 }
 
-async function assertPreservedSensitiveEvidence(
+async function inspectSensitiveEvidence(
   client: PoolClient,
   claim: ShopifyOrderWebhookTargetClaim,
   observation: NormalizedObservation,
+  requireRetained: boolean,
 ) {
-  const sensitive = observation.events.filter((event) => (
-    event.trackingNumber !== null
-      || event.trackingUrl !== null
-      || event.providerActorFingerprint !== null
-  ))
-  if (!sensitive.length) return
-  const retained = await client.query<{
-    event_hash: string
-    tracking_number: string | null
-    tracking_url: string | null
-    provider_actor_fingerprint: string | null
-    sensitive_evidence_redacted_at: Date | null
-    sensitive_evidence_expired: boolean
-  }>(
-    `SELECT event_hash, tracking_number, tracking_url,
-            provider_actor_fingerprint,
-            sensitive_evidence_redacted_at,
-            sensitive_evidence_expires_at <= clock_timestamp()
-              AS sensitive_evidence_expired
-     FROM operations_commerce_order_event_observations
-     WHERE organization_id = $1::uuid
-       AND integration_account_id = $2::uuid
-       AND provider = 'shopify'
-       AND external_order_id = $3
-       AND event_hash = ANY($4::text[])`,
-    [
-      claim.organizationId,
-      claim.integrationAccountId,
-      observation.externalOrderId,
-      sensitive.map((event) => event.eventHash),
-    ],
-  )
-  const byHash = new Map(retained.rows.map((event) => [event.event_hash, event]))
-  const differs = sensitive.some((event) => {
-    const stored = byHash.get(event.eventHash)
-    return !stored
-      || (
-        stored.sensitive_evidence_redacted_at !== null
-        && !stored.sensitive_evidence_expired
-      )
-      || (
-        stored.sensitive_evidence_redacted_at === null
-        && (
-          stored.tracking_number !== event.trackingNumber
-          || stored.tracking_url !== event.trackingUrl
-          || stored.provider_actor_fingerprint
-            !== event.providerActorFingerprint
-        )
-      )
-  })
-  if (differs) {
-    throw new CommerceOrderSyncError(
-      'COMMERCE_ORDER_SYNC_SENSITIVE_REVISION_CONFLICT',
-      'Sensitive provider evidence changed without a new provider revision',
-      409,
-    )
-  }
+  return inspectCommerceOrderTrackingUrlEvidenceWithClient(client, {
+    organizationId: claim.organizationId, integrationAccountId: claim.integrationAccountId, provider: 'shopify',
+  }, observation, { requireRetained, conflict: () => {
+    throw new CommerceOrderSyncError('COMMERCE_ORDER_SYNC_SENSITIVE_REVISION_CONFLICT',
+      'Sensitive provider evidence changed without a new provider revision', 409)
+  } })
 }
 
 async function insertExactObservation(
@@ -1067,7 +1025,7 @@ async function insertExactObservation(
         + `:${observation.externalOrderId}`,
     ],
   )
-  let row = (
+  let row: ObservationRow | undefined = (
     await client.query<ObservationRow>(
       `SELECT id::text, global_id, order_id::text, source_hash,
               observation_kind, webhook_target_id::text,
@@ -1123,6 +1081,12 @@ async function insertExactObservation(
       )
     ).rows[0]
   }
+  const urlEnrichments = await inspectSensitiveEvidence(client, claim, observation, Boolean(row))
+  const nativeScope = { organizationId: claim.organizationId, integrationAccountId: claim.integrationAccountId, provider: 'shopify' as const }
+  const nativeSnapshots = await inspectCommerceOrderNativeActivityWithClient(client, nativeScope, observation)
+  // A URL-aware hash can have been sealed without its URL by the old writer.
+  // Capture the fresh read under this claim instead of modifying that parent.
+  if (urlEnrichments.length || nativeSnapshots.length) row = undefined
   if (!row) {
     const inserted = await client.query<ObservationRow>(
       `INSERT INTO operations_commerce_order_observations (
@@ -1136,7 +1100,8 @@ async function insertExactObservation(
          canonical_return_state, currency, provider_total_minor,
          provider_inventory_reservation_state, provider_created_at,
          provider_processed_at, provider_updated_at, provider_cancelled_at,
-         provider_closed_at, observed_at, provider_read_count
+         provider_closed_at, observed_at, provider_read_count,
+         native_activity_state, native_activity_reason, native_activity_fetched_count
        )
        SELECT
          $1::uuid, $2::uuid, NULL, $3::uuid, $4, $5::uuid,
@@ -1144,7 +1109,7 @@ async function insertExactObservation(
          $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
          $18, $19, $20, $21, $22::timestamptz, $23::timestamptz,
          $24::timestamptz, $25::timestamptz, $26::timestamptz,
-         $27::timestamptz, $28
+         $27::timestamptz, $28, $29, $30, $31
        FROM (SELECT 1) singleton
        LEFT JOIN LATERAL (
          SELECT orders.id
@@ -1191,6 +1156,9 @@ async function insertExactObservation(
         observation.providerClosedAt,
         observation.observedAt,
         observation.providerReadCount,
+        observation.nativeActivityState || null,
+        observation.nativeActivityReason || null,
+        observation.nativeActivityFetchedCount ?? null,
       ],
     )
     row = inserted.rows[0]
@@ -1232,8 +1200,7 @@ async function insertExactObservation(
       'Shopify exact-order observation conflict could not be resolved',
     )
   }
-  if (!appended) {
-    await assertPreservedSensitiveEvidence(client, claim, observation)
+  if (!appended && !urlEnrichments.length && !nativeSnapshots.length) {
     return { row, appended: 0, preserved: 1, linesAppended: 0, eventsAppended: 0 }
   }
   let linesAppended = 0
@@ -1313,13 +1280,13 @@ async function insertExactObservation(
         event.externalSubjectId,
         event.eventHash,
         event.eventKind,
-        event.eventStatus,
+        event.eventKind === 'provider_activity' ? null : event.eventStatus,
         event.quantity,
         event.amountMinor,
         event.currency,
         event.inventoryEffectKind,
-        event.attributionSource,
-        event.providerActorFingerprint,
+        event.eventKind === 'provider_activity' ? 'unavailable' : event.attributionSource,
+        event.eventKind === 'provider_activity' ? null : event.providerActorFingerprint,
         event.providerLocationId,
         event.trackingCarrier,
         event.trackingNumber,
@@ -1331,6 +1298,10 @@ async function insertExactObservation(
     )
     eventsAppended += Number(result.rowCount || 0)
   }
+  await appendCommerceOrderTrackingUrlEvidenceWithClient(client, {
+    organizationId: claim.organizationId, integrationAccountId: claim.integrationAccountId, provider: 'shopify',
+  }, observation, row.id, urlEnrichments)
+  await appendCommerceOrderNativeActivityWithClient(client, nativeScope, observation, row.id, nativeSnapshots)
   return {
     row,
     appended: 1,
@@ -1355,7 +1326,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
   if (
     observation.observationKind !== 'webhook_exact_read'
     || observation.externalOrderId !== input.claim.externalOrderId
-    || observation.providerReadCount !== 3
+    || observation.providerReadCount < 3 || observation.providerReadCount > 5
     || !observation.providerUpdatedAt
     || new Date(observation.providerUpdatedAt).getTime()
       < new Date(input.claim.claimedProviderUpdatedAt).getTime()
@@ -1452,7 +1423,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7::uuid,
          $8, $9, $10, $11::timestamptz, $12::timestamptz, $13,
-         $14, $15, 3, 0, $16::timestamptz
+         $14, $15, $17, 0, $16::timestamptz
        )
        RETURNING global_id`,
       [
@@ -1472,6 +1443,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.readAllOrdersScopeObserved,
         input.returnHistoryScopeObserved,
         observation.observedAt,
+        observation.providerReadCount,
       ],
     )
     const completed = await client.query<{
@@ -1495,7 +1467,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
            lock_token = NULL,
            lease_expires_at = NULL,
            last_error_code = NULL,
-           provider_read_count = provider_read_count + 3,
+           provider_read_count = provider_read_count + $7,
            updated_at = clock_timestamp()
        WHERE organization_id = $1::uuid
          AND id = $2::uuid
@@ -1511,6 +1483,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.claim.capturedDirtyVersion,
         observation.observedAt,
         input.claim.lockToken,
+        observation.providerReadCount,
       ],
     )
     if (!completed.rows[0]) {
@@ -1533,7 +1506,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         capturedDirtyVersion: input.claim.capturedDirtyVersion,
         appended: persisted.appended,
         preserved: persisted.preserved,
-        providerReads: 3,
+        providerReads: observation.providerReadCount,
         providerWrites: 0,
       },
     }, client)
@@ -1546,7 +1519,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
       preserved: persisted.preserved,
       linesAppended: persisted.linesAppended,
       eventsAppended: persisted.eventsAppended,
-      providerReads: 3 as const,
+      providerReads: observation.providerReadCount,
       providerWrites: 0 as const,
     })
   })

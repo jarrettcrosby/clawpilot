@@ -13,6 +13,7 @@ const baseEnv = {
   CLAWPILOT_MAIL_FROM: 'stewards@eigenracing.com',
   MATON_AUTH_GMAIL_CONNECTION_ID: '',
   CLAWPILOT_AUTH_MAIL_FROM: '',
+  CLAWPILOT_AUTH_SELF_DELIVERY: '',
   CAREER_SITE_SUBMISSIONS_ENABLED: '0',
 }
 const fetchTrapImport = `data:text/javascript,${encodeURIComponent(`
@@ -54,6 +55,7 @@ function runWithMockProfiles({
   authIsPrimary = false,
   authReturnedSender = null,
   authSender = 'stewards@eigenracing.com',
+  selfDelivery = '',
 }) {
   const mockSource = `
     globalThis.fetch = async (url, init) => {
@@ -88,6 +90,7 @@ function runWithMockProfiles({
         MATON_BASE_URL: 'https://gateway.maton.ai',
         MATON_AUTH_GMAIL_CONNECTION_ID: 'auth-gmail-connection',
         CLAWPILOT_AUTH_MAIL_FROM: authSender,
+        CLAWPILOT_AUTH_SELF_DELIVERY: selfDelivery,
       },
       encoding: 'utf8',
       timeout: 5_000,
@@ -103,6 +106,22 @@ assert.equal(
   ).length,
   2,
 )
+
+const selfDeliveryBinding = { connectionId: 'test-gmail-connection', mailboxEmail: 'workspace@example.com',
+  recipientEmails: ['workspace@example.com', 'reviewed-alias@example.com'] }
+const verifiedSelfDelivery = runWithMockProfiles({ sameProfile: false, selfDelivery: JSON.stringify(selfDeliveryBinding) })
+assert.equal(verifiedSelfDelivery.status, 0, verifiedSelfDelivery.stderr)
+const movedMailbox = runWithMockProfiles({ sameProfile: false,
+  selfDelivery: JSON.stringify({ ...selfDeliveryBinding, mailboxEmail: 'other@example.com' }) })
+assert.equal(movedMailbox.status, 1)
+assert.match(movedMailbox.stderr, /self-delivery mailbox identity changed/)
+for (const selfDelivery of ['null', '[]', '{', JSON.stringify({ ...selfDeliveryBinding, connectionId: 'unconfigured-connection' }),
+  JSON.stringify({ ...selfDeliveryBinding, recipientEmails: ['*'] })]) {
+  const result = runWithFetchTrap({ CLAWPILOT_AUTH_SELF_DELIVERY: selfDelivery })
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /CLAWPILOT_AUTH_SELF_DELIVERY is invalid/)
+  assert.doesNotMatch(result.stderr, /FETCH_MUST_NOT_RUN/)
+}
 
 const primaryAuthSender = runWithMockProfiles({
   sameProfile: false,

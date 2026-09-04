@@ -16,7 +16,8 @@ import HistoryRounded from '@mui/icons-material/HistoryRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import { createCommerceOrderHistoryRequestFence } from '@/lib/integrations/commerceOrderHistoryRequestFence'
 import { commerceOrderQuantitySummary } from '@/lib/integrations/commerceOrderHistoryPresentation'
-import { presentCommerceOrderTimelineEvents } from '@/lib/operations/providerOrderHistory'
+import { nativeActivityCoverageFromPayload, presentCommerceOrderTimelineEvents } from '@/lib/operations/providerOrderHistory'
+import { NativeActivityCoverageNotice, NativeActivityText } from '@/components/operations/CommerceNativeActivity'
 
 type CommerceProvider = 'shopify' | 'faire'
 
@@ -149,6 +150,7 @@ function money(minor: number | null, currency: string | null) {
 }
 
 function timelineAttribution(event: TimelineItem) {
+  if (event.eventKind === 'provider_activity') return ''
   const assignedTo = typeof event.payload.assignedTo === 'string'
     ? event.payload.assignedTo.trim()
     : ''
@@ -619,6 +621,12 @@ export default function CommerceOrderHistoryPanel({
                       </Typography>
                     ) : (
                       <Stack spacing={1.25}>
+                        {provider === 'shopify' ? (
+                          <NativeActivityCoverageNotice coverage={nativeActivityCoverageFromPayload(
+                            timeline.find((event) => event.eventKind === 'order_lines_snapshot')?.payload,
+                            timelineTruncated,
+                          )} />
+                        ) : null}
                         {timelineTruncated ? (
                           <Alert severity="info">
                             Showing the latest {timelineLimit} events for this order.
@@ -644,6 +652,13 @@ export default function CommerceOrderHistoryPanel({
                             <Typography variant="caption" color="text.secondary" display="block">
                               {timestamp(event.occurredAt)} · {event.evidenceSource === 'clawpilot' ? 'ClawPilot' : provider === 'shopify' ? 'Shopify' : 'Faire'}
                             </Typography>
+                            {event.eventKind === 'provider_activity' ? (
+                              <NativeActivityText
+                                message={typeof event.payload.providerMessage === 'string' ? event.payload.providerMessage : null}
+                                actor={typeof event.payload.providerActorDisplayName === 'string' ? event.payload.providerActorDisplayName : null}
+                                redacted={event.payload.nativeActivityRedacted === true}
+                              />
+                            ) : null}
                             {context.length > 0 ? (
                               <Typography variant="caption" color="text.secondary" display="block" sx={{ overflowWrap: 'anywhere' }}>
                                 {context.join(' · ')}

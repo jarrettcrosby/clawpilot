@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { SHOPIFY_EXACT_HISTORY_MAX_PROVIDER_READS } from '@/lib/integrations/commerceOrderHistoryReadLimits'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -275,7 +276,8 @@ function validatedOutcome(
     || typeof value.changed !== 'boolean'
     || typeof value.terminalUnsupported !== 'boolean'
     || !nonnegativeSafeInteger(value.providerReads)
-    || Number(value.providerReads) > 3
+    || Number(value.providerReads) > (expected.provider === 'shopify'
+      ? SHOPIFY_EXACT_HISTORY_MAX_PROVIDER_READS : 2)
     || (
       value.outcome === 'captured'
       && (value.code !== null || value.terminalUnsupported)

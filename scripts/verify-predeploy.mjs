@@ -111,6 +111,13 @@ const commerceOrderHistoryFollowupsMigration = [
   '1a7f62aba18fda00e1fce1ffc7f6af705eca68c1999fd0efe87da7103f14e628',
 ]
 
+const additiveOrderHistoryEvidenceMigrations = [
+  ['db/migrations/0347_operations_commerce_order_tracking_url_evidence.sql',
+    '54dc59d7d00d225139341171066ce4f1b1b640a6c77d6d5aee5db845cac4a6b4'],
+  ['db/migrations/0348_operations_commerce_native_activity_evidence.sql',
+    '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'],
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -183,9 +190,15 @@ for (const requiredFragment of [
   'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT = 14',
   '88e112da61f9894dbf031952f1c11bc7dce8b3c0398089e35c79adaeb91b1eae',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
-  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9',
+  '638fe20619a607f2e9009c7eecf230cbaad9ce255476134005ebed67a5f64840',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
+  'OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT = 42',
+  '5b448cb504fbc42d6dfe2f8ecef643bb0a5576255b30658f598d2be21a20a800',
+  'OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT = 47',
+  '2134de8f34c8e6d644363498fc46e06df25880d21aee29eeb6f1eb4ff4365c93',
+  '${OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL}',
+  '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL}',
   'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
 ]) {
   if (!orderEditingHealth.includes(requiredFragment)) {
@@ -402,6 +415,13 @@ const healthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
 )
+for (const [file, checksum] of additiveOrderHistoryEvidenceMigrations) {
+  if (!existsSync(resolve(root, file))) fail(`missing additive order-history evidence migration: ${file}`)
+  if (createHash('sha256').update(readFileSync(resolve(root, file))).digest('hex') !== checksum) {
+    fail(`Additive order-history evidence migration checksum drifted: ${file}`)
+  }
+  if (!orderEditingHealth.includes(checksum)) fail(`Evidence migration is not attested: ${file}`)
+}
 for (const requiredFragment of [
   "from '@/lib/persistence/operationsOrderEditingReleaseHealth'",
   '${OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL}',
@@ -952,6 +972,9 @@ for (const requiredPath of [
   'db/migrations/0341_operations_faire_order_workbench_exact_history.sql',
   'db/migrations/0342_operations_order_history_line_fidelity.sql',
   'db/migrations/0343_operations_commerce_order_history_followups.sql',
+  'db/migrations/0347_operations_commerce_order_tracking_url_evidence.sql',
+  'db/migrations/0348_operations_commerce_native_activity_evidence.sql',
+  'scripts/test-commerce-order-tracking-url-evidence-postgres.mjs',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',

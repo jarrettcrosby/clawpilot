@@ -296,9 +296,9 @@ export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL =
 
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30
 export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_HASH =
-  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9'
+  '638fe20619a607f2e9009c7eecf230cbaad9ce255476134005ebed67a5f64840'
 
-export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL = String.raw`
+const orderWorkbenchBaseExactHistoryHealthSql = String.raw`
   EXISTS (
     SELECT 1 FROM public.schema_migrations
     WHERE filename = '0340_operations_order_workbench_exact_history.sql'
@@ -492,6 +492,141 @@ const tableTriggerArtifacts = (tableName: string) => String.raw`
   WHERE installed_namespace.nspname = 'public'
     AND installed_table.relname = '${tableName}'
     AND NOT installed_trigger.tgisinternal
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_MIGRATION_CHECKSUM =
+  '54dc59d7d00d225139341171066ce4f1b1b640a6c77d6d5aee5db845cac4a6b4'
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT = 42
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_HASH =
+  '5b448cb504fbc42d6dfe2f8ecef643bb0a5576255b30658f598d2be21a20a800'
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL = String.raw`
+  artifacts(kind, identity, definition) AS (
+    ${tableRelationArtifact('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${tableIndexArtifacts('operations_commerce_order_tracking_url_evidence')}
+    UNION ALL
+    ${functionArtifacts([
+      'public.protect_commerce_order_tracking_url_evidence()',
+      'public.reject_commerce_order_tracking_url_evidence_mutation()',
+      'public.redact_expired_commerce_order_tracking_url_evidence(integer)',
+    ])}
+    UNION ALL
+    ${tableTriggerArtifacts('operations_commerce_order_tracking_url_evidence')}
+  )
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_FINGERPRINT_SQL = String.raw`
+  WITH ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
+export const OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0347_operations_commerce_order_tracking_url_evidence.sql'
+      AND checksum = '${OPERATIONS_TRACKING_URL_EVIDENCE_MIGRATION_CHECKSUM}'
+  ) AND (
+    WITH ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACTS_SQL}
+    SELECT pg_catalog.count(*) = ${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT}
+      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+        pg_catalog.string_agg(
+          kind || '|' || identity || '|' || definition,
+          pg_catalog.chr(10) ORDER BY kind, identity
+        ), 'UTF8'
+      ), 'sha256'), 'hex') = '${OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_HASH}'
+    FROM artifacts
+  )
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_MIGRATION_CHECKSUM =
+  '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT = 47
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH =
+  '2134de8f34c8e6d644363498fc46e06df25880d21aee29eeb6f1eb4ff4365c93'
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL = String.raw`
+  artifacts(kind, identity, definition) AS (
+    ${tableRelationArtifact('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableIndexArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${functionArtifacts([
+      'public.protect_commerce_order_native_activity_evidence()',
+      'public.reject_commerce_order_native_activity_evidence_mutation()',
+      'public.redact_expired_commerce_order_native_activity_evidence(integer)',
+      'public.protect_commerce_order_observation_lineage()',
+      'public.protect_shopify_order_webhook_read()',
+      'public.protect_shopify_order_webhook_target()',
+    ])}
+    UNION ALL
+    ${tableTriggerArtifacts('operations_commerce_order_native_activity_evidence')}
+    UNION ALL
+    ${tableColumnArtifacts('operations_commerce_order_observations')}
+      AND installed_column.attname IN (
+        'native_activity_state', 'native_activity_reason', 'native_activity_fetched_count'
+      )
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_observations')}
+      AND installed_constraint.conname = 'commerce_order_observation_native_activity_valid'
+    UNION ALL
+    ${tableConstraintArtifacts('operations_commerce_order_event_observations')}
+      AND installed_constraint.conname = 'commerce_order_event_kind_native_activity_valid'
+    UNION ALL
+    ${tableConstraintArtifacts('operations_shopify_order_webhook_reads')}
+      AND installed_constraint.conname = 'shopify_order_webhook_read_count_native_activity_valid'
+  )
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_FINGERPRINT_SQL = String.raw`
+  WITH ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0348_operations_commerce_native_activity_evidence.sql'
+      AND checksum = '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_MIGRATION_CHECKSUM}'
+  ) AND (
+    WITH ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACTS_SQL}
+    SELECT pg_catalog.count(*) = ${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT}
+      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+        pg_catalog.string_agg(
+          kind || '|' || identity || '|' || definition,
+          pg_catalog.chr(10) ORDER BY kind, identity
+        ), 'UTF8'
+      ), 'sha256'), 'hex') = '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH}'
+    FROM artifacts
+  )
+`
+
+export const OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL = String.raw`
+  (${orderWorkbenchBaseExactHistoryHealthSql})
+  AND (${OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL})
+  AND (${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL})
 `
 
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACTS_SQL = String.raw`

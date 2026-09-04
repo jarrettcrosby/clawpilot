@@ -436,14 +436,14 @@ async function main() {
         await applyMigration(client, file)
         exactHistoryInstalled ||= (
           file ===
-            '0342_operations_order_history_line_fidelity.sql'
+            '0348_operations_commerce_native_activity_evidence.sql'
         )
         if (!process.argv.includes('--print-fingerprints')) {
           assert.equal(
             await exactHistoryHealth(client),
             exactHistoryInstalled,
             exactHistoryInstalled
-              ? `${file} must preserve exact-history health after 0342`
+              ? `${file} must preserve exact-history health after 0348`
               : `${file} must not prematurely satisfy exact-history health`,
           )
         }

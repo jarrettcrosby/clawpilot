@@ -643,10 +643,18 @@ export type OperationsSummary = {
   unbilledMinor: string
 }
 
+export type OperationsNativeActivityCoverage = {
+  state: 'complete' | 'partial' | 'unavailable'
+  reason: string | null
+  fetchedCount: number
+  displayTruncated: boolean
+}
+
 export type OperationsProviderOrderHistory = {
   observedAt: string | null
   currency: string | null
   providerTotalMinor: string | null
+  nativeActivity?: OperationsNativeActivityCoverage
   currentLines: Array<{
     externalLineId: string
     externalProductId: string | null
@@ -683,6 +691,9 @@ export type OperationsProviderOrderHistory = {
     trackingNumber: string | null
     trackingUrl: string | null
     trackingRedacted: boolean
+    providerMessage?: string | null
+    providerActorDisplayName?: string | null
+    nativeActivityRedacted?: boolean
   }>
   providerWrites: 0
 }

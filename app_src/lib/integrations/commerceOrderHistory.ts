@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
 import { hasEffectiveShopifyScope } from '@/lib/integrations/commerceCapabilities'
 import {
+  readShopifyOrderNativeActivity,
+  type ShopifyNativeActivity,
+} from '@/lib/integrations/shopifyOrderNativeActivity'
+import {
   commerceProviderStaffEvidenceFingerprint,
   decryptCommerceCredential,
 } from '@/lib/integrations/commerceCredentialCrypto'
@@ -35,7 +39,9 @@ import {
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
 
-const SHOPIFY_PAGE_SIZE = 5
+// One core order plus at most two optional native-activity pages stays within
+// the existing eight-read persistence/lease envelope (six attempted reads).
+const SHOPIFY_PAGE_SIZE = 1
 const SHOPIFY_LINE_LIMIT = 50
 // Shopify returns Order.fulfillments as a bounded list rather than a cursor
 // connection. Real multi-parcel wholesale orders can legitimately exceed 20
@@ -92,7 +98,7 @@ export type ExactShopifyOrderHistoryInput = {
 export type ExactShopifyOrderHistoryRead = {
   provider: 'shopify'
   observation: CommerceOrderObservationInput
-  providerReads: 3
+  providerReads: number
   providerWrites: 0
   readAllOrdersScopeObserved: boolean
   returnHistoryScopeObserved: boolean
@@ -932,6 +938,10 @@ export function privacyMinimizedCommerceOrderEventEvidence(
   return Object.fromEntries(Object.entries(event).filter(([key]) => (
     key !== 'trackingNumber'
       && key !== 'providerActorFingerprint'
+      && key !== 'providerMessage'
+      && key !== 'providerActorDisplayName'
+      && !(event.eventKind === 'provider_activity'
+        && (key === 'eventStatus' || key === 'attributionSource'))
       && !(
         event.eventKind === 'return_state_observed'
           && key === 'occurredAt'
@@ -961,7 +971,16 @@ export function commerceOrderHistoryObservation(
     source,
     observedAt,
   )
+  const native = provider === 'shopify' && source.nativeActivity
+    ? source.nativeActivity as ShopifyNativeActivity : null
+  if (native) events.push(...native.events)
+  const nativeCoverage = native ? {
+    nativeActivityState: native.nativeActivityState,
+    nativeActivityReason: native.nativeActivityReason,
+    nativeActivityFetchedCount: native.nativeActivityFetchedCount,
+  } : {}
   const minimized = {
+    ...nativeCoverage,
     externalOrderId: order.identity.value,
     orderNumber: order.orderNumber,
     providerCreatedAt: order.providerCreatedAt,
@@ -999,6 +1018,7 @@ export function commerceOrderHistoryObservation(
     events: events.map(privacyMinimizedCommerceOrderEventEvidence),
   }
   return {
+    ...nativeCoverage,
     observationKind,
     externalOrderId: order.identity.value,
     orderNumber: order.orderNumber,
@@ -1889,7 +1909,9 @@ async function readShopifyHistoryPage(
     )
   }
   const sourceOrders: JsonRecord[] = []
+  let providerReads = 3
   for (const listedId of listedIds as string[]) {
+    providerReads += 1
     const detailData = await shopifyAdminGraphql<JsonRecord>(credential, {
       query: shopifyOrderHistoryDetailQuery(readReturns),
       operationName: 'ClawPilotCommerceOrderHistoryDetail',
@@ -1903,7 +1925,20 @@ async function readShopifyHistoryPage(
         502,
       )
     }
-    sourceOrders.push(order)
+    assertShopifyOrderHistoryDetailEvidence(order, readReturns)
+    const nativeActivity = await readShopifyOrderNativeActivity({
+      externalOrderId: listedId,
+      observedAt,
+      includeStaffAuthors: grant.grantedScopes.includes('read_users')
+        && probe.grantedScopes.includes('read_users'),
+      readPage: (request) => {
+        providerReads += 1
+        return shopifyAdminGraphql<JsonRecord>(credential, request, {
+          timeoutMs: PROVIDER_TIMEOUT_MS,
+        })
+      },
+    })
+    sourceOrders.push({ ...order, nativeActivity })
   }
   sourceOrders.forEach((order) => {
     assertShopifyOrderHistoryDetailEvidence(order, readReturns)
@@ -1949,14 +1984,14 @@ async function readShopifyHistoryPage(
       order,
       sourceById.get(order.identity.value) || {},
       observedAt,
-      3 + sourceOrders.length,
+      providerReads,
       input.mode === 'continuous_poll'
         ? 'scheduled_poll'
         : 'historical_backfill',
     )),
     nextProviderCursor: listEvidence.nextCursor,
     providerRowsSeen: listedOrders.length,
-    providerReads: 3 + sourceOrders.length,
+    providerReads,
     providerWrites: 0,
     readAllOrdersScopeObserved: readAllOrders,
     returnHistoryScopeObserved: readReturns,
@@ -2198,6 +2233,18 @@ export async function readExactShopifyOrderHistoryObservation(
       )
     }
     assertShopifyOrderHistoryDetailEvidence(source, readReturns)
+    source.nativeActivity = await readShopifyOrderNativeActivity({
+      externalOrderId,
+      observedAt,
+      includeStaffAuthors: grant.grantedScopes.includes('read_users')
+        && probe.grantedScopes.includes('read_users'),
+      readPage: (request) => {
+        providerReads += 1
+        return shopifyAdminGraphql<JsonRecord>(credential, request, {
+          timeoutMs: PROVIDER_TIMEOUT_MS,
+        })
+      },
+    })
     const normalized = normalizeShopifyCommerce({
       data: {
         products: completeConnection([]),
@@ -2224,10 +2271,10 @@ export async function readExactShopifyOrderHistoryObservation(
         normalized.orders[0],
         source,
         observedAt,
-        3,
+        providerReads,
         input.observationKind,
       ),
-      providerReads: 3,
+      providerReads,
       providerWrites: 0,
       readAllOrdersScopeObserved: readAllOrders,
       returnHistoryScopeObserved: readReturns,

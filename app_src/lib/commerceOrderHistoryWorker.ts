@@ -1,4 +1,5 @@
 import { readCommerceOrderHistoryPage } from '@/lib/integrations/commerceOrderHistory'
+import { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS } from '@/lib/integrations/commerceOrderHistoryReadLimits'
 import {
   appendCommerceOrderBackfillPageInPostgres,
   claimCommerceOrderBackfillsInPostgres,
@@ -15,10 +16,10 @@ import {
   withCommerceStoreSyncProviderReadFenceInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 
-// One Shopify page is bounded to token + identity + list + five exact-order
-// reads. Failed page attempts reserve that entire envelope because the adapter
+// One Shopify page is bounded to token + identity + list + one exact order
+// and two optional native-activity pages. Failed attempts reserve the envelope because the adapter
 // cannot report how many provider reads completed before it rejected.
-const MAX_PROVIDER_READS_PER_PAGE = 8
+const MAX_PROVIDER_READS_PER_PAGE = SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS
 const MAX_PAGE_ATTEMPTS_PER_RUN = 24
 const MAX_PROVIDER_READ_RESERVATIONS_PER_RUN =
   MAX_PROVIDER_READS_PER_PAGE * MAX_PAGE_ATTEMPTS_PER_RUN

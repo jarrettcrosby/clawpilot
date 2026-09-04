@@ -1,3 +1,4 @@
+import { SHOPIFY_EXACT_HISTORY_MAX_PROVIDER_READS } from '@/lib/integrations/commerceOrderHistoryReadLimits'
 import {
   readExactShopifyOrderHistoryObservation,
 } from '@/lib/integrations/commerceOrderHistory'
@@ -13,7 +14,7 @@ import {
 } from '@/lib/persistence/commerceStoreSync'
 
 const MAX_TARGETS_PER_RUN = 5
-const PROVIDER_READS_PER_TARGET = 3
+const PROVIDER_READS_PER_TARGET = SHOPIFY_EXACT_HISTORY_MAX_PROVIDER_READS
 
 function isStoreSyncReadPause(error: unknown) {
   const code = error && typeof error === 'object' && 'code' in error
@@ -82,7 +83,8 @@ export async function processShopifyOrderWebhookSignals(input: {
           })
           if (
             read.provider !== 'shopify'
-            || read.providerReads !== PROVIDER_READS_PER_TARGET
+            || !Number.isSafeInteger(read.providerReads)
+            || read.providerReads < 3 || read.providerReads > PROVIDER_READS_PER_TARGET
             || read.providerWrites !== 0
             || read.observation.externalOrderId !== claim.externalOrderId
             || read.observation.observationKind !== 'webhook_exact_read'

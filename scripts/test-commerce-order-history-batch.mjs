@@ -478,7 +478,7 @@ for (const fragment of [
   'validOrderHistorySyncResult',
   'const historyTotals = historyResults.reduce',
   'historyTotals.refreshed',
-  'historyTotals.changed',
+  'Refreshed order details and activity for',
   'const historyRemaining = historyResults.at(-1)?.remaining || 0',
   'refresh again to continue.',
 ]) {

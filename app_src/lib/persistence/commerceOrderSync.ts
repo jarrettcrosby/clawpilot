@@ -1,5 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
+import {
+  inspectCommerceOrderNativeActivityWithClient,
+  appendCommerceOrderNativeActivityWithClient,
+  commerceOrderNativeActivityJoinSql,
+  COMMERCE_ORDER_NATIVE_MESSAGE_SQL,
+  COMMERCE_ORDER_NATIVE_ACTOR_SQL,
+  COMMERCE_ORDER_NATIVE_ACTION_SQL,
+  COMMERCE_ORDER_NATIVE_REDACTED_SQL,
+} from '@/lib/persistence/commerceOrderNativeActivity'
+import {
+  appendCommerceOrderTrackingUrlEvidenceWithClient,
+  inspectCommerceOrderTrackingUrlEvidenceWithClient,
+  commerceOrderTrackingUrlEvidenceJoinSql,
+  COMMERCE_ORDER_TRACKING_URL_VALUE_SQL,
+} from '@/lib/persistence/commerceOrderTrackingUrlEvidence'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { hasEffectiveShopifyScope } from '@/lib/integrations/commerceCapabilities'
 import {
@@ -66,6 +81,7 @@ const EVENT_KINDS = new Set([
   'return_created',
   'return_updated',
   'return_state_observed',
+  'provider_activity',
 ] as const)
 const INVENTORY_EFFECT_KINDS = new Set([
   'none',
@@ -101,6 +117,7 @@ type CommerceOrderEventKind =
   | 'return_created'
   | 'return_updated'
   | 'return_state_observed'
+  | 'provider_activity'
 type InventoryEffectKind =
   | 'none'
   | 'order_demand'
@@ -405,6 +422,8 @@ export type CommerceOrderEventObservationInput = {
   trackingCarrier?: string | null
   trackingNumber?: string | null
   trackingUrl?: string | null
+  providerMessage?: string | null
+  providerActorDisplayName?: string | null
   occurredAt: string
 }
 
@@ -453,6 +472,9 @@ export type CommerceOrderObservationInput = {
   providerClosedAt?: string | null
   observedAt: string
   providerReadCount: number
+  nativeActivityState?: 'complete' | 'partial' | 'unavailable'
+  nativeActivityReason?: string | null
+  nativeActivityFetchedCount?: number
   lines: readonly CommerceOrderObservationLineInput[]
   events?: readonly CommerceOrderEventObservationInput[]
 }
@@ -742,7 +764,27 @@ export function normalizeCommerceOrderObservationInput(
           512,
         ),
         trackingUrl: optionalHttpUrl(event.trackingUrl, 'Tracking URL'),
+        providerMessage: event.providerMessage == null ? null : (() => {
+          if (typeof event.providerMessage !== 'string') {
+            throw new CommerceOrderSyncError('COMMERCE_ORDER_SYNC_INPUT_INVALID', 'Provider message is invalid', 400)
+          }
+          const value = event.providerMessage.trim()
+          if (value.length > 8000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+            throw new CommerceOrderSyncError('COMMERCE_ORDER_SYNC_INPUT_INVALID', 'Provider message is invalid', 400)
+          }
+          return value || null
+        })(),
+        providerActorDisplayName: optionalText(event.providerActorDisplayName, 'Provider actor display name', 255),
         occurredAt,
+      }
+      if (normalized.eventKind === 'provider_activity' && (
+        !normalized.externalEventId || normalized.externalSubjectId !== externalOrderId
+        || normalized.trackingNumber !== null || normalized.trackingUrl !== null
+        || normalized.providerActorFingerprint !== null
+        || normalized.quantity !== null || normalized.amountMinor !== null
+        || normalized.inventoryEffectKind !== 'none'
+      )) {
+        throw new CommerceOrderSyncError('COMMERCE_ORDER_SYNC_INPUT_INVALID', 'Native provider activity identity is invalid', 400)
       }
       const sensitiveIdentifiers = [
         normalized.trackingNumber,
@@ -773,6 +815,12 @@ export function normalizeCommerceOrderObservationInput(
           key !== 'trackingNumber'
           && key !== 'trackingUrl'
           && key !== 'providerActorFingerprint'
+          && key !== 'providerMessage'
+          && key !== 'providerActorDisplayName'
+          && !(normalized.eventKind === 'provider_activity' && [
+            'eventStatus', 'attributionSource', 'quantity', 'amountMinor', 'currency',
+            'inventoryEffectKind', 'providerLocationId', 'trackingCarrier',
+          ].includes(key))
         )),
       )
       return {
@@ -846,6 +894,16 @@ export function normalizeCommerceOrderObservationInput(
       }
       return value
     })(),
+    ...(input.nativeActivityState === undefined ? {} : {
+      nativeActivityState: enumValue(input.nativeActivityState,
+        new Set(['complete', 'partial', 'unavailable'] as const), 'Native activity coverage'),
+      nativeActivityReason: optionalText(input.nativeActivityReason, 'Native activity reason', 255),
+      nativeActivityFetchedCount: (() => {
+        const value = count(input.nativeActivityFetchedCount, 'Native activity fetched count')
+        if (value > 500) throw new CommerceOrderSyncError('COMMERCE_ORDER_SYNC_INPUT_INVALID', 'Native activity count exceeds the bounded read', 400)
+        return value
+      })(),
+    }),
     lines,
     events,
   }
@@ -865,6 +923,12 @@ export function normalizeCommerceOrderObservationInput(
           'trackingNumber',
           'providerActorFingerprint',
           'eventHash',
+          'providerMessage',
+          'providerActorDisplayName',
+          ...(event.eventKind === 'provider_activity' ? [
+            'eventStatus', 'attributionSource', 'quantity', 'amountMinor', 'currency',
+            'inventoryEffectKind', 'providerLocationId', 'trackingCarrier',
+          ] : []),
           ...(event.eventKind === 'return_state_observed'
             ? ['occurredAt']
             : []),
@@ -942,7 +1006,7 @@ async function appendObservationsWithClient(
       || latestObservationRow?.manual_provider_read_lease_id
         === context.manualProviderReadLeaseId
     )
-    let observationRow = latestObservationRow?.source_hash
+    let observationRow: { id: string; global_id: string; order_id: string | null; source_hash: string } | undefined = latestObservationRow?.source_hash
         === observation.sourceHash
       && (
         !exactObservation
@@ -995,68 +1059,23 @@ async function appendObservationsWithClient(
             ],
           )
         ).rows[0]
-    if (observationRow) {
-      const sensitiveEvents = observation.events.filter((event) => (
-        event.trackingNumber !== null
-          || event.trackingUrl !== null
-          || event.providerActorFingerprint !== null
-      ))
-      if (sensitiveEvents.length) {
-        const retainedSensitive = await client.query<{
-          event_hash: string
-          tracking_number: string | null
-          tracking_url: string | null
-          provider_actor_fingerprint: string | null
-          sensitive_evidence_redacted_at: Date | null
-          sensitive_evidence_expired: boolean
-        }>(
-          `SELECT event_hash, tracking_number, tracking_url,
-                  provider_actor_fingerprint,
-                  sensitive_evidence_redacted_at,
-                  sensitive_evidence_expires_at <= clock_timestamp()
-                    AS sensitive_evidence_expired
-           FROM operations_commerce_order_event_observations
-           WHERE organization_id = $1::uuid
-             AND integration_account_id = $2::uuid
-             AND provider = $3
-             AND external_order_id = $4
-             AND event_hash = ANY($5::text[])`,
-          [
-            context.organizationId,
-            context.integrationAccountId,
-            context.provider,
-            observation.externalOrderId,
-            sensitiveEvents.map((event) => event.eventHash),
-          ],
-        )
-        const retainedByHash = new Map(
-          retainedSensitive.rows.map((event) => [event.event_hash, event]),
-        )
-        const conflict = sensitiveEvents.some((event) => {
-          const retained = retainedByHash.get(event.eventHash)
-          return !retained
-            || (
-              retained.sensitive_evidence_redacted_at !== null
-              && !retained.sensitive_evidence_expired
-            )
-            || (
-              retained.sensitive_evidence_redacted_at === null
-              && (
-                retained.tracking_number !== event.trackingNumber
-                || retained.tracking_url !== event.trackingUrl
-                || retained.provider_actor_fingerprint
-                  !== event.providerActorFingerprint
-              )
-            )
-        })
-        if (conflict) {
+    const urlEnrichments = await inspectCommerceOrderTrackingUrlEvidenceWithClient(
+      client, context, observation, {
+        requireRetained: Boolean(observationRow),
+        conflict: () => {
           throw new CommerceOrderSyncError(
             'COMMERCE_ORDER_SYNC_SENSITIVE_REVISION_CONFLICT',
-            'Sensitive provider evidence changed without a new provider revision',
-            409,
+            'Sensitive provider evidence changed without a new provider revision', 409,
           )
-        }
-      }
+        },
+      },
+    )
+    const nativeSnapshots = await inspectCommerceOrderNativeActivityWithClient(client, context, observation)
+    // A matching hash may belong to an old, sealed observation whose URL was
+    // never retained. Capture this actual read under its current authority;
+    // do not mutate that parent or append children to its expired lease.
+    if (urlEnrichments.length || nativeSnapshots.length) observationRow = undefined
+    if (observationRow) {
       preserved += 1
       observationWasPreserved = true
     }
@@ -1077,14 +1096,15 @@ async function appendObservationsWithClient(
          provider_inventory_reservation_state, provider_created_at,
          provider_processed_at, provider_updated_at, provider_cancelled_at,
          provider_closed_at, observed_at, provider_read_count,
-         manual_provider_read_lease_id
+         manual_provider_read_lease_id, native_activity_state,
+         native_activity_reason, native_activity_fetched_count
        )
        SELECT
          $1::uuid, $2::uuid, $3::uuid, canonical.id, $4, $5, $6,
          $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
          $18, $19, $20, $21, $22::timestamptz, $23::timestamptz,
          $24::timestamptz, $25::timestamptz, $26::timestamptz,
-         $27::timestamptz, $28, $29::uuid
+         $27::timestamptz, $28, $29::uuid, $30, $31, $32
        FROM (SELECT 1) singleton
        LEFT JOIN LATERAL (
          SELECT orders.id
@@ -1132,6 +1152,9 @@ async function appendObservationsWithClient(
         observation.observedAt,
         observation.providerReadCount,
         context.manualProviderReadLeaseId,
+        observation.nativeActivityState || null,
+        observation.nativeActivityReason || null,
+        observation.nativeActivityFetchedCount ?? null,
       ],
     )
     observationRow = observationRow || inserted?.rows[0]
@@ -1139,7 +1162,7 @@ async function appendObservationsWithClient(
       appended += 1
     } else if (!observationRow) {
       preserved += 1
-      observationWasPreserved = true
+      observationWasPreserved = urlEnrichments.length === 0 && nativeSnapshots.length === 0
       observationRow = (
           await client.query<{
             id: string
@@ -1280,13 +1303,13 @@ async function appendObservationsWithClient(
           event.externalSubjectId,
           event.eventHash,
           event.eventKind,
-          event.eventStatus,
+          event.eventKind === 'provider_activity' ? null : event.eventStatus,
           event.quantity,
           event.amountMinor,
           event.currency,
           event.inventoryEffectKind,
-          event.attributionSource,
-          event.providerActorFingerprint,
+          event.eventKind === 'provider_activity' ? 'unavailable' : event.attributionSource,
+          event.eventKind === 'provider_activity' ? null : event.providerActorFingerprint,
           event.providerLocationId,
           event.trackingCarrier,
           event.trackingNumber,
@@ -1298,6 +1321,10 @@ async function appendObservationsWithClient(
       )
       eventsAppended += Number(eventResult.rowCount || 0)
     }
+    await appendCommerceOrderTrackingUrlEvidenceWithClient(
+      client, context, observation, observationRow.id, urlEnrichments,
+    )
+    await appendCommerceOrderNativeActivityWithClient(client, context, observation, observationRow.id, nativeSnapshots)
   }
   return { appended, preserved, linesAppended, eventsAppended }
 }
@@ -1332,11 +1359,13 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
     )
   }
   const observation = normalizeObservation(input.observation)
-  const expectedProviderReadCount = input.provider === 'shopify' ? 3 : 2
+  const providerReadCountValid = input.provider === 'shopify'
+    ? observation.providerReadCount >= 3 && observation.providerReadCount <= 5
+    : observation.providerReadCount === 2
   if (
     observation.observationKind !== 'manual_exact_read'
     || observation.externalOrderId !== input.externalOrderId
-    || observation.providerReadCount !== expectedProviderReadCount
+    || !providerReadCountValid
   ) {
     throw new CommerceOrderSyncError(
       'COMMERCE_ORDER_SYNC_INPUT_INVALID',
@@ -1402,7 +1431,7 @@ export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
     }, [observation])
     return Object.freeze({
       ...persisted,
-      providerReads: expectedProviderReadCount,
+      providerReads: observation.providerReadCount,
       providerWrites: 0 as const,
     })
   })
@@ -3915,8 +3944,12 @@ export async function redactExpiredCommerceOrderSensitiveEvidenceInPostgres(
 ) {
   const limit = Math.max(1, Math.min(Number(input.limit || 250), 1000))
   const result = await query<{ redacted: number }>(
-    `SELECT redact_expired_commerce_order_sensitive_evidence($1)::integer
-       AS redacted`,
+    `WITH base AS (SELECT redact_expired_commerce_order_sensitive_evidence($1) AS count),
+       urls AS (SELECT CASE WHEN base.count < $1
+         THEN redact_expired_commerce_order_tracking_url_evidence($1-base.count) ELSE 0 END AS count FROM base),
+       native AS (SELECT CASE WHEN base.count+urls.count < $1
+         THEN redact_expired_commerce_order_native_activity_evidence($1-base.count-urls.count) ELSE 0 END AS count FROM base,urls)
+     SELECT (base.count+urls.count+native.count)::integer AS redacted FROM base,urls,native`,
     [limit],
   )
   return {
@@ -4092,7 +4125,7 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
           )
           AND policy.continuous_transport = 'webhook_signal_plus_poll')
          AS webhook_signal_plus_poll_policies,
-       (SELECT count(*)::integer
+       ((SELECT count(*)::integer
         FROM operations_commerce_order_event_observations event
         WHERE event.sensitive_evidence_redacted_at IS NULL
           AND event.sensitive_evidence_expires_at <= now()
@@ -4100,7 +4133,18 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
             event.provider_actor_fingerprint IS NOT NULL
             OR event.tracking_number IS NOT NULL
             OR event.tracking_url IS NOT NULL
-          )) AS expired_sensitive_evidence,
+          )) + (SELECT count(*)::integer
+        FROM operations_commerce_order_tracking_url_evidence evidence
+        WHERE evidence.sensitive_evidence_redacted_at IS NULL
+          AND evidence.sensitive_evidence_expires_at <= now()
+          AND (evidence.tracking_url IS NOT NULL OR evidence.tracking_number IS NOT NULL
+            OR evidence.provider_actor_fingerprint IS NOT NULL))
+        + (SELECT count(*)::integer
+        FROM operations_commerce_order_native_activity_evidence evidence
+        WHERE evidence.sensitive_evidence_redacted_at IS NULL
+          AND evidence.sensitive_evidence_expires_at <= now()
+          AND (evidence.provider_action IS NOT NULL OR evidence.provider_message IS NOT NULL
+            OR evidence.provider_actor_display_name IS NOT NULL))) AS expired_sensitive_evidence,
        totals.last_completed_at
      FROM active_health active
      CROSS JOIN terminal_totals totals
@@ -4646,7 +4690,7 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
      SELECT 'provider'::text AS evidence_source,
             false AS required_line_snapshot,
             event.global_id AS evidence_global_id,
-            event.event_kind, event.event_status,
+            event.event_kind, ${COMMERCE_ORDER_NATIVE_ACTION_SQL} AS event_status,
             event.occurred_at,
             CASE WHEN event.sensitive_evidence_expires_at <= now()
                    AND event.attribution_source = 'provider_staff'
@@ -4665,9 +4709,11 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
               'trackingNumber', CASE
                 WHEN event.sensitive_evidence_expires_at > now()
                   THEN event.tracking_number ELSE NULL END,
-              'trackingUrl', CASE
-                WHEN event.sensitive_evidence_expires_at > now()
-                  THEN event.tracking_url ELSE NULL END,
+              'trackingUrl', ${COMMERCE_ORDER_TRACKING_URL_VALUE_SQL},
+              'providerMessage', ${COMMERCE_ORDER_NATIVE_MESSAGE_SQL},
+              'providerActorDisplayName', ${COMMERCE_ORDER_NATIVE_ACTOR_SQL},
+              'nativeActivityRedacted', CASE WHEN event.event_kind = 'provider_activity'
+                THEN ${COMMERCE_ORDER_NATIVE_REDACTED_SQL} ELSE NULL END,
               'sensitiveEvidenceRedactedAt',
                 event.sensitive_evidence_redacted_at
             )) AS payload
@@ -4683,6 +4729,20 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
           = event.integration_account_id
       AND event_observation.provider = event.provider
       AND event_observation.external_order_id = event.external_order_id
+     ${commerceOrderTrackingUrlEvidenceJoinSql(`$4::text[] IS NULL OR EXISTS (
+       SELECT 1 FROM latest_observation anchor
+       WHERE (COALESCE(url_observation.provider_updated_at, url_observation.observed_at),
+              url_observation.observed_at, url_observation.id)
+         <= (COALESCE(anchor.provider_updated_at, anchor.observed_at), anchor.observed_at, anchor.id)
+         AND url_observation.observed_at <= anchor.observed_at
+     )`)}
+     ${commerceOrderNativeActivityJoinSql(`$4::text[] IS NULL OR EXISTS (
+       SELECT 1 FROM latest_observation anchor
+       WHERE (COALESCE(native_observation.provider_updated_at, native_observation.observed_at),
+              native_observation.observed_at, native_observation.id)
+         <= (COALESCE(anchor.provider_updated_at, anchor.observed_at), anchor.observed_at, anchor.id)
+         AND native_observation.observed_at <= anchor.observed_at
+     )`)}
      WHERE event.external_order_id = $3
        AND (
          $4::text[] IS NULL
@@ -4701,6 +4761,8 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
              anchor.observed_at,
              anchor.id
            )
+             AND (event.event_kind <> 'provider_activity'
+               OR event_observation.observed_at <= anchor.observed_at)
          )
        )
      UNION ALL
@@ -4720,7 +4782,12 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
               'observedAt', latest.observed_at,
               'inventorySemantics', 'order_demand',
               'lines', COALESCE(lines.payload, '[]'::jsonb)
-            ) AS payload
+            ) || CASE WHEN latest.native_activity_state IS NULL THEN '{}'::jsonb
+              ELSE jsonb_strip_nulls(jsonb_build_object(
+                'nativeActivityState', latest.native_activity_state,
+                'nativeActivityReason', latest.native_activity_reason,
+                'nativeActivityFetchedCount', latest.native_activity_fetched_count
+              )) END AS payload
      FROM latest_observation latest
      LEFT JOIN LATERAL (
        SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
@@ -4891,7 +4958,7 @@ export async function readCommerceOrderEvidenceTimelineFromPostgres(input: {
      )
      SELECT 'provider'::text AS evidence_source,
             event.global_id AS evidence_global_id,
-            event.event_kind, event.event_status,
+            event.event_kind, ${COMMERCE_ORDER_NATIVE_ACTION_SQL} AS event_status,
             event.occurred_at,
             CASE WHEN event.sensitive_evidence_expires_at <= now()
                    AND event.attribution_source = 'provider_staff'
@@ -4910,9 +4977,11 @@ export async function readCommerceOrderEvidenceTimelineFromPostgres(input: {
               'trackingNumber', CASE
                 WHEN event.sensitive_evidence_expires_at > now()
                   THEN event.tracking_number ELSE NULL END,
-              'trackingUrl', CASE
-                WHEN event.sensitive_evidence_expires_at > now()
-                  THEN event.tracking_url ELSE NULL END
+              'trackingUrl', ${COMMERCE_ORDER_TRACKING_URL_VALUE_SQL},
+              'providerMessage', ${COMMERCE_ORDER_NATIVE_MESSAGE_SQL},
+              'providerActorDisplayName', ${COMMERCE_ORDER_NATIVE_ACTOR_SQL},
+              'nativeActivityRedacted', CASE WHEN event.event_kind = 'provider_activity'
+                THEN ${COMMERCE_ORDER_NATIVE_REDACTED_SQL} ELSE NULL END
             )) AS payload
      FROM operations_commerce_order_event_observations event
      JOIN target
@@ -4920,6 +4989,8 @@ export async function readCommerceOrderEvidenceTimelineFromPostgres(input: {
       AND target.integration_account_id = event.integration_account_id
       AND target.source_provider = event.provider
       AND target.external_order_id = event.external_order_id
+     ${commerceOrderTrackingUrlEvidenceJoinSql()}
+     ${commerceOrderNativeActivityJoinSql()}
      UNION ALL
      SELECT 'clawpilot'::text AS evidence_source,
             domain.global_id AS evidence_global_id,

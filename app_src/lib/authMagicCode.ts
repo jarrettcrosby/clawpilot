@@ -161,7 +161,10 @@ async function issueAuthMagicCode(input: {
   }
 
   try {
-    await sendAuthMagicCodeEmail({ to: requestedEmail, code })
+    const delivery = await sendAuthMagicCodeEmail({ to: requestedEmail, code })
+    if (delivery?.inboxPlacement === 'unconfirmed') {
+      console.warn('[auth] Sign-in code sent; configured self-mailbox Inbox placement was not confirmed')
+    }
   } catch {
     await query(
       `
