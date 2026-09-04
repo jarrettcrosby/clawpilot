@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   monitor:
-    name: production and development
+    name: production
     runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:
@@ -31,11 +31,4 @@ jobs:
           CLAWPILOT_BASE_URL: https://aiapp.eigenracing.com
           CLAWPILOT_EXPECT_BRANCH: main
           CLAWPILOT_EXPECT_ENVIRONMENT: production
-        run: node scripts/monitor-deployed-runtime.mjs
-
-      - name: Verify development runtime contract
-        env:
-          CLAWPILOT_BASE_URL: https://dev.aiapp.eigenracing.com
-          CLAWPILOT_EXPECT_BRANCH: dev
-          CLAWPILOT_EXPECT_ENVIRONMENT: development
         run: node scripts/monitor-deployed-runtime.mjs
