@@ -952,7 +952,7 @@ const crmSuiteCrmMeetingIngestion = read('app_src/lib/crm/suiteCrmMeetingIngesti
 assertIncludes(crmSuiteCrmMeetingIngestion, 'listSuiteCrmMeetingsUpdatedSince', 'native SuiteCRM meeting polling')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'hasMeaningfulChanges', 'SuiteCRM meeting echo prevention')
 assertIncludes(crmSuiteCrmMeetingIngestion, 'crm:suitecrm-meeting-calendar:', 'SuiteCRM to Calendar update idempotency')
-assertIncludes(crmSuiteCrmMeetingIngestion, 'meetingCalendarOwnerEmail', 'original Calendar organizer routing')
+assertIncludes(crmSuiteCrmMeetingIngestion, 'resolveRecordedCrmMeetingCalendarCommunication', 'original reviewed Calendar routing')
 
 const crmSuiteCrmCallIngestion = read('app_src/lib/crm/suiteCrmCallIngestion.ts')
 assertIncludes(crmSuiteCrmCallIngestion, 'listSuiteCrmCallsUpdatedSince', 'native SuiteCRM Call polling')

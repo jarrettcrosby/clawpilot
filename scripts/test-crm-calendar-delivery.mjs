@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -160,6 +162,15 @@ const commonMocks = {
     globalIdPattern,
   },
   '@/lib/users': { normalizeUserEmail },
+  '@/lib/tenancy': {
+    listPipelineSpaces: async (_actor, options) => {
+      assert.equal(options.ensureDefaults, false)
+      return [{ id: PIPELINE_ID, accessRole: 'editor' }]
+    },
+    requireResourceEditor: (pipeline) => {
+      if (pipeline.accessRole === 'viewer') throw new Error('This resource is view-only')
+    },
+  },
   '@/lib/zonedDateTime': {
     zonedDateTimeToIso(value) {
       const parsed = new Date(String(value || ''))
@@ -173,6 +184,8 @@ let resolutionCalls = 0
 let insertedParameters = null
 let preparedExistingAction = null
 let preparedTargetReads = 0
+let preparedMeetingLockCount = 0
+let preparedMeetingExists = true
 let preparedMeetingTarget = {
   ...contactTarget,
   entity: 'meetings',
@@ -184,6 +197,13 @@ let preparedMeetingTarget = {
 }
 const prepareClient = {
   async query(sql, parameters = []) {
+    if (sql.includes('SELECT source_hash FROM crm_meetings')) {
+      assert.match(sql, /FOR UPDATE/)
+      assert.match(sql, /NOT IN \('true', '1', 'yes'\)/)
+      assert.deepEqual(Array.from(parameters), [PIPELINE_ID, MEETING_ID])
+      preparedMeetingLockCount += 1
+      return { rows: preparedMeetingExists ? [{ source_hash: 'meeting-source-hash' }] : [] }
+    }
     if (sql.includes('INSERT INTO audit_events')) return { rows: [], rowCount: 1 }
     if (!sql.includes('WITH inserted AS')) throw new Error(`unexpected prepare SQL: ${sql.slice(0, 80)}`)
     insertedParameters = parameters
@@ -331,6 +351,7 @@ await prepareRuntime.enqueueCrmIntegrationAction({
 })
 assert.equal(insertedParameters[11], CREDENTIAL_OWNER_EMAIL)
 assert.equal(JSON.parse(insertedParameters[8]).meetingMode, 'google_meet')
+assert.equal(preparedMeetingLockCount, 0, 'contact Calendar actions must not lock an unrelated meeting')
 
 const mutableMeetingRequest = {
   pipelineId: PIPELINE_ID,
@@ -341,7 +362,17 @@ const mutableMeetingRequest = {
   idempotencyKey: 'calendar-action-lost-response-replay',
 }
 const initiallyQueuedMeeting = await prepareRuntime.enqueueCrmIntegrationAction(mutableMeetingRequest)
+assert.equal(preparedMeetingLockCount, 1, 'generic meeting enqueue must lock the meeting before inserting intent')
 const queuedMeetingPayload = JSON.parse(insertedParameters[8])
+preparedMeetingExists = false
+const insertedBeforeMissingMeeting = insertedParameters
+await assert.rejects(
+  prepareRuntime.enqueueCrmIntegrationAction({ ...mutableMeetingRequest, idempotencyKey: 'missing-meeting' }),
+  (error) => error?.code === 'CRM_RECORD_NOT_FOUND',
+  'a deleted or archived meeting must not acquire a new queued action after the initial target read',
+)
+assert.equal(insertedParameters, insertedBeforeMissingMeeting, 'missing meeting must fail before the action insert')
+preparedMeetingExists = true
 preparedExistingAction = actionRow({
   id: initiallyQueuedMeeting.action.id,
   aggregate_type: 'crm_meeting',
@@ -599,6 +630,7 @@ let atomicAction = null
 let atomicStageCalls = 0
 let atomicInsideTransaction = false
 let atomicRequestLockAcquired = false
+let atomicMeetingLockAcquired = false
 const atomicClient = {
   async query(sql, parameters = []) {
     if (sql.includes('pg_advisory_xact_lock')) {
@@ -609,7 +641,16 @@ const atomicClient = {
     if (sql.includes('WHERE actor_email = $1 AND idempotency_key = $2') && sql.includes('FOR UPDATE')) {
       return { rows: atomicAction ? [atomicAction] : [], rowCount: atomicAction ? 1 : 0 }
     }
+    if (sql.includes('SELECT source_hash FROM crm_meetings')) {
+      assert.match(sql, /FOR UPDATE/)
+      assert.deepEqual(Array.from(parameters), [PIPELINE_ID, MEETING_ID])
+      assert.equal(atomicRequestLockAcquired, true)
+      assert.equal(atomicStageCalls, 1, 'common enqueue lock must reuse the already staged meeting')
+      atomicMeetingLockAcquired = true
+      return { rows: [{ source_hash: 'meeting-source-hash' }] }
+    }
     if (sql.includes('WITH inserted AS')) {
+      assert.equal(atomicMeetingLockAcquired, true, 'atomic enqueue must also use the shared meeting lock')
       atomicAction = actionRow({
         actor_email: parameters[1], provider: parameters[2], app: parameters[3], action_type: parameters[4],
         aggregate_type: parameters[5], aggregate_id: parameters[6], reference_code: parameters[7],
@@ -1424,3 +1465,166 @@ for (const fragment of [
 }
 
 console.log('CRM Calendar delivery contract tests passed')
+
+// Opt-in real concurrency contract: no configured application database is used.
+// --source-ref HEAD runs the same interleaving against the pre-fix helper.
+if (process.argv.includes('--postgres')) await verifyMeetingEnqueuePostgresLock()
+
+async function verifyMeetingEnqueuePostgresLock() {
+  const { Pool } = requireFromApp('pg')
+  const sourceRefIndex = process.argv.indexOf('--source-ref')
+  const sourceRef = sourceRefIndex < 0 ? null : process.argv[sourceRefIndex + 1]
+  assert.ok(sourceRefIndex < 0 || sourceRef, '--source-ref requires a git reference')
+  const path = 'app_src/lib/crm/integrationActions.ts'
+  const source = sourceRef ? execFileSync('git', ['show', `${sourceRef}:${path}`], { encoding: 'utf8' }) : read(path)
+  const parsed = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
+  const names = ['insertPreparedAction', 'auditAction', 'CrmIntegrationActionError']
+  const declarations = names.map((name) => {
+    const declaration = parsed.statements.find((statement) => (
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name?.text === name
+    ))
+    assert.ok(declaration, `production declaration ${name} must exist`)
+    return declaration.getText(parsed).replace(/^export\s+/u, '')
+  }).join('\n')
+  const output = ts.transpileModule(declarations, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText
+  const context = { actionView: (row) => row }
+  vm.runInNewContext(`${output}\nglobalThis.insert = insertPreparedAction`, context)
+  const container = `clawpilot-calendar-lock-test-${process.pid}-${randomUUID().slice(0, 8)}`
+  let pool
+  const clients = []
+  try {
+    execFileSync('docker', ['run', '--rm', '-d', '--name', container,
+      '-e', 'POSTGRES_PASSWORD=calendar_lock_test', '-e', 'POSTGRES_DB=calendar_lock_test',
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 60_000, stdio: 'pipe' })
+    const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8' }).match(/:(\d+)\s*$/u)?.[1]
+    assert.ok(port)
+    pool = new Pool({ connectionString: `postgresql://postgres:calendar_lock_test@127.0.0.1:${port}/calendar_lock_test`,
+      max: 4, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+    const deadline = Date.now() + 30_000
+    while (true) {
+      try { await pool.query('SELECT 1'); break } catch (error) {
+        if (Date.now() > deadline) throw error
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+      }
+    }
+    await pool.query(`
+      CREATE TABLE crm_meetings (id uuid PRIMARY KEY, pipeline_id uuid, source_hash text, source_payload jsonb);
+      CREATE TABLE crm_integration_actions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(), pipeline_id uuid, actor_email text, provider text, app text,
+        action_type text, aggregate_type text, aggregate_id text, reference_code text, payload jsonb, status text,
+        idempotency_key text, workspace_organization_id uuid, communication_credential_owner_email text,
+        communication_connection_id text, communication_account_email text, communication_identity_email text,
+        communication_calendar_id text, communication_binding_source text, created_at timestamptz,
+        available_at timestamptz, updated_at timestamptz, UNIQUE (actor_email, idempotency_key));
+      CREATE TABLE audit_events (actor text, event_type text, aggregate_type text, aggregate_id text, payload jsonb);
+    `)
+    const otherMeetingId = randomUUID()
+    await pool.query(`INSERT INTO crm_meetings VALUES ($1,$2,'original','{}'),($3,$2,'other','{}')`,
+      [MEETING_ID, PIPELINE_ID, otherMeetingId])
+    const reverse = await pool.connect(); clients.push(reverse)
+    const enqueue = await pool.connect(); clients.push(enqueue)
+    const reversePid = (await reverse.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    const enqueuePid = (await enqueue.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    const meetingLock = 'SELECT source_hash FROM crm_meetings WHERE pipeline_id=$1 AND id=$2 FOR UPDATE'
+    const action = (key, meetingId = MEETING_ID) => ({ pipelineId: PIPELINE_ID, actorEmail: ACTOR_EMAIL,
+      provider: 'maton', app: 'google-calendar', actionType: 'create_calendar_event', aggregateType: 'crm_meeting',
+      aggregateId: meetingId, referenceCode: MEETING_REFERENCE, payload: { subject: 'Undelivered local edit' },
+      idempotencyKey: key, communication: communicationSnapshot })
+    async function waitForLock(pid, label) {
+      const until = Date.now() + 1500
+      while (Date.now() < until) {
+        const result = await pool.query('SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1', [pid])
+        if (result.rows[0]?.wait_event_type === 'Lock') return
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+      }
+      assert.fail(`${label} must wait for the existing meeting lock`)
+    }
+    const startInsert = (candidate, client = enqueue) => context.insert(client, candidate).then(
+      (value) => ({ value }), (error) => ({ error }),
+    )
+    const completed = async (pending) => {
+      const result = await pending
+      if (result.error) throw result.error
+      return result.value
+    }
+
+    // A reverse transaction that already checked pending intent must prevent
+    // a generic enqueue from inserting a phantom before reverse staging commits.
+    await reverse.query('BEGIN')
+    await reverse.query(meetingLock, [PIPELINE_ID, MEETING_ID])
+    await enqueue.query('BEGIN')
+    const blockedInsert = startInsert(action('reverse-first'))
+    await waitForLock(enqueuePid, 'Generic Calendar enqueue')
+    assert.equal((await reverse.query('SELECT count(*)::int AS count FROM crm_integration_actions')).rows[0].count, 0)
+    await reverse.query('COMMIT')
+    assert.equal((await completed(blockedInsert)).created, true)
+    await enqueue.query('COMMIT')
+
+    // Conversely, a reverse reader must wait for uncommitted intent, then use
+    // a fresh READ COMMITTED statement to see it before staging provider data.
+    await enqueue.query('BEGIN')
+    await context.insert(enqueue, action('enqueue-first'))
+    await reverse.query('BEGIN')
+    const blockedReverse = reverse.query(meetingLock, [PIPELINE_ID, MEETING_ID])
+    await waitForLock(reversePid, 'Reverse Calendar staging')
+    await enqueue.query('COMMIT')
+    await blockedReverse
+    assert.equal((await reverse.query(`SELECT count(*)::int AS count FROM crm_integration_actions
+      WHERE pipeline_id=$1 AND aggregate_type='crm_meeting' AND aggregate_id=$2
+        AND status IN ('queued','processing','failed','dead')`, [PIPELINE_ID, MEETING_ID])).rows[0].count, 2)
+    await reverse.query('COMMIT')
+
+    // The fence is per meeting, not a pipeline-wide serialization point.
+    await reverse.query('BEGIN')
+    await reverse.query(meetingLock, [PIPELINE_ID, MEETING_ID])
+    await enqueue.query('BEGIN')
+    assert.equal((await context.insert(enqueue, action('other-meeting', otherMeetingId))).created, true)
+    await enqueue.query('COMMIT')
+    await reverse.query('COMMIT')
+
+    // New keys still serialize on the same meeting; neither intent disappears.
+    await enqueue.query('BEGIN')
+    await context.insert(enqueue, action('concurrent-first'))
+    await reverse.query('BEGIN')
+    const secondInsert = startInsert(action('concurrent-second'), reverse)
+    await waitForLock(reversePid, 'Second same-meeting enqueue')
+    await enqueue.query('COMMIT')
+    assert.equal((await completed(secondInsert)).created, true)
+    await reverse.query('COMMIT')
+
+    // The read-before-insert optimization must preserve full intent checking.
+    for (const changedIntent of [
+      { ...action('enqueue-first'), payload: { subject: 'Different intent' } },
+      action('enqueue-first', otherMeetingId),
+    ]) {
+      await enqueue.query('BEGIN')
+      await assert.rejects(context.insert(enqueue, changedIntent),
+        (error) => error?.code === 'CRM_ACTION_IDEMPOTENCY_CONFLICT')
+      await enqueue.query('ROLLBACK')
+    }
+
+    // retry/fail lock action→meeting. DO NOTHING must not introduce an opposing
+    // action-row lock when replaying an already committed idempotency key.
+    for (const retryState of ['failed', 'dead']) {
+      await reverse.query('BEGIN')
+      await reverse.query(`SELECT * FROM crm_integration_actions WHERE idempotency_key='enqueue-first' FOR UPDATE`)
+      await reverse.query(`UPDATE crm_integration_actions SET status=$1 WHERE idempotency_key='enqueue-first'`, [retryState])
+      await enqueue.query('BEGIN')
+      assert.equal((await context.insert(enqueue, action('enqueue-first'))).created, false)
+      await enqueue.query('COMMIT')
+      await reverse.query(meetingLock, [PIPELINE_ID, MEETING_ID])
+      await reverse.query('COMMIT')
+    }
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM crm_integration_actions')).rows[0].count, 5,
+      'concurrent keys persist once each; idempotent/conflicting replays do not create another provider action')
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM audit_events')).rows[0].count, 5,
+      'idempotent replays must not emit duplicate queued audits')
+    console.log(`CRM Calendar PostgreSQL meeting-lock interleavings passed (${sourceRef || 'working tree'})`)
+  } finally {
+    for (const client of clients) { await client.query('ROLLBACK').catch(() => {}); client.release() }
+    if (pool) await pool.end()
+    spawnSync('docker', ['stop', '-t', '1', container], { timeout: 30_000, stdio: 'pipe' })
+  }
+}
