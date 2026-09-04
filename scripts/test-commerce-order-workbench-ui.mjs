@@ -2,6 +2,8 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
+await import('./test-order-tracking-summary.mjs')
+
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 const [operations, drawer, imports, intake] = await Promise.all([
   read('app_src/components/operations/OperationsSection.tsx'),
