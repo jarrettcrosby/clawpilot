@@ -27,7 +27,28 @@ Start the isolated local runtime from the repository root:
 ./scripts/dev-start.sh
 ```
 
-Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths; normal validation must not use a plain `npm run dev`. When `APP_AUTH_REQUIRED=0` on a non-hosted runtime, API requests use a synthetic local operator so the isolated file-backed workspace remains testable without weakening Railway or Vercel session enforcement. Keep a tool-managed startup shell alive while browser testing so its child process is not cleaned up.
+Use `http://localhost:4002`. The start script binds to `127.0.0.1` by default
+and supplies isolated `data-dev` paths; normal validation must not use a plain
+`npm run dev`. When `APP_AUTH_REQUIRED=0` on a non-hosted runtime, API requests
+use a synthetic local operator so the isolated file-backed workspace remains
+testable without weakening Railway or Vercel session enforcement. Keep a
+tool-managed startup shell alive while browser testing so its child process is
+not cleaned up.
+
+A temporary trusted-LAN test requires both an explicit non-loopback host and
+the separate security opt-in:
+
+```bash
+CLAWPILOT_LOCAL_BIND_HOST=0.0.0.0 \
+  CLAWPILOT_LOCAL_ALLOW_LAN=1 \
+  ./scripts/dev-start.sh
+```
+
+This exposes an authentication-disabled fixture runtime to the local network.
+Use it only on a trusted temporary LAN, never port-forward it, and stop it with
+`./scripts/dev-stop.sh` as soon as the device test is complete. LAN clients use
+the Mac's explicit LAN address; the managed HTTPS development-domain proxy
+remains loopback-only.
 
 After the hosted Railway development environment is retired, this Mac may keep
 the familiar development origin without exposing the local runtime publicly:
@@ -47,9 +68,13 @@ final hosted-development acceptance pass is complete, because the local
 mapping would otherwise make browser checks bypass Railway. Before recreating
 a hosted development environment, run
 `./scripts/manage-local-development-domain.sh disable` so the browser resumes
-using public DNS. The `dev` branch, Railway service definitions, append-only
-migrations, and a verified development database archive are retained for that
-future restoration.
+using public DNS. Disable removes only the managed hosts block and local proxy
+service. It does not stop an already running local app and intentionally does
+not remove the shared mkcert CA from the macOS trust store; use
+`./scripts/dev-stop.sh` for the app, and treat CA removal as a separate,
+host-wide trust decision. The `dev` branch, Railway service definitions,
+append-only migrations, and a verified development database archive are
+retained for a future hosted restoration.
 
 After a reboot, rerun `./scripts/manage-local-development-domain.sh enable` to
 start the isolated app again; the command is idempotent. Use `status` to verify
@@ -58,6 +83,33 @@ the hosts override, proxy, and HTTPS health together.
 The loopback override applies only to this Mac. An iPhone or Watch requires a
 separately trusted certificate and LAN or VPN DNS path to the Mac; do not expose
 the unauthenticated local fixture runtime to the public internet.
+
+### Retired Hosted-Development Operations
+
+The local origin preserves same-origin browser behavior; it does not recreate
+the retired Railway development stack. The file-backed local fixture has no
+development Postgres or SuiteCRM authority, hosted worker lane, public webhook
+receiver, provider credentials, or durable provider callback identity.
+Consequently, the following previously hosted-development operations are not
+available through the local-domain override:
+
+- AG Alchemy carrier-sandbox delegation and provider rate/label proof;
+- live Shopify development-store setup, location administration, provider
+  mutations, webhooks, and callback acceptance;
+- hosted SuiteCRM projections/search and background outbox, reconciliation,
+  repository-callback, or persistence/worker-heartbeat acceptance; and
+- any proof that depends on an exact Railway service, database fingerprint,
+  secret set, public callback URL, or retained hosted-development data.
+
+Use deterministic self-tests and file fixtures for local behavior, disposable
+Postgres tests where a test explicitly provisions one, and protected Vercel
+previews for build and UI evidence. Live provider and durable worker acceptance
+runs only against production after review; local evidence must not be described
+as provider or hosted persistence proof. Restoring a true hosted non-production
+lane requires disabling the local override, provisioning isolated services and
+secrets, restoring the verified development archive, assigning and verifying
+its domains, and completing the normal authenticated acceptance gates before
+use.
 
 ## Hosted Topology
 

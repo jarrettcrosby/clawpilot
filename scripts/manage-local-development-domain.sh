@@ -8,6 +8,7 @@ HOSTS_END="# END CLAWPILOT LOCAL DEVELOPMENT"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+HOSTS_HELPER="$SCRIPT_DIR/manage-local-development-hosts.py"
 STATE_ROOT="${CLAWPILOT_LOCAL_DOMAIN_ROOT:-$HOME/Library/Application Support/ClawPilot/local-development-domain}"
 TLS_DIR="$STATE_ROOT/tls"
 CADDY_DATA_DIR="$STATE_ROOT/caddy-data"
@@ -25,7 +26,8 @@ Usage: scripts/manage-local-development-domain.sh <prepare|enable|disable|status
 prepare  Generate an untrusted local certificate and proxy configuration.
 enable   Trust the local CA, map dev.aiapp.eigenracing.com to loopback, install
          the local HTTPS proxy, and start ClawPilot on port 4002.
-disable  Remove only the local hostname override and proxy service. This is
+disable  Remove only the local hostname override and proxy service. It leaves
+         the local app process and the shared mkcert CA trust intact. This is
          required before restoring a hosted Railway development environment.
 status   Verify hostname resolution, proxy service state, and HTTPS health.
 
@@ -98,44 +100,41 @@ write_runtime_files() {
 
 rewrite_hosts() {
   local action="$1"
-  sudo python3 - "$action" "$DOMAIN" "$HOSTS_BEGIN" "$HOSTS_END" <<'PY'
-from pathlib import Path
-import os
-import sys
-import tempfile
-
-action, domain, begin, end = sys.argv[1:]
-hosts = Path('/etc/hosts')
-lines = hosts.read_text(encoding='utf-8').splitlines()
-result = []
-inside = False
-for line in lines:
-    if line == begin:
-        inside = True
-        continue
-    if line == end:
-        inside = False
-        continue
-    if not inside:
-        result.append(line)
-if action == 'enable':
-    if result and result[-1] != '':
-        result.append('')
-    result.extend([begin, f'127.0.0.1 {domain}', f'::1 {domain}', end])
-payload = '\n'.join(result).rstrip() + '\n'
-fd, temporary = tempfile.mkstemp(prefix='hosts.clawpilot.', dir='/etc')
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-        handle.write(payload)
-    os.chmod(temporary, 0o644)
-    os.chown(temporary, 0, 0)
-    os.replace(temporary, hosts)
-finally:
-    if os.path.exists(temporary):
-        os.unlink(temporary)
-PY
+  sudo /usr/bin/python3 "$HOSTS_HELPER" "$action" /etc/hosts \
+    "$DOMAIN" "$HOSTS_BEGIN" "$HOSTS_END"
   sudo dscacheutil -flushcache
   sudo killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+verify_hosts_block() {
+  /usr/bin/python3 "$HOSTS_HELPER" verify /etc/hosts \
+    "$DOMAIN" "$HOSTS_BEGIN" "$HOSTS_END"
+}
+
+verify_effective_loopback_resolution() {
+  /usr/bin/python3 - "$DOMAIN" <<'PY'
+import ipaddress
+import socket
+import sys
+
+domain = sys.argv[1]
+addresses = {
+    entry[4][0].split("%", 1)[0]
+    for entry in socket.getaddrinfo(domain, 443, type=socket.SOCK_STREAM)
+}
+if not addresses:
+    raise SystemExit(f"{domain} did not resolve")
+not_loopback = sorted(
+    address
+    for address in addresses
+    if not ipaddress.ip_address(address).is_loopback
+)
+if not_loopback:
+    raise SystemExit(
+        f"{domain} has non-loopback effective resolution: "
+        + ", ".join(not_loopback)
+    )
+PY
 }
 
 enable_domain() {
@@ -145,6 +144,8 @@ enable_domain() {
   echo "Installing the loopback hostname and HTTPS proxy..."
   sudo -v
   rewrite_hosts enable
+  verify_hosts_block
+  verify_effective_loopback_resolution
   sudo launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
   sudo install -o root -g wheel -m 600 "$PLIST_FILE" "$SYSTEM_PLIST"
   sudo launchctl bootstrap system "$SYSTEM_PLIST"
@@ -164,15 +165,17 @@ disable_domain() {
   fi
   rewrite_hosts disable
   echo "Local override disabled. Public DNS and Railway were not changed."
+  echo "Any local app process is unchanged; use scripts/dev-stop.sh to stop it."
+  echo "The shared mkcert CA remains trusted; removing it is a separate host-wide decision."
 }
 
 status_domain() {
   local failed=0
-  if grep -Fq "$HOSTS_BEGIN" /etc/hosts \
-     && grep -Eq "^(127\\.0\\.0\\.1|::1)[[:space:]]+$DOMAIN([[:space:]]|$)" /etc/hosts; then
-    echo "hosts: enabled ($DOMAIN -> loopback)"
+  if verify_hosts_block >/dev/null 2>&1 \
+     && verify_effective_loopback_resolution >/dev/null 2>&1; then
+    echo "hosts: enabled (exact managed block; effective resolution is loopback-only)"
   else
-    echo "hosts: disabled"
+    echo "hosts: disabled, malformed, duplicated, or not loopback-only"
     failed=1
   fi
   if launchctl print "system/$LABEL" >/dev/null 2>&1; then

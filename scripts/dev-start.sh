@@ -3,7 +3,8 @@ set -euo pipefail
 
 PORT="4002"
 PUBLIC_URL="${CLAWPILOT_LOCAL_PUBLIC_URL:-http://localhost:${PORT}}"
-BIND_HOST="${CLAWPILOT_LOCAL_BIND_HOST:-0.0.0.0}"
+BIND_HOST="${CLAWPILOT_LOCAL_BIND_HOST:-127.0.0.1}"
+ALLOW_LAN="${CLAWPILOT_LOCAL_ALLOW_LAN:-0}"
 LOG_FILE="/tmp/clawd-app-dev.log"
 LOG_ROTATE_BYTES=$((5 * 1024 * 1024))
 PID_FILE="/tmp/clawd-app-dev.pid"
@@ -18,6 +19,27 @@ if ! git -C "$DEV_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "ClawPilot repository missing at $DEV_REPO"
   exit 1
 fi
+
+case "$ALLOW_LAN" in
+  0|1) ;;
+  *)
+    echo "CLAWPILOT_LOCAL_ALLOW_LAN must be 0 or 1." >&2
+    exit 1
+    ;;
+esac
+
+case "$BIND_HOST" in
+  127.0.0.1|::1|localhost) ;;
+  *)
+    if [[ "$ALLOW_LAN" != "1" ]]; then
+      echo "Refusing non-loopback bind host '$BIND_HOST'." >&2
+      echo "Set CLAWPILOT_LOCAL_ALLOW_LAN=1 only for an intentional trusted-LAN session." >&2
+      exit 1
+    fi
+    echo "WARNING: ClawPilot local fixtures are binding to $BIND_HOST with authentication disabled." >&2
+    echo "Use only on a trusted temporary LAN; never expose or port-forward this runtime." >&2
+    ;;
+esac
 
 DEV_DATA_ROOT="$DEV_REPO/data-dev"
 mkdir -p "$DEV_DATA_ROOT/pipeline/normalized" "$DEV_DATA_ROOT/pipeline/dropdowns" "$DEV_DATA_ROOT/logs" "$DEV_DATA_ROOT/agents"
