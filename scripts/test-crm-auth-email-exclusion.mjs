@@ -104,6 +104,7 @@ const matchedSenders = []
 const linkedIds = []
 const fixtureMessages = new Map([...excluded, ...retained].map((entry) => [entry.id, entry]))
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
+  '@/lib/crm/emailAddressHeaders': loadModule('app_src/lib/crm/emailAddressHeaders.ts', {}),
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
   '@/lib/tenancy': { resolvePipelineSpaceAccess: async () => ({ id: pipelineId, ownerEmail }) },

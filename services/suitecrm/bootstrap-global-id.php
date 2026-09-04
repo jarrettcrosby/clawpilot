@@ -12,6 +12,9 @@ require_once 'modules/ModuleBuilder/parsers/ParserFactory.php';
 require_once 'modules/ModuleBuilder/parsers/parser.searchfields.php';
 require_once 'include/SugarObjects/VardefManager.php';
 require_once 'lib/Search/SearchModules.php';
+require_once __DIR__ . '/install-email-search.php';
+
+install_clawpilot_email_search(__DIR__ . '/email-search', getcwd());
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
