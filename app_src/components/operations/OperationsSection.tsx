@@ -112,6 +112,7 @@ import {
 import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipmentConstants'
 import GlCodingPanel from '@/components/operations/GlCodingPanel'
 import CommerceImportsPanel from '@/components/operations/CommerceImportsPanel'
+import { NativeActivityCoverageNotice, NativeActivityText } from '@/components/operations/CommerceNativeActivity'
 import PackagingMaterialsPanel from '@/components/operations/PackagingMaterialsPanel'
 import PickManagementPanel from '@/components/operations/PickManagementPanel'
 import PrinterConfigurationPanel from '@/components/operations/PrinterConfigurationPanel'
@@ -2572,6 +2573,9 @@ function OrderDetailDrawer({
                       The current sales-channel snapshot contains no items.
                     </Typography>
                   )}
+                  {order.sourceProvider === 'shopify' && (
+                    <NativeActivityCoverageNotice coverage={order.providerHistory.nativeActivity} />
+                  )}
                   {order.providerHistory.events.length > 0 && (
                     <Box component="details" data-testid="canonical-provider-events">
                       <Typography component="summary" variant="body2" fontWeight={600} sx={{ cursor: 'pointer' }}>
@@ -2596,6 +2600,10 @@ function OrderDetailDrawer({
                                 {displayStatus(event.kind)}
                                 {event.status ? ` · ${displayStatus(event.status)}` : ''}
                               </Typography>
+                              {event.kind === 'provider_activity' && (
+                                <NativeActivityText message={event.providerMessage}
+                                  actor={event.providerActorDisplayName} redacted={event.nativeActivityRedacted} />
+                              )}
                               <Typography variant="caption" color="text.secondary" display="block">
                                 {formatUserDateTime(event.occurredAt, dateTime, {
                                   year: 'numeric',
@@ -5040,16 +5048,11 @@ export default function OperationsSection({
         ? 'Visible provider history: current line and tracking details were not refreshed.'
         : historyTotals.attempted === 0
           ? 'Visible provider history: no orders were stale enough for an exact detail refresh.'
-          : `Visible provider history: refreshed current line, tracking, and fulfillment evidence for ${
+          : `Refreshed order details and activity for ${
               historyTotals.refreshed
             } of ${historyTotals.attempted} visible sales-channel ${
               historyTotals.attempted === 1 ? 'order' : 'orders'
-            }. ${historyTotals.changed === 0
-              ? 'No detail changes were detected.'
-              : `${historyTotals.changed} ${
-                  historyTotals.changed === 1 ? 'order had' : 'orders had'
-                } updated evidence.`
-            }${historyRemaining > 0
+            }.${historyRemaining > 0
               ? ` ${historyRemaining} visible ${
                   historyRemaining === 1
                     ? 'order history remains'

@@ -521,7 +521,9 @@ try {
   )
   assert.ok(authModule.source.includes('workspace_organization_ids'))
   assert.ok(authModule.source.includes('assigned.organization_ids::uuid[]'))
-  assert.ok(!authModule.source.includes('console.'))
+  assert.deepEqual(authModule.source.match(/console\.[^\n]+/g), [
+    "console.warn('[auth] Sign-in code sent; configured self-mailbox Inbox placement was not confirmed')",
+  ], 'Authentication logging is restricted to one static delivery diagnostic without code, address or provider response')
 
   const unauthorized = await requestAuthMagicCode({ email: 'other@example.com' })
   assert.equal(unauthorized.status, 'not-authorized')

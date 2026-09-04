@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
+import { emailBodyPreview } from '../app_src/lib/crm/emailBodyPreview.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (relative) => readFile(path.join(root, relative), 'utf8')
@@ -33,6 +34,10 @@ function loadTypeScript(pathname, source, mocks = {}) {
     module: loaded,
     require: (specifier) => Object.prototype.hasOwnProperty.call(mocks, specifier)
       ? mocks[specifier]
+      : specifier === '@/lib/integrations/shopifyOrderNativeActivity'
+        ? nativeActivityRuntime
+      : specifier === '@/lib/integrations/commerceOrderHistoryReadLimits'
+        ? readLimitsRuntime
       : specifier === 'node:crypto'
         ? requireFromApp('node:crypto')
         : {},
@@ -51,6 +56,16 @@ function loadTypeScript(pathname, source, mocks = {}) {
   }, { filename: pathname })
   return loaded.exports
 }
+
+const readLimitsRuntime = loadTypeScript(
+  'app_src/lib/integrations/commerceOrderHistoryReadLimits.ts',
+  await read('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts'),
+)
+const nativeActivityRuntime = loadTypeScript(
+  'app_src/lib/integrations/shopifyOrderNativeActivity.ts',
+  await read('app_src/lib/integrations/shopifyOrderNativeActivity.ts'),
+  { '@/lib/crm/emailBodyPreview.mjs': { emailBodyPreview } },
+)
 
 const [
   migration, persistence, history, capabilities, worker, processRoute,
@@ -1184,6 +1199,7 @@ let shopifyAdapterDetail = null
 let shopifyAdapterNextCursor = null
 let shopifyAdapterReadReturns = false
 let shopifyAdapterFailureStage = null
+let shopifyAdapterNativeNodes = []
 let faireAdapterOrder = null
 let faireAdapterFailureStage = null
 const normalizedAdapterOrder = (provider, source) => ({
@@ -1308,6 +1324,13 @@ const adapterHistoryRuntime = loadTypeScript(
         }
       },
       shopifyAdminGraphql: async (_credential, request) => {
+        if (request.operationName === 'ClawPilotShopifyOrderNativeActivity') {
+          if (shopifyAdapterFailureStage === 'native') throw new Error('optional activity denied')
+          return { order: { id: shopifyAdapterDetail.id, events: {
+            nodes: shopifyAdapterNativeNodes,
+            pageInfo: { hasNextPage: false, endCursor: null },
+          } } }
+        }
         if (shopifyAdapterFailureStage === 'detail') {
           throw new Error('detail read failed')
         }
@@ -1435,6 +1458,45 @@ for (const [failureStage, expectedProviderReads] of [
   )
 }
 shopifyAdapterFailureStage = null
+shopifyAdapterNativeNodes = [{
+  __typename: 'BasicEvent', id: 'gid://shopify/BasicEvent/99881',
+  subjectId: validShopifyDetail.id, action: 'fulfillment_cancelled',
+  createdAt: '2026-08-12T12:00:00.000Z',
+  message: '<b>Fulfillment cancelled</b>', actor: 'Provider operator',
+  attributeToUser: true, attributeToApp: false,
+}]
+const nativeAdapterRead = await readShopifyAdapter(validShopifyDetail)
+assert.equal(nativeAdapterRead.providerReads, 5)
+assert.equal(nativeAdapterRead.observations[0].nativeActivityState, 'complete')
+assert.equal(nativeAdapterRead.observations[0].nativeActivityFetchedCount, 1)
+const nativeEvent = nativeAdapterRead.observations[0].events.find((event) => event.eventKind === 'provider_activity')
+assert.equal(nativeEvent.providerMessage, 'Fulfillment cancelled')
+assert.equal(nativeEvent.providerActorDisplayName, 'Provider operator')
+assert.equal(nativeEvent.attributionSource, 'unavailable', 'display names are not authenticated staff IDs')
+shopifyAdapterNativeNodes = [{ ...shopifyAdapterNativeNodes[0], message: 'Edited provider text',
+  actor: 'Renamed operator', action: 'fulfillment_updated', attributeToUser: false, attributeToApp: true }]
+const nativeEditedRead = await readShopifyAdapter(validShopifyDetail)
+assert.equal(nativeEditedRead.observations[0].sourceHash, nativeAdapterRead.observations[0].sourceHash,
+  'mutable sensitive text, action and attribution never change the permanent source hash')
+const nativeInitialNormalized = persistenceRuntime.normalizeCommerceOrderObservationInput(nativeAdapterRead.observations[0])
+const nativeEditedNormalized = persistenceRuntime.normalizeCommerceOrderObservationInput(nativeEditedRead.observations[0])
+assert.equal(nativeInitialNormalized.events.find((event) => event.eventKind === 'provider_activity').eventHash,
+  nativeEditedNormalized.events.find((event) => event.eventKind === 'provider_activity').eventHash,
+  'one provider event retains one stable identity across content/action/attribution changes')
+const nativeExact = await adapterHistoryRuntime.readExactShopifyOrderHistoryObservation({
+  organizationId: '00000000-0000-4000-8000-000000000001', accountGlobalId: 'gia0000001',
+  expectedCredentialGeneration: 1, externalOrderId: validShopifyDetail.id,
+  observedAt: '2026-08-13T00:03:00.000Z', observationKind: 'manual_exact_read',
+})
+assert.equal(nativeExact.providerReads, 4)
+assert.equal(nativeExact.observation.providerReadCount, 4)
+shopifyAdapterFailureStage = 'native'
+const nativeDenied = await readShopifyAdapter(validShopifyDetail)
+assert.equal(nativeDenied.observations.length, 1, 'optional timeline denial cannot fail core order import')
+assert.equal(nativeDenied.observations[0].nativeActivityState, 'unavailable')
+assert.equal(nativeDenied.providerReads, 5, 'failed optional page attempts are counted')
+shopifyAdapterFailureStage = null
+shopifyAdapterNativeNodes = []
 const shopifyAdapterOne = await readShopifyAdapter(
   shopifyTrackingDetail('1Z-ADAPTER-ONE', '2026-08-13T00:00:00.000Z'),
 )

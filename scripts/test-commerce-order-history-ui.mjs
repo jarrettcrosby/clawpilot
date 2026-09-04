@@ -376,6 +376,12 @@ for (const contract of [
   '0276_operations_commerce_order_sync_foundation.sql',
   '0340_operations_order_workbench_exact_history.sql',
   '0343_operations_commerce_order_history_followups.sql',
+  '0347_operations_commerce_order_tracking_url_evidence.sql',
+  '0348_operations_commerce_native_activity_evidence.sql',
+  'OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL',
+  'OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL',
+  'operations_commerce_order_tracking_url_evidence',
+  'operations_commerce_order_native_activity_evidence',
   '0277_operations_commerce_authority_policies.sql',
   '0278_operations_shopify_order_webhook_signals.sql',
   'operations_commerce_order_sync_foundation_applied',
@@ -469,7 +475,7 @@ assert.ok(
 )
 for (const contract of [
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 30',
-  'a31b0f451ba40622d88cd30079fde4674d7ce12427ce21c955a4a4f48542d7e9',
+  '638fe20619a607f2e9009c7eecf230cbaad9ce255476134005ebed67a5f64840',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
   '0341_operations_faire_order_workbench_exact_history.sql',

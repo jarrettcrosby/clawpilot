@@ -23,6 +23,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
+import { NativeActivityCoverageNotice, NativeActivityText } from '@/components/operations/CommerceNativeActivity'
 import type {
   OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderRefreshConflict,
@@ -303,6 +304,9 @@ export default function ImportedOrderWorkingCopyDrawer({
   ))
   const adjustmentEvents = (order?.providerHistory.events || []).filter((event) => (
     event.kind.startsWith('refund_') || event.kind.startsWith('return_')
+  ))
+  const nativeActivityEvents = (order?.providerHistory.events || []).filter((event) => (
+    event.kind === 'provider_activity'
   ))
   const invalidLinePrices = useMemo(() => new Set((order?.lines || [])
     .filter((line) => {
@@ -616,7 +620,7 @@ export default function ImportedOrderWorkingCopyDrawer({
           </Stack>
 
           {order?.resolutionDetailsLoaded
-            && (providerTerminal || order.providerHistory.events.length) && (
+            && (providerTerminal || order.providerHistory.events.length || order.provider === 'shopify') && (
             <>
               <Divider />
               <Stack spacing={1.5}>
@@ -642,6 +646,29 @@ export default function ImportedOrderWorkingCopyDrawer({
                     {' '}to load the latest provider record.
                   </Typography>
                 )}
+
+                {order.provider === 'shopify' ? (
+                  <Box>
+                    <Typography variant="body2" fontWeight={700} sx={{ mb: 0.5 }}>
+                      Shopify timeline activity
+                    </Typography>
+                    <NativeActivityCoverageNotice coverage={order.providerHistory.nativeActivity} />
+                    <Stack spacing={1} sx={{ mt: 1 }}>
+                      {nativeActivityEvents.map((event) => (
+                        <Box key={event.globalId}>
+                          <Typography variant="body2" fontWeight={600}>
+                            {event.status ? providerEventLabel(event.status) : 'Provider activity'}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            {providerEventTime(event.occurredAt)}
+                          </Typography>
+                          <NativeActivityText message={event.providerMessage}
+                            actor={event.providerActorDisplayName} redacted={event.nativeActivityRedacted} />
+                        </Box>
+                      ))}
+                    </Stack>
+                  </Box>
+                ) : null}
 
                 <Box>
                   <Typography variant="body2" fontWeight={700} sx={{ mb: 0.5 }}>

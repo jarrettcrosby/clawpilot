@@ -187,6 +187,59 @@ type MailContent = {
   messagePurpose?: 'auth-magic-code'
 }
 
+type AuthInboxPlacement = 'not-applicable' | 'confirmed' | 'unconfirmed'
+
+async function authSelfDeliveryRequested(profile: MailProfile, recipient: string): Promise<boolean> {
+  const raw = String(process.env.CLAWPILOT_AUTH_SELF_DELIVERY || '').trim()
+  if (!raw) return false
+  let value: { connectionId?: unknown; mailboxEmail?: unknown; recipientEmails?: unknown }
+  try {
+    if (raw.length > 4096) throw new Error('oversize')
+    value = JSON.parse(raw)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('shape')
+  } catch {
+    throw new Error('CLAWPILOT_AUTH_SELF_DELIVERY must be an account-bound JSON configuration')
+  }
+  const connectionId = String(value.connectionId || '').trim()
+  const validEmail = (email: unknown): email is string => typeof email === 'string'
+    && email.length <= 254 && /^[\x21-\x7e]+$/.test(email) && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email)
+  if (!connectionId || !/^[a-zA-Z0-9-]{1,100}$/.test(connectionId)
+    || !validEmail(value.mailboxEmail) || !Array.isArray(value.recipientEmails)
+    || value.recipientEmails.length < 1 || value.recipientEmails.length > 30
+    || !value.recipientEmails.every(validEmail)) {
+    throw new Error('CLAWPILOT_AUTH_SELF_DELIVERY is invalid')
+  }
+  // This is an operator-reviewed list of aliases belonging to one exact sending
+  // mailbox, not a domain-wide match or a user-controlled sender preference.
+  if (connectionId !== mailConnectionId(profile)
+    || !value.recipientEmails.some((email) => email.toLowerCase() === recipient.toLowerCase())) return false
+  if ((await gmailMailboxEmail(profile)) !== value.mailboxEmail.toLowerCase()) {
+    throw new Error('Authentication self-delivery mailbox identity changed')
+  }
+  return true
+}
+
+async function placeAuthSelfDeliveryInInbox(profile: MailProfile, messageId: string | null): Promise<AuthInboxPlacement> {
+  // The ID comes only from this just-completed send. Never search or relabel
+  // historic mail, and never create another copy of an authentication message.
+  if (!messageId || !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) return 'unconfirmed'
+  try {
+    const response = await mailFetch(profile)(`/google-mail/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}/modify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ addLabelIds: ['INBOX', 'UNREAD'] }),
+    })
+    if (!response.ok) return 'unconfirmed'
+    const receipt = await response.json() as { id?: unknown; labelIds?: unknown }
+    return receipt.id === messageId && Array.isArray(receipt.labelIds) && receipt.labelIds.includes('INBOX')
+      ? 'confirmed' : 'unconfirmed'
+  } catch {
+    // Sending already succeeded. A label failure must not invalidate the code
+    // the recipient has, or trigger another send through a different identity.
+    return 'unconfirmed'
+  }
+}
+
 function buildMessage(input: MailContent & { from: string }): string {
   const boundary = `clawpilot-${crypto.randomUUID()}`
   const subject = cleanHeader(input.subject, 'Email subject')
@@ -223,6 +276,8 @@ async function sendMessage(
 ) {
   const to = assertEmail(input.to)
   const from = profile === 'auth' ? authMailFromAddress() : mailFromAddress()
+  const selfDelivery = input.messagePurpose === 'auth-magic-code'
+    && await authSelfDeliveryRequested(profile, to)
   await verifySender(profile, from)
   const raw = base64Url(buildMessage({ ...input, from, to }))
   const response = await mailFetch(profile)(GMAIL_SEND_PATH, {
@@ -238,7 +293,10 @@ async function sendMessage(
     id?: unknown
     message?: { id?: unknown }
   }
-  return { messageId: String(data.id || data.message?.id || '').trim() || null }
+  const messageId = String(data.id || data.message?.id || '').trim() || null
+  const inboxPlacement: AuthInboxPlacement = selfDelivery
+    ? await placeAuthSelfDeliveryInInbox(profile, messageId) : 'not-applicable'
+  return { messageId, inboxPlacement }
 }
 
 async function verifySender(profile: MailProfile, sender: string) {
@@ -307,7 +365,7 @@ function authMagicCodeContent(to: string, code: string) {
 
 export async function sendAuthMagicCodeEmail(
   input: SendAuthMagicCodeEmailInput,
-): Promise<{ messageId: string | null }> {
+): Promise<{ messageId: string | null; inboxPlacement: AuthInboxPlacement }> {
   const to = assertEmail(input.to)
   const code = assertCode(input.code)
   return sendMessage(authMagicCodeContent(to, code), await authMailProfileForRecipient(to))

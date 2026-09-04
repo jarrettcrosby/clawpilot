@@ -136,6 +136,25 @@ async function verifySender(profile) {
 }
 
 async function verify() {
+  const selfDelivery = String(process.env.CLAWPILOT_AUTH_SELF_DELIVERY || '').trim()
+  if (selfDelivery) {
+    let binding
+    try {
+      if (selfDelivery.length > 4096) throw new Error('size')
+      binding = JSON.parse(selfDelivery)
+      const email = (entry) => typeof entry === 'string' && entry.length <= 254
+        && /^[\x21-\x7e]+$/.test(entry) && /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(entry)
+      if (!binding || ![platformConnectionId, authConnectionId].includes(binding.connectionId)
+        || !/^[a-zA-Z0-9-]{1,100}$/.test(binding.connectionId || '')
+        || !email(binding.mailboxEmail) || !Array.isArray(binding.recipientEmails)
+        || binding.recipientEmails.length < 1 || binding.recipientEmails.length > 30
+        || !binding.recipientEmails.every(email)) throw new Error('shape')
+    } catch {
+      throw new Error('CLAWPILOT_AUTH_SELF_DELIVERY is invalid')
+    }
+    const mailbox = await gmailProfileEmail(binding.connectionId, 'Authentication self-delivery')
+    if (mailbox !== binding.mailboxEmail.toLowerCase()) throw new Error('Authentication self-delivery mailbox identity changed')
+  }
   if (authConnectionId) {
     const platformProfileEmail = await gmailProfileEmail(platformConnectionId, 'Platform')
     const authProfileEmail = await gmailProfileEmail(authConnectionId, 'Authentication')

@@ -5,6 +5,8 @@ import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { verifyCommerceOrderTrackingUrlRuntime } from './test-commerce-order-tracking-url-runtime.mjs'
+import { verifyCommerceOrderNativeActivityRuntime } from './test-commerce-order-native-activity-runtime.mjs'
 import {
   actorEmail,
   applyMigration,
@@ -3974,6 +3976,8 @@ async function verify(databaseUrl, ids) {
       ids.organization,
       accountTwo,
     )
+    await verifyCommerceOrderTrackingUrlRuntime({ pool, persistence, ids, createLease: createAdditionalManualLease })
+    await verifyCommerceOrderNativeActivityRuntime({ pool, persistence, ids, createLease: createAdditionalManualLease })
   } finally {
     await pool.end()
   }
