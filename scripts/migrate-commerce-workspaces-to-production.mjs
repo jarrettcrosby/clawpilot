@@ -7,9 +7,9 @@
  *
  * This is deliberately not a database-clone tool. It never reads source
  * credential, cursor, order, webhook-payload, provider-attempt, or outbox
- * payload tables. It creates disabled, credential-free sales-channel
+ * payload tables. It creates disabled, credential-free sales and shipping
  * placeholders and queues canonical target SuiteCRM projections. Provider
- * reconnection remains in the supported application workflow.
+ * reconnection remains in guarded target-side workflows.
  */
 
 import assert from 'node:assert/strict'
@@ -19,9 +19,9 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-export const SCRIPT_VERSION = 'commerce-workspace-production-migration-v2'
-export const MANIFEST_FORMAT = 'clawpilot-commerce-workspace-migration-plan-v2'
-export const MAPPING_FORMAT = 'clawpilot-commerce-workspace-migration-mapping-v2'
+export const SCRIPT_VERSION = 'sales-shipping-workspace-production-migration-v3'
+export const MANIFEST_FORMAT = 'clawpilot-sales-shipping-workspace-migration-plan-v3'
+export const MAPPING_FORMAT = 'clawpilot-sales-shipping-workspace-migration-mapping-v3'
 export const SOURCE_DATABASE_IDENTITY = '750aa268-0e31-4065-a99c-4016e4d4fab1'
 export const TARGET_DATABASE_IDENTITY = '0474a18c-649c-491b-bea1-7da006d21d81'
 export const CONFIRMED_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
@@ -32,6 +32,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u
 const IDENTIFIER = /^[a-z_][a-z0-9_]*$/u
 const SUITECRM_NAMESPACE = 'ad5d6a0f-5942-5dc0-aab9-d9cba48a16b1'
+const AG_MANAGED_CARRIER_DELEGATION = 'ag-alchemy-episcs-sandbox-rating-delegation'
 
 export const WORKSPACES = Object.freeze([
   Object.freeze({
@@ -51,11 +52,21 @@ export const WORKSPACES = Object.freeze([
       ]),
       excludedContactReferences: Object.freeze(['gc01v7g9ahm4b4']),
       excludedWarehouseGlobalIds: Object.freeze(['gwhg4dpsfmjp9dm']),
+      excludedAccounts: Object.freeze([
+        Object.freeze({
+          id: 'f28ae7bf-1874-41bf-87a4-311511dfec63',
+          globalId: 'gia9iduqbikp5et',
+          provider: 'mock-commerce',
+          integrationType: 'commerce',
+          environment: 'mock',
+        }),
+      ]),
       accounts: Object.freeze([
         Object.freeze({
           id: '03696a20-aaf4-4049-b0e3-051d9b937749',
           globalId: 'gia5156705',
           provider: 'faire',
+          integrationType: 'commerce',
           environment: 'production',
           displayName: 'Pro Bakery Bites by Ag-Alchemy',
           externalAccountIdSha256: '9ebe274c5db9782fd0da927e41329d428e62aa68a6028ebe22e32810d42f88a2',
@@ -65,10 +76,59 @@ export const WORKSPACES = Object.freeze([
           id: 'da56c6d6-fddd-47c0-bf26-66cdfc42ae2c',
           globalId: 'gia9286799',
           provider: 'shopify',
+          integrationType: 'commerce',
           environment: 'sandbox',
           displayName: 'AG Alchemy',
           externalAccountIdSha256: '68308a772f11b6110d48de3da8a1360827c1dd616dfb5777992c49544a33d848',
-          reconnectEligible: false,
+          reconnectEligible: true,
+        }),
+        Object.freeze({
+          id: '010fd720-bfe8-4a4c-9f8d-581eb4b6b456',
+          globalId: 'gia3106288',
+          provider: 'fedex_rest',
+          integrationType: 'carrier',
+          environment: 'sandbox',
+          displayName: 'FedEx sandbox fulfillment diagnostics via EPISCS',
+          reconnectEligible: true,
+          carrierAccount: Object.freeze({
+            id: '52fdba26-1dea-4649-9b40-1f93aee573f2',
+            globalId: 'gac3534106',
+            displayName: 'FedEx sandbox fulfillment diagnostics account',
+            senderName: 'Ag-Alchemy',
+            sourceAccountNumberFingerprint: '1b11796e05536ea569b2a51c2ac31976e2281844ae95f37c05581cfbe5dfb042',
+            sourceAddressFingerprint: '36d1e561f153afd9690c5d4ba7644abf18971bf3c6089cca900c5ce3ad57d2cb',
+          }),
+          sourceAuthority: Object.freeze({
+            organizationReference: 'ga5122758',
+            integrationGlobalId: 'gia7335302',
+            carrierAccountGlobalId: 'gac2368052',
+            accountNumberLastFour: '1073',
+            registeredAddressLine1: '101 Jegs Place',
+          }),
+        }),
+        Object.freeze({
+          id: '72acd52d-a547-43f9-a78d-bb96e33e0525',
+          globalId: 'gia5910262',
+          provider: 'ups_rest',
+          integrationType: 'carrier',
+          environment: 'sandbox',
+          displayName: 'UPS sandbox fulfillment diagnostics via EPISCS',
+          reconnectEligible: true,
+          carrierAccount: Object.freeze({
+            id: 'b1856b57-6522-46b2-a2f2-d7c622fdb2b0',
+            globalId: 'gac9576332',
+            displayName: 'UPS sandbox fulfillment diagnostics account',
+            senderName: 'Ag-Alchemy',
+            sourceAccountNumberFingerprint: '248d58d287b5ab2906e94ccf5662a38c288797831ab3481138a4b66f52995ddd',
+            sourceAddressFingerprint: '36d1e561f153afd9690c5d4ba7644abf18971bf3c6089cca900c5ce3ad57d2cb',
+          }),
+          sourceAuthority: Object.freeze({
+            organizationReference: 'ga5122758',
+            integrationGlobalId: 'gia2057284',
+            carrierAccountGlobalId: 'gac5139730',
+            accountNumberLastFour: '3574',
+            registeredAddressLine1: '101 Jegs Place',
+          }),
         }),
       ]),
     }),
@@ -96,11 +156,13 @@ export const WORKSPACES = Object.freeze([
       excludedOrganizationReferences: Object.freeze([]),
       excludedContactReferences: Object.freeze([]),
       excludedWarehouseGlobalIds: Object.freeze([]),
+      excludedAccounts: Object.freeze([]),
       accounts: Object.freeze([
         Object.freeze({
           id: 'c13e4e64-edae-4e73-9ae0-c116c1419688',
           globalId: 'gia585rig3qiq7j',
           provider: 'shopify',
+          integrationType: 'commerce',
           environment: 'production',
           displayName: 'French Florist',
           externalAccountIdSha256: '3f38b0416975b74695e498db78b878a487b61d406cd2d1ab5deb59438358df12',
@@ -132,15 +194,51 @@ export const WORKSPACES = Object.freeze([
       excludedOrganizationReferences: Object.freeze(['ga4dac0p3as51t']),
       excludedContactReferences: Object.freeze([]),
       excludedWarehouseGlobalIds: Object.freeze([]),
+      excludedAccounts: Object.freeze([]),
       accounts: Object.freeze([
         Object.freeze({
           id: '28038134-b624-4b52-8518-e9740785e5c3',
           globalId: 'giah34fedoa5b1o',
           provider: 'shopify',
+          integrationType: 'commerce',
           environment: 'sandbox',
           displayName: 'Test Pro Bakery Bites',
           externalAccountIdSha256: 'f47f0e6cc3e525a5d5604d8d499ef93381e843ff1cee9100c4283625b9cd0954',
-          reconnectEligible: false,
+          reconnectEligible: true,
+        }),
+        Object.freeze({
+          id: 'c8aa9ff7-35f4-44e9-9419-e54b7c977002',
+          globalId: 'gia4h85q2nhuig0',
+          provider: 'ups_rest',
+          integrationType: 'carrier',
+          environment: 'production',
+          displayName: 'UPS production',
+          reconnectEligible: true,
+          carrierAccount: Object.freeze({
+            id: 'fe5953e0-ee8e-4b5b-8629-46a57d8282f4',
+            globalId: 'gacdf85s635a8sq',
+            displayName: "Rotella's Bakery",
+            senderName: "Warehouse Rotella's Bakery",
+            sourceAccountNumberFingerprint: '2c3fb57b1479db90951719c5870ee91b1fd413c17bd7e955a2405a5cd9117a68',
+            sourceAddressFingerprint: '0863d99a3b63ef27377c5de5992a6906546659f20eb8a2355429b00592fb1e7c',
+          }),
+        }),
+        Object.freeze({
+          id: '8abcaaa5-a2a6-4800-9a4d-941bd3761a8c',
+          globalId: 'gia83f2h5i45ud6',
+          provider: 'ups_rest',
+          integrationType: 'carrier',
+          environment: 'sandbox',
+          displayName: 'UPS sandbox',
+          reconnectEligible: true,
+          carrierAccount: Object.freeze({
+            id: '05b50351-d29f-4954-b3a1-c08203289279',
+            globalId: 'gacljo93c7qtd42',
+            displayName: "Rotella's Bakery",
+            senderName: "Warehouse Rotella's Bakery",
+            sourceAccountNumberFingerprint: '319a420658fcb7d5df25ac0477f1d0ebe14b76abdf619e74c7fc95fc0b30483a',
+            sourceAddressFingerprint: '0863d99a3b63ef27377c5de5992a6906546659f20eb8a2355429b00592fb1e7c',
+          }),
         }),
       ]),
     }),
@@ -161,6 +259,7 @@ export const DATASET_ORDER = Object.freeze([
   'operations_shipping_scopes',
   'crm_product_categories',
   'operations_integration_accounts',
+  'operations_carrier_account_migration_placeholders',
   'crm_organizations',
   'crm_contacts',
   'crm_contact_source_aliases',
@@ -187,6 +286,7 @@ export const GENERATED_REFERENCE_PREFIX = Object.freeze({
   crm_contacts: ['reference_code', 'gc'],
   crm_products: ['reference_code', 'gp'],
   operations_integration_accounts: ['global_id', 'gia'],
+  operations_carrier_account_migration_placeholders: ['global_id', 'gac'],
   operations_product_mappings: ['global_id', 'gpm'],
   operations_product_channel_states: ['global_id', 'gpcs'],
   operations_warehouses: ['global_id', 'gwh'],
@@ -204,6 +304,7 @@ export const GENERATED_REFERENCE_PREFIX = Object.freeze({
 const TABLE_ID_COLUMN = Object.freeze({
   crm_product_categories: 'id',
   operations_integration_accounts: 'id',
+  operations_carrier_account_migration_placeholders: 'id',
   crm_organizations: 'id',
   crm_contacts: 'id',
   crm_products: 'id',
@@ -235,6 +336,7 @@ export const TARGET_SCOPE_COLUMN = Object.freeze({
   operations_shipping_scopes: 'organization_id',
   crm_product_categories: 'pipeline_id',
   operations_integration_accounts: 'organization_id',
+  operations_carrier_account_migration_placeholders: 'organization_id',
   crm_organizations: 'pipeline_id',
   // crm_contacts.organization_id is a CRM-account FK, not a workspace FK.
   crm_contacts: 'pipeline_id',
@@ -462,21 +564,115 @@ export function sanitizeJson(value, replacements = new Map()) {
   return result
 }
 
+const SAFE_PLACEHOLDER_CONFIGURATION_KEYS = Object.freeze({
+  commerce: Object.freeze([
+    'accountName',
+    'adapterVersion',
+    'apiVersion',
+    'authMode',
+    'classification',
+    'shopDomain',
+  ]),
+  carrier: Object.freeze([
+    'accountOwnerType',
+    'authMode',
+  ]),
+})
+
+export function safePlaceholderConfiguration(source) {
+  const integrationType = text(source.integration_type)
+  const sourceConfiguration = source.configuration
+    && typeof source.configuration === 'object'
+    && !Array.isArray(source.configuration)
+    ? source.configuration
+    : {}
+  const allowed = SAFE_PLACEHOLDER_CONFIGURATION_KEYS[integrationType]
+  if (!allowed) fail(`Unsupported placeholder integration type: ${integrationType}`)
+  const configuration = {}
+  for (const key of allowed) {
+    const value = sourceConfiguration[key]
+    if (value !== undefined && value !== null) configuration[key] = sanitizeJson(value)
+  }
+  if (integrationType === 'carrier') {
+    const requested = Array.isArray(sourceConfiguration.allowedCapabilities)
+      ? sourceConfiguration.allowedCapabilities
+        .filter((value) => typeof value === 'string')
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .sort()
+      : []
+    configuration.allowedCapabilities = []
+    if (requested.length) configuration.rebindRequestedCapabilities = [...new Set(requested)]
+  }
+  configuration.migrationRequiresCredentialRebind = true
+  configuration.migrationRequiresProviderIdentityVerification = true
+  return configuration
+}
+
+function sourceManagedCarrierPlaceholderConfiguration(
+  source,
+  expected,
+  senderOriginWarehouseGlobalId,
+) {
+  if (!expected.sourceAuthority) {
+    fail(`${expected.globalId} lacks its required production source authority`)
+  }
+  const sourceConfiguration = source.configuration || {}
+  if (
+    sourceConfiguration.managedBy !== AG_MANAGED_CARRIER_DELEGATION
+    || sourceConfiguration.credentialRevealAllowed !== false
+    || !['sandbox_rating_only', 'sandbox_fulfillment_diagnostic']
+      .includes(sourceConfiguration.authorizationScope)
+  ) {
+    fail(`${expected.globalId} source-managed carrier policy changed`)
+  }
+  const requestedCapabilities = Array.isArray(sourceConfiguration.allowedCapabilities)
+    ? sourceConfiguration.allowedCapabilities
+      .filter((value) => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter(Boolean)
+    : []
+  const expectedCapabilities = sourceConfiguration.authorizationScope === 'sandbox_rating_only'
+    ? ['sandbox_rate']
+    : ['sandbox_rate', 'sandbox_label']
+  if (canonicalJson(requestedCapabilities) !== canonicalJson(expectedCapabilities)) {
+    fail(`${expected.globalId} source-managed carrier capabilities changed`)
+  }
+  return {
+    ...safePlaceholderConfiguration(source),
+    managedBy: AG_MANAGED_CARRIER_DELEGATION,
+    authorizationScope: sourceConfiguration.authorizationScope,
+    credentialRevealAllowed: false,
+    delegatedFromOrganizationReferenceCode:
+      expected.sourceAuthority.organizationReference,
+    sourceIntegrationGlobalId: expected.sourceAuthority.integrationGlobalId,
+    sourceCarrierAccountGlobalId: expected.sourceAuthority.carrierAccountGlobalId,
+    senderOriginWarehouseGlobalId,
+    allowedCapabilities: [],
+    rebindRequestedCapabilities: [...new Set(requestedCapabilities)].sort(),
+    migrationRequiresSourceAuthorityRebind: true,
+  }
+}
+
 export function buildCredentialFreePlaceholder(source, target, actor) {
-  assert.equal(source.integration_type, 'commerce')
-  assert.ok(['shopify', 'faire'].includes(source.provider))
+  assert.ok(['commerce', 'carrier'].includes(source.integration_type))
+  if (source.integration_type === 'commerce') {
+    assert.ok(['shopify', 'faire'].includes(source.provider))
+  } else {
+    assert.ok(['ups_rest', 'fedex_rest'].includes(source.provider))
+  }
   assert.ok(['sandbox', 'production'].includes(source.environment))
   return {
     id: target.id,
     global_id: target.globalId,
     organization_id: target.organizationId,
     provider: source.provider,
-    integration_type: 'commerce',
+    integration_type: source.integration_type,
     environment: source.environment,
     external_account_id: null,
     display_name: source.display_name,
     status: 'disabled',
-    configuration: {},
+    configuration: target.configuration || safePlaceholderConfiguration(source),
     credential_reference: null,
     commerce_credential_generation: 0,
     receipt_intake_enabled: false,
@@ -704,39 +900,222 @@ async function assertScaffold(client, workspace, actor, side) {
   }
 }
 
+const SAFE_SOURCE_CONFIGURATION_SQL = `jsonb_strip_nulls(jsonb_build_object(
+  'accountName', account.configuration->'accountName',
+  'adapterVersion', account.configuration->'adapterVersion',
+  'apiVersion', account.configuration->'apiVersion',
+  'authMode', account.configuration->'authMode',
+  'classification', account.configuration->'classification',
+  'shopDomain', account.configuration->'shopDomain',
+  'accountOwnerType', account.configuration->'accountOwnerType',
+  'allowedCapabilities', account.configuration->'allowedCapabilities',
+  'managedBy', account.configuration->'managedBy',
+  'authorizationScope', account.configuration->'authorizationScope',
+  'credentialRevealAllowed', account.configuration->'credentialRevealAllowed',
+  'delegatedFromOrganizationReferenceCode',
+    account.configuration->'delegatedFromOrganizationReferenceCode',
+  'sourceIntegrationGlobalId', account.configuration->'sourceIntegrationGlobalId',
+  'sourceCarrierAccountGlobalId',
+    account.configuration->'sourceCarrierAccountGlobalId',
+  'senderOriginWarehouseGlobalId',
+    account.configuration->'senderOriginWarehouseGlobalId'
+))`
+
 async function assertSourceAccounts(client, workspace) {
-  const ids = workspace.source.accounts.map((account) => account.id)
+  const selectedAccounts = workspace.source.accounts
+  const excludedAccounts = workspace.source.excludedAccounts || []
+  const inventory = [...selectedAccounts, ...excludedAccounts]
   const result = await client.query(
     `SELECT id::text, global_id, provider, integration_type, environment,
             display_name, external_account_id IS NOT NULL AS external_account_id_present,
             encode(digest(coalesce(external_account_id, ''), 'sha256'), 'hex')
-              AS external_account_id_sha256
-     FROM operations_integration_accounts
-     WHERE organization_id = $1::uuid AND id = ANY($2::uuid[])
+              AS external_account_id_sha256,
+            ${SAFE_SOURCE_CONFIGURATION_SQL} AS configuration
+     FROM operations_integration_accounts account
+     WHERE organization_id = $1::uuid
+       AND integration_type IN ('commerce', 'carrier')
      ORDER BY id`,
-    [workspace.source.organizationId, ids],
+    [workspace.source.organizationId],
   )
-  if (result.rowCount !== ids.length) fail(`${workspace.key} source integration account set is incomplete`)
-  for (const expected of workspace.source.accounts) {
+  if (result.rowCount !== inventory.length) {
+    fail(`${workspace.key} source sales/shipping account inventory changed`)
+  }
+  for (const expected of inventory) {
     const observed = result.rows.find((row) => row.id === expected.id)
     if (
       !observed
       || observed.global_id !== expected.globalId
       || observed.provider !== expected.provider
-      || observed.integration_type !== 'commerce'
+      || observed.integration_type !== expected.integrationType
       || observed.environment !== expected.environment
-      || observed.external_account_id_present !== true
-      || observed.external_account_id_sha256 !== expected.externalAccountIdSha256
-      || observed.external_account_id_sha256 === sha256('')
     ) {
       fail(`${workspace.key} source account ${expected.globalId} identity changed`)
     }
+    if (expected.integrationType === 'commerce' && expected.environment !== 'mock' && (
+      observed.external_account_id_present !== true
+      || observed.external_account_id_sha256 !== expected.externalAccountIdSha256
+      || observed.external_account_id_sha256 === sha256('')
+    )) fail(`${workspace.key} source account ${expected.globalId} provider identity changed`)
+    if (expected.environment === 'mock' && observed.external_account_id_present) {
+      fail(`${workspace.key} excluded mock account ${expected.globalId} acquired a provider identity`)
+    }
   }
-  return result.rows
+  const carrierAccounts = selectedAccounts.filter((account) => account.integrationType === 'carrier')
+  const carrierRows = carrierAccounts.length
+    ? await rows(client,
+      `SELECT id::text, global_id, integration_account_id::text,
+              display_name, sender_name, account_number_last_four,
+              account_number_fingerprint,
+              registered_address_fingerprint
+       FROM operations_carrier_accounts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = ANY($2::uuid[])
+       ORDER BY integration_account_id, id`,
+      [workspace.source.organizationId, carrierAccounts.map((account) => account.id)])
+    : []
+  if (carrierRows.length !== carrierAccounts.length) {
+    fail(`${workspace.key} source carrier-account mapping set is incomplete`)
+  }
+  for (const account of carrierAccounts) {
+    const expected = account.carrierAccount
+    const observed = carrierRows.find((row) => row.integration_account_id === account.id)
+    if (
+      !expected
+      || !observed
+      || observed.id !== expected.id
+      || observed.global_id !== expected.globalId
+      || observed.display_name !== expected.displayName
+      || observed.sender_name !== expected.senderName
+      || !/^[\x20-\x7e]{4}$/u.test(observed.account_number_last_four || '')
+      || observed.account_number_fingerprint !== expected.sourceAccountNumberFingerprint
+      || observed.registered_address_fingerprint !== expected.sourceAddressFingerprint
+    ) fail(`${workspace.key} source carrier mapping for ${account.globalId} changed`)
+    if (account.sourceAuthority) {
+      const configuration = result.rows.find((row) => row.id === account.id)?.configuration || {}
+      const expectedCapabilities = configuration.authorizationScope === 'sandbox_rating_only'
+        ? ['sandbox_rate']
+        : ['sandbox_rate', 'sandbox_label']
+      if (
+        configuration.managedBy !== AG_MANAGED_CARRIER_DELEGATION
+        || configuration.credentialRevealAllowed !== false
+        || !['sandbox_rating_only', 'sandbox_fulfillment_diagnostic']
+          .includes(configuration.authorizationScope)
+        || !Array.isArray(configuration.allowedCapabilities)
+        || canonicalJson(configuration.allowedCapabilities)
+          !== canonicalJson(expectedCapabilities)
+        || observed.account_number_last_four
+          !== account.sourceAuthority.accountNumberLastFour
+      ) fail(`${workspace.key} source-managed carrier delegation ${account.globalId} changed`)
+    }
+  }
+  return result.rows.filter((row) => (
+    selectedAccounts.some((account) => account.id === row.id)
+  ))
 }
 
 function selectedAccountIds(workspace) {
   return workspace.source.accounts.map((account) => account.id)
+}
+
+function selectedCommerceAccountIds(workspace) {
+  return workspace.source.accounts
+    .filter((account) => account.integrationType === 'commerce')
+    .map((account) => account.id)
+}
+
+function selectedCarrierAccountIds(workspace) {
+  return workspace.source.accounts
+    .filter((account) => account.integrationType === 'carrier')
+    .map((account) => account.id)
+}
+
+async function targetSourceAuthorityDependencies(client, workspace, lock = false) {
+  const dependencies = []
+  for (const account of workspace.source.accounts.filter((candidate) => (
+    candidate.integrationType === 'carrier' && candidate.sourceAuthority
+  ))) {
+    const required = account.sourceAuthority
+    const result = await client.query(
+      `SELECT authority_org.id::text AS authority_organization_id,
+              authority_integration.id::text AS authority_integration_account_id,
+              authority_integration.global_id AS authority_integration_global_id,
+              authority_integration.provider,
+              authority_integration.integration_type,
+              authority_integration.environment,
+              authority_integration.status AS integration_status,
+              authority_account.id::text AS authority_carrier_account_id,
+              authority_account.global_id AS authority_carrier_account_global_id,
+              authority_account.account_number_last_four,
+              authority_account.registered_address_fingerprint,
+              authority_account.address_verification,
+              authority_account.allow_sender_billing,
+              authority_account.status AS carrier_account_status,
+              lower(regexp_replace(
+                btrim(authority_account.registered_address->>'line1'),
+                '\\s+', ' ', 'g'
+              )) AS registered_address_line1,
+              authority_credential.verification_status AS credential_verification_status
+       FROM workspace_organizations authority_org
+       JOIN operations_integration_accounts authority_integration
+         ON authority_integration.organization_id = authority_org.id
+        AND authority_integration.global_id = $2
+       JOIN operations_carrier_accounts authority_account
+         ON authority_account.organization_id = authority_org.id
+        AND authority_account.integration_account_id = authority_integration.id
+        AND authority_account.global_id = $3
+       JOIN operations_carrier_credentials authority_credential
+         ON authority_credential.organization_id = authority_org.id
+        AND authority_credential.integration_account_id = authority_integration.id
+       WHERE authority_org.reference_code = $1
+       LIMIT 2
+       ${lock
+    ? 'FOR SHARE OF authority_org, authority_integration, authority_account, authority_credential'
+    : ''}`,
+      [
+        required.organizationReference,
+        required.integrationGlobalId,
+        required.carrierAccountGlobalId,
+      ],
+    )
+    const observed = result.rows[0]
+    const expectedLine1 = required.registeredAddressLine1
+      .trim().replace(/\s+/gu, ' ').toLowerCase()
+    const ready = result.rowCount === 1
+      && observed.provider === account.provider
+      && observed.integration_type === 'carrier'
+      && observed.environment === account.environment
+      && observed.integration_status === 'active'
+      && observed.carrier_account_status === 'active'
+      && observed.credential_verification_status === 'verified'
+      && observed.account_number_last_four === required.accountNumberLastFour
+      && observed.registered_address_line1 === expectedLine1
+      && observed.registered_address_fingerprint
+        === account.carrierAccount.sourceAddressFingerprint
+      && ['operator_attested', 'provider_verified']
+        .includes(observed.address_verification)
+      && observed.allow_sender_billing === true
+    dependencies.push({
+      targetIntegrationSourceGlobalId: account.globalId,
+      provider: account.provider,
+      environment: account.environment,
+      requiredOrganizationReference: required.organizationReference,
+      requiredIntegrationGlobalId: required.integrationGlobalId,
+      requiredCarrierAccountGlobalId: required.carrierAccountGlobalId,
+      requiredAccountNumberLastFour: required.accountNumberLastFour,
+      requiredRegisteredAddressFingerprint:
+        account.carrierAccount.sourceAddressFingerprint,
+      authorityOrganizationId: observed?.authority_organization_id || null,
+      authorityIntegrationAccountId: observed?.authority_integration_account_id || null,
+      authorityCarrierAccountId: observed?.authority_carrier_account_id || null,
+      ready,
+      blocker: ready
+        ? null
+        : 'required production source carrier authority is absent, inactive, unverified, or identity-mismatched',
+    })
+  }
+  return dependencies.sort((left, right) => (
+    left.targetIntegrationSourceGlobalId.localeCompare(right.targetIntegrationSourceGlobalId)
+  ))
 }
 
 async function rows(client, sql, params = []) {
@@ -764,6 +1143,8 @@ async function loadWorkspaceData(client, workspace, options = {}) {
   const org = workspace.source.organizationId
   const pipeline = workspace.source.pipelineId
   const accounts = selectedAccountIds(workspace)
+  const commerceAccounts = selectedCommerceAccountIds(workspace)
+  const carrierAccounts = selectedCarrierAccountIds(workspace)
   const excludedOrganizations = workspace.source.excludedOrganizationReferences
   const excludedContacts = workspace.source.excludedContactReferences
   const warehouseGlobalId = workspace.source.warehouseGlobalId
@@ -781,10 +1162,35 @@ async function loadWorkspaceData(client, workspace, options = {}) {
   data.operations_integration_accounts = await rows(client,
     `SELECT id, global_id, organization_id, provider, integration_type,
             environment, display_name, status,
+            ${SAFE_SOURCE_CONFIGURATION_SQL} AS configuration,
             created_by, updated_by, created_at, updated_at
-     FROM operations_integration_accounts
+     FROM operations_integration_accounts account
      WHERE organization_id = $1::uuid AND id = ANY($2::uuid[])
      ORDER BY id`, [org, accounts])
+  data.operations_carrier_account_migration_placeholders = carrierAccounts.length
+    ? await rows(client,
+      `SELECT carrier_account.id, carrier_account.global_id,
+              carrier_account.organization_id,
+              carrier_account.integration_account_id,
+              integration.provider, integration.environment,
+              carrier_account.display_name, carrier_account.sender_name,
+              carrier_account.account_number_last_four
+                AS source_account_number_last_four,
+              carrier_account.account_number_fingerprint
+                AS source_account_number_fingerprint,
+              carrier_account.registered_address_fingerprint
+                AS source_registered_address_fingerprint,
+              carrier_account.id AS source_carrier_account_id,
+              carrier_account.global_id AS source_carrier_account_global_id
+       FROM operations_carrier_accounts carrier_account
+       JOIN operations_integration_accounts integration
+         ON integration.organization_id = carrier_account.organization_id
+        AND integration.id = carrier_account.integration_account_id
+       WHERE carrier_account.organization_id = $1::uuid
+         AND carrier_account.integration_account_id = ANY($2::uuid[])
+       ORDER BY carrier_account.integration_account_id, carrier_account.id`,
+      [org, carrierAccounts])
+    : []
   data.crm_organizations = await rows(client,
     `SELECT * FROM crm_organizations
      WHERE pipeline_id = $1::uuid
@@ -814,7 +1220,7 @@ async function loadWorkspaceData(client, workspace, options = {}) {
        AND pipeline_id = $2::uuid
        AND integration_account_id = ANY($3::uuid[])
        AND product_id = ANY($4::uuid[])
-     ORDER BY id`, [org, pipeline, accounts, selectedProductIds])
+     ORDER BY id`, [org, pipeline, commerceAccounts, selectedProductIds])
   const selectedMappingIds = data.operations_product_mappings.map((row) => row.id)
   data.operations_product_channel_states = await rows(client,
     `SELECT * FROM operations_product_channel_states
@@ -825,7 +1231,7 @@ async function loadWorkspaceData(client, workspace, options = {}) {
          (product_id IS NULL AND product_mapping_id IS NULL)
          OR (product_id = ANY($4::uuid[]) AND product_mapping_id = ANY($5::uuid[]))
        )
-     ORDER BY id`, [org, pipeline, accounts, selectedProductIds, selectedMappingIds])
+     ORDER BY id`, [org, pipeline, commerceAccounts, selectedProductIds, selectedMappingIds])
   data.operations_warehouses = await rows(client,
     `SELECT * FROM operations_warehouses
      WHERE organization_id = $1::uuid AND global_id = $2 ORDER BY id`,
@@ -895,7 +1301,7 @@ async function loadWorkspaceData(client, workspace, options = {}) {
        AND product_id = ANY($4::uuid[])
        AND default_pack_profile_version_id = ANY($5::uuid[])
        AND mapping_purpose = 'catalog'
-     ORDER BY id`, [org, pipeline, accounts, selectedProductIds, versionIds])
+     ORDER BY id`, [org, pipeline, commerceAccounts, selectedProductIds, versionIds])
   data.operations_external_identifiers = await rows(client,
     `SELECT * FROM operations_external_identifiers
      WHERE organization_id = $1::uuid
@@ -903,7 +1309,7 @@ async function loadWorkspaceData(client, workspace, options = {}) {
        AND entity_type = 'crm.organization'
        AND entity_global_id = ANY($2::text[])
      ORDER BY integration_account_id, entity_type, external_id`,
-    [org, selectedOrganizationReferences, accounts])
+    [org, selectedOrganizationReferences, commerceAccounts])
   data.crm_product_image_assets = await rows(client,
     `SELECT ${options.includeImageBytes ? 'selected.*' : 'selected.id, selected.organization_id, selected.pipeline_id, selected.product_id, selected.asset_revision, selected.mime_type, selected.content_sha256, selected.byte_length, selected.pixel_width, selected.pixel_height, selected.alt_text, selected.source, selected.is_primary, selected.row_version, selected.created_by, selected.updated_by, selected.created_at, selected.updated_at'}
      FROM (
@@ -926,6 +1332,7 @@ async function loadWorkspaceData(client, workspace, options = {}) {
 async function sourceBlockers(client, workspace) {
   const org = workspace.source.organizationId
   const accounts = selectedAccountIds(workspace)
+  const commerceAccounts = selectedCommerceAccountIds(workspace)
   const controls = await rows(client,
     `SELECT account.id::text AS integration_account_id,
             account.global_id,
@@ -937,28 +1344,28 @@ async function sourceBlockers(client, workspace) {
        ON control.organization_id = account.organization_id
       AND control.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid AND account.id = ANY($2::uuid[])
-     ORDER BY account.id`, [org, accounts])
+     ORDER BY account.id`, [org, commerceAccounts])
   const activeLeases = await rows(client,
     `SELECT integration_account_id::text, count(*)::integer AS count
      FROM operations_commerce_store_sync_read_leases
      WHERE organization_id = $1::uuid
        AND integration_account_id = ANY($2::uuid[])
        AND released_at IS NULL AND expires_at > clock_timestamp()
-     GROUP BY integration_account_id ORDER BY integration_account_id`, [org, accounts])
+     GROUP BY integration_account_id ORDER BY integration_account_id`, [org, commerceAccounts])
   const continuations = await rows(client,
     `SELECT integration_account_id::text, count(*)::integer AS count
      FROM operations_commerce_intake_continuations
      WHERE organization_id = $1::uuid
        AND integration_account_id = ANY($2::uuid[])
        AND cursor_state = 'available' AND expires_at > clock_timestamp()
-     GROUP BY integration_account_id ORDER BY integration_account_id`, [org, accounts])
+     GROUP BY integration_account_id ORDER BY integration_account_id`, [org, commerceAccounts])
   const externalEffects = await rows(client,
     `SELECT integration_account_id::text, global_id, action, state, error_code
      FROM operations_commerce_external_effect_intents
      WHERE organization_id = $1::uuid
        AND integration_account_id = ANY($2::uuid[])
        AND state IN ('pending', 'claimed', 'unknown')
-     ORDER BY integration_account_id, global_id`, [org, accounts])
+     ORDER BY integration_account_id, global_id`, [org, commerceAccounts])
   const webhooks = await rows(client,
     `SELECT integration_account_id::text, state, count(*)::integer AS count
      FROM operations_commerce_webhook_receipts
@@ -966,7 +1373,7 @@ async function sourceBlockers(client, workspace) {
        AND integration_account_id = ANY($2::uuid[])
        AND state IN ('held', 'queued', 'processing', 'failed', 'dead_letter')
      GROUP BY integration_account_id, state
-     ORDER BY integration_account_id, state`, [org, accounts])
+     ORDER BY integration_account_id, state`, [org, commerceAccounts])
   const cutoverFences = await rows(client,
     `SELECT integration_account_id::text, migration_name, state, frozen_at
      FROM operations_commerce_workspace_migration_cutover_fences
@@ -991,7 +1398,7 @@ async function sourceBlockers(client, workspace) {
          AND integration_account_id = ANY($2::uuid[])
          AND dirty_version > reconciled_version
        GROUP BY integration_account_id
-       ORDER BY integration_account_id`, [org, accounts])
+       ORDER BY integration_account_id`, [org, commerceAccounts])
     dirtyReconciliation.push({ table, missing: false, rows: selected })
   }
   const heldWorkDefinitions = [
@@ -1027,7 +1434,7 @@ async function sourceBlockers(client, workspace) {
          AND ${quotedIdentifier(stateColumn)} = ANY($3::text[])
        GROUP BY integration_account_id, ${quotedIdentifier(stateColumn)}
        ORDER BY integration_account_id, ${quotedIdentifier(stateColumn)}`,
-      [org, accounts, states])
+      [org, commerceAccounts, states])
     heldWork.push({ table, missing: false, rows: selected })
   }
   const revisionWork = await rows(client,
@@ -1041,8 +1448,8 @@ async function sourceBlockers(client, workspace) {
          OR claim_state IN ('pending', 'processing', 'failed', 'dead_letter')
        )
      GROUP BY integration_account_id, claim_state
-     ORDER BY integration_account_id, claim_state`, [org, accounts])
-  const paused = controls.length === accounts.length && controls.every((control) => (
+     ORDER BY integration_account_id, claim_state`, [org, commerceAccounts])
+  const paused = controls.length === commerceAccounts.length && controls.every((control) => (
     control.desired_state === 'paused'
     && control.explicit_choice === true
     && control.effective_running === false
@@ -1074,7 +1481,8 @@ async function sourceBlockers(client, workspace) {
 }
 
 const SOURCE_CUTOVER_LOCK_TABLES = Object.freeze([
-  ...DATASET_ORDER,
+  ...DATASET_ORDER.filter((table) => table !== 'operations_carrier_account_migration_placeholders'),
+  'operations_carrier_accounts',
   'operations_commerce_store_sync_controls',
   'operations_commerce_workspace_migration_cutover_fences',
   'operations_commerce_store_sync_read_leases',
@@ -1108,7 +1516,7 @@ async function acquireSourceCutoverLocks(client) {
   )
 }
 
-const TARGET_EMPTY_SCAFFOLD_ALLOWLIST = new Set([
+const TARGET_GLOBAL_SAFE_TABLES = new Set([
   'workspace_organizations',
   'app_users',
   'pipeline_spaces',
@@ -1121,7 +1529,23 @@ const TARGET_EMPTY_SCAFFOLD_ALLOWLIST = new Set([
   'workspace_organization_preferences',
   'operations_shipping_scopes',
   'audit_events',
+  'crm_integration_cursors',
+  'crm_reference_aliases',
+  'crm_reference_number_registry',
+  'crm_reference_registry',
+  'crm_suitecrm_product_image_ingestion_worker_heartbeat',
+  'operations_commerce_product_image_import_worker_heartbeat',
 ])
+
+const TARGET_SCOPE_ANCHORS = Object.freeze({
+  workspace_organizations: Object.freeze({ columns: Object.freeze(['id']) }),
+  pipeline_spaces: Object.freeze({
+    columns: Object.freeze(['workspace_organization_id']),
+  }),
+  project_boards: Object.freeze({
+    columns: Object.freeze(['workspace_organization_id']),
+  }),
+})
 
 const TARGET_SCAFFOLD_BASELINE = Object.freeze([
   Object.freeze({ table: 'workspace_organizations', column: 'id', scope: 'organization' }),
@@ -1149,32 +1573,14 @@ function isTargetMigrationDomainTable(table) {
     || table === 'sync_outbox'
 }
 
-async function scopedTargetCount(client, table, workspace) {
-  if (!IDENTIFIER.test(table)) fail(`Unsafe table identifier: ${table}`)
-  const columns = await rows(client,
-    `SELECT column_name FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = $1`, [table])
-  const names = new Set(columns.map((row) => row.column_name))
-  if (!names.size) return 0
-  const scopeColumn = TARGET_SCOPE_COLUMN[table]
-  if (!scopeColumn || !names.has(scopeColumn)) {
-    fail(`Cannot derive exact target scope for ${table}`)
-  }
-  const scopeValue = scopeColumn === 'pipeline_id'
-    ? workspace.target.pipelineId
-    : workspace.target.organizationId
-  return Number((await client.query(
-    `SELECT count(*)::bigint AS count FROM ${quotedIdentifier(table)}
-     WHERE ${quotedIdentifier(scopeColumn)} = $1::uuid`,
-    [scopeValue],
-  )).rows[0].count)
-}
-
 function appendTargetScopePredicate(table, alias, columns, workspace, params) {
   const names = new Set(columns)
   const add = (value) => {
     params.push(value)
     return `$${params.length}`
+  }
+  if (table === 'workspace_organizations') {
+    return `${alias}.id = ${add(workspace.target.organizationId)}::uuid`
   }
   if (table === 'sync_outbox') {
     const pipeline = add(workspace.target.pipelineId)
@@ -1250,74 +1656,41 @@ async function targetForeignKeys(client) {
      ORDER BY child.relname, parent.relname, constraint_row.oid`)
 }
 
-function targetScopePaths(rootTable, directTables, edgesByChild, maxDepth = 8) {
-  const paths = []
-  for (const firstEdge of edgesByChild.get(rootTable) || []) {
-    const queue = [{
-      table: firstEdge.parent_table,
-      path: [firstEdge],
-      visited: new Set([rootTable, firstEdge.parent_table]),
-    }]
-    const visitedTables = new Set()
-    while (queue.length) {
-      const candidate = queue.shift()
-      if (directTables.has(candidate.table)) {
-        paths.push(candidate.path)
-        break
-      }
-      if (candidate.path.length >= maxDepth || visitedTables.has(candidate.table)) continue
-      visitedTables.add(candidate.table)
-      for (const edge of edgesByChild.get(candidate.table) || []) {
-        if (candidate.visited.has(edge.parent_table)) continue
-        queue.push({
-          table: edge.parent_table,
-          path: [...candidate.path, edge],
-          visited: new Set([...candidate.visited, edge.parent_table]),
-        })
-      }
+function targetScopePaths(rootTable, directTables, edgesByChild) {
+  const queue = [{ table: rootTable, path: [] }]
+  const visited = new Set([rootTable])
+  while (queue.length) {
+    const candidate = queue.shift()
+    if (candidate.path.length && directTables.has(candidate.table)) {
+      return [candidate.path]
+    }
+    for (const edge of edgesByChild.get(candidate.table) || []) {
+      if (visited.has(edge.parent_table)) continue
+      visited.add(edge.parent_table)
+      queue.push({
+        table: edge.parent_table,
+        path: [...candidate.path, edge],
+      })
     }
   }
-  const unique = new Map(paths.map((pathRows) => [
-    pathRows.map((edge) => (
-      `${edge.child_table}(${edge.child_columns.join(',')})->${edge.parent_table}(${edge.parent_columns.join(',')})`
-    )).join('/'),
-    pathRows,
-  ]))
-  return [...unique.values()]
+  return []
 }
 
-function targetScopePathPredicate(pathRows, directByTable, workspace, params) {
-  const joins = []
-  const conditions = []
-  for (let index = 0; index < pathRows.length; index += 1) {
-    const edge = pathRows[index]
-    const childAlias = index === 0 ? 'scoped_row' : `scope_${index}`
-    const parentAlias = `scope_${index + 1}`
-    const link = edge.child_columns.map((column, columnIndex) => (
-      `${parentAlias}.${quotedIdentifier(edge.parent_columns[columnIndex])}`
-      + ` = ${childAlias}.${quotedIdentifier(column)}`
-    )).join(' AND ')
-    if (index === 0) {
-      joins.push(`FROM ${quotedIdentifier(edge.parent_table)} ${parentAlias}`)
-      conditions.push(link)
-    } else {
-      joins.push(`JOIN ${quotedIdentifier(edge.parent_table)} ${parentAlias} ON ${link}`)
-    }
-  }
-  const anchor = pathRows.at(-1).parent_table
-  const anchorInfo = directByTable.get(anchor)
-  conditions.push(appendTargetScopePredicate(
-    anchor,
-    `scope_${pathRows.length}`,
-    anchorInfo.columns,
-    workspace,
-    params,
-  ))
-  return `EXISTS (SELECT 1 ${joins.join(' ')} WHERE ${conditions.join(' AND ')})`
+function scopePathDescriptor(pathRows) {
+  return pathRows.map((edge) => ({
+    childTable: edge.child_table,
+    childColumns: edge.child_columns,
+    parentTable: edge.parent_table,
+    parentColumns: edge.parent_columns,
+  }))
 }
 
-export async function targetCounts(client, workspace) {
-  const scopedTables = await rows(client,
+export async function targetScopeAudit(client, workspace) {
+  const ownsSession = typeof client.release !== 'function'
+  const session = ownsSession ? await client.connect() : client
+  if (ownsSession) await session.query('BEGIN')
+  try {
+  const scopedTables = await rows(session,
     `SELECT table_info.table_name,
             array_agg(table_info.column_name::text ORDER BY table_info.column_name)::text[] AS columns
      FROM information_schema.columns table_info
@@ -1336,46 +1709,35 @@ export async function targetCounts(client, workspace) {
       'board_id',
     ]])
   const output = {}
-  const domainScopedTables = scopedTables.filter((selected) => (
-    isTargetMigrationDomainTable(selected.table_name)
-  ))
-  const directByTable = new Map(domainScopedTables.map((selected) => [
-    selected.table_name,
-    { columns: selected.columns },
-  ]))
-  if (await tableExists(client, 'sync_outbox')) {
+  const directByTable = new Map(scopedTables
+    .filter((selected) => {
+      if (
+        !isTargetMigrationDomainTable(selected.table_name)
+        || TARGET_GLOBAL_SAFE_TABLES.has(selected.table_name)
+      ) return false
+      const columns = new Set(selected.columns)
+      return columns.has('pipeline_id')
+        || columns.has('workspace_organization_id')
+        || columns.has('organization_root_id')
+        || columns.has('board_id')
+        || (columns.has('organization_id') && !selected.table_name.startsWith('crm_'))
+    })
+    .map((selected) => [
+      selected.table_name,
+      { columns: selected.columns },
+    ]))
+  for (const [table, spec] of Object.entries(TARGET_SCOPE_ANCHORS)) {
+    if (await tableExists(session, table)) directByTable.set(table, spec)
+  }
+  if (await tableExists(session, 'sync_outbox')) {
     directByTable.set('sync_outbox', { columns: [] })
   }
-  for (const selected of domainScopedTables) {
-    const table = selected.table_name
-    if (TARGET_EMPTY_SCAFFOLD_ALLOWLIST.has(table)) continue
-    const params = []
-    const predicate = appendTargetScopePredicate(
-      table, 'scoped_row', selected.columns, workspace, params)
-    output[table] = Number((await client.query(
-      `SELECT count(*)::bigint AS count
-       FROM ${quotedIdentifier(table)} scoped_row
-       WHERE ${predicate}`,
-      params,
-    )).rows[0].count)
-  }
-  if (directByTable.has('sync_outbox')) {
-    const params = []
-    const predicate = appendTargetScopePredicate(
-      'sync_outbox', 'scoped_row', [], workspace, params)
-    output.sync_outbox = Number((await client.query(
-      `SELECT count(*)::bigint AS count
-       FROM sync_outbox scoped_row
-       WHERE ${predicate}`,
-      params,
-    )).rows[0].count)
-  }
-  const baseTables = (await rows(client,
+  const baseTables = (await rows(session,
     `SELECT table_name
      FROM information_schema.tables
      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
      ORDER BY table_name`)).map((row) => row.table_name)
-  const foreignKeys = await targetForeignKeys(client)
+  const foreignKeys = await targetForeignKeys(session)
   const edgesByChild = new Map()
   for (const edge of foreignKeys) {
     const existing = edgesByChild.get(edge.child_table) || []
@@ -1383,28 +1745,166 @@ export async function targetCounts(client, workspace) {
     edgesByChild.set(edge.child_table, existing)
   }
   const directTables = new Set(directByTable.keys())
-  for (const table of baseTables) {
-    if (!isTargetMigrationDomainTable(table)
-      || directTables.has(table)
-      || TARGET_EMPTY_SCAFFOLD_ALLOWLIST.has(table)) continue
-    const paths = targetScopePaths(table, directTables, edgesByChild)
-    if (!paths.length) continue
-    const params = []
-    const predicates = paths.map((pathRows) => (
-      targetScopePathPredicate(pathRows, directByTable, workspace, params)
-    ))
-    output[table] = Number((await client.query(
-      `SELECT count(*)::bigint AS count
-       FROM ${quotedIdentifier(table)} scoped_row
-       WHERE ${predicates.map((predicate) => `(${predicate})`).join(' OR ')}`,
-      params,
-    )).rows[0].count)
+  const scopeReachableTables = new Set(directTables)
+  let reachabilityChanged = true
+  while (reachabilityChanged) {
+    reachabilityChanged = false
+    for (const edge of foreignKeys) {
+      if (
+        scopeReachableTables.has(edge.parent_table)
+        && isTargetMigrationDomainTable(edge.child_table)
+        && !TARGET_GLOBAL_SAFE_TABLES.has(edge.child_table)
+        && !scopeReachableTables.has(edge.child_table)
+      ) {
+        scopeReachableTables.add(edge.child_table)
+        reachabilityChanged = true
+      }
+    }
   }
-  return Object.fromEntries(Object.entries(output).sort(([left], [right]) => left.localeCompare(right)))
+
+  const temporaryScopeTable = `migration_target_scope_${crypto.randomBytes(8).toString('hex')}`
+  await session.query(
+    `CREATE TEMP TABLE ${quotedIdentifier(temporaryScopeTable)} (
+       table_name text NOT NULL,
+       row_tid tid NOT NULL,
+       PRIMARY KEY (table_name, row_tid)
+     ) ON COMMIT DROP`,
+  )
+  for (const [table, direct] of directByTable) {
+    if (!scopeReachableTables.has(table)) continue
+    const params = []
+    const predicate = appendTargetScopePredicate(
+      table,
+      'direct_row',
+      direct.columns,
+      workspace,
+      params,
+    )
+    await session.query(
+      `INSERT INTO ${quotedIdentifier(temporaryScopeTable)} (table_name, row_tid)
+       SELECT $${params.length + 1}, direct_row.ctid
+       FROM ${quotedIdentifier(table)} direct_row
+       WHERE ${predicate}
+       ON CONFLICT DO NOTHING`,
+      [...params, table],
+    )
+  }
+
+  const propagationEdges = foreignKeys.filter((edge) => (
+    scopeReachableTables.has(edge.child_table)
+    && scopeReachableTables.has(edge.parent_table)
+  ))
+  let propagated
+  do {
+    propagated = 0
+    for (let offset = 0; offset < propagationEdges.length; offset += 40) {
+      const group = propagationEdges.slice(offset, offset + 40)
+      const selects = group.map((edge, index) => {
+        const childAlias = `child_${index}`
+        const parentAlias = `parent_${index}`
+        const scopedAlias = `scope_${index}`
+        const link = edge.child_columns.map((column, columnIndex) => (
+          `${childAlias}.${quotedIdentifier(column)}`
+          + ` = ${parentAlias}.${quotedIdentifier(edge.parent_columns[columnIndex])}`
+        )).join(' AND ')
+        return `SELECT ${quotedLiteral(edge.child_table)}::text AS table_name,
+                       ${childAlias}.ctid AS row_tid
+                FROM ${quotedIdentifier(edge.child_table)} ${childAlias}
+                JOIN ${quotedIdentifier(edge.parent_table)} ${parentAlias}
+                  ON ${link}
+                JOIN ${quotedIdentifier(temporaryScopeTable)} ${scopedAlias}
+                  ON ${scopedAlias}.table_name = ${quotedLiteral(edge.parent_table)}
+                 AND ${scopedAlias}.row_tid = ${parentAlias}.ctid`
+      })
+      if (!selects.length) continue
+      const inserted = await session.query(
+        `INSERT INTO ${quotedIdentifier(temporaryScopeTable)} (table_name, row_tid)
+         ${selects.join('\nUNION ALL\n')}
+         ON CONFLICT DO NOTHING`,
+      )
+      propagated += inserted.rowCount || 0
+    }
+  } while (propagated > 0)
+
+  const scopedCounts = new Map((await rows(session,
+    `SELECT table_name, count(*)::bigint AS count
+     FROM ${quotedIdentifier(temporaryScopeTable)}
+     GROUP BY table_name`,
+  )).map((row) => [row.table_name, Number(row.count)]))
+  const classifications = []
+  const denied = []
+  for (const table of baseTables) {
+    if (!isTargetMigrationDomainTable(table)) continue
+    if (TARGET_GLOBAL_SAFE_TABLES.has(table)) {
+      classifications.push({
+        table,
+        classification: 'global-safe',
+        strategy: 'compiled-allowlist',
+      })
+      continue
+    }
+    let classification
+    if (directTables.has(table)) {
+      const direct = directByTable.get(table)
+      classification = {
+        table,
+        classification: 'scoped',
+        strategy: table === 'sync_outbox' ? 'explicit-json' : 'direct',
+        scopeColumns: table === 'sync_outbox' ? ['payload', 'aggregate_id'] : direct.columns,
+      }
+    } else {
+      const paths = targetScopePaths(table, directTables, edgesByChild)
+      if (!paths.length) {
+        const deniedClassification = {
+          table,
+          classification: 'denied',
+          strategy: 'unclassifiable',
+          reason: 'no compiled global-safe rule, direct scope, explicit JSON rule, or foreign-key scope path',
+        }
+        classifications.push(deniedClassification)
+        denied.push(table)
+        continue
+      }
+      classification = {
+        table,
+        classification: 'scoped',
+        strategy: 'indirect',
+        paths: paths.map(scopePathDescriptor),
+      }
+    }
+    output[table] = scopedCounts.get(table) || 0
+    classifications.push(classification)
+  }
+  const counts = Object.fromEntries(
+    Object.entries(output).sort(([left], [right]) => left.localeCompare(right)),
+  )
+  classifications.sort((left, right) => left.table.localeCompare(right.table))
+  const result = {
+    counts,
+    classifications,
+    classificationDigest: digest(classifications),
+    denied: denied.sort(),
+  }
+  if (ownsSession) await session.query('COMMIT')
+  return result
+  } catch (error) {
+    if (ownsSession) await session.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    if (ownsSession) session.release()
+  }
 }
 
-function targetIsEmpty(counts) {
-  return Object.values(counts).every((count) => count === 0)
+export async function targetCounts(client, workspace) {
+  const audit = await targetScopeAudit(client, workspace)
+  if (audit.denied.length) {
+    fail(`Target scope classification denied candidate tables: ${audit.denied.join(', ')}`)
+  }
+  return audit.counts
+}
+
+function targetIsEmpty(counts, denied = []) {
+  return denied.length === 0 && Object.values(counts).every((count) => count === 0)
 }
 
 async function targetConfigurationBaseline(client, workspace, actor, lock = false) {
@@ -1443,19 +1943,42 @@ async function targetConfigurationBaseline(client, workspace, actor, lock = fals
   }
 }
 
-function safeAccountPlan(account, observed) {
-  return {
+function safeAccountPlan(account, observed, carrierRow = null, sourceAuthority = null) {
+  const plan = {
     sourceId: account.id,
     sourceGlobalId: account.globalId,
     provider: account.provider,
+    integrationType: account.integrationType,
     environment: account.environment,
     displayName: observed.display_name,
-    externalAccountIdSha256: account.externalAccountIdSha256,
+    safeConfiguration: safePlaceholderConfiguration({
+      integration_type: account.integrationType,
+      configuration: observed.configuration,
+    }),
     reconnectEligible: account.reconnectEligible,
-    productionDisposition: account.reconnectEligible
-      ? 'disabled_placeholder_reconnect_after_cutover_gates'
-      : 'disabled_placeholder_do_not_connect_without_production_identity_proof',
+    productionDisposition: account.environment === 'sandbox'
+      ? 'disabled_sandbox_placeholder_rebind_and_verify_before_activation'
+      : 'disabled_production_placeholder_rebind_and_verify_before_activation',
   }
+  if (account.integrationType === 'commerce') {
+    plan.externalAccountIdSha256 = account.externalAccountIdSha256
+  } else {
+    plan.carrierAccount = {
+      sourceId: account.carrierAccount.id,
+      sourceGlobalId: account.carrierAccount.globalId,
+      displayName: account.carrierAccount.displayName,
+      senderName: account.carrierAccount.senderName,
+      sourceAccountNumberFingerprint: account.carrierAccount.sourceAccountNumberFingerprint,
+      sourceAddressFingerprint: account.carrierAccount.sourceAddressFingerprint,
+      sourceAccountNumberLastFour: carrierRow?.source_account_number_last_four || null,
+      rebindMode: account.sourceAuthority ? 'source_authority' : 'direct_credential',
+      productionDisposition: account.sourceAuthority
+        ? 'identity_only_placeholder_blocked_until_verified_production_source_authority_rebind'
+        : 'identity_only_placeholder_materialized_after_target_credential_and_shipper_rebind',
+    }
+    if (account.sourceAuthority) plan.sourceAuthority = sourceAuthority
+  }
+  return plan
 }
 
 async function targetStorageBaseline(client, capabilities) {
@@ -1510,7 +2033,12 @@ async function buildPlan(source, target, actor, endpointBindings, workspaces = W
     const data = await loadWorkspaceData(source, workspace, { includeImageBytes: false })
     validateDatasetClosure(data, workspace)
     const blockers = await sourceBlockers(source, workspace)
-    const emptyCounts = await targetCounts(target, workspace)
+    const sourceAuthorityDependencies = await targetSourceAuthorityDependencies(
+      target,
+      workspace,
+    )
+    const targetScope = await targetScopeAudit(target, workspace)
+    const emptyCounts = targetScope.counts
     const configurationBaseline = await targetConfigurationBaseline(target, workspace, actor)
     const projected = sourceSnapshotProjection(data)
     workspacePlans.push({
@@ -1530,14 +2058,26 @@ async function buildPlan(source, target, actor, endpointBindings, workspaces = W
       accounts: workspace.source.accounts.map((account) => safeAccountPlan(
         account,
         accountRows.find((row) => row.id === account.id),
+        data.operations_carrier_account_migration_placeholders
+          .find((row) => row.integration_account_id === account.id),
+        sourceAuthorityDependencies.find((dependency) => (
+          dependency.targetIntegrationSourceGlobalId === account.globalId
+        )),
       )),
       counts: datasetCounts(data),
       sourceStateDigest: digest(projected),
       sourceBlockers: blockers,
+      sourceAuthorityDependencies,
+      sourceAuthorityDependencyDigest: digest(sourceAuthorityDependencies),
       targetCounts: emptyCounts,
+      targetScopeClassifications: targetScope.classifications,
+      targetScopeClassificationDigest: targetScope.classificationDigest,
+      targetScopeDenied: targetScope.denied,
       targetConfigurationBaseline: configurationBaseline,
-      targetEmpty: targetIsEmpty(emptyCounts),
-      ready: blockers.ready && targetIsEmpty(emptyCounts),
+      targetEmpty: targetIsEmpty(emptyCounts, targetScope.denied),
+      ready: blockers.ready
+        && sourceAuthorityDependencies.every((dependency) => dependency.ready)
+        && targetIsEmpty(emptyCounts, targetScope.denied),
     })
   }
   const plan = {
@@ -1558,7 +2098,10 @@ async function buildPlan(source, target, actor, endpointBindings, workspaces = W
       sourceSuiteCrmIdsAndOutbox: true,
       targetSuiteCrmProjectionQueued: true,
       providerReconnectsAndWrites: true,
-      carrierAndPrinterAccounts: true,
+      carrierCredentialAndEncryptedAccountMaterial: true,
+      carrierIdentityMappingsRetainedAsDisabledPlaceholders: true,
+      printerAccounts: true,
+      providerOperationalState: true,
       developmentFixtures: true,
     },
     workspaces: workspacePlans,
@@ -1569,6 +2112,9 @@ async function buildPlan(source, target, actor, endpointBindings, workspaces = W
     counts: workspace.counts,
     sourceStateDigest: workspace.sourceStateDigest,
     targetCounts: workspace.targetCounts,
+    targetScopeClassificationDigest: workspace.targetScopeClassificationDigest,
+    targetScopeDenied: workspace.targetScopeDenied,
+    sourceAuthorityDependencyDigest: workspace.sourceAuthorityDependencyDigest,
     targetConfigurationBaseline: workspace.targetConfigurationBaseline,
   })))
   plan.manifestDigest = manifestDigest(plan)
@@ -1594,6 +2140,10 @@ async function writableColumns(client, table) {
 function quotedIdentifier(value) {
   if (!IDENTIFIER.test(value)) fail(`Unsafe SQL identifier: ${value}`)
   return `"${value}"`
+}
+
+function quotedLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`
 }
 
 async function insertRow(client, table, input, columnCache) {
@@ -1785,6 +2335,9 @@ function requiredMappedId(identityMaps, table, sourceId, label, nullable = false
 }
 
 const FK_REMAP = Object.freeze({
+  operations_carrier_account_migration_placeholders: Object.freeze({
+    integration_account_id: ['operations_integration_accounts', false],
+  }),
   crm_product_categories: Object.freeze({ parent_id: ['crm_product_categories', true] }),
   crm_organizations: Object.freeze({ parent_organization_id: ['crm_organizations', true] }),
   crm_contacts: Object.freeze({ organization_id: ['crm_organizations', false] }),
@@ -2053,7 +2606,15 @@ function suiteCrmOutboxReceiptDescriptor(projection) {
   }
 }
 
-function transformRow(table, sourceRow, identityMaps, workspace, actor, owner) {
+function transformRow(
+  table,
+  sourceRow,
+  identityMaps,
+  workspace,
+  actor,
+  owner,
+  workspacePlan,
+) {
   const row = sanitizeJson(sourceRow, identityMaps.replacements)
   const identity = TABLE_ID_COLUMN[table]
     ? identityMaps.byTable.get(table)?.get(sourceRow[TABLE_ID_COLUMN[table]])
@@ -2136,6 +2697,38 @@ function transformRow(table, sourceRow, identityMaps, workspace, actor, owner) {
       || sourceRow.created_at
       || new Date(0).toISOString()
   }
+  if (table === 'operations_carrier_account_migration_placeholders') {
+    const expectedIntegration = workspace.source.accounts.find((account) => (
+      account.id === sourceRow.integration_account_id
+    ))
+    if (!expectedIntegration?.carrierAccount) {
+      fail(`${workspace.key} carrier placeholder lacks a compiled integration identity`)
+    }
+    const sourceAuthority = workspacePlan.sourceAuthorityDependencies?.find((dependency) => (
+      dependency.targetIntegrationSourceGlobalId === expectedIntegration.globalId
+    )) || null
+    row.source_carrier_account_id = sourceRow.id
+    row.source_carrier_account_global_id = sourceRow.global_id
+    row.rebind_mode = expectedIntegration.sourceAuthority
+      ? 'source_authority'
+      : 'direct_credential'
+    row.required_source_authority_organization_id = sourceAuthority?.authorityOrganizationId || null
+    row.required_source_authority_integration_account_id =
+      sourceAuthority?.authorityIntegrationAccountId || null
+    row.required_source_authority_carrier_account_id =
+      sourceAuthority?.authorityCarrierAccountId || null
+    row.required_source_organization_reference =
+      expectedIntegration.sourceAuthority?.organizationReference || null
+    row.required_source_integration_global_id =
+      expectedIntegration.sourceAuthority?.integrationGlobalId || null
+    row.required_source_carrier_account_global_id =
+      expectedIntegration.sourceAuthority?.carrierAccountGlobalId || null
+    row.state = 'awaiting_credential_rebind'
+    row.target_account_number_fingerprint = null
+    row.materialized_by = null
+    row.materialized_at = null
+    row.created_by = actor
+  }
   if (
     table === 'operations_product_barcodes'
     && row.barcode_source === 'internal'
@@ -2191,6 +2784,7 @@ export function validateDatasetClosure(data, workspace) {
   orderedRowsForInsert('operations_locations', data.operations_locations)
 
   const accounts = selectedIds(data, 'operations_integration_accounts')
+  const carrierPlaceholders = data.operations_carrier_account_migration_placeholders || []
   const organizations = selectedIds(data, 'crm_organizations')
   const contacts = selectedIds(data, 'crm_contacts')
   const categories = selectedIds(data, 'crm_product_categories')
@@ -2206,6 +2800,22 @@ export function validateDatasetClosure(data, workspace) {
   assertSelectedReference(data.crm_contact_source_aliases, 'contact_id', contacts, 'crm_contact_source_aliases.contact_id')
   assertSelectedReference(data.crm_products, 'category_id', categories, 'crm_products.category_id', true)
   assertSelectedReference(data.operations_product_mappings, 'integration_account_id', accounts, 'operations_product_mappings.integration_account_id')
+  assertSelectedReference(
+    carrierPlaceholders,
+    'integration_account_id',
+    accounts,
+    'operations_carrier_account_migration_placeholders.integration_account_id',
+  )
+  const expectedCarrierAccounts = workspace.source.accounts
+    .filter((account) => account.integrationType === 'carrier')
+  if (
+    carrierPlaceholders.length !== expectedCarrierAccounts.length
+    || carrierPlaceholders.some((row) => !expectedCarrierAccounts.some((account) => (
+      account.id === row.integration_account_id
+      && account.carrierAccount?.id === row.id
+      && account.carrierAccount?.globalId === row.global_id
+    )))
+  ) fail(`${workspace.key} carrier-account mapping closure changed`)
   assertSelectedReference(data.operations_product_mappings, 'product_id', products, 'operations_product_mappings.product_id')
   assertSelectedReference(data.operations_product_channel_states, 'integration_account_id', accounts, 'operations_product_channel_states.integration_account_id')
   assertSelectedReference(data.operations_product_channel_states, 'product_id', products, 'operations_product_channel_states.product_id', true)
@@ -2280,34 +2890,53 @@ async function insertProviderIdentityFence(
   client,
   workspace,
   sourceAccount,
+  carrierSourceRow,
   targetAccountId,
   actor,
   workspacePlan,
 ) {
   const expected = workspace.source.accounts.find((account) => account.id === sourceAccount.id)
   if (!expected) fail(`${workspace.key} source account is outside the compiled provider identity fence`)
+  const sourceProviderIdentitySha256 = expected.integrationType === 'commerce'
+    ? expected.externalAccountIdSha256
+    : digest({
+      provider: expected.provider,
+      environment: expected.environment,
+      carrierAccountGlobalId: expected.carrierAccount.globalId,
+      sourceAccountNumberLastFour: carrierSourceRow?.source_account_number_last_four,
+      sourceAccountNumberFingerprint: expected.carrierAccount.sourceAccountNumberFingerprint,
+      sourceRegisteredAddressFingerprint: expected.carrierAccount.sourceAddressFingerprint,
+    })
   const result = await client.query(
     `INSERT INTO operations_commerce_migration_provider_identity_fences (
-       organization_id, integration_account_id, provider, environment,
+       organization_id, integration_account_id, provider, integration_type,
+       identity_kind, environment,
        source_database_identity, source_database_endpoint_sha256,
        target_database_endpoint_sha256, source_account_global_id,
+       source_provider_identity_sha256,
        expected_external_account_id_sha256, reconnect_eligible,
        verification_state, migration_event_key, created_by
      ) VALUES (
-       $1::uuid, $2::uuid, $3, $4, $5::uuid, $6, $7, $8, $9, $10,
-       'awaiting_provider_identity', $11, $12
+       $1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, $9, $10,
+       $11, $12, $13, 'awaiting_provider_identity', $14, $15
      )
-     RETURNING expected_external_account_id_sha256, verification_state`,
+     RETURNING integration_type, source_provider_identity_sha256,
+               expected_external_account_id_sha256, verification_state`,
     [
       workspace.target.organizationId,
       targetAccountId,
       expected.provider,
+      expected.integrationType,
+      expected.integrationType === 'commerce'
+        ? 'external_account_id'
+        : 'carrier_shipper_account',
       expected.environment,
       SOURCE_DATABASE_IDENTITY,
       workspacePlan.sourceEndpointSha256,
       workspacePlan.targetEndpointSha256,
       expected.globalId,
-      expected.externalAccountIdSha256,
+      sourceProviderIdentitySha256,
+      expected.integrationType === 'commerce' ? expected.externalAccountIdSha256 : null,
       expected.reconnectEligible,
       receiptEventKey(workspace, workspacePlan.sourceStateDigest),
       actor,
@@ -2315,7 +2944,10 @@ async function insertProviderIdentityFence(
   )
   if (
     result.rowCount !== 1
-    || result.rows[0].expected_external_account_id_sha256 !== expected.externalAccountIdSha256
+    || result.rows[0].integration_type !== expected.integrationType
+    || result.rows[0].source_provider_identity_sha256 !== sourceProviderIdentitySha256
+    || result.rows[0].expected_external_account_id_sha256
+      !== (expected.integrationType === 'commerce' ? expected.externalAccountIdSha256 : null)
     || result.rows[0].verification_state !== 'awaiting_provider_identity'
   ) fail(`${workspace.key} provider identity fence was not created`)
 }
@@ -2342,13 +2974,40 @@ async function insertWorkspaceData(client, data, workspace, actor, workspacePlan
       let transformed
       if (table === 'operations_integration_accounts') {
         const targetIdentity = identityMaps.byTable.get(table).get(sourceRow.id)
+        const expected = workspace.source.accounts.find((account) => account.id === sourceRow.id)
+        if (!expected) fail(`${workspace.key} selected integration lacks a compiled identity`)
+        let configuration
+        if (expected.sourceAuthority) {
+          const targetWarehouseGlobalId = identityMaps.byTable
+            .get('operations_warehouses')
+            ?.get((data.operations_warehouses || []).find((warehouse) => (
+              warehouse.global_id === workspace.source.warehouseGlobalId
+            ))?.id)?.reference
+          if (!targetWarehouseGlobalId) {
+            fail(`${workspace.key} source-managed carrier lacks its migrated origin warehouse`)
+          }
+          configuration = sourceManagedCarrierPlaceholderConfiguration(
+            sourceRow,
+            expected,
+            targetWarehouseGlobalId,
+          )
+        }
         transformed = buildCredentialFreePlaceholder(sourceRow, {
           ...targetIdentity,
           globalId: targetIdentity.reference,
           organizationId: workspace.target.organizationId,
+          configuration,
         }, actor)
       } else {
-        transformed = transformRow(table, sourceRow, identityMaps, workspace, actor, owner)
+        transformed = transformRow(
+          table,
+          sourceRow,
+          identityMaps,
+          workspace,
+          actor,
+          owner,
+          workspacePlan,
+        )
       }
       const insertedRow = await insertRow(client, table, transformed, columnCache)
       inserted[table].push(insertedRow)
@@ -2375,11 +3034,15 @@ async function insertWorkspaceData(client, data, workspace, actor, workspacePlan
         )
       }
       if (table === 'operations_integration_accounts') {
-        await setPlaceholderPaused(client, workspace, insertedRow.id, actor)
+        if (sourceRow.integration_type === 'commerce') {
+          await setPlaceholderPaused(client, workspace, insertedRow.id, actor)
+        }
         await insertProviderIdentityFence(
           client,
           workspace,
           sourceRow,
+          data.operations_carrier_account_migration_placeholders
+            .find((row) => row.integration_account_id === sourceRow.id),
           insertedRow.id,
           actor,
           workspacePlan,
@@ -2471,6 +3134,19 @@ function receiptIdentityDigest(payload) {
   return digest(identity)
 }
 
+async function providerIdentityFenceProjection(client, organizationId) {
+  return rows(client,
+    `SELECT integration_account_id::text, provider, integration_type,
+            identity_kind, environment, source_provider_identity_sha256,
+            expected_external_account_id_sha256, reconnect_eligible,
+            source_database_identity::text,
+            source_database_endpoint_sha256, target_database_endpoint_sha256,
+            source_account_global_id
+     FROM operations_commerce_migration_provider_identity_fences
+     WHERE organization_id = $1::uuid
+     ORDER BY integration_account_id`, [organizationId])
+}
+
 function validateReceiptPayload(payload, workspace, manifest) {
   if (!payload || typeof payload !== 'object') fail(`${workspace.key} migration receipt payload is invalid`)
   if (payload.scriptVersion !== SCRIPT_VERSION || payload.manifestDigest !== manifest.manifestDigest) {
@@ -2514,7 +3190,16 @@ function validateReceiptPayload(payload, workspace, manifest) {
     || payload.counts.sync_outbox !== payload.suiteCrmOutbox.length
     || payload.providerConnectionsCreated !== 0
     || payload.credentialRowsCopied !== 0
-    || !SHA256.test(payload.providerIdentityFenceDigest || '')) {
+    || payload.carrierAccountSecretRowsCopied !== 0
+    || !SHA256.test(payload.providerIdentityFenceDigest || '')
+    || !SHA256.test(payload.sourceAuthorityDependencyDigest || '')
+    || !Array.isArray(payload.sourceAuthorityDependencies)
+    || digest(payload.sourceAuthorityDependencies)
+      !== payload.sourceAuthorityDependencyDigest
+    || canonicalJson(payload.sourceAuthorityDependencies)
+      !== canonicalJson(manifest.workspaces
+        ?.find((candidate) => candidate.key === workspace.key)
+        ?.sourceAuthorityDependencies || [])) {
     fail(`${workspace.key} migration receipt materialization contract is invalid`)
   }
   const outboxKeys = new Set()
@@ -2631,35 +3316,57 @@ async function assertReceiptMaterialization(client, workspace, payload) {
       fail(`${workspace.key} SuiteCRM migration outbox projection changed`)
     }
   }
-  const fences = await rows(client,
-    `SELECT integration_account_id::text, expected_external_account_id_sha256,
-            reconnect_eligible, source_database_identity::text,
-            source_database_endpoint_sha256, target_database_endpoint_sha256,
-            source_account_global_id
-     FROM operations_commerce_migration_provider_identity_fences
-     WHERE organization_id = $1::uuid
-     ORDER BY integration_account_id`, [workspace.target.organizationId])
+  const fences = await providerIdentityFenceProjection(
+    client,
+    workspace.target.organizationId,
+  )
   if (digest(fences) !== payload.providerIdentityFenceDigest) {
     fail(`${workspace.key} migrated provider identity fence materialization changed`)
   }
+  const sourceAuthorities = await targetSourceAuthorityDependencies(client, workspace)
+  if (
+    sourceAuthorities.some((dependency) => !dependency.ready)
+    || digest(sourceAuthorities) !== payload.sourceAuthorityDependencyDigest
+    || canonicalJson(sourceAuthorities)
+      !== canonicalJson(payload.sourceAuthorityDependencies)
+  ) fail(`${workspace.key} migrated source carrier authority dependency changed`)
 }
 
-async function assertPlaceholderPostState(client, workspace, expectedAccounts) {
+async function assertPlaceholderPostState(client, workspace) {
+  const expectedAccounts = workspace.source.accounts
+  const expectedCommerceAccounts = expectedAccounts.filter((account) => (
+    account.integrationType === 'commerce'
+  ))
+  const expectedCarrierAccounts = expectedAccounts.filter((account) => (
+    account.integrationType === 'carrier'
+  ))
   const accounts = await rows(client,
-    `SELECT id::text, global_id, provider, environment, status,
+    `SELECT id::text, global_id, provider, integration_type, environment, status,
             external_account_id, credential_reference,
-            commerce_credential_generation, receipt_intake_enabled
+            commerce_credential_generation, receipt_intake_enabled,
+            configuration
      FROM operations_integration_accounts
-     WHERE organization_id = $1::uuid AND integration_type = 'commerce'
-     ORDER BY provider, environment`, [workspace.target.organizationId])
-  if (accounts.length !== expectedAccounts) fail(`${workspace.key} target account count changed during apply`)
+     WHERE organization_id = $1::uuid
+       AND integration_type IN ('commerce', 'carrier')
+     ORDER BY integration_type, provider, environment`, [workspace.target.organizationId])
+  if (accounts.length !== expectedAccounts.length) {
+    fail(`${workspace.key} target account count changed during apply`)
+  }
   for (const account of accounts) {
+    const expected = expectedAccounts.find((candidate) => (
+      candidate.provider === account.provider
+      && candidate.integrationType === account.integration_type
+      && candidate.environment === account.environment
+    ))
     if (
-      account.status !== 'disabled'
+      !expected
+      || account.status !== 'disabled'
       || account.external_account_id !== null
       || account.credential_reference !== null
       || Number(account.commerce_credential_generation) !== 0
       || account.receipt_intake_enabled !== false
+      || account.configuration?.migrationRequiresCredentialRebind !== true
+      || account.configuration?.migrationRequiresProviderIdentityVerification !== true
     ) fail(`${workspace.key} target placeholder ${account.global_id} is not fail-closed`)
   }
   const controls = await rows(client,
@@ -2668,7 +3375,7 @@ async function assertPlaceholderPostState(client, workspace, expectedAccounts) {
      FROM operations_commerce_store_sync_controls
      WHERE organization_id = $1::uuid`, [workspace.target.organizationId])
   if (
-    controls.length !== expectedAccounts
+    controls.length !== expectedCommerceAccounts.length
     || controls.some((control) => (
       control.desired_state !== 'paused'
       || control.explicit_choice !== true
@@ -2683,19 +3390,50 @@ async function assertPlaceholderPostState(client, workspace, expectedAccounts) {
     fail(`${workspace.key} placeholder unexpectedly acquired an order-history policy before provider verification`)
   }
   const fences = await rows(client,
-    `SELECT provider, environment, expected_external_account_id_sha256,
+    `SELECT provider, integration_type, environment,
+            expected_external_account_id_sha256,
             reconnect_eligible, verification_state,
-            verified_external_account_id_sha256
+            verified_external_account_id_sha256, verified_carrier_account_id,
+            verified_carrier_account_identity_sha256
      FROM operations_commerce_migration_provider_identity_fences
      WHERE organization_id = $1::uuid
      ORDER BY provider, environment`, [workspace.target.organizationId])
   if (
-    fences.length !== expectedAccounts
+    fences.length !== expectedAccounts.length
     || fences.some((fence) => (
       fence.verification_state !== 'awaiting_provider_identity'
       || fence.verified_external_account_id_sha256 !== null
+      || fence.verified_carrier_account_id !== null
+      || fence.verified_carrier_account_identity_sha256 !== null
     ))
   ) fail(`${workspace.key} migrated provider identity fences are not fail-closed`)
+  const carrierPlaceholders = await rows(client,
+    `SELECT integration_account_id::text, rebind_mode, state,
+            target_account_number_fingerprint, materialized_by, materialized_at
+     FROM operations_carrier_account_migration_placeholders
+     WHERE organization_id = $1::uuid
+     ORDER BY integration_account_id`, [workspace.target.organizationId])
+  if (
+    carrierPlaceholders.length !== expectedCarrierAccounts.length
+    || carrierPlaceholders.some((placeholder) => (
+      placeholder.state !== 'awaiting_credential_rebind'
+      || placeholder.target_account_number_fingerprint !== null
+      || placeholder.materialized_by !== null
+      || placeholder.materialized_at !== null
+    ))
+  ) fail(`${workspace.key} migrated carrier account placeholders are not fail-closed`)
+  const carrierSecrets = await client.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_carrier_credentials
+        WHERE organization_id = $1::uuid) AS credentials,
+       (SELECT count(*)::integer FROM operations_carrier_accounts
+        WHERE organization_id = $1::uuid) AS accounts`,
+    [workspace.target.organizationId],
+  )
+  if (
+    carrierSecrets.rows[0].credentials !== 0
+    || carrierSecrets.rows[0].accounts !== 0
+  ) fail(`${workspace.key} carrier credentials or encrypted account material was copied`)
   const identifiers = await rows(client,
     `SELECT status, last_verified_at, match_evidence
      FROM operations_external_identifiers
@@ -2728,14 +3466,10 @@ async function recordMigrationReceipt(
   actor,
 ) {
   const eventKey = receiptEventKey(workspace, plan.sourceStateDigest)
-  const providerFences = await rows(client,
-    `SELECT integration_account_id::text, expected_external_account_id_sha256,
-            reconnect_eligible, source_database_identity::text,
-            source_database_endpoint_sha256, target_database_endpoint_sha256,
-            source_account_global_id
-     FROM operations_commerce_migration_provider_identity_fences
-     WHERE organization_id = $1::uuid
-     ORDER BY integration_account_id`, [workspace.target.organizationId])
+  const providerFences = await providerIdentityFenceProjection(
+    client,
+    workspace.target.organizationId,
+  )
   const payload = {
     scriptVersion: SCRIPT_VERSION,
     manifestDigest: plan.manifestDigest,
@@ -2765,8 +3499,11 @@ async function recordMigrationReceipt(
       byteLength: Number(image.byte_length),
     })).sort((left, right) => left.id.localeCompare(right.id)),
     providerIdentityFenceDigest: digest(providerFences),
+    sourceAuthorityDependencies: plan.sourceAuthorityDependencies,
+    sourceAuthorityDependencyDigest: plan.sourceAuthorityDependencyDigest,
     providerConnectionsCreated: 0,
     credentialRowsCopied: 0,
+    carrierAccountSecretRowsCopied: 0,
   }
   payload.receiptIdentityDigest = receiptIdentityDigest(payload)
   const result = await client.query(
@@ -2792,6 +3529,20 @@ async function applyWorkspace(target, workspace, data, workspacePlan, manifest, 
       [`${SCRIPT_VERSION}:${workspace.target.organizationId}`],
     )
     await assertScaffold(target, workspace, actor, 'target')
+    const sourceAuthorityDependencies = await targetSourceAuthorityDependencies(
+      target,
+      workspace,
+      true,
+    )
+    if (
+      sourceAuthorityDependencies.some((dependency) => !dependency.ready)
+      || digest(sourceAuthorityDependencies)
+        !== workspacePlan.sourceAuthorityDependencyDigest
+      || canonicalJson(sourceAuthorityDependencies)
+        !== canonicalJson(workspacePlan.sourceAuthorityDependencies)
+    ) {
+      fail(`${workspace.key} production source carrier authority changed after the reviewed plan`)
+    }
     const eventKey = receiptEventKey(workspace, workspacePlan.sourceStateDigest)
     const existing = await readReceipt(target, eventKey)
     if (existing) {
@@ -2813,8 +3564,16 @@ async function applyWorkspace(target, workspace, data, workspacePlan, manifest, 
     if (canonicalJson(currentConfiguration) !== canonicalJson(workspacePlan.targetConfigurationBaseline)) {
       fail(`${workspace.key} target configuration changed after the reviewed plan`)
     }
-    const beforeCounts = await targetCounts(target, workspace)
-    if (!targetIsEmpty(beforeCounts)) {
+    const beforeScope = await targetScopeAudit(target, workspace)
+    if (
+      beforeScope.classificationDigest !== workspacePlan.targetScopeClassificationDigest
+      || canonicalJson(beforeScope.classifications)
+        !== canonicalJson(workspacePlan.targetScopeClassifications)
+    ) {
+      fail(`${workspace.key} target scope classification changed after the reviewed plan`)
+    }
+    const beforeCounts = beforeScope.counts
+    if (!targetIsEmpty(beforeCounts, beforeScope.denied)) {
       fail(`${workspace.key} target contains selected rows without an exact migration receipt`)
     }
     const migrationWorkspacePlan = {
@@ -2824,10 +3583,13 @@ async function applyWorkspace(target, workspace, data, workspacePlan, manifest, 
     }
     const { inserted, mapping, suiteCrmOutbox } = await insertWorkspaceData(
       target, data, workspace, actor, migrationWorkspacePlan)
-    await assertPlaceholderPostState(target, workspace, workspace.source.accounts.length)
+    await assertPlaceholderPostState(target, workspace)
+    const commerceAccountCount = workspace.source.accounts.filter((account) => (
+      account.integrationType === 'commerce'
+    )).length
     const counts = {
       ...Object.fromEntries(Object.entries(inserted).map(([table, selected]) => [table, selected.length])),
-      operations_commerce_store_sync_controls: workspace.source.accounts.length,
+      operations_commerce_store_sync_controls: commerceAccountCount,
       operations_commerce_migration_provider_identity_fences: workspace.source.accounts.length,
       sync_outbox: suiteCrmOutbox.length,
     }
@@ -2989,7 +3751,7 @@ function safeSummary(plan) {
         availableContinuations: workspace.sourceBlockers.availableContinuations.reduce((sum, row) => sum + row.count, 0),
         unresolvedExternalEffects: workspace.sourceBlockers.unresolvedExternalEffects.length,
         actionableWebhooks: workspace.sourceBlockers.actionableWebhooks.reduce((sum, row) => sum + row.count, 0),
-        missingCutoverFences: workspace.sourceBlockers.controls.length
+        missingCutoverFences: workspace.accounts.length
           - workspace.sourceBlockers.cutoverFences.filter((fence) => (
             fence.migration_name === SCRIPT_VERSION && fence.state === 'frozen'
           )).length,
@@ -3055,7 +3817,9 @@ export async function main(
     await source.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
     await acquireSourceCutoverLocks(source)
     if (options.command === 'plan') {
-      await target.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+      // Exact transitive target-scope discovery uses an ON COMMIT DROP temp
+      // table; this transaction never mutates durable target state.
+      await target.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
       try {
         const plan = await buildPlan(source, target, options.actor, endpointBindings, workspaces)
         writePrivateJson(options.output, plan)

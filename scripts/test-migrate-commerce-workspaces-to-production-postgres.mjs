@@ -23,6 +23,7 @@ import {
   databaseEndpointFingerprint,
   digest,
   main as runMigration,
+  targetScopeAudit,
   targetCounts,
 } from './migrate-commerce-workspaces-to-production.mjs'
 
@@ -61,6 +62,19 @@ async function waitForPostgres(databaseUrl) {
 
 function databaseUrl(port, database) {
   return `postgresql://postgres:commerce_migration@127.0.0.1:${port}/${database}`
+}
+
+function carrierAddressFingerprint(address) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      line1: address.line1.trim().toLowerCase(),
+      line2: address.line2?.trim().toLowerCase() || null,
+      city: address.city.trim().toLowerCase(),
+      region: address.region.trim().toLowerCase(),
+      postalCode: address.postalCode.trim().toLowerCase().replace(/[\s-]/gu, ''),
+      countryCode: address.countryCode.trim().toUpperCase(),
+    }))
+    .digest('hex')
 }
 
 function withDatabase(connectionString, database) {
@@ -147,6 +161,27 @@ async function allocate(client, prefix) {
   )).rows[0].reference
 }
 
+async function reserveExactGlobalReference(client, referenceCode) {
+  const match = /^(g[a-z]{1,4})([0-9]{7})$/u.exec(referenceCode)
+  assert.ok(match, `Invalid exact Global ID test fixture: ${referenceCode}`)
+  const [, prefix, numberValue] = match
+  await client.query(
+    `INSERT INTO crm_reference_number_registry (number_value, allocated_at)
+     VALUES ($1, $2)`,
+    [numberValue, fixedTime],
+  )
+  await client.query(
+    `INSERT INTO crm_reference_registry (
+       reference_code, prefix, canonical_code, status, allocated_at, entity_type
+     )
+     SELECT $1, $2, $1, 'active', $3, entity_type
+     FROM global_reference_entity_types
+     WHERE prefix = $2`,
+    [referenceCode, prefix, fixedTime],
+  )
+  return referenceCode
+}
+
 async function seedActor(client) {
   await client.query(
     `INSERT INTO app_users (
@@ -156,9 +191,11 @@ async function seedActor(client) {
   )
 }
 
-async function seedScaffold(client, label, primary = false) {
+async function seedScaffold(client, label, primary = false, exactReference = null) {
   const organizationId = randomUUID()
-  const organizationReference = await allocate(client, 'ga')
+  const organizationReference = exactReference
+    ? await reserveExactGlobalReference(client, exactReference)
+    : await allocate(client, 'ga')
   const pipelineId = randomUUID()
   const boards = [randomUUID(), randomUUID()]
   await client.query(
@@ -358,6 +395,7 @@ async function seedSourceDomain(client, scaffold, index, reconnectEligible) {
       id: integrationAccountId,
       globalId: integrationAccountGlobalId,
       provider: 'shopify',
+      integrationType: 'commerce',
       environment: 'production',
       displayName: `Synthetic store ${index}`,
       externalAccountIdSha256,
@@ -371,10 +409,185 @@ async function seedSourceDomain(client, scaffold, index, reconnectEligible) {
   }
 }
 
+async function seedCarrierConnection(client, scaffold, options) {
+  const integrationAccountId = randomUUID()
+  const integrationAccountGlobalId = options.integrationGlobalId
+    ? await reserveExactGlobalReference(client, options.integrationGlobalId)
+    : await allocate(client, 'gia')
+  const carrierAccountId = randomUUID()
+  const carrierAccountGlobalId = options.carrierAccountGlobalId
+    ? await reserveExactGlobalReference(client, options.carrierAccountGlobalId)
+    : await allocate(client, 'gac')
+  const address = options.address || {
+    line1: '101 Jegs Place',
+    line2: null,
+    city: 'Mocksville',
+    region: 'NC',
+    postalCode: '27028',
+    countryCode: 'US',
+  }
+  const addressFingerprint = carrierAddressFingerprint(address)
+  const accountNumberFingerprint = digest({
+    organizationId: scaffold.organizationId,
+    provider: options.provider,
+    environment: options.environment,
+    accountNumberLastFour: options.accountNumberLastFour,
+    fixture: options.displayName,
+  })
+  const configuration = options.configuration || {
+    authMode: 'oauth_client_credentials',
+    accountOwnerType: 'workspace',
+    allowedCapabilities: options.environment === 'sandbox'
+      ? ['sandbox_rate', 'sandbox_label']
+      : ['production_rate', 'production_label'],
+  }
+  await client.query(
+    `INSERT INTO operations_integration_accounts (
+       id, global_id, organization_id, provider, integration_type,
+       environment, external_account_id, display_name, status,
+       configuration, commerce_credential_generation,
+       created_by, updated_by, created_at, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, 'carrier', $5, NULL, $6, $7,
+       $8::jsonb, 0, $9, $9, $10, $10
+     )`,
+    [integrationAccountId, integrationAccountGlobalId, scaffold.organizationId,
+      options.provider, options.environment, options.displayName,
+      options.status || 'active', JSON.stringify(configuration),
+      CONFIRMED_OWNER_EMAIL, fixedTime],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_credentials (
+       organization_id, integration_account_id,
+       credential_ciphertext, credential_iv, credential_tag,
+       credential_version, client_id_last_four, account_number_last_four,
+       verification_status, verified_at, created_by, updated_by,
+       created_at, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, 1, 'test', $6,
+       $7, CASE WHEN $7 = 'verified' THEN $9::timestamptz ELSE NULL END,
+       $8, $8, $9, $9
+     )`,
+    [scaffold.organizationId, integrationAccountId,
+      Buffer.from(`credential-${options.displayName}`), Buffer.alloc(12, 6),
+      Buffer.alloc(16, 7), options.accountNumberLastFour,
+      options.credentialVerification || 'verified', CONFIRMED_OWNER_EMAIL, fixedTime],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_accounts (
+       id, global_id, organization_id, integration_account_id,
+       display_name, sender_name,
+       account_number_ciphertext, account_number_iv, account_number_tag,
+       encryption_version, account_number_last_four, account_number_fingerprint,
+       registered_address, registered_address_fingerprint,
+       address_verification, allow_sender_billing, allow_recipient_billing,
+       allow_third_party_billing, status, created_by, updated_by,
+       created_at, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, 'fixture-ciphertext', 'fixture-iv',
+       'fixture-tag', 1, $7, $8, $9::jsonb, $10,
+       'operator_attested', true, true, false, 'active', $11, $11, $12, $12
+     )`,
+    [carrierAccountId, carrierAccountGlobalId, scaffold.organizationId,
+      integrationAccountId, options.accountDisplayName || options.displayName,
+      options.senderName || 'Fixture Sender', options.accountNumberLastFour,
+      accountNumberFingerprint, JSON.stringify(address), addressFingerprint,
+      CONFIRMED_OWNER_EMAIL, fixedTime],
+  )
+  if (options.cutover !== false) {
+    await client.query(
+      `INSERT INTO operations_commerce_workspace_migration_cutover_fences (
+         organization_id, integration_account_id, migration_name, state,
+         frozen_by, frozen_at, reason, created_at, updated_at
+       ) VALUES ($1, $2, $3, 'frozen', $4, $5, $6, $5, $5)`,
+      [scaffold.organizationId, integrationAccountId, SCRIPT_VERSION,
+        CONFIRMED_OWNER_EMAIL, fixedTime, 'Disposable carrier acceptance cutover'],
+    )
+  }
+  return {
+    id: integrationAccountId,
+    globalId: integrationAccountGlobalId,
+    provider: options.provider,
+    integrationType: 'carrier',
+    environment: options.environment,
+    displayName: options.displayName,
+    reconnectEligible: true,
+    carrierAccount: {
+      id: carrierAccountId,
+      globalId: carrierAccountGlobalId,
+      displayName: options.accountDisplayName || options.displayName,
+      senderName: options.senderName || 'Fixture Sender',
+      sourceAccountNumberFingerprint: accountNumberFingerprint,
+      sourceAddressFingerprint: addressFingerprint,
+    },
+    accountNumberLastFour: options.accountNumberLastFour,
+    address,
+  }
+}
+
 async function seedWorkspacePair(source, target, index, reconnectEligible) {
   const sourceScaffold = await seedScaffold(source, `source-${index}`, index === 1)
   const targetScaffold = await seedScaffold(target, `target-${index}`, index === 1)
   const domain = await seedSourceDomain(source, sourceScaffold, index, reconnectEligible)
+  const carrierAccounts = []
+  let targetSourceAuthority = null
+  if (index === 1) {
+    const authorityScaffold = await seedScaffold(
+      target,
+      'target-source-authority',
+      false,
+      'ga5122758',
+    )
+    const authority = await seedCarrierConnection(target, authorityScaffold, {
+      provider: 'fedex_rest',
+      environment: 'sandbox',
+      integrationGlobalId: 'gia7335302',
+      carrierAccountGlobalId: 'gac2368052',
+      displayName: 'Existing verified sandbox source authority',
+      accountDisplayName: 'Existing sandbox source shipper',
+      senderName: 'Source Authority',
+      accountNumberLastFour: '1073',
+      cutover: false,
+    })
+    targetSourceAuthority = { scaffold: authorityScaffold, account: authority }
+    const directCarrier = await seedCarrierConnection(source, sourceScaffold, {
+      provider: 'ups_rest',
+      environment: 'production',
+      displayName: 'Synthetic direct UPS production',
+      accountDisplayName: 'Synthetic direct UPS shipper',
+      senderName: 'Synthetic Warehouse',
+      accountNumberLastFour: '3574',
+    })
+    const managedCarrier = await seedCarrierConnection(source, sourceScaffold, {
+      provider: 'fedex_rest',
+      environment: 'sandbox',
+      displayName: 'Synthetic source-managed FedEx sandbox',
+      accountDisplayName: 'Synthetic delegated FedEx shipper',
+      senderName: 'Synthetic Warehouse',
+      accountNumberLastFour: authority.accountNumberLastFour,
+      address: authority.address,
+      configuration: {
+        authMode: 'oauth_client_credentials',
+        accountOwnerType: 'delegated_source',
+        allowedCapabilities: ['sandbox_rate', 'sandbox_label'],
+        managedBy: 'ag-alchemy-episcs-sandbox-rating-delegation',
+        authorizationScope: 'sandbox_fulfillment_diagnostic',
+        credentialRevealAllowed: false,
+        delegatedFromOrganizationReferenceCode: 'ga0000000',
+        sourceIntegrationGlobalId: 'gia0000000',
+        sourceCarrierAccountGlobalId: 'gac0000000',
+        senderOriginWarehouseGlobalId: domain.warehouseGlobalId,
+      },
+    })
+    managedCarrier.sourceAuthority = {
+      organizationReference: authorityScaffold.organizationReference,
+      integrationGlobalId: authority.globalId,
+      carrierAccountGlobalId: authority.carrierAccount.globalId,
+      accountNumberLastFour: authority.accountNumberLastFour,
+      registeredAddressLine1: authority.address.line1,
+    }
+    carrierAccounts.push(directCarrier, managedCarrier)
+  }
   return {
     workspace: {
       key: `synthetic-${index}`,
@@ -387,7 +600,8 @@ async function seedWorkspacePair(source, target, index, reconnectEligible) {
         excludedOrganizationReferences: [],
         excludedContactReferences: [],
         excludedWarehouseGlobalIds: [],
-        accounts: [domain.account],
+        excludedAccounts: [],
+        accounts: [domain.account, ...carrierAccounts],
       },
       target: {
         organizationId: targetScaffold.organizationId,
@@ -401,6 +615,8 @@ async function seedWorkspacePair(source, target, index, reconnectEligible) {
     sourceScaffold,
     targetScaffold,
     domain,
+    carrierAccounts,
+    targetSourceAuthority,
   }
 }
 
@@ -599,6 +815,131 @@ async function count(client, sql, params = []) {
   return Number((await client.query(sql, params)).rows[0].count)
 }
 
+async function materializeTargetCarrier(client, fixture, migrationResult, sourceAccount) {
+  const integrationAccountId = migrationResult.mapping.operations_integration_accounts[
+    sourceAccount.id
+  ].id
+  const placeholderIdentity = migrationResult.mapping[
+    'operations_carrier_account_migration_placeholders'
+  ][sourceAccount.carrierAccount.id]
+  const targetFingerprint = digest({
+    organizationId: fixture.targetScaffold.organizationId,
+    integrationAccountId,
+    sourceGlobalId: sourceAccount.globalId,
+    targetReauthentication: true,
+  })
+  const placeholder = (await client.query(
+    `SELECT display_name, sender_name, source_account_number_last_four,
+            source_registered_address_fingerprint, rebind_mode
+     FROM operations_carrier_account_migration_placeholders
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [fixture.targetScaffold.organizationId, integrationAccountId],
+  )).rows[0]
+  assert.ok(placeholder)
+
+  await assert.rejects(
+    client.query(
+      `UPDATE operations_integration_accounts SET status = 'active'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.targetScaffold.organizationId, integrationAccountId],
+    ),
+    /provider and shipper identity is not verified/iu,
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_credentials (
+       organization_id, integration_account_id,
+       credential_ciphertext, credential_iv, credential_tag,
+       credential_version, client_id_last_four, account_number_last_four,
+       verification_status, verified_at, created_by, updated_by,
+       created_at, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, 1, 'new1', NULL,
+       'verified', $7, $6, $6, $7, $7
+     )`,
+    [fixture.targetScaffold.organizationId, integrationAccountId,
+      Buffer.from(`fresh-target-credential-${sourceAccount.globalId}`),
+      Buffer.alloc(12, 8), Buffer.alloc(16, 9),
+      CONFIRMED_OWNER_EMAIL, fixedTime],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_accounts (
+       id, global_id, organization_id, integration_account_id,
+       display_name, sender_name,
+       account_number_ciphertext, account_number_iv, account_number_tag,
+       encryption_version, account_number_last_four, account_number_fingerprint,
+       registered_address, registered_address_fingerprint,
+       address_verification, allow_sender_billing, allow_recipient_billing,
+       allow_third_party_billing, status, created_by, updated_by,
+       created_at, updated_at
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6,
+       'fresh-target-account-ciphertext', 'fresh-target-account-iv',
+       'fresh-target-account-tag', 1, $7, $8, $9::jsonb, $10,
+       'operator_attested', true, false, false, 'active', $11, $11, $12, $12
+     )`,
+    [placeholderIdentity.id, placeholderIdentity.reference,
+      fixture.targetScaffold.organizationId, integrationAccountId,
+      placeholder.display_name, placeholder.sender_name,
+      placeholder.source_account_number_last_four, targetFingerprint,
+      JSON.stringify(sourceAccount.address),
+      placeholder.source_registered_address_fingerprint,
+      CONFIRMED_OWNER_EMAIL, fixedTime],
+  )
+  await assert.rejects(
+    client.query(
+      `UPDATE operations_carrier_account_migration_placeholders
+       SET state = 'materialized',
+           target_account_number_fingerprint = $3,
+           materialized_by = $4,
+           materialized_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [fixture.targetScaffold.organizationId, integrationAccountId,
+        digest('wrong-target-carrier-fingerprint'), CONFIRMED_OWNER_EMAIL],
+    ),
+    /verified target credential and exact shipper identity/iu,
+  )
+  await client.query(
+    `UPDATE operations_carrier_account_migration_placeholders
+     SET state = 'materialized',
+         target_account_number_fingerprint = $3,
+         materialized_by = $4,
+         materialized_at = clock_timestamp()
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [fixture.targetScaffold.organizationId, integrationAccountId,
+      targetFingerprint, CONFIRMED_OWNER_EMAIL],
+  )
+  await client.query(
+    `UPDATE operations_commerce_migration_provider_identity_fences
+     SET verification_state = 'verified',
+         verified_carrier_account_id = $3::uuid,
+         verified_carrier_account_identity_sha256 = $4,
+         verified_by = $5,
+         verified_at = clock_timestamp()
+     WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+    [fixture.targetScaffold.organizationId, integrationAccountId,
+      placeholderIdentity.id, targetFingerprint, CONFIRMED_OWNER_EMAIL],
+  )
+  const capabilities = sourceAccount.sourceAuthority
+    ? ['sandbox_rate', 'sandbox_label']
+    : sourceAccount.environment === 'production'
+      ? ['production_rate', 'production_label']
+      : ['sandbox_rate', 'sandbox_label']
+  const configurationPatch = sourceAccount.sourceAuthority
+    ? { migrationSourceAuthorityVerified: true, allowedCapabilities: capabilities }
+    : { allowedCapabilities: capabilities }
+  await client.query(
+    `UPDATE operations_integration_accounts
+     SET status = 'active',
+         credential_reference = $3,
+         configuration = configuration || $4::jsonb
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.targetScaffold.organizationId, integrationAccountId,
+      `carrier-credential:${integrationAccountId}:v1`,
+      JSON.stringify(configurationPatch)],
+  )
+  return { integrationAccountId, placeholderIdentity, targetFingerprint }
+}
+
 async function runAcceptance(sourceUrl, targetUrl, directory) {
   process.env.PGSSLMODE = 'disable'
   const environment = migrationEnvironment(sourceUrl, targetUrl)
@@ -651,6 +992,91 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
       'DELETE FROM operations_migration_scope_probe WHERE id = $1',
       [organizationScopedProbeId],
     )
+    await target.query(
+      `CREATE TABLE operations_migration_indirect_parent (
+         id uuid PRIMARY KEY,
+         organization_id uuid NOT NULL
+           REFERENCES workspace_organizations(id)
+       )`,
+    )
+    for (let depth = 1; depth <= 10; depth += 1) {
+      const table = `operations_migration_indirect_${String(depth).padStart(2, '0')}`
+      const parent = depth === 1
+        ? 'operations_migration_indirect_parent'
+        : `operations_migration_indirect_${String(depth - 1).padStart(2, '0')}`
+      await target.query(
+        `CREATE TABLE ${table} (
+           id uuid PRIMARY KEY,
+           parent_id uuid NOT NULL REFERENCES ${parent}(id)
+         )`,
+      )
+    }
+    const indirectParentId = randomUUID()
+    await target.query(
+      `INSERT INTO operations_migration_indirect_parent (id, organization_id)
+       VALUES ($1, $2)`,
+      [
+        indirectParentId,
+        fixtures[0].targetScaffold.organizationId,
+      ],
+    )
+    let indirectRowId = indirectParentId
+    for (let depth = 1; depth <= 10; depth += 1) {
+      const nextId = randomUUID()
+      const table = `operations_migration_indirect_${String(depth).padStart(2, '0')}`
+      await target.query(
+        `INSERT INTO ${table} (id, parent_id) VALUES ($1, $2)`,
+        [nextId, indirectRowId],
+      )
+      indirectRowId = nextId
+    }
+    const indirectScope = await targetScopeAudit(target, fixtures[0].workspace)
+    assert.equal(indirectScope.counts.operations_migration_indirect_10, 1)
+    assert.equal(indirectScope.classifications.find((item) => (
+      item.table === 'operations_migration_indirect_10'
+    ))?.strategy, 'indirect')
+    for (let depth = 10; depth >= 1; depth -= 1) {
+      const table = `operations_migration_indirect_${String(depth).padStart(2, '0')}`
+      await target.query(`DROP TABLE ${table}`)
+    }
+    await target.query('DROP TABLE operations_migration_indirect_parent')
+
+    const jsonScopeOutbox = await target.query(
+      `INSERT INTO sync_outbox (
+         aggregate_type, aggregate_id, operation, target_system, payload,
+         status, idempotency_key
+       ) VALUES (
+         'migration_scope_probe', $1, 'scope_probe', 'suitecrm', $2::jsonb,
+         'queued', $3
+       ) RETURNING id::text`,
+      [
+        fixtures[0].targetScaffold.organizationId,
+        JSON.stringify({
+          organizationId: fixtures[0].targetScaffold.organizationId,
+        }),
+        `migration-scope-probe:${randomUUID()}`,
+      ],
+    )
+    const jsonScope = await targetScopeAudit(target, fixtures[0].workspace)
+    assert.equal(jsonScope.counts.sync_outbox, 1)
+    assert.equal(jsonScope.classifications.find((item) => (
+      item.table === 'sync_outbox'
+    ))?.strategy, 'explicit-json')
+    await target.query('DELETE FROM sync_outbox WHERE id = $1', [jsonScopeOutbox.rows[0].id])
+
+    await target.query(
+      `CREATE TABLE operations_migration_unclassifiable_probe (
+         id uuid PRIMARY KEY,
+         opaque_scope text NOT NULL
+       )`,
+    )
+    const deniedScope = await targetScopeAudit(target, fixtures[0].workspace)
+    assert.ok(deniedScope.denied.includes('operations_migration_unclassifiable_probe'))
+    await assert.rejects(
+      targetCounts(target, fixtures[0].workspace),
+      /classification denied candidate tables.*operations_migration_unclassifiable_probe/iu,
+    )
+    await target.query('DROP TABLE operations_migration_unclassifiable_probe')
     const unexpectedTargetId = await seedTemporaryTargetRow(target, fixtures[0])
     const blockedPlanPath = join(directory, 'blocked-plan.json')
     const blockedPlan = await runMigration(
@@ -694,10 +1120,73 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
     await clearSourceBlockers(source, fixtures[0])
     await target.query('DELETE FROM operations_warehouses WHERE id = $1', [unexpectedTargetId])
 
+    await target.query(
+      `UPDATE operations_integration_accounts SET status = 'disabled'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixtures[0].targetSourceAuthority.scaffold.organizationId,
+        fixtures[0].targetSourceAuthority.account.id],
+    )
+    const authorityBlockedPlanPath = join(directory, 'authority-blocked-plan.json')
+    const authorityBlockedPlan = await runMigration(
+      planArguments(authorityBlockedPlanPath),
+      environment,
+      runtime,
+    )
+    assert.equal(authorityBlockedPlan.applyReady, false)
+    assert.equal(
+      authorityBlockedPlan.workspaces[0].sourceAuthorityDependencies[0].ready,
+      false,
+    )
+    assert.match(
+      authorityBlockedPlan.workspaces[0].sourceAuthorityDependencies[0].blocker,
+      /source carrier authority is absent, inactive, unverified, or identity-mismatched/iu,
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts SET status = 'active'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixtures[0].targetSourceAuthority.scaffold.organizationId,
+        fixtures[0].targetSourceAuthority.account.id],
+    )
+
     const planPath = join(directory, 'ready-plan.json')
     const plan = await runMigration(planArguments(planPath), environment, runtime)
     assert.equal(plan.applyReady, true)
     assert.ok(plan.workspaces.every((workspace) => workspace.targetEmpty && workspace.ready))
+    assert.equal(plan.workspaces[0].accounts.length, 3)
+    assert.equal(plan.workspaces[0].sourceAuthorityDependencies.length, 1)
+    assert.deepEqual(
+      plan.workspaces[0].sourceAuthorityDependencies[0],
+      {
+        targetIntegrationSourceGlobalId: fixtures[0].carrierAccounts[1].globalId,
+        provider: 'fedex_rest',
+        environment: 'sandbox',
+        requiredOrganizationReference: 'ga5122758',
+        requiredIntegrationGlobalId: 'gia7335302',
+        requiredCarrierAccountGlobalId: 'gac2368052',
+        requiredAccountNumberLastFour: '1073',
+        requiredRegisteredAddressFingerprint:
+          fixtures[0].carrierAccounts[1].carrierAccount.sourceAddressFingerprint,
+        authorityOrganizationId:
+          fixtures[0].targetSourceAuthority.scaffold.organizationId,
+        authorityIntegrationAccountId:
+          fixtures[0].targetSourceAuthority.account.id,
+        authorityCarrierAccountId:
+          fixtures[0].targetSourceAuthority.account.carrierAccount.id,
+        ready: true,
+        blocker: null,
+      },
+    )
+    for (const carrierPlan of plan.workspaces[0].accounts.filter((account) => (
+      account.integrationType === 'carrier'
+    ))) {
+      assert.deepEqual(carrierPlan.safeConfiguration.allowedCapabilities, [])
+      assert.equal(carrierPlan.safeConfiguration.migrationRequiresCredentialRebind, true)
+      assert.equal(
+        carrierPlan.safeConfiguration.migrationRequiresProviderIdentityVerification,
+        true,
+      )
+      assert.equal(JSON.stringify(carrierPlan).includes('credential-ciphertext'), false)
+    }
     assertPrivateFile(planPath)
 
     await target.query(
@@ -844,6 +1333,124 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
         [fixture.targetScaffold.organizationId]), 0)
     }
 
+    const carrierFixture = fixtures[0]
+    const carrierMigrationResult = mapping.results[0]
+    assert.equal(await count(target,
+      `SELECT count(*) FROM operations_integration_accounts
+       WHERE organization_id = $1 AND integration_type = 'carrier'`,
+      [carrierFixture.targetScaffold.organizationId]), 2)
+    assert.equal(await count(target,
+      `SELECT count(*) FROM operations_commerce_store_sync_controls
+       WHERE organization_id = $1`,
+      [carrierFixture.targetScaffold.organizationId]), 1)
+    assert.equal(await count(target,
+      `SELECT count(*) FROM operations_carrier_account_migration_placeholders
+       WHERE organization_id = $1 AND state = 'awaiting_credential_rebind'`,
+      [carrierFixture.targetScaffold.organizationId]), 2)
+    assert.equal(await count(target,
+      `SELECT count(*) FROM operations_carrier_credentials
+       WHERE organization_id = $1`,
+      [carrierFixture.targetScaffold.organizationId]), 0)
+    assert.equal(await count(target,
+      `SELECT count(*) FROM operations_carrier_accounts
+       WHERE organization_id = $1`,
+      [carrierFixture.targetScaffold.organizationId]), 0)
+    const authorityBefore = (await target.query(
+      `SELECT integration.status AS integration_status,
+              credential.credential_fingerprint,
+              carrier_account.account_number_fingerprint,
+              carrier_account.registered_address_fingerprint
+       FROM operations_integration_accounts integration
+       JOIN operations_carrier_credentials credential
+         ON credential.organization_id = integration.organization_id
+        AND credential.integration_account_id = integration.id
+       JOIN operations_carrier_accounts carrier_account
+         ON carrier_account.organization_id = integration.organization_id
+        AND carrier_account.integration_account_id = integration.id
+       WHERE integration.organization_id = $1::uuid AND integration.id = $2::uuid`,
+      [carrierFixture.targetSourceAuthority.scaffold.organizationId,
+        carrierFixture.targetSourceAuthority.account.id],
+    )).rows[0]
+    const directCarrier = await materializeTargetCarrier(
+      target,
+      carrierFixture,
+      carrierMigrationResult,
+      carrierFixture.carrierAccounts[0],
+    )
+    const managedCarrier = await materializeTargetCarrier(
+      target,
+      carrierFixture,
+      carrierMigrationResult,
+      carrierFixture.carrierAccounts[1],
+    )
+    assert.equal((await target.query(
+      `SELECT operations_shopify_carrier_configuration_allows_rating(
+                configuration, environment
+              ) AS allowed
+       FROM operations_integration_accounts WHERE id = $1::uuid`,
+      [managedCarrier.integrationAccountId],
+    )).rows[0].allowed, true)
+    assert.equal((await target.query(
+      `SELECT operations_shopify_carrier_configuration_allows_rating(
+                configuration, environment
+              ) AS allowed
+       FROM operations_integration_accounts WHERE id = $1::uuid`,
+      [directCarrier.integrationAccountId],
+    )).rows[0].allowed, true)
+    const authorityAfter = (await target.query(
+      `SELECT integration.status AS integration_status,
+              credential.credential_fingerprint,
+              carrier_account.account_number_fingerprint,
+              carrier_account.registered_address_fingerprint
+       FROM operations_integration_accounts integration
+       JOIN operations_carrier_credentials credential
+         ON credential.organization_id = integration.organization_id
+        AND credential.integration_account_id = integration.id
+       JOIN operations_carrier_accounts carrier_account
+         ON carrier_account.organization_id = integration.organization_id
+        AND carrier_account.integration_account_id = integration.id
+       WHERE integration.organization_id = $1::uuid AND integration.id = $2::uuid`,
+      [carrierFixture.targetSourceAuthority.scaffold.organizationId,
+        carrierFixture.targetSourceAuthority.account.id],
+    )).rows[0]
+    assert.deepEqual(authorityAfter, authorityBefore)
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_integration_accounts SET status = 'disabled'
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [carrierFixture.targetSourceAuthority.scaffold.organizationId,
+          carrierFixture.targetSourceAuthority.account.id],
+      ),
+      /source integration authority is immutable/iu,
+    )
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_carrier_credentials
+         SET verification_status = 'failed', verified_at = NULL
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [carrierFixture.targetSourceAuthority.scaffold.organizationId,
+          carrierFixture.targetSourceAuthority.account.id],
+      ),
+      /source credential authority must remain verified/iu,
+    )
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_carrier_accounts SET allow_sender_billing = false
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [carrierFixture.targetSourceAuthority.scaffold.organizationId,
+          carrierFixture.targetSourceAuthority.account.carrierAccount.id],
+      ),
+      /source carrier authority is immutable/iu,
+    )
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_carrier_accounts SET account_number_last_four = '9999'
+         WHERE id = $1::uuid`,
+        [managedCarrier.placeholderIdentity.id],
+      ),
+      /verified carrier shipper identity is immutable/iu,
+    )
+
     const firstResult = mapping.results[0]
     const firstFixture = fixtures[0]
     const firstTargetAccountId = firstResult.mapping.operations_integration_accounts[
@@ -876,7 +1483,7 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
          WHERE id = $1`,
         [firstTargetAccountId],
       ),
-      /provider and environment are immutable/iu,
+      /provider, integration type, and environment are immutable/iu,
     )
     await target.query('BEGIN')
     try {
@@ -929,7 +1536,7 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
         [secondFixture.targetScaffold.organizationId, secondTargetAccountId,
           CONFIRMED_OWNER_EMAIL],
       ),
-      /verification_valid|did not match/iu,
+      /verification_valid|did not match|not eligible for reconnect/iu,
     )
 
     const retryMapping = join(directory, 'retry-mapping.json')

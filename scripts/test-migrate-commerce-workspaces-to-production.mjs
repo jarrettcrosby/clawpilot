@@ -144,11 +144,15 @@ assert.throws(() => topologicalRows([
 ], 'parent_id', 'fixture'), /unselected parent/u)
 
 const emptyDataset = Object.fromEntries(DATASET_ORDER.map((table) => [table, []]))
-assert.equal(validateDatasetClosure(emptyDataset, WORKSPACES[0]), true)
+const emptyWorkspace = {
+  ...WORKSPACES[0],
+  source: { ...WORKSPACES[0].source, accounts: [] },
+}
+assert.equal(validateDatasetClosure(emptyDataset, emptyWorkspace), true)
 assert.throws(() => validateDatasetClosure({
   ...emptyDataset,
   crm_products: [{ id: 'product', category_id: 'missing' }],
-}, WORKSPACES[0]), /crm_products\.category_id references an unselected row/u)
+}, emptyWorkspace), /crm_products\.category_id references an unselected row/u)
 
 const placeholder = buildCredentialFreePlaceholder({
   integration_type: 'commerce',
@@ -164,11 +168,47 @@ const placeholder = buildCredentialFreePlaceholder({
   organizationId: '62140295-6680-4102-8f6c-e7bf8d001f39',
 }, CONFIRMED_OWNER_EMAIL)
 assert.equal(placeholder.status, 'disabled')
-assert.deepEqual(placeholder.configuration, {})
+assert.deepEqual(placeholder.configuration, {
+  shopDomain: 'must-not-copy.example',
+  migrationRequiresCredentialRebind: true,
+  migrationRequiresProviderIdentityVerification: true,
+})
 assert.equal(placeholder.external_account_id, null)
 assert.equal(placeholder.credential_reference, null)
 assert.equal(placeholder.commerce_credential_generation, 0)
 assert.equal(placeholder.receipt_intake_enabled, false)
+
+const carrierPlaceholder = buildCredentialFreePlaceholder({
+  integration_type: 'carrier',
+  provider: 'ups_rest',
+  environment: 'production',
+  display_name: 'UPS production',
+  configuration: {
+    authMode: 'oauth_client_credentials',
+    accountOwnerType: 'customer_owned',
+    allowedCapabilities: ['production_rate', 'production_label'],
+    accessToken: 'must-not-copy',
+    providerCursor: 'must-not-copy',
+    webhookSecret: 'must-not-copy',
+  },
+  external_account_id: 'must-not-copy',
+  credential_reference: 'must-not-copy',
+}, {
+  id: '4de8e0a7-9b39-4be2-8b53-ce07a421cc18',
+  globalId: 'gia0000002',
+  organizationId: '62140295-6680-4102-8f6c-e7bf8d001f39',
+}, CONFIRMED_OWNER_EMAIL)
+assert.equal(carrierPlaceholder.integration_type, 'carrier')
+assert.deepEqual(carrierPlaceholder.configuration, {
+  accountOwnerType: 'customer_owned',
+  authMode: 'oauth_client_credentials',
+  allowedCapabilities: [],
+  rebindRequestedCapabilities: ['production_label', 'production_rate'],
+  migrationRequiresCredentialRebind: true,
+  migrationRequiresProviderIdentityVerification: true,
+})
+assert.equal(carrierPlaceholder.external_account_id, null)
+assert.equal(carrierPlaceholder.credential_reference, null)
 
 assert.deepEqual(WORKSPACES.map((workspace) => workspace.key), [
   'ag-alchemy', 'french-florist', 'test-pro-bakery-bites',
@@ -179,15 +219,49 @@ assert.deepEqual(WORKSPACES.map((workspace) => workspace.target.organizationId),
   'c8fcf491-cf8c-469a-b03c-0026a762752c',
 ])
 const accounts = WORKSPACES.flatMap((workspace) => workspace.source.accounts)
-assert.equal(accounts.length, 4)
-assert.equal(accounts.filter((account) => account.environment === 'sandbox').length, 2)
+assert.equal(accounts.length, 8)
+assert.equal(accounts.filter((account) => account.integrationType === 'commerce').length, 4)
+assert.equal(accounts.filter((account) => account.integrationType === 'carrier').length, 4)
+assert.equal(accounts.filter((account) => account.environment === 'sandbox').length, 5)
+assert.ok(accounts.every((account) => account.reconnectEligible === true))
 assert.ok(accounts
-  .filter((account) => account.environment === 'sandbox')
-  .every((account) => account.reconnectEligible === false))
-assert.ok(accounts
-  .filter((account) => account.environment === 'production')
-  .every((account) => account.reconnectEligible === true))
-assert.ok(accounts.every((account) => /^[a-f0-9]{64}$/u.test(account.externalAccountIdSha256)))
+  .filter((account) => account.integrationType === 'commerce')
+  .every((account) => /^[a-f0-9]{64}$/u.test(account.externalAccountIdSha256)))
+assert.deepEqual(
+  WORKSPACES[0].source.excludedAccounts.map((account) => account.globalId),
+  ['gia9iduqbikp5et'],
+)
+assert.deepEqual(
+  accounts.filter((account) => account.sourceAuthority).map((account) => ({
+    globalId: account.globalId,
+    provider: account.provider,
+    sourceAuthority: account.sourceAuthority,
+  })),
+  [
+    {
+      globalId: 'gia3106288',
+      provider: 'fedex_rest',
+      sourceAuthority: {
+        organizationReference: 'ga5122758',
+        integrationGlobalId: 'gia7335302',
+        carrierAccountGlobalId: 'gac2368052',
+        accountNumberLastFour: '1073',
+        registeredAddressLine1: '101 Jegs Place',
+      },
+    },
+    {
+      globalId: 'gia5910262',
+      provider: 'ups_rest',
+      sourceAuthority: {
+        organizationReference: 'ga5122758',
+        integrationGlobalId: 'gia2057284',
+        carrierAccountGlobalId: 'gac5139730',
+        accountNumberLastFour: '3574',
+        registeredAddressLine1: '101 Jegs Place',
+      },
+    },
+  ],
+)
 
 const imageBytes = Buffer.from('representative image bytes')
 const projected = sourceSnapshotProjection(Object.fromEntries(
@@ -234,6 +308,10 @@ for (const forbiddenSql of [
   'FROM operations_commerce_sync_cursors',
   'FROM operations_orders',
   'FROM sync_outbox',
+  'FROM operations_carrier_credentials',
+  'account_number_ciphertext',
+  'credential_ciphertext',
+  'registered_address,',
 ]) assert.equal(sourceSelection.includes(forbiddenSql), false, `forbidden source selection: ${forbiddenSql}`)
 assert.doesNotMatch(source, /\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b/iu)
 
@@ -288,23 +366,49 @@ for (const required of [
   'credential_reference: null',
   'external_account_id: null',
   'receipt_intake_enabled: false',
+  'sourceAuthorityDependencies',
+  'operations_carrier_account_migration_placeholders',
+  'source_account_number_last_four',
+  'carrierAccountSecretRowsCopied: 0',
 ]) assert.ok(source.includes(required), `missing fail-closed contract: ${required}`)
 
-const safetyMigration = fs.readFileSync(
+const safetyMigration = [fs.readFileSync(
   new URL('../db/migrations/0353_operations_commerce_workspace_migration_safety.sql', import.meta.url),
   'utf8',
-)
+), fs.readFileSync(
+  new URL('../db/migrations/0354_operations_sales_shipping_workspace_migration_safety.sql', import.meta.url),
+  'utf8',
+)].join('\n')
 for (const required of [
   'operations_commerce_workspace_migration_cutover_fences',
   'operations_commerce_migration_provider_identity_fences',
-  'expected_external_account_id_sha256 text NOT NULL',
+  'operations_carrier_account_migration_placeholders',
+  'source_provider_identity_sha256 text NOT NULL',
+  "rebind_mode IN ('direct_credential', 'source_authority')",
+  'required_source_authority_integration_account_id',
   'source_database_endpoint_sha256 text NOT NULL',
   'target_database_endpoint_sha256 text NOT NULL',
   'Migrated provider identity fences are immutable',
   'Migrated commerce account provider identity is not verified',
+  'Migrated carrier account provider and shipper identity is not verified',
+  'Migrated source-managed carrier requires its verified production source authority',
+  'Active migrated delegation source credential authority must remain verified',
+  'migrationSourceAuthorityVerified',
   'Commerce workspace migration receipts are immutable',
 ]) assert.ok(safetyMigration.includes(required), `missing 0353 safety contract: ${required}`)
 assert.doesNotMatch(safetyMigration, /\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b/iu)
+
+const carrierPersistence = fs.readFileSync(
+  new URL('../app_src/lib/persistence/carrierIntegrations.ts', import.meta.url),
+  'utf8',
+)
+for (const required of [
+  'FROM operations_carrier_account_migration_placeholders',
+  "state = 'materialized'",
+  'verified_carrier_account_id',
+  'verified_carrier_account_identity_sha256',
+  'The carrier account does not match the identity approved for this migrated workspace',
+]) assert.ok(carrierPersistence.includes(required), `missing carrier rebind contract: ${required}`)
 
 const commercePersistence = fs.readFileSync(
   new URL('../app_src/lib/persistence/commerceIntegrations.ts', import.meta.url),
