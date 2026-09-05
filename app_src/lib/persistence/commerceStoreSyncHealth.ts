@@ -471,13 +471,30 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
           )
         )
     ) OPERATOR(pg_catalog.=)
-      'a28138f13bf3b2eaf60624e9efb6e7fff669032bcf27043adff648b2d82528da'
+      CASE WHEN EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0350_operations_commerce_order_history_exclusions.sql'
+          AND checksum =
+            '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+      ) THEN
+        '781547ec55717096d63670bc1e72b5b14705e8a26c7f3f614e7ce11ceb6a123f'
+      ELSE
+        'a28138f13bf3b2eaf60624e9efb6e7fff669032bcf27043adff648b2d82528da'
+      END
     -- pg_get_constraintdef() is intentionally human-readable and does not
     -- expose bound operator OIDs. Resolve every parsed CHECK operator to stable
     -- namespace/type/procedure identities, so byte-identical text rebound to
     -- an attacker operator fails closed without pinning cluster-local OIDs.
     AND (
-      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 37
+      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=)
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0350_operations_commerce_order_history_exclusions.sql'
+              AND checksum =
+                '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+          ) THEN 45 ELSE 37 END
         AND pg_catalog.encode(
           public.digest(
             pg_catalog.convert_to(
@@ -530,7 +547,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
           ),
           'hex'
         ) OPERATOR(pg_catalog.=)
-          '724e0c8f03f49d3f9664948070f811a28a9dbeea2b6a60bd6c12d28d8c33b3bc'
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0350_operations_commerce_order_history_exclusions.sql'
+              AND checksum =
+                '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+          ) THEN
+            'b8dcf5dd48bc901d4217f554d1fe58a20537e3f97b10d1990947747d69f4a3d9'
+          ELSE
+            '724e0c8f03f49d3f9664948070f811a28a9dbeea2b6a60bd6c12d28d8c33b3bc'
+          END
       FROM pg_catalog.pg_constraint installed_constraint
       JOIN pg_catalog.pg_class installed_table
         ON installed_table.oid OPERATOR(pg_catalog.=)
@@ -794,7 +821,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
           )
         )
       ) OPERATOR(pg_catalog.=)
-        'd8a27f153b77f54154bc82a5f28dbcb97c064d915500bdb6fcbff643b1608a66'
+        CASE WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0350_operations_commerce_order_history_exclusions.sql'
+            AND checksum =
+              '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+        ) THEN
+          '790b37421ad6764a8b8990cab88b8756a59b9032e279c1647627d3cce2bddb1a'
+        ELSE
+          'd8a27f153b77f54154bc82a5f28dbcb97c064d915500bdb6fcbff643b1608a66'
+        END
       AND NOT EXISTS (
         SELECT 1
         FROM public.schema_migrations
@@ -929,7 +966,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
             )
           )
         ) OPERATOR(pg_catalog.=)
-          '4abf9b4700d86b2cd84eab60bd59ca5935531dad5ee7566979d93a0612c3ef71'
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0350_operations_commerce_order_history_exclusions.sql'
+              AND checksum =
+                '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+          ) THEN
+            '94207eb17485a62b79d0de6a847797a9948ec85d008dbe42c48cfb9ddeffc596'
+          ELSE
+            '4abf9b4700d86b2cd84eab60bd59ca5935531dad5ee7566979d93a0612c3ef71'
+          END
         AND EXISTS (
           SELECT 1
           FROM public.schema_migrations
@@ -941,7 +988,14 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
       )
     )
     AND (
-      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 11
+      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=)
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0350_operations_commerce_order_history_exclusions.sql'
+              AND checksum =
+                '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+          ) THEN 12 ELSE 11 END
         AND pg_catalog.encode(
           public.digest(
             pg_catalog.convert_to(
@@ -987,7 +1041,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
           ),
           'hex'
         ) OPERATOR(pg_catalog.=)
-          '6a4c29744ed7377933b90739df8d35d30b8d168d4f195b1014ded507f0a5010a'
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0350_operations_commerce_order_history_exclusions.sql'
+              AND checksum =
+                '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+          ) THEN
+            '80dd02356810339e89c53262a7b2a16371665da2ce7dbbcfc2585c4b02099196'
+          ELSE
+            '6a4c29744ed7377933b90739df8d35d30b8d168d4f195b1014ded507f0a5010a'
+          END
       FROM pg_catalog.pg_trigger installed_trigger
       JOIN pg_catalog.pg_class trigger_table
         ON trigger_table.oid OPERATOR(pg_catalog.=)
@@ -1033,9 +1097,65 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
             ),
             pg_catalog.to_regprocedure(
               'public.validate_operations_commerce_store_sync_identity()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.guard_commerce_order_history_lease_exclusion()'
             )
           ]::pg_catalog.oid[]
         )
+    )
+    AND (
+      NOT EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0350_operations_commerce_order_history_exclusions.sql'
+      )
+      OR (
+        EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0350_operations_commerce_order_history_exclusions.sql'
+            AND checksum =
+              '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+        )
+        AND COALESCE((
+          SELECT
+            pg_catalog.encode(
+              public.digest(
+                pg_catalog.convert_to(
+                  pg_catalog.btrim(pg_catalog.regexp_replace(
+                    installed_function.prosrc,
+                    '[[:space:]]+', ' ', 'g'
+                  )),
+                  'UTF8'
+                ),
+                'sha256'
+              ),
+              'hex'
+            ) OPERATOR(pg_catalog.=)
+              'd292cec75ea5790d80b985e179f043245f33744bd71ac10036b578681e0f83be'
+            AND installed_language.lanname OPERATOR(pg_catalog.=) 'plpgsql'
+            AND installed_function.provolatile OPERATOR(pg_catalog.=) 'v'
+            AND pg_catalog.pg_get_function_result(installed_function.oid)
+                  OPERATOR(pg_catalog.=) 'trigger'
+            AND installed_function.prokind OPERATOR(pg_catalog.=) 'f'
+            AND NOT installed_function.proisstrict
+            AND NOT installed_function.prosecdef
+            AND NOT installed_function.proleakproof
+            AND installed_function.proparallel OPERATOR(pg_catalog.=) 'u'
+            AND installed_function.proconfig OPERATOR(pg_catalog.=) ARRAY[
+              'search_path=pg_catalog, public, pg_temp'
+            ]::text[]
+          FROM pg_catalog.pg_proc installed_function
+          JOIN pg_catalog.pg_language installed_language
+            ON installed_language.oid OPERATOR(pg_catalog.=)
+              installed_function.prolang
+          WHERE installed_function.oid OPERATOR(pg_catalog.=)
+            pg_catalog.to_regprocedure(
+              'public.guard_commerce_order_history_lease_exclusion()'
+            )
+        ), false)
+      )
     )
     AND NOT EXISTS (
       SELECT 1
