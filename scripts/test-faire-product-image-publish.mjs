@@ -57,6 +57,9 @@ const projection = load(
     '@/lib/integrations/commerceProviderImageSource': {
       readCurrentCommerceProviderImageSources: noop,
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+      isIntegrationCredentialRuntimeGateError: () => false,
+    },
     '@/lib/integrations/faireCommerceClient': {
       createFaireCommerceClient: () => ({}),
     },

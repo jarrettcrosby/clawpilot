@@ -1402,6 +1402,9 @@ async function verifyRouteBehavior() {
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
       },
+      '@/lib/integrations/integrationCredentialRuntimeHttp': {
+        integrationCredentialRuntimeMaintenanceResponse: () => null,
+      },
       '@/lib/operations/productionFulfillmentRerateExecution': {
         ProductionFulfillmentRerateExecutionError,
         executeProductionFulfillmentRerate: async (input) => {
@@ -3977,6 +3980,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/integrations/commerceOrderRevisionEvidence':
             commerceOrderRevisionEvidence,
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/operations/commerceStoreSync': commerceStoreSyncPolicy,
           '@/lib/persistence/commerceStoreSync': {
             assertCommerceStoreSyncProviderReadLeaseCurrentWithClient:
@@ -4084,6 +4090,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/postgres': postgres,
         },
@@ -4158,6 +4167,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
       mocks: {
         '@/lib/auditWriter': auditWriter,
         '@/lib/crm/stableId': stableId,
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+          isIntegrationCredentialRuntimeGateError: () => false,
+        },
         '@/lib/integrations/carrierCheckoutRate': {
           rateCheckoutShipment: async () => {
             throw new Error(

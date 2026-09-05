@@ -402,6 +402,13 @@ const integrationService = loadTypeScriptModule(
           }
         },
       },
+      '@/lib/integrations/commerceReadRuntime': {
+        commerceReadCredentialEligible: () => true,
+      },
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+        assertIntegrationCredentialProviderIoReady: () => {},
+        isIntegrationCredentialRuntimeGateError: () => false,
+      },
       '@/lib/integrations/faireCommerceClient': {
         FAIRE_API_SCOPES: [],
         FaireCommerceClientError: StubProviderError,

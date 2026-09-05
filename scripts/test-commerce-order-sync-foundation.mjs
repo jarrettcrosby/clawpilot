@@ -350,6 +350,8 @@ const persistenceRuntime = loadTypeScript(
       COMMERCE_ORDER_SYNC_CURSOR_AAD_VERSION:
         'commerce-order-sync-cursor-aad-v1',
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/commerceStoreSync': {
       commerceStoreSyncRunningSql: () => 'TRUE',
     },

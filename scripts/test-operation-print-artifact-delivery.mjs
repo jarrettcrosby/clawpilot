@@ -485,6 +485,9 @@ async function verifyRouteContracts() {
         },
         CarrierIntegrationRequestError: CarrierRequestError,
       },
+      '@/lib/integrations/integrationCredentialRuntimeHttp': {
+        integrationCredentialRuntimeMaintenanceResponse: () => null,
+      },
       '@/lib/operations/authorization': {
         activeOperationsOrganizationId(actor) {
           if (!actor.organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')

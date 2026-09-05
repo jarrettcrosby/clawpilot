@@ -3174,6 +3174,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/postgres': postgres,
         },

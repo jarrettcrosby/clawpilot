@@ -65,6 +65,12 @@ function loadPersistence() {
           unresolvedCarrierBillingAccountFingerprint: unresolvedFingerprint,
         }
       }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return { isIntegrationCredentialRuntimeGateError: () => false }
+      }
       if (specifier === '@/lib/operations/carrierBillingImport') {
         class CarrierBillingImportError extends Error {}
         return {

@@ -811,6 +811,12 @@ async function verify(databaseUrl, fixtures) {
     {
       '@/lib/operations/commerceStoreSync': domain,
       '@/lib/auditWriter': { async recordAuditEvent() {} },
+      '@/lib/integrations/commerceReadRuntime': loadTypeScript(
+        'app_src/lib/integrations/commerceReadRuntime.ts',
+      ),
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+        isIntegrationCredentialRuntimeGateError: () => false,
+      },
       '@/lib/persistence/postgres': postgresAdapter(pool),
     },
   )

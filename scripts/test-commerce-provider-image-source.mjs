@@ -170,6 +170,9 @@ function fixture(overrides = {}) {
             return String(value)
           },
         },
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+          isIntegrationCredentialRuntimeGateError: () => false,
+        },
         '@/lib/integrations/commerceCapabilities': {
           hasEffectiveShopifyScope(scopes, scope) {
             return scopes.includes(scope)

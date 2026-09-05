@@ -91,6 +91,12 @@ function loadTypeScriptModule(path, mocks = {}) {
           mocks,
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return { isIntegrationCredentialRuntimeGateError: () => false }
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })
