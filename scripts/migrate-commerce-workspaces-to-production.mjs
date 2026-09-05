@@ -1535,6 +1535,10 @@ const TARGET_GLOBAL_SAFE_TABLES = new Set([
   'crm_reference_registry',
   'crm_suitecrm_product_image_ingestion_worker_heartbeat',
   'operations_commerce_product_image_import_worker_heartbeat',
+  // One persisted global lease coordinates bounded storage maintenance for
+  // every tenant. It has no organization-scoped payload or foreign key and
+  // is therefore target infrastructure, not migratable workspace data.
+  'operations_commerce_storage_maintenance_lanes',
 ])
 
 const TARGET_SCOPE_ANCHORS = Object.freeze({
