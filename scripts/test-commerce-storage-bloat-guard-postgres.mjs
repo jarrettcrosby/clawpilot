@@ -52,19 +52,34 @@ if (!databaseUrl) {
     `postgresql://postgres:commerce_guard@127.0.0.1:${port}/commerce_guard`
   )
   let ready = false
+  let consecutiveExternalConnections = 0
   for (let attempt = 0; attempt < 120; attempt += 1) {
+    const readinessPool = new Pool({
+      connectionString: databaseUrl,
+      application_name: 'clawpilot-commerce-storage-bloat-guard-readiness',
+      max: 1,
+      connectionTimeoutMillis: 1_000,
+      idleTimeoutMillis: 1_000,
+    })
     try {
-      command('docker', [
-        'exec', disposableContainer, 'pg_isready',
-        '-U', 'postgres', '-d', 'commerce_guard',
-      ])
-      ready = true
-      break
+      await readinessPool.query('SELECT 1')
+      consecutiveExternalConnections += 1
+      if (consecutiveExternalConnections >= 3) {
+        ready = true
+        break
+      }
     } catch {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
+      consecutiveExternalConnections = 0
+    } finally {
+      await readinessPool.end().catch(() => {})
     }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
   }
-  assert.equal(ready, true, 'Disposable PostgreSQL did not become ready')
+  assert.equal(
+    ready,
+    true,
+    'Disposable PostgreSQL did not accept three consecutive external connections',
+  )
   command('npm', ['run', 'db:migrate'], {
     env: { ...process.env, DATABASE_URL: databaseUrl },
     timeout: 180_000,
