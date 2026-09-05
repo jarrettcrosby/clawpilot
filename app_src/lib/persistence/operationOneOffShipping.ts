@@ -8,6 +8,9 @@ import {
   resolveCarrierSandboxShippingRuntime,
 } from '@/lib/integrations/carrierIntegrations'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
   CarrierOneOffGroupError,
   carrierOneOffGroupLifecycleMode,
@@ -2748,6 +2751,7 @@ export async function createOperationsOneOffCarrierGroupInPostgres(input: {
       prepared: preparedRequest,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const carrierError = terminalCarrierError(error)
     await finalizeAttemptFailure({
       organizationId,
@@ -3605,6 +3609,7 @@ export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
       })
       voidEvidence = providerResult.evidence
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const carrierError = terminalCarrierError(error)
       await finalizeAttemptFailure({
         organizationId,

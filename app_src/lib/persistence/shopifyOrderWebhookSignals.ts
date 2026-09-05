@@ -34,8 +34,12 @@ import {
 import {
   assessCommerceOrderHistoryAdmissionWithClient,
 } from '@/lib/persistence/commerceOrderHistoryAdmission'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
+const WEBHOOK_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
+  capability: 'webhook_hydration',
+})
 
 export class ShopifyOrderWebhookSignalPersistenceError extends Error {
   constructor(
@@ -213,6 +217,7 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
          AND account.global_id = $3
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
+         AND ${WEBHOOK_READ_ACCOUNT_SQL}
        FOR UPDATE OF account`,
       [
         input.runtime.organizationId,
@@ -318,6 +323,7 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
          AND account.id = $2::uuid
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
+         AND ${WEBHOOK_READ_ACCOUNT_SQL}
        FOR UPDATE OF account, credential, policy`,
       [
         input.runtime.organizationId,
@@ -704,7 +710,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
                 (
                   account.integration_type = 'commerce'
                   AND account.provider = 'shopify'
-                  AND account.status = 'active'
+                  AND ${WEBHOOK_READ_ACCOUNT_SQL}
                   AND account.external_account_id IS NOT NULL
                   AND account.commerce_credential_generation
                         = target.credential_generation
@@ -844,7 +850,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
           AND account.id = target.integration_account_id
           AND account.integration_type = 'commerce'
           AND account.provider = 'shopify'
-          AND account.status = 'active'
+          AND ${WEBHOOK_READ_ACCOUNT_SQL}
           AND account.commerce_credential_generation
               = target.credential_generation
          JOIN operations_commerce_credentials credential
@@ -955,6 +961,7 @@ export async function assertShopifyOrderWebhookClaimCurrentForProviderReadInPost
         AND account.global_id = $4
         AND account.integration_type = 'commerce'
         AND account.provider = 'shopify'
+        AND ${WEBHOOK_READ_ACCOUNT_SQL}
         AND account.commerce_credential_generation = $5
        WHERE target.organization_id = $1::uuid
          AND target.id = $2::uuid
@@ -1639,9 +1646,14 @@ export async function failShopifyOrderWebhookExactReadInPostgres(input: {
   })
 }
 
-export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(
-  input: { claim: ShopifyOrderWebhookTargetClaim },
-) {
+async function parkShopifyOrderWebhookExactReadInPostgres(input: {
+  claim: ShopifyOrderWebhookTargetClaim
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Shopify order webhook parking reason is invalid')
+  }
   const parked = await query(
     `UPDATE operations_shopify_order_webhook_targets
      SET claim_state = 'pending',
@@ -1654,7 +1666,7 @@ export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgre
          locked_by = NULL,
          lock_token = NULL,
          lease_expires_at = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $8,
          updated_at = clock_timestamp()
      WHERE organization_id = $1::uuid
        AND id = $2::uuid
@@ -1673,9 +1685,25 @@ export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgre
       input.claim.policyRevision,
       input.claim.capturedDirtyVersion,
       input.claim.lockToken,
+      input.errorCode,
     ],
   )
   return { parked: parked.rowCount === 1 }
+}
+
+export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(
+  input: { claim: ShopifyOrderWebhookTargetClaim },
+) {
+  return parkShopifyOrderWebhookExactReadInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkShopifyOrderWebhookExactReadForRuntimeMaintenanceInPostgres(
+  input: { claim: ShopifyOrderWebhookTargetClaim; errorCode: string },
+) {
+  return parkShopifyOrderWebhookExactReadInPostgres(input)
 }
 
 export async function readShopifyOrderWebhookSignalHealthFromPostgres() {

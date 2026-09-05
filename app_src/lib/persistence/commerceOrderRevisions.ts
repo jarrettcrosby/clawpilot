@@ -8,6 +8,9 @@ import {
   decryptCommerceOrderRevisionProtectedSnapshot,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   resolveCommerceOrderRevisionEvidenceKeyConfig,
   summarizeCommerceOrderRevisionEvidenceKeyReadiness,
 } from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
@@ -51,7 +54,9 @@ const GLOBAL_DISPOSITION_ID = /^gcod(?:[0-9]{7}|[0-9a-v]{12})$/u
 const GLOBAL_APPLICATION_ID = /^gcoa(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{2,127}$/u
-const READABLE_ACCOUNT_SQL = commerceReadAccountSql('account')
+const READABLE_ACCOUNT_SQL = commerceReadAccountSql('account', {
+  capability: 'orders_history',
+})
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 export type CommerceOrderRevisionProvider = 'shopify' | 'faire'
@@ -2546,19 +2551,26 @@ export async function failCommerceOrderRevisionTargetInPostgres(input: {
   return result.rows[0]?.claim_state || null
 }
 
-export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres(
-  input: {
-    claim: CommerceOrderRevisionClaim
-    workerId: string
-  },
-) {
+async function parkCommerceOrderRevisionTargetInPostgres(input: {
+  claim: CommerceOrderRevisionClaim
+  workerId: string
+  errorCode: string
+}) {
   validateClaim(input.claim)
   const workerId = boundedText(
     input.workerId,
     'Commerce order revision worker ID',
     200,
   )
-  if (workerId !== input.claim.workerId) {
+  if (
+    workerId !== input.claim.workerId
+    || (
+      input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+      && !/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(
+        input.errorCode,
+      )
+    )
+  ) {
     throw new Error('Commerce order revision pause disposition is invalid')
   }
   const result = await query(
@@ -2569,7 +2581,7 @@ export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres
          locked_by = NULL,
          lock_token = NULL,
          locked_until = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $5,
          row_version = row_version + 1,
          updated_at = now()
      WHERE id = $1::uuid
@@ -2583,9 +2595,32 @@ export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres
       input.claim.organizationId,
       workerId,
       input.claim.leaseToken,
+      input.errorCode,
     ],
   )
   return result.rowCount === 1
+}
+
+export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres(
+  input: {
+    claim: CommerceOrderRevisionClaim
+    workerId: string
+  },
+) {
+  return parkCommerceOrderRevisionTargetInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkCommerceOrderRevisionTargetForRuntimeMaintenanceInPostgres(
+  input: {
+    claim: CommerceOrderRevisionClaim
+    workerId: string
+    errorCode: string
+  },
+) {
+  return parkCommerceOrderRevisionTargetInPostgres(input)
 }
 
 export class CommerceOrderRevisionGateError extends Error {
@@ -3782,7 +3817,8 @@ export async function applyCommerceOrderRevisionToClawPilotInPostgres(input: {
         row.source_hash,
         'ship_to',
       )
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       throw new CommerceOrderRevisionDispositionError(
         'COMMERCE_ORDER_REVISION_PROTECTED_HEADER_INVALID',
         'Protected provider header evidence failed integrity validation',

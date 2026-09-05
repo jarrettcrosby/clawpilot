@@ -6,6 +6,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 
+import {
+  IntegrationCredentialRuntimeGateError,
+  isIntegrationCredentialRuntimeGateError,
+} from './lib/integration-credential-runtime-test-double.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -73,6 +78,24 @@ class MockShopifyCarrierServiceClientError
 
 function unavailable() {
   throw new Error('default dependency should be overridden by the test')
+}
+
+let runtimeGateCheckCount = 0
+let runtimeGateFailureAt = null
+let runtimeGateFailure = null
+
+function assertRuntimeGate() {
+  runtimeGateCheckCount += 1
+  if (runtimeGateCheckCount === runtimeGateFailureAt) {
+    throw runtimeGateFailure
+  }
+  return { mode: 'test', status: 'verified', providerIoReady: true }
+}
+
+function resetRuntimeGate() {
+  runtimeGateCheckCount = 0
+  runtimeGateFailureAt = null
+  runtimeGateFailure = null
 }
 
 function loadRegistrationModule() {
@@ -170,6 +193,15 @@ function loadRegistrationModule() {
         }
       }
       if (
+        specifier ===
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return {
+          assertIntegrationCredentialProviderIoReady: assertRuntimeGate,
+          isIntegrationCredentialRuntimeGateError,
+        }
+      }
+      if (
         specifier === '@/lib/persistence/commerceExternalEffects'
       ) {
         return {
@@ -202,6 +234,48 @@ function loadRegistrationModule() {
 }
 
 const registration = loadRegistrationModule()
+
+{
+  const routeSource = readFileSync(
+    resolve(
+      root,
+      'app_src/app/api/integrations/commerce/shopify/carrier-service/route.ts',
+    ),
+    'utf8',
+  )
+  assert.match(
+    routeSource,
+    /if \(isIntegrationCredentialRuntimeGateError\(error\)\) \{[\s\S]*?status: 503,[\s\S]*?'Retry-After': '60'/,
+    'runtime proof loss must surface as retryable maintenance',
+  )
+  const mutationStart = routeSource.indexOf(
+    'async function executeResourceScopedCarrierServiceMutation',
+  )
+  const mutationEnd = routeSource.indexOf('\nexport async function', mutationStart)
+  assert.ok(mutationStart >= 0 && mutationEnd > mutationStart)
+  const mutationSource = routeSource.slice(mutationStart, mutationEnd)
+  const authorizeIndex = mutationSource.indexOf(
+    'await authorizeShopifyCarrierServiceMutationInPostgres',
+  )
+  const claimIndex = mutationSource.indexOf(
+    'await claimShopifyCarrierServiceMutationInPostgres',
+  )
+  assert.ok(authorizeIndex > 0 && claimIndex > authorizeIndex)
+  assert.ok(
+    mutationSource.lastIndexOf(
+      'assertIntegrationCredentialProviderIoReady()',
+      authorizeIndex,
+    ) > 0,
+    'the route must prove readiness before creating a one-time authorization',
+  )
+  assert.ok(
+    mutationSource.lastIndexOf(
+      'assertIntegrationCredentialProviderIoReady()',
+      claimIndex,
+    ) > authorizeIndex,
+    'the route must re-prove readiness before claiming the authorization',
+  )
+}
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const accountGlobalId = 'gia0000001'
 const integrationAccountId =
@@ -522,6 +596,93 @@ function authorizedDependencies(authorization, options = {}) {
       },
     },
   }
+}
+
+{
+  const { calls, deps } = dependencies()
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  runtimeGateFailure = outage
+  runtimeGateFailureAt = 1
+  await assert.rejects(
+    () => registration.executeShopifyCarrierServiceRegistration(
+      command(),
+      deps,
+    ),
+    (error) => error === outage,
+  )
+  assert.deepEqual(calls.map(([name]) => name), ['prepare'])
+  resetRuntimeGate()
+}
+
+{
+  const { calls, deps } = dependencies()
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  runtimeGateFailure = outage
+  runtimeGateFailureAt = 2
+  await assert.rejects(
+    () => registration.executeShopifyCarrierServiceRegistration(
+      command(),
+      deps,
+    ),
+    (error) => error === outage,
+  )
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['prepare', 'claim'],
+    'post-claim maintenance must not synthesize terminal provider evidence',
+  )
+  resetRuntimeGate()
+}
+
+{
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  const { calls, deps } = dependencies()
+  deps.decryptCredential = (...args) => {
+    calls.push(['decrypt', args])
+    throw outage
+  }
+  await assert.rejects(
+    () => registration.executeShopifyCarrierServiceRegistration(
+      command(),
+      deps,
+    ),
+    (error) => error === outage,
+  )
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['prepare', 'claim', 'runtime', 'decrypt'],
+  )
+}
+
+{
+  const mutation = command().mutation
+  const authorization = claimedAuthorization(mutation)
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  const { calls, deps } = authorizedDependencies(authorization)
+  deps.decryptCredential = (...args) => {
+    calls.push(['decrypt', args])
+    throw outage
+  }
+  await assert.rejects(
+    () => registration.executeAuthorizedShopifyCarrierServiceMutation(
+      { authorization, mutation },
+      deps,
+    ),
+    (error) => error === outage,
+  )
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['runtime', 'decrypt'],
+    'a claimed authorization must remain unresolved during key maintenance',
+  )
 }
 
 {

@@ -67,10 +67,12 @@ async function seed(pool, kind, authority = 'automatic') {
 function loadSubjects(withTransaction) {
   const store = productionFunctions('app_src/lib/persistence/commerceStoreSync.ts', [
     'CommerceStoreSyncProviderReadFenceError', 'CommerceStoreSyncProviderReadLeaseError',
+    'providerReadCapability', 'providerReadAccountSql',
     'assertCommerceStoreSyncProviderReadLeaseCurrentWithClient', 'acquireProviderReadLease',
   ], {
     withTransaction, randomUUID, PROVIDER_READ_LEASE_SECONDS: 60,
     commerceStoreSyncProviderReadIntentFingerprint: () => fingerprint,
+    commerceReadAccountSql: () => "account.status = 'active'",
   })
   const intake = productionFunctions('app_src/lib/persistence/commerceIntake.ts', [
     'resolveAccount', 'lockCommerceStoreSyncState', 'requireCommerceStoreSyncRunning',

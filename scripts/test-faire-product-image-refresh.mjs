@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import test from 'node:test'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -89,6 +90,8 @@ class CommerceProductImageImportError extends Error {
 const service = loadTypeScriptModule(
   'app_src/lib/integrations/faireProductImageRefresh.ts',
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceProviderImageSource': {
       CommerceProviderImageSourceError,
       async readCurrentCommerceProviderImageSources() {

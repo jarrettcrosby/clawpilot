@@ -5,6 +5,10 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES,
   UPS_WHOLE_SHIPMENT_PACKAGING_TYPES,
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
@@ -1155,6 +1159,7 @@ async function executeCarrierSandboxRateRequest(
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 12_000, 15_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
+    assertIntegrationCredentialProviderIoReady()
     const response = await options.fetchImpl(RATE_ENDPOINTS[input.provider], {
       method: 'POST',
       headers: {
@@ -1209,6 +1214,7 @@ async function executeCarrierSandboxRateRequest(
       },
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof CarrierCredentialClientError) throw error
     if (error instanceof Error && error.name === 'AbortError') {
       throw new CarrierCredentialClientError('Carrier sandbox rating timed out', 504, 'CARRIER_PROVIDER_TIMEOUT')

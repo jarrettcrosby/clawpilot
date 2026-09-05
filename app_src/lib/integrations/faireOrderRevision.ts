@@ -7,6 +7,9 @@ import {
 } from '@/lib/integrations/commerceCredentialCrypto'
 import type { EncryptedCommerceOrderRevisionValue } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   getFaireOrder,
   probeFaireBrandProfile,
   type FaireCommerceClientOptions,
@@ -764,7 +767,8 @@ export async function inspectFaireCanonicalOrderRevision(
       runtime.environment,
       runtime.externalAccountId,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return fail(
       'FAIRE_ORDER_REVISION_CREDENTIAL_INVALID',
       'Stored Faire credential could not be decrypted',
@@ -779,6 +783,7 @@ export async function inspectFaireCanonicalOrderRevision(
     exactBrandIdentity(profile, target.externalAccountId)
     source = await dependencies.getOrder(options, target.externalOrderId)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof FaireOrderRevisionError) throw error
     return fail(
       'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',

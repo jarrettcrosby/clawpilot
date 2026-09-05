@@ -6,6 +6,9 @@ import {
 import {
   commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceIntake'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
 export const runtime = 'nodejs'
@@ -37,6 +40,24 @@ function unavailableResult(errorCode: string) {
     providerWrites: 0,
     errorCodes: { [errorCode]: 1 },
   }
+}
+
+function runtimeMaintenanceResponse(failure: unknown) {
+  if (!isIntegrationCredentialRuntimeGateError(failure)) return null
+  return NextResponse.json({
+    ok: false,
+    maintenance: true,
+    retryable: true,
+    errorCode: String((failure as { code?: unknown }).code || ''),
+  }, {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Retry-After': '60',
+    },
+  })
 }
 
 export async function POST(req: NextRequest) {
@@ -75,7 +96,9 @@ export async function POST(req: NextRequest) {
       workerId,
     })
     return NextResponse.json({ ok: true, ...result })
-  } catch {
+  } catch (error) {
+    const maintenance = runtimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     return NextResponse.json(
       { ok: false, errorCode: 'COMMERCE_PRODUCT_IMAGE_WORKER_FAILED' },
       { status: 500 },

@@ -40,6 +40,9 @@ export async function POST(
   if (!result.authenticated) return genericNotFound()
   return NextResponse.json(result.response, {
     status: result.httpStatus,
-    headers: RESPONSE_HEADERS,
+    headers: {
+      ...RESPONSE_HEADERS,
+      ...(result.httpStatus === 503 ? { 'Retry-After': '60' } : {}),
+    },
   })
 }

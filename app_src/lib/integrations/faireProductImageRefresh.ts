@@ -12,6 +12,9 @@ import {
   type CommerceProductImageImportJobState,
 } from '@/lib/persistence/commerceProductImageImports'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   readFaireProductImageRefreshTargetInPostgres,
   reconcileExactFaireProductImageRefreshInPostgres,
 } from '@/lib/persistence/faireProductImageRefresh'
@@ -153,6 +156,7 @@ function assertReviewedTarget(
 }
 
 function sanitizedFailure(error: unknown): never {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof FaireProductImageRefreshError) throw error
   if (
     error instanceof CommerceProviderImageSourceError

@@ -11,6 +11,16 @@ app_visible: false
 
 # Distributed Operations
 
+This contract preserves delivery evidence created while a hosted Railway
+development environment existed. That environment is retired. Unless a
+paragraph explicitly describes the Railway production lane, **development** in
+this document now means the `dev` source branch plus local fixtures or
+disposable PostgreSQL evidence; retained exact Railway-development IDs and
+commands are historical and unavailable without a separately reviewed
+restoration. The Vercel application project remains transitional rather than
+accepted preview-only until its legacy production-scoped variables and domain
+authority pass the gated retirement audit.
+
 ## Purpose And Activation Status
 
 Provide native distributed order management, warehouse execution, carrier shipping, and 3PL billing inside ClawPilot. The module serves 3PL operators, retailers, distributors, manufacturers, and fulfillment operators without creating a second application or duplicating CRM, product, identity, audit, task, document, notification, or accounting masters.
@@ -2378,6 +2388,12 @@ The current repository includes a disabled-by-default Python 3.13 / Google OR-To
 The input carries an explicit allowed-warehouse set. An organization snapshot containing one allowed warehouse can never produce a second facility or split plan. Generic multi-warehouse planning remains available only when the immutable snapshot names multiple eligible facilities and its split policy explicitly permits them. The strict development preview projects carton candidates only from active packaging materials joined to the selected active warehouse's available, positive on-hand packaging stock; drafts, unavailable stock, and zero-stock rows are ineligible. A future hosted planner must retain that rule. Cartons, inventory, historical demand, and carrier-derived costs must be supplied as versioned facts; neither implementation invents them.
 
 Packaging-material assortment selection is a separate authenticated v1 operation. It accepts only operator-supplied candidate boxes/poly mailers, versioned historical demand frequency, and precomputed feasible landed-cost/waste edges. Hard coverage is the default, while any lower coverage threshold and maximum material-SKU count must be explicit. It lexicographically minimizes frequency-weighted landed cost, active material count, weighted waste, and stable identifiers. This operation is a design aid for maintaining a manageable warehouse material catalog; it does not cartonize an order, call a carrier, activate a material, or write a catalog.
+
+The older two-Railway-environment optimizer statement below is preserved as
+historical delivery evidence and is superseded by the active topology: only
+Railway production may host the live optimizer. Local/disposable optimizer
+tests remain pre-production evidence, and no Vercel deployment may own the
+optimizer secret or private service route.
 
 The optimizer is a required capability-parity service in both Railway environments; development evidence does not prove production deployment or configuration. Each environment needs its own service instance, secret, exact private URL, application configuration-readiness evidence from `/api/health`, and separate service-health evidence. The separately gated Shopify cartonization preview still requires OR-Tools and remains an in-memory, zero-write diagnostic. Migration `0176` adds a different boundary: it does not invoke the optimizer, but can accept one previously sealed `operational` cartonization/rate evidence aggregate for a promoted order and persist its exact single-warehouse plan, package allocations, package contents, and whole-shipment carrier-rate choice. That operator acceptance is not production optimizer activation, multi-warehouse planning, packing-list execution, transport purchase, or shipment confirmation. Migration `0180` supplies append-only production execution-time rerate and selection authority for an exact Active package set. The authenticated Operations `execute-production-rerate` command creates the read-only carrier network evidence through one bounded UPS/FedEx whole-shipment request after the prepared attempt is committed; `select-production-rerate-offer` then records one manual, immutable, unexpired local selection for the complete package set without another network call. Hosted activation still requires durable optimizer invocation/recovery observability and the downstream provider-authoritative release and picking, rerate recovery/reconciliation, operator selection UI or policy-based auto-selection, label and shipment dispatch/finalization, package documents, tracking, inventory consumption, and fulfillment-export gates.
 

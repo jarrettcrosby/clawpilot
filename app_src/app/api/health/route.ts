@@ -45,6 +45,10 @@ import {
   summarizeCommerceOrderRevisionEvidenceKeyReadiness,
 } from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 import {
+  integrationCredentialRuntimeEnforcementRequired,
+  refreshIntegrationCredentialRuntimeReadiness,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   readShopifyInventoryRefreshHealthFromPostgres,
   readShopifyInventoryRefreshWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
@@ -167,6 +171,8 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
   'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
+const COMMERCE_PRODUCT_IMAGE_RUNTIME_PARKING_PROSRC_SHA256 =
+  '57f2f359ae6b82e9dae121a295a3e85e783df45fbd78287d44af71a30d4235e0'
 
 // Exact structural attestation for the development-only canonical Shopify
 // test-store lane. The migration checksum pins the DDL, while the function,
@@ -2916,10 +2922,64 @@ export async function GET() {
     || process.env.RAILWAY_ENVIRONMENT,
   )
   const cloudProvider = railwayRuntime ? 'railway' : process.env.VERCEL ? 'vercel' : null
+  const integrationCredentialRuntimeRequired =
+    integrationCredentialRuntimeEnforcementRequired()
 
-  if (isHostedRuntime()) {
+  if (integrationCredentialRuntimeRequired) {
     const errors: string[] = []
     const warnings: string[] = []
+    let integrationCredentialRuntime: Record<string, unknown> = {
+      status: 'error',
+      mode: String(
+        process.env.INTEGRATION_CREDENTIAL_ATTESTATION_MODE || 'strict',
+      ),
+      deploymentReady: false,
+      providerIoReady: false,
+    }
+    try {
+      const readiness =
+        await refreshIntegrationCredentialRuntimeReadiness({
+          client: { query },
+          allowMissingProof: true,
+        })
+      integrationCredentialRuntime = {
+        mode: readiness.mode,
+        status: readiness.status,
+        deploymentReady: readiness.deploymentReady,
+        providerIoReady: readiness.providerIoReady,
+        proofVerified: readiness.proofVerified,
+        proofRefreshed: readiness.proofRefreshed,
+        maintenance: readiness.mode === 'adoption',
+      }
+      if (integrationCredentialRuntime.providerIoReady !== true) {
+        warnings.push(
+          'Integration credential adoption mode is active; provider access is disabled.',
+        )
+      }
+    } catch (error) {
+      const candidateCode = error && typeof error === 'object'
+        && 'code' in error
+        ? String(error.code || '')
+        : ''
+      const code = /^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]+$/u.test(
+        candidateCode,
+      )
+        ? candidateCode
+        : 'INTEGRATION_CREDENTIAL_RUNTIME_VERIFICATION_FAILED'
+      integrationCredentialRuntime = {
+        status: 'error',
+        mode: String(
+          process.env.INTEGRATION_CREDENTIAL_ATTESTATION_MODE || 'strict',
+        ),
+        deploymentReady: false,
+        providerIoReady: false,
+        blocker: code,
+      }
+      console.error('[health] Integration credential runtime gate failed', {
+        code,
+      })
+      errors.push('Integration credential runtime attestation failed.')
+    }
     const storage = getStorageDriver()
     const commerceReadReconciliation = commerceReadRuntimeSummary()
     const shopifyOrderManagementRuntimeState =
@@ -3491,7 +3551,10 @@ export async function GET() {
           faire_provider_write_auth_applied: boolean
           faire_fulfillment_authority_applied: boolean
           operations_commerce_fulfillment_recovery_applied: boolean
+          operations_commerce_fulfillment_recovery_budget_applied: boolean
           operations_commerce_product_image_imports_applied: boolean
+          operations_commerce_product_image_runtime_parking_applied: boolean
+          operations_hosted_production_sandbox_read_authority_applied: boolean
           operations_commerce_product_image_fanout_applied: boolean
           operations_commerce_product_image_source_normalization_applied: boolean
           operations_faire_product_image_projection_applied: boolean
@@ -4786,6 +4849,95 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0359_operations_commerce_fulfillment_recovery_budget.sql'
+                  AND checksum =
+                    '1bd515490a8c30ac412b03a17e4d37dc434376efa773cb0a723633195dcbe8f2'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_attribute attribute
+                JOIN pg_attrdef default_value
+                  ON default_value.adrelid = attribute.attrelid
+                 AND default_value.adnum = attribute.attnum
+                WHERE attribute.attrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports'
+                  )
+                  AND attribute.attname = 'automatic_recovery_attempts'
+                  AND attribute.atttypid = 'integer'::regtype
+                  AND attribute.attnotnull
+                  AND NOT attribute.attisdropped
+                  AND pg_get_expr(
+                    default_value.adbin,
+                    default_value.adrelid,
+                    true
+                  ) = '0'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports'
+                  )
+                  AND constraint_row.conname =
+                    'operations_commerce_fulfillment_exports_recovery_budget_valid'
+                  AND constraint_row.contype = 'c'
+                  AND constraint_row.convalidated
+                  AND regexp_replace(
+                    pg_get_constraintdef(constraint_row.oid, true),
+                    '[()[:space:]]',
+                    '',
+                    'g'
+                  ) =
+                    'CHECKautomatic_recovery_attempts>=0ANDautomatic_recovery_attempts<=attempts'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index index_row
+                WHERE index_row.indexrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports_recovery_budget_idx'
+                  )
+                  AND index_row.indrelid = to_regclass(
+                    'operations_commerce_fulfillment_exports'
+                  )
+                  AND NOT index_row.indisunique
+                  AND index_row.indisvalid
+                  AND index_row.indisready
+                  AND index_row.indpred IS NOT NULL
+                  AND index_row.indexprs IS NULL
+                  AND index_row.indnkeyatts = 6
+                  AND index_row.indnatts = 6
+                  AND ARRAY(
+                    SELECT indexed_attribute.attname::text
+                    FROM unnest(index_row.indkey) WITH ORDINALITY
+                      indexed_column(attnum, ordinality)
+                    JOIN pg_attribute indexed_attribute
+                      ON indexed_attribute.attrelid = index_row.indrelid
+                     AND indexed_attribute.attnum = indexed_column.attnum
+                    ORDER BY indexed_column.ordinality
+                  ) = ARRAY[
+                    'state',
+                    'error_code',
+                    'updated_at',
+                    'automatic_recovery_attempts',
+                    'attempts',
+                    'id'
+                  ]::text[]
+                  AND regexp_replace(
+                    pg_get_expr(
+                      index_row.indpred,
+                      index_row.indrelid,
+                      true
+                    ),
+                    '[()[:space:]]',
+                    '',
+                    'g'
+                  ) =
+                    'provider=ANYARRAY[''shopify''::text,''faire''::text]ANDstate=ANYARRAY[''processing''::text,''failed''::text]'
+              ) AS operations_commerce_fulfillment_recovery_budget_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0221_operations_commerce_product_image_imports.sql'
               )
               AND to_regclass(
@@ -5056,6 +5208,129 @@ export async function GET() {
                   AND index_row.indisvalid
                   AND index_row.indisready
               ) AS operations_commerce_product_image_imports_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0357_operations_commerce_product_image_runtime_parking.sql'
+                  AND checksum =
+                    'e8636998cfa8e8e24717ba7ffda11f4e2e0031fc83a439914a18f6d568c836a2'
+              )
+              AND to_regclass(
+                'operations_commerce_product_image_import_jobs'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                JOIN pg_namespace namespace
+                  ON namespace.oid = procedure.pronamespace
+                WHERE namespace.nspname = 'public'
+                  AND procedure.oid = to_regprocedure(
+                    'guard_operations_commerce_product_image_import_job()'
+                  )::oid
+                  AND NOT procedure.prosecdef
+                  AND procedure.proconfig @>
+                    ARRAY['search_path=pg_catalog, public']::text[]
+                  AND encode(
+                    digest(
+                      convert_to(
+                        btrim(
+                          regexp_replace(
+                            regexp_replace(
+                              procedure.prosrc,
+                              E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                              ' ',
+                              'g'
+                            ),
+                            '[[:space:]]+',
+                            ' ',
+                            'g'
+                          )
+                        ),
+                        'UTF8'
+                      ),
+                      'sha256'
+                    ),
+                    'hex'
+                  ) = '${COMMERCE_PRODUCT_IMAGE_RUNTIME_PARKING_PROSRC_SHA256}'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_product_image_import_jobs'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_operations_commerce_product_image_import_job_write'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_operations_commerce_product_image_import_job()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              ) AS operations_commerce_product_image_runtime_parking_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0358_operations_hosted_production_sandbox_read_authority.sql'
+                  AND checksum =
+                    '3e99c87a322816df28a76d0e00a2001d5301f978163679f950c1be856c1b5b79'
+              )
+              AND to_regclass(
+                'operations_commerce_hosted_production_sandbox_read_authorizations'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                WHERE procedure.oid = to_regprocedure(
+                    'guard_hosted_production_sandbox_read_authorization()'
+                  )::oid
+                  AND procedure.prosecdef = false
+                  AND procedure.proconfig @>
+                    ARRAY['search_path=public, pg_catalog, pg_temp']::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_proc procedure
+                WHERE procedure.oid = to_regprocedure(
+                    'operations_commerce_hosted_production_sandbox_read_is_current(uuid,uuid,text)'
+                  )::oid
+                  AND procedure.provolatile = 's'
+                  AND procedure.prosecdef = false
+                  AND procedure.proconfig @>
+                    ARRAY['search_path=public, pg_catalog, pg_temp']::text[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger trigger_row
+                WHERE trigger_row.tgrelid = to_regclass(
+                    'operations_commerce_hosted_production_sandbox_read_authorizations'
+                  )
+                  AND trigger_row.tgname =
+                    'guard_hosted_production_sandbox_read_authorization_trigger'
+                  AND trigger_row.tgfoid = to_regprocedure(
+                    'guard_hosted_production_sandbox_read_authorization()'
+                  )::oid
+                  AND trigger_row.tgenabled = 'O'
+                  AND trigger_row.tgtype = 31
+                  AND NOT trigger_row.tgisinternal
+              )
+              AND (
+                SELECT count(*) = 5
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = to_regclass(
+                    'operations_commerce_hosted_production_sandbox_read_authorizations'
+                  )
+                  AND constraint_row.convalidated
+                  AND constraint_row.conname = ANY(ARRAY[
+                    'operations_commerce_hosted_prod_sandbox_read_account_fkey',
+                    'operations_commerce_hosted_prod_sandbox_read_capabilities_exact',
+                    'operations_commerce_hosted_prod_sandbox_read_only',
+                    'operations_commerce_hosted_prod_sandbox_read_expiry_valid',
+                    'operations_commerce_hosted_prod_sandbox_read_state_valid'
+                  ]::text[])
+              ) AS operations_hosted_production_sandbox_read_authority_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8357,6 +8632,75 @@ export async function GET() {
                   : Promise.resolve(null),
               ])
             : null
+        const hostedProductionSandboxReadAuthority =
+          row?.operations_hosted_production_sandbox_read_authority_applied
+            ? (await query<{
+                total: number
+                active: number
+                current: number
+                expiring_soon: number
+                expired_unrevoked: number
+                invalid_active: number
+                future_active: number
+                revoked: number
+                earliest_current_expiry: string | null
+              }>(`
+                SELECT
+                  count(*)::integer AS total,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                  ))::integer AS active,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                      AND operations_commerce_hosted_production_sandbox_read_is_current(
+                        authority.organization_id,
+                        authority.integration_account_id,
+                        'catalog'
+                      )
+                  ))::integer AS current,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                      AND operations_commerce_hosted_production_sandbox_read_is_current(
+                        authority.organization_id,
+                        authority.integration_account_id,
+                        'catalog'
+                      )
+                      AND authority.expires_at <=
+                        statement_timestamp() + interval '14 days'
+                  ))::integer AS expiring_soon,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                      AND authority.expires_at <= statement_timestamp()
+                  ))::integer AS expired_unrevoked,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                      AND authority.authorized_at <= statement_timestamp()
+                      AND authority.expires_at > statement_timestamp()
+                      AND NOT operations_commerce_hosted_production_sandbox_read_is_current(
+                        authority.organization_id,
+                        authority.integration_account_id,
+                        'catalog'
+                      )
+                  ))::integer AS invalid_active,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'active'
+                      AND authority.authorized_at > statement_timestamp()
+                  ))::integer AS future_active,
+                  (count(*) FILTER (
+                    WHERE authority.state = 'revoked'
+                  ))::integer AS revoked,
+                  (min(authority.expires_at) FILTER (
+                    WHERE authority.state = 'active'
+                      AND operations_commerce_hosted_production_sandbox_read_is_current(
+                        authority.organization_id,
+                        authority.integration_account_id,
+                        'catalog'
+                      )
+                  ))::text AS earliest_current_expiry
+                FROM operations_commerce_hosted_production_sandbox_read_authorizations
+                  authority
+              `)).rows[0]
+            : null
         database = {
           status: 'reachable',
           checkedAt: row?.now || new Date(checkedAt).toISOString(),
@@ -8543,7 +8887,10 @@ export async function GET() {
             && row?.faire_provider_write_auth_applied
             && row?.faire_fulfillment_authority_applied
             && row?.operations_commerce_fulfillment_recovery_applied
+            && row?.operations_commerce_fulfillment_recovery_budget_applied
             && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_runtime_parking_applied
+            && row?.operations_hosted_production_sandbox_read_authority_applied
             && row?.operations_commerce_product_image_fanout_applied
             && row?.operations_commerce_product_image_source_normalization_applied
             && row?.operations_faire_product_image_projection_applied
@@ -8600,6 +8947,60 @@ export async function GET() {
             authorityContract:
               row?.operations_commerce_store_sync_authority_contract
               || 'unavailable',
+          },
+          commerceFulfillmentRecoveryBudget: {
+            status: row?.operations_commerce_fulfillment_recovery_applied
+              && row?.operations_commerce_fulfillment_recovery_budget_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+            monotonicClaimFence: Boolean(
+              row?.operations_commerce_fulfillment_recovery_budget_applied,
+            ),
+            independentAutomaticRecoveryBudget: Boolean(
+              row?.operations_commerce_fulfillment_recovery_budget_applied,
+            ),
+          },
+          hostedProductionSandboxReadAuthority: {
+            status: !row?.operations_hosted_production_sandbox_read_authority_applied
+              ? 'migration-or-structure-pending'
+              : Number(hostedProductionSandboxReadAuthority?.invalid_active || 0) > 0
+                || Number(hostedProductionSandboxReadAuthority?.future_active || 0) > 0
+                ? 'invalid-active'
+                : Number(hostedProductionSandboxReadAuthority?.expiring_soon || 0) > 0
+                  ? 'expiring-soon'
+                  : Number(hostedProductionSandboxReadAuthority?.current || 0) > 0
+                    ? 'ready'
+                    : Number(hostedProductionSandboxReadAuthority?.expired_unrevoked || 0) > 0
+                      ? 'expired'
+                      : 'inactive',
+            capabilities: [
+              'catalog',
+              'images',
+              'inventory',
+              'orders_history',
+              'webhook_hydration',
+            ],
+            providerWritesEnabled: false,
+            automaticOrderPromotionEnabled: false,
+            warningWindowDays: 14,
+            total: Number(hostedProductionSandboxReadAuthority?.total || 0),
+            active: Number(hostedProductionSandboxReadAuthority?.active || 0),
+            current: Number(hostedProductionSandboxReadAuthority?.current || 0),
+            expiringSoon: Number(
+              hostedProductionSandboxReadAuthority?.expiring_soon || 0,
+            ),
+            expiredUnrevoked: Number(
+              hostedProductionSandboxReadAuthority?.expired_unrevoked || 0,
+            ),
+            invalidActive: Number(
+              hostedProductionSandboxReadAuthority?.invalid_active || 0,
+            ),
+            futureActive: Number(
+              hostedProductionSandboxReadAuthority?.future_active || 0,
+            ),
+            revoked: Number(hostedProductionSandboxReadAuthority?.revoked || 0),
+            earliestCurrentExpiry:
+              hostedProductionSandboxReadAuthority?.earliest_current_expiry || null,
           },
           orderEditing: {
             status: row?.operations_order_editing_release_applied
@@ -8669,6 +9070,24 @@ export async function GET() {
         }
         const carrierDiagnosticAttempts =
           row?.carrier_shipping_diagnostic_attempt_counts
+        if (Number(hostedProductionSandboxReadAuthority?.expiring_soon || 0) > 0) {
+          warnings.push(
+            'Hosted-production Shopify sandbox read authority expires within 14 days; review and renew it before expiry if the demo stores must remain connected.',
+          )
+        }
+        if (Number(hostedProductionSandboxReadAuthority?.expired_unrevoked || 0) > 0) {
+          warnings.push(
+            'Hosted-production Shopify sandbox read authority has expired and is fail-closed; revoke or replace the expired grant after review.',
+          )
+        }
+        if (
+          Number(hostedProductionSandboxReadAuthority?.invalid_active || 0) > 0
+          || Number(hostedProductionSandboxReadAuthority?.future_active || 0) > 0
+        ) {
+          warnings.push(
+            'Hosted-production Shopify sandbox read authority is active but not current for its verified provider identity or credential generation.',
+          )
+        }
         if (
           (carrierDiagnosticAttempts?.sandbox?.stalePrepared || 0) > 0
           || (carrierDiagnosticAttempts?.production?.stalePrepared || 0) > 0
@@ -9097,7 +9516,10 @@ export async function GET() {
           || !row?.faire_provider_write_auth_applied
           || !row?.faire_fulfillment_authority_applied
           || !row?.operations_commerce_fulfillment_recovery_applied
+          || !row?.operations_commerce_fulfillment_recovery_budget_applied
           || !row?.operations_commerce_product_image_imports_applied
+          || !row?.operations_commerce_product_image_runtime_parking_applied
+          || !row?.operations_hosted_production_sandbox_read_authority_applied
           || !row?.operations_commerce_product_image_fanout_applied
           || !row?.operations_commerce_product_image_source_normalization_applied
           || !row?.operations_faire_product_image_projection_applied
@@ -9533,7 +9955,9 @@ export async function GET() {
                               AND account.id = job.integration_account_id
                               AND account.integration_type = 'commerce'
                               AND account.provider = job.provider
-                              AND ${commerceReadAccountSql('account')}
+                              AND ${commerceReadAccountSql('account', {
+                                capability: 'catalog',
+                              })}
                               AND account.commerce_credential_generation
                                 = job.credential_version
                               AND credential.credential_version
@@ -9602,7 +10026,9 @@ export async function GET() {
                      ON activation.organization_id = account.organization_id
                    WHERE account.integration_type = 'commerce'
                      AND account.provider = 'shopify'
-                     AND ${commerceReadAccountSql('account')}
+                     AND ${commerceReadAccountSql('account', {
+                       capability: 'catalog',
+                     })}
                      AND account.commerce_credential_generation
                        = refresh.credential_generation
                      AND credential.credential_version
@@ -9659,7 +10085,9 @@ export async function GET() {
                     WHERE cursor.resource = 'products'
                       AND cursor.reconciliation_status = 'running'
                       AND account.integration_type = 'commerce'
-                      AND ${commerceReadAccountSql('account')}
+                      AND ${commerceReadAccountSql('account', {
+                        capability: 'catalog',
+                      })}
                       AND credential.credential_version
                         = account.commerce_credential_generation
                       AND credential.verification_status = 'verified'
@@ -10128,6 +10556,7 @@ export async function GET() {
           if (
             commerceReadRuntimeAvailable()
             && row?.operations_commerce_product_image_imports_applied
+            && row?.operations_commerce_product_image_runtime_parking_applied
             && row?.operations_commerce_product_image_fanout_applied
             && row?.operations_commerce_product_image_source_normalization_applied
           ) {
@@ -10550,13 +10979,18 @@ export async function GET() {
     }
 
     return NextResponse.json({
-      status: errors.length > 0 ? 'error' : 'ok',
+      status: errors.length > 0
+        ? 'error'
+        : integrationCredentialRuntime.maintenance === true
+          ? 'maintenance'
+          : 'ok',
       errors,
       warnings,
-      runtime: cloudProvider || 'hosted',
+      runtime: cloudProvider || 'authenticated-postgres',
       environment: process.env.RAILWAY_ENVIRONMENT_NAME || process.env.VERCEL_ENV || null,
       storage,
       database,
+      integrationCredentialRuntime,
       careerSiteSubmissions,
       careerSiteMail,
       careerSiteAgents,
@@ -10615,7 +11049,9 @@ export async function GET() {
         },
       },
       checkedAt,
-    }, { status: errors.length > 0 ? 503 : 200 })
+    }, {
+      status: errors.length > 0 ? 503 : 200,
+    })
   }
 
   const logSource = resolveLogPath()

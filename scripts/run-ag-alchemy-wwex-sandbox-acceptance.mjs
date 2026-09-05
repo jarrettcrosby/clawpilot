@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const nodeRequire = createRequire(import.meta.url)
@@ -205,6 +206,10 @@ function loadTypeScriptModule(path, dependencies = {}) {
 
 const credentialCrypto = loadTypeScriptModule(
   'app_src/lib/integrations/brokeredTransportCredentialCrypto.ts',
+  {
+    './integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
+  },
 )
 const wwexFoundation = loadTypeScriptModule(
   'app_src/lib/integrations/wwexSpeedshipFoundation.ts',

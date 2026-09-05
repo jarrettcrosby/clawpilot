@@ -16,6 +16,9 @@ import {
   voidCarrierSandboxLabel,
 } from '@/lib/integrations/carrierSandboxLabel'
 import { CARRIER_SANDBOX_RATE_FIXTURE } from '@/lib/integrations/carrierSandboxRate'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import type { OperationsSandboxLabelCommandResult } from '@/lib/operations/types'
 import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
@@ -678,6 +681,7 @@ function safeProviderResponse(error: CarrierSandboxLabelError) {
 }
 
 function mapCarrierError(error: unknown): OperationsRequestError {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof OperationsRequestError) return error
   if (error instanceof CarrierIntegrationRequestError) {
     return new OperationsRequestError(error.code, error.message, error.status)
@@ -1310,6 +1314,7 @@ export async function createOperationsSandboxLabelInPostgres(
         : {}),
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const carrierError = error instanceof CarrierSandboxLabelError
       ? error
       : new CarrierSandboxLabelError(
@@ -1562,6 +1567,7 @@ export async function voidOperationsSandboxLabelInPostgres(
       providerReference: activeLabel.provider_label_id,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const carrierError = error instanceof CarrierSandboxLabelError
       ? error
       : new CarrierSandboxLabelError(

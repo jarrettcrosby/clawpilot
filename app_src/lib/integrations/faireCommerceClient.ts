@@ -1,3 +1,8 @@
+import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+
 export const FAIRE_API_BASE_URL = 'https://www.faire.com/external-api/v2' as const
 export const FAIRE_OAUTH_AUTHORIZE_URL =
   'https://faire.com/oauth2/authorize' as const
@@ -2097,6 +2102,7 @@ export async function exchangeFaireOAuthAuthorizationCode(
   let response: Response
   let bytes: Uint8Array
   try {
+    assertIntegrationCredentialProviderIoReady()
     response = await fetchImpl(FAIRE_OAUTH_TOKEN_URL, {
       method: 'POST',
       headers: {
@@ -2118,6 +2124,7 @@ export async function exchangeFaireOAuthAuthorizationCode(
     })
     bytes = await readBoundedResponse(response)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof FaireCommerceClientError) throw error
     if (controller.signal.aborted || isAbortError(error)) {
       throw new FaireCommerceClientError(
@@ -2234,6 +2241,7 @@ export function createFaireCommerceClient(
     let response: Response
     let bytes: Uint8Array
     try {
+      assertIntegrationCredentialProviderIoReady()
       response = await fetchImpl(url, {
         method: input.method || 'GET',
         headers,
@@ -2245,6 +2253,7 @@ export function createFaireCommerceClient(
       })
       bytes = await readBoundedResponse(response)
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       if (error instanceof FaireCommerceClientError) throw error
       if (controller.signal.aborted || isAbortError(error)) {
         throw new FaireCommerceClientError(

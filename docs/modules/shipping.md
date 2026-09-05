@@ -121,8 +121,11 @@ ClawPilot Railway app service, project, and environment. Vercel deployments, bro
 previews, generic development markers, and local runtimes cannot authorize or
 select production postage.
 
-Railway development eligibility is only a runtime boundary. It does not grant
-carrier authority. Before any production provider call, the command still
+The retained Railway-development eligibility branch is a dormant legacy
+boundary; the hosted development environment is retired and cannot authorize
+postage in the active topology. If a separately reviewed hosted development
+lane is ever restored, runtime eligibility still does not grant carrier
+authority. Before any production provider call, the command still
 requires all of the following current facts:
 
 - Operations is Active and the actor can manage, execute, and activate
@@ -137,8 +140,8 @@ requires all of the following current facts:
   idempotent purchase and the durable pre-call fence still passes.
 
 A successful request creates real production postage and may incur charges.
-The complete label group must be reviewed and then voided through ClawPilot for
-an approved development exercise. Revoking `production_label` immediately
+For a separately approved live acceptance exercise, the complete label group
+must be reviewed and then voided through ClawPilot. Revoking `production_label` immediately
 blocks new purchases but deliberately does not disable the exact-account void
 path, so already purchased postage cannot be stranded. Provider acceptance is
 not claimed by the runtime or unit tests; it requires a separately authorized
@@ -172,10 +175,13 @@ PostgreSQL seal.
 `scripts/run-ag-alchemy-wwex-sandbox-acceptance.mjs` is a separate, opt-in
 acceptance for actual Worldwide Express sandbox OAuth and read-only `shopFlow`
 requests. Default and `--self-test` modes use no live database or provider.
-Execution requires the exact confirmation printed by its default plan, the
-trusted Railway development project/environment identity, the trusted database
-fingerprint, a repeatable-read read-only transaction, the sole active AG
-Alchemy warehouse, and an active verified WWEX sandbox rate capability. Its
+The live execution lane is preserved only as historical hosted-development
+evidence and is unavailable in the active topology. Default and `--self-test`
+modes remain hermetic. If a hosted development lane is separately restored,
+live execution requires the exact confirmation printed by its default plan,
+the trusted Railway development project/environment identity, the trusted
+database fingerprint, a repeatable-read read-only transaction, the sole active
+AG Alchemy warehouse, and an active verified WWEX sandbox rate capability. Its
 network gate permits only the reviewed OAuth endpoint and `/svc/shopFlow`;
 tender, integrated-order, pickup, label, BOL, and other provider mutation
 routes are unavailable.

@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -78,6 +79,9 @@ function loadAdapterModule() {
           requestShopifyAccessToken: unavailable,
           shopifyAdminGraphql: unavailable,
         }
+      }
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
       }
       return nodeRequire(specifier)
     },

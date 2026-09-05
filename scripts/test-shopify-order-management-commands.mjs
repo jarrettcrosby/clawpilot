@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const requireFromApp = createRequire(
@@ -782,6 +783,9 @@ function loadCommands() {
     module,
     process,
     require(specifier) {
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
+      }
       if (specifier === '@/lib/integrations/commerceCredentialCrypto') {
         return {
           decryptCommerceCredential(

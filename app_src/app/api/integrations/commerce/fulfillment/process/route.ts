@@ -4,6 +4,12 @@ import {
   commerceFulfillmentRecoveryRuntimeAvailable,
   processCommerceFulfillmentRecovery,
 } from '@/lib/commerceFulfillmentRecoveryWorker'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   readCommerceFulfillmentRecoveryHealthInPostgres,
@@ -74,10 +80,15 @@ export async function POST(req: NextRequest) {
       heartbeatAt: heartbeat.checkedAt,
     })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
     await recordCommerceFulfillmentRecoveryHeartbeatInPostgres({
-      phase: 'failed',
+      phase: maintenance ? 'maintenance' : 'failed',
       workerId,
+      ...(isIntegrationCredentialRuntimeGateError(error)
+        ? { errorCode: String((error as { code?: unknown }).code || '') }
+        : {}),
     }).catch(() => undefined)
+    if (maintenance) return maintenance
     throw error
   }
 }

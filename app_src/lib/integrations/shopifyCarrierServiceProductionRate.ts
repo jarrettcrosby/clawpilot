@@ -22,6 +22,9 @@ import {
 import {
   shopifyCheckoutCarrierSelectionKey,
 } from '@/lib/integrations/shopifyCheckoutCarrierSelection'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const SHA256 = /^[a-f0-9]{64}$/
 
@@ -256,6 +259,7 @@ export async function rateShopifyProductionCheckoutShipment(input: {
       })),
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (runtime) {
       const fallback = safeFailureRequest({
         provider: input.binding.provider,

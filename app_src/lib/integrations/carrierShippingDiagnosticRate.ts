@@ -15,6 +15,9 @@ import {
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import { writeCarrierProductionRateEvidenceInPostgres } from '@/lib/persistence/carrierIntegrations'
 import { OperationsRequestError } from '@/lib/persistence/operations'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export type CarrierShippingDiagnosticDestination = {
   name: string
@@ -115,7 +118,7 @@ export async function testCarrierProductionShippingDiagnosticRate(input: {
     if (!carrierProductionLabelAuthorizationAllowed()) {
       throw new OperationsRequestError(
         'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
-        'LIVE production diagnostics are available only in production or the trusted Railway development service',
+        'LIVE production diagnostics are available only in the trusted Railway production service',
         403,
       )
     }
@@ -217,6 +220,7 @@ export async function testCarrierProductionShippingDiagnosticRate(input: {
       evidenceGlobalId,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const safe = diagnosticError(error)
     if (runtime && prepared) {
       await writeCarrierProductionRateEvidenceInPostgres({

@@ -11,6 +11,9 @@ import {
   encryptCommerceIntakeContinuation,
   shopifyCheckoutDestinationFingerprint,
 } from '@/lib/integrations/commerceCredentialCrypto'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
 import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
@@ -8389,12 +8392,14 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       let address: Record<string, unknown> | null = null
       try {
         party = encryptedSnapshot(candidate, input.accountGlobalId, 'party')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         party = null
       }
       try {
         address = encryptedSnapshot(candidate, input.accountGlobalId, 'ship_to')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         address = null
       }
       const lines = linesByCandidate.get(candidate.id) || []
@@ -10590,7 +10595,8 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
     let party: Record<string, unknown> | null = null
     try {
       party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       party = null
     }
     const externalIdentity = party?.externalIdentity
@@ -11029,12 +11035,14 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
       let address: Record<string, unknown> | null = null
       try {
         party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         party = null
       }
       try {
         address = encryptedSnapshot(candidate, input.runtime.globalId, 'ship_to')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         address = null
       }
       const externalIdentity = party?.externalIdentity
@@ -11401,7 +11409,8 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
             input.runtime.globalId,
             'ship_to',
           )
-        } catch {
+        } catch (error) {
+          if (isIntegrationCredentialRuntimeGateError(error)) throw error
           snapshot = null
         }
         if (!snapshot || !completeAddress(snapshot)) {
@@ -12018,7 +12027,8 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
             input.runtime.globalId,
             'ship_to',
           )
-        } catch {
+        } catch (error) {
+          if (isIntegrationCredentialRuntimeGateError(error)) throw error
           snapshot = null
         }
         if (!snapshot || !completeAddress(snapshot)) {
@@ -12125,7 +12135,8 @@ export async function confirmCommerceCandidateAddressInPostgres(input: {
         'ship_to',
       )
       providerAddress = snapshot ? normalizedAddress(snapshot) : null
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       providerAddress = null
     }
     const source = providerAddress

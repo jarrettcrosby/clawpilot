@@ -9,6 +9,7 @@ import {
 import {
   readFaireOAuthCallbackAuthorizationCode,
 } from '@/lib/integrations/faireOAuthCallback'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
@@ -99,6 +100,8 @@ export async function GET(req: NextRequest) {
     })
     return redirect('connected')
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     if (error instanceof Error && error.message === 'Unauthorized') {
       return redirect('error', 'UNAUTHORIZED')
     }

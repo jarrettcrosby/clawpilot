@@ -227,7 +227,13 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - `quickbooks_departments`
 - `quickbooks_tax_codes`
 
-All rows are organization-scoped. A multi-business user connects, selects, and reports on Toast only within the active workspace membership; credentials and restaurant data never cross root businesses. Development and production use their own Postgres databases and credential records.
+All rows are organization-scoped. A multi-business user connects, selects, and
+reports on Toast only within the active workspace membership; credentials and
+restaurant data never cross root businesses. Railway production is the required
+owner of the live Postgres and credential records after cutover. Local and
+remote-local runtimes do not receive or reuse them. Post-retirement Vercel
+previews must not receive them; the current legacy application-project
+assignments remain cutover blockers until the gated cleanup and re-audit pass.
 
 ## Current Release Boundary
 

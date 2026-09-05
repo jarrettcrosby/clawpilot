@@ -5,6 +5,10 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CarrierSandboxLabelError,
   carrierLabelAdapterInternals,
   type CarrierLabelOutputFormat,
@@ -866,6 +870,7 @@ export async function executeCarrierOneOffGroupShipment(
       timeoutMs,
       signal: controller.signal,
     })
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(
       prepared.providerEndpoint,
       {
@@ -943,6 +948,7 @@ export async function executeCarrierOneOffGroupShipment(
       },
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw mappedError(error, prepared.correlationId)
   } finally {
     clearTimeout(timeout)
@@ -1100,6 +1106,7 @@ export async function executeCarrierOneOffGroupVoid(
       signal: controller.signal,
     })
     const isUps = prepared.provider === 'ups_rest'
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(
       prepared.providerEndpoint,
       {
@@ -1187,6 +1194,7 @@ export async function executeCarrierOneOffGroupVoid(
       },
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw mappedError(error, prepared.correlationId)
   } finally {
     clearTimeout(timeout)

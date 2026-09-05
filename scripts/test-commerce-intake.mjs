@@ -5,6 +5,8 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -82,6 +84,44 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeHttp'
+      ) {
+        return {
+          integrationCredentialRuntimeMaintenanceResponse(error) {
+            if (
+              !integrationCredentialRuntimeGate
+                .isIntegrationCredentialRuntimeGateError(error)
+            ) {
+              return null
+            }
+            return {
+              payload: {
+                ok: false,
+                error:
+                  'Integration credential services are temporarily unavailable',
+                code: error.code,
+                retryable: true,
+              },
+              status: 503,
+              headers: {
+                'Cache-Control': 'no-store, max-age=0',
+                Pragma: 'no-cache',
+                Expires: '0',
+                'Retry-After': '60',
+                'X-Content-Type-Options': 'nosniff',
+              },
+            }
+          },
+        }
       }
       if (specifier === '@/lib/integrations/commerceReadRuntime') {
         return loadTypeScriptModule(
@@ -2281,9 +2321,45 @@ includes(credentialCryptoSource, [
 ], 'Encrypted commerce read replay evidence')
 includes(credentialCryptoSource, [
   'commerceCustomerEvidenceFingerprint',
-  ".createHmac('sha256', encryptionKey())",
+  'withEncryptionKey((key)',
+  ".createHmac('sha256', key)",
   'clawpilot:commerce:customer-evidence:v1',
 ], 'Keyed commerce customer evidence fingerprints')
+const commerceRuntimeGateError =
+  new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+const unavailableCommerceCrypto = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceCredentialCrypto.ts',
+  {
+    mocks: {
+      '@/lib/globalIds.mjs': globalIds,
+      '@/lib/persistence/config': { isHostedRuntime: () => false },
+      '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs': {},
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+        ...integrationCredentialRuntimeGate,
+        integrationCredentialRuntimeEncryptionKey() {
+          throw commerceRuntimeGateError
+        },
+      },
+    },
+  },
+)
+assert.throws(
+  () => unavailableCommerceCrypto.decryptCommerceCredential(
+    {
+      ciphertext: Buffer.alloc(1),
+      iv: Buffer.alloc(12),
+      tag: Buffer.alloc(16),
+    },
+    '11111111-1111-4111-8111-111111111111',
+    'shopify',
+    'production',
+    'runtime-gate.example.myshopify.com',
+  ),
+  (error) => error === commerceRuntimeGateError,
+  'commerce decryption must preserve typed runtime maintenance',
+)
 const workflowSource = read(
   'app_src/components/settings/CommerceIntakeWorkflow.tsx',
 )

@@ -18,6 +18,9 @@ import {
 import {
   ShopifyProductWritebackError,
 } from '@/lib/integrations/shopifyProductWriteback'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   requestSession,
@@ -52,6 +55,8 @@ function fail(code: string, message: string, status = 400): never {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof ShopifyProductWritebackError) {
     return json({
       ok: false,

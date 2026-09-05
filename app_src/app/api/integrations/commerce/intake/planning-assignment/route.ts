@@ -3,6 +3,9 @@ import {
   inspectShopifyOrderPlanningAssignment,
   ShopifyOrderPlanningAuthorityError,
 } from '@/lib/integrations/shopifyOrderPlanningAuthority'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -102,6 +105,8 @@ export async function POST(req: NextRequest) {
     })
     return json({ ok: true, assignment })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     if (error instanceof Error && error.message === 'Unauthorized') {
       return json(
         { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },

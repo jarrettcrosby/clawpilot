@@ -193,6 +193,11 @@ const route = loadTypeScriptModule(
       },
     },
     '@/lib/integrations/faireCommerceClient': { FaireCommerceClientError },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse() {
+        return null
+      },
+    },
     '@/lib/integrations/shopifyCommerceClient': { ShopifyCommerceClientError },
     '@/lib/operations/authorization': {
       activeOperationsOrganizationId(actor) {

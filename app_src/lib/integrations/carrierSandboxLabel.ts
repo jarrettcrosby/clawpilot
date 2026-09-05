@@ -5,6 +5,10 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   carrierSandboxPartyFingerprint,
   normalizeCarrierSandboxParty,
@@ -1062,6 +1066,7 @@ export async function createCarrierSandboxLabel(
       timeoutMs: options.timeoutMs,
     })).accessToken
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw credentialError(error)
   }
   const transactionId = randomUUID().replace(/-/g, '')
@@ -1081,6 +1086,7 @@ export async function createCarrierSandboxLabel(
     const serializedBody = JSON.stringify(body)
     operationContext.operationStage = 'shipment_request_dispatch'
     operationContext.providerRequestDispatchAttempted = true
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(LABEL_ENDPOINTS[input.provider], {
       method: 'POST',
       headers: {
@@ -1151,6 +1157,7 @@ export async function createCarrierSandboxLabel(
       },
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw operationError(error, transactionId, operationContext)
   } finally {
     clearTimeout(timeout)
@@ -1184,6 +1191,7 @@ export async function voidCarrierSandboxLabel(
       timeoutMs: options.timeoutMs,
     })).accessToken
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw credentialError(error)
   }
   const transactionId = randomUUID().replace(/-/g, '')
@@ -1206,6 +1214,7 @@ export async function voidCarrierSandboxLabel(
         })
     operationContext.operationStage = 'shipment_request_dispatch'
     operationContext.providerRequestDispatchAttempted = true
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(
       isUps
         ? `${VOID_ENDPOINTS.ups_rest}/${encodeURIComponent(providerReference)}`
@@ -1292,6 +1301,7 @@ export async function voidCarrierSandboxLabel(
       },
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw operationError(error, transactionId, operationContext)
   } finally {
     clearTimeout(timeout)

@@ -118,6 +118,26 @@ const additiveOrderHistoryEvidenceMigrations = [
     '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'],
 ]
 
+const integrationCredentialKeyAttestationMigration = [
+  'db/migrations/0356_operations_integration_credential_key_attestation.sql',
+  '7d66bab80f112d4c07466c8530921c514d67f4db8231ea97019b71005b74506f',
+]
+
+const commerceProductImageRuntimeParkingMigration = [
+  'db/migrations/0357_operations_commerce_product_image_runtime_parking.sql',
+  'e8636998cfa8e8e24717ba7ffda11f4e2e0031fc83a439914a18f6d568c836a2',
+]
+
+const hostedProductionSandboxReadAuthorityMigration = [
+  'db/migrations/0358_operations_hosted_production_sandbox_read_authority.sql',
+  '3e99c87a322816df28a76d0e00a2001d5301f978163679f950c1be856c1b5b79',
+]
+
+const commerceFulfillmentRecoveryBudgetMigration = [
+  'db/migrations/0359_operations_commerce_fulfillment_recovery_budget.sql',
+  '1bd515490a8c30ac412b03a17e4d37dc434376efa773cb0a723633195dcbe8f2',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -154,6 +174,66 @@ if (!existsSync(resolve(root, 'app_src/package.json'))) {
 }
 
 const rootPackage = readJson('package.json')
+
+const [integrationCredentialKeyAttestationMigrationPath,
+  integrationCredentialKeyAttestationMigrationChecksum] =
+  integrationCredentialKeyAttestationMigration
+if (!existsSync(resolve(root, integrationCredentialKeyAttestationMigrationPath))) {
+  fail('missing integration credential key-attestation migration')
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, integrationCredentialKeyAttestationMigrationPath)))
+    .digest('hex') !== integrationCredentialKeyAttestationMigrationChecksum
+) {
+  fail('integration credential key-attestation migration checksum drifted')
+}
+
+const [commerceProductImageRuntimeParkingMigrationPath,
+  commerceProductImageRuntimeParkingMigrationChecksum] =
+  commerceProductImageRuntimeParkingMigration
+if (!existsSync(resolve(root, commerceProductImageRuntimeParkingMigrationPath))) {
+  fail('missing commerce product-image runtime-parking migration')
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, commerceProductImageRuntimeParkingMigrationPath)))
+    .digest('hex') !== commerceProductImageRuntimeParkingMigrationChecksum
+) {
+  fail('commerce product-image runtime-parking migration checksum drifted')
+}
+
+const [hostedProductionSandboxReadAuthorityMigrationPath,
+  hostedProductionSandboxReadAuthorityMigrationChecksum] =
+  hostedProductionSandboxReadAuthorityMigration
+if (!existsSync(resolve(root, hostedProductionSandboxReadAuthorityMigrationPath))) {
+  fail('missing hosted-production sandbox read-authority migration')
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, hostedProductionSandboxReadAuthorityMigrationPath),
+    ))
+    .digest('hex') !== hostedProductionSandboxReadAuthorityMigrationChecksum
+) {
+  fail('hosted-production sandbox read-authority migration checksum drifted')
+}
+
+const [commerceFulfillmentRecoveryBudgetMigrationPath,
+  commerceFulfillmentRecoveryBudgetMigrationChecksum] =
+  commerceFulfillmentRecoveryBudgetMigration
+if (!existsSync(resolve(root, commerceFulfillmentRecoveryBudgetMigrationPath))) {
+  fail('missing commerce fulfillment-recovery budget migration')
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, commerceFulfillmentRecoveryBudgetMigrationPath),
+    ))
+    .digest('hex') !== commerceFulfillmentRecoveryBudgetMigrationChecksum
+) {
+  fail('commerce fulfillment-recovery budget migration checksum drifted')
+}
 
 for (const [relativePath, expectedChecksum] of orderEditingReleaseMigrations) {
   if (!existsSync(resolve(root, relativePath))) {
@@ -255,6 +335,40 @@ const healthRouteSource = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
 )
+for (const requiredFragment of [
+  hostedProductionSandboxReadAuthorityMigrationChecksum,
+  'AS operations_hosted_production_sandbox_read_authority_applied',
+  '&& row?.operations_hosted_production_sandbox_read_authority_applied',
+  '|| !row?.operations_hosted_production_sandbox_read_authority_applied',
+  'hostedProductionSandboxReadAuthority',
+  "'expiring-soon'",
+  'warningWindowDays: 14',
+  'Hosted-production Shopify sandbox read authority expires within 14 days',
+]) {
+  if (!healthRouteSource.includes(requiredFragment)) {
+    fail(
+      'health route is missing hosted-production sandbox read-authority wiring: '
+      + requiredFragment,
+    )
+  }
+}
+for (const requiredFragment of [
+  commerceFulfillmentRecoveryBudgetMigrationChecksum,
+  'AS operations_commerce_fulfillment_recovery_budget_applied',
+  '&& row?.operations_commerce_fulfillment_recovery_budget_applied',
+  '|| !row?.operations_commerce_fulfillment_recovery_budget_applied',
+  'commerceFulfillmentRecoveryBudget',
+  'automatic_recovery_attempts',
+  'operations_commerce_fulfillment_exports_recovery_budget_valid',
+  'operations_commerce_fulfillment_exports_recovery_budget_idx',
+]) {
+  if (!healthRouteSource.includes(requiredFragment)) {
+    fail(
+      'health route is missing commerce fulfillment-recovery budget wiring: '
+      + requiredFragment,
+    )
+  }
+}
 for (const requiredFragment of [
   'OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL',
   'operations_order_unit_weight_applied',
@@ -840,13 +954,8 @@ if (String(vercel.buildCommand || '') !== 'npm run build:vercel') {
 }
 
 const vercelDeploymentEnabled = vercel?.git?.deploymentEnabled
-if (
-  !vercelDeploymentEnabled
-  || vercelDeploymentEnabled.dev !== false
-  || vercelDeploymentEnabled.main !== false
-  || Object.keys(vercelDeploymentEnabled).length !== 2
-) {
-  fail('app_src/vercel.json must disable automatic dev and main deployments while leaving feature previews enabled')
+if (vercelDeploymentEnabled !== false) {
+  fail('app_src/vercel.json must disable Vercel Git deployments for every branch during the transitional cutover')
 }
 
 if (String(vercel.outputDirectory || '') !== '.next') {
@@ -855,6 +964,82 @@ if (String(vercel.outputDirectory || '') !== '.next') {
 
 if (!existsSync(resolve(root, 'app_src/package-lock.json'))) {
   fail('missing app_src/package-lock.json required by Vercel npm ci')
+}
+
+const vercelBuild = readFileSync(resolve(root, 'scripts/vercel-build.mjs'), 'utf8')
+for (const requiredPreviewBoundary of [
+  "environment !== 'preview'",
+  'production and development deployments are prohibited by the post-cutover contract',
+  'does not prove the legacy Vercel credential retirement is complete',
+]) {
+  if (!vercelBuild.includes(requiredPreviewBoundary)) {
+    fail(`scripts/vercel-build.mjs is missing preview boundary: ${requiredPreviewBoundary}`)
+  }
+}
+for (const prohibitedVercelAction of [
+  'verify-mail-sender.mjs',
+  'db-migrate.mjs',
+  'db:migrate',
+]) {
+  if (vercelBuild.includes(prohibitedVercelAction)) {
+    fail(`scripts/vercel-build.mjs must not contain ${prohibitedVercelAction}`)
+  }
+}
+
+const environmentContract = readFileSync(
+  resolve(root, 'docs/operations/clawpilot-environments.md'),
+  'utf8',
+)
+for (const requiredCutoverBoundary of [
+  'This table is the accepted target, not a claim that the retirement is already',
+  '`AGENT_CREDENTIAL_DATABASE_URL`',
+  'No `INTEGRATION_CREDENTIAL_*` variable was present',
+  'Until this succeeds, the cutover remains incomplete and Vercel is not accepted as preview-only',
+  'npm run integration-key:attest -- verify',
+  '--hostname 127.0.0.1 --port 4002',
+]) {
+  if (!environmentContract.includes(requiredCutoverBoundary)) {
+    fail(`environment contract is missing cutover boundary: ${requiredCutoverBoundary}`)
+  }
+}
+
+const environmentExample = readFileSync(resolve(root, '.env.example'), 'utf8')
+for (const requiredRemoteLocalSetting of [
+  '# APP_AUTH_REQUIRED=1',
+  '# CLAWPILOT_STORAGE=postgres',
+  '# CLAWPILOT_DB_FALLBACK_TO_FILE=false',
+  '# DATABASE_URL=postgresql://user:password@host:port/database',
+  '# INTEGRATION_CREDENTIAL_ENCRYPTION_KEY=replace-with-at-least-32-random-characters',
+  '# INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID=local-integrations-2026-09',
+  '# INTEGRATION_CREDENTIAL_ATTESTATION_MODE=strict',
+  '# CLAWPILOT_EXECUTION_ENABLED=0',
+  '# CLAWPILOT_COMMERCE_INTAKE_ENABLED=0',
+  '# CRM_ENABLED=0',
+]) {
+  if (!environmentExample.includes(requiredRemoteLocalSetting)) {
+    fail(`.env.example is missing remote-local setting: ${requiredRemoteLocalSetting}`)
+  }
+}
+for (const productionSpecificExample of [
+  'https://dev.aiapp.eigenracing.com',
+  'https://aiapp.eigenracing.com',
+  'https://eigenracing.com',
+  'suburbiasandwichco.com',
+  'jarrett@',
+  '405bb919-0364-4a88-8a62-b4c9da42cd8f',
+  'replace-with-the-production-Sheet-id',
+]) {
+  if (environmentExample.includes(productionSpecificExample)) {
+    fail(`.env.example must not carry production-specific value: ${productionSpecificExample}`)
+  }
+}
+
+const backupAudit = readFileSync(
+  resolve(root, 'scripts/railway-backup-audit.mjs'),
+  'utf8',
+)
+if (!backupAudit.includes("const DEFAULT_ENVIRONMENTS = ['development', 'production']")) {
+  fail('Railway backup audit must cover development and production until DEV retirement is accepted')
 }
 
 const railway = readJson('railway.json')
@@ -903,6 +1088,45 @@ const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'ut
 if (!railwayStart.includes('npm run release:record')) {
   fail('scripts/start-railway.sh must record a release after runtime health validation')
 }
+for (const requiredIntegrationCredentialGate of [
+  'require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY 32',
+  'require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID 1',
+  'INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict',
+  'node scripts/verify-integration-credential-runtime.mjs',
+  'export INTEGRATION_CREDENTIAL_RUNTIME_PROOF',
+  'the pipeline outbox poller is suppressed',
+]) {
+  if (!railwayStart.includes(requiredIntegrationCredentialGate)) {
+    fail(
+      'scripts/start-railway.sh is missing integration credential runtime gate: '
+      + requiredIntegrationCredentialGate,
+    )
+  }
+}
+if (
+  railwayStart.indexOf('node scripts/verify-integration-credential-runtime.mjs')
+    > railwayStart.indexOf('npm run start &')
+) {
+  fail('integration credential runtime attestation must precede application startup')
+}
+
+const strictWorkerGatePosition = railwayStart.indexOf(
+  'if [[ "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" == "strict" ]]; then',
+)
+const workerStartPosition = railwayStart.indexOf(
+  'node scripts/pipeline-outbox-poller.mjs &',
+)
+const workerSuppressionPosition = railwayStart.indexOf(
+  'the pipeline outbox poller is suppressed',
+)
+if (
+  strictWorkerGatePosition < 0
+  || workerStartPosition < strictWorkerGatePosition
+  || workerSuppressionPosition < workerStartPosition
+  || !railwayStart.includes('if [[ -n "$WORKER_PID" ]]; then')
+) {
+  fail('Railway adoption maintenance must suppress and safely omit the outbox poller')
+}
 
 const healthGatePosition = railwayStart.indexOf('[[ "$HEALTHY" == "1" ]]')
 const toastBackfillPosition = railwayStart.indexOf('npm run toast:activate-payment-date-backfill')
@@ -919,6 +1143,26 @@ if (releaseRecordPosition < healthGatePosition) {
 }
 
 for (const requiredPath of [
+  'db/migrations/0356_operations_integration_credential_key_attestation.sql',
+  'db/migrations/0357_operations_commerce_product_image_runtime_parking.sql',
+  'db/migrations/0358_operations_hosted_production_sandbox_read_authority.sql',
+  'db/migrations/0359_operations_commerce_fulfillment_recovery_budget.sql',
+  'app_src/lib/integrations/integrationCredentialKeyAttestation.mjs',
+  'app_src/lib/integrations/integrationCredentialRuntimeGate.mjs',
+  'scripts/integration-credential-key-attestation.mjs',
+  'scripts/verify-integration-credential-runtime.mjs',
+  'scripts/production-rebind-history-schema-attestation.mjs',
+  'scripts/rebind-migrated-production-integrations.mjs',
+  'scripts/test-integration-credential-key-attestation.mjs',
+  'scripts/test-integration-credential-key-attestation-postgres.mjs',
+  'scripts/test-integration-credential-runtime-gate.mjs',
+  'scripts/test-integration-credential-runtime-gate-postgres.mjs',
+  'scripts/test-production-rebind-history-schema-attestation.mjs',
+  'scripts/test-rebind-migrated-production-integrations.mjs',
+  'scripts/test-rebind-migrated-production-integrations-postgres.mjs',
+  'scripts/test-commerce-production-read-parity.mjs',
+  'docs/operations/integration-credential-key-attestation.md',
+  'docs/operations/commerce-workspace-production-migration.md',
   'db/migrations/0303_operations_shopify_order_webhook_reconciliation.sql',
   'app_src/lib/integrations/shopifyOrderWebhookRecovery.ts',
   'app_src/lib/persistence/shopifyOrderWebhookReconciliation.ts',
@@ -1742,6 +1986,45 @@ if (
   fail('commerce order workbench tests must run the bounded history batch gate')
 }
 
+const productionCutoverGate = String(
+  rootPackage?.scripts?.['test:production-cutover'] || '',
+)
+const integrationCredentialRuntimeGate = readFileSync(
+  resolve(root, 'app_src/lib/integrations/integrationCredentialRuntimeGate.mjs'),
+  'utf8',
+)
+for (const requiredRuntimeSchemaGate of [
+  '0357_operations_commerce_product_image_runtime_parking.sql',
+  'e8636998cfa8e8e24717ba7ffda11f4e2e0031fc83a439914a18f6d568c836a2',
+  'product_image_runtime_parking_migration_applied',
+  'product_image_runtime_parking_function_valid',
+  'product_image_runtime_parking_trigger_valid',
+]) {
+  if (!integrationCredentialRuntimeGate.includes(requiredRuntimeSchemaGate)) {
+    fail(
+      'integration credential runtime gate must fail closed on missing 0357 readiness: '
+      + requiredRuntimeSchemaGate,
+    )
+  }
+}
+for (const requiredGate of [
+  'npm run test:commerce-workspace-migration',
+  'npm run test:integration-key-attestation',
+  'scripts/test-integration-credential-runtime-gate.mjs',
+  'scripts/test-integration-credential-runtime-gate-postgres.mjs',
+  'npm run test:commerce-product-image-import-worker',
+  'npm run test:commerce-product-image-imports-postgres',
+  'npm run test:commerce-fulfillment-recovery',
+  'npm run test:operation-shipment-completion',
+  'scripts/test-production-rebind-history-schema-attestation.mjs',
+  'npm run test:migrated-production-provider-rebind',
+  'npm run test:commerce-production-read-parity',
+]) {
+  if (!productionCutoverGate.includes(requiredGate)) {
+    fail(`production cutover tests must run ${requiredGate}`)
+  }
+}
+
 const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
 if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download')) {
   fail('application build must not regenerate the tracked developer print-agent preview')
@@ -1756,6 +2039,8 @@ run(process.execPath, [
 ])
 run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e.mjs'])
 run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e-health.mjs'])
+run('npm', ['run', 'test:commerce-product-image-import-worker'])
+run('npm', ['run', 'test:commerce-product-image-imports-postgres'])
 run('npm', ['run', 'build'])
 
 if (!existsSync(resolve(root, 'app_src/.next/BUILD_ID'))) {

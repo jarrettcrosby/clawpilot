@@ -3465,6 +3465,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,
           '@/lib/integrations/shopifyExternalFulfillmentReconciliation':

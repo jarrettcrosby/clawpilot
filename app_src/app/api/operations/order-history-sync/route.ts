@@ -8,6 +8,9 @@ import {
 import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -414,6 +417,8 @@ export async function POST(req: NextRequest) {
     })
     return response({ ok: true, replayed: false, result })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     if (error instanceof Error && error.message === 'Unauthorized') {
       return response({
         ok: false,

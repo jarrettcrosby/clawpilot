@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -89,6 +90,8 @@ const evidence = loadTypeScriptModule(
 const credentialCrypto = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCredentialCrypto.ts',
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs': await import(
       '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
     ),
@@ -309,6 +312,8 @@ function createShopifyExactReadHarness(responses) {
         commerceReadRuntimeAvailable: () => true,
         commerceReadRuntimeMode: () => 'development',
       },
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
       '@/lib/integrations/faireCommerceClient': {},
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION: 'test-faire-normalizer',

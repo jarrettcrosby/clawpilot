@@ -4,6 +4,9 @@ import {
   type ShopifyCommerceClientOptions,
   type ShopifyCommerceRuntimeCredential,
 } from '@/lib/integrations/shopifyCommerceClient'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export const SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS = [
   'orders/create',
@@ -881,6 +884,7 @@ export async function reconcileShopifyOrderWebhookSubscriptions(
         providerId,
       }))
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const known = error instanceof ShopifyOrderWebhookError
         ? error
         : null
@@ -904,6 +908,7 @@ export async function reconcileShopifyOrderWebhookSubscriptions(
       options,
     )
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (plan.length === 0) throw error
     const known = error instanceof ShopifyOrderWebhookError ? error : null
     throw new ShopifyOrderWebhookDispatchError(

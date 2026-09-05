@@ -21,7 +21,9 @@ import {
 const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
-const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
+const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
+  capability: 'orders_history',
+})
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
   AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
@@ -1664,6 +1666,37 @@ export async function resetCommerceOrderReconciliationInPostgres(input: {
     }, client)
     return result
   })
+}
+
+export async function parkCommerceOrderReconciliationForRuntimeMaintenanceInPostgres(
+  input: {
+    target: CommerceOrderReconciliationTarget
+    errorCode: string
+  },
+) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(
+    input.errorCode,
+  )) {
+    throw new Error('Commerce order reconciliation parking reason is invalid')
+  }
+  const parked = await query(
+    `UPDATE operations_commerce_sync_cursors
+     SET reconciliation_status = 'idle',
+         last_error_code = $4,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+       AND resource = 'orders'
+       AND reconciliation_status = 'running'
+       AND last_started_at = $3::timestamptz`,
+    [
+      input.target.organizationId,
+      input.target.integrationAccountId,
+      input.target.startedAt,
+      input.errorCode,
+    ],
+  )
+  return { parked: parked.rowCount === 1 }
 }
 
 export async function failCommerceOrderReconciliationInPostgres(input: {

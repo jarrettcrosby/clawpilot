@@ -3,12 +3,28 @@
 ClawPilot is a private command center for project boards, CRM and pipeline activity, working documents, releases, short links, integrations, and task-linked AI agents.
 
 - Canonical repository: `jarrettcrosby/clawpilot`
-- Active development branch: `dev`
+- Active development branch: `dev` (local and CI validation; protected previews resume only after the gated Vercel retirement)
 - Production branch: `main`
-- Development: `https://dev.aiapp.eigenracing.com`
+- Local development: `http://127.0.0.1:4002`
+- Authenticated remote-local development gateway: `https://dev.aiapp.eigenracing.com`
 - Production: `https://aiapp.eigenracing.com`
 
-The Next.js application lives in `app_src/`. Railway runs the application worker and environment-specific Postgres services; Vercel provides the matching web deployment and protected previews. Google Sheets remains the writable operator table for pipeline data.
+The Next.js application lives in `app_src/`. The accepted cutover target makes
+Railway the sole hosted production runtime and owner of the production
+application, workers, and Postgres. The application Vercel project then provides
+protected compile/UI previews only; a separate Vercel gateway may proxy
+authenticated remote-local development to the Mac without receiving production
+data or secrets. Google Sheets remains the writable operator table for pipeline
+data.
+
+Cutover is not complete yet. A read-only Vercel audit on September 5, 2026
+found legacy production-scoped database, agent-credential-database,
+authentication-mail, integration-evidence, and Google SSO configuration still
+assigned to the application project. Do not describe or use that project as
+preview-only until Railway is verified at the exact release commit—including
+health, persistence, workers, and an authenticated production workflow—and the
+legacy Vercel variables and production authority are then removed and
+re-audited.
 
 ## Quick Start
 
@@ -103,7 +119,13 @@ The old `clawd-app` folders and deleted dated notes remain available through Git
 - **Google Sheets** is the writable operator table for managed pipeline opportunities. CRM, calculations, dropdowns, and dashboard tabs are generated projections, not independent authorities.
 - **SuiteCRM** is the external CRM administration and history surface. ClawPilot stages tenant-scoped writes through an idempotent outbox and reconciles supported inbound changes.
 - **QuickBooks, Toast, Google, Maton, and OpenAI** remain provider systems. ClawPilot stores scoped connection metadata and durable evidence; browser requests do not bypass authorization or write directly to providers.
-- **Vercel** serves the web application and protected previews. **Railway** runs the application/worker service and environment-specific Postgres. Development and production never share databases or provider state.
+- **Railway** is the required sole production web application, worker, and
+  durable-Postgres authority after cutover acceptance. **Vercel** is being
+  retired to protected compile/UI previews only; its currently assigned legacy
+  production-scoped variables must be removed only after Railway exact-commit
+  acceptance and must not be treated as target-state authority. Local and
+  remote-local development use isolated non-production state and never share
+  the production database or provider credentials.
 
 Every request must preserve both signed-user and active-workspace scope. Global app administration, organization membership, resource sharing, CRM ownership, and provider authorization are separate controls.
 

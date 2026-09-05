@@ -9,6 +9,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -179,6 +180,9 @@ export function loadTypeScriptModule(path, mocks = {}) {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceCredentialCrypto.ts',
         )
+      }
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
       }
       if (specifier === '@/lib/globalIds.mjs') {
         return {

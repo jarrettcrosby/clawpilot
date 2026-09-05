@@ -1,6 +1,9 @@
 import crypto from 'crypto'
 import { normalizeGlobalId } from '@/lib/globalIds.mjs'
-import { isHostedRuntime } from '@/lib/persistence/config'
+import {
+  integrationCredentialRuntimeEncryptionKey,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export type DirectCarrierProvider = 'ups_rest' | 'fedex_rest' | 'usps_rest'
 export type CarrierEnvironment = 'sandbox' | 'production'
@@ -134,25 +137,22 @@ export function normalizeCarrierCredentialPayload(
   }
 }
 
-function encryptionKey() {
-  const dedicated = String(
-    process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY
-    || process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
-    || '',
-  )
-  if (isHostedRuntime() && dedicated.length < 32) {
-    throw new Error('Carrier credential encryption is not configured')
+function withEncryptionKey<T>(operation: (key: Buffer) => T): T {
+  const key = integrationCredentialRuntimeEncryptionKey()
+  try {
+    return operation(key)
+  } finally {
+    key.fill(0)
   }
-  const secret = dedicated || String(process.env.APP_SESSION_SECRET || '')
-  if (secret.length < 32) throw new Error('Carrier credential encryption is not configured')
-  return crypto.createHash('sha256').update(secret).digest()
 }
 
 function fingerprintKey() {
-  return crypto
-    .createHmac('sha256', encryptionKey())
-    .update('clawpilot:carrier:fingerprint:v1', 'utf8')
-    .digest()
+  return withEncryptionKey((key) => (
+    crypto
+      .createHmac('sha256', key)
+      .update('clawpilot:carrier:fingerprint:v1', 'utf8')
+      .digest()
+  ))
 }
 
 export function carrierAccountNumberFingerprint(
@@ -166,10 +166,15 @@ export function carrierAccountNumberFingerprint(
   const environment = normalizeCarrierEnvironment(environmentValue)
   const accountNumber = normalizeOptionalCarrierAccountNumber(accountNumberValue)
   if (!accountNumber) throw new Error('The carrier billing account number is required')
-  return crypto
-    .createHmac('sha256', fingerprintKey())
-    .update(`${organizationId}:${provider}:${environment}:${accountNumber}`, 'utf8')
-    .digest('hex')
+  const key = fingerprintKey()
+  try {
+    return crypto
+      .createHmac('sha256', key)
+      .update(`${organizationId}:${provider}:${environment}:${accountNumber}`, 'utf8')
+      .digest('hex')
+  } finally {
+    key.fill(0)
+  }
 }
 
 export function unresolvedCarrierBillingAccountFingerprint(
@@ -192,13 +197,18 @@ export function unresolvedCarrierBillingAccountFingerprint(
   const accountNumber = normalizeOptionalCarrierAccountNumber(accountNumberValue)
   if (!provider) throw new Error('Carrier provider is required')
   if (!accountNumber) throw new Error('The carrier billing account number is required')
-  return crypto
-    .createHmac('sha256', fingerprintKey())
-    .update(
-      `clawpilot:carrier-billing:unresolved:v1:${networkIdentity}:${provider}:${environment}:${accountNumber}`,
-      'utf8',
-    )
-    .digest('hex')
+  const key = fingerprintKey()
+  try {
+    return crypto
+      .createHmac('sha256', key)
+      .update(
+        `clawpilot:carrier-billing:unresolved:v1:${networkIdentity}:${provider}:${environment}:${accountNumber}`,
+        'utf8',
+      )
+      .digest('hex')
+  } finally {
+    key.fill(0)
+  }
 }
 
 export function carrierAccountAddressFingerprint(value: unknown) {
@@ -255,13 +265,15 @@ export function encryptCarrierCredential(
   const provider = normalizeDirectCarrierProvider(providerValue)
   const credential = normalizeCarrierCredentialPayload(credentialValue, provider)
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(authenticatedData(organizationId, provider, environmentValue))
-  const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(credential), 'utf8'),
-    cipher.final(),
-  ])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(authenticatedData(organizationId, provider, environmentValue))
+    const ciphertext = Buffer.concat([
+      cipher.update(JSON.stringify(credential), 'utf8'),
+      cipher.final(),
+    ])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptCarrierCredential(
@@ -272,12 +284,15 @@ export function decryptCarrierCredential(
 ) {
   try {
     const provider = normalizeDirectCarrierProvider(providerValue)
-    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), fields.iv)
-    decipher.setAAD(authenticatedData(organizationId, provider, environmentValue))
-    decipher.setAuthTag(fields.tag)
-    const raw = Buffer.concat([decipher.update(fields.ciphertext), decipher.final()]).toString('utf8')
-    return normalizeCarrierCredentialPayload(JSON.parse(raw) as CarrierCredentialPayload, provider)
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, fields.iv)
+      decipher.setAAD(authenticatedData(organizationId, provider, environmentValue))
+      decipher.setAuthTag(fields.tag)
+      const raw = Buffer.concat([decipher.update(fields.ciphertext), decipher.final()]).toString('utf8')
+      return normalizeCarrierCredentialPayload(JSON.parse(raw) as CarrierCredentialPayload, provider)
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored carrier credential could not be decrypted')
   }
 }
@@ -292,15 +307,17 @@ export function encryptCarrierAccountNumber(
   const accountNumber = normalizeOptionalCarrierAccountNumber(accountNumberValue)
   if (!accountNumber) throw new Error('The carrier billing account number is required')
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(carrierAccountAuthenticatedData(
-    organizationId,
-    providerValue,
-    environmentValue,
-    carrierAccountGlobalId,
-  ))
-  const ciphertext = Buffer.concat([cipher.update(accountNumber, 'utf8'), cipher.final()])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(carrierAccountAuthenticatedData(
+      organizationId,
+      providerValue,
+      environmentValue,
+      carrierAccountGlobalId,
+    ))
+    const ciphertext = Buffer.concat([cipher.update(accountNumber, 'utf8'), cipher.final()])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptCarrierAccountNumber(
@@ -311,18 +328,21 @@ export function decryptCarrierAccountNumber(
   carrierAccountGlobalId: unknown,
 ) {
   try {
-    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), fields.iv)
-    decipher.setAAD(carrierAccountAuthenticatedData(
-      organizationId,
-      providerValue,
-      environmentValue,
-      carrierAccountGlobalId,
-    ))
-    decipher.setAuthTag(fields.tag)
-    return normalizeOptionalCarrierAccountNumber(
-      Buffer.concat([decipher.update(fields.ciphertext), decipher.final()]).toString('utf8'),
-    ) as string
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, fields.iv)
+      decipher.setAAD(carrierAccountAuthenticatedData(
+        organizationId,
+        providerValue,
+        environmentValue,
+        carrierAccountGlobalId,
+      ))
+      decipher.setAuthTag(fields.tag)
+      return normalizeOptionalCarrierAccountNumber(
+        Buffer.concat([decipher.update(fields.ciphertext), decipher.final()]).toString('utf8'),
+      ) as string
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored carrier account number could not be decrypted')
   }
 }

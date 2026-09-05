@@ -18,6 +18,9 @@ import {
   type ShopifyOrderShippingAddress,
 } from '@/lib/integrations/shopifyOrderManagement'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   shopifyOrderManagementAccountAllowed,
   shopifyOrderManagementRuntime,
 } from '@/lib/integrations/shopifyOrderManagementRuntime'
@@ -1419,6 +1422,7 @@ export async function executeShopifyOrderManagementCommand(input: {
         : undefined,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const errorCode = error instanceof Error && 'code' in error
       ? String((error as { code?: unknown }).code || '')
       : 'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_UNKNOWN'
