@@ -533,6 +533,10 @@ export async function readIntegrationCredentialRuntimeAttestation(
                 FROM pg_catalog.pg_constraint constraint_row
                 WHERE constraint_row.conrelid =
                         'public.operations_integration_credential_key_attestations'::regclass
+                  -- PostgreSQL 18 also exposes NOT NULL constraints here.
+                  -- Count only the release-pinned primary, foreign, and check
+                  -- constraints shared by supported PostgreSQL versions.
+                  AND constraint_row.contype IN ('p', 'f', 'c')
               ) AS attestation_constraints_valid,
               (
                 SELECT array_agg(
