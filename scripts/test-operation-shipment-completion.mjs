@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 import { normalizeGlobalId } from '../app_src/lib/globalIds.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const contractsOnly = process.argv.includes('--contracts-only')
@@ -55,6 +56,12 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
       return nodeRequire(specifier)
     },
   }
@@ -429,7 +436,7 @@ async function addSandboxLabelsForAllPackages(
   for (const [index, row] of context.rows.entries()) {
     const trackingNumber = `${environment.toUpperCase()}E2E${index + 1}${randomUUID()
       .replaceAll('-', '').slice(0, 16).toUpperCase()}`
-    await pool.query(
+    const retiredMaintenanceEvidence = await pool.query(
       `INSERT INTO operations_labels (
          organization_id, package_id, carrier_rate_id, carrier, service_code,
          tracking_number, format, label_payload, provider_label_id,
@@ -5644,10 +5651,11 @@ async function verifyShipmentCompletion(databaseUrl) {
     const cappedProcessingExport = await pool.query(
       `INSERT INTO operations_commerce_fulfillment_exports (
          organization_id, order_id, shipment_id, provider, external_order_id,
-         state, attempts, payload_snapshot, idempotency_key, updated_at
+         state, attempts, automatic_recovery_attempts,
+         payload_snapshot, idempotency_key, updated_at
        )
        SELECT organization_id, order_id, shipment_id, provider, external_order_id,
-              'processing', 8, payload_snapshot,
+              'processing', 8, 8, payload_snapshot,
               idempotency_key || ':capped-processing-recovery',
               now() - interval '6 minutes'
        FROM operations_commerce_fulfillment_exports
@@ -5658,11 +5666,12 @@ async function verifyShipmentCompletion(databaseUrl) {
     const cappedUnknownExport = await pool.query(
       `INSERT INTO operations_commerce_fulfillment_exports (
          organization_id, order_id, shipment_id, provider, external_order_id,
-         state, attempts, payload_snapshot, idempotency_key,
+         state, attempts, automatic_recovery_attempts,
+         payload_snapshot, idempotency_key,
          error_code, error_message, completed_at
        )
        SELECT organization_id, order_id, shipment_id, provider, external_order_id,
-              'failed', 8, payload_snapshot,
+              'failed', 8, 8, payload_snapshot,
               idempotency_key || ':capped-unknown-recovery',
               'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
               'Unresolved acceptance outcome', now()
@@ -5680,7 +5689,8 @@ async function verifyShipmentCompletion(databaseUrl) {
       })
     assert.equal(exhaustedCount, 2)
     const exhaustedEvidence = await pool.query(
-      `SELECT global_id, state, attempts, error_code,
+      `SELECT global_id, state, attempts, automatic_recovery_attempts,
+              error_code,
               completed_at IS NOT NULL AS completed
        FROM operations_commerce_fulfillment_exports
        WHERE organization_id = $1::uuid
@@ -5698,6 +5708,7 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.ok(exhaustedEvidence.rows.every((row) => (
       row.state === 'failed'
       && row.attempts === 8
+      && row.automatic_recovery_attempts === 8
       && row.error_code ===
         'OPERATIONS_COMMERCE_EXPORT_AUTOMATIC_RECOVERY_EXHAUSTED'
       && row.completed === true
@@ -5716,6 +5727,104 @@ async function verifyShipmentCompletion(databaseUrl) {
       row.payload.managerRecoveryRequired === true
       && row.payload.providerIo === false
     )))
+
+    const runtimeMaintenanceExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, automatic_recovery_attempts,
+         payload_snapshot, idempotency_key, requested_at, updated_at
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'queued', 7, 0, payload_snapshot,
+              idempotency_key || ':runtime-maintenance-budget',
+              now() - interval '30 days', now() - interval '30 days'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(runtimeMaintenanceExport.rowCount, 1)
+    for (const expectedFenceAttempt of [8, 9]) {
+      const maintenanceClaim = await commerceFulfillmentRecovery
+        .claimCommerceFulfillmentRecoveryInPostgres({
+          workerId: 'shipment-completion-maintenance-test',
+        })
+      assert.equal(
+        maintenanceClaim.commerceExportGlobalId,
+        runtimeMaintenanceExport.rows[0].global_id,
+      )
+      assert.equal(maintenanceClaim.attempt, expectedFenceAttempt)
+      assert.equal(maintenanceClaim.automaticRecoveryAttempt, 1)
+      assert.equal(maintenanceClaim.priorAutomaticRecoveryAttempts, 0)
+      assert.equal(
+        await commerceFulfillmentRecovery
+          .parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres({
+            workerId: 'shipment-completion-maintenance-test',
+            claim: maintenanceClaim,
+          }),
+        true,
+      )
+      const parkedEvidence = await pool.query(
+        `SELECT state, attempts, automatic_recovery_attempts,
+                provider_reference, error_code, error_message, completed_at
+         FROM operations_commerce_fulfillment_exports
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [
+          authorizedFixture.organizationId,
+          runtimeMaintenanceExport.rows[0].global_id,
+        ],
+      )
+      assert.deepEqual(parkedEvidence.rows[0], {
+        state: 'queued',
+        attempts: expectedFenceAttempt,
+        automatic_recovery_attempts: 0,
+        provider_reference: null,
+        error_code: null,
+        error_message: null,
+        completed_at: null,
+      })
+    }
+    const maintenanceExhausted = await commerceFulfillmentRecovery
+      .finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres({
+        workerId: 'shipment-completion-maintenance-test',
+        limit: 5,
+      })
+    assert.equal(maintenanceExhausted, 0)
+    const maintenanceAudits = await pool.query(
+      `SELECT payload
+       FROM audit_events
+       WHERE organization_id = $1::uuid
+         AND aggregate_id = $2
+         AND event_type =
+           'operations.commerce_fulfillment.runtime_maintenance_parked'
+       ORDER BY event_key`,
+      [
+        authorizedFixture.organizationId,
+        runtimeMaintenanceExport.rows[0].global_id,
+      ],
+    )
+    assert.equal(maintenanceAudits.rowCount, 2)
+    assert.ok(maintenanceAudits.rows.every((row) => (
+      row.payload.automaticAttemptConsumed === false
+      && row.payload.providerIo === false
+    )))
+    const retiredMaintenanceEvidence = await pool.query(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = 'unsupported',
+           error_code = 'TEST_RUNTIME_MAINTENANCE_EVIDENCE_RETIRED',
+           error_message = 'Acceptance-only maintenance evidence retained',
+           completed_at = now(),
+           updated_at = now()
+       WHERE organization_id = $1::uuid AND global_id = $2
+         AND state = 'queued'
+         AND attempts = 9
+         AND automatic_recovery_attempts = 0`,
+      [
+        authorizedFixture.organizationId,
+        runtimeMaintenanceExport.rows[0].global_id,
+      ],
+    )
+    assert.equal(retiredMaintenanceEvidence.rowCount, 1)
 
     const fairePreDispatchCrashExport = await pool.query(
       `INSERT INTO operations_commerce_fulfillment_exports (

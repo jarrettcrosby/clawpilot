@@ -66,12 +66,23 @@ function withEnvironment(values, callback) {
 
 const runtime = loadRuntime()
 
+function productionReadSql(alias, capability = 'orders_history') {
+  return `(${alias}.status = 'active' AND (`
+    + `${alias}.environment = 'production' OR (`
+    + `${alias}.provider = 'shopify' AND `
+    + `${alias}.integration_type = 'commerce' AND `
+    + `${alias}.environment = 'sandbox' AND `
+    + 'operations_commerce_hosted_production_sandbox_read_is_current('
+    + `${alias}.organization_id, ${alias}.id, '${capability}'`
+    + ')))'
+}
+
 withEnvironment({ CLAWPILOT_ENV: 'production' }, () => {
   assert.equal(runtime.commerceReadRuntimeAvailable(), false)
   assert.equal(runtime.commerceReadRuntimeMode(), null)
   assert.equal(
     runtime.commerceReadAccountSql('account'),
-    "(account.status = 'active' AND account.environment = 'production')",
+    productionReadSql('account'),
   )
 })
 
@@ -109,6 +120,16 @@ withEnvironment({
     verificationStatus: 'verified',
   }
   assert.equal(runtime.commerceReadCredentialEligible(eligible), true)
+  assert.equal(runtime.commerceReadCredentialEligible({
+    ...eligible,
+    environment: 'sandbox',
+    hostedProductionSandboxReadCapabilities: ['catalog'],
+  }, { capability: 'catalog' }), true)
+  assert.equal(runtime.commerceReadCredentialEligible({
+    ...eligible,
+    environment: 'sandbox',
+    hostedProductionSandboxReadCapabilities: ['catalog'],
+  }, { capability: 'orders_history' }), false)
   for (const ineligible of [
     { ...eligible, environment: 'sandbox' },
     { ...eligible, status: 'disabled' },
@@ -119,8 +140,12 @@ withEnvironment({
     assert.equal(runtime.commerceReadCredentialEligible(ineligible), false)
   }
   assert.equal(
-    runtime.commerceReadAccountSql('account'),
-    "(account.status = 'active' AND account.environment = 'production')",
+    runtime.commerceReadAccountSql('account', { capability: 'inventory' }),
+    productionReadSql('account', 'inventory'),
+  )
+  assert.throws(
+    () => runtime.commerceReadAccountSql('account', { capability: 'provider_write' }),
+    /capability is invalid/u,
   )
   assert.deepEqual(
     JSON.parse(JSON.stringify(runtime.commerceReadRuntimeSummary())),
@@ -128,8 +153,10 @@ withEnvironment({
       available: true,
       mode: 'production',
       providerWrites: 0,
-      productionAccountPolicy: 'active_verified_production_only',
+      productionAccountPolicy:
+        'active_verified_production_or_exact_expiring_shopify_sandbox_read_authority',
       productionTestOrdersAllowed: false,
+      productionSandboxProviderWritesAllowed: false,
       automaticOrderPromotionAvailable: false,
     },
   )
@@ -209,7 +236,27 @@ for (const path of [
 const health = read('app_src/app/api/health/route.ts')
 assert.ok(health.includes('commerceReadReconciliation'))
 assert.ok(health.includes('runtimeAuthority: commerceReadReconciliation'))
-assert.ok(health.includes("commerceReadAccountSql('account')"))
+for (const expected of [
+  '0358_operations_hosted_production_sandbox_read_authority.sql',
+  '3e99c87a322816df28a76d0e00a2001d5301f978163679f950c1be856c1b5b79',
+  'AS operations_hosted_production_sandbox_read_authority_applied',
+  'operations_commerce_hosted_production_sandbox_read_is_current(',
+  'hostedProductionSandboxReadAuthority',
+  "'expiring-soon'",
+  'warningWindowDays: 14',
+  'Hosted-production Shopify sandbox read authority expires within 14 days',
+]) {
+  assert.ok(
+    health.includes(expected),
+    `Health must expose hosted-production sandbox read-authority state: ${expected}`,
+  )
+}
+for (const capability of ['catalog']) {
+  assert.ok(
+    health.includes(`capability: '${capability}'`),
+    `Health must use the exact ${capability} read capability`,
+  )
+}
 assert.ok(health.includes("status = 'pending' AND authoritative"))
 assert.ok(health.includes("status = 'failed' AND authoritative"))
 assert.match(

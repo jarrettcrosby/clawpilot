@@ -243,6 +243,7 @@ async function runtime(input: {
   }
   if (!commerceReadCredentialEligible(stored, {
     developmentRequiresActive: true,
+    capability: 'inventory',
   })) {
     throw new CommerceIntegrationRequestError(
       commerceReadRuntimeMode() === 'production'

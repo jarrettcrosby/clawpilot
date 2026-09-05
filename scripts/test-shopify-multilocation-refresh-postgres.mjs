@@ -7,6 +7,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
 
 const root = process.cwd()
 const requireFromApp = createRequire(
@@ -39,22 +40,9 @@ async function applyMigration(client, filename) {
     resolve(root, 'db/migrations', filename),
     'utf8',
   )
-  await client.query('BEGIN')
-  try {
-    await client.query(sql)
-    await client.query(
-      'ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text',
-    )
-    await client.query(
-      `INSERT INTO schema_migrations (filename, checksum)
-       VALUES ($1, $2)`,
-      [filename, createHash('sha256').update(sql).digest('hex')],
-    )
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK')
-    throw new Error(`Migration ${filename} failed`, { cause: error })
-  }
+  await applyMigrationSqlForTest(client, filename, sql, {
+    checksum: createHash('sha256').update(sql).digest('hex'),
+  })
 }
 
 async function waitForPostgres(databaseUrl) {

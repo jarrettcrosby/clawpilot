@@ -11,14 +11,17 @@ app_visible: false
 
 # Express Parcel development warehouse normalization
 
-This runbook applies only to the Railway **development** database and the
-Express Parcel workspace `ga8142977`. It retires the bounded 21-order WMS
+This is a preserved historical one-time runbook for the now-retired Railway
+**development** database and the Express Parcel workspace `ga8142977`. It is
+not executable in the active local, remote-local, Vercel, or Railway
+production topology. It retired the bounded 21-order WMS
 simulator and eight mock-commerce proof orders, then makes the warehouse that
 owns the working Zebra binding the real Delaware warehouse.
 
-The process intentionally does not copy production into development. Suburbia
-and Express Parcel remain real tenant fixtures in development, while synthetic
-warehouse test lineages are retired with their audit evidence intact.
+The process intentionally did not copy production into development. Suburbia
+and Express Parcel remained real tenant fixtures in that historical database,
+while synthetic warehouse test lineages were retired with their audit evidence
+intact.
 
 ## Required retained identities
 

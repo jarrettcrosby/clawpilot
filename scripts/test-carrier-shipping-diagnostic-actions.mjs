@@ -7,6 +7,8 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -313,6 +315,8 @@ const actions = loadTypeScriptModule(
       },
     },
     '@/lib/integrations/carrierShippingDiagnosticRate': {},
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/carrierSandboxRate': {
       buildCarrierSandboxRateFixture: () => ({ shipment: 'fixture' }),
       carrierSandboxPartyFingerprint: () => destinationHash,

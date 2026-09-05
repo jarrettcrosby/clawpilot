@@ -8,6 +8,9 @@ import {
   type FaireShipmentInput,
   type FaireVerifiedCredentialBinding,
 } from '@/lib/integrations/faireCommerceClient'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const FAIRE_ORDER_ID = /^bo_[A-Za-z0-9_-]+$/
 const FAIRE_SHIPMENT_ID = /^s_[A-Za-z0-9_-]+$/
@@ -519,7 +522,8 @@ async function reconcileTracking(
   let order: Record<string, unknown>
   try {
     order = exactOrder(await client.getOrder(orderId), orderId)
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return unknownResult(orderId, writeAttempt, packages, reason)
   }
   const references = matchedShipments(order, packages)
@@ -669,7 +673,10 @@ export async function executeFaireFulfillmentWriteback(
       if (!outcomeCanBeUnknown(error)) throw error
       try {
         order = exactOrder(await client.getOrder(orderId), orderId)
-      } catch {
+      } catch (readbackError) {
+        if (isIntegrationCredentialRuntimeGateError(readbackError)) {
+          throw readbackError
+        }
         return unknownResult(
           orderId,
           writeAttempt,

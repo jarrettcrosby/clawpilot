@@ -31,6 +31,8 @@ require_value APP_LOGIN_PASSWORD 16
 require_value APP_LOGIN_EMAIL 5
 require_value APP_SESSION_SECRET 32
 require_value AGENT_CREDENTIAL_ENCRYPTION_KEY 32
+require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY 32
+require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID 1
 require_value INTEGRATION_EVIDENCE_FINGERPRINT_KEY 32
 require_value INTEGRATION_EVIDENCE_ACTIVE_KEY_ID 1
 require_value INTEGRATION_EVIDENCE_ENCRYPTION_KEYS 2
@@ -98,7 +100,24 @@ fi
 
 [[ "$CLAWPILOT_MAIL_FROM" == *@* ]] || fail "CLAWPILOT_MAIL_FROM must be an email address"
 [[ "$CLAWPILOT_PUBLIC_URL" == https://* ]] || fail "CLAWPILOT_PUBLIC_URL must use HTTPS"
+case "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" in
+  strict) ;;
+  adoption)
+    require_value INTEGRATION_CREDENTIAL_ATTESTATION_ADOPTION_DEADLINE 20
+    ;;
+  *) fail "INTEGRATION_CREDENTIAL_ATTESTATION_MODE must be strict or adoption" ;;
+esac
 node scripts/validate-runtime-config.mjs
+
+# This proof is inherited only by this application process. The verifier reads
+# and decrypts the immutable database sentinel after migrations have run. In
+# the explicit adoption mode an absent sentinel may boot the deployment, but
+# the signed proof keeps all integration credential reads/writes disabled.
+INTEGRATION_CREDENTIAL_RUNTIME_PROOF="$(
+  node scripts/verify-integration-credential-runtime.mjs
+)" || fail "integration credential runtime attestation failed"
+export INTEGRATION_CREDENTIAL_RUNTIME_PROOF
+require_value INTEGRATION_CREDENTIAL_RUNTIME_PROOF 80
 
 cleanup() {
   [[ -n "$WORKER_PID" ]] && kill "$WORKER_PID" 2>/dev/null || true
@@ -121,13 +140,20 @@ for _attempt in $(seq 1 120); do
 done
 [[ "$READY" == "1" ]] || fail "application did not become reachable within 120 seconds"
 
-node scripts/pipeline-outbox-poller.mjs &
-WORKER_PID=$!
+if [[ "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" == "strict" ]]; then
+  node scripts/pipeline-outbox-poller.mjs &
+  WORKER_PID=$!
+else
+  echo "[railway-start] integration credential adoption maintenance is active; the pipeline outbox poller is suppressed" >&2
+fi
 
 HEALTHY=0
 for _attempt in $(seq 1 120); do
   kill -0 "$APP_PID" 2>/dev/null || fail "application exited before health validation"
-  kill -0 "$WORKER_PID" 2>/dev/null || fail "runtime worker exited before health validation"
+  if [[ -n "$WORKER_PID" ]]; then
+    kill -0 "$WORKER_PID" 2>/dev/null \
+      || fail "runtime worker exited before health validation"
+  fi
   if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$HEALTH_URL"; then
     HEALTHY=1
     break
@@ -136,8 +162,12 @@ for _attempt in $(seq 1 120); do
 done
 [[ "$HEALTHY" == "1" ]] || fail "application did not pass health validation within 120 seconds"
 
-npm run toast:activate-payment-date-backfill
-npm run release:record
+if [[ "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" == "strict" ]]; then
+  npm run toast:activate-payment-date-backfill
+  npm run release:record
+else
+  echo "[railway-start] integration credential adoption maintenance is active; normal release recording is suppressed" >&2
+fi
 
 while kill -0 "$APP_PID" 2>/dev/null; do
   if [[ -n "$WORKER_PID" ]] && ! kill -0 "$WORKER_PID" 2>/dev/null; then

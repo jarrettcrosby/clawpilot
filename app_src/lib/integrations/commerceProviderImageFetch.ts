@@ -13,6 +13,10 @@ import {
   validateCrmProductImage,
   type CrmProductImageMimeType,
 } from '@/lib/crm/productImageAssets'
+import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export const COMMERCE_PROVIDER_IMAGE_FETCH_TIMEOUT_MS = 15_000
 export const COMMERCE_PROVIDER_IMAGE_MAX_REDIRECTS = 3
@@ -927,6 +931,7 @@ export async function fetchCommerceProviderImage(
       )
       let response: CommerceProviderImageHttpResponse
       try {
+        assertIntegrationCredentialProviderIoReady()
         response = await abortable(
           dependencies.fetch({
             url: new URL(validatedUrl.url.toString()),
@@ -937,6 +942,7 @@ export async function fetchCommerceProviderImage(
           controller.signal,
         )
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         if (error instanceof FetchAborted) throw error
         if (error instanceof CommerceProviderImageFetchError) throw error
         fail(
@@ -1059,6 +1065,7 @@ export async function fetchCommerceProviderImage(
       502,
     )
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof CommerceProviderImageFetchError) throw error
     if (error instanceof FetchAborted || controller.signal.aborted) {
       if (timedOut) {

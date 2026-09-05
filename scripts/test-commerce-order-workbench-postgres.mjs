@@ -183,6 +183,23 @@ async function seedTenant(client, fixture, label) {
       actorEmail,
     ],
   )
+  const historyPolicyAvailable = (await client.query(
+    `SELECT to_regclass(
+       'public.operations_commerce_order_history_policies'
+     ) IS NOT NULL AS available`,
+  )).rows[0]?.available === true
+  if (historyPolicyAvailable) {
+    await client.query(
+      `INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify', 'new_orders_only',
+         statement_timestamp(), statement_timestamp(), NULL
+       )`,
+      [fixture.organization, fixture.integration],
+    )
+  }
   await client.query(
     `INSERT INTO operations_commerce_intake_runs (
        id, global_id, organization_id, integration_account_id, pipeline_id,
@@ -2760,6 +2777,10 @@ async function verifyAcceptance(
       )
     await Promise.race([
       promotionCandidateLocked,
+      promotionOutcomePromise.then((outcome) => {
+        if (outcome.status === 'rejected') throw outcome.reason
+        throw new Error('Promotion finished before acquiring the candidate row')
+      }),
       new Promise((_, reject) => setTimeout(
         () => reject(new Error('Promotion did not acquire the candidate row')),
         5_000,

@@ -14,6 +14,9 @@ import {
   type ShopifyCommerceRuntimeCredential,
   type ShopifyConnectionProbe,
 } from '@/lib/integrations/shopifyCommerceClient'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const ORDER_GID_PATTERN = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const ORDER_TRANSACTION_GID_PATTERN =
@@ -3805,6 +3808,7 @@ export async function executeShopifyOrderManagementAction(
         dependencies,
       )
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return explicitFirstMutationRejection(error)
         ? rejectedResult({ action: action.type, probe, before, error })
         : unknownResult({
@@ -3850,6 +3854,7 @@ export async function executeShopifyOrderManagementAction(
         safeMessage: null,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return unknownResult({
         action: action.type,
         probe,
@@ -3999,6 +4004,7 @@ export async function executeShopifyOrderManagementAction(
         safeMessage: null,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       if (acceptedWrites === 0 && explicitFirstMutationRejection(error)) {
         return rejectedResult({ action: action.type, probe, before, error })
       }
@@ -4027,6 +4033,7 @@ export async function executeShopifyOrderManagementAction(
         dependencies,
       )
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return explicitFirstMutationRejection(error)
         ? rejectedResult({ action: action.type, probe, before, error })
         : unknownResult({
@@ -4078,6 +4085,7 @@ export async function executeShopifyOrderManagementAction(
         safeMessage: null,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return unknownResult({
         action: action.type,
         probe,
@@ -4140,6 +4148,7 @@ export async function executeShopifyOrderManagementAction(
         dependencies,
       )
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return explicitFirstMutationRejection(error)
         ? rejectedResult({ action: action.type, probe, before, error })
         : unknownResult({
@@ -4204,6 +4213,7 @@ export async function executeShopifyOrderManagementAction(
         safeMessage: null,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       return unknownResult({
         action: action.type,
         probe,
@@ -4287,6 +4297,7 @@ export async function executeShopifyOrderManagementAction(
       safeMessage: null,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (acceptedStages === 0 && explicitFirstMutationRejection(error)) {
       return rejectedResult({ action: action.type, probe, before, error })
     }

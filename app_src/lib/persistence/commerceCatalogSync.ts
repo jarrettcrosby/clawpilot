@@ -17,7 +17,9 @@ const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
 const CATALOG_SYNC_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce.catalog.worker.heartbeat'
-const CATALOG_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
+const CATALOG_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
+  capability: 'catalog',
+})
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const PRODUCT_READABLE_CONNECTION_SQL = `(
   (
@@ -476,6 +478,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
       commerce_credential_generation: number
       credential_version: number
       verification_status: 'unverified' | 'verified' | 'failed'
+      hosted_production_sandbox_read_authorized: boolean
       auth_mode:
         | 'shopify_client_credentials'
         | 'faire_brand_token'
@@ -492,6 +495,11 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
          credential.credential_version,
          credential.verification_status,
          credential.auth_mode,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           account.organization_id,
+           account.id,
+           'catalog'
+         ) AS hosted_production_sandbox_read_authorized,
          EXISTS (
            SELECT 1
            FROM operations_activation_scopes activation
@@ -517,7 +525,9 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
       environment: account.environment,
       status: account.status,
       verificationStatus: account.verification_status,
-    })
+      hostedProductionSandboxReadCapabilities:
+        account.hosted_production_sandbox_read_authorized ? ['catalog'] : [],
+    }, { capability: 'catalog' })
     || account.credential_version
       !== account.commerce_credential_generation
   ) {
@@ -1319,9 +1329,14 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
   })
 }
 
-export async function parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres(
-  input: { job: CommerceCatalogSyncJob },
-) {
+async function parkCommerceCatalogSyncJobInPostgres(input: {
+  job: CommerceCatalogSyncJob
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Commerce catalog sync parking reason is invalid')
+  }
   const parked = await query(
     `UPDATE operations_commerce_catalog_sync_jobs
      SET status = 'pending',
@@ -1330,7 +1345,7 @@ export async function parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres(
          locked_at = NULL,
          locked_by = NULL,
          lock_token = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $5,
          completed_at = NULL,
          updated_at = now()
      WHERE id = $1::uuid
@@ -1345,9 +1360,25 @@ export async function parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres(
       input.job.organizationId,
       input.job.integrationAccountId,
       input.job.lockToken,
+      input.errorCode,
     ],
   )
   return { parked: parked.rowCount === 1 }
+}
+
+export async function parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres(
+  input: { job: CommerceCatalogSyncJob },
+) {
+  return parkCommerceCatalogSyncJobInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkCommerceCatalogSyncJobForRuntimeMaintenanceInPostgres(
+  input: { job: CommerceCatalogSyncJob; errorCode: string },
+) {
+  return parkCommerceCatalogSyncJobInPostgres(input)
 }
 
 export async function readCommerceCatalogSyncStateWithClient(

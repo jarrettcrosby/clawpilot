@@ -11,6 +11,9 @@ import {
   encryptCommerceIntakeContinuation,
   shopifyCheckoutDestinationFingerprint,
 } from '@/lib/integrations/commerceCredentialCrypto'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { exactProductMappingMutation } from '@/lib/integrations/commerceProductMappingPolicy'
 import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
@@ -71,6 +74,13 @@ import {
   assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
   type CommerceStoreSyncProviderReadLease,
 } from '@/lib/persistence/commerceStoreSync'
+import {
+  assessCommerceOrderHistoryAdmissionWithClient,
+  lockCommerceOrderHistoryAdmissionWithClient,
+} from '@/lib/persistence/commerceOrderHistoryAdmission'
+import type {
+  CommerceOrderHistoryMode,
+} from '@/lib/integrations/commerceOrderHistoryPolicy'
 import {
   applyCommerceCatalogSyncPolicyWithClient,
   commerceCatalogCredentialSupportsProducts,
@@ -228,6 +238,9 @@ type IntakeAccountRow = {
   store_sync_explicit_choice: boolean | null
   store_sync_revision: string | number | null
   store_sync_reason: string | null
+  order_history_mode: CommerceOrderHistoryMode
+  order_history_ingestion_floor: Date | null
+  order_history_frozen_at: Date
 }
 
 export type CommerceCustomerPrefetchBindingPlan = {
@@ -886,7 +899,10 @@ async function resolveAccount(
        store_sync.desired_state AS store_sync_desired_state,
        store_sync.explicit_choice AS store_sync_explicit_choice,
        store_sync.revision AS store_sync_revision,
-       store_sync.reason AS store_sync_reason
+       store_sync.reason AS store_sync_reason,
+       history.history_mode AS order_history_mode,
+       history.ingestion_floor AS order_history_ingestion_floor,
+       history.frozen_at AS order_history_frozen_at
      FROM operations_integration_accounts account
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
@@ -894,8 +910,12 @@ async function resolveAccount(
       ON pipeline.workspace_organization_id = activation.organization_id
       AND pipeline.id = activation.data_pipeline_id
      LEFT JOIN operations_commerce_store_sync_controls store_sync
-       ON store_sync.organization_id = account.organization_id
+      ON store_sync.organization_id = account.organization_id
       AND store_sync.integration_account_id = account.id
+     LEFT JOIN operations_commerce_order_history_policies history
+       ON history.organization_id = account.organization_id
+      AND history.integration_account_id = account.id
+      AND history.provider = account.provider
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
@@ -925,6 +945,13 @@ async function resolveAccount(
     intakeError(
       'COMMERCE_INTAKE_ACCOUNT_REQUIRED',
       'The selected commerce connection is unavailable',
+    )
+  }
+  if (!row.order_history_mode || !row.order_history_frozen_at) {
+    intakeError(
+      'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+      'The immutable order-history policy is unavailable',
+      409,
     )
   }
   return row
@@ -4487,12 +4514,21 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     const batchNumber = continuation
       ? continuation.batch_number + 1
       : 1
+    const frozenOrderFloor =
+      account.order_history_ingestion_floor?.getTime() ?? null
     const windowStart = continuation
       ? iso(continuation.window_start)
       : (
-          input.resource === 'orders' && account.provider === 'shopify'
-            ? new Date(now.getTime() - 60 * 24 * 60 * 60 * 1_000).toISOString()
-            : null
+          input.resource !== 'orders'
+            ? null
+            : account.provider === 'shopify'
+              ? new Date(Math.max(
+                  now.getTime() - 60 * 24 * 60 * 60 * 1_000,
+                  frozenOrderFloor ?? 0,
+                )).toISOString()
+              : frozenOrderFloor === null
+                ? null
+                : new Date(frozenOrderFloor).toISOString()
         )
     const windowEnd = continuation
       ? new Date(continuation.window_end).toISOString()
@@ -5869,24 +5905,19 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         row,
       ]),
     )
-    const normalizationRejections = input.envelope.rejections.map(
-      (rejection) => ({
-        resourceType: rejection.resourceType,
-        externalId: rejection.externalId,
-        sourceHash: rejection.sourceHash,
-        errorCode: rejection.errorCode,
-        safeMessage: rejection.safeMessage,
-      }),
-    )
-    const recordsRejected = normalizationRejections.length
-    const recordsSeen = (
-      variantCount
-      + input.envelope.orders.length
-      + recordsRejected
-    )
     const externalOrderIds = [
-      ...new Set(input.envelope.orders.map((order) => order.identity.value)),
-    ]
+      ...new Set([
+        ...input.envelope.orders.map((order) => order.identity.value),
+        ...input.envelope.rejections
+          .filter((rejection) => rejection.resourceType === 'order')
+          .map((rejection) => rejection.externalId),
+      ]),
+    ].sort((left, right) => left.localeCompare(right))
+    const normalizedOrderByExternalId = new Map(
+      input.envelope.orders.map((order) => [order.identity.value, order]),
+    )
+    const admittedExternalOrderIds = new Set<string>()
+    const historyExcludedExternalOrderIds = new Set<string>()
     const canonicalExternalOrderIds = new Set<string>()
     const latestCandidateByExternalOrder = new Map<string, {
       sourceRevision: string
@@ -5905,7 +5936,48 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           integrationAccountId: account.id,
           externalOrderId,
         })
+        await lockCommerceOrderHistoryAdmissionWithClient(client, {
+          organizationId: account.organization_id,
+          integrationAccountId: account.id,
+          provider: account.provider,
+          externalOrderId,
+        })
+        const normalizedOrder = normalizedOrderByExternalId.get(
+          externalOrderId,
+        )
+        const admission =
+          await assessCommerceOrderHistoryAdmissionWithClient(client, {
+            organizationId: account.organization_id,
+            integrationAccountId: account.id,
+            provider: account.provider,
+            externalOrderId,
+            providerCreatedAt: normalizedOrder?.providerCreatedAt || null,
+            locksHeld: true,
+          })
+        if (admission.reason === 'policy_missing') {
+          intakeError(
+            'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+            'The immutable order-history policy is unavailable',
+            409,
+          )
+        }
+        if (
+          admission.reason === 'provider_created_at_required'
+          && normalizedOrder
+        ) {
+          intakeError(
+            'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
+            'Provider order creation time is required by the frozen history policy',
+            409,
+          )
+        }
+        if (admission.admitted) {
+          admittedExternalOrderIds.add(externalOrderId)
+        } else {
+          historyExcludedExternalOrderIds.add(externalOrderId)
+        }
       }
+      const admittedExternalOrderIdValues = [...admittedExternalOrderIds]
       const canonicalOrders = await client.query<{
         external_order_id: string
       }>(
@@ -5932,7 +6004,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
              candidate.workflow_state = 'promoted'
              OR candidate.canonical_order_id IS NOT NULL
            )`,
-        [account.organization_id, account.id, externalOrderIds],
+        [account.organization_id, account.id, admittedExternalOrderIdValues],
       )
       for (const row of canonicalOrders.rows) {
         canonicalExternalOrderIds.add(row.external_order_id)
@@ -5972,7 +6044,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
                   candidate.observed_at DESC,
                   candidate.created_at DESC,
                   candidate.id DESC`,
-        [account.organization_id, account.id, externalOrderIds],
+        [account.organization_id, account.id, admittedExternalOrderIdValues],
       )
       for (const row of latestCandidates.rows) {
         latestCandidateByExternalOrder.set(row.external_order_id, {
@@ -5985,6 +6057,27 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         })
       }
     }
+    const admittedOrders = input.envelope.orders.filter((order) => (
+      admittedExternalOrderIds.has(order.identity.value)
+    ))
+    const normalizationRejections = input.envelope.rejections
+      .filter((rejection) => (
+        rejection.resourceType !== 'order'
+        || admittedExternalOrderIds.has(rejection.externalId)
+      ))
+      .map((rejection) => ({
+        resourceType: rejection.resourceType,
+        externalId: rejection.externalId,
+        sourceHash: rejection.sourceHash,
+        errorCode: rejection.errorCode,
+        safeMessage: rejection.safeMessage,
+      }))
+    const recordsRejected = normalizationRejections.length
+    const recordsSeen = (
+      variantCount
+      + input.envelope.orders.length
+      + input.envelope.rejections.length
+    )
     const runResult = await client.query<{
       id: string
       global_id: string
@@ -6037,7 +6130,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           (variant) => variant.identity.value,
         ),
       ),
-      ...input.envelope.orders.flatMap(
+      ...admittedOrders.flatMap(
         (order) => order.lines
           .map((line) => exactMappingIdentity(line))
           .filter((identity): identity is string => Boolean(identity)),
@@ -6420,7 +6513,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
     let ordersStaged = 0
     let ordersPreserved = 0
     let ordersSkippedCanonical = 0
-    for (const order of input.envelope.orders) {
+    for (const order of admittedOrders) {
       const externalOrderId = order.identity.value
       if (canonicalExternalOrderIds.has(externalOrderId)) {
         ordersSkippedCanonical += 1
@@ -7218,6 +7311,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       `UPDATE operations_commerce_intake_read_intents
        SET intent_state = 'staged',
            staged_run_id = $2::uuid,
+           response_ciphertext = NULL,
+           response_iv = NULL,
+           response_tag = NULL,
+           response_purged_at = now(),
            row_version = row_version + 1,
            updated_by = $3,
            updated_at = now()
@@ -7266,6 +7363,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       productVariantsStaged,
       productVariantsPreserved,
       recordsRejected,
+      historyExcludedOrders: historyExcludedExternalOrderIds.size,
       recordsStaged,
       productImageImports,
       ...(input.exactExternalProductIdHash
@@ -7300,6 +7398,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         productVariantsStaged,
         productVariantsPreserved,
         recordsRejected,
+        historyExcludedOrders: historyExcludedExternalOrderIds.size,
         normalizationRejections,
         productImageImports,
         action: stageResult.action,
@@ -8293,12 +8392,14 @@ export async function readCommerceIntakeStateFromPostgres(input: {
       let address: Record<string, unknown> | null = null
       try {
         party = encryptedSnapshot(candidate, input.accountGlobalId, 'party')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         party = null
       }
       try {
         address = encryptedSnapshot(candidate, input.accountGlobalId, 'ship_to')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         address = null
       }
       const lines = linesByCandidate.get(candidate.id) || []
@@ -10494,7 +10595,8 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
     let party: Record<string, unknown> | null = null
     try {
       party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       party = null
     }
     const externalIdentity = party?.externalIdentity
@@ -10933,12 +11035,14 @@ export async function readAutomaticCommerceCustomerTargetsForRunInPostgres(
       let address: Record<string, unknown> | null = null
       try {
         party = encryptedSnapshot(candidate, input.runtime.globalId, 'party')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         party = null
       }
       try {
         address = encryptedSnapshot(candidate, input.runtime.globalId, 'ship_to')
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         address = null
       }
       const externalIdentity = party?.externalIdentity
@@ -11305,7 +11409,8 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
             input.runtime.globalId,
             'ship_to',
           )
-        } catch {
+        } catch (error) {
+          if (isIntegrationCredentialRuntimeGateError(error)) throw error
           snapshot = null
         }
         if (!snapshot || !completeAddress(snapshot)) {
@@ -11922,7 +12027,8 @@ export async function readAutomaticFaireOrderPromotionTargetsForRunInPostgres(
             input.runtime.globalId,
             'ship_to',
           )
-        } catch {
+        } catch (error) {
+          if (isIntegrationCredentialRuntimeGateError(error)) throw error
           snapshot = null
         }
         if (!snapshot || !completeAddress(snapshot)) {
@@ -12029,7 +12135,8 @@ export async function confirmCommerceCandidateAddressInPostgres(input: {
         'ship_to',
       )
       providerAddress = snapshot ? normalizedAddress(snapshot) : null
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       providerAddress = null
     }
     const source = providerAddress

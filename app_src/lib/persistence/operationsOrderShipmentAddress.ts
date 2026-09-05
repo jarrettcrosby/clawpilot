@@ -7,6 +7,9 @@ import {
   encryptCommerceCandidateSnapshot,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   changedOrderShipToFields,
   mergeOrderShipToDraft,
   normalizeOrderShipToDraft,
@@ -176,7 +179,8 @@ function decryptLocalAddress(row: ShipmentAddressRow): OrderShipToDraft {
       'ship_to',
     )
     return normalizeOrderShipToDraft(value)
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     protectedAddressUnreadable()
   }
 }

@@ -43,6 +43,9 @@ const route = loadTypeScriptModule(
       },
       operationsCapabilities: () => ({ canView: true }),
     },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse: () => null,
+    },
     '@/lib/persistence/config': {
       isPostgresStorageEnabled: () => true,
     },
@@ -103,6 +106,9 @@ const activeRoute = loadTypeScriptModule(
         '00000000-0000-4000-8000-000000000001'
       ),
       operationsCapabilities: () => ({ canView: true }),
+    },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse: () => null,
     },
     '@/lib/persistence/config': {
       isPostgresStorageEnabled: () => true,

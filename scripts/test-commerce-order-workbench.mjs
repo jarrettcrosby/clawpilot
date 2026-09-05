@@ -713,6 +713,11 @@ const workbenchRoute = loadTypeScriptSourceModule(
         }
       },
     },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse() {
+        return null
+      },
+    },
     '@/lib/integrations/shopifyCommerceClient': {
       ShopifyCommerceClientError,
     },

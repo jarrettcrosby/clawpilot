@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
+import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
 import vm from 'node:vm'
 
 const root = process.cwd()
@@ -90,6 +91,12 @@ function loadTypeScriptModule(path, mocks = {}) {
           mocks,
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return { isIntegrationCredentialRuntimeGateError: () => false }
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })
@@ -127,14 +134,11 @@ async function applyMigrations(client) {
     'Faire inventory polling migration is missing',
   )
   for (const file of files) {
-    await client.query('BEGIN')
-    try {
-      await client.query(read(`db/migrations/${file}`))
-      await client.query('COMMIT')
-    } catch (error) {
-      await client.query('ROLLBACK')
-      throw new Error(`Migration ${file} failed`, { cause: error })
-    }
+    await applyMigrationSqlForTest(
+      client,
+      file,
+      read(`db/migrations/${file}`),
+    )
   }
 }
 
@@ -173,11 +177,15 @@ const integrationErrors = {
   },
 }
 
+const auditEvents = []
+
 const polling = loadTypeScriptModule(
   'app_src/lib/persistence/faireInventoryPolling.ts',
   {
     '@/lib/auditWriter': {
-      async recordAuditEvent() {},
+      async recordAuditEvent(input) {
+        auditEvents.push(input)
+      },
     },
     '@/lib/integrations/commerceIntegrations': integrationErrors,
     '@/lib/persistence/postgres': persistenceMock,
@@ -428,6 +436,47 @@ async function verifyPolling(pool) {
   assert.equal(target.credentialVersion, 1)
   assert.equal(target.activationRevision, 1)
   assert.equal(target.recoveredLease, false)
+  const auditCountBeforeRuntimePark = auditEvents.length
+  const runtimeParked = await polling
+    .parkFaireInventoryPollForRuntimeMaintenanceInPostgres({
+      target,
+      errorCode: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    })
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(runtimeParked)),
+    { leaseLost: false, parked: true },
+  )
+  const runtimeParkedJob = (
+    await pool.query(
+      `SELECT status, attempt_count, selector_after, locked_at, locked_by,
+              lock_token, lease_expires_at, last_error_code, completed_at
+       FROM operations_faire_inventory_poll_jobs
+       WHERE id = $1::uuid`,
+      [target.id],
+    )
+  ).rows[0]
+  assert.deepEqual(runtimeParkedJob, {
+    status: 'pending',
+    attempt_count: 0,
+    selector_after: null,
+    locked_at: null,
+    locked_by: null,
+    lock_token: null,
+    lease_expires_at: null,
+    last_error_code: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    completed_at: null,
+  })
+  assert.equal(
+    auditEvents.length,
+    auditCountBeforeRuntimePark,
+    'runtime maintenance parking must not write a false failure audit',
+  )
+  ;[target] = await polling.claimFaireInventoryPollJobsInPostgres({
+    limit: 1,
+    workerId: 'faire-postgres-worker-after-runtime-maintenance',
+  })
+  assert.ok(target)
+  assert.equal(target.attemptCount, 1)
   let releaseInFlightRead
   let markInFlightReadStarted
   const inFlightReadStarted = new Promise((resolvePromise) => {

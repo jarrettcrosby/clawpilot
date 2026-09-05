@@ -2,6 +2,9 @@ import {
   readCommerceShopifyOrderRevisionEnvelope,
 } from '@/lib/integrations/commerceIntake'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   commerceOrderRevisionProtectedContentFingerprint,
   encryptCommerceOrderRevisionProtectedSnapshot,
   type EncryptedCommerceOrderRevisionValue,
@@ -334,6 +337,7 @@ export async function inspectShopifyCanonicalOrderRevision(
       expectedCredentialVersion: claim.credentialVersion,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyOrderRevisionError) throw error
     throw new ShopifyOrderRevisionError(
       'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED',

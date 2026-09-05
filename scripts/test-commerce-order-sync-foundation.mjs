@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
 import { emailBodyPreview } from '../app_src/lib/crm/emailBodyPreview.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (relative) => readFile(path.join(root, relative), 'utf8')
@@ -66,10 +67,18 @@ const nativeActivityRuntime = loadTypeScript(
   await read('app_src/lib/integrations/shopifyOrderNativeActivity.ts'),
   { '@/lib/crm/emailBodyPreview.mjs': { emailBodyPreview } },
 )
+const historyPolicySource = await read(
+  'app_src/lib/integrations/commerceOrderHistoryPolicy.ts',
+)
+const historyPolicyRuntime = loadTypeScript(
+  'app_src/lib/integrations/commerceOrderHistoryPolicy.ts',
+  historyPolicySource,
+)
 
 const [
   migration, persistence, history, capabilities, worker, processRoute,
-  commerceIntegrations,
+  commerceIntegrations, historyPolicyMigration, historyAdmission,
+  historyExclusionMigration,
 ] =
   await Promise.all([
   read('db/migrations/0276_operations_commerce_order_sync_foundation.sql'),
@@ -79,6 +88,9 @@ const [
   read('app_src/lib/commerceOrderHistoryWorker.ts'),
   read('app_src/app/api/integrations/commerce/orders/process/route.ts'),
   read('app_src/lib/persistence/commerceIntegrations.ts'),
+  read('db/migrations/0349_operations_commerce_order_history_policy.sql'),
+  read('app_src/lib/persistence/commerceOrderHistoryAdmission.ts'),
+  read('db/migrations/0350_operations_commerce_order_history_exclusions.sql'),
 ])
 
 for (const table of [
@@ -123,7 +135,14 @@ assert.match(persistence, /SHOPIFY_READ_ORDERS_REQUIRED/u)
 assert.doesNotMatch(persistence, /SHOPIFY_READ_ALL_ORDERS_REQUIRED/u)
 assert.match(persistence, /readAllOrdersGranted/u)
 assert.match(persistence, /credential\.external_account_id = account\.external_account_id/u)
-assert.match(persistence, /60 \* 24 \* 60 \* 60 \* 1_000/u)
+assert.match(persistence, /commerceOrderHistoryWindow/u)
+assert.match(persistence, /assessCommerceOrderHistoryAdmissionWithClient/u)
+assert.match(persistence, /lockCommerceOrderHistoryAdmissionWithClient/u)
+assert.match(persistence, /COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED/u)
+assert.doesNotMatch(
+  persistence,
+  /CASE WHEN account\.provider = 'shopify'[\s\S]{0,120}'last_60_days'/u,
+)
 assert.match(persistence, /providerWrites: 0 as const/u)
 assert.match(persistence, /lock_token = gen_random_uuid\(\)/u)
 assert.match(persistence, /LEFT JOIN LATERAL[\s\S]{0,400}operations_orders/u)
@@ -141,6 +160,136 @@ assert.match(
   /credential_external_account_id !== row\.external_account_id/u,
 )
 
+assert.match(
+  historyPolicyMigration,
+  /CREATE TABLE operations_commerce_order_history_policies/u,
+)
+assert.match(historyPolicyMigration, /history_mode = 'provider_all'/u)
+assert.match(historyPolicyMigration, /commerce order history policy is immutable/u)
+assert.match(
+  historyPolicyMigration,
+  /ALTER FUNCTION protect_commerce_order_history_policy\(\)[\s\S]{0,100}SET search_path = pg_catalog, public, pg_temp/u,
+)
+assert.match(
+  historyPolicyMigration,
+  /SELECT account\.organization_id,[\s\S]{0,180}'new_orders_only',[\s\S]{0,80}frozen\.at,[\s\S]{0,80}frozen\.at/u,
+)
+assert.match(
+  historyPolicyMigration,
+  /order_history_mode text NOT NULL DEFAULT 'new_orders_only'/u,
+)
+assert.match(
+  historyPolicyMigration,
+  /commerce_order_backfill_coverage_basis_check[\s\S]{0,300}NOT VALID/u,
+)
+assert.match(
+  historyPolicyMigration,
+  /VALIDATE CONSTRAINT commerce_order_backfill_coverage_basis_check/u,
+)
+assert.match(historyAdmission, /The frozen floor governs first materialization only/u)
+assert.match(historyAdmission, /operations_orders canonical/u)
+assert.match(historyAdmission, /operations_external_identifiers external/u)
+assert.match(historyAdmission, /operations_commerce_order_candidates candidate/u)
+assert.match(historyAdmission, /operations_commerce_order_observations observation/u)
+assert.match(historyAdmission, /reason: 'known_provider_identity'/u)
+assert.match(historyAdmission, /providerCreatedAt >= row\.ingestion_floor\.getTime\(\)/u)
+assert.match(
+  historyExclusionMigration,
+  /history_exclusion_code = 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED'/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /history_excluded_provider_created_at <= captured_at/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /NEW\.excluded_provider_created_at < history\.ingestion_floor/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /NEW\.excluded_provider_created_at <=\s+NEW\.observed_provider_updated_at/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /Order-history exclusion evidence is immutable/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /commerce_store_sync_history_exclusion_valid[\s\S]{0,900}NOT VALID;[\s\S]{0,150}VALIDATE CONSTRAINT commerce_store_sync_history_exclusion_valid/u,
+)
+assert.match(
+  historyExclusionMigration,
+  /shopify_order_webhook_history_exclusion_valid[\s\S]{0,700}NOT VALID;[\s\S]{0,150}VALIDATE CONSTRAINT shopify_order_webhook_history_exclusion_valid/u,
+)
+assert.match(
+  persistence,
+  /account\.integration_type = 'commerce'[\s\S]{0,80}account\.provider = \$4/u,
+)
+assert.match(
+  commerceIntegrations,
+  /operations_commerce_order_history_policies[\s\S]{0,800}ON CONFLICT \(organization_id, integration_account_id\) DO NOTHING/u,
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'new_orders_only',
+    'shopify',
+  ),
+  'new_orders_only',
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(undefined, 'shopify'),
+  'new_orders_only',
+)
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(undefined, 'faire'),
+  'new_orders_only',
+)
+for (const mode of ['last_7_days', 'last_30_days', 'last_60_days']) {
+  assert.equal(
+    historyPolicyRuntime.normalizeCommerceOrderHistoryMode(mode, 'shopify'),
+    mode,
+  )
+  assert.equal(
+    historyPolicyRuntime.normalizeCommerceOrderHistoryMode(mode, 'faire'),
+    mode,
+  )
+}
+assert.equal(
+  historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'provider_all',
+    'faire',
+  ),
+  'provider_all',
+)
+assert.equal(
+  historyPolicyRuntime.commerceOrderHistoryRequestedFrom(
+    'last_7_days',
+    new Date('2026-09-04T12:00:00.000Z'),
+  ).toISOString(),
+  '2026-08-28T12:00:00.000Z',
+)
+assert.equal(
+  historyPolicyRuntime.commerceOrderHistoryRequestedFrom(
+    'provider_all',
+    new Date('2026-09-04T12:00:00.000Z'),
+  ),
+  null,
+)
+assert.throws(
+  () => historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'provider_all',
+    'shopify',
+  ),
+  /invalid for shopify/u,
+)
+assert.throws(
+  () => historyPolicyRuntime.normalizeCommerceOrderHistoryMode(
+    'unbounded',
+    'faire',
+  ),
+  /invalid for faire/u,
+)
+
 assert.match(history, /status:any created_at:>='/u)
 assert.match(history, /created_at:<='/u)
 assert.match(history, /sortKey: \$\{sortKey\}, reverse: false/u)
@@ -152,7 +301,7 @@ assert.match(history, /readAllOrdersScopeObserved: readAllOrders/u)
 assert.match(history, /returnHistoryScopeObserved: readReturns/u)
 assert.match(history, /listFaireOrders\(options, \{/u)
 assert.match(history, /cursor: input\.providerCursor/u)
-assert.match(history, /updatedAtMin: input\.mode === 'continuous_poll'/u)
+assert.match(history, /updatedAtMin: requestedFrom/u)
 assert.doesNotMatch(history, /updateFaire|cancelFaire|moveFaire|updateShopify|mutation /u)
 assert.match(history, /attributionSource: 'unavailable'/u)
 assert.doesNotMatch(history, /providerActorFingerprint: staffFingerprint/u)
@@ -201,6 +350,8 @@ const persistenceRuntime = loadTypeScript(
       COMMERCE_ORDER_SYNC_CURSOR_AAD_VERSION:
         'commerce-order-sync-cursor-aad-v1',
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/commerceStoreSync': {
       commerceStoreSyncRunningSql: () => 'TRUE',
     },
@@ -223,6 +374,8 @@ const cryptoRuntime = loadTypeScript(
     '@/lib/persistence/config': { isHostedRuntime: () => hosted },
     '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs':
       keyConfiguration,
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
   },
 )
 const historyRuntime = loadTypeScript(
@@ -792,6 +945,14 @@ assert.throws(
 )
 assert.equal(
   historyRuntime.faireOrderHistoryListWindow({
+    requestedFrom: '2026-08-06T00:00:00.000Z',
+    requestedThrough: '2026-08-13T00:00:00.000Z',
+    mode: 'historical_backfill',
+  }).updatedAtMin,
+  '2026-08-06T00:00:00.000Z',
+)
+assert.equal(
+  historyRuntime.faireOrderHistoryListWindow({
     requestedFrom: '2026-08-12T23:00:00.000Z',
     requestedThrough: '2026-08-13T00:00:00.000Z',
     mode: 'continuous_poll',
@@ -802,27 +963,56 @@ assert.doesNotThrow(
   () => historyRuntime.assertShopifyOrderHistoryWindowAccessible({
     requestedFrom: '2026-06-14T00:00:00.000Z',
     requestedThrough: '2026-08-13T00:00:00.000Z',
-    observedAt: '2026-08-13T00:09:59.999Z',
+    observedAt: '2026-08-14T00:00:00.000Z',
     readAllOrdersGranted: false,
   }),
-  'The exact 60-day read_orders attempt must tolerate the bounded queue SLA',
+  'A frozen admission floor must not make delayed standard-scope work fail',
 )
-assert.throws(
-  () => historyRuntime.assertShopifyOrderHistoryWindowAccessible({
+assert.equal(
+  historyRuntime.shopifyOrderHistoryProviderRequestedFrom({
     requestedFrom: '2026-06-14T00:00:00.000Z',
     requestedThrough: '2026-08-13T00:00:00.000Z',
-    observedAt: '2026-08-13T00:10:00.001Z',
+    observedAt: '2026-08-14T00:00:00.000Z',
     readAllOrdersGranted: false,
   }),
-  /missed its bounded execution window/u,
+  '2026-06-15T00:00:00.000Z',
+  'Standard read_orders must clamp the provider query, not mutate the policy floor',
 )
-assert.doesNotThrow(
-  () => historyRuntime.assertShopifyOrderHistoryWindowAccessible({
+assert.equal(
+  historyRuntime.shopifyOrderHistoryProviderRequestedFrom({
     requestedFrom: '2026-06-14T00:00:00.000Z',
     requestedThrough: '2026-08-13T00:00:00.000Z',
     observedAt: '2026-08-14T00:00:00.000Z',
     readAllOrdersGranted: true,
   }),
+  '2026-06-14T00:00:00.000Z',
+  'read_all_orders may query the complete configured window',
+)
+assert.equal(
+  historyRuntime.shopifyOrderHistoryProviderRequestedFrom({
+    requestedFrom: '2026-04-01T00:00:00.000Z',
+    requestedThrough: '2026-05-01T00:00:00.000Z',
+    observedAt: '2026-08-14T00:00:00.000Z',
+    readAllOrdersGranted: false,
+  }),
+  null,
+  'A delayed standard-scope session must terminate when no accessible overlap remains',
+)
+assert.doesNotThrow(
+  () => historyRuntime.shopifyHistoricalOrderSearchWindow({
+    requestedFrom: '2026-05-01T00:00:00.000Z',
+    requestedThrough: '2026-08-13T00:00:00.000Z',
+    mode: 'historical_backfill',
+  }),
+  'Authorized historical backfill is not inherently limited to 60 days',
+)
+assert.throws(
+  () => historyRuntime.shopifyHistoricalOrderSearchWindow({
+    requestedFrom: '2026-05-01T00:00:00.000Z',
+    requestedThrough: '2026-08-13T00:00:00.000Z',
+    mode: 'continuous_poll',
+  }),
+  /provider-read window is invalid/u,
 )
 assert.match(
   historyRuntime.shopifyHistoricalOrderSearchWindow({
@@ -1228,6 +1418,7 @@ let adapterProvider = 'shopify'
 let shopifyAdapterDetail = null
 let shopifyAdapterNextCursor = null
 let shopifyAdapterReadReturns = false
+let shopifyAdapterReadAllOrders = true
 let shopifyAdapterFailureStage = null
 let shopifyAdapterNativeNodes = []
 let faireAdapterOrder = null
@@ -1287,6 +1478,9 @@ const adapterHistoryRuntime = loadTypeScript(
   'app_src/lib/integrations/commerceOrderHistory.ts',
   history,
   {
+    '@/lib/integrations/commerceReadRuntime': {
+      commerceReadCredentialEligible: () => true,
+    },
     '@/lib/integrations/commerceCapabilities': {
       hasEffectiveShopifyScope: (scopes, expected) => scopes.includes(expected),
     },
@@ -1336,7 +1530,8 @@ const adapterHistoryRuntime = loadTypeScript(
         return {
           accessToken: 'access',
           grantedScopes: [
-            'read_orders', 'read_all_orders',
+            'read_orders',
+            ...(shopifyAdapterReadAllOrders ? ['read_all_orders'] : []),
             ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
           ],
         }
@@ -1348,7 +1543,8 @@ const adapterHistoryRuntime = loadTypeScript(
         return {
           shopId: 'gid://shopify/Shop/adapter',
           grantedScopes: [
-            'read_orders', 'read_all_orders',
+            'read_orders',
+            ...(shopifyAdapterReadAllOrders ? ['read_all_orders'] : []),
             ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
           ],
         }
@@ -1447,6 +1643,7 @@ const readShopifyAdapter = async (detail, overrides = {}) => {
   shopifyAdapterDetail = detail
   shopifyAdapterNextCursor = overrides.nextCursor ?? null
   shopifyAdapterReadReturns = overrides.readReturns ?? false
+  shopifyAdapterReadAllOrders = overrides.readAllOrders ?? true
   return adapterHistoryRuntime.readCommerceOrderHistoryPage({
     organizationId: '00000000-0000-4000-8000-000000000001',
     accountGlobalId: 'gia0000001',
@@ -1456,7 +1653,7 @@ const readShopifyAdapter = async (detail, overrides = {}) => {
     requestedThrough: overrides.requestedThrough
       ?? '2026-08-13T00:02:00.000Z',
     providerCursor: null,
-    observedAt: '2026-08-13T00:03:00.000Z',
+    observedAt: overrides.observedAt ?? '2026-08-13T00:03:00.000Z',
     mode: overrides.mode ?? 'historical_backfill',
   })
 }
@@ -1625,6 +1822,20 @@ const overlappedShopifyPage = await readShopifyAdapter(
   },
 )
 assert.equal(overlappedShopifyPage.observations.length, 1)
+const expiredShopifyStandardScopePage = await readShopifyAdapter(
+  shopifyTrackingDetail('1Z-EXPIRED', '2026-05-01T00:00:00.000Z'),
+  {
+    readAllOrders: false,
+    requestedFrom: '2026-04-01T00:00:00.000Z',
+    requestedThrough: '2026-05-01T00:00:00.000Z',
+    observedAt: '2026-08-14T00:00:00.000Z',
+  },
+)
+assert.equal(expiredShopifyStandardScopePage.observations.length, 0)
+assert.equal(expiredShopifyStandardScopePage.providerRowsSeen, 0)
+assert.equal(expiredShopifyStandardScopePage.nextProviderCursor, null)
+assert.equal(expiredShopifyStandardScopePage.providerReads, 2)
+assert.equal(expiredShopifyStandardScopePage.readAllOrdersScopeObserved, false)
 
 const shopifyLifecycleDetail = (
   revision,
@@ -2175,6 +2386,8 @@ const workerRuntime = loadTypeScript(
   'app_src/lib/commerceOrderHistoryWorker.ts',
   worker,
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceOrderHistory': {
       async readCommerceOrderHistoryPage(input) {
         workerCalls.push(['read', input.providerCursor])

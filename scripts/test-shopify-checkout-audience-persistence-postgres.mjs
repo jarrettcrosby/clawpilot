@@ -1691,6 +1691,10 @@ async function exercise(databaseUrl) {
           CommerceIntegrationRequestError,
           testCommerceConnection: async () => null,
         },
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+          assertIntegrationCredentialProviderIoReady: () => undefined,
+          isIntegrationCredentialRuntimeGateError: () => false,
+        },
         '@/lib/operations/hybridCartonization': {
           HYBRID_CARTONIZATION_ALGORITHM_VERSION: 'test',
         },

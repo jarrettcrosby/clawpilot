@@ -2,16 +2,22 @@ import {
   claimCommerceFulfillmentRecoveryInPostgres,
   COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT,
   finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres,
+  parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres,
   type CommerceFulfillmentRecoveryClaim,
 } from '@/lib/persistence/commerceFulfillmentRecovery'
 import {
   executeOperationsCommerceFulfillmentExportFromPostgres,
 } from '@/lib/persistence/operations'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 type Dependencies = {
   claim: typeof claimCommerceFulfillmentRecoveryInPostgres
   finalizeExhausted:
     typeof finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres
+  parkRuntimeMaintenance:
+    typeof parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres
   execute: typeof executeOperationsCommerceFulfillmentExportFromPostgres
 }
 
@@ -19,6 +25,8 @@ const DEFAULT_DEPENDENCIES: Dependencies = {
   claim: claimCommerceFulfillmentRecoveryInPostgres,
   finalizeExhausted:
     finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres,
+  parkRuntimeMaintenance:
+    parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres,
   execute: executeOperationsCommerceFulfillmentExportFromPostgres,
 }
 
@@ -101,6 +109,16 @@ export async function processCommerceFulfillmentRecovery(input: {
         terminalFailures += 1
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        const maintenanceError = error
+        await Promise.allSettled([
+          dependencies.parkRuntimeMaintenance({
+            workerId: input.workerId,
+            claim,
+          }),
+        ])
+        throw maintenanceError
+      }
       const code = errorCode(error)
       if (code && CONTENTION_CODES.has(code)) contentionSkipped += 1
       else executionErrors += 1

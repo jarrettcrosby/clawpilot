@@ -337,6 +337,12 @@ vm.runInNewContext(transpiledApplication, {
   module: applicationModule,
   require(identifier) {
     if (identifier === 'node:crypto') return requireFromApp(identifier)
+    if (
+      identifier
+      === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+    ) {
+      return { isIntegrationCredentialRuntimeGateError: () => false }
+    }
     return {}
   },
 }, { filename: 'app_src/lib/operations/productionFulfillmentRerates.ts' })

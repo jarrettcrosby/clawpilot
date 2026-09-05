@@ -11,6 +11,9 @@ import {
 import {
   executeShopifyRateWarmRequest,
 } from '@/lib/integrations/shopifyRateWarmRuntime'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -60,6 +63,8 @@ export async function GET(request: NextRequest) {
       headers: RESPONSE_HEADERS,
     })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     return genericFailure(safeStatus(error))
   }
 }

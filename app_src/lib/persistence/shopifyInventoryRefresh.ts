@@ -13,7 +13,7 @@ const WORKER_HEARTBEAT_KEY =
   'commerce.shopify_inventory_refresh.worker.heartbeat'
 const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
-  { developmentRequiresActive: true },
+  { developmentRequiresActive: true, capability: 'inventory' },
 )
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const INVENTORY_READABLE_CONNECTION_SQL = `(
@@ -1669,9 +1669,14 @@ export async function failShopifyInventoryRefreshJobInPostgres(input: {
   return outcome
 }
 
-export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
-  input: { job: ShopifyInventoryRefreshJob },
-) {
+async function parkShopifyInventoryRefreshInPostgres(input: {
+  job: ShopifyInventoryRefreshJob
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Shopify inventory refresh parking reason is invalid')
+  }
   const parked = await query(
     `UPDATE operations_shopify_inventory_refresh_jobs
      SET status = CASE
@@ -1685,7 +1690,7 @@ export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
          lock_token = NULL,
          lease_expires_at = NULL,
          cancel_requested = false,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $5,
          completed_at = NULL,
          updated_at = now()
      WHERE id = $1::uuid
@@ -1699,9 +1704,25 @@ export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
       input.job.organizationId,
       input.job.integrationAccountId,
       input.job.lockToken,
+      input.errorCode,
     ],
   )
   return { parked: parked.rowCount === 1 }
+}
+
+export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
+  input: { job: ShopifyInventoryRefreshJob },
+) {
+  return parkShopifyInventoryRefreshInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkShopifyInventoryRefreshForRuntimeMaintenanceInPostgres(
+  input: { job: ShopifyInventoryRefreshJob; errorCode: string },
+) {
+  return parkShopifyInventoryRefreshInPostgres(input)
 }
 
 export async function recordShopifyInventoryRefreshWorkerHeartbeatInPostgres(

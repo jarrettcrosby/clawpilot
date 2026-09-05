@@ -171,6 +171,9 @@ async function verify(databaseUrl, ids) {
         },
       },
       '@/lib/integrations/shopifyOrderWebhook': shopifyOrderWebhook,
+      '@/lib/integrations/commerceReadRuntime': {
+        commerceReadAccountSql: () => "account.status = 'active'",
+      },
       '@/lib/persistence/postgres': acknowledgmentTestAdapter,
       '@/lib/persistence/commerceOrderSync': commerceOrderSync,
     },
@@ -1663,6 +1666,19 @@ async function verify(databaseUrl, ids) {
        )`,
       [ids.organization, webhookFirstAccountId, actorEmail],
     )
+    await pool.query(
+      `WITH policy_clock AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       )
+       SELECT $1::uuid, $2::uuid, 'shopify', 'new_orders_only',
+              policy_clock.value, policy_clock.value, $3
+       FROM policy_clock`,
+      [ids.organization, webhookFirstAccountId, actorEmail],
+    )
     const webhookFirstRuntime = {
       ...runtime(ids),
       integrationAccountId: webhookFirstAccountId,
@@ -1824,30 +1840,186 @@ async function verify(databaseUrl, ids) {
        WHERE receipt.target_id=target.id) AS receipts
       FROM operations_shopify_order_webhook_targets target WHERE external_order_id=$1`, [urlOrderId])
     assert.deepEqual(actualCounts.rows, [{ total: 18, receipts: 18 }], 'webhook accounting must retain actual three-to-five read costs')
+
+    const floorFixture = await pool.connect()
+    try {
+      await floorFixture.query('BEGIN')
+      await floorFixture.query('SET LOCAL session_replication_role = replica')
+      await floorFixture.query(
+        `UPDATE operations_commerce_order_history_policies
+         SET history_mode = 'new_orders_only', ingestion_floor = frozen_at
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [ids.organization, ids.integration],
+      )
+      await floorFixture.query('COMMIT')
+    } catch (error) {
+      await floorFixture.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      floorFixture.release()
+    }
+    const frozenFloor = (await pool.query(
+      `SELECT ingestion_floor
+       FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [ids.organization, ids.integration],
+    )).rows[0].ingestion_floor
+    const beforeFrozenFloor = new Date(
+      frozenFloor.getTime() - 24 * 60 * 60 * 1_000,
+    ).toISOString()
+    const boundaryUpdatedAt = new Date().toISOString()
+    const boundaryObservation = ({ externalOrderId, label }) => {
+      const base = observation(boundaryUpdatedAt)
+      return {
+        ...base,
+        externalOrderId,
+        orderNumber: `#${label}`,
+        sourceHash: createHash('sha256').update(label).digest('hex'),
+        providerCreatedAt: beforeFrozenFloor,
+        providerProcessedAt: beforeFrozenFloor,
+        providerUpdatedAt: boundaryUpdatedAt,
+        observedAt: boundaryUpdatedAt,
+        lines: base.lines.map((line) => ({
+          ...line,
+          externalLineId: `gid://shopify/LineItem/${label}`,
+        })),
+        events: base.events.map((event) => ({
+          ...event,
+          externalEventId: `${label}-tracking`,
+          externalSubjectId: `${label}-shipment`,
+          occurredAt: boundaryUpdatedAt,
+        })),
+      }
+    }
+    const appendBoundaryRead = async ({ externalOrderId, label }) => {
+      await persistence.recordShopifyOrderWebhookSignalInPostgres({
+        ...input,
+        providerEventId: `${label}-signal-${randomUUID()}`,
+        providerTriggeredAt: boundaryUpdatedAt,
+        evidence: evidence({
+          externalOrderId,
+          providerUpdatedAt: boundaryUpdatedAt,
+          payloadHash: createHash('sha256').update(`${label}-signal`).digest('hex'),
+        }),
+      })
+      const claims = await persistence.claimShopifyOrderWebhookTargetsInPostgres({
+        workerId: `${label}-worker`,
+        limit: 25,
+      })
+      const claim = claims.find((entry) => entry.externalOrderId === externalOrderId)
+      assert.ok(claim, `${label} must capture a current webhook hydration claim`)
+      return persistence.appendShopifyOrderWebhookExactReadInPostgres({
+        claim,
+        observation: boundaryObservation({ externalOrderId, label }),
+        readAllOrdersScopeObserved: true,
+        returnHistoryScopeObserved: true,
+      })
+    }
+
+    const excludedOrderId = 'gid://shopify/Order/93990002'
+    const excludedRead = await appendBoundaryRead({
+      externalOrderId: excludedOrderId,
+      label: 'history-floor-excluded-9399',
+    })
+    assert.deepEqual({
+      historyExcluded: excludedRead.historyExcluded,
+      appended: excludedRead.appended,
+      linesAppended: excludedRead.linesAppended,
+      eventsAppended: excludedRead.eventsAppended,
+      providerReads: excludedRead.providerReads,
+    }, {
+      historyExcluded: true,
+      appended: 0,
+      linesAppended: 0,
+      eventsAppended: 0,
+      providerReads: 3,
+    }, 'An unknown pre-floor webhook order must retain only terminal read evidence')
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_order_observations
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3`,
+      [ids.organization, ids.integration, excludedOrderId],
+    )).rows[0].count), 0)
+    const excludedEvidence = (await pool.query(
+      `SELECT global_id, observation_id::text,
+              history_exclusion_code, excluded_provider_created_at
+       FROM operations_shopify_order_webhook_reads
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3`,
+      [ids.organization, ids.integration, excludedOrderId],
+    )).rows[0]
+    assert.equal(excludedEvidence.observation_id, null)
+    assert.equal(
+      excludedEvidence.history_exclusion_code,
+      'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+    )
+    assert.equal(
+      excludedEvidence.excluded_provider_created_at.toISOString(),
+      beforeFrozenFloor,
+    )
+    await rejection(
+      pool.query(
+        `UPDATE operations_shopify_order_webhook_reads
+         SET history_exclusion_code = NULL
+         WHERE global_id = $1`,
+        [excludedEvidence.global_id],
+      ),
+      /Shopify order webhook reads are immutable/u,
+    )
+
+    const knownOldRead = await appendBoundaryRead({
+      externalOrderId: urlOrderId,
+      label: 'history-floor-known-update-9399',
+    })
+    assert.equal(knownOldRead.historyExcluded, false)
+    assert.equal(knownOldRead.appended, 1)
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_order_observations
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3
+         AND provider_created_at < $4::timestamptz`,
+      [ids.organization, ids.integration, urlOrderId, frozenFloor],
+    )).rows[0].count) > 0, true,
+    'A known pre-floor provider identity must retain later webhook facts')
   } finally {
     await pool.end()
   }
 }
 
 async function main() {
-  command('docker', ['info'], { timeout: 30_000 })
-  const container = (
-    `clawpilot-order-webhook-${process.pid}-${randomUUID().slice(0, 8)}`
-  )
+  const externalDatabaseUrl = String(
+    process.env.CLAWPILOT_SHOPIFY_ORDER_WEBHOOK_DATABASE_URL || '',
+  ).trim()
+  if (!externalDatabaseUrl) {
+    command('docker', ['info'], { timeout: 30_000 })
+  }
+  const container = externalDatabaseUrl
+    ? null
+    : `clawpilot-order-webhook-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    command('docker', [
-      'run', '--rm', '-d', '--name', container,
-      '-e', 'POSTGRES_PASSWORD=shopify_order_webhook',
-      '-e', 'POSTGRES_DB=shopify_order_webhook',
-      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
-    const portOutput = command('docker', ['port', container, '5432/tcp'])
-    const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
-    assert.ok(port > 0)
-    const databaseUrl = (
-      'postgresql://postgres:shopify_order_webhook@127.0.0.1:'
-      + `${port}/shopify_order_webhook`
-    )
+    let databaseUrl = externalDatabaseUrl
+    if (!databaseUrl) {
+      command('docker', [
+        'run', '--rm', '-d', '--name', container,
+        '-e', 'POSTGRES_PASSWORD=shopify_order_webhook',
+        '-e', 'POSTGRES_DB=shopify_order_webhook',
+        '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
+      ], { timeout: 180_000 })
+      const portOutput = command('docker', ['port', container, '5432/tcp'])
+      const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
+      assert.ok(port > 0)
+      databaseUrl = (
+        'postgresql://postgres:shopify_order_webhook@127.0.0.1:'
+        + `${port}/shopify_order_webhook`
+      )
+    }
     await waitForPostgres(databaseUrl)
     const pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const client = await pool.connect()
@@ -1878,17 +2050,35 @@ async function main() {
          ) ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
         [ids.organization, ids.integration, actorEmail],
       )
+      await client.query('BEGIN')
+      try {
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_commerce_order_history_policies
+           SET history_mode = 'last_60_days',
+               ingestion_floor = frozen_at - interval '60 days'
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid`,
+          [ids.organization, ids.integration],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw error
+      }
     } finally {
       client.release()
       await pool.end()
     }
     await verify(databaseUrl, ids)
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 20_000,
-    })
+    if (container) {
+      spawnSync('docker', ['stop', '-t', '1', container], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 20_000,
+      })
+    }
   }
   console.log('Shopify order webhook signal disposable-PostgreSQL acceptance passed')
 }

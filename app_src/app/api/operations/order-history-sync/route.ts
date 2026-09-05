@@ -8,6 +8,9 @@ import {
 import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -119,7 +122,7 @@ async function refreshCandidate(input: {
       'An exact provider-history read is still in progress',
     )
   }
-  if (replay?.status === 'unavailable') {
+  if (replay?.status === 'unavailable' || replay?.status === 'excluded') {
     return Object.freeze({
       candidateGlobalId: candidate.candidateGlobalId,
       accountGlobalId: candidate.accountGlobalId,
@@ -195,6 +198,18 @@ async function refreshCandidate(input: {
           providerReadLease,
           observation: exact.observation,
         })
+        if ('status' in captured && captured.status === 'excluded') {
+          return Object.freeze({
+            candidateGlobalId: candidate.candidateGlobalId,
+            accountGlobalId: candidate.accountGlobalId,
+            provider: candidate.provider,
+            outcome: 'unavailable' as const,
+            changed: false,
+            code: 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+            terminalUnsupported: false,
+            providerReads: captured.providerReads,
+          })
+        }
         return Object.freeze({
           candidateGlobalId: candidate.candidateGlobalId,
           accountGlobalId: candidate.accountGlobalId,
@@ -402,6 +417,8 @@ export async function POST(req: NextRequest) {
     })
     return response({ ok: true, replayed: false, result })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     if (error instanceof Error && error.message === 'Unauthorized') {
       return response({
         ok: false,

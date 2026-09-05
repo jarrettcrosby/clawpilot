@@ -24,6 +24,9 @@ import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipme
 import {
   packShippingOneOffShipmentInPostgres,
 } from '@/lib/persistence/shippingOneOffPack'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -42,6 +45,8 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof OneOffShipmentPersistenceError) {
     return json({
       ok: false,

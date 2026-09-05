@@ -64,13 +64,19 @@ DATABASE_URL=postgresql://localhost/clawpilot_dev \
 node scripts/seed-wms-development-simulation.mjs
 ```
 
-Use a Railway development environment through its injected variables:
+The former Railway hosted-development invocation is retained below only as
+legacy evidence. That environment is retired; do not run this command unless a
+separate, isolated hosted-development service and database have been restored
+and accepted:
 
 ```bash
 WMS_SIM_ENV=dev \
 WMS_SIM_ORGANIZATION_ID=<workspace-organization-uuid> \
 node scripts/seed-wms-development-simulation.mjs
 ```
+
+Local or disposable PostgreSQL is the only supported active simulation lane.
+Never point the simulator at the Railway production database.
 
 The default pipeline is selected first. Set `WMS_SIM_PIPELINE_ID` to choose a
 specific pipeline belonging to the supplied organization.

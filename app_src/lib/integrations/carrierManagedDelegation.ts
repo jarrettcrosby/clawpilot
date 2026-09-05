@@ -3,6 +3,17 @@ export const AG_ALCHEMY_EPISCS_CARRIER_DELEGATION =
 
 export const AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE = 'gwh5366613'
 
+export const AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_ORGANIZATION = 'ga5122758'
+
+export const AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_IDENTITIES = Object.freeze([
+  'gia7335302:gac2368052',
+  'gia2057284:gac5139730',
+])
+
+const AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_PAIRS = new Set(
+  AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_IDENTITIES,
+)
+
 export const MANAGED_SANDBOX_RATING_SCOPE = 'sandbox_rating_only'
 
 export const MANAGED_SANDBOX_FULFILLMENT_SCOPE =
@@ -19,6 +30,10 @@ type ManagedCarrierConfiguration = {
   credentialRevealAllowed?: unknown
   senderOriginWarehouseGlobalId?: unknown
   allowedCapabilities?: unknown
+  delegatedFromOrganizationReferenceCode?: unknown
+  sourceIntegrationGlobalId?: unknown
+  sourceCarrierAccountGlobalId?: unknown
+  migrationSourceAuthorityVerified?: unknown
 }
 
 function exactCapabilities(value: unknown, expected: string[]) {
@@ -48,11 +63,26 @@ export function managedCarrierDelegationProfile(
   configuration: ManagedCarrierConfiguration,
 ): ManagedCarrierDelegationProfile | null {
   if (!isSourceManagedCarrierConfiguration(configuration)) return null
+  const migratedProductionAuthorityMatches = (
+    configuration.migrationSourceAuthorityVerified === true
+    && configuration.delegatedFromOrganizationReferenceCode
+      === AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_ORGANIZATION
+    && AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_PAIRS.has(
+      `${String(configuration.sourceIntegrationGlobalId || '')}`
+      + `:${String(configuration.sourceCarrierAccountGlobalId || '')}`,
+    )
+    && /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/u.test(
+      String(configuration.senderOriginWarehouseGlobalId || ''),
+    )
+  )
   const commonPolicyMatches = (
     configuration.managedBy === AG_ALCHEMY_EPISCS_CARRIER_DELEGATION
     && configuration.credentialRevealAllowed === false
-    && configuration.senderOriginWarehouseGlobalId
-      === AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE
+    && (
+      configuration.senderOriginWarehouseGlobalId
+        === AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE
+      || migratedProductionAuthorityMatches
+    )
   )
   if (!commonPolicyMatches) return 'drifted'
   if (

@@ -1,9 +1,31 @@
 export type CommerceReadRuntimeMode = 'development' | 'production'
+export type CommerceReadCapability =
+  | 'catalog'
+  | 'images'
+  | 'inventory'
+  | 'orders_history'
+  | 'webhook_hydration'
+
+const COMMERCE_READ_CAPABILITIES = new Set<CommerceReadCapability>([
+  'catalog',
+  'images',
+  'inventory',
+  'orders_history',
+  'webhook_hydration',
+])
+
+function exactReadCapability(value: unknown): CommerceReadCapability {
+  if (!COMMERCE_READ_CAPABILITIES.has(value as CommerceReadCapability)) {
+    throw new Error('Commerce read capability is invalid')
+  }
+  return value as CommerceReadCapability
+}
 
 type CommerceReadCredential = {
   environment: 'sandbox' | 'production'
   status: 'active' | 'disabled' | 'error'
   verificationStatus: 'unverified' | 'verified' | 'failed'
+  hostedProductionSandboxReadCapabilities?: CommerceReadCapability[]
 }
 
 function runtimeLane() {
@@ -24,8 +46,10 @@ function runtimeLane() {
 /**
  * Provider reads and local reconciliation use the established commerce-intake
  * feature flag in both hosted lanes. Production is deliberately a narrower
- * authority: only active, verified production accounts are eligible. The
- * development lane retains the existing sandbox/test-account behavior.
+ * authority: active, verified production accounts are eligible. The two
+ * compiled Shopify demo accounts additionally need a current, capability-
+ * specific hosted-production sandbox-read authorization. The development lane
+ * retains the existing sandbox/test-account behavior.
  */
 export function commerceReadRuntimeMode(): CommerceReadRuntimeMode | null {
   if (process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED !== '1') return null
@@ -47,13 +71,23 @@ export function productionCommerceReadRuntime() {
 
 export function commerceReadCredentialEligible(
   credential: CommerceReadCredential,
-  options: { developmentRequiresActive?: boolean } = {},
+  options: {
+    developmentRequiresActive?: boolean
+    capability?: CommerceReadCapability
+  } = {},
 ) {
   if (credential.verificationStatus !== 'verified') return false
   if (commerceReadRuntimeMode() === 'production') {
+    const capability = exactReadCapability(options.capability || 'orders_history')
     return (
-      credential.environment === 'production'
-      && credential.status === 'active'
+      credential.status === 'active'
+      && (
+        credential.environment === 'production'
+        || (
+          credential.environment === 'sandbox'
+          && credential.hostedProductionSandboxReadCapabilities?.includes(capability) === true
+        )
+      )
     )
   }
   if (commerceReadRuntimeMode() !== 'development') return false
@@ -65,7 +99,10 @@ export function commerceReadCredentialEligible(
 /** Trusted SQL fragment; alias is restricted before interpolation. */
 export function commerceReadAccountSql(
   alias = 'account',
-  options: { developmentRequiresActive?: boolean } = {},
+  options: {
+    developmentRequiresActive?: boolean
+    capability?: CommerceReadCapability
+  } = {},
 ) {
   if (!/^[a-z][a-z0-9_]*$/u.test(alias)) {
     throw new Error('Commerce read SQL alias is invalid')
@@ -74,7 +111,15 @@ export function commerceReadAccountSql(
   // disabled. This prevents a module initialized before worker activation from
   // ever compiling a development-strength account predicate in production.
   if (runtimeLane() === 'production') {
-    return `(${alias}.status = 'active' AND ${alias}.environment = 'production')`
+    const capability = exactReadCapability(options.capability || 'orders_history')
+    return `(${alias}.status = 'active' AND (`
+      + `${alias}.environment = 'production' OR (`
+      + `${alias}.provider = 'shopify' AND `
+      + `${alias}.integration_type = 'commerce' AND `
+      + `${alias}.environment = 'sandbox' AND `
+      + 'operations_commerce_hosted_production_sandbox_read_is_current('
+      + `${alias}.organization_id, ${alias}.id, '${capability}'`
+      + ')))'
   }
   return options.developmentRequiresActive
     ? `${alias}.status = 'active'`
@@ -88,9 +133,10 @@ export function commerceReadRuntimeSummary() {
     mode,
     providerWrites: 0,
     productionAccountPolicy: mode === 'production'
-      ? 'active_verified_production_only'
+      ? 'active_verified_production_or_exact_expiring_shopify_sandbox_read_authority'
       : 'not_applicable',
     productionTestOrdersAllowed: false,
+    productionSandboxProviderWritesAllowed: false,
     automaticOrderPromotionAvailable: mode === 'development',
   } as const
 }

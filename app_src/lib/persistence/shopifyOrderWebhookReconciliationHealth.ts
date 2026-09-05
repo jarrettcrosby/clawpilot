@@ -14,6 +14,18 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION_CHECKSUM =
 export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION =
   '0316_operations_commerce_fulfillment_authority_leases.sql' as const
 
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY =
+  '0353_operations_commerce_workspace_migration_safety.sql' as const
+
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_CHECKSUM =
+  '07127dec7a0b8ad1ff2b661d801c89fefde5aa07a0ad0926710d784d0b7f6e09' as const
+
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY =
+  '0354_operations_sales_shipping_workspace_migration_safety.sql' as const
+
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY_CHECKSUM =
+  '322e822d66cc6b6e9d4fd9d662fe3e1064db7b9fe08279e7024e9644e422c399' as const
+
 const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_FUNCTION_HASH =
   '9ccde1c41904db27900dc0800c0077e7fa1a7ce70d02f1035324d2a60e27bb43'
 
@@ -26,6 +38,12 @@ const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_TRIGGER_HASH =
 const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_TRIGGER_HASH =
   'bab09e9c0408f54b6ce113c9a60e4175d7f529f7bcc2ad53f284aa701222e5a9'
 
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_TRIGGER_HASH =
+  'dc6d574262700868de9f0b3fe4a81cc72985933e9e1569214ac11b28d9a40e05'
+
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY_TRIGGER_HASH =
+  '7da8e6dea1e15f45734cecc02923b9416e3715aef64bd371910bb20eb6c96759'
+
 // This expression is shared by runtime health and disposable-PostgreSQL
 // tamper tests. Every name is public-qualified: a search_path lookalike must
 // never satisfy release health.
@@ -37,6 +55,48 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
       '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION}'
       AND installed_migration.checksum =
         '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION_CHECKSUM}'
+  )
+  AND (
+    NOT EXISTS (
+      SELECT 1
+      FROM public.schema_migrations commerce_migration_safety
+      WHERE commerce_migration_safety.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY}'
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.schema_migrations commerce_migration_safety
+      WHERE commerce_migration_safety.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY}'
+        AND commerce_migration_safety.checksum =
+          '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_CHECKSUM}'
+    )
+  )
+  AND (
+    NOT EXISTS (
+      SELECT 1
+      FROM public.schema_migrations sales_shipping_migration_safety
+      WHERE sales_shipping_migration_safety.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY}'
+    )
+    OR (
+      EXISTS (
+        SELECT 1
+        FROM public.schema_migrations sales_shipping_migration_safety
+        WHERE sales_shipping_migration_safety.filename =
+          '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY}'
+          AND sales_shipping_migration_safety.checksum =
+            '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY_CHECKSUM}'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM public.schema_migrations commerce_migration_safety
+        WHERE commerce_migration_safety.filename =
+          '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY}'
+          AND commerce_migration_safety.checksum =
+            '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_CHECKSUM}'
+      )
+    )
   )
   AND (
     WITH required_table(name) AS (
@@ -409,6 +469,20 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
         'app_user_organization_memberships'
       )
   ) = CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM public.schema_migrations sales_shipping_migration_safety
+      WHERE sales_shipping_migration_safety.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY}'
+    )
+    THEN '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY_TRIGGER_HASH}'
+    WHEN EXISTS (
+      SELECT 1
+      FROM public.schema_migrations commerce_migration_safety
+      WHERE commerce_migration_safety.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY}'
+    )
+    THEN '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_TRIGGER_HASH}'
     WHEN EXISTS (
       SELECT 1
       FROM public.schema_migrations installed_phase

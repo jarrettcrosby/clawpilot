@@ -16,6 +16,7 @@ import {
   updateCarrierAccount,
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { carrierProductionLabelRuntimePolicy } from '@/lib/integrations/carrierProductionLabelRuntime'
 import { testCarrierProductionShippingDiagnosticRate } from '@/lib/integrations/carrierShippingDiagnosticRate'
 import {
@@ -61,6 +62,8 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
   }

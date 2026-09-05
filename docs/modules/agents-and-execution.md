@@ -36,7 +36,7 @@ These are application roles, not separately created ChatGPT custom agents. Each 
 
 - Every ClawPilot user completes their own ChatGPT/Codex device authorization. The browser approval flow returns to ClawPilot after the user grants access.
 - Access and refresh tokens are encrypted in the restricted credential database and keyed by normalized ClawPilot email.
-- Development and production may share only that least-privilege credential store and encryption key. Boards, tasks, messages, runs, and results remain environment-specific.
+- Railway production owns the production least-privilege credential store and encryption key. Local or remote-local development may use a separate non-production credential store and key; it must never reuse the production values. Post-retirement Vercel previews must not receive agent credentials or execute agent work. The current application project still has a legacy production-scoped agent credential database assignment, so it remains a cutover blocker until the gated removal and re-audit in the environment contract pass. Boards, tasks, messages, runs, and results remain scoped to their own data authority.
 - Expired or revoked authorization disables execution and asks that user to reconnect; ClawPilot does not fall back to another user's credential or a synthetic response.
 - Per-user ChatGPT authorization is an identity, usage, and credential boundary. It is not a prompt-injection boundary and never replaces ClawPilot's authorization and action policies.
 

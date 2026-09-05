@@ -25,7 +25,12 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
 - Pipeline ownership choices are not application-access lists. Active ClawPilot members are projected to CRM Contacts and remain governed by their application role. An administrator may separately mark a tenant Contact as a CRM-only pipeline person; that record may own opportunities but cannot authenticate to ClawPilot until it completes the normal invitation and activation flow.
 - The selected pipeline's `Opportunities` Sheet table is the only writable workbook input. Sheet pulls stage those changes into the same CRM gateway used by ClawPilot writes.
 - Railway Postgres stores tenant-scoped CRM projections, source identity, synchronization status, reconciliation runs, and outbox leases. It is not a second independent CRM authority.
-- Development and production use separate SuiteCRM, MariaDB, Postgres, Google workbook, and user data.
+- Railway production is the required owner of SuiteCRM, MariaDB, Postgres,
+  Google workbooks, and live user data after cutover. Local and remote-local
+  runtimes have no production CRM, database, workbook, or provider authority.
+  Post-retirement Vercel previews must have none; the current legacy Vercel
+  database/configuration assignments leave that retirement unaccepted until the
+  environment runbook's gated cleanup and re-audit pass.
 
 ## Entity Mapping
 

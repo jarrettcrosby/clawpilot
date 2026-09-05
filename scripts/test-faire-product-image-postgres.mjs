@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
+import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
 import vm from 'node:vm'
 
 const root = process.cwd()
@@ -137,17 +138,11 @@ async function applyMigrations(client) {
     'Faire Product-image expired reconciliation migration is missing',
   )
   for (const file of files) {
-    await client.query('BEGIN')
-    try {
-      await client.query(readFileSync(
-        resolve(root, 'db/migrations', file),
-        'utf8',
-      ))
-      await client.query('COMMIT')
-    } catch (error) {
-      await client.query('ROLLBACK')
-      throw new Error(`Migration ${file} failed`, { cause: error })
-    }
+    await applyMigrationSqlForTest(
+      client,
+      file,
+      readFileSync(resolve(root, 'db/migrations', file), 'utf8'),
+    )
   }
 }
 

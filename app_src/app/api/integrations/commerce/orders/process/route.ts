@@ -12,6 +12,9 @@ import {
 import {
   shopifyAutomaticOrderPromotionHealthSnapshot,
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { processCommerceOrderReconciliation } from '@/lib/commerceOrderReconciliationWorker'
 import { processCommerceOrderHistory } from '@/lib/commerceOrderHistoryWorker'
 import {
@@ -28,6 +31,10 @@ import {
 import {
   redactExpiredCommerceOrderSensitiveEvidenceInPostgres,
 } from '@/lib/persistence/commerceOrderSync'
+import {
+  commerceStorageMaintenanceFailureResult,
+  maintainCommerceStorageInPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -40,6 +47,36 @@ function authorized(req: NextRequest) {
   const left = Buffer.from(expected)
   const right = Buffer.from(provided)
   return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+async function maintainRouteCommerceStorageSafely() {
+  try {
+    return await maintainCommerceStorageInPostgres({
+      workerId: 'commerce-orders-process-route',
+    })
+  } catch (error) {
+    return commerceStorageMaintenanceFailureResult(error)
+  }
+}
+
+function runtimeMaintenanceResponse(error: unknown) {
+  if (!isIntegrationCredentialRuntimeGateError(error)) return null
+  const code = String((error as { code?: unknown }).code || '')
+  return NextResponse.json({
+    ok: false,
+    maintenance: true,
+    retryable: true,
+    code,
+    error: 'Integration credential runtime is temporarily unavailable',
+  }, {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Retry-After': '60',
+    },
+  })
 }
 
 function safeCommerceOrderHistoryFailureCode(error: unknown) {
@@ -58,6 +95,7 @@ async function processCommerceOrderHistoryIsolated(input: {
   try {
     return await processCommerceOrderHistory(input)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return {
       degraded: true as const,
       errorCode: safeCommerceOrderHistoryFailureCode(error),
@@ -84,6 +122,7 @@ async function processShopifyOrderWebhookSignalsIsolated(input: {
   try {
     return await processShopifyOrderWebhookSignals(input)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return {
       degraded: true as const,
       errorCode: safeShopifyOrderWebhookFailureCode(error),
@@ -200,6 +239,9 @@ export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }
+  const commerceStorageMaintenance = isPostgresStorageEnabled()
+    ? await maintainRouteCommerceStorageSafely()
+    : null
   if (!commerceReadRuntimeAvailable()) {
     const [protectedSnapshotPurge, orderSensitiveEvidenceRedaction] =
       isPostgresStorageEnabled()
@@ -214,6 +256,7 @@ export async function POST(req: NextRequest) {
       reason: 'commerce-read-reconciliation-disabled',
       protectedSnapshotPurge,
       orderSensitiveEvidenceRedaction,
+      commerceStorageMaintenance,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -279,9 +322,28 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       ...completedResult,
+      routeCommerceStorageMaintenance: commerceStorageMaintenance,
       heartbeatAt: heartbeat.checkedAt,
     })
   } catch (error) {
+    const maintenance = runtimeMaintenanceResponse(error)
+    if (maintenance) {
+      await Promise.allSettled([(async () => {
+        const failedAttentionHealth = await durableAutomaticAttentionHealth()
+        await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
+          phase: 'maintenance',
+          workerId,
+          errorCode: String((error as { code?: unknown }).code || ''),
+          providerReadOnly: true,
+          localCanonicalOrderWritesPossible:
+            commerceReadRuntimeMode?.() === 'development',
+          runtimeMode: commerceReadRuntimeMode?.() || null,
+          providerWrites: 0,
+          ...failedAttentionHealth,
+        })
+      })()])
+      return maintenance
+    }
     const failedAttentionHealth = await durableAutomaticAttentionHealth()
     await recordCommerceOrderReconciliationWorkerHeartbeatInPostgres({
       phase: 'failed',

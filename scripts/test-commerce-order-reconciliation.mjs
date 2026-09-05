@@ -4,11 +4,13 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
+const commerceStorageMaintenanceTrace = []
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -49,6 +51,12 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
       if (specifier === '@/lib/integrations/commerceReadRuntime') {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceReadRuntime.ts',
@@ -79,6 +87,37 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
               purged: 0,
               expiredProtectedReadBacklog: null,
               backlogTruncated: false,
+            }
+          },
+        }
+      }
+      if (specifier === '@/lib/persistence/commerceStorageMaintenance') {
+        return {
+          async maintainCommerceStorageInPostgres(input) {
+            commerceStorageMaintenanceTrace.push(input)
+            return {
+              schemaAvailable: true,
+              executed: false,
+              status: 'not_due',
+              errorCode: null,
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+          commerceStorageMaintenanceFailureResult(error) {
+            return {
+              schemaAvailable: false,
+              executed: false,
+              status: 'failed',
+              errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
             }
           },
         }
@@ -1614,9 +1653,8 @@ assert.ok(
   'Order reconciliation must not present scanned provider rows as orders added',
 )
 assert.ok(
-  !intakeSource.includes('updatedAtMin: page.windowStart')
-    && !intakeSource.includes('initialWindowStart'),
-  'Fresh Faire automatic polls must start as full current-order scans',
+  intakeSource.includes('updatedAtMin: page.windowStart'),
+  'Faire automatic polls must carry the immutable first-admission boundary',
 )
 assert.ok(
   intakeSource.includes('Shopify must grant read_orders for current operational intake'),
@@ -1682,6 +1720,19 @@ assert.equal(
   'Protected snapshot retention must run even when commerce intake is disabled',
 )
 assert.equal(disabledSummary.protectedSnapshotPurge.purged, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(commerceStorageMaintenanceTrace.at(-1))),
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
+    inventoryLevelLimit: 10000,
+    workerId: 'commerce-order-reconciliation',
+  },
+  'Permanent commerce storage maintenance must run every reconciliation cycle',
+)
+assert.equal(disabledSummary.commerceStorageMaintenance.schemaAvailable, true)
 const currentFaireGateHealth = JSON.parse(JSON.stringify(
   fairePromotionPolicy.faireAutomaticOrderPromotionGateHealth(),
 ))
@@ -3137,6 +3188,8 @@ assert.equal(completedRouteHeartbeats.at(-1).phase, 'completed')
 let disabledRoutePurgeCalls = 0
 let disabledRouteRedactionCalls = 0
 let disabledRouteWorkerCalls = 0
+const disabledRouteMaintenanceCallsBefore =
+  commerceStorageMaintenanceTrace.length
 const disabledRouteModule = loadTypeScriptModule(
   'app_src/app/api/integrations/commerce/orders/process/route.ts',
   {
@@ -3233,6 +3286,19 @@ assert.equal(disabledRoutePurgeCalls, 1)
 assert.equal(disabledRouteRedactionCalls, 1)
 assert.equal(disabledRouteWorkerCalls, 0)
 assert.equal(
+  commerceStorageMaintenanceTrace.length,
+  disabledRouteMaintenanceCallsBefore + 1,
+  'Disabled order processing must still offer permanent storage maintenance',
+)
+assert.equal(
+  commerceStorageMaintenanceTrace.at(-1)?.workerId,
+  'commerce-orders-process-route',
+)
+assert.equal(
+  disabledRouteResponse.body.commerceStorageMaintenance.status,
+  'not_due',
+)
+assert.equal(
   disabledRouteResponse.body.orderSensitiveEvidenceRedaction.providerWrites,
   0,
 )
@@ -3260,7 +3326,13 @@ includes(route, [
   'health?.faireUnattributedAttentionRequired',
   "phase: 'started'",
   "phase: 'completed'",
+  "phase: 'maintenance'",
   "phase: 'failed'",
+  'await Promise.allSettled([(async () => {',
+  'return maintenance',
+  'isIntegrationCredentialRuntimeGateError(error)',
+  'status: 503',
+  "'Retry-After': '60'",
   'providerReadOnly: true',
   "commerceReadRuntimeMode?.() === 'development'",
   'shopifyAutomaticOrderPromotionHealthSnapshot',

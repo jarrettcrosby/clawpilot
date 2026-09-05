@@ -56,7 +56,7 @@ const SHOPIFY_WAREHOUSE_STARTER_LOCATIONS = Object.freeze([
 ])
 const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
-  { developmentRequiresActive: true },
+  { developmentRequiresActive: true, capability: 'inventory' },
 )
 
 export class CommerceInventoryPersistenceError extends Error {
@@ -383,6 +383,32 @@ type InventoryMappingStateRow = QueryResultRow & {
 function decimal(value: string | number | null | undefined): number {
   const parsed = Number(value || 0)
   return Number.isFinite(parsed) ? parsed : 0
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, canonicalJsonValue(child)]),
+    )
+  }
+  return value
+}
+
+function inventoryLevelSetHash(rows: Array<Record<string, unknown>>) {
+  const ordered = [...rows].sort((left, right) => (
+    String(left.external_inventory_item_id || '').localeCompare(
+      String(right.external_inventory_item_id || ''),
+    )
+    || String(left.source_hash || '').localeCompare(
+      String(right.source_hash || ''),
+    )
+  ))
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalJsonValue(ordered)))
+    .digest('hex')
 }
 
 function iso(value: Date | string | null | undefined): string | null {
@@ -1291,6 +1317,18 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         409,
       )
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        'commerce-inventory-snapshot-content',
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        'shopify',
+        SHOPIFY_INVENTORY_ADAPTER_VERSION,
+        input.snapshot.location.id,
+        input.snapshot.snapshotHash,
+      ].join(':'),
+    )
     await client.query(
       `INSERT INTO operations_commerce_inventory_snapshot_contents (
          organization_id, integration_account_id, provider, adapter_version,
@@ -1303,7 +1341,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
        ON CONFLICT (
          organization_id, integration_account_id, provider_location_id,
          adapter_version, snapshot_hash
-       ) DO NOTHING`,
+       ) WHERE snapshot_content IS NOT NULL DO NOTHING`,
       [
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
@@ -1326,6 +1364,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
          AND provider_location_id = $4
          AND snapshot_hash = $5
          AND level_count = $6
+         AND payload_purged_at IS NULL
          AND snapshot_content = $7::jsonb
          AND content_bytes = $8
        LIMIT 1`,
@@ -1594,8 +1633,12 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          'clawpilot.shopify_inventory_sync', 'on', true
        )`,
     )
-    const replay = await client.query<{ global_id: string }>(
-      `SELECT global_id
+    const replay = await client.query<{
+      global_id: string
+      level_set_reused: boolean
+    }>(
+      `SELECT global_id,
+              source_level_set_run_id IS NOT NULL AS level_set_reused
        FROM operations_commerce_inventory_sync_runs
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -1616,6 +1659,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       return {
         runGlobalId: replay.rows[0].global_id,
         replayed: true,
+        levelSetReused: replay.rows[0].level_set_reused,
       }
     }
     await lockShopifyInventoryProviderReadAuthority(
@@ -2084,7 +2128,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       snapshot.levels.map((level) => level.inventoryItemId),
     )
     const previousRun = await client.query<{ id: string }>(
-      `SELECT id::text
+      `SELECT COALESCE(source_level_set_run_id, id)::text AS id
        FROM operations_commerce_inventory_sync_runs
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -2383,6 +2427,96 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         return next
       }, 0),
     }
+    const buildEvidenceRows = (
+      positionByProduct: Map<string, ExistingPositionRow>,
+    ) => preparedLevels.map((prepared) => {
+      const mapping = prepared.mapping
+      const position = mapping
+        ? positionByProduct.get(mapping.product_id)
+        : null
+      const projectedPosition = prepared.projectionState === 'projected'
+        ? position
+        : null
+      return {
+        external_inventory_item_id: prepared.level.inventoryItemId,
+        sku: prepared.level.sku,
+        tracked: prepared.level.tracked,
+        mapping_state: mapping ? 'mapped' : 'unmapped',
+        projection_state: prepared.projectionState,
+        pipeline_id: mapping?.pipeline_id || null,
+        product_id: mapping?.product_id || null,
+        inventory_position_id: projectedPosition?.id || null,
+        provider_available_quantity:
+          prepared.level.quantities.available,
+        provider_incoming_quantity: prepared.level.quantities.incoming,
+        provider_committed_quantity:
+          prepared.level.quantities.committed,
+        provider_damaged_quantity: prepared.level.quantities.damaged,
+        provider_on_hand_quantity: prepared.level.quantities.on_hand,
+        provider_quality_control_quantity:
+          prepared.level.quantities.quality_control,
+        provider_reserved_quantity: prepared.level.quantities.reserved,
+        provider_safety_stock_quantity:
+          prepared.level.quantities.safety_stock,
+        provider_quantity_evidence:
+          prepared.level.quantityEvidence,
+        operational_available_quantity: prepared.operationalAvailable,
+        equation_matches: prepared.level.equationMatches,
+        provider_updated_at: prepared.level.updatedAt,
+        provider_weight_grams: prepared.level.providerWeightGrams,
+        provider_dimensions_mm:
+          prepared.level.providerDimensionsMm,
+        product_snapshot: {
+          ...prepared.level.productSnapshot,
+          mappedProduct: {
+            globalId: mapping?.product_global_id || null,
+            name: mapping?.product_name || null,
+            sku: mapping?.product_sku || null,
+          },
+        },
+        source_hash: prepared.level.sourceHash,
+      }
+    })
+    // A new projected product needs its database position ID before the level
+    // set can be hashed. That first run remains a full set; its next unchanged
+    // observation becomes the canonical reusable set.
+    const prospectiveEvidenceRows = createdCount === 0
+      ? buildEvidenceRows(existingByProduct)
+      : null
+    const levelSetHash = prospectiveEvidenceRows
+      ? inventoryLevelSetHash(prospectiveEvidenceRows)
+      : null
+    const reusableLevelSet = (
+      levelSetHash
+      && changedProjected.length === 0
+      && positionsToZero.length === 0
+    ) ? (await client.query<{ id: string; global_id: string }>(
+        `SELECT run.id::text, run.global_id
+         FROM operations_commerce_inventory_sync_runs run
+         WHERE run.organization_id = $1::uuid
+           AND run.integration_account_id = $2::uuid
+           AND run.location_mapping_id = $3::uuid
+           AND run.level_set_hash = $4
+           AND run.source_level_set_run_id IS NULL
+           AND run.status = 'succeeded'
+           AND (
+             SELECT count(*)
+             FROM operations_commerce_inventory_levels level
+             WHERE level.organization_id = run.organization_id
+               AND level.integration_account_id = run.integration_account_id
+               AND level.sync_run_id = run.id
+           ) = $5::integer
+         ORDER BY run.completed_at DESC, run.id DESC
+         LIMIT 1
+         FOR SHARE`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          locationMapping.id,
+          levelSetHash,
+          preparedLevels.length,
+        ],
+      )).rows[0] || null : null
     const finalizedAttempt = await client.query(
       `UPDATE operations_commerce_provider_attempts
        SET state = 'succeeded',
@@ -2416,6 +2550,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           providerWrites: 0,
           orderQuantityAdjustment: 0,
           inventoryApplied: true,
+          levelSetReused: Boolean(reusableLevelSet),
+          sourceInventoryRunGlobalId:
+            reusableLevelSet?.global_id || null,
         }),
         input.providerLocation.id,
         input.attempt.leaseToken,
@@ -2440,13 +2577,14 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          provider_available_quantity, provider_committed_quantity,
          provider_on_hand_quantity, operational_available_quantity,
          positions_created, positions_updated, positions_zeroed,
-         provider_writes, order_quantity_adjustment, created_by, completed_at
+         provider_writes, order_quantity_adjustment, level_set_hash,
+         source_level_set_run_id, created_by, completed_at
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
          $7::uuid, $8::uuid, 'shopify', $9, $10, $11, $12, $13,
          'succeeded', $14, $15, $16::timestamptz, $17, $18, $19, $20,
          $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, 0, 0,
-         $31, now()
+         $31, $32::uuid, $33, now()
        )
        RETURNING id::text, global_id`,
       [
@@ -2480,6 +2618,8 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         createdCount,
         changedProjected.length - createdCount,
         positionsToZero.length,
+        levelSetHash,
+        reusableLevelSet?.id || null,
         input.actorEmail,
       ],
     )
@@ -2610,55 +2750,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         ],
       )
     }
-    const evidenceRows = preparedLevels.map((prepared) => {
-      const mapping = prepared.mapping
-      const position = mapping
-        ? positionByProduct.get(mapping.product_id)
-        : null
-      const projectedPosition = prepared.projectionState === 'projected'
-        ? position
-        : null
-      return {
-        external_inventory_item_id: prepared.level.inventoryItemId,
-        sku: prepared.level.sku,
-        tracked: prepared.level.tracked,
-        mapping_state: mapping ? 'mapped' : 'unmapped',
-        projection_state: prepared.projectionState,
-        pipeline_id: mapping?.pipeline_id || null,
-        product_id: mapping?.product_id || null,
-        inventory_position_id: projectedPosition?.id || null,
-        provider_available_quantity:
-          prepared.level.quantities.available,
-        provider_incoming_quantity: prepared.level.quantities.incoming,
-        provider_committed_quantity:
-          prepared.level.quantities.committed,
-        provider_damaged_quantity: prepared.level.quantities.damaged,
-        provider_on_hand_quantity: prepared.level.quantities.on_hand,
-        provider_quality_control_quantity:
-          prepared.level.quantities.quality_control,
-        provider_reserved_quantity: prepared.level.quantities.reserved,
-        provider_safety_stock_quantity:
-          prepared.level.quantities.safety_stock,
-        provider_quantity_evidence:
-          prepared.level.quantityEvidence,
-        operational_available_quantity: prepared.operationalAvailable,
-        equation_matches: prepared.level.equationMatches,
-        provider_updated_at: prepared.level.updatedAt,
-        provider_weight_grams: prepared.level.providerWeightGrams,
-        provider_dimensions_mm:
-          prepared.level.providerDimensionsMm,
-        product_snapshot: {
-          ...prepared.level.productSnapshot,
-          mappedProduct: {
-            globalId: mapping?.product_global_id || null,
-            name: mapping?.product_name || null,
-            sku: mapping?.product_sku || null,
-          },
-        },
-        source_hash: prepared.level.sourceHash,
-      }
-    })
-    if (evidenceRows.length) {
+    const evidenceRows = prospectiveEvidenceRows
+      || buildEvidenceRows(positionByProduct)
+    if (evidenceRows.length && !reusableLevelSet) {
       await client.query(
         `INSERT INTO operations_commerce_inventory_levels (
            organization_id, sync_run_id, integration_account_id,
@@ -2751,6 +2845,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           positionsCreated: createdCount,
           positionsUpdated: changedProjected.length - createdCount,
           positionsZeroed: positionsToZero.length,
+          levelSetReused: Boolean(reusableLevelSet),
+          sourceInventoryRunGlobalId:
+            reusableLevelSet?.global_id || null,
           providerWrites: 0,
           orderQuantityAdjustment: 0,
         }),
@@ -2762,6 +2859,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         return {
           runGlobalId: run.rows[0].global_id,
           replayed: false,
+          levelSetReused: Boolean(reusableLevelSet),
         }
       })
     } catch (error) {
@@ -2789,6 +2887,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       providerWrites: 0,
       orderQuantityAdjustment: 0,
       replayed: committed.replayed,
+      levelSetReused: committed.levelSetReused,
     },
   })
   return committed
@@ -4029,7 +4128,7 @@ export async function readShopifyInventoryStateFromPostgres(input: {
       AND position.id = level.inventory_position_id
      WHERE level.organization_id = $1::uuid
        AND level.sync_run_id = (
-         SELECT id
+         SELECT COALESCE(source_level_set_run_id, id)
          FROM operations_commerce_inventory_sync_runs
          WHERE organization_id = $1::uuid
            AND global_id = $2

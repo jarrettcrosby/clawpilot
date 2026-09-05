@@ -19,7 +19,7 @@ Conversation history is supporting context, not the durable engineering record. 
 2. `AGENTS.md` and the `dev` branch policy.
 3. The owning active module or operations contract under `docs/`.
 4. Append-only migrations, focused tests, Git history, and deployed health evidence.
-5. Runtime records in the environment-specific Postgres database.
+5. Runtime records in the applicable isolated data authority: local development data or the sole Railway production Postgres database.
 
 Do not reconstruct current behavior from screenshots or a long prior conversation when the repository and active contracts can answer the question directly.
 

@@ -25,6 +25,10 @@ import {
   type ShopifyCommerceRuntimeCredential,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   assertRedactedCommerceExternalEffectEvidence,
   claimCommerceExternalEffectsInPostgres,
   commerceExternalEffectHash,
@@ -711,6 +715,7 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
     ...authorization,
     attempt: authorization.attempt,
   }
+  assertIntegrationCredentialProviderIoReady()
   let runtime: CommerceRuntimeCredentialRecord | null
   try {
     runtime = await dependencies.readRuntimeCredential({
@@ -719,6 +724,7 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
     })
     assertAuthorizedRuntimeMatches(runtime, attemptedAuthorization)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyCarrierServiceRegistrationError) throw error
     registrationError(
       safeErrorCode(
@@ -740,6 +746,7 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
     const shopDomain = normalizeShopifyShopDomain(
       runtime.configuration.shopDomain,
     )
+    assertIntegrationCredentialProviderIoReady()
     const grant = await dependencies.requestAccessToken(
       {
         shopDomain,
@@ -762,6 +769,7 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
       accessToken: grant.accessToken,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyCarrierServiceRegistrationError) throw error
     registrationError(
       safeErrorCode(
@@ -778,11 +786,13 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
   if (mutation.operation === 'create') {
     let observedServices: ShopifyCarrierService[]
     try {
+      assertIntegrationCredentialProviderIoReady()
       observedServices = await dependencies.listCarrierServices(
         credential,
         { timeoutMs: 10_000 },
       )
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       registrationError(
         safeErrorCode(
           error,
@@ -845,12 +855,14 @@ export async function verifyShopifyCarrierServiceMutationForReconciliation(
   const serviceGid = mutation.id
   let observed: ShopifyCarrierService | null
   try {
+    assertIntegrationCredentialProviderIoReady()
     observed = await dependencies.queryCarrierService(
       credential,
       serviceGid,
       { timeoutMs: 10_000 },
     )
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     registrationError(
       safeErrorCode(
         error,
@@ -932,7 +944,8 @@ function decryptShopifyCredential(
       runtime.environment,
       runtime.externalAccountId,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     registrationError(
       'SHOPIFY_CARRIER_SERVICE_REGISTRATION_CREDENTIAL_INVALID',
       'The verified Shopify credential could not be used',
@@ -1103,6 +1116,9 @@ async function finalizeFailure(input: {
   stage: string
   providerMutationAttempted: boolean
 }): Promise<never> {
+  // Runtime proof loss did not reach Shopify. Preserve the claimed no-replay
+  // effect for reconciliation rather than manufacturing terminal evidence.
+  if (isIntegrationCredentialRuntimeGateError(input.error)) throw input.error
   const outcome = input.providerMutationAttempted
     && unknownProviderOutcome(input.error)
     ? 'unknown'
@@ -1304,6 +1320,7 @@ export async function executeShopifyCarrierServiceRegistration(
       prepared.globalId,
     )
   }
+  assertIntegrationCredentialProviderIoReady()
 
   let claims: ClaimedCommerceExternalEffect[]
   try {
@@ -1317,6 +1334,7 @@ export async function executeShopifyCarrierServiceRegistration(
       leaseSeconds: 60,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     registrationError(
       safeErrorCode(
         error,
@@ -1339,6 +1357,9 @@ export async function executeShopifyCarrierServiceRegistration(
   }
   const claim = claims[0]
   assertClaimMatches(claim, prepared, normalized)
+  // Close the preflight/claim race without weakening the no-replay state
+  // machine. Proof loss leaves this exact claim for reconciliation.
+  assertIntegrationCredentialProviderIoReady()
 
   let runtime: CommerceRuntimeCredentialRecord | null
   try {
@@ -1367,6 +1388,7 @@ export async function executeShopifyCarrierServiceRegistration(
     const shopDomain = normalizeShopifyShopDomain(
       runtime.configuration.shopDomain,
     )
+    assertIntegrationCredentialProviderIoReady()
     const grant = await dependencies.requestAccessToken(
       {
         shopDomain,
@@ -1403,6 +1425,7 @@ export async function executeShopifyCarrierServiceRegistration(
 
   let providerResult: ShopifyCarrierService | string
   try {
+    assertIntegrationCredentialProviderIoReady()
     providerResult = await performProviderMutation({
       mutation: normalized.mutation,
       credential: runtimeCredential,
@@ -1502,6 +1525,9 @@ async function finalizeAuthorizedFailure(input: {
   providerMutationAttempted: boolean
   finalizedBy: string
 }): Promise<never> {
+  // A revoked credential proof is maintenance, not a provider outcome. The
+  // one-time authorization remains consumed and unresolved by design.
+  if (isIntegrationCredentialRuntimeGateError(input.error)) throw input.error
   // Once the mutation request has been dispatched, only Shopify's explicit
   // GraphQL userErrors prove that no mutation ID was returned and therefore
   // that zero writes occurred. A timeout, malformed response, mismatched ID,
@@ -1634,6 +1660,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     'Mutation finalizer',
     200,
   )
+  assertIntegrationCredentialProviderIoReady()
   let runtime: CommerceRuntimeCredentialRecord | null
   try {
     runtime = await dependencies.readRuntimeCredential({
@@ -1661,6 +1688,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     const shopDomain = normalizeShopifyShopDomain(
       runtime.configuration.shopDomain,
     )
+    assertIntegrationCredentialProviderIoReady()
     const grant = await dependencies.requestAccessToken(
       {
         shopDomain,
@@ -1698,6 +1726,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
   let priorService: ShopifyCarrierService | null = null
   if (mutation.operation === 'update') {
     try {
+      assertIntegrationCredentialProviderIoReady()
       priorService = await dependencies.queryCarrierService(
         runtimeCredential,
         mutation.id,
@@ -1724,6 +1753,7 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
 
   let providerResult: ShopifyCarrierService | string
   try {
+    assertIntegrationCredentialProviderIoReady()
     providerResult = await performProviderMutation({
       mutation,
       credential: runtimeCredential,

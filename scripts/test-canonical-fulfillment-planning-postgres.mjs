@@ -1797,7 +1797,8 @@ async function appendShopifyInventoryReconciliation(
          equation_mismatch_levels, provider_available_quantity,
          provider_committed_quantity, provider_on_hand_quantity,
          operational_available_quantity, positions_created,
-         positions_updated, positions_zeroed, created_by, completed_at
+         positions_updated, positions_zeroed, created_by, completed_at,
+         level_set_hash
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
          $6::uuid, $7::uuid, $8::uuid,
@@ -1805,9 +1806,10 @@ async function appendShopifyInventoryReconciliation(
          $11, $12, $13, 'succeeded',
          $14, $15, $16::timestamptz,
          1, 1, 1, 0, 0, 0, 0,
-         $17, $18, $19, $17, 0, 1, 0, $20, $16::timestamptz
+         $17, $18, $19, $17, 0, 1, 0, $20, $16::timestamptz,
+         $21
        )
-       RETURNING id::text, global_id`,
+       RETURNING id::text, global_id, level_set_hash`,
       [
         fixture.organizationId,
         source.integration_account_id,
@@ -1829,6 +1831,7 @@ async function appendShopifyInventoryReconciliation(
         committedQuantity,
         onHandQuantity,
         fixture.email,
+        sha(`inventory-level-set-latest-${suffix}`),
       ],
     )
     const run = runResult.rows[0]
@@ -1892,6 +1895,156 @@ async function appendShopifyInventoryReconciliation(
       onHandQuantity,
       committedQuantity,
     }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function appendUnchangedShopifyInventoryObservation(
+  pool,
+  fixture,
+  sourceRunId,
+) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const sourceResult = await client.query(
+      `SELECT run.*
+       FROM operations_commerce_inventory_sync_runs run
+       WHERE run.organization_id = $1::uuid
+         AND run.id = $2::uuid
+         AND run.status = 'succeeded'
+         AND run.source_level_set_run_id IS NULL
+         AND run.level_set_hash IS NOT NULL`,
+      [fixture.organizationId, sourceRunId],
+    )
+    assert.equal(sourceResult.rowCount, 1)
+    const source = sourceResult.rows[0]
+    const suffix = randomUUID().slice(0, 8)
+    const evidenceTimestamp = new Date(
+      new Date(source.completed_at).getTime() + 1000,
+    ).toISOString()
+    const attemptResult = await client.query(
+      `INSERT INTO operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state,
+         completed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'inventory_read', $3,
+         $4, $5, $6, '{}'::jsonb, '{}'::jsonb, 'succeeded',
+         $7::timestamptz, $8
+       )
+       RETURNING id::text`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        source.adapter_version,
+        source.provider_location_id,
+        `inventory-attempt-unchanged-${suffix}`,
+        sha(`inventory-attempt-unchanged-${suffix}`),
+        evidenceTimestamp,
+        fixture.email,
+      ],
+    )
+    const capturedSnapshot = JSON.stringify({
+      fixture: 'canonical-unchanged-provider-commitment',
+      snapshotHash: source.snapshot_hash,
+    })
+    const captureResult = await client.query(
+      `INSERT INTO operations_commerce_inventory_captures (
+         organization_id, integration_account_id, provider_attempt_id,
+         warehouse_id, location_id, provider, adapter_version,
+         credential_version, request_hash, snapshot_hash,
+         provider_location_id, provider_fetched_at, level_count,
+         captured_snapshot, snapshot_bytes, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         'shopify', $6, $7, $8, $9,
+         $10, $11::timestamptz, $12, $13::jsonb, $14, $15
+       )
+       RETURNING id::text`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        attemptResult.rows[0].id,
+        source.warehouse_id,
+        source.location_id,
+        source.adapter_version,
+        source.credential_version,
+        sha(`inventory-request-unchanged-${suffix}`),
+        source.snapshot_hash,
+        source.provider_location_id,
+        evidenceTimestamp,
+        source.levels_seen,
+        capturedSnapshot,
+        Buffer.byteLength(capturedSnapshot, 'utf8'),
+        fixture.email,
+      ],
+    )
+    const aliasResult = await client.query(
+      `INSERT INTO operations_commerce_inventory_sync_runs (
+         organization_id, integration_account_id, provider_attempt_id,
+         capture_id, location_mapping_id, warehouse_id, location_id,
+         inventory_pool_id, provider, adapter_version, credential_version,
+         idempotency_key, request_hash, snapshot_hash, status,
+         provider_location_id, provider_location_name, provider_fetched_at,
+         levels_seen, levels_mapped, levels_projected, levels_unmapped,
+         levels_untracked, negative_available_levels,
+         equation_mismatch_levels, provider_available_quantity,
+         provider_committed_quantity, provider_on_hand_quantity,
+         operational_available_quantity, positions_created,
+         positions_updated, positions_zeroed, provider_writes,
+         order_quantity_adjustment, created_by, completed_at,
+         level_set_hash, source_level_set_run_id
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid, $8::uuid,
+         'shopify', $9, $10, $11, $12, $13, 'succeeded',
+         $14, $15, $16::timestamptz,
+         $17, $18, $19, $20, $21, $22, $23,
+         $24, $25, $26, $27, 0, 0, 0, 0, 0, $28,
+         $16::timestamptz, $29, $30::uuid
+       )
+       RETURNING id::text, global_id, source_level_set_run_id::text`,
+      [
+        fixture.organizationId,
+        source.integration_account_id,
+        attemptResult.rows[0].id,
+        captureResult.rows[0].id,
+        source.location_mapping_id,
+        source.warehouse_id,
+        source.location_id,
+        source.inventory_pool_id,
+        source.adapter_version,
+        source.credential_version,
+        `inventory-run-unchanged-${suffix}`,
+        sha(`inventory-run-request-unchanged-${suffix}`),
+        source.snapshot_hash,
+        source.provider_location_id,
+        source.provider_location_name,
+        evidenceTimestamp,
+        source.levels_seen,
+        source.levels_mapped,
+        source.levels_projected,
+        source.levels_unmapped,
+        source.levels_untracked,
+        source.negative_available_levels,
+        source.equation_mismatch_levels,
+        source.provider_available_quantity,
+        source.provider_committed_quantity,
+        source.provider_on_hand_quantity,
+        source.operational_available_quantity,
+        fixture.email,
+        source.level_set_hash,
+        source.id,
+      ],
+    )
+    await client.query('COMMIT')
+    return { run: aliasResult.rows[0] }
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
     throw error
@@ -2086,6 +2239,11 @@ async function verifyLatestProviderCommitmentRelease(
   })
 
   const latest = await appendShopifyInventoryReconciliation(pool, fixture)
+  const unchanged = await appendUnchangedShopifyInventoryObservation(
+    pool,
+    fixture,
+    latest.run.id,
+  )
   const supportResult = await pool.query(
     `SELECT reservation.id::text AS reservation_id,
             support.supported,
@@ -2107,7 +2265,7 @@ async function verifyLatestProviderCommitmentRelease(
   assert.equal(supportResult.rows[0].reason_code, 'OK')
   assert.equal(
     supportResult.rows[0].latest_sync_run_global_id,
-    latest.run.global_id,
+    unchanged.run.global_id,
   )
   await installReceiptExemptUnlistedCheckoutMapping(pool, fixture)
   await assert.rejects(
@@ -2207,8 +2365,25 @@ async function verifyLatestProviderCommitmentRelease(
   assert.deepEqual(
     releaseEvent.rows[0].payload
       .providerCommitmentInventorySyncRunGlobalIds,
-    [latest.run.global_id],
+    [unchanged.run.global_id],
   )
+
+  const consumed = await pool.query(
+    `UPDATE operations_reservations
+     SET status = 'consumed', released_at = now()
+     WHERE organization_id = $1::uuid
+       AND order_id = $2::uuid
+       AND reservation_authority = 'provider_commitment'
+       AND status = 'active'
+     RETURNING status, provider_inventory_sync_run_id::text,
+               provider_inventory_level_id::text`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.deepEqual(consumed.rows[0], {
+    status: 'consumed',
+    provider_inventory_sync_run_id: fixture.inventoryRun.id,
+    provider_inventory_level_id: fixture.inventoryLevel.id,
+  })
 
   const undercoveredFixture = await seedCanonicalPlanningFixture(pool)
   await operations.planOperationsOrderFromPostgres({
@@ -2999,6 +3174,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/postgres': postgres,
         },
@@ -3289,6 +3467,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
                 'Canonical planning acceptance does not hash Shopify fulfillment attempts',
               )
             },
+          },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,
@@ -4698,6 +4879,29 @@ async function main() {
       migration.includes(fragment),
       `Canonical planning migration is missing ${fragment}`,
     )
+  }
+
+  const suppliedDatabaseUrl = String(process.env.DATABASE_URL || '').trim()
+  if (suppliedDatabaseUrl) {
+    const parsed = new URL(suppliedDatabaseUrl)
+    assert.ok(
+      ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname),
+      'Supplied canonical-planning database must be local and disposable',
+    )
+    await waitForPostgres(suppliedDatabaseUrl)
+    command('node', ['scripts/db-migrate.mjs'], {
+      env: {
+        ...process.env,
+        DATABASE_URL: suppliedDatabaseUrl,
+        PGSSLMODE: 'disable',
+      },
+      timeout: 180_000,
+    })
+    await verifyCanonicalPlanning(suppliedDatabaseUrl)
+    console.log(
+      'Canonical fulfillment planning local-PostgreSQL acceptance passed',
+    )
+    return
   }
 
   command('docker', ['info'], { timeout: 30_000 })

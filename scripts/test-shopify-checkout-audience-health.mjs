@@ -25,6 +25,19 @@ const futureCommerceRolloutContractMigration = readFileSync(
   ),
   'utf8',
 )
+const preMigrationSafetyCarrierRatingFunction = readFileSync(
+  resolve(
+    root,
+    'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+  ),
+  'utf8',
+).match(
+  /CREATE OR REPLACE FUNCTION\s+(?:public\.)?operations_shopify_carrier_configuration_allows_rating\([\s\S]*?\n\$\$;/u,
+)?.[0]
+assert.ok(
+  preMigrationSafetyCarrierRatingFunction,
+  'The exact pre-0354 carrier-rating function must remain available to test rolling health',
+)
 assert.equal(
   createHash('sha256')
     .update(futureCommerceRolloutContractMigration)
@@ -131,6 +144,8 @@ for (const fragment of [
   '8b6de19ad2fa428edd087100e1cb73c851ba59a7fdff248ce71eedd9d3b3e3bb',
   '0309_operations_measured_packaging_evidence.sql',
   '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2',
+  '0354_operations_sales_shipping_workspace_migration_safety.sql',
+  '322e822d66cc6b6e9d4fd9d662fe3e1064db7b9fe08279e7024e9644e422c399',
   'derive_operations_shopify_checkout_rate_source_compat()',
   'derive_operations_shopify_checkout_rate_source_compat_write',
   '35818f8af90aa04cc95a7fecbf10f3af0fcb31f708e14c374db7e4521b01c698',
@@ -139,7 +154,9 @@ for (const fragment of [
   '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64',
   'b28b6980199f9e2fd9af0e43f84b825570fcdda1bed1b35ba1a0891bb5f65ae0',
   'f0c296dbf7f1d67b8a99e2f98c1b097c54ea876da83a01d7aad3191b4e7c8823',
+  'b599b5047d42b8f4e4b1dd29898d7b4d50bb241bdb1e5f031e8c95f5197414f6',
   'ed9536637383e8d5a4a62c2a99ef4daca73b1a746e558e9dc409b2bf19baf29d',
+  'ec1e699fff0e0e1e90b6415081c3cb0cb80d36bdd7e0642401c0f32a10174371',
   'df473e7836235c04c828539deb912ecb65c57709b489d07458d09f0b7bbcf490',
   'fde4be4596b4ee46d81af6b2b22bc92548e63a427877e2f1e2f055d212e0d57e',
   'd57e00e735e7bb4e86f6b88827c50360007cccefd98573de58ed3733c889ea38',
@@ -272,6 +289,34 @@ async function receiptWriterContract(pool) {
   return String(result.rows[0]?.contract || '')
 }
 
+async function projectFrozenCommerceContractPredecessor(client) {
+  // 0305 is a frozen rollout-contract fixture for the exact 0299-era schema.
+  // Later additive migrations legitimately extend the read-lease table, so
+  // remove only those post-contract additions inside the caller's rollback
+  // transaction before exercising the frozen contraction.
+  const result = await client.query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'operations_commerce_store_sync_read_leases'
+         AND column_name = 'history_exclusion_code'
+     ) AS applied`,
+  )
+  if (result.rows[0]?.applied !== true) return
+  await client.query(
+    `DROP TRIGGER IF EXISTS
+       guard_commerce_order_history_lease_exclusion_write
+       ON public.operations_commerce_store_sync_read_leases;
+     DROP FUNCTION IF EXISTS
+       public.guard_commerce_order_history_lease_exclusion();
+     ALTER TABLE public.operations_commerce_store_sync_read_leases
+       DROP COLUMN history_exclusion_code,
+       DROP COLUMN history_excluded_external_order_id,
+       DROP COLUMN history_excluded_provider_created_at`,
+  )
+}
+
 async function tamper(pool, sql, message) {
   await pool.query('BEGIN')
   try {
@@ -307,6 +352,7 @@ async function rejectCommerceContractPredecessor(
   try {
     await client.query('BEGIN')
     await client.query(tamperSql)
+    await projectFrozenCommerceContractPredecessor(client)
     await assert.rejects(
       client.query(futureCommerceRolloutContractMigration),
       expectedError,
@@ -372,6 +418,167 @@ async function exercise(pool) {
     'legacy-writer-compatible',
     'Fresh Release A schema must expose only the exact legacy-writer phase',
   )
+  const rollingPreMigrationSafetyClient = await pool.connect()
+  try {
+    await rollingPreMigrationSafetyClient.query('BEGIN')
+    await rollingPreMigrationSafetyClient.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0354_operations_sales_shipping_workspace_migration_safety.sql'`,
+    )
+    await rollingPreMigrationSafetyClient.query(
+      preMigrationSafetyCarrierRatingFunction,
+    )
+    // Migration 0299 hardens every audited checkout function after the 0285
+    // body is installed. Reapply that exact pre-0354 catalog setting because
+    // CREATE OR REPLACE above intentionally reconstructs the older body.
+    await rollingPreMigrationSafetyClient.query(
+      `ALTER FUNCTION
+         public.operations_shopify_carrier_configuration_allows_rating(
+           jsonb,
+           text
+         )
+       SET search_path = pg_catalog, public, pg_temp`,
+    )
+    assert.equal(
+      await attestRateControl(rollingPreMigrationSafetyClient),
+      true,
+      'The exact pre-0354 function and absent ledger must remain rollout-healthy',
+    )
+    assert.equal(
+      await receiptWriterContract(rollingPreMigrationSafetyClient),
+      'legacy-writer-compatible',
+      'The exact pre-0354 phase must preserve the legacy writer contract',
+    )
+  } finally {
+    await rollingPreMigrationSafetyClient.query('ROLLBACK').catch(() => {})
+    rollingPreMigrationSafetyClient.release()
+  }
+  assert.equal(
+    await attestRateControl(pool),
+    true,
+    'The pre-0354 rolling-health rollback must restore final health',
+  )
+  await tamperRateControl(
+    pool,
+    `DELETE FROM public.schema_migrations
+     WHERE filename =
+       '0354_operations_sales_shipping_workspace_migration_safety.sql'`,
+    'The post-0354 carrier-rating body must not pass as a pre-0354 phase',
+  )
+  const stalePostMigrationLedgerClient = await pool.connect()
+  try {
+    await stalePostMigrationLedgerClient.query('BEGIN')
+    await stalePostMigrationLedgerClient.query(
+      preMigrationSafetyCarrierRatingFunction,
+    )
+    await stalePostMigrationLedgerClient.query(
+      `ALTER FUNCTION
+         public.operations_shopify_carrier_configuration_allows_rating(
+           jsonb,
+           text
+         )
+       SET search_path = pg_catalog, public, pg_temp`,
+    )
+    assert.equal(
+      await attestRateControl(stalePostMigrationLedgerClient),
+      false,
+      'The pre-0354 body must not pass under the exact post-0354 ledger',
+    )
+    assert.equal(
+      await receiptWriterContract(stalePostMigrationLedgerClient),
+      'invalid',
+      'A stale post-0354 ledger/body pairing must invalidate the writer phase',
+    )
+  } finally {
+    await stalePostMigrationLedgerClient.query('ROLLBACK').catch(() => {})
+    stalePostMigrationLedgerClient.release()
+  }
+  const rollingPreMigrationStrictClient = await pool.connect()
+  try {
+    await rollingPreMigrationStrictClient.query('BEGIN')
+    await rollingPreMigrationStrictClient.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0354_operations_sales_shipping_workspace_migration_safety.sql'`,
+    )
+    await rollingPreMigrationStrictClient.query(
+      preMigrationSafetyCarrierRatingFunction,
+    )
+    await rollingPreMigrationStrictClient.query(
+      `ALTER FUNCTION
+         public.operations_shopify_carrier_configuration_allows_rating(
+           jsonb,
+           text
+         )
+       SET search_path = pg_catalog, public, pg_temp`,
+    )
+    await projectFrozenCommerceContractPredecessor(
+      rollingPreMigrationStrictClient,
+    )
+    await rollingPreMigrationStrictClient.query(
+      futureCommerceRolloutContractMigration,
+    )
+    await rollingPreMigrationStrictClient.query(
+      `INSERT INTO public.schema_migrations (filename, checksum)
+       VALUES (
+         '0305_operations_commerce_rollout_contract.sql',
+         'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
+       )`,
+    )
+    assert.equal(
+      await attestRateControl(rollingPreMigrationStrictClient),
+      true,
+      'The exact pre-0354 strict 0305 phase must remain rollout-healthy',
+    )
+    assert.equal(
+      await receiptWriterContract(rollingPreMigrationStrictClient),
+      'strict-explicit',
+      'The exact pre-0354 strict 0305 phase must expose the strict writer contract',
+    )
+  } finally {
+    await rollingPreMigrationStrictClient.query('ROLLBACK').catch(() => {})
+    rollingPreMigrationStrictClient.release()
+  }
+  const checksumFallthroughClient = await pool.connect()
+  try {
+    await checksumFallthroughClient.query('BEGIN')
+    await checksumFallthroughClient.query(
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0354_operations_sales_shipping_workspace_migration_safety.sql'`,
+    )
+    await checksumFallthroughClient.query(
+      preMigrationSafetyCarrierRatingFunction,
+    )
+    await checksumFallthroughClient.query(
+      `ALTER FUNCTION
+         public.operations_shopify_carrier_configuration_allows_rating(
+           jsonb,
+           text
+         )
+       SET search_path = pg_catalog, public, pg_temp`,
+    )
+    assert.equal(
+      await attestRateControl(checksumFallthroughClient),
+      false,
+      'A wrong 0354 checksum must not fall through to pre-0354 function health',
+    )
+    assert.equal(
+      await receiptWriterContract(checksumFallthroughClient),
+      'invalid',
+      'A wrong 0354 checksum must invalidate the exposed writer phase',
+    )
+  } finally {
+    await checksumFallthroughClient.query('ROLLBACK').catch(() => {})
+    checksumFallthroughClient.release()
+  }
+  assert.equal(
+    await attestRateControl(pool),
+    true,
+    'The 0354 checksum-fallthrough rollback must restore final health',
+  )
   const attackerClient = await pool.connect()
   try {
     await attackerClient.query('BEGIN')
@@ -414,7 +621,12 @@ async function exercise(pool) {
          object_name text
        ) RETURNS pg_catalog.regclass
        LANGUAGE sql IMMUTABLE STRICT
-       AS $$ SELECT NULL::pg_catalog.regclass $$`,
+       AS $$ SELECT NULL::pg_catalog.regclass $$;
+       CREATE FUNCTION checkout_rate_control_attacker.jsonb_typeof(
+         payload jsonb
+       ) RETURNS text
+       LANGUAGE sql IMMUTABLE STRICT
+       AS $$ SELECT 'array'::text $$`,
     )
     await attackerClient.query(`SET LOCAL session_replication_role = 'replica'`)
     await attackerClient.query(
@@ -538,6 +750,41 @@ async function exercise(pool) {
       await receiptWriterContract(attackerClient),
       'legacy-writer-compatible',
       'An unrelated foreign-schema index name must not invalidate the Release A writer phase',
+    )
+    const hardenedRatingSemantics = await attackerClient.query(
+      `SELECT public.operations_shopify_carrier_configuration_allows_rating(
+         '{"allowedCapabilities":{"production_rate":true}}'::jsonb,
+         'production'
+       ) AS allowed`,
+    )
+    assert.deepEqual(
+      hardenedRatingSemantics.rows[0],
+      { allowed: false },
+      'The migrated carrier-rating function must ignore an attacker-first jsonb_typeof overload',
+    )
+    await attackerClient.query(
+      `ALTER FUNCTION
+         public.operations_shopify_carrier_configuration_allows_rating(
+           jsonb,
+           text
+         )
+       RESET search_path`,
+    )
+    assert.equal(
+      await attestRateControl(attackerClient),
+      false,
+      'Removing the migrated carrier-rating search_path must fail exact health',
+    )
+    const unhardenedRatingSemantics = await attackerClient.query(
+      `SELECT public.operations_shopify_carrier_configuration_allows_rating(
+         '{"allowedCapabilities":{"production_rate":true}}'::jsonb,
+         'production'
+       ) AS allowed`,
+    )
+    assert.deepEqual(
+      unhardenedRatingSemantics.rows[0],
+      { allowed: true },
+      'The attacker fixture must prove why the carrier-rating search_path is pinned',
     )
   } finally {
     await attackerClient.query('ROLLBACK').catch(() => {})
@@ -783,6 +1030,20 @@ async function exercise(pool) {
     `UPDATE schema_migrations
      SET checksum = repeat('0', 64)
      WHERE filename =
+       '0354_operations_sales_shipping_workspace_migration_safety.sql'`,
+    'A changed 0354 migration checksum must fail health',
+  )
+  await tamperRateControl(
+    pool,
+    `DELETE FROM schema_migrations
+     WHERE filename = '0309_operations_measured_packaging_evidence.sql'`,
+    '0354 health must require its exact 0309 predecessor ledger',
+  )
+  await tamperRateControl(
+    pool,
+    `UPDATE schema_migrations
+     SET checksum = repeat('0', 64)
+     WHERE filename =
        '0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql'`,
     'A changed 0317 simulation-readiness checksum must fail health',
   )
@@ -936,6 +1197,7 @@ async function exercise(pool) {
       'invalid',
       'An extra bridge binding must invalidate the exposed writer phase',
     )
+    await projectFrozenCommerceContractPredecessor(pool)
     await assert.rejects(
       pool.query(futureCommerceRolloutContractMigration),
       /exact receipt-writer trigger/u,
@@ -965,6 +1227,7 @@ async function exercise(pool) {
        RETURNS trigger LANGUAGE plpgsql
        AS $$ BEGIN RETURN NEW; END $$`,
     )
+    await projectFrozenCommerceContractPredecessor(rejectedContractClient)
     await assert.rejects(
       rejectedContractClient.query(futureCommerceRolloutContractMigration),
       /requires the exact receipt-writer bridge/u,
@@ -1092,6 +1355,7 @@ async function exercise(pool) {
     await contractClient.query('BEGIN')
     // db-migrate executes the exact SQL before recording its checksum in the
     // same transaction. Keep this order identical to the production runner.
+    await projectFrozenCommerceContractPredecessor(contractClient)
     await contractClient.query(futureCommerceRolloutContractMigration)
     await contractClient.query(
       `INSERT INTO public.schema_migrations (filename, checksum)

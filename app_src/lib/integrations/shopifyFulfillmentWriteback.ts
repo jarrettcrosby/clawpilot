@@ -18,6 +18,9 @@ import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   requireCurrentCommerceProviderWritesInPostgres,
   requireSealedCommerceProviderWritesInPostgres,
   type CommerceProviderWriteAuthority,
@@ -1455,7 +1458,8 @@ async function writeShopifyFulfillment(
       operationName: 'ClawPilotFulfillmentCreate',
       variables,
     })
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new ShopifyFulfillmentWritebackError(
       'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
       'Shopify fulfillment dispatch did not return a verifiable outcome; reconcile the prepared attempt before any further write',

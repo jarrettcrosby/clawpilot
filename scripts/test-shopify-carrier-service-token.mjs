@@ -7,6 +7,7 @@ import vm from 'node:vm'
 
 import * as globalIds from '../app_src/lib/globalIds.mjs'
 import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -55,6 +56,16 @@ const sandbox = {
     }
     if (specifier === '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs') {
       return commerceOrderRevisionEvidenceKeyConfig
+    }
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+      return {
+        integrationCredentialRuntimeEncryptionKey: () => (
+          integrationCredentialRuntimeGate
+            .integrationCredentialRuntimeEncryptionKey({
+              environment: processMock.env,
+            })
+        ),
+      }
     }
     return nodeRequire(specifier)
   },

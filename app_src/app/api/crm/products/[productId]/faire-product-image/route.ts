@@ -5,6 +5,9 @@ import {
   FaireProductImageProjectionError,
   reconcileFaireProductImagePublish,
 } from '@/lib/integrations/faireProductImageProjection'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { appPublicUrl } from '@/lib/publicUrl'
 import {
   FaireProviderWriteAuthorizationError,
@@ -42,6 +45,8 @@ function fail(code: string, message: string, status = 400): never {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (
     error instanceof FaireProductImageProjectionError
     || error instanceof FaireProviderWriteAuthorizationError

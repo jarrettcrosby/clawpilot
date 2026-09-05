@@ -1602,6 +1602,9 @@ for (const fragment of [
 const commerceFulfillmentRecoveryMigration = read(
   'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
 )
+const commerceFulfillmentRecoveryBudgetMigration = read(
+  'db/migrations/0359_operations_commerce_fulfillment_recovery_budget.sql',
+)
 for (const fragment of [
   'operations_commerce_fulfillment_exports_recovery_idx',
   'operations_commerce_fulfillment_exports',
@@ -1617,6 +1620,24 @@ for (const fragment of [
     commerceFulfillmentRecoveryMigration,
     fragment,
     'Commerce fulfillment recovery migration',
+  )
+}
+for (const fragment of [
+  'ADD COLUMN IF NOT EXISTS automatic_recovery_attempts integer',
+  'DISABLE TRIGGER protect_operations_commerce_fulfillment_export_write',
+  'SET automatic_recovery_attempts = attempts',
+  'ENABLE TRIGGER protect_operations_commerce_fulfillment_export_write',
+  'ALTER COLUMN automatic_recovery_attempts SET DEFAULT 0',
+  'ALTER COLUMN automatic_recovery_attempts SET NOT NULL',
+  'operations_commerce_fulfillment_exports_recovery_budget_valid',
+  'automatic_recovery_attempts >= 0',
+  'automatic_recovery_attempts <= attempts',
+  'operations_commerce_fulfillment_exports_recovery_budget_idx',
+]) {
+  assertIncludes(
+    commerceFulfillmentRecoveryBudgetMigration,
+    fragment,
+    'Commerce fulfillment recovery-budget migration',
   )
 }
 for (const fragment of [
@@ -1830,6 +1851,22 @@ for (const fragment of [
   assertIncludes(healthRoute, fragment, 'hosted Faire provider-write readiness')
 }
 for (const fragment of [
+  '0359_operations_commerce_fulfillment_recovery_budget.sql',
+  'f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11',
+  'automatic_recovery_attempts',
+  'operations_commerce_fulfillment_exports_recovery_budget_valid',
+  'operations_commerce_fulfillment_exports_recovery_budget_idx',
+  'operations_commerce_fulfillment_recovery_budget_applied',
+  'commerceFulfillmentRecoveryBudget',
+  'independentAutomaticRecoveryBudget',
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'hosted commerce fulfillment recovery-budget readiness',
+  )
+}
+for (const fragment of [
   'SHA-256 over pg_proc.prosrc after removing full-line -- comments',
   faireScopeCurrentProsrcSha256,
   faireScopeTriggerProsrcSha256,
@@ -1920,6 +1957,38 @@ assert.ok(
 const commerceProductImageImportMigration = read(
   'db/migrations/0221_operations_commerce_product_image_imports.sql',
 )
+const commerceProductImageRuntimeParkingMigration = read(
+  'db/migrations/0357_operations_commerce_product_image_runtime_parking.sql',
+)
+const commerceProductImageRuntimeParkingMigrationSha256 =
+  'e8636998cfa8e8e24717ba7ffda11f4e2e0031fc83a439914a18f6d568c836a2'
+const commerceProductImageRuntimeParkingProsrcSha256 =
+  '57f2f359ae6b82e9dae121a295a3e85e783df45fbd78287d44af71a30d4235e0'
+assert.equal(
+  sha256(commerceProductImageRuntimeParkingMigration),
+  commerceProductImageRuntimeParkingMigrationSha256,
+  'Commerce product-image runtime-parking migration checksum changed',
+)
+assert.equal(
+  sha256(normalizedPgProcBodyFromMigration(
+    commerceProductImageRuntimeParkingMigration,
+    'guard_operations_commerce_product_image_import_job',
+  )),
+  commerceProductImageRuntimeParkingProsrcSha256,
+  'Commerce product-image runtime-parking normalized prosrc changed',
+)
+for (const fragment of [
+  '0357_operations_commerce_product_image_runtime_parking.sql',
+  commerceProductImageRuntimeParkingMigrationSha256,
+  commerceProductImageRuntimeParkingProsrcSha256,
+  'operations_commerce_product_image_runtime_parking_applied',
+]) {
+  assertIncludes(
+    healthRoute,
+    fragment,
+    'hosted commerce product-image runtime-parking health',
+  )
+}
 for (const fragment of [
   'operations_commerce_product_image_snapshot_fences',
   'operations_commerce_product_image_observation_sets',
@@ -2175,6 +2244,14 @@ assert.ok(
 )
 assert.ok(
   (
+    healthRoute.match(
+      /operations_commerce_product_image_runtime_parking_applied/g,
+    ) || []
+  ).length >= 4,
+  'Commerce product-image runtime parking must gate migrations, health, and worker checks',
+)
+assert.ok(
+  (
     healthRoute.match(/operations_commerce_product_image_fanout_applied/g)
     || []
   ).length >= 4,
@@ -2377,20 +2454,25 @@ const migrator = read('scripts/db-migrate.mjs')
 assertIncludes(migrator, "pg_advisory_lock(hashtext('clawpilot-schema-migrations'))", 'serialized database migrations')
 assertIncludes(migrator, "createHash('sha256')", 'migration checksums')
 assertIncludes(migrator, 'migration checksum mismatch', 'migration drift detection')
+assertIncludes(migrator, 'clawpilot:migration-mode=nontransactional', 'online migration mode')
+assertIncludes(migrator, 'clawpilot:migration-statement-break', 'online migration statement boundaries')
+assertIncludes(migrator, 'query_timeout: 0', 'online migration query budget override')
+assertIncludes(migrator, 'recordAppliedMigration', 'online migration completion record')
 
 const vercelConfigSource = read('app_src/vercel.json')
-assertIncludes(vercelConfigSource, 'npm run build:vercel', 'Vercel managed build gate')
+assertIncludes(vercelConfigSource, 'npm run build:vercel', 'Vercel protected preview build gate')
 const vercelConfig = JSON.parse(vercelConfigSource)
 assert.deepEqual(
   vercelConfig.git?.deploymentEnabled,
-  { dev: false, main: false },
-  'Vercel dev and main deployments must remain explicit while feature previews stay enabled by default',
+  false,
+  'Vercel Git deployments must remain disabled for every branch during the transitional cutover',
 )
 const vercelBuild = read('scripts/vercel-build.mjs')
-assertIncludes(vercelBuild, "if (environment === 'production')", 'production Vercel deployment gate')
-assertIncludes(vercelBuild, "if (branch !== 'main')", 'production Vercel fail-closed branch gate')
-assertIncludes(vercelBuild, "environment === 'preview' && branch === 'dev'", 'development Vercel deployment gate')
+assertIncludes(vercelBuild, "environment !== 'preview'", 'Vercel preview-only deployment gate')
+assertIncludes(vercelBuild, 'production and development deployments are prohibited by the post-cutover contract', 'Vercel hosted-runtime prohibition')
+assertIncludes(vercelBuild, 'does not prove the legacy Vercel credential retirement is complete', 'Vercel cutover-evidence boundary')
 assertIncludes(vercelBuild, "run('npm', ['run', 'build'], appRoot)", 'Vercel compile-first ordering')
+assert.ok(!vercelBuild.includes('verify-mail-sender.mjs'), 'Vercel previews must not verify managed mail')
 assert.ok(!vercelBuild.includes('db-migrate.mjs'), 'Vercel builds must not invoke the database migrator')
 assert.ok(!vercelBuild.includes('db:migrate'), 'Vercel builds must not invoke the migration package script')
 

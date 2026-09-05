@@ -6,6 +6,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
 
+import {
+  IntegrationCredentialRuntimeGateError,
+  isIntegrationCredentialRuntimeGateError,
+} from './lib/integration-credential-runtime-test-double.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -63,6 +68,23 @@ function unavailable() {
 }
 
 let graphqlImpl = unavailable
+let runtimeGateCheckCount = 0
+let runtimeGateFailureAt = null
+let runtimeGateFailure = null
+
+function assertRuntimeGate() {
+  runtimeGateCheckCount += 1
+  if (runtimeGateCheckCount === runtimeGateFailureAt) {
+    throw runtimeGateFailure
+  }
+  return { mode: 'test', status: 'verified', providerIoReady: true }
+}
+
+function resetRuntimeGate() {
+  runtimeGateCheckCount = 0
+  runtimeGateFailureAt = null
+  runtimeGateFailure = null
+}
 
 function loadWritebackModule() {
   const path =
@@ -145,6 +167,15 @@ function loadWritebackModule() {
           },
           ShopifyCommerceClientError:
             MockShopifyCommerceClientError,
+        }
+      }
+      if (
+        specifier ===
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return {
+          assertIntegrationCredentialProviderIoReady: assertRuntimeGate,
+          isIntegrationCredentialRuntimeGateError,
         }
       }
       if (
@@ -402,6 +433,63 @@ function dependencies(overrides = {}) {
     ...overrides,
   }
   return { deps, calls, getPrepared: () => prepared }
+}
+
+{
+  const { deps, calls } = dependencies()
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  runtimeGateFailure = outage
+  runtimeGateFailureAt = 1
+  await assert.rejects(
+    () => writeback.executeShopifyProductWriteback(command(), deps),
+    (error) => error === outage,
+  )
+  assert.equal(calls.claim, 0)
+  assert.equal(calls.runtime, 0)
+  assert.equal(calls.finalize.length, 0)
+  resetRuntimeGate()
+}
+
+{
+  const { deps, calls } = dependencies()
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  runtimeGateFailure = outage
+  runtimeGateFailureAt = 2
+  await assert.rejects(
+    () => writeback.executeShopifyProductWriteback(command(), deps),
+    (error) => error === outage,
+  )
+  assert.equal(calls.claim, 1)
+  assert.equal(calls.runtime, 0)
+  assert.equal(calls.decrypt, 0)
+  assert.equal(calls.mutate, 0)
+  assert.equal(calls.finalize.length, 0)
+  resetRuntimeGate()
+}
+
+{
+  const outage = new IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  const { deps, calls } = dependencies({
+    decryptCredential() {
+      calls.decrypt += 1
+      throw outage
+    },
+  })
+  await assert.rejects(
+    () => writeback.executeShopifyProductWriteback(command(), deps),
+    (error) => error === outage,
+  )
+  assert.equal(calls.claim, 1)
+  assert.equal(calls.decrypt, 1)
+  assert.equal(calls.token, 0)
+  assert.equal(calls.mutate, 0)
+  assert.equal(calls.finalize.length, 0)
 }
 
 async function expectCode(action, code) {

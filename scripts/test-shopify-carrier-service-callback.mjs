@@ -121,7 +121,9 @@ for (const required of [
   'stage: checkoutFailureStage(',
   'checkpoint: input.checkpoint',
   'reasonCode: errorCode(input.error)',
-  "'SHOPIFY_CHECKOUT_FINGERPRINT_CONFIG_MISSING'",
+  'integrationCredentialRuntimeEncryptionKey()',
+  'isIntegrationCredentialRuntimeGateError(classifiedError)',
+  'assertIntegrationCredentialProviderIoReady()',
   "'SHOPIFY_CHECKOUT_WAREHOUSE_ORIGIN_MISMATCH'",
   "'SHOPIFY_CHECKOUT_LINE_QUANTITY_UNSUPPORTED'",
   "'SHOPIFY_CHECKOUT_LINE_WEIGHT_REQUIRED'",
@@ -623,6 +625,11 @@ assert.ok(
 assert.ok(
   route.includes('status: result.httpStatus'),
   'authenticated callback outcomes must retain success/retry status',
+)
+assert.ok(
+  route.includes("result.httpStatus === 503")
+    && route.includes("'Retry-After': '60'"),
+  'authenticated maintenance responses must carry a bounded retry hint',
 )
 assert.equal(
   /requireRequestUser|resolveRequestSession/.test(route),

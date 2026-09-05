@@ -14,6 +14,14 @@ const leaseMigrationPath = resolve(
   root,
   'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
 )
+const commerceMigrationSafetyPath = resolve(
+  root,
+  'db/migrations/0353_operations_commerce_workspace_migration_safety.sql',
+)
+const salesShippingMigrationSafetyPath = resolve(
+  root,
+  'db/migrations/0354_operations_sales_shipping_workspace_migration_safety.sql',
+)
 const healthPath = resolve(
   root,
   'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
@@ -29,6 +37,11 @@ const predeployPath = resolve(root, 'scripts/verify-predeploy.mjs')
 
 const migration = readFileSync(migrationPath, 'utf8')
 const leaseMigration = readFileSync(leaseMigrationPath, 'utf8')
+const commerceMigrationSafety = readFileSync(commerceMigrationSafetyPath, 'utf8')
+const salesShippingMigrationSafety = readFileSync(
+  salesShippingMigrationSafetyPath,
+  'utf8',
+)
 const health = readFileSync(healthPath, 'utf8')
 const orderEditingHealth = readFileSync(orderEditingHealthPath, 'utf8')
 const route = readFileSync(routePath, 'utf8')
@@ -37,6 +50,12 @@ const ci = readFileSync(ciPath, 'utf8')
 const predeploy = readFileSync(predeployPath, 'utf8')
 const checksum = createHash('sha256').update(migration).digest('hex')
 const leaseChecksum = createHash('sha256').update(leaseMigration).digest('hex')
+const commerceMigrationSafetyChecksum = createHash('sha256')
+  .update(commerceMigrationSafety)
+  .digest('hex')
+const salesShippingMigrationSafetyChecksum = createHash('sha256')
+  .update(salesShippingMigrationSafety)
+  .digest('hex')
 
 assert.match(
   health,
@@ -48,6 +67,16 @@ assert.match(
   new RegExp(leaseChecksum, 'u'),
   'shared release health must pin the exact 0316 migration checksum',
 )
+for (const [phase, phaseChecksum] of [
+  ['commerce migration safety', commerceMigrationSafetyChecksum],
+  ['sales and shipping migration safety', salesShippingMigrationSafetyChecksum],
+]) {
+  assert.match(
+    health,
+    new RegExp(phaseChecksum, 'u'),
+    `webhook health must pin the exact ${phase} migration checksum`,
+  )
+}
 for (const leasePhaseEvidence of [
   '0316_operations_commerce_fulfillment_authority_leases.sql',
   'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM',

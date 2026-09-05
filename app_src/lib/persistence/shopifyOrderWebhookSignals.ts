@@ -31,8 +31,15 @@ import {
   normalizeCommerceOrderObservationInput,
   type CommerceOrderObservationInput,
 } from '@/lib/persistence/commerceOrderSync'
+import {
+  assessCommerceOrderHistoryAdmissionWithClient,
+} from '@/lib/persistence/commerceOrderHistoryAdmission'
+import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
 
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
+const WEBHOOK_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
+  capability: 'webhook_hydration',
+})
 
 export class ShopifyOrderWebhookSignalPersistenceError extends Error {
   constructor(
@@ -210,6 +217,7 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
          AND account.global_id = $3
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
+         AND ${WEBHOOK_READ_ACCOUNT_SQL}
        FOR UPDATE OF account`,
       [
         input.runtime.organizationId,
@@ -315,6 +323,7 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
          AND account.id = $2::uuid
          AND account.integration_type = 'commerce'
          AND account.provider = 'shopify'
+         AND ${WEBHOOK_READ_ACCOUNT_SQL}
        FOR UPDATE OF account, credential, policy`,
       [
         input.runtime.organizationId,
@@ -701,7 +710,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
                 (
                   account.integration_type = 'commerce'
                   AND account.provider = 'shopify'
-                  AND account.status = 'active'
+                  AND ${WEBHOOK_READ_ACCOUNT_SQL}
                   AND account.external_account_id IS NOT NULL
                   AND account.commerce_credential_generation
                         = target.credential_generation
@@ -841,7 +850,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
           AND account.id = target.integration_account_id
           AND account.integration_type = 'commerce'
           AND account.provider = 'shopify'
-          AND account.status = 'active'
+          AND ${WEBHOOK_READ_ACCOUNT_SQL}
           AND account.commerce_credential_generation
               = target.credential_generation
          JOIN operations_commerce_credentials credential
@@ -952,6 +961,7 @@ export async function assertShopifyOrderWebhookClaimCurrentForProviderReadInPost
         AND account.global_id = $4
         AND account.integration_type = 'commerce'
         AND account.provider = 'shopify'
+        AND ${WEBHOOK_READ_ACCOUNT_SQL}
         AND account.commerce_credential_generation = $5
        WHERE target.organization_id = $1::uuid
          AND target.id = $2::uuid
@@ -1406,11 +1416,37 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         'Shopify exact-order read claim is stale',
       )
     }
-    const persisted = await insertExactObservation(
+    const admission = await assessCommerceOrderHistoryAdmissionWithClient(
       client,
-      input.claim,
-      observation,
+      {
+        organizationId: input.claim.organizationId,
+        integrationAccountId: input.claim.integrationAccountId,
+        provider: 'shopify',
+        externalOrderId: observation.externalOrderId,
+        providerCreatedAt: observation.providerCreatedAt,
+      },
     )
+    if (admission.reason === 'policy_missing') {
+      conflict(
+        'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+        'The immutable order-history policy is unavailable',
+      )
+    }
+    if (admission.reason === 'provider_created_at_required') {
+      conflict(
+        'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
+        'Provider order creation time is required by the frozen history policy',
+      )
+    }
+    const persisted = admission.admitted
+      ? await insertExactObservation(client, input.claim, observation)
+      : {
+          row: null,
+          appended: 0,
+          preserved: 0,
+          linesAppended: 0,
+          eventsAppended: 0,
+        }
     const read = await client.query<{ global_id: string }>(
       `INSERT INTO operations_shopify_order_webhook_reads (
          organization_id, integration_account_id, target_id,
@@ -1419,11 +1455,13 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
          external_order_id, claimed_provider_updated_at,
          observed_provider_updated_at, source_hash,
          read_all_orders_scope_observed, return_history_scope_observed,
-         provider_read_count, provider_write_count, observed_at
+         provider_read_count, provider_write_count, observed_at,
+         history_exclusion_code, excluded_provider_created_at
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7::uuid,
          $8, $9, $10, $11::timestamptz, $12::timestamptz, $13,
-         $14, $15, $17, 0, $16::timestamptz
+         $14, $15, $17, 0, $16::timestamptz, $18,
+         $19::timestamptz
        )
        RETURNING global_id`,
       [
@@ -1433,7 +1471,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.claim.capturedDirtyVersion,
         input.claim.lockToken,
         input.claim.signalGlobalId,
-        persisted.row.id,
+        persisted.row?.id || null,
         input.claim.credentialGeneration,
         input.claim.policyRevision,
         input.claim.externalOrderId,
@@ -1444,6 +1482,10 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.returnHistoryScopeObserved,
         observation.observedAt,
         observation.providerReadCount,
+        admission.admitted
+          ? null
+          : 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+        admission.admitted ? null : observation.providerCreatedAt,
       ],
     )
     const completed = await client.query<{
@@ -1506,6 +1548,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         capturedDirtyVersion: input.claim.capturedDirtyVersion,
         appended: persisted.appended,
         preserved: persisted.preserved,
+        historyExcluded: !admission.admitted,
         providerReads: observation.providerReadCount,
         providerWrites: 0,
       },
@@ -1521,6 +1564,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
       eventsAppended: persisted.eventsAppended,
       providerReads: observation.providerReadCount,
       providerWrites: 0 as const,
+      historyExcluded: !admission.admitted,
     })
   })
 }
@@ -1602,9 +1646,14 @@ export async function failShopifyOrderWebhookExactReadInPostgres(input: {
   })
 }
 
-export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(
-  input: { claim: ShopifyOrderWebhookTargetClaim },
-) {
+async function parkShopifyOrderWebhookExactReadInPostgres(input: {
+  claim: ShopifyOrderWebhookTargetClaim
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Shopify order webhook parking reason is invalid')
+  }
   const parked = await query(
     `UPDATE operations_shopify_order_webhook_targets
      SET claim_state = 'pending',
@@ -1617,7 +1666,7 @@ export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgre
          locked_by = NULL,
          lock_token = NULL,
          lease_expires_at = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $8,
          updated_at = clock_timestamp()
      WHERE organization_id = $1::uuid
        AND id = $2::uuid
@@ -1636,9 +1685,25 @@ export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgre
       input.claim.policyRevision,
       input.claim.capturedDirtyVersion,
       input.claim.lockToken,
+      input.errorCode,
     ],
   )
   return { parked: parked.rowCount === 1 }
+}
+
+export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(
+  input: { claim: ShopifyOrderWebhookTargetClaim },
+) {
+  return parkShopifyOrderWebhookExactReadInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkShopifyOrderWebhookExactReadForRuntimeMaintenanceInPostgres(
+  input: { claim: ShopifyOrderWebhookTargetClaim; errorCode: string },
+) {
+  return parkShopifyOrderWebhookExactReadInPostgres(input)
 }
 
 export async function readShopifyOrderWebhookSignalHealthFromPostgres() {

@@ -4,6 +4,8 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE,
   AG_ALCHEMY_EPISCS_CARRIER_DELEGATION,
+  AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_IDENTITIES,
+  AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_ORGANIZATION,
   MANAGED_SANDBOX_FULFILLMENT_SCOPE,
   MANAGED_SANDBOX_RATING_SCOPE,
   carrierConfigurationAllowsSandboxLabel,
@@ -5228,10 +5230,30 @@ async function cancelUnauthorizedRateTestLabelJobs(
              AND connection.configuration->>'authorizationScope' = $5
              AND connection.configuration->'credentialRevealAllowed'
                = 'false'::jsonb
-             AND connection.configuration->>'senderOriginWarehouseGlobalId'
-               = $6
+             AND (
+               connection.configuration->>'senderOriginWarehouseGlobalId' = $6
+               OR (
+                 connection.configuration->'migrationSourceAuthorityVerified'
+                   = 'true'::jsonb
+                 AND connection.configuration
+                   ->>'delegatedFromOrganizationReferenceCode' = $7
+                 AND concat(
+                   connection.configuration->>'sourceIntegrationGlobalId',
+                   ':',
+                   connection.configuration->>'sourceCarrierAccountGlobalId'
+                 ) = ANY($8::text[])
+                 AND connection.configuration
+                   ->>'senderOriginWarehouseGlobalId' = (
+                     SELECT origin.global_id
+                     FROM operations_warehouses origin
+                     WHERE origin.organization_id = $1::uuid
+                       AND origin.id = $2::uuid
+                       AND origin.status = 'active'
+                   )
+               )
+             )
              AND connection.configuration->'allowedCapabilities'
-               = $7::jsonb
+               = $9::jsonb
            )
            OR (
              NOT COALESCE(
@@ -5263,6 +5285,8 @@ async function cancelUnauthorizedRateTestLabelJobs(
       MANAGED_SANDBOX_RATING_SCOPE,
       MANAGED_SANDBOX_FULFILLMENT_SCOPE,
       AG_ALCHEMY_CARRIER_ORIGIN_WAREHOUSE,
+      AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_ORGANIZATION,
+      AG_ALCHEMY_PRODUCTION_SOURCE_AUTHORITY_IDENTITIES,
       JSON.stringify(['sandbox_rate', 'sandbox_label']),
     ],
   )

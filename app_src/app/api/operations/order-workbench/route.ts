@@ -10,6 +10,7 @@ import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
 import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import {
@@ -417,6 +418,8 @@ async function requestBody(req: NextRequest) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return response({
       ok: false,
@@ -780,15 +783,22 @@ export async function POST(req: NextRequest) {
               }
             },
           })
-        if ('status' in captured && captured.status === 'unavailable') {
+        if (
+          'status' in captured
+          && ['unavailable', 'excluded'].includes(captured.status)
+        ) {
+          const historyCode = 'code' in captured
+            && typeof captured.code === 'string'
+            ? captured.code
+            : 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED'
           historyRefresh = {
             status: 'unavailable',
-            code: captured.code,
+            code: historyCode,
             providerReads: captured.providerReads,
             providerWrites: 0,
           }
           console.warn('[operations-order-workbench] exact history unavailable', {
-            code: captured.code,
+            code: historyCode,
             candidateGlobalId,
           })
         } else {

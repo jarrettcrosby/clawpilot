@@ -3,10 +3,15 @@ import {
   readExactShopifyOrderHistoryObservation,
 } from '@/lib/integrations/commerceOrderHistory'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   appendShopifyOrderWebhookExactReadInPostgres,
   assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres,
   claimShopifyOrderWebhookTargetsInPostgres,
   failShopifyOrderWebhookExactReadInPostgres,
+  parkShopifyOrderWebhookExactReadForRuntimeMaintenanceInPostgres,
   parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
@@ -46,6 +51,7 @@ export async function processShopifyOrderWebhookSignals(input: {
     1,
     Math.min(Number(input.limit || 1), MAX_TARGETS_PER_RUN),
   )
+  assertIntegrationCredentialProviderIoReady()
   const claims = await claimShopifyOrderWebhookTargetsInPostgres({
     workerId: input.workerId,
     limit,
@@ -61,7 +67,8 @@ export async function processShopifyOrderWebhookSignals(input: {
   let eventsAppended = 0
   let failurePersistenceErrors = 0
   let parked = 0
-  for (const claim of claims) {
+  for (let claimIndex = 0; claimIndex < claims.length; claimIndex += 1) {
+    const claim = claims[claimIndex]
     try {
       await assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
         claim,
@@ -107,6 +114,15 @@ export async function processShopifyOrderWebhookSignals(input: {
       linesAppended += completed.linesAppended
       eventsAppended += completed.eventsAppended
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled(claims.slice(claimIndex).map(async (claimedTarget) => (
+          await parkShopifyOrderWebhookExactReadForRuntimeMaintenanceInPostgres({
+            claim: claimedTarget,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          })
+        )))
+        throw error
+      }
       if (isStoreSyncReadPause(error)) {
         const disposition =
           await parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres({

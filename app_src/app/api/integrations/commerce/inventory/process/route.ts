@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   shopifyInventoryRuntimeAvailable,
 } from '@/lib/integrations/commerceInventory'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
@@ -17,6 +20,10 @@ import {
 import {
   processShopifyInventoryRefreshOutbox,
 } from '@/lib/shopifyInventoryRefreshWorker'
+import {
+  commerceStorageMaintenanceFailureResult,
+  maintainCommerceStorageInPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -32,6 +39,36 @@ function authorized(req: NextRequest) {
     left.length === right.length
     && crypto.timingSafeEqual(left, right)
   )
+}
+
+function runtimeMaintenanceResponse(error: unknown) {
+  if (!isIntegrationCredentialRuntimeGateError(error)) return null
+  const code = String((error as { code?: unknown }).code || '')
+  return NextResponse.json({
+    ok: false,
+    maintenance: true,
+    retryable: true,
+    code,
+    error: 'Integration credential runtime is temporarily unavailable',
+  }, {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Retry-After': '60',
+    },
+  })
+}
+
+async function maintainRouteCommerceStorageSafely() {
+  try {
+    return await maintainCommerceStorageInPostgres({
+      workerId: 'commerce-inventory-process-route',
+    })
+  } catch (error) {
+    return commerceStorageMaintenanceFailureResult(error)
+  }
 }
 
 async function runShopifyLane(input: {
@@ -57,8 +94,13 @@ async function runShopifyLane(input: {
     return { result, heartbeatAt: heartbeat.checkedAt }
   } catch (error) {
     await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
-      phase: 'failed',
+      phase: isIntegrationCredentialRuntimeGateError(error)
+        ? 'maintenance'
+        : 'failed',
       workerId: input.workerId,
+      errorCode: isIntegrationCredentialRuntimeGateError(error)
+        ? String((error as { code?: unknown }).code || '')
+        : undefined,
       resource: 'inventory',
       readOnly: true,
       providerWrites: 0,
@@ -86,8 +128,13 @@ async function runFaireLane(input: {
     return { result, heartbeatAt: heartbeat.checkedAt }
   } catch (error) {
     await recordFaireInventoryPollWorkerHeartbeatInPostgres({
-      phase: 'failed',
+      phase: isIntegrationCredentialRuntimeGateError(error)
+        ? 'maintenance'
+        : 'failed',
       workerId: input.workerId,
+      errorCode: isIntegrationCredentialRuntimeGateError(error)
+        ? String((error as { code?: unknown }).code || '')
+        : undefined,
     }).catch(() => undefined)
     throw error
   }
@@ -100,6 +147,10 @@ export async function POST(req: NextRequest) {
       { status: 401 },
     )
   }
+  const postgresEnabled = isPostgresStorageEnabled()
+  const commerceStorageMaintenance = postgresEnabled
+    ? await maintainRouteCommerceStorageSafely()
+    : null
   const shopifyEnabled = shopifyInventoryRuntimeAvailable()
   const faireEnabled = faireInventoryPollingRuntimeAvailable()
   if (!shopifyEnabled && !faireEnabled) {
@@ -107,9 +158,10 @@ export async function POST(req: NextRequest) {
       ok: true,
       skipped: true,
       reason: 'shopify-inventory-disabled',
+      commerceStorageMaintenance,
     })
   }
-  if (!isPostgresStorageEnabled()) {
+  if (!postgresEnabled) {
     return NextResponse.json(
       {
         ok: false,
@@ -134,6 +186,14 @@ export async function POST(req: NextRequest) {
   ])
   // Both bounded lanes always settle before either error is rethrown, so a
   // provider-specific failure cannot prevent the other provider from working.
+  if (shopifyLane.status === 'rejected') {
+    const maintenance = runtimeMaintenanceResponse(shopifyLane.reason)
+    if (maintenance) return maintenance
+  }
+  if (faireLane.status === 'rejected') {
+    const maintenance = runtimeMaintenanceResponse(faireLane.reason)
+    if (maintenance) return maintenance
+  }
   if (shopifyLane.status === 'rejected') throw shopifyLane.reason
   if (faireLane.status === 'rejected') throw faireLane.reason
   const shopify = shopifyLane.value?.result || null
@@ -149,6 +209,7 @@ export async function POST(req: NextRequest) {
         reason: 'shopify-inventory-disabled',
       },
       faire,
+      routeCommerceStorageMaintenance: commerceStorageMaintenance,
       heartbeatAt: faireLane.value?.heartbeatAt || null,
     })
   }
@@ -162,6 +223,7 @@ export async function POST(req: NextRequest) {
       skipped: true,
       reason: 'faire-inventory-disabled',
     },
+    routeCommerceStorageMaintenance: commerceStorageMaintenance,
     heartbeatAt: shopifyLane.value?.heartbeatAt || null,
   })
 }

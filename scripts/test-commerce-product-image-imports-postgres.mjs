@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
+import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
 import vm from 'node:vm'
 
 const root = process.cwd()
@@ -122,15 +123,18 @@ async function applyMigrations(client) {
     ),
     'exact commerce image fan-out migration is missing',
   )
+  assert.ok(
+    files.includes(
+      '0357_operations_commerce_product_image_runtime_parking.sql',
+    ),
+    'commerce image runtime-maintenance parking migration is missing',
+  )
   for (const file of files) {
-    await client.query('BEGIN')
-    try {
-      await client.query(read(`db/migrations/${file}`))
-      await client.query('COMMIT')
-    } catch (error) {
-      await client.query('ROLLBACK')
-      throw new Error(`Migration ${file} failed`, { cause: error })
-    }
+    await applyMigrationSqlForTest(
+      client,
+      file,
+      read(`db/migrations/${file}`),
+    )
   }
 }
 
@@ -155,6 +159,10 @@ const persistenceMock = {
     'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
     [key],
   ),
+  query: (...args) => {
+    assert.ok(runtimePool, 'Runtime PostgreSQL pool is not configured')
+    return runtimePool.query(...args)
+  },
   withTransaction: withRuntimeTransaction,
 }
 
@@ -648,6 +656,220 @@ async function verifyImports(pool) {
     externalProductId: 'gid://shopify/Product/900',
     variants: ['gid://shopify/ProductVariant/901'],
   })
+  await addProduct(pool, gamma, {
+    key: 'runtime-maintenance',
+    name: 'Runtime maintenance image product',
+    externalProductId: 'gid://shopify/Product/940',
+    variants: ['gid://shopify/ProductVariant/941'],
+  })
+  await addProduct(pool, gamma, {
+    key: 'store-sync-pause',
+    name: 'Store sync pause image product',
+    externalProductId: 'gid://shopify/Product/1940',
+    variants: ['gid://shopify/ProductVariant/1941'],
+  })
+
+  await recordObservation(gamma, {
+    externalProductId: 'gid://shopify/Product/940',
+    providerImageId: 'shopify-runtime-maintenance-image',
+    locatorSha256: sha256('runtime-maintenance-locator'),
+    sourceHash: sha256('runtime-maintenance-source'),
+  })
+  const runtimeMaintenanceClaim = await claimOne(
+    gamma.organizationId,
+    'image-import-runtime-maintenance',
+  )
+  const runtimeAuditBefore = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM audit_events
+     WHERE organization_id = $1::uuid
+       AND aggregate_type = 'operations_commerce_product_image_import_job'
+       AND aggregate_id = $2`,
+    [gamma.organizationId, runtimeMaintenanceClaim.jobGlobalId],
+  )
+  await assert.rejects(
+    pool.query(
+      `UPDATE operations_commerce_product_image_import_jobs
+       SET state = 'queued',
+           attempt_count = attempt_count - 1,
+           lease_token = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_DISABLED',
+           completed_at = NULL
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [gamma.organizationId, runtimeMaintenanceClaim.jobId],
+    ),
+    /Invalid commerce product image import job transition/u,
+  )
+  await assert.rejects(
+    pool.query(
+      `UPDATE operations_commerce_product_image_import_jobs
+       SET state = 'queued',
+           attempt_count = attempt_count - 1,
+           lease_token = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+           completed_at = NULL,
+           asset_alt_text = 'mutated while parked'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [gamma.organizationId, runtimeMaintenanceClaim.jobId],
+    ),
+    /Invalid commerce product image import job transition/u,
+  )
+  await assert.rejects(
+    pool.query(
+      `UPDATE operations_commerce_product_image_import_jobs
+       SET state = 'queued',
+           lease_token = NULL,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+           completed_at = NULL
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [gamma.organizationId, runtimeMaintenanceClaim.jobId],
+    ),
+    /Invalid commerce product image import job transition/u,
+  )
+  const runtimePark = await imageImports
+    .parkCommerceProductImageImportForRuntimeMaintenanceInPostgres({
+      organizationId: runtimeMaintenanceClaim.organizationId,
+      jobId: runtimeMaintenanceClaim.jobId,
+      leaseToken: runtimeMaintenanceClaim.leaseToken,
+      workerId: 'image-import-runtime-maintenance',
+      errorCode: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    })
+  assert.equal(runtimePark.parked, true)
+  const runtimeParkedState = await pool.query(
+    `SELECT state, attempt_count, lease_token, claimed_by, claimed_at,
+            lease_expires_at, last_error_code, completed_at
+     FROM operations_commerce_product_image_import_jobs
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [gamma.organizationId, runtimeMaintenanceClaim.jobId],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(runtimeParkedState.rows[0])),
+    {
+      state: 'queued',
+      attempt_count: 0,
+      lease_token: null,
+      claimed_by: null,
+      claimed_at: null,
+      lease_expires_at: null,
+      last_error_code: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+      completed_at: null,
+    },
+  )
+  const runtimeAuditAfter = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM audit_events
+     WHERE organization_id = $1::uuid
+       AND aggregate_type = 'operations_commerce_product_image_import_job'
+       AND aggregate_id = $2`,
+    [gamma.organizationId, runtimeMaintenanceClaim.jobGlobalId],
+  )
+  assert.equal(
+    runtimeAuditAfter.rows[0].count,
+    runtimeAuditBefore.rows[0].count,
+    'runtime maintenance parking must not emit failure or dead-letter audit',
+  )
+  await assert.rejects(
+    imageImports
+      .parkCommerceProductImageImportForRuntimeMaintenanceInPostgres({
+        organizationId: runtimeMaintenanceClaim.organizationId,
+        jobId: runtimeMaintenanceClaim.jobId,
+        leaseToken: runtimeMaintenanceClaim.leaseToken,
+        workerId: 'image-import-runtime-maintenance',
+        errorCode: 'UNTRUSTED_RUNTIME_REASON',
+      }),
+    /parking reason is invalid/u,
+  )
+  const runtimeMaintenanceReclaim = await claimOne(
+    gamma.organizationId,
+    'image-import-runtime-maintenance-reclaim',
+  )
+  assert.equal(runtimeMaintenanceReclaim.jobId, runtimeMaintenanceClaim.jobId)
+  assert.equal(
+    runtimeMaintenanceReclaim.attemptCount,
+    1,
+    'runtime maintenance parking must restore the consumed retry budget',
+  )
+  await completeClaim(runtimeMaintenanceReclaim, ONE_PIXEL_PNG, 'image/png')
+
+  await recordObservation(gamma, {
+    externalProductId: 'gid://shopify/Product/1940',
+    providerImageId: 'shopify-store-sync-pause-image',
+    locatorSha256: sha256('store-sync-pause-locator'),
+    sourceHash: sha256('store-sync-pause-source'),
+  })
+  const storeSyncPauseClaim = await claimOne(
+    gamma.organizationId,
+    'image-import-store-sync-pause',
+  )
+  const storeSyncAuditBefore = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM audit_events
+     WHERE organization_id = $1::uuid
+       AND aggregate_type = 'operations_commerce_product_image_import_job'
+       AND aggregate_id = $2`,
+    [gamma.organizationId, storeSyncPauseClaim.jobGlobalId],
+  )
+  const storeSyncPark = await imageImports
+    .parkCommerceProductImageImportForStoreSyncPauseInPostgres({
+      organizationId: storeSyncPauseClaim.organizationId,
+      jobId: storeSyncPauseClaim.jobId,
+      leaseToken: storeSyncPauseClaim.leaseToken,
+      workerId: 'image-import-store-sync-pause',
+    })
+  assert.equal(storeSyncPark.parked, true)
+  const storeSyncParkedState = await pool.query(
+    `SELECT state, attempt_count, lease_token, claimed_by, claimed_at,
+            lease_expires_at, last_error_code, completed_at
+     FROM operations_commerce_product_image_import_jobs
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [gamma.organizationId, storeSyncPauseClaim.jobId],
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(storeSyncParkedState.rows[0])),
+    {
+      state: 'queued',
+      attempt_count: 0,
+      lease_token: null,
+      claimed_by: null,
+      claimed_at: null,
+      lease_expires_at: null,
+      last_error_code: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+      completed_at: null,
+    },
+  )
+  const storeSyncAuditAfter = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM audit_events
+     WHERE organization_id = $1::uuid
+       AND aggregate_type = 'operations_commerce_product_image_import_job'
+       AND aggregate_id = $2`,
+    [gamma.organizationId, storeSyncPauseClaim.jobGlobalId],
+  )
+  assert.equal(
+    storeSyncAuditAfter.rows[0].count,
+    storeSyncAuditBefore.rows[0].count,
+    'Store sync pause parking must not emit failure or dead-letter audit',
+  )
+  const storeSyncPauseReclaim = await claimOne(
+    gamma.organizationId,
+    'image-import-store-sync-pause-reclaim',
+  )
+  assert.equal(storeSyncPauseReclaim.jobId, storeSyncPauseClaim.jobId)
+  assert.equal(
+    storeSyncPauseReclaim.attemptCount,
+    1,
+    'Store sync pause parking must restore the consumed retry budget',
+  )
+  await completeClaim(storeSyncPauseReclaim, ONE_PIXEL_PNG, 'image/png')
 
   await assertImportCode(
     imageImports.reconcileCommerceProductImageSetInPostgres(

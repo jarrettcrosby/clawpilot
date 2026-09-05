@@ -23,6 +23,9 @@ import {
   shopifyLocationAdministrationRuntime,
 } from '@/lib/integrations/shopifyLocationAdministrationRuntime'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   claimShopifyLocationAdministrationInPostgres,
   prepareShopifyLocationAdministrationInPostgres,
   readPendingShopifyLocationAdministrationsInPostgres,
@@ -749,6 +752,7 @@ export async function executeShopifyLocationAdministrationProviderMutation(
       input.clientOptions,
     )
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const code = error instanceof ShopifyCommerceClientError
       && /^[A-Z][A-Z0-9_]{1,127}$/u.test(error.code)
       ? error.code
@@ -815,7 +819,8 @@ export async function executeShopifyLocationAdministrationProviderMutation(
       input.clientOptions,
       { graphql },
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return Object.freeze({
       action: input.action,
       outcome: 'unknown',
@@ -855,6 +860,7 @@ export async function executeShopifyLocationAdministrationProviderMutation(
 }
 
 function integrationError(error: unknown): ShopifyLocationAdministrationError {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof ShopifyLocationAdministrationError) return error
   if (error instanceof ShopifyLocationAdministrationPersistenceError) {
     return new ShopifyLocationAdministrationError({

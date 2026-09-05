@@ -13,6 +13,9 @@ import {
   ShopifyOrderManagementCommandError,
 } from '@/lib/operations/shopifyOrderManagementCommands'
 import { ShopifyOrderManagementError } from '@/lib/integrations/shopifyOrderManagement'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { ShopifyOrderManagementPersistenceError } from '@/lib/persistence/shopifyOrderManagement'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -1017,6 +1020,8 @@ function requireCancellationSameOrigin(req: NextRequest) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
   }

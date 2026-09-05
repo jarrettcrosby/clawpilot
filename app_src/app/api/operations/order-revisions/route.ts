@@ -6,6 +6,9 @@ import {
 import {
   refreshCommerceOrderRevisionFromProvider,
 } from '@/lib/operations/commerceOrderRevisionCommands'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   applyCommerceOrderRevisionToClawPilotInPostgres,
@@ -467,6 +470,8 @@ function executionRequired() {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
   }

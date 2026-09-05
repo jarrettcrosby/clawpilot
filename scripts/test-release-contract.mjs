@@ -456,6 +456,7 @@ assert.equal(railwayConfig.deploy.preDeployCommand, 'bash scripts/predeploy-rail
 const railwayPredeploy = read('scripts/predeploy-railway.sh')
 for (const fragment of [
   'npm run mail:verify',
+  'npm run db:preflight:commerce-storage',
   'npm run db:migrate',
   'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
@@ -465,6 +466,11 @@ for (const fragment of [
 }
 assert.ok(!railwayPredeploy.includes('CLAWPILOT_DEMO_MODE'))
 assert.ok(!railwayPredeploy.includes('RAILWAY_ENVIRONMENT_NAME'))
+assert.ok(
+  railwayPredeploy.indexOf('npm run db:preflight:commerce-storage')
+    < railwayPredeploy.indexOf('npm run db:migrate'),
+  'commerce storage preflight must run before online migrations',
+)
 assert.ok(
   railwayPredeploy.indexOf('npm run db:migrate') < railwayPredeploy.indexOf('npm run demo:seed'),
   'demo data must only be seeded after migrations complete',
@@ -479,28 +485,61 @@ assert.ok(
 const railwayStart = read('scripts/start-railway.sh')
 assert.ok(railwayStart.indexOf('/api/health') < railwayStart.indexOf('npm run release:record'))
 assert.ok(railwayStart.includes('application did not pass health validation'))
+const healthRoute = read('app_src/app/api/health/route.ts')
+for (const fragment of [
+  '0359_operations_commerce_fulfillment_recovery_budget.sql',
+  'f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11',
+  'AS operations_commerce_fulfillment_recovery_budget_applied',
+  '&& row?.operations_commerce_fulfillment_recovery_budget_applied',
+  '|| !row?.operations_commerce_fulfillment_recovery_budget_applied',
+  'commerceFulfillmentRecoveryBudget',
+]) {
+  assert.ok(
+    healthRoute.includes(fragment),
+    `release health contract missing fulfillment recovery-budget readiness: ${fragment}`,
+  )
+}
 
 const vercelConfig = JSON.parse(read('app_src/vercel.json'))
 assert.deepEqual(
   vercelConfig.git?.deploymentEnabled,
-  { dev: false, main: false },
-  'Vercel must wait for an explicit exact-commit deployment on dev and main while retaining feature previews',
+  false,
+  'Vercel Git deployments must remain disabled for every branch during the transitional cutover',
 )
+
+const environmentExample = read('.env.example')
+for (const productionSpecificExample of [
+  'https://dev.aiapp.eigenracing.com',
+  'https://aiapp.eigenracing.com',
+  'https://eigenracing.com',
+  'suburbiasandwichco.com',
+  'jarrett@',
+  '405bb919-0364-4a88-8a62-b4c9da42cd8f',
+  'replace-with-the-production-Sheet-id',
+]) {
+  assert.ok(
+    !environmentExample.includes(productionSpecificExample),
+    `.env.example must not carry production-specific value: ${productionSpecificExample}`,
+  )
+}
 
 const vercelBuild = read('scripts/vercel-build.mjs')
 for (const fragment of [
+  "environment !== 'preview'",
+  'production and development deployments are prohibited by the post-cutover contract',
+  'does not prove the legacy Vercel credential retirement is complete',
   "run('npm', ['run', 'build'], appRoot)",
-  "if (environment === 'production')",
-  "if (branch !== 'main')",
-  "environment === 'preview' && branch === 'dev'",
-  "resolve(root, 'scripts', 'verify-mail-sender.mjs')",
-  'database migrations are owned by the Railway deployment path',
 ]) {
   assert.ok(vercelBuild.includes(fragment), `Vercel build contract missing ${fragment}`)
 }
+assert.ok(
+  !vercelBuild.includes('verify-mail-sender.mjs'),
+  'Vercel previews must not verify managed mail',
+)
 for (const forbiddenMigrationPath of [
   'db-migrate.mjs',
   'db:migrate',
+  'db:preflight:commerce-storage',
   'predeploy-railway.sh',
 ]) {
   assert.ok(
@@ -508,10 +547,5 @@ for (const forbiddenMigrationPath of [
     `Vercel build must not invoke the migration authority through ${forbiddenMigrationPath}`,
   )
 }
-assert.ok(
-  vercelBuild.indexOf("run('npm', ['run', 'build'], appRoot)")
-    < vercelBuild.indexOf("resolve(root, 'scripts', 'verify-mail-sender.mjs')"),
-  'Vercel must compile before its managed mail verification gate',
-)
 
 console.log('PASS test-release-contract')

@@ -4,15 +4,10 @@ export const CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID =
 export const CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID =
   'f3fdf47c-6645-42ff-9a28-52843f8e4da2'
 
-export const CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID =
-  'e4abd95f-825c-4242-b37b-825a92597e98'
-
 export const CARRIER_PRODUCTION_LABEL_RAILWAY_PRODUCTION_ENVIRONMENT_ID =
   '058ce52f-1d3b-44bb-afe2-0df2bf24efb9'
 
-export type CarrierProductionLabelRuntimeLane =
-  | 'production'
-  | 'railway_development'
+export type CarrierProductionLabelRuntimeLane = 'production'
 
 export type CarrierProductionLabelRuntimePolicy = Readonly<{
   allowed: boolean
@@ -29,8 +24,8 @@ function normalized(value: unknown) {
  * policy only decides whether the current ClawPilot runtime may expose that
  * already-authorized mutation.
  *
- * Both hosted lanes are exact-identity gated so a generic development,
- * production, local, test, staging, foreign Railway, or Vercel runtime cannot
+ * The sole hosted production lane is exact-identity gated so a generic
+ * development, local, test, staging, foreign Railway, or Vercel runtime cannot
  * become eligible from NODE_ENV or an ambiguous lane marker alone.
  */
 export function carrierProductionLabelRuntimePolicy(
@@ -72,21 +67,6 @@ export function carrierProductionLabelRuntimePolicy(
     normalized(environment.RAILWAY_SERVICE_ID)
       === CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID
   )
-  const trustedRailwayDevelopment = (
-    normalized(environment.RAILWAY_ENVIRONMENT_NAME) === 'development'
-    && railwayProjectMatches
-    && railwayServiceMatches
-    && normalized(environment.RAILWAY_ENVIRONMENT_ID)
-      === CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID
-    && !hasProductionMarker
-  )
-  if (trustedRailwayDevelopment) {
-    return Object.freeze({
-      allowed: true,
-      lane: 'railway_development',
-    })
-  }
-
   const trustedRailwayProduction = (
     normalized(environment.RAILWAY_ENVIRONMENT_NAME) === 'production'
     && railwayProjectMatches

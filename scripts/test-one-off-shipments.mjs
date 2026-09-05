@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const requireFromApp = createRequire(
@@ -49,7 +50,12 @@ function runModule(path, requireModule) {
     exports: module.exports,
     module,
     process,
-    require: requireModule,
+    require(specifier) {
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
+      }
+      return requireModule(specifier)
+    },
   }, { filename: path })
   return module.exports
 }
@@ -84,11 +90,10 @@ assert.equal(
     RAILWAY_SERVICE_ID:
       productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
     RAILWAY_ENVIRONMENT_ID:
-      productionLabelRuntime
-        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+      'e4abd95f-825c-4242-b37b-825a92597e98',
   }),
-  'production',
-  'Trusted Railway development must expose the production one-off carrier environment',
+  'sandbox',
+  'The retired Railway development identity must not expose production postage',
 )
 assert.equal(
   operationsContract.oneOffRateEnvironment({
@@ -106,8 +111,7 @@ assert.equal(
     RAILWAY_SERVICE_ID:
       productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
     RAILWAY_ENVIRONMENT_ID:
-      productionLabelRuntime
-        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+      'e4abd95f-825c-4242-b37b-825a92597e98',
     VERCEL: '1',
     VERCEL_ENV: 'preview',
   }),

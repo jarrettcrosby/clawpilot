@@ -429,7 +429,7 @@ export function oneOffShippingExecutionModes(input: {
         ...(input.runtimeEnvironment === 'production'
           ? []
           : [
-              'Live postage is available only in production or the trusted Railway development service',
+              'Live postage is available only in the trusted Railway production service',
             ]),
         ...(input.canPurchaseLivePostage
           ? []

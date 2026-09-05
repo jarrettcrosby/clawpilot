@@ -610,10 +610,43 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
         `carrier-account:${input.organizationId}:${input.provider}:${input.environment}`,
       )
       const connection = await lockedUserManagedCarrierConnection(client, input)
-      const globalIdResult = await client.query<{ global_id: string }>(
-        `SELECT allocate_global_reference('gac') AS global_id`,
+      const migrationPlaceholder = await client.query<{
+        id: string
+        global_id: string
+        source_account_number_last_four: string
+        source_registered_address_fingerprint: string
+        state: 'awaiting_credential_rebind' | 'materialized'
+      }>(
+        `SELECT id::text, global_id, source_account_number_last_four,
+                source_registered_address_fingerprint, state
+         FROM operations_carrier_account_migration_placeholders
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+         FOR UPDATE`,
+        [input.organizationId, connection.id],
       )
-      const globalId = globalIdResult.rows[0].global_id
+      const placeholder = migrationPlaceholder.rows[0] || null
+      const accountNumberLastFour = input.accountNumber?.slice(-4) || null
+      const registeredAddressFingerprint = carrierAccountAddressFingerprint(
+        input.registeredAddress,
+      )
+      if (placeholder?.state === 'materialized') {
+        throw new Error('The migrated carrier shipper identity is already materialized')
+      }
+      if (placeholder && (
+        accountNumberLastFour !== placeholder.source_account_number_last_four
+        || registeredAddressFingerprint
+          !== placeholder.source_registered_address_fingerprint
+      )) {
+        throw new Error(
+          'The carrier account does not match the identity approved for this migrated workspace',
+        )
+      }
+      const globalId = placeholder
+        ? placeholder.global_id
+        : (await client.query<{ global_id: string }>(
+          `SELECT allocate_global_reference('gac') AS global_id`,
+        )).rows[0].global_id
       const encrypted = encryptCarrierAccountNumber(
         input.accountNumber,
         input.organizationId,
@@ -621,21 +654,24 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
         input.environment,
         globalId,
       )
-      await client.query(
+      const insertedAccount = await client.query<{ id: string }>(
         `INSERT INTO operations_carrier_accounts (
-           global_id, organization_id, integration_account_id, display_name, sender_name,
+           id, global_id, organization_id, integration_account_id,
+           display_name, sender_name,
            account_number_ciphertext, account_number_iv, account_number_tag,
            encryption_version, account_number_last_four, account_number_fingerprint,
            registered_address, registered_address_fingerprint,
            address_verification, allow_sender_billing, allow_recipient_billing,
            allow_third_party_billing, status, created_by, updated_by
          ) VALUES (
-           $1, $2::uuid, $3::uuid, $4, $5,
-           $6, $7, $8, 1, $9, $10,
-           $11::jsonb, $12, 'operator_attested', $13, $14, $15,
-           'active', $16, $16
-         )`,
+           COALESCE($1::uuid, gen_random_uuid()), $2, $3::uuid, $4::uuid,
+           $5, $6, $7, $8, $9, 1, $10, $11,
+           $12::jsonb, $13, 'operator_attested', $14, $15, $16,
+           'active', $17, $17
+         )
+         RETURNING id::text`,
         [
+          placeholder?.id || null,
           globalId,
           input.organizationId,
           connection.id,
@@ -644,7 +680,7 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
           encryptedText(encrypted.ciphertext),
           encryptedText(encrypted.iv),
           encryptedText(encrypted.tag),
-          input.accountNumber?.slice(-4),
+          accountNumberLastFour,
           carrierAccountNumberFingerprint(
             input.organizationId,
             input.provider,
@@ -652,13 +688,65 @@ export async function createCarrierAccountInPostgres(input: CarrierAccountWriteI
             input.accountNumber,
           ),
           JSON.stringify(input.registeredAddress),
-          carrierAccountAddressFingerprint(input.registeredAddress),
+          registeredAddressFingerprint,
           input.allowSenderBilling,
           input.allowRecipientBilling,
           input.allowThirdPartyBilling,
           input.actorEmail,
         ],
       )
+      if (placeholder) {
+        const targetAccountNumberFingerprint = carrierAccountNumberFingerprint(
+          input.organizationId,
+          input.provider,
+          input.environment,
+          input.accountNumber,
+        )
+        const materialized = await client.query(
+          `UPDATE operations_carrier_account_migration_placeholders
+           SET state = 'materialized',
+               target_account_number_fingerprint = $3,
+               materialized_by = $4,
+               materialized_at = clock_timestamp(),
+               updated_at = clock_timestamp()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND state = 'awaiting_credential_rebind'`,
+          [
+            input.organizationId,
+            connection.id,
+            targetAccountNumberFingerprint,
+            input.actorEmail,
+          ],
+        )
+        if (materialized.rowCount !== 1) {
+          throw new Error('The migrated carrier account placeholder changed during rebind')
+        }
+        const verifiedFence = await client.query(
+          `UPDATE operations_commerce_migration_provider_identity_fences
+           SET verification_state = 'verified',
+               verified_carrier_account_id = $3::uuid,
+               verified_carrier_account_identity_sha256 = $4,
+               verified_by = $5,
+               verified_at = clock_timestamp(),
+               updated_at = clock_timestamp()
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+             AND integration_type = 'carrier'
+             AND verification_state = 'awaiting_provider_identity'
+             AND reconnect_eligible = true`,
+          [
+            input.organizationId,
+            connection.id,
+            insertedAccount.rows[0].id,
+            targetAccountNumberFingerprint,
+            input.actorEmail,
+          ],
+        )
+        if (verifiedFence.rowCount !== 1) {
+          throw new Error('The migrated carrier provider identity fence changed during rebind')
+        }
+      }
       await auditCarrier(client, {
         actorEmail: input.actorEmail,
         organizationId: input.organizationId,

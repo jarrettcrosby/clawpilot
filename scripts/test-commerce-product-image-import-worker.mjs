@@ -6,6 +6,9 @@ import { resolve } from 'node:path'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import * as integrationCredentialRuntimeGate from
+  '../app_src/lib/integrations/integrationCredentialRuntimeGate.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -77,11 +80,14 @@ const worker = loadTypeScriptModule(
         withCurrentCommerceProviderImageSources: unused,
         selectCommerceProviderImageSource: unused,
       },
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
       '@/lib/persistence/commerceProductImageImports': {
         assertCommerceProductImageImportClaimCurrentInPostgres: unused,
         claimCommerceProductImageImportJobsInPostgres: unused,
         completeCommerceProductImageImportJobInPostgres: unused,
         failCommerceProductImageImportJobInPostgres: unused,
+        parkCommerceProductImageImportForRuntimeMaintenanceInPostgres: unused,
         parkCommerceProductImageImportForStoreSyncPauseInPostgres: unused,
         recordCommerceProductImageImportWorkerHeartbeatInPostgres: unused,
         resolveWaitingCommerceProductImageImportJobsInPostgres: unused,
@@ -214,6 +220,8 @@ function fixture(input = {}) {
     completions: [],
     failures: [],
     parks: [],
+    runtimeChecks: [],
+    runtimeParks: [],
     heartbeats: [],
   }
   const sources = input.sources || [{
@@ -223,6 +231,12 @@ function fixture(input = {}) {
     url: SOURCE_SECRET,
   }]
   const dependencies = {
+    assertProviderIoReady() {
+      state.runtimeChecks.push({ sequence: state.runtimeChecks.length + 1 })
+      if (input.runtimeErrorAt === state.runtimeChecks.length) {
+        throw input.runtimeError
+      }
+    },
     async resolveWaiting(args) {
       state.resolve.push(args)
       return input.resolved || []
@@ -299,6 +313,11 @@ function fixture(input = {}) {
       if (input.parkError) throw input.parkError
       return { parked: input.parked !== false }
     },
+    async parkRuntime(args) {
+      state.runtimeParks.push(args)
+      if (input.runtimeParkError) throw input.runtimeParkError
+      return { parked: input.runtimeParked !== false }
+    },
     async heartbeat(args) {
       state.heartbeats.push(args)
       if (input.heartbeatError === args.phase) {
@@ -355,6 +374,7 @@ test('imports sequential claims and reuses one exact product source read', async
   assert.equal(result.providerWrites, 0)
   assert.equal(run.state.resolve[0].organizationId, undefined)
   assert.equal(run.state.claims.length, 2)
+  assert.equal(run.state.runtimeChecks.length, 7)
   assert.ok(run.state.claims.every((entry) => entry.limit === 1))
   assert.ok(run.state.claims.every((entry) => entry.leaseSeconds === 120))
   assert.equal(run.state.completions[0].actorEmail, 'operator@example.com')
@@ -368,6 +388,62 @@ test('imports sequential claims and reuses one exact product source read', async
   assert.ok(!JSON.stringify(result).includes('11111111-1111'))
   assert.ok(!JSON.stringify(result).includes('gcij000000000001'))
 })
+
+test('runtime proof outage stops before waiting resolution or claim', async () => {
+  const runtimeError =
+    new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+      'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    )
+  const run = fixture({ runtimeError, runtimeErrorAt: 1 })
+
+  await assert.rejects(
+    worker.processCommerceProductImageImports(
+      { workerId: 'image-worker-runtime-preflight' },
+      run.dependencies,
+    ),
+    (error) => error === runtimeError,
+  )
+
+  assert.equal(run.state.resolve.length, 0)
+  assert.equal(run.state.claims.length, 0)
+  assert.equal(run.state.runtimeParks.length, 0)
+  assert.equal(run.state.failures.length, 0)
+  assert.equal(
+    run.state.heartbeats.map((entry) => entry.phase).join(','),
+    'starting,degraded',
+  )
+})
+
+test('runtime proof outage after claim parks without retry or dead-letter',
+  async () => {
+    const runtimeError =
+      new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+        'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+      )
+    const run = fixture({ readError: runtimeError })
+
+    await assert.rejects(
+      worker.processCommerceProductImageImports(
+        { workerId: 'image-worker-runtime-race' },
+        run.dependencies,
+      ),
+      (error) => error === runtimeError,
+    )
+
+    assert.equal(run.state.claims.length, 1)
+    assert.equal(run.state.runtimeParks.length, 1)
+    assert.equal(
+      run.state.runtimeParks[0].errorCode,
+      'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    )
+    assert.equal(run.state.failures.length, 0)
+    assert.equal(run.state.fetches.length, 0)
+    assert.equal(
+      run.state.heartbeats.map((entry) => entry.phase).join(','),
+      'starting,degraded',
+    )
+  },
+)
 
 test('stale provider source is a permanent persisted failure', async () => {
   const run = fixture({
@@ -650,7 +726,11 @@ test('secret route authorizes in constant time and only returns safe aggregates'
         'next/server': {
           NextResponse: {
             json(body, init = {}) {
-              return { body, status: init.status || 200 }
+              return {
+                body,
+                status: init.status || 200,
+                headers: init.headers || {},
+              }
             },
           },
         },
@@ -680,6 +760,8 @@ test('secret route authorizes in constant time and only returns safe aggregates'
             return runtimeAvailable
           },
         },
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+          integrationCredentialRuntimeGate,
         '@/lib/persistence/config': {
           isPostgresStorageEnabled() {
             return true
@@ -711,6 +793,22 @@ test('secret route authorizes in constant time and only returns safe aggregates'
     assert.equal(workerCalls, 1)
     assert.ok(!JSON.stringify(allowed.body).includes(SOURCE_SECRET))
 
+    workerError =
+      new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+        'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+      )
+    const maintenance = await route.POST(
+      request(`Bearer ${'s'.repeat(40)}`),
+    )
+    assert.equal(maintenance.status, 503)
+    assert.equal(maintenance.headers['Retry-After'], '60')
+    assert.equal(maintenance.body.maintenance, true)
+    assert.equal(maintenance.body.retryable, true)
+    assert.equal(
+      maintenance.body.errorCode,
+      'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    )
+
     workerError = codedError(
       'UNSAFE_PROVIDER_DETAIL',
       500,
@@ -733,7 +831,7 @@ test('secret route authorizes in constant time and only returns safe aggregates'
       disabled.body.errorCodes.COMMERCE_PRODUCT_IMAGE_IMPORT_DISABLED,
       1,
     )
-    assert.equal(workerCalls, 2)
+    assert.equal(workerCalls, 3)
   } finally {
     if (savedSecret === undefined) {
       delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
@@ -748,6 +846,9 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
   const routeSource = read(
     'app_src/app/api/integrations/commerce/images/process/route.ts',
   )
+  const persistenceSource = read(
+    'app_src/lib/persistence/commerceProductImageImports.ts',
+  )
   const proxySource = read('app_src/proxy.ts')
   const pollerSource = read('scripts/pipeline-outbox-poller.mjs')
 
@@ -759,6 +860,8 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
     'fetchCommerceProviderImage',
     'completeCommerceProductImageImportJobInPostgres',
     'recordCommerceProductImageImportWorkerHeartbeatInPostgres',
+    'assertIntegrationCredentialProviderIoReady',
+    'parkCommerceProductImageImportForRuntimeMaintenanceInPostgres',
     'actorEmail: claim.actorEmail',
     'limit: 1',
     'leaseSeconds: JOB_LEASE_SECONDS',
@@ -772,6 +875,16 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
   assert.ok(routeSource.includes('processCommerceProductImageImports'))
   assert.ok(routeSource.includes('errorCode:'))
   assert.ok(!routeSource.includes('error:'))
+  assert.ok(routeSource.includes('isIntegrationCredentialRuntimeGateError'))
+  assert.ok(routeSource.includes('status: 503'))
+  assert.ok(routeSource.includes("'Retry-After': '60'"))
+  assert.ok(persistenceSource.includes(
+    'parkCommerceProductImageImportForRuntimeMaintenanceInPostgres',
+  ))
+  assert.ok(persistenceSource.includes(
+    'attempt_count = GREATEST(0, attempt_count - 1)',
+  ))
+  assert.ok(persistenceSource.includes('last_error_code = $6'))
   assert.ok(!workerSource.includes('console.'))
   assert.ok(!workerSource.includes('error.message'))
   assert.ok(!workerSource.includes('String(error)'))

@@ -21,6 +21,12 @@ import {
   ShopifyCustomerRatePolicyError,
 } from '@/lib/integrations/shopifyCustomerRatePolicy'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -60,6 +66,8 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json(
       { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },
@@ -225,7 +233,8 @@ async function providerCustomerSearch(input: {
       runtime.environment,
       runtime.externalAccountId,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new ShopifyCustomerRatePolicyPersistenceError(
       'SHOPIFY_CUSTOMER_POLICY_CREDENTIAL_INVALID',
       'Stored Shopify credentials are unavailable',
@@ -268,6 +277,7 @@ async function providerCustomerSearch(input: {
 }
 
 function safeCustomerSearchError(error: unknown) {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (
     error instanceof ShopifyCustomerRatePolicyPersistenceError
     || error instanceof ShopifyCustomerRatePolicyError
@@ -345,6 +355,8 @@ async function customerSearchResponse(
       },
     })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     const safe = safeCustomerSearchError(error)
     return json({
       ok: true,

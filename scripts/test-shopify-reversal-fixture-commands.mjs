@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -168,6 +169,9 @@ vm.runInNewContext(output, {
   require(specifier) {
     if (specifier === 'node:crypto') {
       return { createHash, createHmac }
+    }
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+      return integrationCredentialRuntimeGate
     }
     if (specifier === '@/lib/integrations/commerceCredentialCrypto') {
       return {

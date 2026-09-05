@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 import {
   SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL,
   SHIPPING_ONE_OFF_PACK_HEALTH_SQL,
@@ -173,6 +174,9 @@ function loadTypeScript(path, mocks) {
     Promise, RegExp, Set, String, URL, console, exports: module.exports,
     module, process,
     require(specifier) {
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
+      }
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }

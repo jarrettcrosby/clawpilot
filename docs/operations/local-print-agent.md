@@ -165,7 +165,7 @@ not advertise or accept PDF, PNG, Letter, A4, packing slips, return labels, or
 office documents:
 
 ```bash
-CLAWPILOT_PRINT_AGENT_URL=https://dev.aiapp.eigenracing.com \
+CLAWPILOT_PRINT_AGENT_URL=https://aiapp.eigenracing.com \
 CLAWPILOT_PRINT_AGENT_CREDENTIAL='cpprint.v1.<agent-uuid>.<secret>' \
 CLAWPILOT_PRINTER_HOST='printer-hostname-or-static-ip' \
 npm run print-agent:run
@@ -272,7 +272,7 @@ configuration API:
 
 ```bash
 npm run print-agent:pair:macos -- \
-  --base-url 'https://dev.aiapp.eigenracing.com'
+  --base-url 'https://aiapp.eigenracing.com'
 ```
 
 The downloadable menu invokes this same tested pairing and installer path. An
@@ -309,11 +309,18 @@ security add-generic-password -U \
 
 npm run print-agent:install:macos -- \
   --name 'FHMXLAB35 Zebra' \
-  --base-url 'https://dev.aiapp.eigenracing.com' \
+  --base-url 'https://aiapp.eigenracing.com' \
   --printer-host 'FHMXLAB35.local' \
   --keychain-service 'com.clawpilot.print-agent.dev' \
   --keychain-account 'FHMXLAB35'
 ```
+
+These examples enroll the durable agent with the sole Railway production
+runtime. For deterministic local development, use an isolated throwaway agent
+and `http://127.0.0.1:4002`; never copy a production pairing code, runtime
+credential, printer identity, or delivery ledger into local or remote-local
+state. Vercel previews and the remote-local gateway are not print-job
+authorities.
 
 The installer copies the minimal runtime into the user's Application Support
 directory, writes a credential-free property list under
