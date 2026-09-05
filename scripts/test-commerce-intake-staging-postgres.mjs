@@ -90,6 +90,30 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/commerceStorageMaintenance') {
+        const emptyResult = (status, errorCode = null) => ({
+          schemaAvailable: status !== 'failed',
+          executed: false,
+          status,
+          errorCode,
+          intakePayloads: { rows: 0, bytes: 0 },
+          legacyInventoryCaptures: { rows: 0, bytes: 0 },
+          inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+          inventoryObservationAliases: { rows: 0, bytes: 0 },
+          inventoryLevels: { rows: 0, bytes: 0 },
+        })
+        return {
+          async maintainCommerceStorageInPostgres() {
+            return emptyResult('not_due')
+          },
+          commerceStorageMaintenanceFailureResult(error) {
+            return emptyResult(
+              'failed',
+              error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+            )
+          },
+        }
+      }
       if (
         specifier
         === '@/lib/persistence/commerceOrderHistoryAdmission'
