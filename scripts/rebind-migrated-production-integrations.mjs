@@ -99,6 +99,8 @@ const COMMERCE_HISTORY_MODES = Object.freeze([
   'last_60_days',
   'provider_all',
 ])
+export const REBIND_PLAN_MAX_AGE_MS = 15 * 60 * 1000
+export const REBIND_PLAN_MAX_FUTURE_SKEW_MS = 5 * 1000
 
 const AG_MANAGED_BY = 'ag-alchemy-episcs-sandbox-rating-delegation'
 const AG_AUTHORITY_ORGANIZATION_REFERENCE = 'ga5122758'
@@ -513,6 +515,25 @@ function encryptAesGcm(plaintext, keySecret, aad) {
   cipher.setAAD(Buffer.from(aad, 'utf8'))
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
   return { ciphertext, iv, tag: cipher.getAuthTag() }
+}
+
+export function withZeroizedPlaintextBuffer(serialized, transform) {
+  if (typeof serialized !== 'string' || typeof transform !== 'function') {
+    fail('Plaintext buffer operation is invalid')
+  }
+  const plaintext = Buffer.from(serialized, 'utf8')
+  try {
+    return transform(plaintext)
+  } finally {
+    plaintext.fill(0)
+  }
+}
+
+function encryptSerializedAesGcm(serialized, keySecret, aad) {
+  return withZeroizedPlaintextBuffer(
+    serialized,
+    (plaintext) => encryptAesGcm(plaintext, keySecret, aad),
+  )
 }
 
 function commerceAad(organizationId, provider, environment, externalAccountId) {
@@ -1332,6 +1353,40 @@ function poolFor(connectionString, runtime) {
   })
 }
 
+async function targetDatabaseTimestamp(client) {
+  const result = await client.query(
+    `SELECT date_trunc('milliseconds', clock_timestamp()) AS target_database_now`,
+  )
+  const value = new Date(result.rows[0]?.target_database_now)
+  if (result.rowCount !== 1 || Number.isNaN(value.getTime())) {
+    fail('Target database clock is unavailable')
+  }
+  return value.toISOString()
+}
+
+export function assertRebindPlanFreshness(plan, targetDatabaseNow) {
+  const createdAtText = text(plan?.createdAt)
+  const targetNowText = text(targetDatabaseNow)
+  const createdAt = new Date(createdAtText)
+  const targetNow = new Date(targetNowText)
+  if (
+    Number.isNaN(createdAt.getTime())
+    || Number.isNaN(targetNow.getTime())
+    || createdAt.toISOString() !== createdAtText
+    || targetNow.toISOString() !== targetNowText
+  ) {
+    fail('The reviewed rebind plan or target database clock is invalid')
+  }
+  const ageMs = targetNow.getTime() - createdAt.getTime()
+  if (ageMs < -REBIND_PLAN_MAX_FUTURE_SKEW_MS) {
+    fail('The reviewed rebind plan is ahead of the target database clock; rerun plan')
+  }
+  if (ageMs > REBIND_PLAN_MAX_AGE_MS) {
+    fail('The reviewed rebind plan expired; rerun plan and confirm its new digest')
+  }
+  return Object.freeze({ ageMs, targetDatabaseNow: targetNow.toISOString() })
+}
+
 async function databaseIdentity(client) {
   const result = await client.query(
     `SELECT value->>'id' AS database_identity
@@ -1601,6 +1656,85 @@ async function assertTargetSchema(client) {
     || !historyFunction.includes("IF TG_OP <> 'INSERT' THEN")
     || !historyFunction.includes('commerce order history policy is immutable')
   ) fail('Target database lacks the immutable commerce order-history policy guard')
+  const historyConstraintResult = await client.query(
+    `SELECT constraint_record.conname,
+            constraint_record.contype,
+            constraint_record.convalidated,
+            constraint_record.confdeltype,
+            referenced.relname AS referenced_table,
+            COALESCE((
+              SELECT string_agg(attribute.attname, ',' ORDER BY key.ordinality)
+              FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key(attnum, ordinality)
+              JOIN pg_attribute attribute
+                ON attribute.attrelid = constraint_record.conrelid
+               AND attribute.attnum = key.attnum
+            ), '') AS constrained_columns,
+            COALESCE((
+              SELECT string_agg(attribute.attname, ',' ORDER BY key.ordinality)
+              FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key(attnum, ordinality)
+              JOIN pg_attribute attribute
+                ON attribute.attrelid = constraint_record.confrelid
+               AND attribute.attnum = key.attnum
+            ), '') AS referenced_columns,
+            pg_get_constraintdef(constraint_record.oid, true) AS definition
+     FROM pg_constraint constraint_record
+     LEFT JOIN pg_class referenced ON referenced.oid = constraint_record.confrelid
+     WHERE constraint_record.conrelid =
+       'operations_commerce_order_history_policies'::regclass`,
+  )
+  const historyConstraints = new Map(
+    historyConstraintResult.rows.map((row) => [row.conname, row]),
+  )
+  const requireHistoryConstraint = (name, expected) => {
+    const constraint = historyConstraints.get(name)
+    const definition = String(constraint?.definition || '').toLowerCase()
+    if (
+      !constraint
+      || constraint.contype !== expected.type
+      || constraint.convalidated !== true
+      || constraint.constrained_columns !== expected.columns
+      || (expected.referencedTable
+        && (constraint.referenced_table !== expected.referencedTable
+          || constraint.referenced_columns !== expected.referencedColumns
+          || constraint.confdeltype !== 'r'))
+      || (expected.tokens || []).some((token) => !definition.includes(token))
+    ) fail(`Target database lacks required commerce order-history constraint: ${name}`)
+  }
+  requireHistoryConstraint('operations_commerce_order_history_policies_pkey', {
+    type: 'p',
+    columns: 'organization_id,integration_account_id',
+  })
+  requireHistoryConstraint('operations_commerce_order_history_policies_provider_check', {
+    type: 'c', columns: 'provider', tokens: ["'shopify'", "'faire'"],
+  })
+  requireHistoryConstraint('operations_commerce_order_history_policies_history_mode_check', {
+    type: 'c',
+    columns: 'history_mode',
+    tokens: COMMERCE_HISTORY_MODES.map((mode) => `'${mode}'`),
+  })
+  requireHistoryConstraint('commerce_order_history_policy_account_fkey', {
+    type: 'f',
+    columns: 'organization_id,integration_account_id',
+    referencedTable: 'operations_integration_accounts',
+    referencedColumns: 'organization_id,id',
+  })
+  requireHistoryConstraint('operations_commerce_order_history_policies_configured_by_fkey', {
+    type: 'f',
+    columns: 'configured_by',
+    referencedTable: 'app_users',
+    referencedColumns: 'email',
+  })
+  requireHistoryConstraint('commerce_order_history_policy_provider_mode_valid', {
+    type: 'c',
+    columns: 'provider,history_mode',
+    tokens: ["'shopify'", "'faire'", "'new_orders_only'", "'last_60_days'"],
+  })
+  requireHistoryConstraint('commerce_order_history_policy_floor_valid', {
+    type: 'c',
+    columns: 'history_mode,ingestion_floor,frozen_at',
+    tokens: ["'provider_all'", 'ingestion_floor is null', 'ingestion_floor is not null',
+      'ingestion_floor <= frozen_at'],
+  })
 }
 
 async function loadCommerceSource(source, workspace, account) {
@@ -2487,9 +2621,8 @@ async function collectValidatedMaterials(input) {
           || verification.providerMutationCount !== 0
           || !String(verification.operationalProbe || '').endsWith('_read_only')
         ) fail(`${account.sourceGlobalId} provider returned a different account identity`)
-        const targetPlaintext = Buffer.from(JSON.stringify(credential), 'utf8')
-        const encrypted = encryptAesGcm(
-          targetPlaintext,
+        const encrypted = encryptSerializedAesGcm(
+          JSON.stringify(credential),
           input.targetKey,
           commerceAad(
             workspace.targetOrganizationId,
@@ -2583,8 +2716,8 @@ async function collectValidatedMaterials(input) {
         account.environment,
         decrypted.accountNumber,
       )
-      const encryptedCredential = encryptAesGcm(
-        Buffer.from(JSON.stringify(decrypted.credential), 'utf8'),
+      const encryptedCredential = encryptSerializedAesGcm(
+        JSON.stringify(decrypted.credential),
         input.targetKey,
         carrierCredentialAad(
           workspace.targetOrganizationId,
@@ -2592,8 +2725,8 @@ async function collectValidatedMaterials(input) {
           account.environment,
         ),
       )
-      const encryptedAccountNumber = encryptAesGcm(
-        Buffer.from(decrypted.accountNumber, 'utf8'),
+      const encryptedAccountNumber = encryptSerializedAesGcm(
+        decrypted.accountNumber,
         input.targetKey,
         carrierAccountAad(
           workspace.targetOrganizationId,
@@ -2686,6 +2819,11 @@ function buildPlanArtifact(input, materials, createdAt) {
       providerCount: 1,
       recovery: 'export-receipt-after-committed-write; otherwise rerun plan',
     },
+    validity: {
+      timeSource: 'target_database_clock',
+      maxAgeSeconds: REBIND_PLAN_MAX_AGE_MS / 1000,
+      maxFutureSkewSeconds: REBIND_PLAN_MAX_FUTURE_SKEW_MS / 1000,
+    },
     providers: redactedMaterialProjection(materials),
     applyReady: true,
   }
@@ -2733,6 +2871,9 @@ function assertPlanEnvelope(plan, input) {
     || plan.transaction?.isolation !== 'serializable'
     || plan.transaction?.targetAtomic !== true
     || plan.transaction?.providerCount !== 1
+    || plan.validity?.timeSource !== 'target_database_clock'
+    || plan.validity?.maxAgeSeconds !== REBIND_PLAN_MAX_AGE_MS / 1000
+    || plan.validity?.maxFutureSkewSeconds !== REBIND_PLAN_MAX_FUTURE_SKEW_MS / 1000
     || !Array.isArray(plan.providers)
     || plan.providers.length !== 1
     || plan.providers[0]?.sourceAccountGlobalId !== input.selectedAccountGlobalId
@@ -3439,6 +3580,10 @@ export async function applyValidatedMaterials(input, materials, plan) {
       input.workspaces || WORKSPACES,
     )
     assertReviewedPlan(plan, input, materials)
+    await assertRebindPlanFreshness(
+      plan,
+      await targetDatabaseTimestamp(input.target),
+    )
     await insertReviewedHistoryPolicy(input.target, materials[0], input.actor)
     const providerWrites = await reconcileReviewedCallbacks(materials, input.verifier)
     for (const material of materials) {
@@ -3487,7 +3632,9 @@ export async function planRebind(input) {
   if (selected.account.integrationType !== 'commerce' && historyMode) {
     fail('--history-mode is accepted only for a commerce provider rebind plan')
   }
-  const createdAt = new Date().toISOString()
+  await assertDatabaseBoundary(input.source, input.target)
+  await assertTargetSchema(input.target)
+  const createdAt = await targetDatabaseTimestamp(input.target)
   const plannedHistoryPolicy = selected.account.integrationType === 'commerce'
     ? plannedHistoryPolicyEvidence({
       account: selected.account,
@@ -3496,8 +3643,6 @@ export async function planRebind(input) {
       frozenAt: createdAt,
     })
     : null
-  await assertDatabaseBoundary(input.source, input.target)
-  await assertTargetSchema(input.target)
   assertMigrationArtifacts(
     input.manifest,
     input.mapping,
@@ -3546,6 +3691,10 @@ export async function applyRebind(input) {
   }
   await assertDatabaseBoundary(input.source, input.target)
   await assertTargetSchema(input.target)
+  await assertRebindPlanFreshness(
+    input.plan,
+    await targetDatabaseTimestamp(input.target),
+  )
   assertMigrationArtifacts(
     input.manifest,
     input.mapping,

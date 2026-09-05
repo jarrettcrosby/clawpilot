@@ -18,7 +18,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
+  REBIND_PLAN_MAX_AGE_MS,
+  REBIND_PLAN_MAX_FUTURE_SKEW_MS,
   WORKSPACES,
+  assertRebindPlanFreshness,
   canonicalJson,
   carrierAddressFingerprint,
   createProviderVerifier,
@@ -29,6 +32,7 @@ import {
   plannedHistoryPolicyEvidence,
   readBoundedSecretJsonFd,
   sha256,
+  withZeroizedPlaintextBuffer,
   writePrivateJson,
 } from './rebind-migrated-production-integrations.mjs'
 
@@ -263,6 +267,26 @@ assert.equal(WORKSPACES.flatMap((workspace) => workspace.accounts).length, 8)
 assert.equal(new Set(WORKSPACES.map((workspace) => workspace.targetOrganizationId)).size, 3)
 assert.equal(canonicalJson({ b: 1, a: [2] }), '{"a":[2],"b":1}')
 assert.match(digest({ fixed: true }), /^[a-f0-9]{64}$/u)
+let successPlaintext
+const transformedPlaintext = withZeroizedPlaintextBuffer(
+  'temporary-credential-plaintext',
+  (plaintext) => {
+    successPlaintext = plaintext
+    assert.equal(plaintext.toString('utf8'), 'temporary-credential-plaintext')
+    return 'encrypted-result'
+  },
+)
+assert.equal(transformedPlaintext, 'encrypted-result')
+assert.ok(successPlaintext.every((byte) => byte === 0), 'successful encryption input must be zeroized')
+let failedPlaintext
+assert.throws(
+  () => withZeroizedPlaintextBuffer('temporary-account-plaintext', (plaintext) => {
+    failedPlaintext = plaintext
+    throw new Error('fixture encryption failure')
+  }),
+  /fixture encryption failure/u,
+)
+assert.ok(failedPlaintext.every((byte) => byte === 0), 'failed encryption input must be zeroized')
 const parsedHistoryPlan = parseArguments([
   'plan',
   '--actor', 'operator@example.com',
@@ -355,6 +379,34 @@ assert.deepEqual(plannedHistoryPolicyEvidence({
   frozenAt: '2026-09-05T12:00:00.000Z',
   configuredBy: 'operator@example.com',
 })
+const freshnessCreatedAt = '2026-09-05T12:00:00.000Z'
+assert.deepEqual(assertRebindPlanFreshness(
+  { createdAt: freshnessCreatedAt },
+  new Date(Date.parse(freshnessCreatedAt) + REBIND_PLAN_MAX_AGE_MS).toISOString(),
+), {
+  ageMs: REBIND_PLAN_MAX_AGE_MS,
+  targetDatabaseNow: new Date(
+    Date.parse(freshnessCreatedAt) + REBIND_PLAN_MAX_AGE_MS,
+  ).toISOString(),
+})
+assert.doesNotThrow(() => assertRebindPlanFreshness(
+  { createdAt: freshnessCreatedAt },
+  new Date(Date.parse(freshnessCreatedAt) - REBIND_PLAN_MAX_FUTURE_SKEW_MS).toISOString(),
+))
+assert.throws(
+  () => assertRebindPlanFreshness(
+    { createdAt: freshnessCreatedAt },
+    new Date(Date.parse(freshnessCreatedAt) + REBIND_PLAN_MAX_AGE_MS + 1).toISOString(),
+  ),
+  /reviewed rebind plan expired/u,
+)
+assert.throws(
+  () => assertRebindPlanFreshness(
+    { createdAt: freshnessCreatedAt },
+    new Date(Date.parse(freshnessCreatedAt) - REBIND_PLAN_MAX_FUTURE_SKEW_MS - 1).toISOString(),
+  ),
+  /ahead of the target database clock/u,
+)
 const managedAccounts = WORKSPACES
   .flatMap((workspace) => workspace.accounts)
   .filter((account) => account.rebindMode === 'source_authority')
@@ -391,6 +443,20 @@ assert.throws(
 )
 
 const source = readFileSync(new URL('./rebind-migrated-production-integrations.mjs', import.meta.url), 'utf8')
+const materialCollectionSource = source.slice(
+  source.indexOf('async function collectValidatedMaterials'),
+  source.indexOf('function redactedMaterialProjection'),
+)
+assert.equal(
+  (materialCollectionSource.match(/encryptSerializedAesGcm\(/gu) || []).length,
+  3,
+  'all three target encryption inputs must use the zeroizing wrapper',
+)
+assert.equal(
+  materialCollectionSource.includes('encryptAesGcm('),
+  false,
+  'target material collection must not bypass plaintext zeroization',
+)
 for (const forbiddenSql of [
   'FROM operations_commerce_webhook_receipts',
   'FROM operations_commerce_provider_attempts',
@@ -419,6 +485,31 @@ const historyPolicyInsert = source.slice(
 assert.ok(historyPolicyInsert.length > 0)
 assert.match(historyPolicyInsert, /INSERT INTO operations_commerce_order_history_policies/u)
 assert.equal(historyPolicyInsert.includes('ON CONFLICT DO NOTHING'), false)
+const applyTransactionSource = source.slice(
+  source.indexOf('export async function applyValidatedMaterials'),
+  source.indexOf('export async function planRebind'),
+)
+assert.ok(applyTransactionSource.length > 0)
+assert.ok(
+  applyTransactionSource.indexOf('assertRebindPlanFreshness')
+    < applyTransactionSource.indexOf('insertReviewedHistoryPolicy'),
+  'the serializable transaction must recheck plan freshness before inserting policy',
+)
+assert.ok(
+  applyTransactionSource.indexOf('insertReviewedHistoryPolicy')
+    < applyTransactionSource.indexOf('reconcileReviewedCallbacks'),
+  'the reviewed policy insert must remain inside the provider-reconciliation transaction',
+)
+const planSource = source.slice(
+  source.indexOf('export async function planRebind'),
+  source.indexOf('export async function applyRebind'),
+)
+assert.ok(planSource.length > 0)
+assert.ok(
+  planSource.indexOf('targetDatabaseTimestamp')
+    < planSource.indexOf('plannedHistoryPolicyEvidence'),
+  'plan creation and the history cutoff must use the target database clock',
+)
 const authorityLoader = source.slice(
   source.indexOf('async function loadTargetAuthority'),
   source.indexOf('async function loadTargetPlaceholder'),
@@ -426,6 +517,18 @@ const authorityLoader = source.slice(
 assert.ok(authorityLoader.length > 0)
 assert.equal(/credential_ciphertext|account_number_ciphertext/u.test(authorityLoader), false)
 assert.match(authorityLoader, /account_number_fingerprint/u)
+const runbook = readFileSync(
+  new URL('../docs/operations/commerce-workspace-production-migration.md', import.meta.url),
+  'utf8',
+)
+for (const sourceAccountGlobalId of [
+  'gia5156705', 'gia9286799', 'gia585rig3qiq7j', 'giah34fedoa5b1o',
+]) assert.match(runbook, new RegExp(sourceAccountGlobalId, 'u'))
+assert.match(runbook, /receipt_count = 1/u)
+assert.match(runbook, /policy_count = 1/u)
+assert.match(runbook, /exact_policy_match/u)
+assert.match(runbook, /more than 15 minutes old/u)
+assert.match(runbook, /more than 5 seconds ahead of the target database clock/u)
 
 const evidenceDirectory = mkdtempSync(path.join(tmpdir(), 'clawpilot-rebind-evidence-'))
 try {

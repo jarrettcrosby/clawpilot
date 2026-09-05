@@ -19,6 +19,8 @@ import {
   MIGRATION_MANIFEST_FORMAT,
   MIGRATION_MAPPING_FORMAT,
   MIGRATION_SCRIPT_VERSION,
+  REBIND_PLAN_MAX_AGE_MS,
+  REBIND_PLAN_MAX_FUTURE_SKEW_MS,
   SOURCE_DATABASE_IDENTITY,
   TARGET_DATABASE_IDENTITY,
   applyRebind,
@@ -32,6 +34,7 @@ import {
   managedRebindMaterialDigest,
   managedSourceAuthorityApprovalToken,
   planRebind,
+  plannedHistoryPolicyEvidence,
   sha256,
 } from './rebind-migrated-production-integrations.mjs'
 
@@ -143,9 +146,25 @@ async function waitForPostgres(databaseUrl) {
   throw new Error('Disposable PostgreSQL did not become ready')
 }
 
+const historyPolicyMigration = readFileSync(
+  new URL('../db/migrations/0349_operations_commerce_order_history_policy.sql', import.meta.url),
+  'utf8',
+)
+const historyPolicySchemaStart = historyPolicyMigration.indexOf(
+  'CREATE TABLE operations_commerce_order_history_policies',
+)
+const historyPolicySchemaEnd = historyPolicyMigration.indexOf('\nWITH frozen AS', historyPolicySchemaStart)
+assert.ok(historyPolicySchemaStart >= 0 && historyPolicySchemaEnd > historyPolicySchemaStart)
+const historyPolicySchema = historyPolicyMigration.slice(
+  historyPolicySchemaStart,
+  historyPolicySchemaEnd,
+)
+
 const schema = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE app_settings (key text PRIMARY KEY, value jsonb NOT NULL);
+CREATE TABLE app_users (email text PRIMARY KEY);
+INSERT INTO app_users(email) VALUES ('migration-test@example.com');
 CREATE TABLE workspace_organizations (id uuid PRIMARY KEY, reference_code text UNIQUE NOT NULL);
 CREATE TABLE operations_integration_accounts (
   id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
@@ -167,30 +186,7 @@ CREATE TABLE operations_commerce_credentials (
   created_by text, updated_by text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(),
   PRIMARY KEY (organization_id, integration_account_id)
 );
-CREATE TABLE operations_commerce_order_history_policies (
-  organization_id uuid NOT NULL, integration_account_id uuid NOT NULL,
-  provider text NOT NULL, history_mode text NOT NULL,
-  ingestion_floor timestamptz, frozen_at timestamptz NOT NULL,
-  configured_by text, created_at timestamptz DEFAULT now(),
-  PRIMARY KEY (organization_id, integration_account_id)
-);
-CREATE FUNCTION protect_commerce_order_history_policy() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-  IF TG_OP <> 'INSERT' THEN
-    RAISE EXCEPTION 'commerce order history policy is immutable';
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM operations_integration_accounts account
-    WHERE account.organization_id = NEW.organization_id
-      AND account.id = NEW.integration_account_id
-      AND account.integration_type = 'commerce'
-      AND account.provider = NEW.provider
-  ) THEN RAISE EXCEPTION 'commerce order history policy account is invalid'; END IF;
-  RETURN NEW;
-END $$;
-CREATE TRIGGER commerce_order_history_policy_guard
-BEFORE INSERT OR UPDATE OR DELETE ON operations_commerce_order_history_policies
-FOR EACH ROW EXECUTE FUNCTION protect_commerce_order_history_policy();
+${historyPolicySchema}
 CREATE TABLE operations_carrier_credentials (
   organization_id uuid NOT NULL, integration_account_id uuid NOT NULL,
   credential_ciphertext bytea NOT NULL, credential_iv bytea NOT NULL, credential_tag bytea NOT NULL,
@@ -997,6 +993,54 @@ async function runAcceptance(sourceUrl, targetUrl) {
       [data.targetOrg, data.accounts.commerce.targetId],
     )
     assert.equal(plannedPolicyCount.rows[0].count, 0, 'planning must not create history policy')
+    const freshnessDatabaseNow = new Date((await target.query(
+      `SELECT date_trunc('milliseconds', clock_timestamp()) AS target_database_now`,
+    )).rows[0].target_database_now)
+    const planAt = (createdAt) => {
+      const candidate = structuredClone(commercePlan.plan)
+      candidate.createdAt = createdAt
+      candidate.providers[0].orderHistoryPolicy = plannedHistoryPolicyEvidence({
+        account: data.accounts.commerce,
+        actor,
+        historyMode: 'last_30_days',
+        frozenAt: createdAt,
+      })
+      candidate.planDigest = reviewedPlanDigest(candidate)
+      return candidate
+    }
+    let expiredPlanProviderReads = 0
+    const freshnessVerifier = {
+      ...fakeVerifier(data),
+      async commerce(...values) {
+        expiredPlanProviderReads += 1
+        return fakeVerifier(data).commerce(...values)
+      },
+    }
+    const expiredPlan = planAt(new Date(
+      freshnessDatabaseNow.getTime() - REBIND_PLAN_MAX_AGE_MS - 1_000,
+    ).toISOString())
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
+        verifier: freshnessVerifier,
+        plan: expiredPlan,
+        confirmDigest: expiredPlan.planDigest,
+      }),
+      /reviewed rebind plan expired/u,
+    )
+    const futurePlan = planAt(new Date(
+      freshnessDatabaseNow.getTime() + REBIND_PLAN_MAX_FUTURE_SKEW_MS + 60_000,
+    ).toISOString())
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
+        verifier: freshnessVerifier,
+        plan: futurePlan,
+        confirmDigest: futurePlan.planDigest,
+      }),
+      /ahead of the target database clock/u,
+    )
+    assert.equal(expiredPlanProviderReads, 0, 'invalid plan time must fail before provider reads')
     await target.query(
       `INSERT INTO operations_commerce_order_history_policies (
          organization_id, integration_account_id, provider, history_mode,
@@ -1081,6 +1125,77 @@ async function runAcceptance(sourceUrl, targetUrl) {
         [data.targetOrg, data.accounts.commerce.targetId],
       ),
     )
+    const rollbackBaseVerifier = fakeVerifier(data)
+    let postPolicyInsertReconciliations = 0
+    const postPolicyInsertFailureVerifier = {
+      ...rollbackBaseVerifier,
+      async reconcileShopify(...values) {
+        postPolicyInsertReconciliations += 1
+        await rollbackBaseVerifier.reconcileShopify(...values)
+        throw new Error('fixture post-policy-insert reconciliation failure')
+      },
+    }
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
+        verifier: postPolicyInsertFailureVerifier,
+        plan: commercePlan.plan,
+        confirmDigest: commercePlan.plan.planDigest,
+      }),
+      /fixture post-policy-insert reconciliation failure/u,
+    )
+    assert.equal(
+      postPolicyInsertReconciliations,
+      1,
+      'failure injection must execute after the reviewed history-policy insert',
+    )
+    const commerceRolledBack = await target.query(
+      `SELECT account.status AS account_status,
+              account.external_account_id,
+              account.credential_reference,
+              account.commerce_credential_generation,
+              account.receipt_intake_enabled,
+              fence.verification_state,
+              control.desired_state AS sync_desired_state,
+              control.explicit_choice AS sync_explicit_choice,
+              control.revision::integer AS sync_revision,
+              (SELECT count(*)::integer
+               FROM operations_commerce_order_history_policies history
+               WHERE history.organization_id = account.organization_id
+                 AND history.integration_account_id = account.id) AS history_policy_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_credentials credential
+               WHERE credential.organization_id = account.organization_id
+                 AND credential.integration_account_id = account.id) AS credential_count,
+              (SELECT count(*)::integer
+               FROM audit_events event
+               WHERE event.organization_id = account.organization_id
+                 AND event.event_type = 'operations.migrated_provider_rebind.completed'
+                 AND event.payload->>'planDigest' = $3) AS receipt_count
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, commercePlan.plan.planDigest],
+    )
+    assert.deepEqual(commerceRolledBack.rows[0], {
+      account_status: 'disabled',
+      external_account_id: null,
+      credential_reference: null,
+      commerce_credential_generation: 0,
+      receipt_intake_enabled: false,
+      verification_state: 'awaiting_provider_identity',
+      sync_desired_state: 'paused',
+      sync_explicit_choice: true,
+      sync_revision: 1,
+      history_policy_count: 0,
+      credential_count: 0,
+      receipt_count: 0,
+    })
     const baseConcurrencyVerifier = fakeVerifier(data)
     let validationArrivals = 0
     let releaseValidations

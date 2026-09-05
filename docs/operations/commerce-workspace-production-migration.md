@@ -338,7 +338,12 @@ and remains excluded unless a separately reviewed change says otherwise.
 Create and review one commerce plan at a time. Supported Shopify choices are
 `new_orders_only`, `last_7_days`, `last_30_days`, and `last_60_days`; Faire also
 supports `provider_all`. Apply takes the choice only from the confirmed plan,
-so a second history flag is deliberately rejected:
+so a second history flag is deliberately rejected. Plan time and the immutable
+history cutoff come from the millisecond-truncated target database clock. Apply
+fails before provider validation when the plan is more than 15 minutes old or
+more than 5 seconds ahead of the target database clock, and rechecks that fence
+inside the serializable target transaction before any provider callback write.
+If review exceeds that window, rerun plan and review the new digest:
 
 ```bash
 npm run rebind:migrated-production-providers -- plan \
@@ -522,14 +527,85 @@ WHERE email IN (
 )
 ORDER BY email;
 
-SELECT organization_id, count(*) AS history_policy_count
-FROM operations_commerce_order_history_policies
-WHERE organization_id IN (
-  '33785418-9927-4e10-a492-d3a44b9b6f21'::uuid,
-  '3b9ceada-a4ff-4363-8e78-6069dee76328'::uuid,
-  'c8fcf491-cf8c-469a-b03c-0026a762752c'::uuid
+WITH expected(source_account_global_id, organization_id, provider) AS (
+  VALUES
+    ('gia5156705', '33785418-9927-4e10-a492-d3a44b9b6f21'::uuid, 'faire'),
+    ('gia9286799', '33785418-9927-4e10-a492-d3a44b9b6f21'::uuid, 'shopify'),
+    ('gia585rig3qiq7j', '3b9ceada-a4ff-4363-8e78-6069dee76328'::uuid, 'shopify'),
+    ('giah34fedoa5b1o', 'c8fcf491-cf8c-469a-b03c-0026a762752c'::uuid, 'shopify')
 )
-GROUP BY organization_id;
+SELECT expected.source_account_global_id,
+       expected.organization_id,
+       account_evidence.target_account_global_id,
+       expected.provider AS expected_provider,
+       receipt_evidence.receipt_count,
+       policy_evidence.policy_count,
+       receipt_evidence.reviewed_history_mode,
+       policy_evidence.actual_history_mode,
+       receipt_evidence.reviewed_ingestion_floor,
+       policy_evidence.actual_ingestion_floor,
+       receipt_evidence.reviewed_frozen_at,
+       policy_evidence.actual_frozen_at,
+       receipt_evidence.reviewed_configured_by,
+       policy_evidence.actual_configured_by,
+       receipt_evidence.receipt_count = 1
+         AND account_evidence.account_count = 1
+         AND policy_evidence.policy_count = 1
+         AND receipt_evidence.reviewed_provider = expected.provider
+         AND policy_evidence.actual_provider = expected.provider
+         AND policy_evidence.actual_history_mode =
+           receipt_evidence.reviewed_history_mode
+         AND policy_evidence.actual_ingestion_floor IS NOT DISTINCT FROM
+           receipt_evidence.reviewed_ingestion_floor::timestamptz
+         AND policy_evidence.actual_frozen_at =
+           receipt_evidence.reviewed_frozen_at::timestamptz
+         AND policy_evidence.actual_configured_by =
+           receipt_evidence.reviewed_configured_by AS exact_policy_match
+FROM expected
+LEFT JOIN LATERAL (
+  SELECT count(*)::integer AS receipt_count,
+         min(event.payload#>>'{providers,0,orderHistoryPolicy,provider}')
+           AS reviewed_provider,
+         min(event.payload#>>'{providers,0,orderHistoryPolicy,historyMode}')
+           AS reviewed_history_mode,
+         min(event.payload#>>'{providers,0,orderHistoryPolicy,ingestionFloor}')
+           AS reviewed_ingestion_floor,
+         min(event.payload#>>'{providers,0,orderHistoryPolicy,frozenAt}')
+           AS reviewed_frozen_at,
+         min(event.payload#>>'{providers,0,orderHistoryPolicy,configuredBy}')
+           AS reviewed_configured_by
+  FROM audit_events event
+  WHERE event.organization_id = expected.organization_id
+    AND event.event_type = 'operations.migrated_provider_rebind.completed'
+    AND event.payload#>>'{providers,0,sourceAccountGlobalId}' =
+      expected.source_account_global_id
+) receipt_evidence ON true
+LEFT JOIN LATERAL (
+  SELECT count(*)::integer AS account_count,
+         min(account.global_id) AS target_account_global_id
+  FROM operations_commerce_migration_provider_identity_fences fence
+  JOIN operations_integration_accounts account
+    ON account.organization_id = fence.organization_id
+   AND account.id = fence.integration_account_id
+  WHERE fence.organization_id = expected.organization_id
+    AND fence.source_account_global_id = expected.source_account_global_id
+    AND account.integration_type = 'commerce'
+) account_evidence ON true
+LEFT JOIN LATERAL (
+  SELECT count(*)::integer AS policy_count,
+         min(policy.provider) AS actual_provider,
+         min(policy.history_mode) AS actual_history_mode,
+         min(policy.ingestion_floor) AS actual_ingestion_floor,
+         min(policy.frozen_at) AS actual_frozen_at,
+         min(policy.configured_by) AS actual_configured_by
+  FROM operations_commerce_migration_provider_identity_fences fence
+  JOIN operations_commerce_order_history_policies policy
+    ON policy.organization_id = fence.organization_id
+   AND policy.integration_account_id = fence.integration_account_id
+  WHERE fence.organization_id = expected.organization_id
+    AND fence.source_account_global_id = expected.source_account_global_id
+) policy_evidence ON true
+ORDER BY expected.organization_id, expected.source_account_global_id;
 
 SELECT operations_commerce_storage_bloat_health(1000) AS storage_health;
 
