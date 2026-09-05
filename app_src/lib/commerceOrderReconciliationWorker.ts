@@ -12,6 +12,10 @@ import {
   executeCommerceOrderPage,
 } from '@/lib/integrations/commerceIntake'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   markAutomaticFaireOrderPromotionAttentionInPostgres,
   readAutomaticFaireExactRefreshTargetsInPostgres,
 } from '@/lib/persistence/commerceIntake'
@@ -27,6 +31,7 @@ import {
   claimCommerceOrderReconciliationTargetsInPostgres,
   completeCommerceOrderReconciliationInPostgres,
   failCommerceOrderReconciliationInPostgres,
+  parkCommerceOrderReconciliationForRuntimeMaintenanceInPostgres,
   projectCommerceOrderReconciliationPageInPostgres,
 } from '@/lib/persistence/commerceOrderReconciliation'
 import {
@@ -387,6 +392,7 @@ export async function processCommerceOrderReconciliation(input: {
       failureCodes: {},
     }
   }
+  assertIntegrationCredentialProviderIoReady()
   const targets = await claimCommerceOrderReconciliationTargetsInPostgres({
     limit: Math.max(1, Math.min(Number(input.limit || 1), 5)),
     ...(input.organizationId ? { organizationId: input.organizationId } : {}),
@@ -441,7 +447,8 @@ export async function processCommerceOrderReconciliation(input: {
   // Optional chaining keeps isolated VM contract tests compatible with their
   // intentionally minimal integration mock; the real module always exports it.
   const productionReadOnly = commerceReadRuntimeMode?.() === 'production'
-  for (const claimedTarget of targets) {
+  for (let targetIndex = 0; targetIndex < targets.length; targetIndex += 1) {
+    const claimedTarget = targets[targetIndex]
     let target = claimedTarget
     try {
       const targetStartedAtMs = clock()
@@ -531,6 +538,7 @@ export async function processCommerceOrderReconciliation(input: {
           budgetStopReason = 'time'
           break
         }
+        assertIntegrationCredentialProviderIoReady()
         const response = await executeCommerceOrderPage({
           organizationId: target.organizationId,
           accountGlobalId: target.accountGlobalId,
@@ -771,6 +779,7 @@ export async function processCommerceOrderReconciliation(input: {
               )
               targetFaireExactRefreshAttempted += 1
               try {
+                assertIntegrationCredentialProviderIoReady()
                 const exactResponse =
                   await executeCommerceFaireOrderExactRefresh({
                     organizationId: target.organizationId,
@@ -885,6 +894,9 @@ export async function processCommerceOrderReconciliation(input: {
                   ) + count(value)
                 }
               } catch (error) {
+                if (isIntegrationCredentialRuntimeGateError(error)) {
+                  throw error
+                }
                 if (
                   reconciliationFailureCode(error)
                     === 'COMMERCE_ORDER_RECONCILIATION_WRITE_FENCE'
@@ -1083,6 +1095,18 @@ export async function processCommerceOrderReconciliation(input: {
         }
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled([
+          target,
+          ...targets.slice(targetIndex + 1),
+        ].map(async (pendingTarget) => (
+          await parkCommerceOrderReconciliationForRuntimeMaintenanceInPostgres({
+            target: pendingTarget,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          })
+        )))
+        throw error
+      }
       const failure = await failCommerceOrderReconciliationInPostgres({
         target,
         error,

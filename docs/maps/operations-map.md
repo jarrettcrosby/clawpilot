@@ -13,10 +13,10 @@ app_visible: true
 
 ## Runtime And Promotion
 
-- [ClawPilot Environments and Deployment](../operations/clawpilot-environments.md) is the source for local, development, and production topology and promotion gates.
+- [ClawPilot Environments and Deployment](../operations/clawpilot-environments.md) is the source for local/remote-local development, the transitional Vercel retirement gate, post-retirement protected previews, the sole Railway production runtime, and promotion gates.
 - [Demo Account](../operations/public-demo-environment.md) defines the permissioned synthetic workspace, rolling date windows, read-only controls, and provider restrictions.
 - [Release Documentation Contract](../releases/README.md) defines release copy and durable Versions records.
-- Development runs from `dev`; production promotion is a reviewed `dev` to `main` pull request.
+- Development runs locally from `dev`; production promotion is a reviewed `dev` to `main` pull request. Vercel is protected compile/UI preview evidence only.
 
 ## Provider Runbooks
 
@@ -44,14 +44,13 @@ app_visible: true
 - [Printing, Carrier Billing, And GL Coding](../operations/printing-carrier-billing-and-gl-coding.md): printer setup, direct carrier-bill import, GL review, Triangle/Square/Circle settlement, and financial controls.
 - [Local Print Agent](../operations/local-print-agent.md): enrollment, credential rotation, fenced claims, acknowledgements, retry, fallback, and reprint operations.
 
-The bounded development workflows are implemented and tested, but the overall module remains pre-activation for production provider mutations, hosted shipment confirmation, tracking ingestion, commerce-fulfillment dispatch, and accounting export. Sandbox labels cannot confirm shipments or consume inventory. Working-tree migration `0099` and the packing-slip/artifact delivery code establish durable evidence contracts without activating those production commands. On mobile, the Operations subpanel row scrolls horizontally between Orders, Exceptions, Carrier invoicing, Shipment pricing & GL, and Printing by touch or labeled edge controls. Existing environment and backup procedures stay authoritative until provider certification, scoped activation, complete health/reconciliation, and on-call ownership are in place.
+The bounded workflows are implemented and tested through deterministic local/disposable-Postgres evidence, but the overall module remains pre-activation for production provider mutations, hosted shipment confirmation, tracking ingestion, commerce-fulfillment dispatch, and accounting export. Retained references to the former Railway development environment are legacy test and cutover evidence, not a current hosted runtime. Sandbox labels cannot confirm shipments or consume inventory. Working-tree migration `0099` and the packing-slip/artifact delivery code establish durable evidence contracts without activating those production commands. On mobile, the Operations subpanel row scrolls horizontally between Orders, Exceptions, Carrier invoicing, Shipment pricing & GL, and Printing by touch or labeled edge controls. Existing environment and backup procedures stay authoritative until provider certification, scoped activation, complete health/reconciliation, and on-call ownership are in place.
 
 ## Standard Verification Path
 
 1. Run focused tests for the changed boundary.
 2. Run lint, build, test, and predeploy verification.
-3. Verify Railway health and persistence in development.
-4. Perform a real browser workflow in development.
-5. Promote through a pull request.
-6. Repeat hosted checks and the critical browser workflow in production.
-7. Record the release in both environments.
+3. Verify the affected local or disposable-Postgres workflow and, when useful, the protected Vercel compile/UI preview for the exact commit.
+4. Promote through a reviewed pull request.
+5. Verify Railway production health, persistence, workers, and the critical authenticated browser workflow.
+6. Record the production release and exact evidence. Preview or remote-local evidence never substitutes for production health.

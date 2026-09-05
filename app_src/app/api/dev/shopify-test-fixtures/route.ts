@@ -4,6 +4,9 @@ import {
   shopifyReversalFixtureRuntime,
 } from '@/lib/integrations/shopifyReversalFixtureRuntime'
 import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import {
   executeShopifyReversalFixtureCommand,
   prepareShopifyReversalFixtureFulfillment,
   prepareShopifyReversalFixtureOrder,
@@ -162,6 +165,8 @@ export async function POST(req: NextRequest) {
       headers: { 'Cache-Control': 'no-store' },
     })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     const safe = safeError(error)
     return NextResponse.json({
       ok: false,

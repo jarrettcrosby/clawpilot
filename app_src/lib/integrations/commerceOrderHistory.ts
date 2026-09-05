@@ -35,6 +35,9 @@ import {
   type CommerceOrderObservationInput,
 } from '@/lib/persistence/commerceOrderSync'
 import {
+  commerceReadCredentialEligible,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   readCommerceRuntimeCredentialFromPostgres,
   type CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
@@ -1662,6 +1665,10 @@ async function runtimeFor(input: Pick<
     !runtime
     || runtime.status !== 'active'
     || runtime.verificationStatus !== 'verified'
+    || !commerceReadCredentialEligible(runtime, {
+      developmentRequiresActive: true,
+      capability: 'orders_history',
+    })
     || runtime.credentialVersion !== input.expectedCredentialGeneration
     || (runtime.provider === 'shopify'
       && runtime.authMode !== 'shopify_client_credentials')

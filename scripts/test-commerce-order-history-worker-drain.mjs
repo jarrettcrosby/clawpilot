@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const requireFromApp = createRequire(
@@ -36,7 +37,11 @@ function loadWorker(mocks) {
     module: loaded,
     require: (specifier) => mocks[specifier]
       || (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits'
-        ? { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS: 6 } : {}),
+        ? { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS: 6 }
+        : specifier
+            === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+          ? integrationCredentialRuntimeGate
+          : {}),
     Date,
     Error,
     Math,
@@ -283,5 +288,83 @@ assert.equal(isolatedFailure.providerReads, 3)
 assert.equal(isolatedFailure.providerReadReservations, 12)
 assert.equal(isolatedFailure.drainStopReason, 'terminal')
 assert.equal(isolatedFailure.providerWrites, 0)
+
+// Runtime maintenance must attempt to release every lease in the claimed wave
+// even when one parking write fails, and the parking failure must never replace
+// the original typed outage returned to the route.
+const runtimeOutage =
+  new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+const runtimeParkedAccounts = []
+let runtimeWaveClaimed = false
+let runtimeFailurePersistenceCalls = 0
+const runtimeParkingWorker = loadWorker({
+  '@/lib/integrations/commerceOrderHistory': {
+    async readCommerceOrderHistoryPage() {
+      throw runtimeOutage
+    },
+  },
+  '@/lib/persistence/commerceOrderSync': {
+    async redactExpiredCommerceOrderSensitiveEvidenceInPostgres() {
+      return { redacted: 0, providerWrites: 0 }
+    },
+    async materializeDeferredCommerceOrderHistoryRefreshesInPostgres() {
+      return { materialized: 0, skipped: 0, providerWrites: 0 }
+    },
+    async ensureContinuousCommerceOrderPollsInPostgres() {
+      return { scheduled: 0, providerWrites: 0 }
+    },
+    async claimCommerceOrderBackfillsInPostgres() {
+      if (runtimeWaveClaimed) return []
+      runtimeWaveClaimed = true
+      return [
+        job(0),
+        {
+          ...job(0),
+          id: '77777777-7777-4777-8777-777777777777',
+          globalId: 'gcob0000003',
+          accountGlobalId: 'gia0000003',
+          lockToken: '88888888-8888-4888-8888-888888888888',
+        },
+      ]
+    },
+    async readCommerceOrderBackfillCursorFromPostgres() {
+      return null
+    },
+    async parkCommerceOrderBackfillForRuntimeMaintenanceInPostgres(input) {
+      runtimeParkedAccounts.push(input.job.accountGlobalId)
+      if (input.job.accountGlobalId === 'gia0000001') {
+        throw new Error('first runtime parking write unavailable')
+      }
+      return { parked: true }
+    },
+    async failCommerceOrderBackfillInPostgres() {
+      runtimeFailurePersistenceCalls += 1
+      throw new Error('runtime maintenance must not be persisted as failure')
+    },
+    async readCommerceOrderSyncHealthFromPostgres() {
+      return { failed: 0, providerWrites: 0 }
+    },
+    async readCommerceOrderSyncCursorKeyReadinessFromPostgres() {
+      return { ready: true, referencedKeyIds: [] }
+    },
+  },
+  '@/lib/persistence/commerceStoreSync': {
+    withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
+  },
+})
+await assert.rejects(
+  runtimeParkingWorker.processCommerceOrderHistory({
+    workerId: 'runtime-parking-isolation-test',
+    limit: 2,
+  }),
+  (error) => error === runtimeOutage,
+)
+assert.deepEqual(
+  runtimeParkedAccounts.sort(),
+  ['gia0000001', 'gia0000003'],
+)
+assert.equal(runtimeFailurePersistenceCalls, 0)
 
 console.log('Commerce order history worker multi-page drain checks passed')

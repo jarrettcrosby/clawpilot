@@ -10,6 +10,7 @@ import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
 import { FaireCommerceClientError } from '@/lib/integrations/faireCommerceClient'
 import {
@@ -417,6 +418,8 @@ async function requestBody(req: NextRequest) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return response({
       ok: false,

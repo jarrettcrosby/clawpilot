@@ -3,6 +3,11 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 
+import {
+  IntegrationCredentialRuntimeGateError,
+  isIntegrationCredentialRuntimeGateError,
+} from './lib/integration-credential-runtime-test-double.mjs'
+
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -95,6 +100,96 @@ assert.match(runtime, /query ClawPilotExternalFulfillmentReconciliation/)
 assert.match(runtime, /trackingInfo\(first: 11\) \{ company number url \}/)
 assert.doesNotMatch(runtime, /\bmutation\b/)
 assert.match(runtime, /providerWrites: 0/)
+
+let runtimeGateChecks = 0
+let runtimeGateFailureAt = null
+let runtimeGateFailure = null
+const providerCalls = []
+const reconciliationRuntime = await loadTypeScriptModule(
+  'app_src/lib/integrations/shopifyExternalFulfillmentReconciliation.ts',
+  {
+    '@/lib/integrations/commerceCredentialCrypto': {
+      decryptCommerceCredential() {
+        throw runtimeGateFailure
+      },
+    },
+    '@/lib/integrations/commerceCapabilities': {
+      hasEffectiveShopifyScope() { return true },
+    },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+      assertIntegrationCredentialProviderIoReady() {
+        runtimeGateChecks += 1
+        if (runtimeGateChecks === runtimeGateFailureAt) {
+          throw runtimeGateFailure
+        }
+        return { mode: 'test', status: 'verified', providerIoReady: true }
+      },
+      isIntegrationCredentialRuntimeGateError,
+    },
+    '@/lib/integrations/shopifyCommerceClient': {
+      normalizeShopifyShopDomain(value) { return value },
+      async probeShopifyConnection() {
+        providerCalls.push('probe')
+      },
+      async requestShopifyAccessToken() {
+        providerCalls.push('token')
+      },
+      async shopifyAdminGraphql() {
+        providerCalls.push('order')
+      },
+      ShopifyCommerceClientError: class extends Error {},
+    },
+    '@/lib/integrations/shopifyExternalFulfillmentEvidence': {
+      normalizeShopifyExternalFulfillmentEvidence() {
+        throw new Error('normalization must not run during maintenance')
+      },
+      ShopifyExternalFulfillmentEvidenceError: class extends Error {},
+    },
+    '@/lib/persistence/commerceIntegrations': {
+      async readCommerceRuntimeCredentialFromPostgres() {
+        providerCalls.push('runtime')
+        return {
+          organizationId: '11111111-1111-4111-8111-111111111111',
+          provider: 'shopify',
+          environment: 'sandbox',
+          externalAccountId: 'gid://shopify/Shop/1',
+          status: 'active',
+          verificationStatus: 'verified',
+          configuration: { shopDomain: 'example.myshopify.com' },
+          encrypted: {},
+        }
+      },
+    },
+  },
+)
+
+const runtimeOutage = new IntegrationCredentialRuntimeGateError(
+  'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+)
+runtimeGateFailure = runtimeOutage
+runtimeGateFailureAt = 1
+await assert.rejects(
+  () => reconciliationRuntime.inspectShopifyExternalFulfillment({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    accountGlobalId: 'gia0000001',
+    target: {},
+  }),
+  (error) => error === runtimeOutage,
+)
+assert.deepEqual(providerCalls, [])
+
+runtimeGateChecks = 0
+runtimeGateFailureAt = null
+await assert.rejects(
+  () => reconciliationRuntime.inspectShopifyExternalFulfillment({
+    organizationId: '11111111-1111-4111-8111-111111111111',
+    accountGlobalId: 'gia0000001',
+    target: {},
+  }),
+  (error) => error === runtimeOutage,
+  'credential-gate loss must not be relabeled as stored credential corruption',
+)
+assert.deepEqual(providerCalls, ['runtime'])
 
 const commandStart = persistence.indexOf(
   'export async function reconcileShopifyExternalFulfillmentFromPostgres',

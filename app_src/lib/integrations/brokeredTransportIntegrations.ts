@@ -1,5 +1,9 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   brokeredTransportCredentialCommandRequestHash,
   brokeredTransportCredentialIdentifierLastFour,
   decryptBrokeredTransportCredential,
@@ -376,6 +380,7 @@ export async function updateBrokeredTransportCredential(input: {
   idempotencyKey: unknown
   actorEmail: string
 }) {
+  assertIntegrationCredentialProviderIoReady()
   let provider: BrokeredTransportProvider
   let environment: BrokeredTransportEnvironment
   let credential: BrokeredTransportCredential
@@ -720,6 +725,7 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
   verificationCountryCode?: unknown
   actorEmail: string
 }) {
+  assertIntegrationCredentialProviderIoReady()
   let provider: BrokeredTransportProvider
   let environment: BrokeredTransportEnvironment
   try {
@@ -815,6 +821,7 @@ export async function verifyAndActivateBrokeredTransportRates(input: {
       })
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const failure = verificationFailure(error)
     await recordVerificationFailure({
       organizationId: input.organizationId,
@@ -953,6 +960,7 @@ export async function disconnectBrokeredTransportCredential(input: {
   environment: unknown
   actorEmail: string
 }) {
+  assertIntegrationCredentialProviderIoReady()
   let provider: BrokeredTransportProvider
   let environment: BrokeredTransportEnvironment
   try {
@@ -1021,6 +1029,7 @@ export async function readActiveBrokeredTransportRuntimeCredential(input: {
     | 'ltl_bol'
     | 'ltl_pickup'
 }): Promise<BrokeredTransportRuntimeCredential | null> {
+  assertIntegrationCredentialProviderIoReady()
   const result = await query<ConnectionRow>(
     `${CONNECTION_SELECT}
      WHERE account.organization_id = $1::uuid
@@ -1104,6 +1113,7 @@ export async function readActiveBrokeredTransportRuntimeCredential(input: {
 }
 
 export function sanitizedBrokeredTransportIntegrationError(error: unknown) {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof BrokeredTransportIntegrationError) return error
   return new BrokeredTransportIntegrationError(
     'The transport integration request could not be completed',

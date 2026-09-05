@@ -7,6 +7,9 @@ import {
   executeCarrierWholeShipmentRateRequest,
 } from '@/lib/integrations/carrierWholeShipmentRateClient'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   prepareCarrierWholeShipmentRateRequest,
   type CarrierWholeShipmentFedexPickupType,
   type CarrierWholeShipmentRateProvider,
@@ -196,6 +199,7 @@ export async function executeProductionFulfillmentRerate(
       signal: input.signal,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const failure = safeFailure(error)
     const result = await finalizeProductionFulfillmentRerateAttemptInPostgres({
       organizationId: input.organizationId,

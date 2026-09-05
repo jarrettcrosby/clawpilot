@@ -3,6 +3,10 @@ import { SHOPIFY_ADMIN_API_VERSION } from '@/lib/integrations/commerceCapabiliti
 import {
   normalizeShopifyStoreEntityName,
 } from '@/lib/integrations/shopifyCarrierServiceBranding'
+import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const MAX_QUERY_BYTES = 64 * 1024
 const MAX_VARIABLE_BYTES = 256 * 1024
@@ -432,6 +436,7 @@ export async function requestShopifyAccessToken(
     boundedTimeout(options.timeoutMs),
   )
   try {
+    assertIntegrationCredentialProviderIoReady()
     const response = await (options.fetchImpl || fetch)(
       shopifyAccessTokenEndpoint(shopDomain),
       {
@@ -483,6 +488,7 @@ export async function requestShopifyAccessToken(
       expiresAt: new Date(Date.now() + expiresIn * 1_000).toISOString(),
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyCommerceClientError) throw error
     if (error instanceof Error && error.name === 'AbortError') {
       throw new ShopifyCommerceClientError(
@@ -509,6 +515,7 @@ export async function shopifyAdminGraphql<T>(
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), boundedTimeout(options.timeoutMs))
   try {
+    assertIntegrationCredentialProviderIoReady()
     const response = await (options.fetchImpl || fetch)(shopifyAdminGraphqlEndpoint(shopDomain), {
       method: 'POST',
       headers: {
@@ -536,6 +543,7 @@ export async function shopifyAdminGraphql<T>(
     }
     return payload.data as T
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyCommerceClientError) throw error
     if (error instanceof Error && error.name === 'AbortError') {
       throw new ShopifyCommerceClientError(

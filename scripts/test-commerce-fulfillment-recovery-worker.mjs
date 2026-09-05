@@ -70,8 +70,13 @@ function recoveryClaim(overrides = {}) {
     actorEmail: 'operator@example.com',
     provider: 'faire',
     attempt: 1,
+    automaticRecoveryAttempt: 1,
+    priorAutomaticRecoveryAttempts: 0,
     priorState: 'queued',
+    priorProviderReference: null,
     priorErrorCode: null,
+    priorErrorMessage: null,
+    priorCompletedAt: null,
     ...overrides,
   }
 }
@@ -85,6 +90,7 @@ function codedError(code) {
 const unused = async () => {
   throw new Error('Test must inject this dependency')
 }
+class TestIntegrationCredentialRuntimeGateError extends Error {}
 const worker = loadTypeScriptModule(
   'app_src/lib/commerceFulfillmentRecoveryWorker.ts',
   {
@@ -93,9 +99,16 @@ const worker = loadTypeScriptModule(
         claimCommerceFulfillmentRecoveryInPostgres: unused,
         COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT: 8,
         finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres: unused,
+        parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres:
+          unused,
       },
       '@/lib/persistence/operations': {
         executeOperationsCommerceFulfillmentExportFromPostgres: unused,
+      },
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+        isIntegrationCredentialRuntimeGateError(error) {
+          return error instanceof TestIntegrationCredentialRuntimeGateError
+        },
       },
     },
   },
@@ -112,6 +125,9 @@ test('a queued export executes once with its exact preclaim fence', async () => 
     {
       async finalizeExhausted() {
         return 0
+      },
+      async parkRuntimeMaintenance() {
+        throw new Error('Successful execution must not park the claim')
       },
       async claim() {
         return claims.shift() || null
@@ -170,6 +186,9 @@ test('stale and unresolved claims preserve recovery evidence', async () => {
       async finalizeExhausted() {
         return 0
       },
+      async parkRuntimeMaintenance() {
+        throw new Error('Successful execution must not park the claim')
+      },
       async claim() {
         return claims.shift() || null
       },
@@ -212,6 +231,9 @@ test('claiming is bounded and a concurrent claimant is skipped', async () => {
       async finalizeExhausted() {
         return 0
       },
+      async parkRuntimeMaintenance() {
+        throw new Error('Contention must not park the claim')
+      },
       async claim() {
         return claims.shift() || null
       },
@@ -245,6 +267,9 @@ test('unexpected execution failure stays recoverable and does not stop the batch
       async finalizeExhausted() {
         return 0
       },
+      async parkRuntimeMaintenance() {
+        throw new Error('Unexpected failures must not park the claim')
+      },
       async claim() {
         return claims.shift() || null
       },
@@ -258,6 +283,80 @@ test('unexpected execution failure stays recoverable and does not stop the batch
 
   assert.equal(result.executionErrors, 1)
   assert.equal(result.succeeded, 1)
+})
+
+test('credential runtime maintenance parks without spending recovery budget', async () => {
+  const claim = recoveryClaim({
+    commerceExportGlobalId: 'gfe000000000012',
+    attempt: 7,
+    automaticRecoveryAttempt: 4,
+    priorAutomaticRecoveryAttempts: 3,
+    priorState: 'failed',
+    priorProviderReference: 'prior-provider-reference',
+    priorErrorCode: 'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
+    priorErrorMessage: 'Prior reconciliation evidence',
+    priorCompletedAt: '2026-09-04T12:00:00.000Z',
+  })
+  const maintenanceError = new TestIntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_MAINTENANCE',
+  )
+  const parked = []
+  await assert.rejects(
+    worker.processCommerceFulfillmentRecovery(
+      { limit: 1, workerId: 'recovery-worker-test' },
+      {
+        async finalizeExhausted() {
+          return 0
+        },
+        async claim() {
+          return claim
+        },
+        async parkRuntimeMaintenance(input) {
+          parked.push(input)
+          return true
+        },
+        async execute() {
+          throw maintenanceError
+        },
+      },
+    ),
+    (error) => error === maintenanceError,
+  )
+  assert.equal(parked.length, 1)
+  assert.equal(parked[0].workerId, 'recovery-worker-test')
+  assert.equal(parked[0].claim, claim)
+})
+
+test('credential runtime maintenance preserves the gate error when parking fails', async () => {
+  const claim = recoveryClaim({
+    commerceExportGlobalId: 'gfe000000000013',
+    attempt: 8,
+    automaticRecoveryAttempt: 4,
+    priorAutomaticRecoveryAttempts: 3,
+  })
+  const maintenanceError = new TestIntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_MAINTENANCE',
+  )
+  await assert.rejects(
+    worker.processCommerceFulfillmentRecovery(
+      { limit: 1, workerId: 'recovery-worker-test' },
+      {
+        async finalizeExhausted() {
+          return 0
+        },
+        async claim() {
+          return claim
+        },
+        async parkRuntimeMaintenance() {
+          throw new Error('maintenance parking persistence failed')
+        },
+        async execute() {
+          throw maintenanceError
+        },
+      },
+    ),
+    (error) => error === maintenanceError,
+  )
 })
 
 test('runtime is explicitly opt-in', () => {
@@ -275,6 +374,7 @@ test('runtime is explicitly opt-in', () => {
 
 test('Postgres claim and audited ceiling finalizer are bounded and fenced', async () => {
   const claimCalls = []
+  const parkCalls = []
   const finalizerCalls = []
   const audits = []
   const persistence = loadTypeScriptModule(
@@ -296,14 +396,26 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
                 actor_email: null,
                 provider: 'faire',
                 attempts: 3,
+                automatic_recovery_attempts: 2,
+                prior_automatic_recovery_attempts: 1,
                 prior_state: 'processing',
+                prior_provider_reference: null,
                 prior_error_code: null,
+                prior_error_message: null,
+                prior_completed_at: null,
               }],
             }
           },
           async withTransaction(work) {
             return work({
               async query(sql, values) {
+                if (sql.includes('automatic_recovery_attempts = $5')) {
+                  parkCalls.push({ sql, values })
+                  return {
+                    rowCount: 1,
+                    rows: [{ global_id: 'gfe000000000001' }],
+                  }
+                }
                 finalizerCalls.push({ sql, values })
                 return {
                   rowCount: 2,
@@ -314,6 +426,7 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
                       global_id: 'gfe000000000008',
                       provider: 'faire',
                       attempts: 8,
+                      automatic_recovery_attempts: 8,
                       prior_state: 'processing',
                       prior_error_code: null,
                       original_confirmer: 'operator@example.com',
@@ -324,6 +437,7 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
                       global_id: 'gfe000000000009',
                       provider: 'faire',
                       attempts: 8,
+                      automatic_recovery_attempts: 8,
                       prior_state: 'failed',
                       prior_error_code:
                         'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED',
@@ -343,6 +457,8 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
     workerId: 'recovery-worker-test',
   })
   assert.equal(claim.attempt, 3)
+  assert.equal(claim.automaticRecoveryAttempt, 2)
+  assert.equal(claim.priorAutomaticRecoveryAttempts, 1)
   assert.equal(claim.priorState, 'processing')
   assert.equal(claim.actorEmail, null)
   assert.deepEqual(JSON.parse(JSON.stringify(claimCalls[0].values)), [
@@ -351,9 +467,13 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
     300,
   ])
   const sql = claimCalls[0].sql
-  assert.match(sql, /attempts < \$1/)
+  assert.match(sql, /automatic_recovery_attempts < \$1/)
   assert.match(sql, /FOR UPDATE OF fulfillment_export SKIP LOCKED/)
   assert.match(sql, /attempts = candidate\.attempts/)
+  assert.match(
+    sql,
+    /automatic_recovery_attempts =\s+candidate\.automatic_recovery_attempts/,
+  )
   assert.match(sql, /state = candidate\.prior_state/)
   assert.match(sql, /interval '30 seconds'/)
   assert.match(sql, /interval '1 minute'/)
@@ -363,6 +483,29 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
   assert.doesNotMatch(sql, /shipment\.confirmed_by IS NOT NULL/)
   assert.match(sql, /provider IN \('shopify', 'faire'\)/)
   assert.doesNotMatch(sql, /state = 'unsupported'/)
+
+  const parked = await persistence
+    .parkCommerceFulfillmentRecoveryForRuntimeMaintenanceInPostgres({
+      workerId: 'recovery-worker-test',
+      claim,
+    })
+  assert.equal(parked, true)
+  assert.equal(parkCalls.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(parkCalls[0].values)), [
+    '11111111-1111-4111-8111-111111111111',
+    'gfe000000000001',
+    3,
+    'processing',
+    1,
+    null,
+    null,
+    null,
+    null,
+    2,
+  ])
+  assert.match(parkCalls[0].sql, /attempts = \$3/)
+  assert.match(parkCalls[0].sql, /automatic_recovery_attempts = \$10/)
+  assert.match(parkCalls[0].sql, /automatic_recovery_attempts = \$5/)
 
   const finalized = await persistence
     .finalizeExhaustedCommerceFulfillmentRecoveriesInPostgres({
@@ -378,23 +521,37 @@ test('Postgres claim and audited ceiling finalizer are bounded and fenced', asyn
     'OPERATIONS_COMMERCE_EXPORT_AUTOMATIC_RECOVERY_EXHAUSTED',
   ])
   const finalizerSql = finalizerCalls[0].sql
-  assert.match(finalizerSql, /attempts >= \$1/)
+  assert.match(finalizerSql, /automatic_recovery_attempts >= \$1/)
   assert.match(finalizerSql, /state = 'processing'/)
   assert.match(finalizerSql, /state = 'failed'/)
   assert.match(finalizerSql, /FOR UPDATE OF fulfillment_export SKIP LOCKED/)
   assert.match(finalizerSql, /LIMIT \$4/)
   assert.match(finalizerSql, /error_code = \$5/)
   assert.match(finalizerSql, /attempts = candidate\.attempts/)
+  assert.match(
+    finalizerSql,
+    /automatic_recovery_attempts =\s+candidate\.automatic_recovery_attempts/,
+  )
   assert.match(finalizerSql, /state = candidate\.prior_state/)
-  assert.equal(audits.length, 2)
+  assert.equal(audits.length, 3)
   assert.ok(audits.every((event) => event.actor === 'system'))
   assert.ok(audits.every((event) => event.isSystem === true))
-  assert.ok(audits.every((event) => (
+  const maintenanceAudit = audits.find((event) => (
+    event.eventType
+      === 'operations.commerce_fulfillment.runtime_maintenance_parked'
+  ))
+  assert.equal(maintenanceAudit.payload.automaticAttemptConsumed, false)
+  assert.equal(maintenanceAudit.payload.providerIo, false)
+  const exhaustedAudits = audits.filter((event) => (
+    event.eventType === 'operations.commerce_fulfillment.recovery_exhausted'
+  ))
+  assert.equal(exhaustedAudits.length, 2)
+  assert.ok(exhaustedAudits.every((event) => (
     event.payload.managerRecoveryRequired === true
     && event.payload.providerIo === false
   )))
   assert.match(
-    audits[0].eventKey,
+    exhaustedAudits[0].eventKey,
     /gfe000000000008:automatic-recovery-exhausted:8$/,
   )
 })
@@ -488,6 +645,9 @@ test('poller, proxy, route, and runbook expose the bounded worker', () => {
   const migration = read(
     'db/migrations/0229_operations_commerce_fulfillment_recovery.sql',
   )
+  const recoveryBudgetMigration = read(
+    'db/migrations/0359_operations_commerce_fulfillment_recovery_budget.sql',
+  )
   assert.match(
     migration,
     /operations_commerce_fulfillment_exports_recovery_idx/,
@@ -498,6 +658,18 @@ test('poller, proxy, route, and runbook expose the bounded worker', () => {
   )
   assert.match(migration, /provider IN \('shopify', 'faire'\)/)
   assert.match(migration, /state IN \('processing', 'failed'\)/)
+  assert.match(
+    recoveryBudgetMigration,
+    /automatic_recovery_attempts integer/,
+  )
+  assert.match(
+    recoveryBudgetMigration,
+    /automatic_recovery_attempts <= attempts/,
+  )
+  assert.match(
+    recoveryBudgetMigration,
+    /operations_commerce_fulfillment_exports_recovery_budget_idx/,
+  )
   const poller = read('scripts/pipeline-outbox-poller.mjs')
   assert.match(poller, /COMMERCE_FULFILLMENT_RECOVERY_POLL_MS \|\| 60000/)
   assert.match(
@@ -519,6 +691,10 @@ test('poller, proxy, route, and runbook expose the bounded worker', () => {
   assert.match(route, /commerceFulfillmentRecoveryRuntimeAvailable/)
   assert.match(route, /recordCommerceFulfillmentRecoveryHeartbeatInPostgres/)
   const runbook = read('docs/operations/distributed-operations-runbook.md')
-  assert.match(runbook, /Automatic recovery stops after eight claimed attempts/)
+  assert.match(
+    runbook,
+    /Automatic recovery stops after eight provider-recovery attempts/,
+  )
+  assert.match(runbook, /cannot exhaust recoverable work or create an ABA fence/)
   assert.match(runbook, /Faire reconciliation uses provider GETs only/)
 })

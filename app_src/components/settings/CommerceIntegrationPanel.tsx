@@ -545,7 +545,7 @@ function actionableCommerceError(error: unknown) {
     FAIRE_OAUTH_CALLBACK_INVALID:
       'Faire returned an incomplete authorization response. Start the connection again or contact Faire Developer Support.',
     FAIRE_OAUTH_PUBLIC_HTTPS_REQUIRED:
-      'Use the hosted ClawPilot development environment or an approved public HTTPS tunnel for the live Faire authorization.',
+      'Use the trusted Railway production service or an explicitly approved public HTTPS tunnel for the live Faire authorization.',
     COMMERCE_ENCRYPTION_UNAVAILABLE:
       'Ask a ClawPilot administrator to configure commerce credential encryption for this environment.',
   }

@@ -33,7 +33,7 @@ flowchart TD
   Context --> Distributed[Distributed Operations Design]
   Product --> Modules[Module Contracts]
   Platform --> Data[Postgres, Sheets, SuiteCRM]
-  Operations --> Runtime[Dev and Production]
+  Operations --> Runtime[Local Dev, Transitional Vercel, Railway Production]
   Evolution --> Decisions[Decision Records]
   Evolution --> Releases[Versions and Releases]
   Evolution --> Evidence[Incidents and Git History]

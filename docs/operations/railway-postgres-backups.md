@@ -18,13 +18,19 @@ Railway Postgres is the durable store for ClawPilot-owned state. Use two indepen
 1. Railway volume backups as the primary provider-native restore mechanism.
 2. A logical `pg_dump` export before risky migrations or major production promotions.
 
-Both the `development` and `production` Postgres volume instances must have:
+Every retained Railway Postgres volume instance covered by the active cutover
+must have:
 
 - `DAILY` backups, retained by Railway for 6 days.
 - `WEEKLY` backups, retained by Railway for 1 month.
 - `MONTHLY` backups, retained by Railway for 3 months.
 - At least one completed provider backup no more than 30 hours old.
 - A manual provider backup immediately before destructive or high-risk database work.
+
+During the current transition this policy covers both `development`, which is
+the frozen selective-migration source, and `production`, which is the target.
+After migration postflight, archive verification, and an accepted DEV-retirement
+receipt, a separate reviewed change may narrow the active audit to production.
 
 Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
 
@@ -35,7 +41,16 @@ Current Railway references, checked on 2026-07-18 EDT:
 - [Manage volume backups with the public API](https://docs.railway.com/integrations/api/manage-volumes)
 - [Point-in-time recovery](https://docs.railway.com/volumes/point-in-time-recovery)
 
-## Live Provider Evidence
+## Transitional Development Evidence
+
+The provider evidence below was captured earlier, but the hosted Railway
+`development` environment has not yet completed retirement. It remains a
+frozen migration source, backup target, and billable resource until selective
+migration postflight, archive verification, and the distinct retirement
+acceptance receipt succeed. Do not relabel it historical or remove it from the
+default audit before those gates pass.
+
+## Historical Provider Evidence
 
 The initial read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` returned the following state for project `clawpilot` (`b5169ebd-8166-4b96-9a81-7cc8adaa9270`):
 
@@ -46,7 +61,7 @@ The initial read-only Railway GraphQL audit at `2026-07-14T00:39:54.682Z` return
 
 Both instances were `READY`, mounted at `/var/lib/postgresql/data`, and attached to the shared Railway service definition `Postgres` (`bc62c97a-e87f-43fa-8c87-a7503d5565e9`). The volumes are isolated by environment even though Railway reports the same logical volume and service IDs.
 
-That GraphQL result is the pre-configuration baseline. The authenticated dashboard evidence below supersedes its backup and schedule columns: both environments now have verified provider snapshots, active daily, weekly, and monthly schedules, and point-in-time recovery.
+That GraphQL result is the pre-configuration baseline. The authenticated dashboard evidence below superseded its backup and schedule columns at the time: both then-existing environments had verified provider snapshots, active daily, weekly, and monthly schedules, and point-in-time recovery.
 
 ### CLI Limitation And Dashboard Resolution
 
@@ -58,7 +73,7 @@ The operator-authenticated Railway dashboard was used to complete the policy:
 
 1. `production`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
 2. `development`: **Daily**, **Weekly**, and **Monthly** schedules are checked; the manual backup is listed.
-3. The persisted checkbox state was reopened and verified in both environments on `2026-07-14`; production was rechecked on `2026-07-18` with all three schedules still enabled.
+3. The persisted checkbox state was reopened and verified in both then-existing environments on `2026-07-14`; production was rechecked on `2026-07-18` with all three schedules still enabled.
 4. The read-only API audit remains the repeatable machine gate when an account or workspace API token is available.
 
 ### Point-In-Time Recovery Evidence
@@ -74,7 +89,13 @@ Railway reports that a PITR restore creates a new Postgres service and leaves th
 
 ## Repeatable Audit
 
-`scripts/railway-backup-audit.mjs` is read-only. It queries Railway's public GraphQL API and exits nonzero unless both named environments have `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider backup no more than 30 hours old.
+`scripts/railway-backup-audit.mjs` is read-only. During the transition it
+defaults to both `development` and `production` and exits nonzero unless each
+named environment has `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider
+backup no more than 30 hours old. The explicit `--environment` option is
+available for narrower diagnostics or an isolated restore target, but a
+single-environment invocation does not satisfy the cutover backup gate while
+DEV remains the migration source.
 
 Use an account or workspace API token supplied through the environment. Do not commit or print the token.
 
@@ -130,7 +151,11 @@ Manual Railway volume backups were created and confirmed in the authenticated Ra
 | `production` | `2026-07-14 14:28 UTC` | 227 MB | manual backup |
 | `development` | `2026-07-14 14:30 UTC` | 225 MB | manual backup |
 
-Daily, weekly, and monthly schedules were then enabled and their persisted checked state was verified in both environments. The required Railway volume-backup policy is active.
+Daily, weekly, and monthly schedules were then enabled and their persisted
+checked state was verified in both environments. During the transition the
+current policy continues to audit both; after accepted DEV retirement, the
+production policy remains active and this development evidence becomes
+historical.
 
 ## Restore Drill
 
@@ -143,13 +168,17 @@ For a Railway volume restore:
 5. Run migrations and deployed smoke checks.
 6. Verify task, thread, execution, pipeline projection, and outbox counts before reopening writes.
 
-Railway retains the original volume unmounted after staging the replacement. A restore is limited to the same project and environment, and restoring a snapshot removes newer snapshots. Test the workflow in `development` before relying on it for production.
+Railway retains the original volume unmounted after staging the replacement. A restore is limited to the same project and environment, and restoring a snapshot removes newer snapshots. Rehearse the workflow against a separately provisioned disposable restore target before relying on it for production; never use the active production database as the first restore target.
 
 For a logical restore, provision a separate Postgres database first. Restore into the separate database, validate it, then change `DATABASE_URL` deliberately. Do not overwrite the active production database as the first restore step.
 
 ### Verified Logical Restore Drill
 
-The `2026-07-18` pre-hygiene production dump was restored on `2026-07-18` into a uniquely named temporary database on the development Postgres service. The active development and production databases were not changed. Validation returned:
+The `2026-07-18` pre-hygiene production dump was restored on `2026-07-18` into
+a uniquely named temporary database on the development Postgres service.
+Neither active database was changed. This is proof that the artifact was
+restorable; it does not make the retained development environment a disposable
+restore target during the current migration. Validation returned:
 
 | Check | Result |
 |---|---:|

@@ -1,3 +1,16 @@
+function isIntegrationCredentialRuntimeGateError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+
+  const candidate = error as {
+    name?: unknown
+    code?: unknown
+  }
+
+  return candidate.name === 'IntegrationCredentialRuntimeGateError'
+    && typeof candidate.code === 'string'
+    && candidate.code.startsWith('INTEGRATION_CREDENTIAL_RUNTIME_')
+}
+
 export type CheckoutRateCarrierProvider = 'ups_rest' | 'fedex_rest'
 
 export type CheckoutRateParcel = {
@@ -610,6 +623,7 @@ export async function rateCheckoutShipment(input: {
         settledByAccount.set(selection.carrierAccountGlobalId, outcome)
         return outcome
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         const outcome = {
           attempt: {
             provider: selection.provider,
@@ -991,6 +1005,13 @@ export async function rateOptimizedCheckoutPlans(input: {
           }),
         }),
       ))
+      const runtimeMaintenance = settled.find((outcome) => (
+        outcome.status === 'rejected'
+        && isIntegrationCredentialRuntimeGateError(outcome.reason)
+      ))
+      if (runtimeMaintenance?.status === 'rejected') {
+        throw runtimeMaintenance.reason
+      }
       settled.forEach((outcome, index) => {
         const candidate = alternatives[index]
         if (outcome.status === 'rejected') {

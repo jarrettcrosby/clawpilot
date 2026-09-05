@@ -121,7 +121,7 @@ type CarrierPayload = {
   canReconcile?: boolean
   canRevealCredentials?: boolean
   productionLabelAuthorizationAllowed?: boolean
-  productionLabelRuntimeLane?: 'production' | 'railway_development' | null
+  productionLabelRuntimeLane?: 'production' | null
   integrations?: CarrierIntegrationsState
   rateTest?: CarrierShippingDiagnosticRateTest
   rateTestLabel?: CarrierRateTestLabel
@@ -524,9 +524,6 @@ export default function CarrierIntegrationPanel({
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [productionLabelAuthorizationAllowed, setProductionLabelAuthorizationAllowed] =
     useState(false)
-  const [productionLabelRuntimeLane, setProductionLabelRuntimeLane] = useState<
-    'production' | 'railway_development' | null
-  >(null)
   const [revealedCredential, setRevealedCredential] = useState<RevealedCarrierCredential | null>(null)
   const [livePostageReason, setLivePostageReason] = useState('')
   const [livePostageConfirmation, setLivePostageConfirmation] = useState('')
@@ -761,7 +758,7 @@ export default function CarrierIntegrationPanel({
   const productionCreateBlocker = environment !== 'production'
     ? ''
     : !productionLabelAuthorizationAllowed
-      ? 'LIVE label buying is available only in the trusted ClawPilot Railway development or production runtime.'
+      ? 'LIVE label buying is available only in the trusted ClawPilot Railway production runtime.'
       : !canPurchaseLivePostage
         ? 'Live-postage permission is required to buy REAL POSTAGE.'
       : !livePostageAuthorized
@@ -784,7 +781,6 @@ export default function CarrierIntegrationPanel({
         setProductionLabelAuthorizationAllowed(
           result.productionLabelAuthorizationAllowed === true,
         )
-        setProductionLabelRuntimeLane(result.productionLabelRuntimeLane || null)
         setCanExecute(result.canExecute === true)
         setCanPurchaseLivePostage(result.canPurchaseLivePostage === true)
         setCanReconcile(result.canReconcile === true)
@@ -1596,12 +1592,8 @@ export default function CarrierIntegrationPanel({
               variant="outlined"
               label={productionLabelAuthorizationAllowed
                 ? livePostageAuthorized
-                  ? productionLabelRuntimeLane === 'railway_development'
-                    ? 'Railway dev live postage authorized'
-                    : 'Live postage authorized'
-                  : productionLabelRuntimeLane === 'railway_development'
-                    ? 'Railway dev live postage off'
-                    : 'Live postage off'
+                  ? 'Live postage authorized'
+                  : 'Live postage off'
                 : 'Live postage unavailable in this runtime'}
             />
           </Stack>
@@ -1612,21 +1604,12 @@ export default function CarrierIntegrationPanel({
           </Typography>
           {!productionLabelAuthorizationAllowed ? (
             <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.5 }}>
-              Production labels can be authorized only in production or the trusted Railway development
-              service. Vercel previews and local/browser-only runtimes remain blocked.
+              Production labels can be authorized only in the trusted Railway production service.
+              Vercel previews and local, remote-local, or browser-only runtimes remain blocked.
               {livePostageAuthorized
                 ? ' A stored authorization is ignored here and can only be revoked below.'
                 : ''}
             </Typography>
-          ) : null}
-          {productionLabelRuntimeLane === 'railway_development' ? (
-            <Alert severity="warning" sx={{ mt: 1, borderRadius: '8px' }}>
-              <Typography variant="caption">
-                Railway development uses the selected production UPS or FedEx connection. A successful
-                whole-shipment purchase creates real production postage and may incur charges. Use only an
-                approved packed test order, then void the complete group through ClawPilot.
-              </Typography>
-            </Alert>
           ) : null}
           {canRevealCredentials
           && (productionLabelAuthorizationAllowed || livePostageAuthorized) ? (

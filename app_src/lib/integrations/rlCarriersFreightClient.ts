@@ -3,6 +3,10 @@ import {
   type RlCarriersCredential,
 } from '@/lib/integrations/brokeredTransportCredentialCrypto'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   RL_CARRIERS_FREIGHT_ENDPOINTS,
   parseRlCarriersBillOfLadingResponse,
   parseRlCarriersQuotedPickupResponse,
@@ -327,6 +331,7 @@ async function execute<
   const requestedAt = new Date().toISOString()
   let response: Response
   try {
+    assertIntegrationCredentialProviderIoReady()
     response = await (options.fetchImpl || fetch)(prepared.endpoint, {
       method: prepared.method,
       headers: {
@@ -342,6 +347,7 @@ async function execute<
   } catch (error) {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', abortFromExternal)
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof RlCarriersFreightClientError) throw error
     const timedOut = controller.signal.aborted && !externalAbort
     throw failure(
@@ -480,6 +486,7 @@ export async function verifyRlCarriersRuntimeCredential(options: {
     endpoint.searchParams.set('CountryCode', options.countryCode)
     let response: Response
     try {
+      assertIntegrationCredentialProviderIoReady()
       response = await (options.fetchImpl || fetch)(endpoint, {
         method: 'GET',
         headers: {
@@ -490,7 +497,8 @@ export async function verifyRlCarriersRuntimeCredential(options: {
         redirect: 'error',
         signal: controller.signal,
       })
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const timedOut = controller.signal.aborted && !externalAbort
       throw failure(
         operation,

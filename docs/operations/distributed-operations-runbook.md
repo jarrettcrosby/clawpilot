@@ -13,6 +13,16 @@ app_visible: false
 
 ## Status And Scope
 
+Hosted Railway development is operationally frozen and retained only as the
+selective-migration source; infrastructure retirement is not yet accepted.
+References below to its provider exercises are preserved procedures, not an
+active test lane. Current pre-production proof uses local fixtures or disposable
+PostgreSQL, while the retained source remains covered by the backup gate. The
+Vercel application project is also transitional, not yet an accepted
+protected-preview surface, until its legacy
+production-scoped variables and domain authority pass the gated retirement in
+[ClawPilot Environments and Deployment](clawpilot-environments.md).
+
 This runbook governs the target distributed order, inventory, warehouse, carrier, printing, shipment, and 3PL billing module. The development environment has a Postgres-backed order workbench, explicit single-warehouse fulfillment-plan acceptance, warehouse-release, bulk all-ready pick-confirmation, pack-verification, sandbox-label-create, and sandbox-label-void commands for eligible non-archived orders, a shared product/default-package import workflow, an audited exception queue, organization-scoped activation, direct carrier credential administration, UPS and FedEx sandbox rating and label execution against a fixed synthetic fixture, an authenticated idempotent Shadow-to-Active execution-preparation command, an Active-only read-only UPS/FedEx production whole-shipment rerate command, a separate manual local one-service whole-shipment selection command, a persistence-only Active dispatch-attempt boundary with one durable owner plus failed/unknown finalization, append-only redacted provider evidence, durable print delivery, a working-tree packing-slip/artifact and shipment-completion evidence contract, horizontally scrollable mobile Operations subpanel navigation, command-receipt health, and disposable PostgreSQL acceptance. Deterministic mock flows are automated-test evidence only and cannot be launched from the hosted workbench. Active preparation and local selection perform no provider I/O; production rerating is read-only; Active dispatch persistence has no command/public route and performs no provider call; none creates production carrier labels, tracking, shipments, inventory consumption, final packing slips, or commerce writes. This runbook remains `draft` until the module has a hosted production shipment-confirmation command, complete reconciliation and adapter health, tested production mutation adapters, integration/warehouse activation subscopes, and on-call ownership. Current general environment, backup, promotion, and restore procedures remain authoritative:
 
 - [ClawPilot Environments and Deployment](clawpilot-environments.md)
@@ -257,10 +267,10 @@ This procedure does not apply to AG's EPISCS-managed rating-only profile. It app
 ### Commerce Fulfillment Export Recovery
 
 1. Scheduled recovery is fail-closed unless `CLAWPILOT_COMMERCE_FULFILLMENT_RECOVERY_ENABLED=1`. The existing poller calls `/api/integrations/commerce/fulfillment/process` with the worker bearer secret at `COMMERCE_FULFILLMENT_RECOVERY_POLL_MS` (60 seconds by default). Each invocation claims at most five rows and the poller requests one.
-2. A claim is fenced by the exact export attempt count and uses `updated_at` as a five-minute crash lease. New queued exports receive a 30-second grace period. Unknown-outcome reconciliation backs off at 30 seconds, 1 minute, 2 minutes, 5 minutes, then 15 minutes.
+2. A claim is fenced by the exact monotonic export attempt count and uses `updated_at` as a five-minute crash lease. The independent `automatic_recovery_attempts` counter tracks the bounded provider-recovery budget. New queued exports receive a 30-second grace period. Unknown-outcome reconciliation backs off at 30 seconds, 1 minute, 2 minutes, 5 minutes, then 15 minutes based on that recovery budget.
 3. A queued export may execute the existing authorized Shopify or Faire adapter. If a worker crashes after claiming but before registering a durable provider attempt, an exact current-protocol export may safely resume execution: the missing provider attempt proves no provider I/O began. Once any durable provider attempt exists, recovery remains read-only; Faire reconciliation uses provider GETs only and never repeats the one-shot shipment write.
-4. Automatic recovery stops after eight claimed attempts. A stale or unresolved capped row is retained as `failed` with `OPERATIONS_COMMERCE_EXPORT_AUTOMATIC_RECOVERY_EXHAUSTED` for operator reconciliation. Unsupported providers and authorization, credential, scope, configuration, signature, identity, partial-match, and other permanent failures are not selected for blind retry.
-5. Inspect the `commerce.fulfillment_recovery.worker.heartbeat` application setting plus queued, stale-processing, reconciliation-due, ceiling-reached, manual-review, and missing-original-confirmer counts returned by the worker route. A deleted confirmer does not strand recovery: the provider attempt records nullable original actor provenance and the automatic transition is audited as `system`. Do not clear rows or provider attempts. Correct the cause, reconcile provider state, and use the existing operator retry command with the original export identity when manual recovery is justified.
+4. Automatic recovery stops after eight provider-recovery attempts. A runtime credential-maintenance response parks the exact claim: it restores the prior business state and evidence, restores the independent recovery budget, leaves the monotonic claim fence advanced, records a zero-provider-I/O system audit, and returns maintenance to the poller. Maintenance therefore cannot exhaust recoverable work or create an ABA fence. A stale or unresolved genuinely capped row is retained as `failed` with `OPERATIONS_COMMERCE_EXPORT_AUTOMATIC_RECOVERY_EXHAUSTED` for operator reconciliation. Unsupported providers and authorization, credential, scope, configuration, signature, identity, partial-match, and other permanent failures are not selected for blind retry.
+5. Inspect the `commerce.fulfillment_recovery.worker.heartbeat` application setting plus queued, stale-processing, reconciliation-due, ceiling-reached, manual-review, and missing-original-confirmer counts returned by the worker route. Ceiling counts use the independent automatic-recovery budget, not the monotonic fence. A deleted confirmer does not strand recovery: the provider attempt records nullable original actor provenance and the automatic transition is audited as `system`. Do not clear rows or provider attempts. Correct the cause, reconcile provider state, and use the existing operator retry command with the original export identity when manual recovery is justified.
 
 ## Shopify And Faire Commerce Intake
 
@@ -609,7 +619,15 @@ ORDER BY filename;
 
 ### Production Promotion
 
-Use a reviewed `dev` to `main` pull request. Repeat backups, migration checks, hosted health, protected Vercel build status, one authenticated workflow, and cohort reconciliation. Do not copy development operational data or credentials into production.
+Use a reviewed `dev` to `main` pull request. Validate local/disposable evidence,
+then verify the exact Railway production commit, backups, migrations, health,
+persistence, workers, authenticated workflow, and cohort reconciliation. Only
+after that evidence is reviewed, remove the legacy production-scoped variables
+and domain authority from the Vercel application project, re-audit it, and use
+an optional protected preview from the same commit as independent build/UI
+evidence. Do not copy legacy development operational data or credentials into
+production. Follow the ordered release and retirement gates in
+[ClawPilot Environments and Deployment](clawpilot-environments.md).
 
 ## Read-Only Diagnostic Queries
 

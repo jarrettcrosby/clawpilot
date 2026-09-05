@@ -4,6 +4,10 @@ import { isHostedRuntime } from '@/lib/persistence/config'
 import {
   resolveCommerceOrderRevisionEvidenceKeyConfig,
 } from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+import {
+  integrationCredentialRuntimeEncryptionKey,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export type CommerceProvider = 'shopify' | 'faire'
 export type CommerceEnvironment = 'sandbox' | 'production'
@@ -251,20 +255,13 @@ export function normalizeCommerceCredential(
   }
 }
 
-function encryptionKey() {
-  const dedicated = String(
-    process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY
-    || process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
-    || '',
-  )
-  if (isHostedRuntime() && dedicated.length < 32) {
-    throw new Error('Commerce credential encryption is not configured')
+function withEncryptionKey<T>(operation: (key: Buffer) => T): T {
+  const key = integrationCredentialRuntimeEncryptionKey()
+  try {
+    return operation(key)
+  } finally {
+    key.fill(0)
   }
-  const secret = dedicated || String(process.env.APP_SESSION_SECRET || '')
-  if (secret.length < 32) {
-    throw new Error('Commerce credential encryption is not configured')
-  }
-  return crypto.createHash('sha256').update(secret).digest()
 }
 
 const REVISION_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
@@ -334,17 +331,19 @@ export function commerceCustomerEvidenceFingerprint(input: {
   ) {
     throw new Error('Commerce customer evidence is invalid')
   }
-  return crypto
-    .createHmac('sha256', encryptionKey())
-    .update('clawpilot:commerce:customer-evidence:v1\0', 'utf8')
-    .update(organizationId, 'utf8')
-    .update('\0', 'utf8')
-    .update(accountGlobalId, 'utf8')
-    .update('\0', 'utf8')
-    .update(input.kind, 'utf8')
-    .update('\0', 'utf8')
-    .update(value, 'utf8')
-    .digest('hex')
+  return withEncryptionKey((key) => (
+    crypto
+      .createHmac('sha256', key)
+      .update('clawpilot:commerce:customer-evidence:v1\0', 'utf8')
+      .update(organizationId, 'utf8')
+      .update('\0', 'utf8')
+      .update(accountGlobalId, 'utf8')
+      .update('\0', 'utf8')
+      .update(input.kind, 'utf8')
+      .update('\0', 'utf8')
+      .update(value, 'utf8')
+      .digest('hex')
+  ))
 }
 
 /**
@@ -382,10 +381,12 @@ export function shopifyCheckoutDestinationFingerprint(input: {
       + 'and postal code',
     )
   }
-  return crypto
-    .createHmac('sha256', encryptionKey())
-    .update(JSON.stringify(canonical), 'utf8')
-    .digest('hex')
+  return withEncryptionKey((key) => (
+    crypto
+      .createHmac('sha256', key)
+      .update(JSON.stringify(canonical), 'utf8')
+      .digest('hex')
+  ))
 }
 
 /**
@@ -413,21 +414,23 @@ export function shopifyCarrierServiceCallbackToken(input: {
   const callbackTokenVersion = normalizeCommerceCredentialGeneration(
     input.callbackTokenVersion,
   )
-  return crypto
-    .createHmac('sha256', encryptionKey())
-    .update(
-      [
-        'clawpilot',
-        'shopify',
-        'carrier-service-callback',
-        'v1',
-        organizationId,
-        accountGlobalId,
-        credentialGeneration,
-        callbackTokenVersion,
-      ].join(':'),
-    )
-    .digest('base64url')
+  return withEncryptionKey((key) => (
+    crypto
+      .createHmac('sha256', key)
+      .update(
+        [
+          'clawpilot',
+          'shopify',
+          'carrier-service-callback',
+          'v1',
+          organizationId,
+          accountGlobalId,
+          credentialGeneration,
+          callbackTokenVersion,
+        ].join(':'),
+      )
+      .digest('base64url')
+  ))
 }
 
 export function shopifyCarrierServiceCallbackTokenMatches(
@@ -578,18 +581,20 @@ export function commerceCandidateSnapshotContentFingerprint(
   if (Buffer.byteLength(payload, 'utf8') < 2 || Buffer.byteLength(payload, 'utf8') > 65_536) {
     throw new Error('Commerce candidate snapshot must be 2-65536 bytes')
   }
-  return crypto.createHmac('sha256', encryptionKey())
-    .update('clawpilot:commerce:candidate-snapshot-content:v1\0', 'utf8')
-    .update(organizationId, 'utf8')
-    .update('\0', 'utf8')
-    .update(accountGlobalId, 'utf8')
-    .update('\0', 'utf8')
-    .update(externalOrderId, 'utf8')
-    .update('\0', 'utf8')
-    .update(kindValue, 'utf8')
-    .update('\0', 'utf8')
-    .update(payload, 'utf8')
-    .digest('hex')
+  return withEncryptionKey((key) => (
+    crypto.createHmac('sha256', key)
+      .update('clawpilot:commerce:candidate-snapshot-content:v1\0', 'utf8')
+      .update(organizationId, 'utf8')
+      .update('\0', 'utf8')
+      .update(accountGlobalId, 'utf8')
+      .update('\0', 'utf8')
+      .update(externalOrderId, 'utf8')
+      .update('\0', 'utf8')
+      .update(kindValue, 'utf8')
+      .update('\0', 'utf8')
+      .update(payload, 'utf8')
+      .digest('hex')
+  ))
 }
 
 /**
@@ -846,18 +851,20 @@ export function encryptCommerceCredential(
 ): EncryptedCommerceValue {
   const credential = normalizeCommerceCredential(credentialValue)
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(credentialAuthenticatedData(
-    organizationId,
-    credential.provider,
-    environmentValue,
-    externalAccountId,
-  ))
-  const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(credential), 'utf8'),
-    cipher.final(),
-  ])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(credentialAuthenticatedData(
+      organizationId,
+      credential.provider,
+      environmentValue,
+      externalAccountId,
+    ))
+    const ciphertext = Buffer.concat([
+      cipher.update(JSON.stringify(credential), 'utf8'),
+      cipher.final(),
+    ])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptCommerceCredential(
@@ -869,28 +876,31 @@ export function decryptCommerceCredential(
 ): CommerceCredentialPayload {
   try {
     const provider = normalizeCommerceProvider(providerValue)
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      encryptionKey(),
-      fields.iv,
-    )
-    decipher.setAAD(credentialAuthenticatedData(
-      organizationId,
-      provider,
-      environmentValue,
-      externalAccountId,
-    ))
-    decipher.setAuthTag(fields.tag)
-    const raw = Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ]).toString('utf8')
-    const credential = normalizeCommerceCredential(
-      JSON.parse(raw) as CommerceCredentialPayload,
-    )
-    if (credential.provider !== provider) throw new Error('provider mismatch')
-    return credential
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(credentialAuthenticatedData(
+        organizationId,
+        provider,
+        environmentValue,
+        externalAccountId,
+      ))
+      decipher.setAuthTag(fields.tag)
+      const raw = Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ]).toString('utf8')
+      const credential = normalizeCommerceCredential(
+        JSON.parse(raw) as CommerceCredentialPayload,
+      )
+      if (credential.provider !== provider) throw new Error('provider mismatch')
+      return credential
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce credential could not be decrypted')
   }
 }
@@ -903,17 +913,19 @@ export function encryptFaireOAuthPendingCredential(
 ): EncryptedCommerceValue {
   const credential = normalizeFaireOAuthPendingCredential(credentialValue)
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(oauthInstallationAuthenticatedData(
-    organizationId,
-    browserSessionId,
-    stateHash,
-  ))
-  const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(credential), 'utf8'),
-    cipher.final(),
-  ])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(oauthInstallationAuthenticatedData(
+      organizationId,
+      browserSessionId,
+      stateHash,
+    ))
+    const ciphertext = Buffer.concat([
+      cipher.update(JSON.stringify(credential), 'utf8'),
+      cipher.final(),
+    ])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptFaireOAuthPendingCredential(
@@ -923,25 +935,28 @@ export function decryptFaireOAuthPendingCredential(
   stateHash: unknown,
 ): FaireOAuthPendingCredential {
   try {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      encryptionKey(),
-      fields.iv,
-    )
-    decipher.setAAD(oauthInstallationAuthenticatedData(
-      organizationId,
-      browserSessionId,
-      stateHash,
-    ))
-    decipher.setAuthTag(fields.tag)
-    const raw = Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ]).toString('utf8')
-    return normalizeFaireOAuthPendingCredential(
-      JSON.parse(raw) as FaireOAuthPendingCredential,
-    )
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(oauthInstallationAuthenticatedData(
+        organizationId,
+        browserSessionId,
+        stateHash,
+      ))
+      decipher.setAuthTag(fields.tag)
+      const raw = Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ]).toString('utf8')
+      return normalizeFaireOAuthPendingCredential(
+        JSON.parse(raw) as FaireOAuthPendingCredential,
+      )
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored Faire OAuth installation could not be decrypted')
   }
 }
@@ -956,14 +971,16 @@ export function encryptCommerceWebhookPayload(
     throw new Error('Shopify webhook payload must be 2-524288 bytes')
   }
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(webhookAuthenticatedData(
-    accountGlobalId,
-    providerEventId,
-    topic,
-  ))
-  const ciphertext = Buffer.concat([cipher.update(rawPayload), cipher.final()])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(webhookAuthenticatedData(
+      accountGlobalId,
+      providerEventId,
+      topic,
+    ))
+    const ciphertext = Buffer.concat([cipher.update(rawPayload), cipher.final()])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptCommerceWebhookPayload(
@@ -973,22 +990,25 @@ export function decryptCommerceWebhookPayload(
   topic: unknown,
 ) {
   try {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      encryptionKey(),
-      fields.iv,
-    )
-    decipher.setAAD(webhookAuthenticatedData(
-      accountGlobalId,
-      providerEventId,
-      topic,
-    ))
-    decipher.setAuthTag(fields.tag)
-    return Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ])
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(webhookAuthenticatedData(
+        accountGlobalId,
+        providerEventId,
+        topic,
+      ))
+      decipher.setAuthTag(fields.tag)
+      return Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ])
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce webhook payload could not be decrypted')
   }
 }
@@ -1006,28 +1026,29 @@ export function encryptCommerceCandidateSnapshot(
     throw new Error('Commerce candidate snapshot must be 2-65536 bytes')
   }
   const iv = crypto.randomBytes(12)
-  const key = encryptionKey()
-  const authenticatedData = candidateSnapshotAuthenticatedData(
-    organizationId,
-    accountGlobalId,
-    externalOrderId,
-    sourceHash,
-    kind,
-  )
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
-  cipher.setAAD(authenticatedData)
-  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
-  return {
-    ciphertext,
-    iv,
-    tag: cipher.getAuthTag(),
-    hash: crypto.createHmac('sha256', key)
-      .update('clawpilot:commerce:candidate-snapshot-digest:v1\0', 'utf8')
-      .update(authenticatedData)
-      .update(payload)
-      .digest('hex'),
-    encryptionVersion: 1,
-  }
+  return withEncryptionKey((key) => {
+    const authenticatedData = candidateSnapshotAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      externalOrderId,
+      sourceHash,
+      kind,
+    )
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(authenticatedData)
+    const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+    return {
+      ciphertext,
+      iv,
+      tag: cipher.getAuthTag(),
+      hash: crypto.createHmac('sha256', key)
+        .update('clawpilot:commerce:candidate-snapshot-digest:v1\0', 'utf8')
+        .update(authenticatedData)
+        .update(payload)
+        .digest('hex'),
+      encryptionVersion: 1,
+    }
+  })
 }
 
 export function decryptCommerceCandidateSnapshot(
@@ -1039,28 +1060,31 @@ export function decryptCommerceCandidateSnapshot(
   kind: 'party' | 'ship_to',
 ): Record<string, unknown> {
   try {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      encryptionKey(),
-      fields.iv,
-    )
-    decipher.setAAD(candidateSnapshotAuthenticatedData(
-      organizationId,
-      accountGlobalId,
-      externalOrderId,
-      sourceHash,
-      kind,
-    ))
-    decipher.setAuthTag(fields.tag)
-    const value = JSON.parse(Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ]).toString('utf8'))
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error('invalid snapshot')
-    }
-    return value as Record<string, unknown>
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(candidateSnapshotAuthenticatedData(
+        organizationId,
+        accountGlobalId,
+        externalOrderId,
+        sourceHash,
+        kind,
+      ))
+      decipher.setAuthTag(fields.tag)
+      const value = JSON.parse(Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ]).toString('utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('invalid snapshot')
+      }
+      return value as Record<string, unknown>
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce candidate snapshot could not be decrypted')
   }
 }
@@ -1144,7 +1168,8 @@ export function decryptCommerceOrderRevisionProtectedSnapshot(
       throw new Error('invalid snapshot')
     }
     return value as Record<string, unknown>
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce order revision snapshot could not be decrypted')
   }
 }
@@ -1200,30 +1225,31 @@ export function encryptCommerceIntakeReadResult(
     )
   }
   const iv = crypto.randomBytes(12)
-  const key = encryptionKey()
-  const authenticatedData = intakeReadResultAuthenticatedData(
-    organizationId,
-    accountGlobalId,
-    provider,
-    intentId,
-    providerAttemptId,
-    requestHash,
-  )
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
-  cipher.setAAD(authenticatedData)
-  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
-  return {
-    ciphertext,
-    iv,
-    tag: cipher.getAuthTag(),
-    hash: crypto.createHmac('sha256', key)
-      .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
-      .update(authenticatedData)
-      .update(payload)
-      .digest('hex'),
-    bytes: payload.byteLength,
-    encryptionVersion: 1,
-  }
+  return withEncryptionKey((key) => {
+    const authenticatedData = intakeReadResultAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      provider,
+      intentId,
+      providerAttemptId,
+      requestHash,
+    )
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(authenticatedData)
+    const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+    return {
+      ciphertext,
+      iv,
+      tag: cipher.getAuthTag(),
+      hash: crypto.createHmac('sha256', key)
+        .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
+        .update(authenticatedData)
+        .update(payload)
+        .digest('hex'),
+      bytes: payload.byteLength,
+      encryptionVersion: 1,
+    }
+  })
 }
 
 export function decryptCommerceIntakeReadResult(
@@ -1237,47 +1263,49 @@ export function decryptCommerceIntakeReadResult(
   expectedHash?: unknown,
 ): CommerceIntakeReadResultPayload {
   try {
-    const key = encryptionKey()
-    const authenticatedData = intakeReadResultAuthenticatedData(
-      organizationId,
-      accountGlobalId,
-      provider,
-      intentId,
-      providerAttemptId,
-      requestHash,
-    )
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      key,
-      fields.iv,
-    )
-    decipher.setAAD(authenticatedData)
-    decipher.setAuthTag(fields.tag)
-    const payload = Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ])
-    if (expectedHash !== undefined) {
-      const normalizedExpectedHash = String(expectedHash || '')
-        .trim()
-        .toLowerCase()
-      const computedHash = crypto.createHmac('sha256', key)
-        .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
-        .update(authenticatedData)
-        .update(payload)
-        .digest('hex')
-      if (
-        !/^[a-f0-9]{64}$/.test(normalizedExpectedHash)
-        || !crypto.timingSafeEqual(
-          Buffer.from(computedHash, 'hex'),
-          Buffer.from(normalizedExpectedHash, 'hex'),
-        )
-      ) {
-        throw new Error('read result digest mismatch')
+    return withEncryptionKey((key) => {
+      const authenticatedData = intakeReadResultAuthenticatedData(
+        organizationId,
+        accountGlobalId,
+        provider,
+        intentId,
+        providerAttemptId,
+        requestHash,
+      )
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(authenticatedData)
+      decipher.setAuthTag(fields.tag)
+      const payload = Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ])
+      if (expectedHash !== undefined) {
+        const normalizedExpectedHash = String(expectedHash || '')
+          .trim()
+          .toLowerCase()
+        const computedHash = crypto.createHmac('sha256', key)
+          .update('clawpilot:commerce:intake-read-result-digest:v1\0', 'utf8')
+          .update(authenticatedData)
+          .update(payload)
+          .digest('hex')
+        if (
+          !/^[a-f0-9]{64}$/.test(normalizedExpectedHash)
+          || !crypto.timingSafeEqual(
+            Buffer.from(computedHash, 'hex'),
+            Buffer.from(normalizedExpectedHash, 'hex'),
+          )
+        ) {
+          throw new Error('read result digest mismatch')
+        }
       }
-    }
-    return decodeCommerceIntakeReadResult(payload)
-  } catch {
+      return decodeCommerceIntakeReadResult(payload)
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error(
       'Stored commerce intake read result could not be decrypted',
     )
@@ -1299,23 +1327,25 @@ export function encryptCommerceIntakeContinuation(
     throw new Error('Commerce intake continuation must be 2-8192 bytes')
   }
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(intakeContinuationAuthenticatedData(
-    organizationId,
-    accountGlobalId,
-    provider,
-    sessionId,
-    batchNumber,
-    queryHash,
-  ))
-  const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
-  return {
-    ciphertext,
-    iv,
-    tag: cipher.getAuthTag(),
-    hash: crypto.createHash('sha256').update(payload).digest('hex'),
-    encryptionVersion: 1,
-  }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(intakeContinuationAuthenticatedData(
+      organizationId,
+      accountGlobalId,
+      provider,
+      sessionId,
+      batchNumber,
+      queryHash,
+    ))
+    const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
+    return {
+      ciphertext,
+      iv,
+      tag: cipher.getAuthTag(),
+      hash: crypto.createHash('sha256').update(payload).digest('hex'),
+      encryptionVersion: 1,
+    }
+  })
 }
 
 export function decryptCommerceIntakeContinuation(
@@ -1328,26 +1358,29 @@ export function decryptCommerceIntakeContinuation(
   queryHash: unknown,
 ): CommerceIntakeContinuationPayload {
   try {
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      encryptionKey(),
-      fields.iv,
-    )
-    decipher.setAAD(intakeContinuationAuthenticatedData(
-      organizationId,
-      accountGlobalId,
-      provider,
-      sessionId,
-      batchNumber,
-      queryHash,
-    ))
-    decipher.setAuthTag(fields.tag)
-    const value = JSON.parse(Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ]).toString('utf8')) as CommerceIntakeContinuationPayload
-    return normalizeCommerceIntakeContinuation(value)
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv(
+        'aes-256-gcm',
+        key,
+        fields.iv,
+      )
+      decipher.setAAD(intakeContinuationAuthenticatedData(
+        organizationId,
+        accountGlobalId,
+        provider,
+        sessionId,
+        batchNumber,
+        queryHash,
+      ))
+      decipher.setAuthTag(fields.tag)
+      const value = JSON.parse(Buffer.concat([
+        decipher.update(fields.ciphertext),
+        decipher.final(),
+      ]).toString('utf8')) as CommerceIntakeContinuationPayload
+      return normalizeCommerceIntakeContinuation(value)
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce intake continuation could not be decrypted')
   }
 }
@@ -1457,7 +1490,8 @@ export function decryptCommerceOrderSyncCursor(
     return normalizeCommerceIntakeContinuation(
       JSON.parse(payload.toString('utf8')) as CommerceIntakeContinuationPayload,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored commerce order sync cursor could not be decrypted')
   }
 }

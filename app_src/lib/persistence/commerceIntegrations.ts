@@ -7,7 +7,10 @@ import {
   SHOPIFY_INVENTORY_REFRESH_WEBHOOK_TOPICS,
   SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
-import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import {
+  commerceReadAccountSql,
+  type CommerceReadCapability,
+} from '@/lib/integrations/commerceReadRuntime'
 import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   faireFulfillmentWriteReadiness,
@@ -20,6 +23,9 @@ import {
   type CommerceProvider,
   type EncryptedCommerceValue,
 } from '@/lib/integrations/commerceCredentialCrypto'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import {
   shopifyDeletedProductEvidence,
   type ShopifyDeletedProductEvidence,
@@ -105,6 +111,7 @@ type CommerceConnectionRow = {
   order_history_mode: CommerceOrderHistoryMode | null
   order_history_ingestion_floor: TimestampValue | null
   order_history_frozen_at: TimestampValue | null
+  hosted_production_sandbox_read_capabilities: CommerceReadCapability[] | null
   updated_at: TimestampValue
 }
 
@@ -179,6 +186,7 @@ export type CommerceIntegrationAccountState = {
   authMode: CommerceAuthMode | null
   credentialIdentifierLastFour: string | null
   verificationStatus: 'unverified' | 'verified' | 'failed'
+  hostedProductionSandboxReadCapabilities: CommerceReadCapability[]
   verifiedAt: string | null
   lastErrorCode: string | null
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
@@ -229,6 +237,7 @@ export type CommerceRuntimeCredentialRecord = {
   externalAccountId: string
   status: 'active' | 'disabled' | 'error'
   verificationStatus: 'unverified' | 'verified' | 'failed'
+  hostedProductionSandboxReadCapabilities: CommerceReadCapability[]
   credentialVersion: number
   authMode: CommerceAuthMode
   configuration: Record<string, unknown>
@@ -285,6 +294,22 @@ const CONNECTION_SELECT = `SELECT
     history.history_mode AS order_history_mode,
     history.ingestion_floor AS order_history_ingestion_floor,
     history.frozen_at AS order_history_frozen_at,
+    ARRAY(
+      SELECT capability
+      FROM unnest(ARRAY[
+        'catalog',
+        'images',
+        'inventory',
+        'orders_history',
+        'webhook_hydration'
+      ]::text[]) capability
+      WHERE operations_commerce_hosted_production_sandbox_read_is_current(
+        account.organization_id,
+        account.id,
+        capability
+      )
+      ORDER BY capability
+    ) AS hosted_production_sandbox_read_capabilities,
     GREATEST(
       account.updated_at,
       COALESCE(credential.updated_at, account.updated_at)
@@ -350,6 +375,8 @@ function accountState(
     authMode: row.auth_mode,
     credentialIdentifierLastFour: row.credential_identifier_last_four,
     verificationStatus: row.verification_status || 'unverified',
+    hostedProductionSandboxReadCapabilities:
+      row.hosted_production_sandbox_read_capabilities || [],
     verifiedAt: iso(row.verified_at),
     lastErrorCode: row.last_error_code,
     webhookVerificationStatus:
@@ -686,6 +713,8 @@ function runtimeCredential(
     externalAccountId: row.external_account_id,
     status: row.status,
     verificationStatus: row.verification_status || 'unverified',
+    hostedProductionSandboxReadCapabilities:
+      row.hosted_production_sandbox_read_capabilities || [],
     credentialVersion: row.credential_version,
     authMode: row.auth_mode,
     configuration: row.configuration || {},
@@ -2710,6 +2739,7 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
        AND account.provider = 'shopify'
        AND ${commerceReadAccountSql('account', {
          developmentRequiresActive: true,
+         capability: 'catalog',
        })}
        AND account.receipt_intake_enabled = true
        AND credential.external_account_id = account.external_account_id
@@ -2794,6 +2824,7 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
       if (replayed.productDeletionHeld) held += 1
       else reconciled += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       failed += 1
       // Never persist a crypto/parse error message: it may contain portions of
       // authenticated provider input. The fixed code is safe for logs and UI.

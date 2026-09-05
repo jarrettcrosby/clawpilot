@@ -8,6 +8,9 @@ import {
   type DirectCarrierProvider,
 } from '@/lib/integrations/carrierCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CarrierBillingImportError,
   normalizeCarrierBillingCurrency,
   normalizeCarrierBillingEnvironment,
@@ -998,6 +1001,7 @@ export async function importCarrierBillingCsvInPostgres(input: {
       }
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (
       error instanceof CarrierBillingRequestError
       || error instanceof CarrierBillingImportError

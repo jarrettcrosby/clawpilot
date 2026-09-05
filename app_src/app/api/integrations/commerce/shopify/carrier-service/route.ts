@@ -20,6 +20,10 @@ import {
   CommerceIntegrationRequestError,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
+import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { HYBRID_CARTONIZATION_ALGORITHM_VERSION } from '@/lib/operations/hybridCartonization'
 import {
   normalizeShopifyCheckoutPlanRatePolicy,
@@ -137,6 +141,23 @@ function errorResponse(error: unknown) {
       { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },
       401,
     )
+  }
+  if (isIntegrationCredentialRuntimeGateError(error)) {
+    return NextResponse.json({
+      ok: false,
+      maintenance: true,
+      retryable: true,
+      code: error.code,
+      error: 'Integration credential maintenance is in progress',
+    }, {
+      status: 503,
+      headers: {
+        'Cache-Control': 'private, no-store',
+        'Retry-After': '60',
+        Vary: 'Cookie',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    })
   }
   if (
     error instanceof ShopifyCheckoutRatingPersistenceError
@@ -1147,6 +1168,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
       actorEmail: input.actorEmail,
       statementVersion: confirmationStatementVersion,
     })
+  assertIntegrationCredentialProviderIoReady()
   const authorization =
     await authorizeShopifyCarrierServiceMutationInPostgres({
       organizationId: input.organizationId,
@@ -1178,6 +1200,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
       actorRole: input.actorRole,
       expiresInSeconds: 120,
     })
+  assertIntegrationCredentialProviderIoReady()
   const claimed = await claimShopifyCarrierServiceMutationInPostgres({
     organizationId: input.organizationId,
     authorizationGlobalId: authorization.globalId,

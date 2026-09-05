@@ -3,6 +3,10 @@ import {
   decryptCommerceCredential,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CommerceIntegrationRequestError,
 } from '@/lib/integrations/commerceIntegrations'
 import {
@@ -19,6 +23,7 @@ import {
   completeFaireInventoryPollPageInPostgres,
   failFaireInventoryPollJobInPostgres,
   parkFaireInventoryPollForStoreSyncPauseInPostgres,
+  parkFaireInventoryPollForRuntimeMaintenanceInPostgres,
   queueAutomaticFaireInventoryPollsInPostgres,
   readFaireInventoryPollSelectorsInPostgres,
   recordFaireInventoryPollWorkerHeartbeatInPostgres,
@@ -168,6 +173,7 @@ async function faireRuntime(target: FaireInventoryPollTarget) {
     || runtime.credentialVersion !== target.credentialVersion
     || !commerceReadCredentialEligible(runtime, {
       developmentRequiresActive: true,
+      capability: 'inventory',
     })
   ) {
     inventoryError(
@@ -278,6 +284,7 @@ export async function processFaireInventoryPollOutbox(input: {
   limit?: number
   workerId: string
 }) {
+  assertIntegrationCredentialProviderIoReady()
   const automatic = await queueAutomaticFaireInventoryPollsInPostgres()
   const requestedLimit = Math.max(1, Math.min(Number(input.limit || 2), 10))
   let claimed = 0
@@ -293,6 +300,7 @@ export async function processFaireInventoryPollOutbox(input: {
   let untrackedFactsObserved = 0
   let missingVariantsObserved = 0
   for (let index = 0; index < requestedLimit; index += 1) {
+    assertIntegrationCredentialProviderIoReady()
     const [target] = await claimFaireInventoryPollJobsInPostgres({
       limit: 1,
       workerId: input.workerId,
@@ -318,6 +326,15 @@ export async function processFaireInventoryPollOutbox(input: {
       untrackedFactsObserved += Number(result.untrackedCount || 0)
       missingVariantsObserved += Number(result.missingCount || 0)
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled([
+          parkFaireInventoryPollForRuntimeMaintenanceInPostgres({
+            target,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          }),
+        ])
+        throw error
+      }
       if (isStoreSyncReadPause(error)) {
         const disposition =
           await parkFaireInventoryPollForStoreSyncPauseInPostgres({ target })

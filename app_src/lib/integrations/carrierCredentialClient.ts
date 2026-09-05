@@ -3,6 +3,10 @@ import type {
   CarrierEnvironment,
   DirectCarrierProvider,
 } from '@/lib/integrations/carrierCredentialCrypto'
+import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 export type CarrierRuntimeCredential = {
   provider: DirectCarrierProvider
@@ -133,6 +137,7 @@ export async function requestCarrierAccessToken(
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const request = requestFor(input)
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(request.url, { ...request.init, signal: controller.signal })
     if (!response.ok) throw responseError(response.status)
     const contentLength = Number(response.headers.get('content-length') || 0)
@@ -174,6 +179,7 @@ export async function requestCarrierAccessToken(
       scope: typeof payload.scope === 'string' ? payload.scope.slice(0, 512) : null,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof CarrierCredentialClientError) throw error
     if (error instanceof Error && error.name === 'AbortError') {
       throw new CarrierCredentialClientError(

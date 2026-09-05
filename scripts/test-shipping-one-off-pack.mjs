@@ -1579,6 +1579,9 @@ const route = loadTypeScript(
       ONE_OFF_LIVE_POSTAGE_CONFIRMATION:
         'AUTHORIZE THIS LIVE POSTAGE PURCHASE',
     },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse: () => null,
+    },
     '@/lib/persistence/operationOneOffShipping': {
       recoverOperationsOneOffLabelPrintInPostgres: async (input) => {
         printRecoveryCalls += 1

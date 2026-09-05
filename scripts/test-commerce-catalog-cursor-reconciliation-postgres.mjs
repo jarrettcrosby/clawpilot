@@ -118,11 +118,14 @@ const commerceReadRuntime = loadTypeScriptModule(
 const commerceStoreSync = loadTypeScriptModule(
   'app_src/lib/operations/commerceStoreSync.ts',
 )
+const auditEvents = []
 const persistence = loadTypeScriptModule(
   'app_src/lib/persistence/commerceCatalogSync.ts',
   {
     '@/lib/auditWriter': {
-      async recordAuditEvent() {},
+      async recordAuditEvent(input) {
+        auditEvents.push(input)
+      },
     },
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -312,6 +315,44 @@ async function verifyReconciliation(pool) {
   assert.equal(resumedClaims.length, 1)
   assert.equal(resumedClaims[0].id, retainedPausedJob.rows[0].id)
   assert.equal(resumedClaims[0].attemptCount, 1)
+  const auditCountBeforeRuntimePark = auditEvents.length
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await persistence
+        .parkCommerceCatalogSyncJobForRuntimeMaintenanceInPostgres({
+          job: resumedClaims[0],
+          errorCode: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+        }),
+    )),
+    { parked: true },
+  )
+  const runtimeParkedCatalogJob = (
+    await pool.query(
+      `SELECT status, attempt_count, locked_at, locked_by, lock_token,
+              last_error_code, completed_at
+       FROM operations_commerce_catalog_sync_jobs
+       WHERE id = $1::uuid`,
+      [retainedPausedJob.rows[0].id],
+    )
+  ).rows[0]
+  assert.deepEqual(runtimeParkedCatalogJob, {
+    status: 'pending',
+    attempt_count: 0,
+    locked_at: null,
+    locked_by: null,
+    lock_token: null,
+    last_error_code: 'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+    completed_at: null,
+  })
+  assert.equal(auditEvents.length, auditCountBeforeRuntimePark)
+  const runtimeResumedClaims =
+    await persistence.claimCommerceCatalogSyncJobsInPostgres({
+      limit: 5,
+      workerId: 'catalog-runtime-resumed-worker',
+    })
+  assert.equal(runtimeResumedClaims.length, 1)
+  assert.equal(runtimeResumedClaims[0].id, retainedPausedJob.rows[0].id)
+  assert.equal(runtimeResumedClaims[0].attemptCount, 1)
   await pool.query(
     `DELETE FROM operations_commerce_catalog_sync_jobs WHERE id = $1::uuid`,
     [retainedPausedJob.rows[0].id],

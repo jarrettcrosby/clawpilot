@@ -23,6 +23,9 @@ import {
   WwexSpeedshipClientError,
 } from '@/lib/integrations/wwexSpeedshipClient'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   prepareWwexSmallpackShopRequest,
   WWEX_SPEEDSHIP_ADAPTER_VERSION,
 } from '@/lib/integrations/wwexSpeedshipFoundation'
@@ -2396,6 +2399,7 @@ async function attemptSandboxCarrierQuote(input: {
       testedAt: result.testedAt,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const carrierError = error instanceof CarrierIntegrationRequestError ? error : null
     return {
       carrier: input.carrier,
@@ -2528,6 +2532,7 @@ async function attemptWwexCarrierQuote(input: {
       testedAt: executed.completedAt,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const known = error instanceof OneOffShipmentPersistenceError
       || error instanceof WwexSpeedshipClientError
     return {
@@ -2877,6 +2882,7 @@ async function attemptProductionCarrierQuote(input: {
         testedAt: result.evidence.completedAt,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const providerError = error instanceof CarrierWholeShipmentRateClientError
         ? error
         : null
@@ -2904,6 +2910,7 @@ async function attemptProductionCarrierQuote(input: {
       throw error
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const carrierError = error instanceof CarrierIntegrationRequestError
       || error instanceof CarrierWholeShipmentRateClientError
       || error instanceof OneOffShipmentPersistenceError
@@ -2945,7 +2952,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
   if (quote.executionMode === 'live' && oneOffRateEnvironment() !== 'production') {
     requestError(
       'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
-      'Live carrier rating and postage are available only in production or the trusted Railway development service',
+      'Live carrier rating and postage are available only in the trusted Railway production service',
       409,
     )
   }
@@ -3361,6 +3368,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
     })
     return saved
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     await failQuoteCommand({ organizationId, idempotencyKey, error })
     throw error
   }

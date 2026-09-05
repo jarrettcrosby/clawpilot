@@ -27,6 +27,7 @@ const TERMINAL_UNSUPPORTED_CODES = new Set([
 ])
 const READABLE_ACCOUNT_SQL = commerceReadAccountSql('account', {
   developmentRequiresActive: true,
+  capability: 'orders_history',
 })
 
 export type CommerceOrderHistoryBatchProvider = 'shopify' | 'faire'

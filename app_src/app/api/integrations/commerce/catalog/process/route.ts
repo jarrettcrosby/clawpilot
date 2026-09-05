@@ -4,6 +4,9 @@ import {
   commerceReadRuntimeAvailable,
   commerceReadRuntimeMode,
 } from '@/lib/integrations/commerceIntake'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { processCommerceCatalogSyncOutbox } from '@/lib/commerceCatalogSyncWorker'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -25,6 +28,26 @@ function authorized(req: NextRequest) {
     left.length === right.length
     && crypto.timingSafeEqual(left, right)
   )
+}
+
+function runtimeMaintenanceResponse(error: unknown) {
+  if (!isIntegrationCredentialRuntimeGateError(error)) return null
+  const code = String((error as { code?: unknown }).code || '')
+  return NextResponse.json({
+    ok: false,
+    maintenance: true,
+    retryable: true,
+    code,
+    error: 'Integration credential runtime is temporarily unavailable',
+  }, {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Retry-After': '60',
+    },
+  })
 }
 
 export async function POST(req: NextRequest) {
@@ -63,21 +86,37 @@ export async function POST(req: NextRequest) {
     providerReadOnly: true,
     providerWrites: 0,
   })
-  const result = await processCommerceCatalogSyncOutbox({
-    limit: body.limit,
-    workerId,
-  })
-  const heartbeat = await recordCommerceCatalogWorkerHeartbeatInPostgres({
-    phase: 'completed',
-    workerId,
-    ...result,
-    runtimeMode: commerceReadRuntimeMode?.() || null,
-    providerReadOnly: true,
-    providerWrites: 0,
-  })
-  return NextResponse.json({
-    ok: true,
-    ...result,
-    heartbeatAt: heartbeat.checkedAt,
-  })
+  try {
+    const result = await processCommerceCatalogSyncOutbox({
+      limit: body.limit,
+      workerId,
+    })
+    const heartbeat = await recordCommerceCatalogWorkerHeartbeatInPostgres({
+      phase: 'completed',
+      workerId,
+      ...result,
+      runtimeMode: commerceReadRuntimeMode?.() || null,
+      providerReadOnly: true,
+      providerWrites: 0,
+    })
+    return NextResponse.json({
+      ok: true,
+      ...result,
+      heartbeatAt: heartbeat.checkedAt,
+    })
+  } catch (error) {
+    const maintenance = runtimeMaintenanceResponse(error)
+    if (maintenance) {
+      await recordCommerceCatalogWorkerHeartbeatInPostgres({
+        phase: 'maintenance',
+        workerId,
+        errorCode: String((error as { code?: unknown }).code || ''),
+        runtimeMode: commerceReadRuntimeMode?.() || null,
+        providerReadOnly: true,
+        providerWrites: 0,
+      }).catch(() => undefined)
+      return maintenance
+    }
+    throw error
+  }
 }

@@ -127,6 +127,11 @@ vm.runInNewContext(output, {
     if (specifier === '@/lib/users') {
       return { effectiveAuthorizationRole() { return 'owner' } }
     }
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeHttp') {
+      return {
+        integrationCredentialRuntimeMaintenanceResponse() { return null },
+      }
+    }
     return requireFromApp(specifier)
   },
 }, { filename: path })

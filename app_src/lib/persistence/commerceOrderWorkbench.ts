@@ -6,6 +6,9 @@ import {
   encryptCommerceCandidateSnapshot,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   ORDER_SHIP_TO_FIELDS,
   changedOrderShipToFields,
   mergeOrderShipToDraft,
@@ -844,7 +847,8 @@ function decryptProtectedSnapshot(input: {
       input.sourceHash,
       input.kind,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     protectedDataUnreadable()
   }
 }

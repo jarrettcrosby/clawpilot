@@ -5,9 +5,6 @@
   "outputDirectory": ".next",
   "framework": "nextjs",
   "git": {
-    "deploymentEnabled": {
-      "dev": false,
-      "main": false
-    }
+    "deploymentEnabled": false
   }
 }

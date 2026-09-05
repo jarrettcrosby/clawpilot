@@ -238,6 +238,9 @@ function loadRoute() {
     module,
     process,
     require(specifier) {
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeHttp') {
+        return { integrationCredentialRuntimeMaintenanceResponse: () => null }
+      }
       if (specifier === 'next/server') {
         return {
           NextRequest: class NextRequest {},

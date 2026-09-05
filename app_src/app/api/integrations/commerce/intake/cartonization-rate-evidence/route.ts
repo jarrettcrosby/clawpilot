@@ -22,6 +22,8 @@ import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import { isIntegrationCredentialRuntimeGateError } from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -535,6 +537,8 @@ function cartonizationRateEvidenceCommandHash(
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json(
       { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },
@@ -1971,7 +1975,7 @@ export async function POST(req: NextRequest) {
       },
     })
   } catch (error) {
-    if (claimedCommand) {
+    if (claimedCommand && !isIntegrationCredentialRuntimeGateError(error)) {
       const errorCode = (
         error
         && typeof error === 'object'

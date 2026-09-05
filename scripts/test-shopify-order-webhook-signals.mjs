@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -73,6 +74,8 @@ let workerStoreSyncPaused = false
 const worker = loadTypeScriptModule(
   'app_src/lib/shopifyOrderWebhookWorker.ts',
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceOrderHistory': {
       async readExactShopifyOrderHistoryObservation(input) {
         workerCalls.push(['read', input])
@@ -210,6 +213,8 @@ let providerRequest = null
 const module = loadTypeScriptModule(
   'app_src/lib/integrations/shopifyOrderWebhook.ts',
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/shopifyCommerceClient': {
       async shopifyAdminGraphql(_credential, request) {
         providerRequest = request

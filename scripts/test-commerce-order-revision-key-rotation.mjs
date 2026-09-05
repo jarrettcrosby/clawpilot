@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -75,6 +76,8 @@ let hosted = true
 const cryptoModule = loadTypeScriptModule(
   'app_src/lib/integrations/commerceCredentialCrypto.ts',
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs': await import(
       '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
     ),

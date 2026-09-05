@@ -25,6 +25,18 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import {
+  INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
+  normalizeIntegrationCredentialKeyId,
+  verifyIntegrationCredentialKeyAttestation,
+} from '../app_src/lib/integrations/integrationCredentialKeyAttestation.mjs'
+import {
+  PRODUCTION_REBIND_CRITICAL_RELATIONS,
+  PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
+  attestProductionRebindTargetSchema,
+} from './production-rebind-history-schema-attestation.mjs'
+
 export const SCRIPT_VERSION = 'migrated-production-provider-rebind-v1'
 export const PLAN_FORMAT = 'clawpilot-migrated-production-provider-rebind-plan-v1'
 export const RECEIPT_FORMAT = 'clawpilot-migrated-production-provider-rebind-receipt-v1'
@@ -70,13 +82,78 @@ const SHOPIFY_ORDER_INCLUDE_FIELDS = Object.freeze([
   'admin_graphql_api_id',
   'updated_at',
 ])
+const SHOPIFY_SCOPE_TOPICS = Object.freeze([
+  'app/scopes_update',
+])
+const SHOPIFY_INVENTORY_TOPICS = Object.freeze([
+  'inventory_items/create',
+  'inventory_items/delete',
+  'inventory_items/update',
+  'inventory_levels/connect',
+  'inventory_levels/disconnect',
+  'inventory_levels/update',
+])
+const SHOPIFY_CATALOG_TOPICS = Object.freeze([
+  'products/create',
+  'products/delete',
+  'products/update',
+])
+const SHOPIFY_WEBHOOK_GROUPS = Object.freeze([
+  Object.freeze({
+    key: 'scopeWebhookSubscriptions',
+    label: 'access-scope safety',
+    topics: SHOPIFY_SCOPE_TOPICS,
+    includeFields: Object.freeze([]),
+  }),
+  Object.freeze({
+    key: 'webhookSubscriptions',
+    label: 'inventory freshness',
+    topics: SHOPIFY_INVENTORY_TOPICS,
+    includeFields: Object.freeze([]),
+  }),
+  Object.freeze({
+    key: 'catalogWebhookSubscriptions',
+    label: 'product catalog',
+    topics: SHOPIFY_CATALOG_TOPICS,
+    includeFields: Object.freeze([]),
+  }),
+  Object.freeze({
+    key: 'orderWebhookSubscriptions',
+    label: 'order lifecycle',
+    topics: SHOPIFY_ORDER_TOPICS,
+    includeFields: SHOPIFY_ORDER_INCLUDE_FIELDS,
+  }),
+])
+const SHOPIFY_ACCEPTED_RECEIPT_TOPICS = Object.freeze(
+  [
+    ...SHOPIFY_SCOPE_TOPICS,
+    ...SHOPIFY_INVENTORY_TOPICS,
+    ...SHOPIFY_CATALOG_TOPICS,
+  ],
+)
 const SHOPIFY_MINIMUM_READ_SCOPES = Object.freeze([
   'read_inventory',
   'read_locations',
   'read_orders',
   'read_products',
 ])
+const SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_VERSION =
+  'shopify-fulfillment-notification-v1'
+const SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_REASON =
+  'Safe default established during approved production rebind'
+const SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_RELATION =
+  'public.operations_shopify_fulfillment_notification_policies'
 const SHOPIFY_TOPIC_ENUMS = Object.freeze({
+  'app/scopes_update': 'APP_SCOPES_UPDATE',
+  'inventory_items/create': 'INVENTORY_ITEMS_CREATE',
+  'inventory_items/delete': 'INVENTORY_ITEMS_DELETE',
+  'inventory_items/update': 'INVENTORY_ITEMS_UPDATE',
+  'inventory_levels/connect': 'INVENTORY_LEVELS_CONNECT',
+  'inventory_levels/disconnect': 'INVENTORY_LEVELS_DISCONNECT',
+  'inventory_levels/update': 'INVENTORY_LEVELS_UPDATE',
+  'products/create': 'PRODUCTS_CREATE',
+  'products/delete': 'PRODUCTS_DELETE',
+  'products/update': 'PRODUCTS_UPDATE',
   'orders/create': 'ORDERS_CREATE',
   'orders/updated': 'ORDERS_UPDATED',
   'orders/edited': 'ORDERS_EDITED',
@@ -98,6 +175,17 @@ const COMMERCE_HISTORY_MODES = Object.freeze([
   'last_30_days',
   'last_60_days',
   'provider_all',
+])
+const HOSTED_PRODUCTION_SANDBOX_READ_SOURCE_GLOBAL_IDS = new Set([
+  'gia9286799',
+  'giah34fedoa5b1o',
+])
+const HOSTED_PRODUCTION_SANDBOX_READ_CAPABILITIES = Object.freeze([
+  'catalog',
+  'images',
+  'inventory',
+  'orders_history',
+  'webhook_hydration',
 ])
 export const REBIND_PLAN_MAX_AGE_MS = 15 * 60 * 1000
 export const REBIND_PLAN_MAX_FUTURE_SKEW_MS = 5 * 1000
@@ -218,6 +306,13 @@ export const WORKSPACES = Object.freeze([
     ]),
   }),
 ])
+
+function isHostedProductionSandboxReadAccount(account) {
+  return account?.provider === 'shopify'
+    && account?.integrationType === 'commerce'
+    && account?.environment === 'sandbox'
+    && HOSTED_PRODUCTION_SANDBOX_READ_SOURCE_GLOBAL_IDS.has(account?.sourceGlobalId)
+}
 
 function fail(message) {
   throw new Error(message)
@@ -416,6 +511,16 @@ function requiredSecret(environment, name) {
   return value
 }
 
+function requiredTargetKeyId(environment) {
+  try {
+    return normalizeIntegrationCredentialKeyId(
+      environment.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID,
+    )
+  } catch {
+    fail('INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID is required and invalid')
+  }
+}
+
 function validatedDatabaseUrl(value, label) {
   const raw = String(value || '')
   let parsed
@@ -495,15 +600,30 @@ function derivedKey(secret) {
   return crypto.createHash('sha256').update(secret).digest()
 }
 
+function withDerivedKey(secret, transform) {
+  const key = derivedKey(secret)
+  try {
+    return transform(key)
+  } finally {
+    key.fill(0)
+  }
+}
+
 function decryptAesGcm(fields, keySecret, aad, label) {
   try {
-    const decipher = crypto.createDecipheriv('aes-256-gcm', derivedKey(keySecret), fields.iv)
-    decipher.setAAD(Buffer.from(aad, 'utf8'))
-    decipher.setAuthTag(fields.tag)
-    return Buffer.concat([
-      decipher.update(fields.ciphertext),
-      decipher.final(),
-    ])
+    return withDerivedKey(keySecret, (key) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, fields.iv)
+      decipher.setAAD(Buffer.from(aad, 'utf8'))
+      decipher.setAuthTag(fields.tag)
+      const chunks = []
+      try {
+        chunks.push(decipher.update(fields.ciphertext))
+        chunks.push(decipher.final())
+        return Buffer.concat(chunks)
+      } finally {
+        chunks.forEach((chunk) => chunk.fill(0))
+      }
+    })
   } catch {
     fail(`${label} could not be decrypted under the approved source binding`)
   }
@@ -511,22 +631,82 @@ function decryptAesGcm(fields, keySecret, aad, label) {
 
 function encryptAesGcm(plaintext, keySecret, aad) {
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey(keySecret), iv)
-  cipher.setAAD(Buffer.from(aad, 'utf8'))
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withDerivedKey(keySecret, (key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(Buffer.from(aad, 'utf8'))
+    const chunks = []
+    try {
+      chunks.push(cipher.update(plaintext))
+      chunks.push(cipher.final())
+      return {
+        ciphertext: Buffer.concat(chunks),
+        iv,
+        tag: cipher.getAuthTag(),
+      }
+    } finally {
+      chunks.forEach((chunk) => chunk.fill(0))
+    }
+  })
+}
+
+export function withZeroizedBuffer(buffer, transform) {
+  if (!Buffer.isBuffer(buffer) || typeof transform !== 'function') {
+    fail('Plaintext buffer operation is invalid')
+  }
+  try {
+    return transform(buffer)
+  } finally {
+    buffer.fill(0)
+  }
 }
 
 export function withZeroizedPlaintextBuffer(serialized, transform) {
-  if (typeof serialized !== 'string' || typeof transform !== 'function') {
-    fail('Plaintext buffer operation is invalid')
+  if (typeof serialized !== 'string') fail('Plaintext buffer operation is invalid')
+  return withZeroizedBuffer(Buffer.from(serialized, 'utf8'), transform)
+}
+
+function clearSensitiveValue(value, seen = new Set()) {
+  if (Buffer.isBuffer(value)) {
+    value.fill(0)
+    return
   }
-  const plaintext = Buffer.from(serialized, 'utf8')
-  try {
-    return transform(plaintext)
-  } finally {
-    plaintext.fill(0)
+  if (!value || typeof value !== 'object' || seen.has(value)) return
+  seen.add(value)
+  for (const key of Object.keys(value)) {
+    const entry = value[key]
+    clearSensitiveValue(entry, seen)
+    try {
+      value[key] = null
+    } catch {
+      // A frozen test fixture cannot be overwritten; dropping the parent
+      // reference below still bounds the lifetime of its immutable strings.
+    }
   }
+}
+
+export function destroyValidatedMaterials(materials) {
+  if (!Array.isArray(materials)) return
+  for (const material of materials) {
+    if (material?.secret) {
+      clearSensitiveValue(material.secret)
+      try {
+        material.secret = null
+      } catch {
+        // See clearSensitiveValue: callers must also release the materials array.
+      }
+    }
+    if (material?.verification?.runtime) {
+      clearSensitiveValue(material.verification.runtime)
+      try {
+        material.verification.runtime = null
+      } catch {
+        // Provider runtimes can contain short-lived access tokens. Frozen test
+        // fixtures cannot be overwritten, so the released materials array is
+        // still the final reference-lifetime boundary.
+      }
+    }
+  }
+  materials.length = 0
 }
 
 function encryptSerializedAesGcm(serialized, keySecret, aad) {
@@ -562,12 +742,39 @@ function parseCredentialJson(buffer, label) {
 }
 
 function carrierAccountFingerprint(keySecret, organizationId, provider, environment, accountNumber) {
-  const key = crypto.createHmac('sha256', derivedKey(keySecret))
-    .update('clawpilot:carrier:fingerprint:v1', 'utf8')
-    .digest()
-  return crypto.createHmac('sha256', key)
-    .update(`${organizationId}:${provider}:${environment}:${accountNumber}`, 'utf8')
-    .digest('hex')
+  return withDerivedKey(keySecret, (rootKey) => {
+    const fingerprintKey = crypto.createHmac('sha256', rootKey)
+      .update('clawpilot:carrier:fingerprint:v1', 'utf8')
+      .digest()
+    try {
+      return crypto.createHmac('sha256', fingerprintKey)
+        .update(`${organizationId}:${provider}:${environment}:${accountNumber}`, 'utf8')
+        .digest('hex')
+    } finally {
+      fingerprintKey.fill(0)
+    }
+  })
+}
+
+function targetKeyMaterialCommitment(targetKey, purpose, value) {
+  const normalizedPurpose = boundedPrintableAscii(
+    purpose,
+    'Target-key material commitment purpose',
+    8,
+    160,
+  )
+  return withDerivedKey(targetKey, (rootKey) => {
+    const commitmentKey = crypto.createHmac('sha256', rootKey)
+      .update('clawpilot:production-rebind:material-commitment-key:v1', 'utf8')
+      .digest()
+    try {
+      return crypto.createHmac('sha256', commitmentKey)
+        .update(`${normalizedPurpose}\0${canonicalJson(value)}`, 'utf8')
+        .digest('hex')
+    } finally {
+      commitmentKey.fill(0)
+    }
+  })
 }
 
 export function carrierAddressFingerprint(input) {
@@ -629,20 +836,126 @@ function safeProviderError(provider, operation) {
   return new Error(`${provider} ${operation} failed without verified evidence`)
 }
 
-async function boundedJsonResponse(response, provider, operation, limit = 256 * 1024) {
+function boundedProviderText(value, label, maximum, optional = false) {
+  if (optional && (value === null || value === undefined || value === '')) return ''
+  if (
+    typeof value !== 'string'
+    || value.length < 1
+    || value.length > maximum
+    || /[\u0000-\u001f\u007f]/u.test(value)
+  ) fail(`Shopify returned invalid ${label}`)
+  return value
+}
+
+function normalizeShopifyProviderLocation(value) {
+  const source = safeJson(value)
+  const id = boundedProviderText(source.id, 'location ID', 255)
+  if (!/^gid:\/\/shopify\/Location\/[1-9][0-9]{0,20}$/u.test(id)) {
+    fail('Shopify returned invalid location ID')
+  }
+  const sourceAddress = safeJson(source.address)
+  const countryCode = boundedProviderText(
+    sourceAddress.countryCode,
+    'location country code',
+    2,
+  ).toUpperCase()
+  if (!/^[A-Z]{2}$/u.test(countryCode)) {
+    fail('Shopify returned invalid location country code')
+  }
+  let fulfillmentService = null
+  if (source.fulfillmentService !== null && source.fulfillmentService !== undefined) {
+    const service = safeJson(source.fulfillmentService)
+    fulfillmentService = {
+      id: boundedProviderText(service.id, 'fulfillment service ID', 255),
+      handle: boundedProviderText(service.handle, 'fulfillment service handle', 255),
+      serviceName: boundedProviderText(
+        service.serviceName,
+        'fulfillment service name',
+        255,
+      ),
+    }
+  }
+  for (const [field, label] of [
+    ['isActive', 'location active state'],
+    ['activatable', 'location activatable state'],
+    ['shipsInventory', 'location ships-inventory state'],
+    ['fulfillsOnlineOrders', 'location online-fulfillment state'],
+    ['isFulfillmentService', 'location fulfillment-service state'],
+  ]) {
+    if (typeof source[field] !== 'boolean') fail(`Shopify returned invalid ${label}`)
+  }
+  return {
+    id,
+    name: boundedProviderText(source.name, 'location name', 255),
+    isActive: source.isActive,
+    activatable: source.activatable,
+    shipsInventory: source.shipsInventory,
+    fulfillsOnlineOrders: source.fulfillsOnlineOrders,
+    isFulfillmentService: source.isFulfillmentService || Boolean(fulfillmentService),
+    fulfillmentService,
+    address: {
+      address1: boundedProviderText(sourceAddress.address1, 'location address line 1', 255, true),
+      address2: boundedProviderText(sourceAddress.address2, 'location address line 2', 255, true),
+      city: boundedProviderText(sourceAddress.city, 'location city', 255, true),
+      provinceCode: boundedProviderText(
+        sourceAddress.provinceCode,
+        'location province code',
+        64,
+        true,
+      ).toUpperCase(),
+      countryCode,
+      zip: boundedProviderText(sourceAddress.zip, 'location postal code', 64, true),
+    },
+  }
+}
+
+function normalizeShopifyProviderLocations(value) {
+  const connection = safeJson(value)
+  const pageInfo = safeJson(connection.pageInfo)
+  if (
+    !Array.isArray(connection.nodes)
+    || connection.nodes.length > 100
+    || pageInfo.hasNextPage !== false
+    || (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string')
+  ) fail('Shopify location discovery was incomplete')
+  const locations = connection.nodes
+    .map(normalizeShopifyProviderLocation)
+    .sort((left, right) => left.id.localeCompare(right.id))
+  if (new Set(locations.map((location) => location.id)).size !== locations.length) {
+    fail('Shopify returned duplicate location identities')
+  }
+  return locations
+}
+
+function shopifyLocationSnapshotHash(location) {
+  return digest({ schema: 'shopify-location-snapshot-v1', location })
+}
+
+function shopifyLocationSetHash(locations) {
+  return digest({
+    schema: 'shopify-location-set-v1',
+    locations: [...locations].sort((left, right) => left.id.localeCompare(right.id)),
+  })
+}
+
+export async function boundedJsonResponse(response, provider, operation, limit = 256 * 1024) {
   let bytes
   try {
     bytes = Buffer.from(await response.arrayBuffer())
   } catch {
     throw safeProviderError(provider, operation)
   }
-  if (bytes.length > limit || !response.ok) throw safeProviderError(provider, operation)
   try {
-    const value = JSON.parse(bytes.toString('utf8'))
-    if (!value || typeof value !== 'object') throw new Error('invalid')
-    return value
-  } catch {
-    throw safeProviderError(provider, operation)
+    if (bytes.length > limit || !response.ok) throw safeProviderError(provider, operation)
+    try {
+      const value = JSON.parse(bytes.toString('utf8'))
+      if (!value || typeof value !== 'object') throw new Error('invalid')
+      return value
+    } catch {
+      throw safeProviderError(provider, operation)
+    }
+  } finally {
+    bytes.fill(0)
   }
 }
 
@@ -779,6 +1092,15 @@ async function verifyShopify(fetchImpl, credential, configuration) {
     query: `query ClawPilotMigrationIdentityProbe {
       shop { id myshopifyDomain name }
       currentAppInstallation { accessScopes { handle } }
+      locations(first: 100, includeInactive: true, includeLegacy: true) {
+        nodes {
+          id name isActive activatable shipsInventory fulfillsOnlineOrders
+          isFulfillmentService
+          fulfillmentService { id handle serviceName }
+          address { address1 address2 city provinceCode countryCode zip }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
     }`,
     operationName: 'ClawPilotMigrationIdentityProbe',
   })
@@ -816,26 +1138,36 @@ async function verifyShopify(fetchImpl, credential, configuration) {
   if (requiredScopes.some((scope) => !effective(scope))) {
     fail('Shopify no longer grants the approved source capabilities')
   }
+  const locations = normalizeShopifyProviderLocations(data.locations)
   return {
     externalAccountId,
     identitySha256: sha256(externalAccountId),
     accountName: boundedPrintable(shop.name, 'Shopify account name', 1, 255),
     shopDomain: canonicalDomain,
     grantedScopes: [...new Set(scopes)],
+    locations,
+    locationSetSha256: shopifyLocationSetHash(locations),
     runtime,
-    operationalProbe: 'identity_scopes_webhooks_read_only',
+    operationalProbe: 'identity_scopes_webhooks_locations_read_only',
     providerMutationCount: 0,
   }
 }
 
-function normalizeWebhookReadiness(data, desiredUri) {
+function shopifyWebhookGroup(key) {
+  const group = SHOPIFY_WEBHOOK_GROUPS.find((candidate) => candidate.key === key)
+  if (!group) fail('Shopify webhook reconciliation group is invalid')
+  return group
+}
+
+function normalizeWebhookReadiness(data, desiredUri, group) {
   const connection = safeJson(data.webhookSubscriptions)
   const pageInfo = safeJson(connection.pageInfo)
   if (
     !Array.isArray(connection.nodes)
     || pageInfo.hasNextPage !== false
-    || pageInfo.endCursor !== null
-  ) fail('Shopify order webhook discovery was incomplete')
+    || (pageInfo.endCursor !== null && typeof pageInfo.endCursor !== 'string')
+  ) fail(`Shopify ${group.label} webhook discovery was incomplete`)
+  const allowedTopics = new Set(group.topics)
   const subscriptions = connection.nodes.map((entry) => {
     const node = safeJson(entry)
     const topic = SHOPIFY_TOPIC_FROM_ENUM.get(node.topic)
@@ -848,7 +1180,7 @@ function normalizeWebhookReadiness(data, desiredUri) {
       )).sort()
       : fail('Shopify returned malformed webhook evidence')
     if (
-      !topic || typeof node.id !== 'string'
+      !topic || !allowedTopics.has(topic) || typeof node.id !== 'string'
       || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/u.test(node.id)
       || typeof node.uri !== 'string'
       || !['JSON', 'XML'].includes(node.format)
@@ -860,21 +1192,34 @@ function normalizeWebhookReadiness(data, desiredUri) {
       format: node.format,
       includeFields,
       exact: node.uri === desiredUri && node.format === 'JSON'
-        && canonicalJson(includeFields) === canonicalJson([...SHOPIFY_ORDER_INCLUDE_FIELDS].sort()),
+        && canonicalJson(includeFields) === canonicalJson([...group.includeFields].sort()),
     }
   }).sort((left, right) => (
     left.topic.localeCompare(right.topic) || left.providerId.localeCompare(right.providerId)
   ))
   const actions = []
-  for (const topic of SHOPIFY_ORDER_TOPICS) {
+  for (const topic of group.topics) {
     const current = subscriptions.filter((entry) => entry.topic === topic)
     if (current.length > 1) fail(`Shopify has duplicate ${topic} subscriptions requiring review`)
-    if (!current.length) actions.push({ action: 'create', topic, providerId: null })
+    if (!current.length) {
+      actions.push({
+        action: 'create',
+        subscriptionGroup: group.key,
+        topic,
+        providerId: null,
+      })
+    }
     else if (!current[0].exact) {
-      actions.push({ action: 'update', topic, providerId: current[0].providerId })
+      actions.push({
+        action: 'update',
+        subscriptionGroup: group.key,
+        topic,
+        providerId: current[0].providerId,
+      })
     }
   }
   return {
+    subscriptionGroup: group.key,
     desiredUri,
     actions,
     ready: actions.length === 0,
@@ -890,60 +1235,79 @@ function normalizeWebhookReadiness(data, desiredUri) {
 }
 
 async function inspectShopifyWebhooks(fetchImpl, runtime, desiredUri) {
-  const data = await shopifyGraphql(fetchImpl, runtime.shopDomain, runtime.accessToken, {
-    query: `query ClawPilotMigrationOrderWebhookProbe($topics: [WebhookSubscriptionTopic!]) {
-      webhookSubscriptions(first: 100, topics: $topics) {
-        nodes { id topic uri format includeFields }
-        pageInfo { hasNextPage endCursor }
-      }
-    }`,
-    operationName: 'ClawPilotMigrationOrderWebhookProbe',
-    variables: { topics: SHOPIFY_ORDER_TOPICS.map((topic) => SHOPIFY_TOPIC_ENUMS[topic]) },
-  })
-  return normalizeWebhookReadiness(data, desiredUri)
+  const groups = {}
+  for (const group of SHOPIFY_WEBHOOK_GROUPS) {
+    const data = await shopifyGraphql(fetchImpl, runtime.shopDomain, runtime.accessToken, {
+      query: `query ClawPilotMigrationWebhookProbe($topics: [WebhookSubscriptionTopic!]) {
+        webhookSubscriptions(first: 100, topics: $topics) {
+          nodes { id topic uri format includeFields }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      operationName: 'ClawPilotMigrationWebhookProbe',
+      variables: { topics: group.topics.map((topic) => SHOPIFY_TOPIC_ENUMS[topic]) },
+    })
+    groups[group.key] = normalizeWebhookReadiness(data, desiredUri, group)
+  }
+  const actions = SHOPIFY_WEBHOOK_GROUPS.flatMap((group) => groups[group.key].actions)
+  return {
+    desiredUri,
+    groups,
+    actions,
+    ready: SHOPIFY_WEBHOOK_GROUPS.every((group) => groups[group.key].ready),
+    observed: SHOPIFY_WEBHOOK_GROUPS.flatMap((group) => (
+      groups[group.key].observed.map((entry) => ({
+        subscriptionGroup: group.key,
+        ...entry,
+      }))
+    )),
+  }
 }
 
 async function mutateShopifyWebhook(fetchImpl, runtime, desiredUri, action) {
+  const group = shopifyWebhookGroup(action.subscriptionGroup)
+  if (!group.topics.includes(action.topic)) {
+    fail('Shopify webhook reconciliation action does not match its reviewed group')
+  }
   const update = action.action === 'update'
   const field = update ? 'webhookSubscriptionUpdate' : 'webhookSubscriptionCreate'
+  const subscription = {
+    uri: desiredUri,
+    format: 'JSON',
+    ...(group.includeFields.length
+      ? { includeFields: [...group.includeFields] }
+      : {}),
+  }
   const data = await shopifyGraphql(fetchImpl, runtime.shopDomain, runtime.accessToken, {
     query: update
-      ? `mutation ClawPilotMigrationOrderWebhookUpdate($id: ID!, $subscription: WebhookSubscriptionInput!) {
+      ? `mutation ClawPilotMigrationWebhookUpdate($id: ID!, $subscription: WebhookSubscriptionInput!) {
           webhookSubscriptionUpdate(id: $id, webhookSubscription: $subscription) {
             webhookSubscription { id topic uri format includeFields }
             userErrors { field message }
           }
         }`
-      : `mutation ClawPilotMigrationOrderWebhookCreate($topic: WebhookSubscriptionTopic!, $subscription: WebhookSubscriptionInput!) {
+      : `mutation ClawPilotMigrationWebhookCreate($topic: WebhookSubscriptionTopic!, $subscription: WebhookSubscriptionInput!) {
           webhookSubscriptionCreate(topic: $topic, webhookSubscription: $subscription) {
             webhookSubscription { id topic uri format includeFields }
             userErrors { field message }
           }
         }`,
     operationName: update
-      ? 'ClawPilotMigrationOrderWebhookUpdate'
-      : 'ClawPilotMigrationOrderWebhookCreate',
+      ? 'ClawPilotMigrationWebhookUpdate'
+      : 'ClawPilotMigrationWebhookCreate',
     variables: update
       ? {
           id: action.providerId,
-          subscription: {
-            uri: desiredUri,
-            format: 'JSON',
-            includeFields: [...SHOPIFY_ORDER_INCLUDE_FIELDS],
-          },
+          subscription,
         }
       : {
           topic: SHOPIFY_TOPIC_ENUMS[action.topic],
-          subscription: {
-            uri: desiredUri,
-            format: 'JSON',
-            includeFields: [...SHOPIFY_ORDER_INCLUDE_FIELDS],
-          },
+          subscription,
         },
   })
   const result = safeJson(data[field])
   if (!Array.isArray(result.userErrors) || result.userErrors.length) {
-    throw safeProviderError('Shopify', 'order webhook reconciliation')
+    throw safeProviderError('Shopify', 'webhook reconciliation')
   }
   const node = safeJson(result.webhookSubscription)
   if (
@@ -951,10 +1315,10 @@ async function mutateShopifyWebhook(fetchImpl, runtime, desiredUri, action) {
     || node.uri !== desiredUri || node.format !== 'JSON'
     || !Array.isArray(node.includeFields)
     || canonicalJson([...node.includeFields].sort())
-      !== canonicalJson([...SHOPIFY_ORDER_INCLUDE_FIELDS].sort())
+      !== canonicalJson([...group.includeFields].sort())
     || (update && node.id !== action.providerId)
     || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/u.test(String(node.id || ''))
-  ) throw safeProviderError('Shopify', 'order webhook reconciliation')
+  ) throw safeProviderError('Shopify', 'webhook reconciliation')
 }
 
 async function reconcileShopifyWebhooks(fetchImpl, runtime, desiredUri, expectedActions) {
@@ -1584,156 +1948,151 @@ function targetIdentity(mapping, workspace, account) {
     integrationGlobalId: integration.reference,
     carrierAccountId: carrier?.id || null,
     carrierAccountGlobalId: carrier?.reference || null,
+    inventoryLocationMappingIdentities: Object.values(
+      result.mapping.operations_commerce_inventory_location_mappings || {},
+    ).map((mapped) => ({ id: mapped.id, globalId: mapped.reference })),
   }
 }
 
-async function assertTargetSchema(client) {
-  const requiredTables = [
-    'operations_integration_accounts',
-    'operations_commerce_credentials',
-    'operations_commerce_order_history_policies',
-    'operations_carrier_credentials',
-    'operations_carrier_accounts',
-    'operations_carrier_account_migration_placeholders',
-    'operations_warehouses',
-    'operations_commerce_migration_provider_identity_fences',
-    'operations_commerce_store_sync_controls',
-    'operations_commerce_sync_cursors',
-    'operations_shopify_fulfillment_notification_policies',
-    'audit_events',
-  ]
-  const result = await client.query(
-    `SELECT name, to_regclass('public.' || name) IS NOT NULL AS present
-     FROM unnest($1::text[]) AS required(name)
-     ORDER BY name`,
-    [requiredTables],
+function normalizedTargetSchemaAttestation(value) {
+  const postgresMajor = Number(value?.postgresMajor)
+  const expectedMigrations = PRODUCTION_REBIND_SCHEMA_MIGRATIONS.map(
+    ({ filename, checksum }) => ({ filename, checksum }),
   )
-  const missing = result.rows.filter((row) => !row.present).map((row) => row.name)
-  if (missing.length) fail(`Target database lacks required migration schema: ${missing.join(', ')}`)
-  const guard = await client.query(
-    `SELECT trigger.tgenabled,
-            procedure.proname,
-            pg_get_triggerdef(trigger.oid) AS trigger_definition,
-            pg_get_functiondef(procedure.oid) AS function_definition
-     FROM pg_trigger trigger
-     JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
-     WHERE trigger.tgrelid = 'audit_events'::regclass
-       AND trigger.tgname = 'protect_commerce_workspace_migration_receipt_write'
-       AND trigger.tgisinternal = false`,
-  )
-  const receiptGuard = guard.rows[0]
   if (
-    guard.rowCount !== 1
-    || !['O', 'A'].includes(receiptGuard.tgenabled)
-    || receiptGuard.proname !== 'protect_commerce_workspace_migration_receipt'
-    || !/BEFORE (?:UPDATE OR DELETE|DELETE OR UPDATE)/u.test(receiptGuard.trigger_definition || '')
-    || !String(receiptGuard.function_definition || '').includes(
-      'operations.migrated_provider_rebind.completed',
-    )
-    || !String(receiptGuard.function_definition || '').includes(
-      'migrated-provider-rebind:migrated-production-provider-rebind-v1:',
-    )
-  ) fail('Target database lacks the immutable provider rebind receipt guard')
-  const historyGuardResult = await client.query(
-    `SELECT trigger.tgenabled,
-            procedure.proname,
-            pg_get_triggerdef(trigger.oid) AS trigger_definition,
-            pg_get_functiondef(procedure.oid) AS function_definition
-     FROM pg_trigger trigger
-     JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
-     WHERE trigger.tgrelid = 'operations_commerce_order_history_policies'::regclass
-       AND trigger.tgname = 'commerce_order_history_policy_guard'
-       AND trigger.tgisinternal = false`,
-  )
-  const historyGuard = historyGuardResult.rows[0]
-  const historyTrigger = String(historyGuard?.trigger_definition || '')
-  const historyFunction = String(historyGuard?.function_definition || '')
-  if (
-    historyGuardResult.rowCount !== 1
-    || !['O', 'A'].includes(historyGuard.tgenabled)
-    || historyGuard.proname !== 'protect_commerce_order_history_policy'
-    || !/BEFORE\s+(?=[^\n]*INSERT)(?=[^\n]*UPDATE)(?=[^\n]*DELETE)/u.test(historyTrigger)
-    || !historyFunction.includes("IF TG_OP <> 'INSERT' THEN")
-    || !historyFunction.includes('commerce order history policy is immutable')
-  ) fail('Target database lacks the immutable commerce order-history policy guard')
-  const historyConstraintResult = await client.query(
-    `SELECT constraint_record.conname,
-            constraint_record.contype,
-            constraint_record.convalidated,
-            constraint_record.confdeltype,
-            referenced.relname AS referenced_table,
-            COALESCE((
-              SELECT string_agg(attribute.attname, ',' ORDER BY key.ordinality)
-              FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key(attnum, ordinality)
-              JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint_record.conrelid
-               AND attribute.attnum = key.attnum
-            ), '') AS constrained_columns,
-            COALESCE((
-              SELECT string_agg(attribute.attname, ',' ORDER BY key.ordinality)
-              FROM unnest(constraint_record.confkey) WITH ORDINALITY AS key(attnum, ordinality)
-              JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint_record.confrelid
-               AND attribute.attnum = key.attnum
-            ), '') AS referenced_columns,
-            pg_get_constraintdef(constraint_record.oid, true) AS definition
-     FROM pg_constraint constraint_record
-     LEFT JOIN pg_class referenced ON referenced.oid = constraint_record.confrelid
-     WHERE constraint_record.conrelid =
-       'operations_commerce_order_history_policies'::regclass`,
-  )
-  const historyConstraints = new Map(
-    historyConstraintResult.rows.map((row) => [row.conname, row]),
-  )
-  const requireHistoryConstraint = (name, expected) => {
-    const constraint = historyConstraints.get(name)
-    const definition = String(constraint?.definition || '').toLowerCase()
-    if (
-      !constraint
-      || constraint.contype !== expected.type
-      || constraint.convalidated !== true
-      || constraint.constrained_columns !== expected.columns
-      || (expected.referencedTable
-        && (constraint.referenced_table !== expected.referencedTable
-          || constraint.referenced_columns !== expected.referencedColumns
-          || constraint.confdeltype !== 'r'))
-      || (expected.tokens || []).some((token) => !definition.includes(token))
-    ) fail(`Target database lacks required commerce order-history constraint: ${name}`)
+    value?.format !== PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT
+    || !Number.isSafeInteger(postgresMajor)
+    || !SHA256.test(text(value?.schemaDigest).toLowerCase())
+    || canonicalJson(value?.migrations) !== canonicalJson(expectedMigrations)
+  ) fail('Target database schema attestation is invalid')
+  return Object.freeze({
+    format: value.format,
+    postgresMajor,
+    schemaDigest: text(value.schemaDigest).toLowerCase(),
+    migrations: expectedMigrations,
+  })
+}
+
+async function assertTargetSchema(client, attester = attestProductionRebindTargetSchema) {
+  try {
+    return normalizedTargetSchemaAttestation(await attester(client))
+  } catch {
+    fail('Target database failed exact production rebind schema attestation')
   }
-  requireHistoryConstraint('operations_commerce_order_history_policies_pkey', {
-    type: 'p',
-    columns: 'organization_id,integration_account_id',
+}
+
+function normalizedTargetKeyAttestationEvidence(value) {
+  let keyId
+  try {
+    keyId = normalizeIntegrationCredentialKeyId(value?.keyId)
+  } catch {
+    fail('Target integration credential key attestation is invalid')
+  }
+  const recordDigest = text(value?.recordDigest).toLowerCase()
+  if (
+    value?.attestationVersion !== INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION
+    || !SHA256.test(recordDigest)
+  ) fail('Target integration credential key attestation is invalid')
+  return Object.freeze({
+    attestationVersion: INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
+    keyId,
+    recordDigest,
   })
-  requireHistoryConstraint('operations_commerce_order_history_policies_provider_check', {
-    type: 'c', columns: 'provider', tokens: ["'shopify'", "'faire'"],
+}
+
+function normalizedTargetKeyAttestation(value) {
+  if (
+    value?.status !== 'verified'
+    || value?.databaseIdentity !== TARGET_DATABASE_IDENTITY
+  ) fail('Target integration credential key attestation is invalid')
+  return normalizedTargetKeyAttestationEvidence({
+    attestationVersion: INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
+    keyId: value.keyId,
+    recordDigest: value.recordDigest,
   })
-  requireHistoryConstraint('operations_commerce_order_history_policies_history_mode_check', {
-    type: 'c',
-    columns: 'history_mode',
-    tokens: COMMERCE_HISTORY_MODES.map((mode) => `'${mode}'`),
-  })
-  requireHistoryConstraint('commerce_order_history_policy_account_fkey', {
-    type: 'f',
-    columns: 'organization_id,integration_account_id',
-    referencedTable: 'operations_integration_accounts',
-    referencedColumns: 'organization_id,id',
-  })
-  requireHistoryConstraint('operations_commerce_order_history_policies_configured_by_fkey', {
-    type: 'f',
-    columns: 'configured_by',
-    referencedTable: 'app_users',
-    referencedColumns: 'email',
-  })
-  requireHistoryConstraint('commerce_order_history_policy_provider_mode_valid', {
-    type: 'c',
-    columns: 'provider,history_mode',
-    tokens: ["'shopify'", "'faire'", "'new_orders_only'", "'last_60_days'"],
-  })
-  requireHistoryConstraint('commerce_order_history_policy_floor_valid', {
-    type: 'c',
-    columns: 'history_mode,ingestion_floor,frozen_at',
-    tokens: ["'provider_all'", 'ingestion_floor is null', 'ingestion_floor is not null',
-      'ingestion_floor <= frozen_at'],
+}
+
+async function assertTargetKeyAttestation(input) {
+  const verifier = input.targetKeyAttestationVerifier
+    || verifyIntegrationCredentialKeyAttestation
+  try {
+    return normalizedTargetKeyAttestation(await verifier({
+      client: input.target,
+      secret: input.targetKey,
+      keyId: input.targetKeyId,
+      expectedDatabaseIdentity: TARGET_DATABASE_IDENTITY,
+    }))
+  } catch {
+    fail('Target database rejected the configured integration credential key')
+  }
+}
+
+async function lockProductionSchemaMigrations(client) {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtext('clawpilot-schema-migrations'))",
+  )
+}
+
+async function lockProductionRebindSchemaRelations(client) {
+  if (
+    !Array.isArray(PRODUCTION_REBIND_CRITICAL_RELATIONS)
+    || PRODUCTION_REBIND_CRITICAL_RELATIONS.length === 0
+    || PRODUCTION_REBIND_CRITICAL_RELATIONS.some(
+      (relation) => !/^public\.[a-z][a-z0-9_]*$/u.test(relation),
+    )
+  ) fail('Production rebind critical relation allowlist is invalid')
+  await client.query(
+    `LOCK TABLE ${SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_RELATION} IN SHARE ROW EXCLUSIVE MODE`,
+  )
+  await client.query(
+    `LOCK TABLE ${PRODUCTION_REBIND_CRITICAL_RELATIONS.join(', ')} IN ACCESS SHARE MODE`,
+  )
+}
+
+async function lockSourceCutoverFence(source, workspace, account) {
+  await source.query(
+    'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+    [`${MIGRATION_SCRIPT_VERSION}:provider-rebind:${workspace.sourceOrganizationId}:${account.sourceId}`],
+  )
+  const result = await source.query(
+    `SELECT integration.global_id, integration.provider,
+            integration.integration_type, integration.environment,
+            fence.migration_name, fence.state, fence.frozen_by,
+            fence.frozen_at, fence.reason
+     FROM operations_integration_accounts integration
+     JOIN operations_commerce_workspace_migration_cutover_fences fence
+       ON fence.organization_id = integration.organization_id
+      AND fence.integration_account_id = integration.id
+     WHERE integration.organization_id = $1::uuid
+       AND integration.id = $2::uuid
+     FOR SHARE OF integration, fence`,
+    [workspace.sourceOrganizationId, account.sourceId],
+  )
+  const row = result.rows[0]
+  const frozenAt = new Date(row?.frozen_at)
+  if (
+    result.rowCount !== 1
+    || row.global_id !== account.sourceGlobalId
+    || row.provider !== account.provider
+    || row.integration_type !== account.integrationType
+    || row.environment !== account.environment
+    || row.migration_name !== MIGRATION_SCRIPT_VERSION
+    || row.state !== 'frozen'
+    || !EMAIL.test(text(row.frozen_by).toLowerCase())
+    || Number.isNaN(frozenAt.getTime())
+  ) fail(`${account.sourceGlobalId} source cutover fence is not frozen and locked`)
+  const evidence = {
+    sourceOrganizationId: workspace.sourceOrganizationId,
+    sourceAccountGlobalId: account.sourceGlobalId,
+    migrationName: row.migration_name,
+    state: row.state,
+    frozenBy: text(row.frozen_by).toLowerCase(),
+    frozenAt: frozenAt.toISOString(),
+    reasonSha256: sha256(text(row.reason)),
+  }
+  return Object.freeze({
+    ...evidence,
+    evidenceDigest: digest(evidence),
   })
 }
 
@@ -1754,7 +2113,8 @@ async function loadCommerceSource(source, workspace, account) {
        ON credential.organization_id = integration.organization_id
       AND credential.integration_account_id = integration.id
      WHERE integration.organization_id = $1::uuid
-       AND integration.id = $2::uuid`,
+       AND integration.id = $2::uuid
+     FOR SHARE OF integration, credential`,
     [workspace.sourceOrganizationId, account.sourceId],
   )
   if (result.rowCount !== 1) fail(`${account.sourceGlobalId} source credential is unavailable`)
@@ -1798,7 +2158,8 @@ async function loadDirectCarrierSource(source, workspace, account) {
       AND carrier.integration_account_id = integration.id
       AND carrier.id = $3::uuid
      WHERE integration.organization_id = $1::uuid
-       AND integration.id = $2::uuid`,
+       AND integration.id = $2::uuid
+     FOR SHARE OF integration, credential, carrier`,
     [workspace.sourceOrganizationId, account.sourceId, account.sourceCarrierAccountId],
   )
   if (result.rowCount !== 1) fail(`${account.sourceGlobalId} direct carrier source is unavailable`)
@@ -1932,6 +2293,39 @@ export function plannedHistoryPolicyEvidence({ account, actor, historyMode, froz
     frozen_at: frozen.toISOString(),
     configured_by: configuredBy,
   }, account, configuredBy)
+}
+
+function plannedShopifyFulfillmentNotificationPolicyEvidence({ account, actor }) {
+  const normalizedActor = text(actor).toLowerCase()
+  if (
+    account?.integrationType !== 'commerce'
+    || account.provider !== 'shopify'
+    || !EMAIL.test(normalizedActor)
+  ) fail(`${account?.sourceGlobalId || 'Selected provider'} notification policy is invalid`)
+  return {
+    policyVersion: SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_VERSION,
+    notifyCustomerDefault: false,
+    revision: 1,
+    changeReason: SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_REASON,
+    createdBy: normalizedActor,
+    updatedBy: normalizedActor,
+  }
+}
+
+function shopifyFulfillmentNotificationPolicyEvidence(row, account, actor) {
+  const evidence = {
+    policyVersion: text(row.notification_policy_version),
+    notifyCustomerDefault: row.notification_notify_customer_default,
+    revision: Number(row.notification_policy_revision),
+    changeReason: text(row.notification_change_reason),
+    createdBy: text(row.notification_created_by).toLowerCase(),
+    updatedBy: text(row.notification_updated_by).toLowerCase(),
+  }
+  const expected = plannedShopifyFulfillmentNotificationPolicyEvidence({ account, actor })
+  if (canonicalJson(evidence) !== canonicalJson(expected)) {
+    fail(`${account.sourceGlobalId} Shopify fulfillment notification policy is missing or invalid`)
+  }
+  return evidence
 }
 
 function targetConfigurationEvidence(configuration, account) {
@@ -2110,10 +2504,12 @@ export function buildManagedRebindMaterial({
 }
 
 function managedRebindMaterialFingerprint(targetKey, material) {
-  return crypto.createHmac('sha256', derivedKey(targetKey))
-    .update('clawpilot:managed-carrier-reauthentication-material:v1\0', 'utf8')
-    .update(canonicalJson(material), 'utf8')
-    .digest('hex')
+  return withDerivedKey(targetKey, (key) => (
+    crypto.createHmac('sha256', key)
+      .update('clawpilot:managed-carrier-reauthentication-material:v1\0', 'utf8')
+      .update(canonicalJson(material), 'utf8')
+      .digest('hex')
+  ))
 }
 
 function assertReviewedManagedMaterialCommitment(input, account) {
@@ -2247,7 +2643,8 @@ async function loadTargetPlaceholder(
             fence.reconnect_eligible, fence.verification_state,
             fence.verified_external_account_id_sha256,
             fence.verified_carrier_account_id::text,
-            fence.verified_carrier_account_identity_sha256
+            fence.verified_carrier_account_identity_sha256,
+            fence.migration_event_key
      FROM operations_integration_accounts integration
      JOIN operations_commerce_migration_provider_identity_fences fence
        ON fence.organization_id = integration.organization_id
@@ -2310,11 +2707,77 @@ async function loadTargetPlaceholder(
     if (policy.rowCount !== 0) {
       fail(`${account.sourceGlobalId} target order-history policy must be absent before rebind`)
     }
+    const notificationPolicy = await target.query(
+      `SELECT 1
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    if (notificationPolicy.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} target Shopify fulfillment notification policy must be absent before rebind`)
+    }
     if (!plannedHistoryPolicy) {
       fail(`${account.sourceGlobalId} requires an explicitly reviewed order-history choice`)
     }
     row.historyPolicy = plannedHistoryPolicy
+    row.fulfillmentNotificationPolicy = account.provider === 'shopify'
+      ? plannedShopifyFulfillmentNotificationPolicyEvidence({ account, actor: plannedHistoryPolicy.configuredBy })
+      : null
     row.storeSyncControl = storeSyncControlEvidence(control.rows[0], account)
+    const locationMappings = await target.query(
+      `SELECT id::text, global_id, external_location_id,
+              external_location_name, external_location_address,
+              warehouse_id::text, location_id::text, inventory_pool_id::text,
+              mapping_method, active, row_version,
+              ownership_classification, provider_snapshot_json,
+              provider_snapshot_hash, provider_observed_at,
+              inventory_import_enabled
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+       ORDER BY id`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    if (account.provider !== 'shopify' && locationMappings.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} has an invalid Shopify location-routing placeholder`)
+    }
+    const allowedLocationIdentities = new Map(
+      identity.inventoryLocationMappingIdentities.map((entry) => [entry.id, entry.globalId]),
+    )
+    if (locationMappings.rows.some((mapping) => (
+      allowedLocationIdentities.get(mapping.id) !== mapping.global_id
+      || !/^gid:\/\/shopify\/Location\/[1-9][0-9]{0,20}$/u.test(mapping.external_location_id)
+      || mapping.mapping_method !== 'manual'
+      || mapping.active !== false
+      || Number(mapping.row_version) !== 0
+      || mapping.ownership_classification !== 'unknown'
+      || canonicalJson(mapping.provider_snapshot_json) !== canonicalJson({})
+      || mapping.provider_snapshot_hash !== null
+      || mapping.provider_observed_at !== null
+      || mapping.inventory_import_enabled !== false
+      || !UUID.test(mapping.warehouse_id)
+      || !UUID.test(mapping.location_id)
+      || !UUID.test(mapping.inventory_pool_id)
+    ))) fail(`${account.sourceGlobalId} Shopify location-routing placeholder changed`)
+    row.locationMappings = locationMappings.rows.map((mapping) => ({
+      id: mapping.id,
+      globalId: mapping.global_id,
+      externalLocationId: mapping.external_location_id,
+      externalLocationName: mapping.external_location_name,
+      externalLocationAddress: mapping.external_location_address,
+      warehouseId: mapping.warehouse_id,
+      locationId: mapping.location_id,
+      inventoryPoolId: mapping.inventory_pool_id,
+      mappingMethod: mapping.mapping_method,
+      active: mapping.active,
+      rowVersion: Number(mapping.row_version),
+      ownershipClassification: mapping.ownership_classification,
+      providerSnapshot: mapping.provider_snapshot_json,
+      providerSnapshotHash: mapping.provider_snapshot_hash,
+      providerObservedAt: mapping.provider_observed_at,
+      inventoryImportEnabled: mapping.inventory_import_enabled,
+    }))
   } else {
     const placeholder = await target.query(
       `SELECT id::text, global_id, provider, environment, display_name,
@@ -2379,6 +2842,46 @@ async function loadTargetPlaceholder(
   return row
 }
 
+function verifiedShopifyLocationBindings(placeholder, verification, account) {
+  if (account.provider !== 'shopify') return []
+  if (!Array.isArray(verification.locations) || !SHA256.test(verification.locationSetSha256 || '')) {
+    fail(`${account.sourceGlobalId} Shopify location evidence is incomplete`)
+  }
+  if (shopifyLocationSetHash(verification.locations) !== verification.locationSetSha256) {
+    fail(`${account.sourceGlobalId} Shopify location-set identity changed`)
+  }
+  const byProviderId = new Map()
+  for (const location of verification.locations) {
+    if (byProviderId.has(location.id)) {
+      fail(`${account.sourceGlobalId} Shopify location identity is ambiguous`)
+    }
+    byProviderId.set(location.id, location)
+  }
+  return (placeholder.locationMappings || []).map((mapping) => {
+    const location = byProviderId.get(mapping.externalLocationId)
+    if (!location || location.isActive !== true || location.shipsInventory !== true) {
+      fail(`${account.sourceGlobalId} Shopify location mapping is missing or no longer importable`)
+    }
+    return {
+      mappingId: mapping.id,
+      mappingGlobalId: mapping.globalId,
+      externalLocationId: location.id,
+      externalLocationName: location.name,
+      externalLocationAddress: location.address,
+      warehouseId: mapping.warehouseId,
+      locationId: mapping.locationId,
+      inventoryPoolId: mapping.inventoryPoolId,
+      ownershipClassification: location.isFulfillmentService
+        ? 'fulfillment_service'
+        : 'merchant_managed',
+      providerSnapshot: location,
+      providerSnapshotHash: shopifyLocationSnapshotHash(location),
+      active: true,
+      inventoryImportEnabled: true,
+    }
+  })
+}
+
 function bytea(value, label) {
   if (!Buffer.isBuffer(value)) fail(`${label} is not binary ciphertext`)
   return value
@@ -2404,15 +2907,17 @@ function decryptedCommerceCredential(row, sourceKey) {
     row.environment,
     row.external_account_id,
   ), 'Commerce credential')
-  const credential = parseCredentialJson(plaintext, 'Commerce credential')
-  if (
-    credential.provider !== row.provider || credential.authMode !== row.auth_mode
-  ) fail('Stored commerce credential metadata changed')
-  return credential
+  return withZeroizedBuffer(plaintext, (decrypted) => {
+    const credential = parseCredentialJson(decrypted, 'Commerce credential')
+    if (
+      credential.provider !== row.provider || credential.authMode !== row.auth_mode
+    ) fail('Stored commerce credential metadata changed')
+    return credential
+  })
 }
 
 function decryptedCarrierMaterial(row, key, organizationId) {
-  const credential = parseCredentialJson(decryptAesGcm({
+  const credentialPlaintext = decryptAesGcm({
     ciphertext: bytea(row.credential_ciphertext, 'Carrier credential ciphertext'),
     iv: bytea(row.credential_iv, 'Carrier credential IV'),
     tag: bytea(row.credential_tag, 'Carrier credential tag'),
@@ -2420,31 +2925,37 @@ function decryptedCarrierMaterial(row, key, organizationId) {
     organizationId,
     row.provider,
     row.environment,
-  ), 'Carrier credential'), 'Carrier credential')
-  const accountNumber = decryptAesGcm({
-    ciphertext: encodedCiphertext(row.account_number_ciphertext, 'Carrier account ciphertext'),
-    iv: encodedCiphertext(row.account_number_iv, 'Carrier account IV'),
-    tag: encodedCiphertext(row.account_number_tag, 'Carrier account tag'),
-  }, key, carrierAccountAad(
-    organizationId,
-    row.provider,
-    row.environment,
-    row.carrier_account_global_id,
-  ), 'Carrier account number').toString('utf8').trim()
-  if (
-    !credential || typeof credential !== 'object'
-    || typeof credential.clientId !== 'string'
-    || typeof credential.clientSecret !== 'string'
-    || !accountNumber || accountNumber.slice(-4) !== row.account_number_last_four
-    || carrierAccountFingerprint(
-      key,
+  ), 'Carrier credential')
+  return withZeroizedBuffer(credentialPlaintext, (decryptedCredential) => {
+    const credential = parseCredentialJson(decryptedCredential, 'Carrier credential')
+    const accountNumberPlaintext = decryptAesGcm({
+      ciphertext: encodedCiphertext(row.account_number_ciphertext, 'Carrier account ciphertext'),
+      iv: encodedCiphertext(row.account_number_iv, 'Carrier account IV'),
+      tag: encodedCiphertext(row.account_number_tag, 'Carrier account tag'),
+    }, key, carrierAccountAad(
       organizationId,
       row.provider,
       row.environment,
-      accountNumber,
-    ) !== row.account_number_fingerprint
-  ) fail('Carrier credential or shipper account identity changed')
-  return { credential, accountNumber }
+      row.carrier_account_global_id,
+    ), 'Carrier account number')
+    return withZeroizedBuffer(accountNumberPlaintext, (decryptedAccountNumber) => {
+      const accountNumber = decryptedAccountNumber.toString('utf8').trim()
+      if (
+        !credential || typeof credential !== 'object'
+        || typeof credential.clientId !== 'string'
+        || typeof credential.clientSecret !== 'string'
+        || !accountNumber || accountNumber.slice(-4) !== row.account_number_last_four
+        || carrierAccountFingerprint(
+          key,
+          organizationId,
+          row.provider,
+          row.environment,
+          accountNumber,
+        ) !== row.account_number_fingerprint
+      ) fail('Carrier credential or shipper account identity changed')
+      return { credential, accountNumber }
+    })
+  })
 }
 
 function withoutMigrationFlags(configuration) {
@@ -2456,6 +2967,130 @@ function withoutMigrationFlags(configuration) {
     'rebindRequestedCapabilities',
   ]) delete next[key]
   return next
+}
+
+function shopifyWebhookConfigurationEvidence(webhooks, accountGlobalId, observedAt) {
+  if (!webhooks?.ready || !GLOBAL_ID.test(accountGlobalId)) {
+    fail('Shopify runtime webhook evidence is not ready for persistence')
+  }
+  const observedAtValue = new Date(observedAt)
+  if (
+    Number.isNaN(observedAtValue.getTime())
+    || observedAtValue.toISOString() !== observedAt
+  ) fail('Shopify runtime webhook evidence timestamp is invalid')
+  const evidence = {}
+  for (const group of SHOPIFY_WEBHOOK_GROUPS) {
+    const readiness = webhooks.groups?.[group.key]
+    if (
+      readiness?.subscriptionGroup !== group.key
+      || readiness.desiredUri !== webhooks.desiredUri
+      || readiness.ready !== true
+      || !Array.isArray(readiness.actions) || readiness.actions.length !== 0
+      || !Array.isArray(readiness.observed)
+      || readiness.observed.length !== group.topics.length
+      || readiness.observed.some((entry) => entry.exact !== true)
+      || canonicalJson(readiness.observed.map((entry) => entry.topic).sort())
+        !== canonicalJson([...group.topics].sort())
+    ) fail(`Shopify ${group.label} webhook evidence is incomplete`)
+    const shared = {
+      desiredUri: webhooks.desiredUri,
+      requiredTopics: [...group.topics].sort(),
+      observedCount: readiness.observed.length,
+      matchingCount: readiness.observed.filter((entry) => entry.exact).length,
+      missingTopics: [],
+      conflictingTopics: [],
+      ready: true,
+      observedAt,
+      providerWrites: 0,
+    }
+    if (group.key === 'webhookSubscriptions') {
+      evidence[group.key] = {
+        accountGlobalId,
+        credentialGeneration: 1,
+        ...shared,
+        discoveryState: 'succeeded',
+        discoveryErrorCode: null,
+      }
+    } else if (group.key === 'orderWebhookSubscriptions') {
+      evidence[group.key] = {
+        accountGlobalId,
+        credentialGeneration: 1,
+        ...shared,
+        requiredIncludeFields: [...SHOPIFY_ORDER_INCLUDE_FIELDS],
+        subscriptionReady: true,
+        processorState: 'available',
+        exactReadProcessorReady: true,
+        scheduledPollBackstop: true,
+        discoveryState: 'succeeded',
+        discoveryErrorCode: null,
+      }
+    } else {
+      evidence[group.key] = shared
+    }
+  }
+  return evidence
+}
+
+function persistShopifyWebhookConfiguration(material, observedAt) {
+  if (material.account.provider !== 'shopify') return
+  material.secret.configuration = {
+    ...material.secret.configuration,
+    ...shopifyWebhookConfigurationEvidence(
+      material.verification.webhooks,
+      material.identity.integrationGlobalId,
+      observedAt,
+    ),
+    lastVerifiedAt: observedAt,
+  }
+  assertNoSecrets(material.secret.configuration, 'Target commerce configuration')
+}
+
+function assertPersistedShopifyWebhookConfiguration(configuration, accountGlobalId, desiredUri) {
+  const value = safeJson(configuration)
+  const lastVerifiedAt = new Date(value.lastVerifiedAt)
+  if (
+    value.migratedProductionCallbackUriSha256 !== sha256(desiredUri)
+    || canonicalJson(value.acceptedReceiptTopics)
+      !== canonicalJson(SHOPIFY_ACCEPTED_RECEIPT_TOPICS)
+    || Number.isNaN(lastVerifiedAt.getTime())
+    || lastVerifiedAt.toISOString() !== value.lastVerifiedAt
+  ) fail('Shopify receipt-intake configuration is incomplete')
+  for (const group of SHOPIFY_WEBHOOK_GROUPS) {
+    const readiness = safeJson(value[group.key])
+    const commonInvalid = (
+      readiness.desiredUri !== desiredUri
+      || canonicalJson(readiness.requiredTopics)
+        !== canonicalJson([...group.topics].sort())
+      || Number(readiness.observedCount) !== group.topics.length
+      || Number(readiness.matchingCount) !== group.topics.length
+      || canonicalJson(readiness.missingTopics) !== '[]'
+      || canonicalJson(readiness.conflictingTopics) !== '[]'
+      || readiness.ready !== true
+      || Number(readiness.providerWrites) !== 0
+      || readiness.observedAt !== value.lastVerifiedAt
+      || Number.isNaN(new Date(readiness.observedAt).getTime())
+      || new Date(readiness.observedAt).toISOString() !== readiness.observedAt
+    )
+    const lineageInvalid = ['webhookSubscriptions', 'orderWebhookSubscriptions'].includes(group.key)
+      && (
+        readiness.accountGlobalId !== accountGlobalId
+        || Number(readiness.credentialGeneration) !== 1
+        || readiness.discoveryState !== 'succeeded'
+        || readiness.discoveryErrorCode !== null
+      )
+    const orderInvalid = group.key === 'orderWebhookSubscriptions'
+      && (
+        canonicalJson(readiness.requiredIncludeFields)
+          !== canonicalJson(SHOPIFY_ORDER_INCLUDE_FIELDS)
+        || readiness.subscriptionReady !== true
+        || readiness.processorState !== 'available'
+        || readiness.exactReadProcessorReady !== true
+        || readiness.scheduledPollBackstop !== true
+      )
+    if (commonInvalid || lineageInvalid || orderInvalid) {
+      fail(`Shopify ${group.label} runtime subscription evidence is missing or invalid`)
+    }
+  }
 }
 
 function commerceTargetConfiguration(placeholder, account, sourceRow, verification) {
@@ -2470,7 +3105,7 @@ function commerceTargetConfiguration(placeholder, account, sourceRow, verificati
     configuration.apiVersion = SHOPIFY_API_VERSION
     configuration.adapterVersion = configuration.adapterVersion || 'shopify-admin-graphql-2026-07-v1'
     configuration.grantedScopes = verification.grantedScopes
-    configuration.acceptedReceiptTopics = [...SHOPIFY_ORDER_TOPICS]
+    configuration.acceptedReceiptTopics = [...SHOPIFY_ACCEPTED_RECEIPT_TOPICS]
     configuration.webhookSecretVerified = false
     configuration.migratedProductionCallbackUriSha256 = sha256(verification.desiredUri)
   } else {
@@ -2523,6 +3158,8 @@ function redactedProviderEvidence(
   placeholder,
   identity,
   managedMaterial = null,
+  targetKeyCommitmentSha256 = null,
+  locationBindings = [],
 ) {
   if (account.integrationType === 'commerce') {
     return {
@@ -2533,16 +3170,49 @@ function redactedProviderEvidence(
       providerIdentitySha256: verification.identitySha256,
       credentialValidation: 'verified_read_only',
       accountOperationalValidation: verification.operationalProbe,
+      targetKeyMaterialCommitmentSha256: targetKeyCommitmentSha256,
+      locationRouting: account.provider === 'shopify' ? {
+        providerLocationSetSha256: verification.locationSetSha256,
+        mappings: locationBindings.map((binding) => ({
+          mappingGlobalId: binding.mappingGlobalId,
+          externalLocationId: binding.externalLocationId,
+          providerSnapshotHash: binding.providerSnapshotHash,
+          ownershipClassification: binding.ownershipClassification,
+          warehouseId: binding.warehouseId,
+          locationId: binding.locationId,
+          inventoryPoolId: binding.inventoryPoolId,
+          active: binding.active,
+          inventoryImportEnabled: binding.inventoryImportEnabled,
+        })),
+        providerWritesDuringRebind: 0,
+      } : null,
+      carrierServiceReadiness: account.provider === 'shopify' ? {
+        disposition: 'operator_registration_and_callback_verification_required_after_rebind',
+        acceptance: 'bound_to_confirmed_rebind_plan_digest',
+        providerMutationDuringRebind: false,
+        checkoutPackMappingsMigrated: false,
+        checkoutPackRegenerationAllowed: false,
+      } : null,
       targetPlaceholder: {
         configuration: placeholder.targetConfiguration,
         storeSyncControl: placeholder.storeSyncControl,
       },
       orderHistoryPolicy: placeholder.historyPolicy,
+      fulfillmentNotificationPolicy: placeholder.fulfillmentNotificationPolicy,
       callback: account.provider === 'shopify' ? {
         desiredUri: verification.desiredUri,
         desiredUriSha256: sha256(verification.desiredUri),
         actions: verification.webhooks.actions,
         observed: verification.webhooks.observed,
+        subscriptionGroups: Object.fromEntries(
+          SHOPIFY_WEBHOOK_GROUPS.map((group) => [group.key, {
+            requiredTopics: [...group.topics],
+            requiredIncludeFields: [...group.includeFields],
+            actions: verification.webhooks.groups[group.key].actions,
+            observed: verification.webhooks.groups[group.key].observed,
+            ready: verification.webhooks.groups[group.key].ready,
+          }]),
+        ),
         providerWritesDuringPlan: 0,
       } : {
         disposition: 'not_applicable_provider_has_no_documented_webhooks',
@@ -2576,20 +3246,22 @@ function redactedProviderEvidence(
       managedMaterial?.reauthenticationMaterialFingerprintSha256 || null,
     credentialValidation: 'verified_read_only',
     accountOperationalValidation: verification.operationalProbe,
+    targetKeyMaterialCommitmentSha256: targetKeyCommitmentSha256,
     providerWritesDuringPlan: 0,
   }
 }
 
 async function collectValidatedMaterials(input) {
   const materials = []
-  const selected = selectedProviderScope(input)
-  if (
-    selected.account.rebindMode !== 'source_authority'
-    && input.managedRebindMaterial !== undefined
-    && input.managedRebindMaterial !== null
-  ) fail('Managed carrier reauthentication material is accepted only for a source-authority rebind')
-  for (const workspace of input.workspaces || WORKSPACES) {
-    for (const account of workspace.accounts) {
+  try {
+    const selected = selectedProviderScope(input)
+    if (
+      selected.account.rebindMode !== 'source_authority'
+      && input.managedRebindMaterial !== undefined
+      && input.managedRebindMaterial !== null
+    ) fail('Managed carrier reauthentication material is accepted only for a source-authority rebind')
+    for (const workspace of input.workspaces || WORKSPACES) {
+      for (const account of workspace.accounts) {
       if (workspace.key !== selected.workspace.key || account.sourceId !== selected.account.sourceId) {
         continue
       }
@@ -2621,6 +3293,16 @@ async function collectValidatedMaterials(input) {
           || verification.providerMutationCount !== 0
           || !String(verification.operationalProbe || '').endsWith('_read_only')
         ) fail(`${account.sourceGlobalId} provider returned a different account identity`)
+        if (
+          isHostedProductionSandboxReadAccount(account)
+          && (
+            verification.webhooks?.ready !== true
+            || !Array.isArray(verification.webhooks?.actions)
+            || verification.webhooks.actions.length !== 0
+          )
+        ) {
+          fail(`${account.sourceGlobalId} hosted sandbox callback must be configured by the operator before rebind; ClawPilot will not mutate the sandbox provider`)
+        }
         const encrypted = encryptSerializedAesGcm(
           JSON.stringify(credential),
           input.targetKey,
@@ -2637,13 +3319,43 @@ async function collectValidatedMaterials(input) {
           sourceRow,
           verification,
         )
+        const locationBindings = verifiedShopifyLocationBindings(
+          placeholder,
+          verification,
+          account,
+        )
+        const targetKeyCommitmentSha256 = targetKeyMaterialCommitment(
+          input.targetKey,
+          'commerce-provider-material-v1',
+          {
+            targetOrganizationId: workspace.targetOrganizationId,
+            targetIntegrationAccountId: identity.integrationId,
+            provider: account.provider,
+            environment: account.environment,
+            externalAccountId: sourceRow.external_account_id,
+            authMode: sourceRow.auth_mode,
+            credential,
+            finalGrantedScopes: account.provider === 'shopify'
+              ? [...verification.grantedScopes].sort()
+              : [],
+          },
+        )
         materials.push({
           workspace,
           account,
           identity,
           placeholder,
           verification,
-          redacted: redactedProviderEvidence(account, verification, placeholder, identity),
+          redacted: redactedProviderEvidence(
+            account,
+            verification,
+            placeholder,
+            identity,
+            null,
+            targetKeyCommitmentSha256,
+            locationBindings,
+          ),
+          locationBindings,
           secret: {
             credential,
             externalAccountId: sourceRow.external_account_id,
@@ -2736,46 +3448,70 @@ async function collectValidatedMaterials(input) {
         ),
       )
       const configuration = carrierTargetConfiguration(placeholder, account)
-      materials.push({
-        workspace,
-        account,
-        identity,
-        placeholder,
-        verification,
-        redacted: redactedProviderEvidence(
-          account,
-          verification,
-          placeholder,
-          identity,
-          account.rebindMode === 'source_authority' ? decrypted : null,
-        ),
-        secret: {
+      const targetKeyCommitmentSha256 = targetKeyMaterialCommitment(
+        input.targetKey,
+        'carrier-provider-material-v1',
+        {
+          targetOrganizationId: workspace.targetOrganizationId,
+          targetIntegrationAccountId: identity.integrationId,
+          targetCarrierAccountId: identity.carrierAccountId,
+          provider: account.provider,
+          environment: account.environment,
           credential: decrypted.credential,
-          encryptedCredential,
-          encryptedAccountNumber,
           accountNumber: decrypted.accountNumber,
-          targetAccountFingerprint,
-          registeredAddress: address,
-          addressVerification: sourceRow.address_verification,
-          configuration,
-          displayName: placeholder.carrierPlaceholder.display_name,
-          senderName: placeholder.carrierPlaceholder.sender_name,
-          allowSenderBilling: sourceRow.allow_sender_billing,
-          allowRecipientBilling: sourceRow.allow_recipient_billing,
-          allowThirdPartyBilling: sourceRow.allow_third_party_billing,
         },
-      })
+      )
+        materials.push({
+          workspace,
+          account,
+          identity,
+          placeholder,
+          verification,
+          redacted: redactedProviderEvidence(
+            account,
+            verification,
+            placeholder,
+            identity,
+            account.rebindMode === 'source_authority' ? decrypted : null,
+            targetKeyCommitmentSha256,
+          ),
+          secret: {
+            credential: decrypted.credential,
+            encryptedCredential,
+            encryptedAccountNumber,
+            accountNumber: decrypted.accountNumber,
+            targetAccountFingerprint,
+            registeredAddress: address,
+            addressVerification: sourceRow.address_verification,
+            configuration,
+            displayName: placeholder.carrierPlaceholder.display_name,
+            senderName: placeholder.carrierPlaceholder.sender_name,
+            allowSenderBilling: sourceRow.allow_sender_billing,
+            allowRecipientBilling: sourceRow.allow_recipient_billing,
+            allowThirdPartyBilling: sourceRow.allow_third_party_billing,
+          },
+        })
+      }
     }
+    if (materials.length !== 1) fail('Exactly one selected provider must be validated per rebind plan')
+    return materials
+  } catch (error) {
+    destroyValidatedMaterials(materials)
+    throw error
   }
-  if (materials.length !== 1) fail('Exactly one selected provider must be validated per rebind plan')
-  return materials
 }
 
 function redactedMaterialProjection(materials) {
   return materials.map((material) => material.redacted)
 }
 
-function buildPlanArtifact(input, materials, createdAt) {
+function buildPlanArtifact(
+  input,
+  materials,
+  createdAt,
+  targetSchemaAttestation,
+  targetKeyAttestation,
+) {
   const workspaces = input.workspaces || WORKSPACES
   const artifact = {
     format: PLAN_FORMAT,
@@ -2794,6 +3530,7 @@ function buildPlanArtifact(input, materials, createdAt) {
       railwayEnvironmentId: SOURCE_RAILWAY_ENVIRONMENT_ID,
       databaseIdentity: SOURCE_DATABASE_IDENTITY,
       endpointSha256: input.bindings.source,
+      cutoverFence: input.sourceCutoverFence,
     },
     target: {
       railwayProjectId: RAILWAY_PROJECT_ID,
@@ -2801,6 +3538,8 @@ function buildPlanArtifact(input, materials, createdAt) {
       databaseIdentity: TARGET_DATABASE_IDENTITY,
       endpointSha256: input.bindings.target,
       publicOrigin: PRODUCTION_PUBLIC_ORIGIN,
+      schemaAttestation: targetSchemaAttestation,
+      integrationCredentialKeyAttestation: targetKeyAttestation,
     },
     exclusions: {
       mockProviders: true,
@@ -2833,6 +3572,12 @@ function buildPlanArtifact(input, materials, createdAt) {
 }
 
 function assertPlanEnvelope(plan, input) {
+  const reviewedSchemaAttestation = normalizedTargetSchemaAttestation(
+    plan?.target?.schemaAttestation,
+  )
+  const reviewedKeyAttestation = normalizedTargetKeyAttestationEvidence(
+    plan?.target?.integrationCredentialKeyAttestation,
+  )
   if (
     plan?.format !== PLAN_FORMAT
     || plan.scriptVersion !== SCRIPT_VERSION
@@ -2847,8 +3592,16 @@ function assertPlanEnvelope(plan, input) {
     || plan.source?.databaseIdentity !== SOURCE_DATABASE_IDENTITY
     || plan.target?.databaseIdentity !== TARGET_DATABASE_IDENTITY
     || plan.source?.endpointSha256 !== input.bindings.source
+    || canonicalJson(plan.source?.cutoverFence)
+      !== canonicalJson(input.sourceCutoverFence)
     || plan.target?.endpointSha256 !== input.bindings.target
     || plan.target?.publicOrigin !== PRODUCTION_PUBLIC_ORIGIN
+    || (input.targetSchemaAttestation
+      && canonicalJson(reviewedSchemaAttestation)
+        !== canonicalJson(input.targetSchemaAttestation))
+    || (input.targetKeyAttestation
+      && canonicalJson(reviewedKeyAttestation)
+        !== canonicalJson(input.targetKeyAttestation))
     || plan.applyReady !== true
     || plan.planDigest !== planDigest(plan)
     || plan.planDigest !== input.confirmDigest
@@ -2889,7 +3642,7 @@ function assertReviewedPlan(plan, input, materials) {
 }
 
 async function applyCommerceMaterial(client, material, actor) {
-  const { workspace, account, identity, secret } = material
+  const { workspace, account, identity, secret, placeholder } = material
   const locked = await client.query(
     `SELECT account.status, account.external_account_id,
             account.credential_reference, account.commerce_credential_generation,
@@ -3018,6 +3771,116 @@ async function applyCommerceMaterial(client, material, actor) {
   if (updated.rowCount !== 1 || updated.rows[0].global_id !== identity.integrationGlobalId) {
     fail(`${account.sourceGlobalId} commerce placeholder did not activate`)
   }
+  if (account.provider === 'shopify') {
+    for (const binding of material.locationBindings || []) {
+      const location = await client.query(
+        `UPDATE operations_commerce_inventory_location_mappings
+         SET external_location_name = $9,
+             external_location_address = $10::jsonb,
+             mapping_method = 'manual',
+             active = true,
+             row_version = 1,
+             ownership_classification = $11,
+             provider_snapshot_json = $12::jsonb,
+             provider_snapshot_hash = $13,
+             provider_observed_at = clock_timestamp(),
+             inventory_import_enabled = true,
+             updated_by = $14,
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+           AND global_id = $4
+           AND external_location_id = $5
+           AND warehouse_id = $6::uuid
+           AND location_id = $7::uuid
+           AND inventory_pool_id = $8::uuid
+           AND mapping_method = 'manual'
+           AND active = false
+           AND row_version = 0
+           AND ownership_classification = 'unknown'
+           AND provider_snapshot_json = '{}'::jsonb
+           AND provider_snapshot_hash IS NULL
+           AND provider_observed_at IS NULL
+           AND inventory_import_enabled = false
+         RETURNING id::text, global_id, external_location_id,
+                   external_location_name, external_location_address,
+                   warehouse_id::text, location_id::text, inventory_pool_id::text,
+                   mapping_method, active, row_version,
+                   ownership_classification, provider_snapshot_json,
+                   provider_snapshot_hash, inventory_import_enabled`,
+        [
+          workspace.targetOrganizationId,
+          identity.integrationId,
+          binding.mappingId,
+          binding.mappingGlobalId,
+          binding.externalLocationId,
+          binding.warehouseId,
+          binding.locationId,
+          binding.inventoryPoolId,
+          binding.externalLocationName,
+          JSON.stringify(binding.externalLocationAddress),
+          binding.ownershipClassification,
+          JSON.stringify(binding.providerSnapshot),
+          binding.providerSnapshotHash,
+          actor,
+        ],
+      )
+      if (location.rowCount !== 1) {
+        fail(`${account.sourceGlobalId} Shopify location-routing placeholder did not materialize exactly once`)
+      }
+    }
+  }
+  if (isHostedProductionSandboxReadAccount(account)) {
+    const authority = await client.query(
+      `INSERT INTO operations_commerce_hosted_production_sandbox_read_authorizations (
+         organization_id, integration_account_id, authorization_version,
+         state, capabilities, provider_writes_enabled,
+         automatic_order_promotion_enabled,
+         authorized_credential_generation,
+         verified_external_account_id_sha256,
+         migration_receipt_event_key,
+         authorized_by, authorized_at, expires_at, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, 1,
+         'active', $3::text[], false, false,
+         1, $4, $5,
+         $6, clock_timestamp(), clock_timestamp() + interval '90 days', $7
+       )
+       RETURNING authorization_version, state, capabilities,
+                 provider_writes_enabled, automatic_order_promotion_enabled,
+                 authorized_credential_generation,
+                 verified_external_account_id_sha256,
+                 migration_receipt_event_key,
+                 authorized_by, authorized_at, expires_at`,
+      [
+        workspace.targetOrganizationId,
+        identity.integrationId,
+        [...HOSTED_PRODUCTION_SANDBOX_READ_CAPABILITIES],
+        account.externalAccountIdSha256,
+        placeholder.migration_event_key,
+        actor,
+        'Approved hosted-production read-only operation for the migrated Shopify sandbox demo store',
+      ],
+    )
+    const row = authority.rows[0]
+    if (authority.rowCount !== 1) {
+      fail(`${account.sourceGlobalId} hosted sandbox read authority was not created`)
+    }
+    material.hostedProductionSandboxReadAuthority = {
+      authorizationVersion: Number(row.authorization_version),
+      state: row.state,
+      capabilities: row.capabilities,
+      providerWritesEnabled: row.provider_writes_enabled,
+      automaticOrderPromotionEnabled: row.automatic_order_promotion_enabled,
+      authorizedCredentialGeneration: Number(row.authorized_credential_generation),
+      verifiedExternalAccountIdSha256: row.verified_external_account_id_sha256,
+      migrationReceiptEventKey: row.migration_receipt_event_key,
+      authorizedBy: row.authorized_by,
+      authorizedAt: new Date(row.authorized_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+    }
+  }
   for (const resource of COMMERCE_SYNC_RESOURCES[account.provider] || []) {
     await client.query(
       `INSERT INTO operations_commerce_sync_cursors (
@@ -3045,16 +3908,36 @@ async function applyCommerceMaterial(client, material, actor) {
   )
   if (control.rowCount !== 1) fail(`${account.sourceGlobalId} Store sync control was not released`)
   if (account.provider === 'shopify') {
-    await client.query(
+    const notificationPolicy = await client.query(
       `INSERT INTO operations_shopify_fulfillment_notification_policies (
          organization_id, integration_account_id, policy_version,
          notify_customer_default, revision, change_reason, created_by, updated_by
        ) VALUES (
-         $1::uuid, $2::uuid, 'shopify-fulfillment-notification-v1',
-         false, 1, 'Safe default established during approved production rebind', $3, $3
-       ) ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
-      [workspace.targetOrganizationId, identity.integrationId, actor],
+         $1::uuid, $2::uuid, $3,
+         false, 1, $4, $5, $5
+       )
+       RETURNING policy_version AS notification_policy_version,
+                 notify_customer_default AS notification_notify_customer_default,
+                 revision AS notification_policy_revision,
+                 change_reason AS notification_change_reason,
+                 created_by AS notification_created_by,
+                 updated_by AS notification_updated_by`,
+      [
+        workspace.targetOrganizationId,
+        identity.integrationId,
+        SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_VERSION,
+        SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_REASON,
+        actor,
+      ],
     )
+    if (
+      notificationPolicy.rowCount !== 1
+      || canonicalJson(shopifyFulfillmentNotificationPolicyEvidence(
+        notificationPolicy.rows[0],
+        account,
+        actor,
+      )) !== canonicalJson(placeholder.fulfillmentNotificationPolicy)
+    ) fail(`${account.sourceGlobalId} safe Shopify fulfillment notification policy was not inserted atomically`)
   }
 }
 
@@ -3220,20 +4103,177 @@ async function applyCarrierMaterial(client, material, actor) {
   }
 }
 
+function shopifyLocationRoutingPostState(material) {
+  if (material.account.provider !== 'shopify') return null
+  return {
+    providerLocationSetSha256: material.verification.locationSetSha256,
+    mappings: [...(material.locationBindings || [])]
+      .sort((left, right) => left.mappingId.localeCompare(right.mappingId))
+      .map((binding) => ({
+        mappingId: binding.mappingId,
+        mappingGlobalId: binding.mappingGlobalId,
+        externalLocationId: binding.externalLocationId,
+        externalLocationName: binding.externalLocationName,
+        externalLocationAddress: binding.externalLocationAddress,
+        warehouseId: binding.warehouseId,
+        locationId: binding.locationId,
+        inventoryPoolId: binding.inventoryPoolId,
+        mappingMethod: 'manual',
+        active: true,
+        rowVersion: 1,
+        ownershipClassification: binding.ownershipClassification,
+        providerSnapshotHash: binding.providerSnapshotHash,
+        inventoryImportEnabled: true,
+      })),
+  }
+}
+
+function hostedSandboxReadAuthorityRow(row) {
+  return {
+    authorizationVersion: Number(row.authorization_version),
+    state: row.state,
+    capabilities: row.capabilities,
+    providerWritesEnabled: row.provider_writes_enabled,
+    automaticOrderPromotionEnabled: row.automatic_order_promotion_enabled,
+    authorizedCredentialGeneration: Number(row.authorized_credential_generation),
+    verifiedExternalAccountIdSha256: row.verified_external_account_id_sha256,
+    migrationReceiptEventKey: row.migration_receipt_event_key,
+    authorizedBy: row.authorized_by,
+    authorizedAt: new Date(row.authorized_at).toISOString(),
+    expiresAt: new Date(row.expires_at).toISOString(),
+  }
+}
+
+async function assertMaterializedCommerceCutoverExtensions(client, material) {
+  const { workspace, account, identity } = material
+  if (account.provider === 'shopify') {
+    const locations = await client.query(
+      `SELECT id::text, global_id, external_location_id,
+              external_location_name, external_location_address,
+              warehouse_id::text, location_id::text, inventory_pool_id::text,
+              mapping_method, active, row_version,
+              ownership_classification, provider_snapshot_json,
+              provider_snapshot_hash, provider_observed_at,
+              inventory_import_enabled
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+       ORDER BY id`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    const expected = [...(material.locationBindings || [])]
+      .sort((left, right) => left.mappingId.localeCompare(right.mappingId))
+    if (locations.rowCount !== expected.length) {
+      fail(`${account.sourceGlobalId} materialized Shopify location-routing count changed`)
+    }
+    locations.rows.forEach((row, index) => {
+      const binding = expected[index]
+      const observedAt = new Date(row.provider_observed_at)
+      if (
+        row.id !== binding.mappingId
+        || row.global_id !== binding.mappingGlobalId
+        || row.external_location_id !== binding.externalLocationId
+        || row.external_location_name !== binding.externalLocationName
+        || canonicalJson(row.external_location_address)
+          !== canonicalJson(binding.externalLocationAddress)
+        || row.warehouse_id !== binding.warehouseId
+        || row.location_id !== binding.locationId
+        || row.inventory_pool_id !== binding.inventoryPoolId
+        || row.mapping_method !== 'manual'
+        || row.active !== true
+        || Number(row.row_version) !== 1
+        || row.ownership_classification !== binding.ownershipClassification
+        || canonicalJson(row.provider_snapshot_json)
+          !== canonicalJson(binding.providerSnapshot)
+        || row.provider_snapshot_hash !== binding.providerSnapshotHash
+        || Number.isNaN(observedAt.getTime())
+        || row.inventory_import_enabled !== true
+      ) fail(`${account.sourceGlobalId} materialized Shopify location-routing identity changed`)
+    })
+  }
+
+  const authorities = await client.query(
+    `SELECT authorization_version, state, capabilities,
+            provider_writes_enabled, automatic_order_promotion_enabled,
+            authorized_credential_generation,
+            verified_external_account_id_sha256,
+            migration_receipt_event_key,
+            authorized_by, authorized_at, expires_at
+     FROM operations_commerce_hosted_production_sandbox_read_authorizations
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+     ORDER BY authorization_version`,
+    [workspace.targetOrganizationId, identity.integrationId],
+  )
+  if (!isHostedProductionSandboxReadAccount(account)) {
+    if (authorities.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} received an unauthorized hosted sandbox read grant`)
+    }
+    return
+  }
+  const authority = authorities.rows[0]
+  const observed = authority ? hostedSandboxReadAuthorityRow(authority) : null
+  if (
+    authorities.rowCount !== 1
+    || canonicalJson(observed)
+      !== canonicalJson(material.hostedProductionSandboxReadAuthority)
+    || observed.authorizationVersion !== 1
+    || observed.state !== 'active'
+    || canonicalJson(observed.capabilities)
+      !== canonicalJson(HOSTED_PRODUCTION_SANDBOX_READ_CAPABILITIES)
+    || observed.providerWritesEnabled !== false
+    || observed.automaticOrderPromotionEnabled !== false
+    || observed.authorizedCredentialGeneration !== 1
+    || observed.verifiedExternalAccountIdSha256 !== account.externalAccountIdSha256
+    || observed.migrationReceiptEventKey !== material.placeholder.migration_event_key
+  ) fail(`${account.sourceGlobalId} hosted sandbox read authority is incomplete`)
+  const current = await client.query(
+    `SELECT bool_and(
+              operations_commerce_hosted_production_sandbox_read_is_current(
+                $1::uuid, $2::uuid, capability
+              )
+            ) AS all_capabilities_current
+     FROM unnest($3::text[]) capability`,
+    [
+      workspace.targetOrganizationId,
+      identity.integrationId,
+      [...HOSTED_PRODUCTION_SANDBOX_READ_CAPABILITIES],
+    ],
+  )
+  if (current.rows[0]?.all_capabilities_current !== true) {
+    fail(`${account.sourceGlobalId} hosted sandbox read authority is not current`)
+  }
+}
+
 async function assertMaterializedTarget(client, material, targetKey, actor) {
   const { workspace, account, identity, secret } = material
   if (account.integrationType === 'commerce') {
     const result = await client.query(
-      `SELECT account.status, account.external_account_id,
+      `SELECT account.status, account.global_id, account.provider,
+              account.integration_type, account.environment,
+              account.external_account_id, account.credential_reference,
               account.commerce_credential_generation,
               account.receipt_intake_enabled, account.configuration,
+              credential.external_account_id AS credential_external_account_id,
               credential.auth_mode, credential.credential_ciphertext,
               credential.credential_iv, credential.credential_tag,
               credential.credential_version, credential.verification_status,
               credential.webhook_verification_status, fence.verification_state,
-              control.desired_state, control.explicit_choice,
+              fence.expected_external_account_id_sha256,
+              fence.verified_external_account_id_sha256,
+              control.desired_state, control.explicit_choice, control.revision,
+              (SELECT array_agg(cursor.resource ORDER BY cursor.resource)
+                 FROM operations_commerce_sync_cursors cursor
+                WHERE cursor.organization_id = account.organization_id
+                  AND cursor.integration_account_id = account.id) AS cursor_resources,
               history.provider AS history_provider, history.history_mode,
-              history.ingestion_floor, history.frozen_at, history.configured_by
+              history.ingestion_floor, history.frozen_at, history.configured_by,
+              notification.policy_version AS notification_policy_version,
+              notification.notify_customer_default AS notification_notify_customer_default,
+              notification.revision AS notification_policy_revision,
+              notification.change_reason AS notification_change_reason,
+              notification.created_by AS notification_created_by,
+              notification.updated_by AS notification_updated_by
        FROM operations_integration_accounts account
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
@@ -3247,24 +4287,52 @@ async function assertMaterializedTarget(client, material, targetKey, actor) {
        JOIN operations_commerce_order_history_policies history
          ON history.organization_id = account.organization_id
         AND history.integration_account_id = account.id
+       LEFT JOIN operations_shopify_fulfillment_notification_policies notification
+         ON notification.organization_id = account.organization_id
+        AND notification.integration_account_id = account.id
        WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
       [workspace.targetOrganizationId, identity.integrationId],
     )
     const row = result.rows[0]
     if (
       result.rowCount !== 1 || row.status !== 'active'
+      || row.global_id !== identity.integrationGlobalId
+      || row.provider !== account.provider
+      || row.integration_type !== 'commerce'
+      || row.environment !== account.environment
       || row.external_account_id !== secret.externalAccountId
+      || row.credential_external_account_id !== secret.externalAccountId
+      || row.credential_reference !== `commerce-credential:${identity.integrationId}:v1`
       || Number(row.commerce_credential_generation) !== 1
       || Number(row.credential_version) !== 1
+      || row.auth_mode !== secret.authMode
       || row.verification_status !== 'verified'
       || row.verification_state !== 'verified'
+      || row.expected_external_account_id_sha256 !== account.externalAccountIdSha256
+      || row.verified_external_account_id_sha256 !== account.externalAccountIdSha256
       || row.desired_state !== 'running' || row.explicit_choice !== true
+      || Number(row.revision) !== Number(material.placeholder.storeSyncControl.revision) + 1
+      || canonicalJson(row.cursor_resources || []) !== canonicalJson(
+        [...COMMERCE_SYNC_RESOURCES[account.provider]].sort(),
+      )
       || row.receipt_intake_enabled !== (account.provider === 'shopify')
       || row.webhook_verification_status
         !== (account.provider === 'shopify' ? 'unverified' : 'not_applicable')
       || canonicalJson(historyPolicyEvidence(row, account, actor))
         !== canonicalJson(material.placeholder.historyPolicy)
+      || (account.provider === 'shopify'
+        ? canonicalJson(shopifyFulfillmentNotificationPolicyEvidence(row, account, actor))
+          !== canonicalJson(material.placeholder.fulfillmentNotificationPolicy)
+        : row.notification_policy_version !== null)
     ) fail(`${account.sourceGlobalId} target commerce post-state is incomplete`)
+    if (account.provider === 'shopify') {
+      assertPersistedShopifyWebhookConfiguration(
+        row.configuration,
+        identity.integrationGlobalId,
+        material.verification.desiredUri,
+      )
+    }
+    await assertMaterializedCommerceCutoverExtensions(client, material)
     const plaintext = decryptAesGcm({
       ciphertext: bytea(row.credential_ciphertext, 'Target commerce ciphertext'),
       iv: bytea(row.credential_iv, 'Target commerce IV'),
@@ -3275,12 +4343,12 @@ async function assertMaterializedTarget(client, material, targetKey, actor) {
       account.environment,
       row.external_account_id,
     ), 'Target commerce credential')
-    if (canonicalJson(parseCredentialJson(plaintext, 'Target commerce credential'))
-      !== canonicalJson(secret.credential)) {
-      plaintext.fill(0)
-      fail(`${account.sourceGlobalId} target commerce credential round trip changed`)
-    }
-    plaintext.fill(0)
+    withZeroizedBuffer(plaintext, (decrypted) => {
+      if (canonicalJson(parseCredentialJson(decrypted, 'Target commerce credential'))
+        !== canonicalJson(secret.credential)) {
+        fail(`${account.sourceGlobalId} target commerce credential round trip changed`)
+      }
+    })
     return
   }
   const result = await client.query(
@@ -3330,12 +4398,12 @@ async function assertMaterializedTarget(client, material, targetKey, actor) {
     account.provider,
     account.environment,
   ), 'Target carrier credential')
-  if (canonicalJson(parseCredentialJson(credentialPlaintext, 'Target carrier credential'))
-    !== canonicalJson(secret.credential)) {
-    credentialPlaintext.fill(0)
-    fail(`${account.sourceGlobalId} target carrier credential round trip changed`)
-  }
-  credentialPlaintext.fill(0)
+  withZeroizedBuffer(credentialPlaintext, (decrypted) => {
+    if (canonicalJson(parseCredentialJson(decrypted, 'Target carrier credential'))
+      !== canonicalJson(secret.credential)) {
+      fail(`${account.sourceGlobalId} target carrier credential round trip changed`)
+    }
+  })
   const accountNumberPlaintext = decryptAesGcm({
     ciphertext: encodedCiphertext(row.account_number_ciphertext, 'Target carrier account ciphertext'),
     iv: encodedCiphertext(row.account_number_iv, 'Target carrier account IV'),
@@ -3346,11 +4414,11 @@ async function assertMaterializedTarget(client, material, targetKey, actor) {
     account.environment,
     identity.carrierAccountGlobalId,
   ), 'Target carrier account')
-  if (accountNumberPlaintext.toString('utf8') !== secret.accountNumber) {
-    accountNumberPlaintext.fill(0)
-    fail(`${account.sourceGlobalId} target carrier round trip changed`)
-  }
-  accountNumberPlaintext.fill(0)
+  withZeroizedBuffer(accountNumberPlaintext, (decrypted) => {
+    if (decrypted.toString('utf8') !== secret.accountNumber) {
+      fail(`${account.sourceGlobalId} target carrier round trip changed`)
+    }
+  })
 }
 
 function reviewedReceiptProviders(plan) {
@@ -3365,12 +4433,71 @@ function reviewedReceiptProviders(plan) {
   })
 }
 
+function materializedProviderReceiptEvidence(material, confirmedPlanDigest) {
+  const { account, identity, secret } = material
+  if (account.integrationType === 'commerce') {
+    const postState = {
+      targetAccountGlobalId: identity.integrationGlobalId,
+      externalAccountIdSha256: account.externalAccountIdSha256,
+      credentialReference: `commerce-credential:${identity.integrationId}:v1`,
+      credentialGeneration: 1,
+      credentialDecryptability: 'verified_at_commit',
+      receiptIntakeEnabled: account.provider === 'shopify',
+      storeSync: {
+        desiredState: 'running',
+        explicitChoice: true,
+        revision: Number(material.placeholder.storeSyncControl.revision) + 1,
+        cursorResources: [...COMMERCE_SYNC_RESOURCES[account.provider]].sort(),
+      },
+      shopifyWebhookSubscriptionGroups: account.provider === 'shopify'
+        ? Object.fromEntries(SHOPIFY_WEBHOOK_GROUPS.map((group) => [
+            group.key,
+            structuredClone(secret.configuration[group.key]),
+          ]))
+        : null,
+      shopifyLocationRouting: shopifyLocationRoutingPostState(material),
+      hostedProductionSandboxReadAuthority:
+        isHostedProductionSandboxReadAccount(account)
+          ? structuredClone(material.hostedProductionSandboxReadAuthority)
+          : null,
+      carrierServiceReadiness: account.provider === 'shopify' ? {
+        status: 'operator_registration_and_callback_verification_required',
+        acceptedWithPlanDigest: confirmedPlanDigest,
+        providerMutationDuringRebind: false,
+        carrierServiceVerified: false,
+        checkoutPackRegenerationAllowed: false,
+      } : null,
+    }
+    assertNoSecrets(postState, 'Materialized commerce receipt evidence')
+    return postState
+  }
+  const postState = {
+    targetAccountGlobalId: identity.integrationGlobalId,
+    targetCarrierAccountGlobalId: identity.carrierAccountGlobalId,
+    credentialReference: `carrier-credential:${identity.integrationId}:v1`,
+    credentialGeneration: 1,
+    credentialDecryptability: 'verified_at_commit',
+    carrierAccountDecryptability: 'verified_at_commit',
+  }
+  assertNoSecrets(postState, 'Materialized carrier receipt evidence')
+  return postState
+}
+
 function rebindReceiptPayload(input, workspace, materials, plan, providerWrites) {
   const selected = materials.filter((material) => material.workspace.key === workspace.key)
   const selectedSourceIds = new Set(selected.map((material) => material.account.sourceGlobalId))
-  const providers = reviewedReceiptProviders(plan).filter((provider) => (
-    selectedSourceIds.has(provider.sourceAccountGlobalId)
-  ))
+  const materialBySourceId = new Map(selected.map((material) => (
+    [material.account.sourceGlobalId, material]
+  )))
+  const providers = reviewedReceiptProviders(plan)
+    .filter((provider) => selectedSourceIds.has(provider.sourceAccountGlobalId))
+    .map((provider) => ({
+      ...provider,
+      materializedPostState: materializedProviderReceiptEvidence(
+        materialBySourceId.get(provider.sourceAccountGlobalId),
+        plan.planDigest,
+      ),
+    }))
   const payload = {
     format: RECEIPT_FORMAT,
     scriptVersion: SCRIPT_VERSION,
@@ -3428,6 +4555,9 @@ async function reconcileReviewedCallbacks(materials, verifier) {
   for (const material of materials) {
     if (material.account.provider !== 'shopify') continue
     const expected = material.redacted.callback.actions
+    if (isHostedProductionSandboxReadAccount(material.account) && expected.length !== 0) {
+      fail(`${material.account.sourceGlobalId} hosted sandbox rebind cannot mutate provider callbacks`)
+    }
     const after = await verifier.reconcileShopify(material.verification, expected)
     if (!after.ready) fail(`${material.account.sourceGlobalId} callback did not become ready`)
     material.verification.webhooks = after
@@ -3483,6 +4613,16 @@ async function lockReviewedTargetAccount(client, material, actor) {
       [workspace.targetOrganizationId, identity.integrationId],
     )
     if (policy.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} commerce placeholder changed before provider reconciliation`)
+    }
+    const notificationPolicy = await client.query(
+      `SELECT 1
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    if (notificationPolicy.rowCount !== 0) {
       fail(`${account.sourceGlobalId} commerce placeholder changed before provider reconciliation`)
     }
     return
@@ -3571,6 +4711,18 @@ export async function applyValidatedMaterials(input, materials, plan) {
   }
   await input.target.query('BEGIN ISOLATION LEVEL SERIALIZABLE')
   try {
+    await lockProductionSchemaMigrations(input.target)
+    await lockProductionRebindSchemaRelations(input.target)
+    const targetSchemaAttestation = await assertTargetSchema(
+      input.target,
+      input.targetSchemaAttester,
+    )
+    const targetKeyAttestation = await assertTargetKeyAttestation(input)
+    const attestedInput = {
+      ...input,
+      targetSchemaAttestation,
+      targetKeyAttestation,
+    }
     await lockReviewedTargetAccount(input.target, materials[0], input.actor)
     await assertDatabaseBoundary(input.source, input.target)
     await assertCommittedMigrationReceipts(
@@ -3579,13 +4731,17 @@ export async function applyValidatedMaterials(input, materials, plan) {
       input.mapping,
       input.workspaces || WORKSPACES,
     )
-    assertReviewedPlan(plan, input, materials)
+    assertReviewedPlan(plan, attestedInput, materials)
     await assertRebindPlanFreshness(
       plan,
       await targetDatabaseTimestamp(input.target),
     )
     await insertReviewedHistoryPolicy(input.target, materials[0], input.actor)
     const providerWrites = await reconcileReviewedCallbacks(materials, input.verifier)
+    const webhookEvidenceObservedAt = await targetDatabaseTimestamp(input.target)
+    for (const material of materials) {
+      persistShopifyWebhookConfiguration(material, webhookEvidenceObservedAt)
+    }
     for (const material of materials) {
       if (material.account.integrationType === 'commerce') {
         await applyCommerceMaterial(input.target, material, input.actor)
@@ -3633,7 +4789,16 @@ export async function planRebind(input) {
     fail('--history-mode is accepted only for a commerce provider rebind plan')
   }
   await assertDatabaseBoundary(input.source, input.target)
-  await assertTargetSchema(input.target)
+  const sourceCutoverFence = await lockSourceCutoverFence(
+    input.source,
+    selected.workspace,
+    selected.account,
+  )
+  const targetSchemaAttestation = await assertTargetSchema(
+    input.target,
+    input.targetSchemaAttester,
+  )
+  const targetKeyAttestation = await assertTargetKeyAttestation(input)
   const createdAt = await targetDatabaseTimestamp(input.target)
   const plannedHistoryPolicy = selected.account.integrationType === 'commerce'
     ? plannedHistoryPolicyEvidence({
@@ -3660,10 +4825,22 @@ export async function planRebind(input) {
     ...input,
     workspaces,
     plannedHistoryPolicy,
+    sourceCutoverFence,
   })
-  return {
-    plan: buildPlanArtifact({ ...input, workspaces }, materials, createdAt),
-    materials,
+  try {
+    return {
+      plan: buildPlanArtifact(
+        { ...input, workspaces, sourceCutoverFence },
+        materials,
+        createdAt,
+        targetSchemaAttestation,
+        targetKeyAttestation,
+      ),
+      materials,
+    }
+  } catch (error) {
+    destroyValidatedMaterials(materials)
+    throw error
   }
 }
 
@@ -3672,8 +4849,12 @@ export async function applyRebind(input) {
   if (text(input.historyMode)) {
     fail('--history-mode is not accepted during apply; use the reviewed plan choice')
   }
-  assertPlanEnvelope(input.plan, { ...input, workspaces })
   const selected = selectedProviderScope({ ...input, workspaces })
+  const sourceCutoverFence = await lockSourceCutoverFence(
+    input.source,
+    selected.workspace,
+    selected.account,
+  )
   assertReviewedManagedMaterialCommitment(input, selected.account)
   let plannedHistoryPolicy = null
   if (selected.account.integrationType === 'commerce') {
@@ -3690,7 +4871,19 @@ export async function applyRebind(input) {
     plannedHistoryPolicy = recomputedPolicy
   }
   await assertDatabaseBoundary(input.source, input.target)
-  await assertTargetSchema(input.target)
+  const targetSchemaAttestation = await assertTargetSchema(
+    input.target,
+    input.targetSchemaAttester,
+  )
+  const targetKeyAttestation = await assertTargetKeyAttestation(input)
+  const attestedInput = {
+    ...input,
+    workspaces,
+    sourceCutoverFence,
+    targetSchemaAttestation,
+    targetKeyAttestation,
+  }
+  assertPlanEnvelope(input.plan, attestedInput)
   await assertRebindPlanFreshness(
     input.plan,
     await targetDatabaseTimestamp(input.target),
@@ -3712,10 +4905,15 @@ export async function applyRebind(input) {
     ...input,
     workspaces,
     plannedHistoryPolicy,
+    sourceCutoverFence,
   })
-  assertReviewedPlan(input.plan, { ...input, workspaces }, materials)
-  const result = await applyValidatedMaterials({ ...input, workspaces }, materials, input.plan)
-  return buildReceiptArtifact(input, input.plan, result.receipts)
+  try {
+    assertReviewedPlan(input.plan, attestedInput, materials)
+    const result = await applyValidatedMaterials(attestedInput, materials, input.plan)
+    return buildReceiptArtifact(input, input.plan, result.receipts)
+  } finally {
+    destroyValidatedMaterials(materials)
+  }
 }
 
 function rebindPayloadDigest(payload) {
@@ -3754,6 +4952,118 @@ function buildReceiptArtifact(input, plan, receipts) {
   return receipt
 }
 
+async function assertReceiptCommerceCutoverExtensions(
+  target,
+  workspace,
+  account,
+  identity,
+  providerEvidence,
+) {
+  const receiptPostState = safeJson(providerEvidence?.materializedPostState)
+  if (account.provider === 'shopify') {
+    const expectedRouting = safeJson(receiptPostState.shopifyLocationRouting)
+    if (
+      !SHA256.test(expectedRouting.providerLocationSetSha256 || '')
+      || expectedRouting.providerLocationSetSha256
+        !== providerEvidence?.locationRouting?.providerLocationSetSha256
+      || !Array.isArray(expectedRouting.mappings)
+    ) fail(`${account.sourceGlobalId} committed Shopify location-routing receipt is invalid`)
+    const locations = await target.query(
+      `SELECT id::text, global_id, external_location_id,
+              external_location_name, external_location_address,
+              warehouse_id::text, location_id::text, inventory_pool_id::text,
+              mapping_method, active, row_version,
+              ownership_classification, provider_snapshot_json,
+              provider_snapshot_hash, provider_observed_at,
+              inventory_import_enabled
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+       ORDER BY id`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    const observedMappings = locations.rows.map((row) => {
+      const observedAt = new Date(row.provider_observed_at)
+      if (
+        Number.isNaN(observedAt.getTime())
+        || row.provider_snapshot_hash !== shopifyLocationSnapshotHash(
+          row.provider_snapshot_json,
+        )
+        || row.provider_snapshot_json?.id !== row.external_location_id
+        || row.provider_snapshot_json?.name !== row.external_location_name
+        || canonicalJson(row.provider_snapshot_json?.address)
+          !== canonicalJson(row.external_location_address)
+      ) fail(`${account.sourceGlobalId} committed Shopify location snapshot is invalid`)
+      return {
+        mappingId: row.id,
+        mappingGlobalId: row.global_id,
+        externalLocationId: row.external_location_id,
+        externalLocationName: row.external_location_name,
+        externalLocationAddress: row.external_location_address,
+        warehouseId: row.warehouse_id,
+        locationId: row.location_id,
+        inventoryPoolId: row.inventory_pool_id,
+        mappingMethod: row.mapping_method,
+        active: row.active,
+        rowVersion: Number(row.row_version),
+        ownershipClassification: row.ownership_classification,
+        providerSnapshotHash: row.provider_snapshot_hash,
+        inventoryImportEnabled: row.inventory_import_enabled,
+      }
+    })
+    if (canonicalJson(observedMappings) !== canonicalJson(expectedRouting.mappings)) {
+      fail(`${account.sourceGlobalId} committed Shopify location-routing post-state changed`)
+    }
+  } else if (receiptPostState.shopifyLocationRouting !== null) {
+    fail(`${account.sourceGlobalId} received unexpected Shopify location-routing evidence`)
+  }
+
+  const authorities = await target.query(
+    `SELECT authorization_version, state, capabilities,
+            provider_writes_enabled, automatic_order_promotion_enabled,
+            authorized_credential_generation,
+            verified_external_account_id_sha256,
+            migration_receipt_event_key,
+            authorized_by, authorized_at, expires_at
+     FROM operations_commerce_hosted_production_sandbox_read_authorizations
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid
+     ORDER BY authorization_version`,
+    [workspace.targetOrganizationId, identity.integrationId],
+  )
+  if (!isHostedProductionSandboxReadAccount(account)) {
+    if (
+      authorities.rowCount !== 0
+      || receiptPostState.hostedProductionSandboxReadAuthority !== null
+    ) fail(`${account.sourceGlobalId} received unexpected hosted sandbox read authority`)
+    return
+  }
+  const observedAuthority = authorities.rows[0]
+    ? hostedSandboxReadAuthorityRow(authorities.rows[0])
+    : null
+  if (
+    authorities.rowCount !== 1
+    || canonicalJson(observedAuthority)
+      !== canonicalJson(receiptPostState.hostedProductionSandboxReadAuthority)
+  ) fail(`${account.sourceGlobalId} committed hosted sandbox read authority changed`)
+  const current = await target.query(
+    `SELECT bool_and(
+              operations_commerce_hosted_production_sandbox_read_is_current(
+                $1::uuid, $2::uuid, capability
+              )
+            ) AS all_capabilities_current
+     FROM unnest($3::text[]) capability`,
+    [
+      workspace.targetOrganizationId,
+      identity.integrationId,
+      [...HOSTED_PRODUCTION_SANDBOX_READ_CAPABILITIES],
+    ],
+  )
+  if (current.rows[0]?.all_capabilities_current !== true) {
+    fail(`${account.sourceGlobalId} committed hosted sandbox read authority is not current`)
+  }
+}
+
 async function assertReceiptPostState(
   target,
   workspace,
@@ -3761,57 +5071,299 @@ async function assertReceiptPostState(
   identity,
   providerEvidence,
   actor,
+  targetKey,
+  confirmedPlanDigest,
 ) {
+  if (typeof targetKey !== 'string' || targetKey.length < 32) {
+    fail('Target credential key is required to verify committed rebind decryptability')
+  }
+  if (account.integrationType === 'commerce') {
+    const result = await target.query(
+      `SELECT account.global_id, account.provider, account.integration_type,
+              account.environment, account.status, account.external_account_id,
+              account.credential_reference, account.commerce_credential_generation,
+              account.receipt_intake_enabled, account.configuration,
+              fence.verification_state,
+              fence.expected_external_account_id_sha256,
+              fence.verified_external_account_id_sha256,
+              credential.external_account_id AS credential_external_account_id,
+              credential.auth_mode, credential.credential_ciphertext,
+              credential.credential_iv, credential.credential_tag,
+              credential.credential_version,
+              credential.verification_status AS commerce_credential_status,
+              credential.webhook_verification_status,
+              control.desired_state AS sync_desired_state,
+              control.explicit_choice AS sync_explicit_choice,
+              control.revision AS sync_revision,
+              (SELECT jsonb_agg(jsonb_build_object(
+                        'resource', cursor.resource,
+                        'reconciliationStatus', cursor.reconciliation_status
+                      ) ORDER BY cursor.resource)
+                 FROM operations_commerce_sync_cursors cursor
+                WHERE cursor.organization_id = account.organization_id
+                  AND cursor.integration_account_id = account.id) AS sync_cursors,
+              history.provider AS history_provider, history.history_mode,
+              history.ingestion_floor, history.frozen_at, history.configured_by,
+              notification.policy_version AS notification_policy_version,
+              notification.notify_customer_default AS notification_notify_customer_default,
+              notification.revision AS notification_policy_revision,
+              notification.change_reason AS notification_change_reason,
+              notification.created_by AS notification_created_by,
+              notification.updated_by AS notification_updated_by
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       JOIN operations_commerce_order_history_policies history
+         ON history.organization_id = account.organization_id
+        AND history.integration_account_id = account.id
+       LEFT JOIN operations_shopify_fulfillment_notification_policies notification
+         ON notification.organization_id = account.organization_id
+        AND notification.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    const row = result.rows[0]
+    const expectedCursorResources = [...COMMERCE_SYNC_RESOURCES[account.provider]].sort()
+    const cursorEvidence = Array.isArray(row?.sync_cursors) ? row.sync_cursors : []
+    const observedCursorResources = cursorEvidence.map((entry) => text(entry?.resource)).sort()
+    const validCursorStates = new Set(['idle', 'running', 'succeeded', 'failed'])
+    const receiptPostState = safeJson(providerEvidence?.materializedPostState)
+    const currentShopifyGroups = account.provider === 'shopify'
+      ? Object.fromEntries(SHOPIFY_WEBHOOK_GROUPS.map((group) => [
+          group.key,
+          safeJson(row?.configuration?.[group.key]),
+        ]))
+      : null
+    if (result.rowCount === 1 && account.provider === 'shopify') {
+      assertPersistedShopifyWebhookConfiguration(
+        row.configuration,
+        identity.integrationGlobalId,
+        providerEvidence?.callback?.desiredUri,
+      )
+    }
+    if (
+      result.rowCount !== 1
+      || row.global_id !== identity.integrationGlobalId
+      || row.provider !== account.provider
+      || row.integration_type !== 'commerce'
+      || row.environment !== account.environment
+      || row.status !== 'active'
+      || sha256(row.external_account_id || '') !== account.externalAccountIdSha256
+      || row.external_account_id !== row.credential_external_account_id
+      || row.credential_reference !== `commerce-credential:${identity.integrationId}:v1`
+      || Number(row.commerce_credential_generation) !== 1
+      || Number(row.credential_version) !== 1
+      || row.auth_mode !== row.configuration?.authMode
+      || row.commerce_credential_status !== 'verified'
+      || (account.provider === 'shopify'
+        ? !['unverified', 'verified'].includes(row.webhook_verification_status)
+        : row.webhook_verification_status !== 'not_applicable')
+      || row.verification_state !== 'verified'
+      || row.expected_external_account_id_sha256 !== account.externalAccountIdSha256
+      || row.verified_external_account_id_sha256 !== account.externalAccountIdSha256
+      || receiptPostState.targetAccountGlobalId !== identity.integrationGlobalId
+      || receiptPostState.externalAccountIdSha256 !== account.externalAccountIdSha256
+      || receiptPostState.credentialReference
+        !== `commerce-credential:${identity.integrationId}:v1`
+      || Number(receiptPostState.credentialGeneration) !== 1
+      || receiptPostState.credentialDecryptability !== 'verified_at_commit'
+      || receiptPostState.receiptIntakeEnabled !== (account.provider === 'shopify')
+      || row.receipt_intake_enabled !== (account.provider === 'shopify')
+      || row.sync_desired_state !== 'running'
+      || row.sync_explicit_choice !== true
+      || Number(row.sync_revision)
+        !== Number(providerEvidence?.targetPlaceholder?.storeSyncControl?.revision) + 1
+      || canonicalJson(observedCursorResources) !== canonicalJson(expectedCursorResources)
+      || cursorEvidence.some((entry) => !validCursorStates.has(entry?.reconciliationStatus))
+      || receiptPostState.storeSync?.desiredState !== 'running'
+      || receiptPostState.storeSync?.explicitChoice !== true
+      || Number(receiptPostState.storeSync?.revision) !== Number(row.sync_revision)
+      || canonicalJson(receiptPostState.storeSync?.cursorResources)
+        !== canonicalJson(expectedCursorResources)
+      || (account.provider === 'shopify'
+        ? canonicalJson(receiptPostState.shopifyWebhookSubscriptionGroups)
+          !== canonicalJson(currentShopifyGroups)
+        : receiptPostState.shopifyWebhookSubscriptionGroups !== null)
+      || canonicalJson(historyPolicyEvidence(row, account, actor))
+        !== canonicalJson(providerEvidence?.orderHistoryPolicy)
+      || (account.provider === 'shopify'
+        ? canonicalJson(shopifyFulfillmentNotificationPolicyEvidence(row, account, actor))
+          !== canonicalJson(providerEvidence?.fulfillmentNotificationPolicy)
+        : row.notification_policy_version !== null
+          || providerEvidence?.fulfillmentNotificationPolicy !== null)
+      || (account.provider === 'shopify'
+        ? receiptPostState.carrierServiceReadiness?.status
+            !== 'operator_registration_and_callback_verification_required'
+          || receiptPostState.carrierServiceReadiness?.acceptedWithPlanDigest
+            !== confirmedPlanDigest
+          || receiptPostState.carrierServiceReadiness?.providerMutationDuringRebind !== false
+          || receiptPostState.carrierServiceReadiness?.carrierServiceVerified !== false
+          || receiptPostState.carrierServiceReadiness?.checkoutPackRegenerationAllowed !== false
+        : receiptPostState.carrierServiceReadiness !== null)
+    ) fail(`${account.sourceGlobalId} committed commerce rebind post-state is incomplete`)
+    if (account.provider === 'shopify') {
+      if (row.configuration?.providerAccountId !== row.external_account_id) {
+        fail('Shopify persisted external identity is missing or invalid')
+      }
+    }
+    await assertReceiptCommerceCutoverExtensions(
+      target,
+      workspace,
+      account,
+      identity,
+      providerEvidence,
+    )
+    const plaintext = decryptAesGcm({
+      ciphertext: bytea(row.credential_ciphertext, 'Committed commerce ciphertext'),
+      iv: bytea(row.credential_iv, 'Committed commerce IV'),
+      tag: bytea(row.credential_tag, 'Committed commerce tag'),
+    }, targetKey, commerceAad(
+      workspace.targetOrganizationId,
+      account.provider,
+      account.environment,
+      row.external_account_id,
+    ), 'Committed commerce credential')
+    withZeroizedBuffer(plaintext, (decrypted) => {
+      const credential = parseCredentialJson(decrypted, 'Committed commerce credential')
+      if (
+        credential.provider !== account.provider
+        || credential.authMode !== row.auth_mode
+        || (account.provider === 'shopify'
+          && (
+            boundedPrintable(credential.clientId, 'Committed Shopify client ID', 8, 255).length < 8
+            || boundedPrintable(
+              credential.clientSecret,
+              'Committed Shopify client secret',
+              16,
+              4096,
+            ).length < 16
+          ))
+        || (account.provider === 'faire'
+          && boundedPrintable(
+            credential.accessToken,
+            'Committed Faire access token',
+            8,
+            8192,
+          ).length < 8)
+      ) fail(`${account.sourceGlobalId} committed commerce credential lineage is invalid`)
+    })
+    return
+  }
+
   const result = await target.query(
-    `SELECT account.status, fence.verification_state,
-            credential.verification_status AS commerce_credential_status,
-            carrier_credential.verification_status AS carrier_credential_status,
-            placeholder.state AS carrier_placeholder_state,
+    `SELECT account.global_id, account.provider, account.integration_type,
+            account.environment, account.status, account.external_account_id,
+            account.credential_reference, account.configuration,
+            fence.verification_state,
             fence.verified_carrier_account_id::text AS verified_carrier_account_id,
-            history.provider AS history_provider, history.history_mode,
-            history.ingestion_floor, history.frozen_at, history.configured_by
+            credential.credential_ciphertext, credential.credential_iv,
+            credential.credential_tag, credential.credential_version,
+            credential.verification_status AS carrier_credential_status,
+            carrier.account_number_ciphertext, carrier.account_number_iv,
+            carrier.account_number_tag, carrier.account_number_last_four,
+            carrier.account_number_fingerprint,
+            carrier.registered_address_fingerprint,
+            carrier.status AS carrier_account_status,
+            placeholder.state AS carrier_placeholder_state
      FROM operations_integration_accounts account
      JOIN operations_commerce_migration_provider_identity_fences fence
        ON fence.organization_id = account.organization_id
       AND fence.integration_account_id = account.id
-     LEFT JOIN operations_commerce_credentials credential
+     JOIN operations_carrier_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     LEFT JOIN operations_carrier_credentials carrier_credential
-       ON carrier_credential.organization_id = account.organization_id
-      AND carrier_credential.integration_account_id = account.id
-     LEFT JOIN operations_carrier_account_migration_placeholders placeholder
+     JOIN operations_carrier_accounts carrier
+       ON carrier.organization_id = account.organization_id
+      AND carrier.integration_account_id = account.id
+      AND carrier.id = $3::uuid
+     JOIN operations_carrier_account_migration_placeholders placeholder
        ON placeholder.organization_id = account.organization_id
       AND placeholder.integration_account_id = account.id
-     LEFT JOIN operations_commerce_order_history_policies history
-       ON history.organization_id = account.organization_id
-      AND history.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
-    [workspace.targetOrganizationId, identity.integrationId],
+    [workspace.targetOrganizationId, identity.integrationId, identity.carrierAccountId],
   )
   const row = result.rows[0]
+  const receiptPostState = safeJson(providerEvidence?.materializedPostState)
   if (
-    result.rowCount !== 1 || row.status !== 'active' || row.verification_state !== 'verified'
-    || (account.integrationType === 'commerce'
-      && (
-        row.commerce_credential_status !== 'verified'
-        || canonicalJson(historyPolicyEvidence(row, account, actor))
-          !== canonicalJson(providerEvidence?.orderHistoryPolicy)
-      ))
-    || (account.integrationType === 'carrier'
-      && (
-        row.carrier_credential_status !== 'verified'
-        || row.carrier_placeholder_state !== 'materialized'
-        || row.verified_carrier_account_id !== identity.carrierAccountId
-      ))
-  ) fail(`${account.sourceGlobalId} committed rebind post-state is incomplete`)
+    result.rowCount !== 1
+    || row.global_id !== identity.integrationGlobalId
+    || row.provider !== account.provider
+    || row.integration_type !== 'carrier'
+    || row.environment !== account.environment
+    || row.status !== 'active'
+    || row.external_account_id !== null
+    || row.credential_reference !== `carrier-credential:${identity.integrationId}:v1`
+    || Number(row.credential_version) !== 1
+    || row.carrier_credential_status !== 'verified'
+    || row.carrier_account_status !== 'active'
+    || row.carrier_placeholder_state !== 'materialized'
+    || row.verification_state !== 'verified'
+    || row.verified_carrier_account_id !== identity.carrierAccountId
+    || row.account_number_last_four !== providerEvidence?.accountNumberLastFour
+    || row.registered_address_fingerprint !== providerEvidence?.addressFingerprint
+    || receiptPostState.targetAccountGlobalId !== identity.integrationGlobalId
+    || receiptPostState.targetCarrierAccountGlobalId !== identity.carrierAccountGlobalId
+    || receiptPostState.credentialReference
+      !== `carrier-credential:${identity.integrationId}:v1`
+    || Number(receiptPostState.credentialGeneration) !== 1
+    || receiptPostState.credentialDecryptability !== 'verified_at_commit'
+    || receiptPostState.carrierAccountDecryptability !== 'verified_at_commit'
+  ) fail(`${account.sourceGlobalId} committed carrier rebind post-state is incomplete`)
+  const credentialPlaintext = decryptAesGcm({
+    ciphertext: bytea(row.credential_ciphertext, 'Committed carrier credential ciphertext'),
+    iv: bytea(row.credential_iv, 'Committed carrier credential IV'),
+    tag: bytea(row.credential_tag, 'Committed carrier credential tag'),
+  }, targetKey, carrierCredentialAad(
+    workspace.targetOrganizationId,
+    account.provider,
+    account.environment,
+  ), 'Committed carrier credential')
+  withZeroizedBuffer(credentialPlaintext, (decrypted) => {
+    const credential = parseCredentialJson(decrypted, 'Committed carrier credential')
+    boundedPrintable(credential.clientId, 'Committed carrier client ID', 8, 255)
+    boundedPrintable(credential.clientSecret, 'Committed carrier client secret', 16, 4096)
+  })
+  const accountNumberPlaintext = decryptAesGcm({
+    ciphertext: encodedCiphertext(row.account_number_ciphertext, 'Committed carrier account ciphertext'),
+    iv: encodedCiphertext(row.account_number_iv, 'Committed carrier account IV'),
+    tag: encodedCiphertext(row.account_number_tag, 'Committed carrier account tag'),
+  }, targetKey, carrierAccountAad(
+    workspace.targetOrganizationId,
+    account.provider,
+    account.environment,
+    identity.carrierAccountGlobalId,
+  ), 'Committed carrier account number')
+  withZeroizedBuffer(accountNumberPlaintext, (decrypted) => {
+    const accountNumber = decrypted.toString('utf8')
+    if (
+      accountNumber.slice(-4) !== row.account_number_last_four
+      || carrierAccountFingerprint(
+        targetKey,
+        workspace.targetOrganizationId,
+        account.provider,
+        account.environment,
+        accountNumber,
+      ) !== row.account_number_fingerprint
+    ) fail(`${account.sourceGlobalId} committed carrier account lineage is invalid`)
+  })
 }
 
 export async function exportCommittedReceipt(input) {
   const workspaces = input.workspaces || WORKSPACES
   const selected = selectedProviderScope({ ...input, workspaces })
   await assertTargetDatabaseBoundary(input.target)
-  await assertTargetSchema(input.target)
+  const targetSchemaAttestation = await assertTargetSchema(
+    input.target,
+    input.targetSchemaAttester,
+  )
+  const targetKeyAttestation = await assertTargetKeyAttestation(input)
   assertMigrationArtifacts(
     input.manifest,
     input.mapping,
@@ -3820,7 +5372,17 @@ export async function exportCommittedReceipt(input) {
     workspaces,
   )
   await assertCommittedMigrationReceipts(input.target, input.manifest, input.mapping, workspaces)
-  assertPlanEnvelope(input.plan, { ...input, workspaces })
+  assertPlanEnvelope(input.plan, {
+    ...input,
+    workspaces,
+    // Receipt recovery is intentionally target-only after a committed write.
+    // The source fence is already digest-bound inside the reviewed plan and
+    // the immutable committed receipt, so verify that exact embedded evidence
+    // rather than requiring a second source connection during export.
+    sourceCutoverFence: input.sourceCutoverFence || input.plan?.source?.cutoverFence,
+    targetSchemaAttestation,
+    targetKeyAttestation,
+  })
   const { workspace, account } = selected
   const eventKey = `migrated-provider-rebind:${SCRIPT_VERSION}:${workspace.targetOrganizationId}:${input.plan.planDigest}`
   const result = await input.target.query(
@@ -3839,6 +5401,13 @@ export async function exportCommittedReceipt(input) {
   ), 0)
   const observedProviders = Array.isArray(payload?.providers)
     ? payload.providers.map((provider) => provider?.sourceAccountGlobalId)
+    : []
+  const observedReviewedProviders = Array.isArray(payload?.providers)
+    ? payload.providers.map((provider) => {
+        const evidence = structuredClone(provider)
+        delete evidence.materializedPostState
+        return evidence
+      })
     : []
   if (
     result.rowCount !== 1
@@ -3866,7 +5435,7 @@ export async function exportCommittedReceipt(input) {
     || payload.target?.organizationReference !== workspace.targetOrganizationReference
     || payload.accountsMaterialized !== 1
     || payload.providerWrites !== expectedProviderWrites
-    || canonicalJson(payload.providers) !== canonicalJson(expectedProviders)
+    || canonicalJson(observedReviewedProviders) !== canonicalJson(expectedProviders)
     || canonicalJson(observedProviders) !== canonicalJson([account.sourceGlobalId])
     || payload.targetTransaction !== 'committed_atomically'
     || payload.receiptDigest !== rebindPayloadDigest(payload)
@@ -3880,6 +5449,8 @@ export async function exportCommittedReceipt(input) {
     targetIdentity(input.mapping, workspace, account),
     payload.providers[0],
     input.actor,
+    input.targetKey,
+    input.plan.planDigest,
   )
   const receipts = [{
     eventKey: result.rows[0].event_key,
@@ -3906,6 +5477,10 @@ export async function main(runtime = {}) {
   if (runtime.managedRebindMaterial !== undefined && runtime.allowTestBoundary !== true) {
     fail('Managed carrier runtime material overrides are test-only')
   }
+  if (
+    (runtime.targetSchemaAttester || runtime.targetKeyAttestationVerifier)
+    && runtime.allowTestBoundary !== true
+  ) fail('Target attestation overrides are test-only')
   const manifest = runtime.manifest || parsePrivateJson(args.manifest, 'Migration manifest')
   const mapping = runtime.mapping || parsePrivateJson(args.mapping, 'Migration mapping receipt')
   const workspaces = runtime.workspaces || WORKSPACES
@@ -3933,6 +5508,11 @@ export async function main(runtime = {}) {
     }
     assertTargetRailwayBoundary(environment)
     const targetUrl = validatedDatabaseUrl(environment.TARGET_DATABASE_URL, 'TARGET_DATABASE_URL')
+    const targetKey = requiredSecret(
+      environment,
+      'TARGET_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY',
+    )
+    const targetKeyId = requiredTargetKeyId(environment)
     const sourceEndpoint = text(manifest.sourceDatabase?.endpoint_sha256).toLowerCase()
     if (!SHA256.test(sourceEndpoint)) fail('Approved manifest source endpoint binding is invalid')
     const bindings = {
@@ -3955,6 +5535,10 @@ export async function main(runtime = {}) {
         selectedAccountGlobalId: args.selectedAccountGlobalId,
         plan,
         confirmDigest: args.confirmDigest,
+        targetSchemaAttester: runtime.targetSchemaAttester,
+        targetKey,
+        targetKeyId,
+        targetKeyAttestationVerifier: runtime.targetKeyAttestationVerifier,
       })
       await target.query('COMMIT')
       targetReadTransaction = false
@@ -3979,10 +5563,12 @@ export async function main(runtime = {}) {
   const targetUrl = validatedDatabaseUrl(environment.TARGET_DATABASE_URL, 'TARGET_DATABASE_URL')
   const sourceKey = requiredSecret(environment, 'SOURCE_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY')
   const targetKey = requiredSecret(environment, 'TARGET_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY')
+  const targetKeyId = requiredTargetKeyId(environment)
   if (sourceKey === targetKey) fail('Source and target encryption keys must be independently supplied')
   const bindings = endpointBindings(environment, sourceUrl, targetUrl)
   assertMigrationArtifacts(manifest, mapping, bindings, args.actor, workspaces)
   let suppliedManagedMaterial = runtime.managedRebindMaterial
+  let suppliedManagedMaterialOwned = false
   const managedFdSupplied = args.managedRebindSecretsFd !== undefined
   const approvalSupplied = Boolean(args.confirmManagedSourceAuthority)
   if (selected.account.rebindMode === 'source_authority') {
@@ -4009,10 +5595,12 @@ export async function main(runtime = {}) {
   let sourceTransaction = false
   let targetReadTransaction = false
   try {
-    await source.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    // A writable transaction is required solely so PostgreSQL can retain the
+    // exact source account/credential/cutover-fence row locks through provider
+    // verification and the target commit. This script never mutates source.
+    await source.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
     sourceTransaction = true
     await assertDatabaseBoundary(source, target)
-    await assertTargetSchema(target)
     await assertCommittedMigrationReceipts(target, manifest, mapping, workspaces)
     if (args.command === 'apply') {
       assertPlanEnvelope(plan, {
@@ -4030,18 +5618,23 @@ export async function main(runtime = {}) {
         args.managedRebindSecretsFd,
         'Managed carrier secret input',
       )
-      suppliedManagedMaterial = buildManagedRebindMaterial({
-        actor: args.actor,
-        manifest,
-        mapping,
-        bindings,
-        workspace: selected.workspace,
-        account: selected.account,
-        secretInput,
-        approvalToken: args.command === 'plan'
-          ? args.confirmManagedSourceAuthority
-          : managedSourceAuthorityApprovalToken(selected.account),
-      })
+      try {
+        suppliedManagedMaterial = buildManagedRebindMaterial({
+          actor: args.actor,
+          manifest,
+          mapping,
+          bindings,
+          workspace: selected.workspace,
+          account: selected.account,
+          secretInput,
+          approvalToken: args.command === 'plan'
+            ? args.confirmManagedSourceAuthority
+            : managedSourceAuthorityApprovalToken(selected.account),
+        })
+        suppliedManagedMaterialOwned = true
+      } finally {
+        clearSensitiveValue(secretInput)
+      }
     }
     if (args.command === 'plan') {
       await target.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
@@ -4052,6 +5645,7 @@ export async function main(runtime = {}) {
         target,
         sourceKey,
         targetKey,
+        targetKeyId,
         manifest,
         mapping,
         bindings,
@@ -4060,16 +5654,22 @@ export async function main(runtime = {}) {
         selectedAccountGlobalId: args.selectedAccountGlobalId,
         historyMode: args.historyMode,
         managedRebindMaterial: suppliedManagedMaterial,
+        targetSchemaAttester: runtime.targetSchemaAttester,
+        targetKeyAttestationVerifier: runtime.targetKeyAttestationVerifier,
       })
-      await target.query('COMMIT')
-      targetReadTransaction = false
-      await source.query('COMMIT')
-      sourceTransaction = false
-      writePrivateJson(args.output, result.plan)
-      return {
-        command: 'plan',
-        planDigest: result.plan.planDigest,
-        providerCount: result.plan.providers.length,
+      try {
+        await target.query('COMMIT')
+        targetReadTransaction = false
+        await source.query('COMMIT')
+        sourceTransaction = false
+        writePrivateJson(args.output, result.plan)
+        return {
+          command: 'plan',
+          planDigest: result.plan.planDigest,
+          providerCount: result.plan.providers.length,
+        }
+      } finally {
+        destroyValidatedMaterials(result.materials)
       }
     }
     const receipt = await applyRebind({
@@ -4078,6 +5678,7 @@ export async function main(runtime = {}) {
       target,
       sourceKey,
       targetKey,
+      targetKeyId,
       manifest,
       mapping,
       bindings,
@@ -4087,6 +5688,8 @@ export async function main(runtime = {}) {
       managedRebindMaterial: suppliedManagedMaterial,
       plan,
       confirmDigest: args.confirmDigest,
+      targetSchemaAttester: runtime.targetSchemaAttester,
+      targetKeyAttestationVerifier: runtime.targetKeyAttestationVerifier,
     })
     await source.query('COMMIT')
     sourceTransaction = false
@@ -4102,6 +5705,10 @@ export async function main(runtime = {}) {
     if (sourceTransaction) await source.query('ROLLBACK').catch(() => undefined)
     throw error
   } finally {
+    if (suppliedManagedMaterialOwned) {
+      clearSensitiveValue(suppliedManagedMaterial)
+      suppliedManagedMaterial = null
+    }
     source.release()
     target.release()
     await Promise.all([

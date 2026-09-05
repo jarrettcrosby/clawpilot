@@ -20,28 +20,19 @@ function run(command, args, cwd) {
   }
 }
 
-function managedDeployment() {
+function assertPreviewOnlyDeployment() {
   const environment = String(process.env.VERCEL_ENV || '').trim().toLowerCase()
-  const branch = String(process.env.VERCEL_GIT_COMMIT_REF || '').trim()
-  if (environment === 'production') {
-    if (branch !== 'main') {
-      throw new Error('Vercel production deployments must originate from main with Git metadata present')
-    }
-    return true
+  if (process.env.VERCEL && environment !== 'preview') {
+    throw new Error(
+      'ClawPilot application builds accept protected Vercel previews only; production and development deployments are prohibited by the post-cutover contract',
+    )
   }
-  return environment === 'preview' && branch === 'dev'
 }
 
 try {
+  assertPreviewOnlyDeployment()
   run('npm', ['run', 'build'], appRoot)
-
-  if (!managedDeployment()) {
-    console.log('Vercel managed mail gate skipped for an unmanaged preview or local build')
-    process.exit(0)
-  }
-
-  run(process.execPath, [resolve(root, 'scripts', 'verify-mail-sender.mjs')], root)
-  console.log('Vercel managed build and mail gates passed; database migrations are owned by the Railway deployment path')
+  console.log('Vercel protected preview build passed; this is compile/UI evidence only and does not prove the legacy Vercel credential retirement is complete')
 } catch (error) {
   console.error(`Vercel build failed: ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)

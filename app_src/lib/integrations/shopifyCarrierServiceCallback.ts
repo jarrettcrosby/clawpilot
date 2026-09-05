@@ -97,6 +97,11 @@ import {
 import {
   shopifyCheckoutCarrierSelectionKey,
 } from '@/lib/integrations/shopifyCheckoutCarrierSelection'
+import {
+  assertIntegrationCredentialProviderIoReady,
+  integrationCredentialRuntimeEncryptionKey,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -186,25 +191,19 @@ function failedHttpStatus(error: unknown): 503 | 504 {
 }
 
 function callbackFingerprintKey(): Buffer {
-  const secret = String(
-    process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY
-    || process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
-    || process.env.APP_SESSION_SECRET
-    || '',
-  )
-  if (secret.length < 32) {
-    throw checkoutFailureError(
-      'SHOPIFY_CHECKOUT_FINGERPRINT_CONFIG_MISSING',
-      'Shopify callback fingerprinting is not configured',
-    )
-  }
-  return createHash('sha256').update(secret).digest()
+  return integrationCredentialRuntimeEncryptionKey()
 }
 
 function persistedRequestFingerprint(protocolDigest: string) {
-  return createHmac('sha256', callbackFingerprintKey())
-    .update(`shopify-carrier-request-fingerprint-v1:${protocolDigest}`)
-    .digest('hex')
+  let fingerprintKey: Buffer | undefined
+  try {
+    fingerprintKey = callbackFingerprintKey()
+    return createHmac('sha256', fingerprintKey)
+      .update(`shopify-carrier-request-fingerprint-v1:${protocolDigest}`)
+      .digest('hex')
+  } finally {
+    fingerprintKey?.fill(0)
+  }
 }
 
 function fencedCacheKey(input: {
@@ -1779,6 +1778,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     }
     checkpoint = 'receipt_claimed'
     attemptedStage = 'post_claim'
+    assertIntegrationCredentialProviderIoReady()
     requireCallbackTime(workDeadlineAt, workController.signal)
     const planRatePolicy = readShopifyCheckoutPlanRatePolicy(
       account.policySnapshot,
@@ -1868,6 +1868,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
             expectedConfigRowVersion: account.configRowVersion,
             rateSource: account.checkoutRateControl.rateSource,
           })
+          assertIntegrationCredentialProviderIoReady()
           const remaining = Math.max(1, carrierDeadlineAt - Date.now())
           const binding = runtimeCarriers.find((carrier) => (
             carrier.provider === selection.provider
@@ -2369,7 +2370,11 @@ export async function executeShopifyCarrierServiceCallback(input: {
         attemptedStage,
         checkpoint,
       })
-      if (claimed && Date.now() < failurePersistenceDeadlineAt) {
+      if (
+        claimed
+        && !isIntegrationCredentialRuntimeGateError(classifiedError)
+        && Date.now() < failurePersistenceDeadlineAt
+      ) {
         await failClaim(
           claimed,
           errorCode(classifiedError),

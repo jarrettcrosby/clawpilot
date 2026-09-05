@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto'
 import { executeCommerceCatalogProductPage } from '@/lib/integrations/commerceIntake'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   replayHeldShopifyProductDeletionsInPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
   claimCommerceCatalogSyncJobsInPostgres,
   completeCommerceCatalogSyncPageInPostgres,
   failCommerceCatalogSyncJobInPostgres,
+  parkCommerceCatalogSyncJobForRuntimeMaintenanceInPostgres,
   parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres,
   queueAutomaticCommerceCatalogSyncsInPostgres,
   type CommerceCatalogSyncJob,
@@ -156,9 +161,12 @@ export async function processCommerceCatalogSyncOutbox(input: {
   limit?: number
   workerId: string
 }) {
+  assertIntegrationCredentialProviderIoReady()
   const productDeletionReplay =
     await replayHeldShopifyProductDeletionsInPostgres({ limit: 25 })
+  assertIntegrationCredentialProviderIoReady()
   const autoQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()
+  assertIntegrationCredentialProviderIoReady()
   const jobs = await claimCommerceCatalogSyncJobsInPostgres({
     limit: Math.max(1, Math.min(Number(input.limit || 2), 10)),
     workerId: input.workerId,
@@ -170,7 +178,8 @@ export async function processCommerceCatalogSyncOutbox(input: {
   let jobsDead = 0
   let jobsCancelled = 0
   let jobsParked = 0
-  for (const job of jobs) {
+  for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+    const job = jobs[jobIndex]
     try {
       assertCommerceCatalogSweepCanRead(job)
       const response = await executeCommerceCatalogProductPage({
@@ -242,6 +251,15 @@ export async function processCommerceCatalogSyncOutbox(input: {
       if (completion.hasNextBatch) jobsRequeued += 1
       else jobsCompleted += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled(jobs.slice(jobIndex).map(async (claimedJob) => (
+          await parkCommerceCatalogSyncJobForRuntimeMaintenanceInPostgres({
+            job: claimedJob,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          })
+        )))
+        throw error
+      }
       if (isStoreSyncReadPause(error)) {
         const disposition =
           await parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres({ job })
@@ -262,6 +280,7 @@ export async function processCommerceCatalogSyncOutbox(input: {
       }
     }
   }
+  assertIntegrationCredentialProviderIoReady()
   const followUpQueued = await queueAutomaticCommerceCatalogSyncsInPostgres()
   return {
     autoQueued: autoQueued + followUpQueued,

@@ -42,6 +42,9 @@ import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   requireCurrentCommerceProviderWritesInPostgres,
 } from '@/lib/persistence/commerceProviderWrites'
 import {
@@ -611,6 +614,7 @@ async function executeOrder(
       evidenceHash: hash(providerOrder),
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const providerMutationAttempted =
       error instanceof ShopifyReversalFixtureProviderError
       && error.providerMutationAttempted
@@ -736,6 +740,7 @@ async function executeFulfillment(
       }
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const explicitRejection = error instanceof ShopifyFulfillmentWritebackError
       && error.code === 'SHOPIFY_FULFILLMENT_REJECTED'
     const providerMutationAttempted =

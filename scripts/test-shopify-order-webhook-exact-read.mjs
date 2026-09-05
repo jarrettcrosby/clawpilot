@@ -161,6 +161,9 @@ class CommerceOrderSyncError extends Error {
 const history = loadTypeScriptModule(
   'app_src/lib/integrations/commerceOrderHistory.ts',
   {
+    '@/lib/integrations/commerceReadRuntime': {
+      commerceReadCredentialEligible: () => true,
+    },
     '@/lib/integrations/commerceCapabilities': {
       hasEffectiveShopifyScope: (scopes, expected) => scopes.includes(expected),
     },

@@ -21,7 +21,7 @@ const WORKER_HEARTBEAT_KEY = 'faire_inventory_poll_worker_heartbeat'
 const SELECTOR_LIMIT = 50
 const FAIRE_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
-  { developmentRequiresActive: true },
+  { developmentRequiresActive: true, capability: 'inventory' },
 )
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
@@ -947,9 +947,14 @@ export async function failFaireInventoryPollJobInPostgres(input: {
   })
 }
 
-export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
+async function parkFaireInventoryPollInPostgres(input: {
   target: FaireInventoryPollTarget
+  errorCode: string
 }) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Faire inventory poll parking reason is invalid')
+  }
   return withTransaction(async (client) => {
     const parked = await client.query(
       `UPDATE operations_faire_inventory_poll_jobs
@@ -960,7 +965,7 @@ export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
            locked_by = NULL,
            lock_token = NULL,
            lease_expires_at = NULL,
-           last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+           last_error_code = $5,
            completed_at = NULL,
            updated_at = clock_timestamp()
        WHERE id = $1::uuid
@@ -974,6 +979,7 @@ export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
         input.target.lockToken,
         input.target.organizationId,
         input.target.integrationAccountId,
+        input.errorCode,
       ],
     )
     if (parked.rowCount !== 1) return { leaseLost: true, parked: false }
@@ -989,6 +995,24 @@ export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
     )
     return { leaseLost: false, parked: true }
   })
+}
+
+export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
+  target: FaireInventoryPollTarget
+}) {
+  return parkFaireInventoryPollInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkFaireInventoryPollForRuntimeMaintenanceInPostgres(
+  input: {
+    target: FaireInventoryPollTarget
+    errorCode: string
+  },
+) {
+  return parkFaireInventoryPollInPostgres(input)
 }
 
 export async function recoverFaireInventoryPollInPostgres(input: {

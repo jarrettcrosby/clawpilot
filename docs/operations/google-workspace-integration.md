@@ -13,7 +13,8 @@ app_visible: false
 
 ## Ownership Model
 
-ClawPilot uses one owner-managed Google Cloud integration per environment. It does not store a human Google password.
+ClawPilot uses one owner-managed Google Cloud integration in the Railway
+production runtime. It does not store a human Google password.
 
 - The standard API key identifies the Google Cloud project for eligible API requests and quota attribution.
 - The service-account JSON authenticates server-side Drive and Sheets operations with short-lived OAuth access tokens.
@@ -33,7 +34,7 @@ Google references:
 2. Restrict the ClawPilot API key to those APIs and retain the key value for the owner Settings screen.
 3. Open service account `clawpilot-drive@logical-bird-344400.iam.gserviceaccount.com`.
 4. Under **Keys**, create a new JSON key if no current JSON key is available. Google does not allow an existing private key to be downloaded again.
-5. Store the downloaded JSON only long enough to upload it to both ClawPilot environments. Never commit it or place it in the Obsidian vault.
+5. Store the downloaded JSON only long enough to upload it to ClawPilot production. Never copy it to local, remote-local, or Vercel preview environments, commit it, or place it in the Obsidian vault.
 
 ## Shared Drive Preparation
 
@@ -45,7 +46,16 @@ Google references:
 
 ## ClawPilot Configuration
 
-Repeat these steps in `https://dev.aiapp.eigenracing.com` and `https://aiapp.eigenracing.com`; their Postgres credentials are intentionally separate.
+Perform these steps only in Railway production at
+`https://aiapp.eigenracing.com`. The target contract gives the local fixture,
+authenticated remote-local runtime, transitional application Vercel project,
+future post-retirement previews, and remote-local gateway no production Google
+credential or managed-file write authority. The September 5, 2026 Vercel audit still found a
+legacy `GOOGLE_SSO_SERVER_CLIENT_ID` assignment alongside other
+production-scoped configuration. Although a client ID is not a service-account
+private key, remove it from the application project in the gated Vercel
+retirement after Railway acceptance; do not call that project preview-only
+before the re-audit passes.
 
 1. Sign in as the ClawPilot owner and open **Settings > Integrations > Google Workspace**.
 2. Save or rotate the standard Google API key.
@@ -59,7 +69,12 @@ The API never returns either secret. The UI shows only masked key metadata, the 
 
 The expected path is:
 
-`ClawPilot Data/<Production|Development>/Organizations/<ga code + organization name>/Contacts/<gc code + user name>/Pipelines/<gc code + pipeline name>/`
+`ClawPilot Data/Production/Organizations/<ga code + organization name>/Contacts/<gc code + user name>/Pipelines/<gc code + pipeline name>/`
+
+Existing `Development` folders are legacy migration evidence. They are not the
+write target for local, remote-local, or preview runtimes and must not be
+reconnected without restoring and accepting a fully isolated hosted
+development environment.
 
 The workbook has the same `gc code + pipeline name`. Profile or organization-name changes enqueue reconciliation. Existing managed folders are identified by Google resource ID and ClawPilot `appProperties`, moved in place, and verified before empty legacy folders are removed. Do not manually duplicate a managed folder to correct its name; use profile save, pipeline retry, or the provisioning worker.
 

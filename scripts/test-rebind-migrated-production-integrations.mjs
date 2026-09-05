@@ -22,16 +22,19 @@ import {
   REBIND_PLAN_MAX_FUTURE_SKEW_MS,
   WORKSPACES,
   assertRebindPlanFreshness,
+  boundedJsonResponse,
   canonicalJson,
   carrierAddressFingerprint,
   createProviderVerifier,
   databaseEndpointFingerprint,
+  destroyValidatedMaterials,
   digest,
   managedSourceAuthorityApprovalToken,
   parseArguments,
   plannedHistoryPolicyEvidence,
   readBoundedSecretJsonFd,
   sha256,
+  withZeroizedBuffer,
   withZeroizedPlaintextBuffer,
   writePrivateJson,
 } from './rebind-migrated-production-integrations.mjs'
@@ -39,6 +42,24 @@ import {
 const callback = 'https://aiapp.eigenracing.com/api/integrations/commerce/shopify/webhooks/gia1234567'
 const shopDomain = 'fixture-shop.myshopify.com'
 const shopId = 'gid://shopify/Shop/123456789'
+const shopLocation = Object.freeze({
+  id: 'gid://shopify/Location/123456789',
+  name: 'Fixture warehouse',
+  isActive: true,
+  activatable: false,
+  shipsInventory: true,
+  fulfillsOnlineOrders: true,
+  isFulfillmentService: false,
+  fulfillmentService: null,
+  address: {
+    address1: '101 Fixture Way',
+    address2: '',
+    city: 'Hartford',
+    provinceCode: 'CT',
+    countryCode: 'US',
+    zip: '06103',
+  },
+})
 const webhookState = []
 let providerWrites = 0
 let carrierRateReads = 0
@@ -85,15 +106,27 @@ const fakeFetch = async (url, init = {}) => {
             { handle: 'read_orders' }, { handle: 'read_products' },
           ],
         },
+        locations: {
+          nodes: [shopLocation],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
       } })
     }
-    if (request.operationName === 'ClawPilotMigrationOrderWebhookProbe') {
+    if (request.operationName === 'ClawPilotMigrationWebhookProbe') {
+      const requestedTopics = new Set(request.variables.topics)
       return json({ data: { webhookSubscriptions: {
-        nodes: webhookState.map((item) => ({ ...item })),
-        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: webhookState
+          .filter((item) => requestedTopics.has(item.topic))
+          .map((item) => ({ ...item })),
+        pageInfo: {
+          hasNextPage: false,
+          endCursor: webhookState.some((item) => requestedTopics.has(item.topic))
+            ? 'fixture-final-page-cursor'
+            : null,
+        },
       } } })
     }
-    if (request.operationName === 'ClawPilotMigrationOrderWebhookCreate') {
+    if (request.operationName === 'ClawPilotMigrationWebhookCreate') {
       providerWrites += 1
       const topic = request.variables.topic
       const created = {
@@ -101,11 +134,27 @@ const fakeFetch = async (url, init = {}) => {
         topic,
         uri: request.variables.subscription.uri,
         format: 'JSON',
-        includeFields: [...request.variables.subscription.includeFields],
+        includeFields: [...(request.variables.subscription.includeFields || [])],
       }
       webhookState.push(created)
       return json({ data: { webhookSubscriptionCreate: {
         webhookSubscription: created,
+        userErrors: [],
+      } } })
+    }
+    if (request.operationName === 'ClawPilotMigrationWebhookUpdate') {
+      providerWrites += 1
+      const index = webhookState.findIndex((item) => item.id === request.variables.id)
+      assert.notEqual(index, -1, 'the reviewed update must retain its provider identity')
+      const updated = {
+        ...webhookState[index],
+        uri: request.variables.subscription.uri,
+        format: 'JSON',
+        includeFields: [...(request.variables.subscription.includeFields || [])],
+      }
+      webhookState[index] = updated
+      return json({ data: { webhookSubscriptionUpdate: {
+        webhookSubscription: updated,
         userErrors: [],
       } } })
     }
@@ -174,13 +223,25 @@ const shopify = await verifier.commerce(shopifyAccount, {
 assert.equal(shopify.externalAccountId, shopId)
 assert.equal(shopify.identitySha256, sha256(shopId))
 assert.equal(shopify.desiredUri, callback)
-assert.equal(shopify.webhooks.actions.length, 7)
+assert.deepEqual(shopify.locations, [shopLocation])
+assert.match(shopify.locationSetSha256, /^[a-f0-9]{64}$/u)
+assert.equal(shopify.webhooks.actions.length, 17)
+assert.deepEqual(Object.keys(shopify.webhooks.groups), [
+  'scopeWebhookSubscriptions',
+  'webhookSubscriptions',
+  'catalogWebhookSubscriptions',
+  'orderWebhookSubscriptions',
+])
 assert.equal(providerWrites, 0, 'plan probes must be read-only')
 
 const reconciled = await verifier.reconcileShopify(shopify, shopify.webhooks.actions)
 assert.equal(reconciled.ready, true)
-assert.equal(providerWrites, 7)
-assert.equal(webhookState.length, 7)
+assert.equal(providerWrites, 17)
+assert.equal(webhookState.length, 17)
+assert.equal(reconciled.groups.scopeWebhookSubscriptions.ready, true)
+assert.equal(reconciled.groups.webhookSubscriptions.ready, true)
+assert.equal(reconciled.groups.catalogWebhookSubscriptions.ready, true)
+assert.equal(reconciled.groups.orderWebhookSubscriptions.ready, true)
 await assert.rejects(
   verifier.reconcileShopify(shopify, shopify.webhooks.actions),
   /webhook state changed after the reviewed rebind plan/u,
@@ -193,9 +254,53 @@ const replannedShopify = await verifier.commerce(shopifyAccount, {
   clientSecret: 'fixture-client-secret-value',
 }, { shopDomain }, 'gia1234567')
 assert.deepEqual(replannedShopify.webhooks.actions, [])
+assert.equal(replannedShopify.webhooks.observed.length, 17)
 const resumed = await verifier.reconcileShopify(replannedShopify, [])
 assert.equal(resumed.ready, true)
-assert.equal(providerWrites, 7, 'provider reconciliation recovery must be idempotent')
+assert.equal(providerWrites, 17, 'provider reconciliation recovery must be idempotent')
+webhookState.find((item) => item.topic === 'PRODUCTS_UPDATE').uri =
+  'https://stale.example.test/old-shopify-callback'
+const updatePlan = await verifier.commerce(shopifyAccount, {
+  provider: 'shopify',
+  authMode: 'shopify_client_credentials',
+  clientId: 'fixture-client-id',
+  clientSecret: 'fixture-client-secret-value',
+}, { shopDomain }, 'gia1234567')
+assert.deepEqual(updatePlan.webhooks.actions, [{
+  action: 'update',
+  subscriptionGroup: 'catalogWebhookSubscriptions',
+  topic: 'products/update',
+  providerId: webhookState.find((item) => item.topic === 'PRODUCTS_UPDATE').id,
+}])
+await verifier.reconcileShopify(updatePlan, updatePlan.webhooks.actions)
+assert.equal(providerWrites, 18, 'a reviewed non-order control subscription can be repaired exactly')
+assert.equal(
+  webhookState.find((item) => item.topic === 'PRODUCTS_UPDATE').uri,
+  callback,
+)
+const incompletePageVerifier = createProviderVerifier({
+  fetchImpl: async (url, init = {}) => {
+    if (url === `https://${shopDomain}/admin/api/2026-07/graphql.json`) {
+      const request = JSON.parse(init.body)
+      if (request.operationName === 'ClawPilotMigrationWebhookProbe') {
+        return json({ data: { webhookSubscriptions: {
+          nodes: webhookState.map((item) => ({ ...item })),
+          pageInfo: { hasNextPage: true, endCursor: 'fixture-more-pages-cursor' },
+        } } })
+      }
+    }
+    return fakeFetch(url, init)
+  },
+})
+await assert.rejects(
+  incompletePageVerifier.commerce(shopifyAccount, {
+    provider: 'shopify',
+    authMode: 'shopify_client_credentials',
+    clientId: 'fixture-client-id',
+    clientSecret: 'fixture-client-secret-value',
+  }, { shopDomain }, 'gia1234567'),
+  /Shopify access-scope safety webhook discovery was incomplete/u,
+)
 
 const faire = await verifier.commerce({ provider: 'faire', environment: 'production' }, {
   provider: 'faire', authMode: 'faire_brand_token', accessToken: 'faire-fixture-access-token',
@@ -287,6 +392,77 @@ assert.throws(
   /fixture encryption failure/u,
 )
 assert.ok(failedPlaintext.every((byte) => byte === 0), 'failed encryption input must be zeroized')
+let successfulDecryptedBuffer
+const decryptedResult = withZeroizedBuffer(
+  Buffer.from('temporary-source-decrypted-secret', 'utf8'),
+  (plaintext) => {
+    successfulDecryptedBuffer = plaintext
+    assert.equal(plaintext.toString('utf8'), 'temporary-source-decrypted-secret')
+    return 'validated-source-secret'
+  },
+)
+assert.equal(decryptedResult, 'validated-source-secret')
+assert.ok(
+  successfulDecryptedBuffer.every((byte) => byte === 0),
+  'successful source decryption input must be zeroized',
+)
+let failedDecryptedBuffer
+assert.throws(
+  () => withZeroizedBuffer(
+    Buffer.from('temporary-invalid-source-secret', 'utf8'),
+    (plaintext) => {
+      failedDecryptedBuffer = plaintext
+      throw new Error('fixture decrypted-secret validation failure')
+    },
+  ),
+  /fixture decrypted-secret validation failure/u,
+)
+assert.ok(
+  failedDecryptedBuffer.every((byte) => byte === 0),
+  'failed source decryption input must be zeroized',
+)
+const providerResponseBytes = Buffer.from(
+  JSON.stringify({ access_token: 'temporary-provider-response-token' }),
+  'utf8',
+)
+let providerResponseBacking
+const providerResponse = await boundedJsonResponse({
+  ok: true,
+  async arrayBuffer() {
+    providerResponseBacking = providerResponseBytes.buffer.slice(
+      providerResponseBytes.byteOffset,
+      providerResponseBytes.byteOffset + providerResponseBytes.byteLength,
+    )
+    return providerResponseBacking
+  },
+}, 'Shopify', 'fixture token response')
+assert.equal(providerResponse.access_token, 'temporary-provider-response-token')
+assert.ok(
+  new Uint8Array(providerResponseBacking).every((byte) => byte === 0),
+  'successful provider response bytes must be zeroized',
+)
+const rejectedProviderResponseBytes = Buffer.from(
+  JSON.stringify({ access_token: 'temporary-rejected-provider-token' }),
+  'utf8',
+)
+let rejectedProviderResponseBacking
+await assert.rejects(
+  boundedJsonResponse({
+    ok: false,
+    async arrayBuffer() {
+      rejectedProviderResponseBacking = rejectedProviderResponseBytes.buffer.slice(
+        rejectedProviderResponseBytes.byteOffset,
+        rejectedProviderResponseBytes.byteOffset + rejectedProviderResponseBytes.byteLength,
+      )
+      return rejectedProviderResponseBacking
+    },
+  }, 'Shopify', 'fixture rejected token response'),
+  /Shopify fixture rejected token response failed without verified evidence/u,
+)
+assert.ok(
+  new Uint8Array(rejectedProviderResponseBacking).every((byte) => byte === 0),
+  'rejected provider response bytes must be zeroized',
+)
 const parsedHistoryPlan = parseArguments([
   'plan',
   '--actor', 'operator@example.com',
@@ -443,6 +619,52 @@ assert.throws(
 )
 
 const source = readFileSync(new URL('./rebind-migrated-production-integrations.mjs', import.meta.url), 'utf8')
+const boundedResponseSource = source.slice(
+  source.indexOf('export async function boundedJsonResponse'),
+  source.indexOf('function exactHttpsUri'),
+)
+assert.match(boundedResponseSource, /finally\s*\{\s*bytes\.fill\(0\)/u)
+const commerceDecryptionSource = source.slice(
+  source.indexOf('function decryptedCommerceCredential'),
+  source.indexOf('function decryptedCarrierMaterial'),
+)
+assert.match(commerceDecryptionSource, /withZeroizedBuffer\(plaintext/u)
+const carrierDecryptionSource = source.slice(
+  source.indexOf('function decryptedCarrierMaterial'),
+  source.indexOf('function withoutMigrationFlags'),
+)
+assert.equal(
+  (carrierDecryptionSource.match(/withZeroizedBuffer\(/gu) || []).length,
+  2,
+  'carrier credential and account-number plaintext buffers must both be zeroized',
+)
+const sensitiveMaterial = [{
+  verification: {
+    runtime: {
+      shopDomain: 'fixture.myshopify.com',
+      accessToken: 'short-lived-provider-token',
+      responseBytes: Buffer.from('provider-runtime'),
+    },
+  },
+  secret: {
+    credential: { clientId: 'client', clientSecret: 'secret' },
+    accountNumber: '123456789',
+    encrypted: { ciphertext: Buffer.from('ciphertext') },
+  },
+}]
+const sensitiveCiphertextBuffer = sensitiveMaterial[0].secret.encrypted.ciphertext
+const sensitiveRuntime = sensitiveMaterial[0].verification.runtime
+const sensitiveRuntimeBuffer = sensitiveRuntime.responseBytes
+destroyValidatedMaterials(sensitiveMaterial)
+assert.equal(sensitiveMaterial.length, 0)
+assert.deepEqual(sensitiveCiphertextBuffer, Buffer.alloc(sensitiveCiphertextBuffer.length))
+assert.equal(sensitiveRuntime.accessToken, null)
+assert.deepEqual(sensitiveRuntimeBuffer, Buffer.alloc(sensitiveRuntimeBuffer.length))
+const derivedKeySource = source.slice(
+  source.indexOf('function withDerivedKey'),
+  source.indexOf('function decryptAesGcm'),
+)
+assert.match(derivedKeySource, /finally\s*\{\s*key\.fill\(0\)/u)
 const materialCollectionSource = source.slice(
   source.indexOf('async function collectValidatedMaterials'),
   source.indexOf('function redactedMaterialProjection'),
@@ -457,13 +679,21 @@ assert.equal(
   false,
   'target material collection must not bypass plaintext zeroization',
 )
+const sourceProviderLoaderCode = source.slice(
+  source.indexOf('async function loadCommerceSource'),
+  source.indexOf('async function loadTargetAuthority'),
+)
 for (const forbiddenSql of [
   'FROM operations_commerce_webhook_receipts',
   'FROM operations_commerce_provider_attempts',
   'FROM sync_outbox',
   'FROM operations_commerce_sync_cursors',
 ]) {
-  assert.equal(source.includes(forbiddenSql), false, `must not read/copy forbidden source state: ${forbiddenSql}`)
+  assert.equal(
+    sourceProviderLoaderCode.includes(forbiddenSql),
+    false,
+    `must not read/copy forbidden source state: ${forbiddenSql}`,
+  )
 }
 assert.match(source, /BEGIN ISOLATION LEVEL SERIALIZABLE/u)
 assert.match(source, /SOURCE_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY/u)
@@ -477,7 +707,11 @@ assert.match(source, /--managed-rebind-secrets-fd/u)
 assert.match(source, /readBoundedSecretJsonFd/u)
 assert.match(source, /target order-history policy must be absent before rebind/u)
 assert.match(source, /reviewed order-history policy was not inserted atomically/u)
-assert.match(source, /commerce_order_history_policy_guard/u)
+assert.match(source, /target Shopify fulfillment notification policy must be absent before rebind/u)
+assert.match(source, /safe Shopify fulfillment notification policy was not inserted atomically/u)
+assert.match(source, /attestProductionRebindTargetSchema/u)
+assert.match(source, /verifyIntegrationCredentialKeyAttestation/u)
+assert.match(source, /INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID/u)
 const historyPolicyInsert = source.slice(
   source.indexOf('async function insertReviewedHistoryPolicy'),
   source.indexOf('export async function applyValidatedMaterials'),
@@ -485,11 +719,46 @@ const historyPolicyInsert = source.slice(
 assert.ok(historyPolicyInsert.length > 0)
 assert.match(historyPolicyInsert, /INSERT INTO operations_commerce_order_history_policies/u)
 assert.equal(historyPolicyInsert.includes('ON CONFLICT DO NOTHING'), false)
+const notificationPolicyInsert = source.slice(
+  source.indexOf('INSERT INTO operations_shopify_fulfillment_notification_policies'),
+  source.indexOf('async function applyCarrierMaterial'),
+)
+assert.ok(notificationPolicyInsert.length > 0)
+assert.match(notificationPolicyInsert, /RETURNING policy_version/u)
+assert.equal(notificationPolicyInsert.includes('ON CONFLICT'), false)
 const applyTransactionSource = source.slice(
   source.indexOf('export async function applyValidatedMaterials'),
   source.indexOf('export async function planRebind'),
 )
 assert.ok(applyTransactionSource.length > 0)
+assert.ok(
+  applyTransactionSource.indexOf('lockProductionSchemaMigrations')
+    < applyTransactionSource.indexOf('lockProductionRebindSchemaRelations')
+    && applyTransactionSource.indexOf('lockProductionRebindSchemaRelations')
+      < applyTransactionSource.indexOf('assertTargetSchema'),
+  'the serializable transaction must own the migration lock before rechecking exact schema',
+)
+assert.match(source, /LOCK TABLE.*IN ACCESS SHARE MODE/u)
+assert.match(
+  source,
+  /LOCK TABLE \$\{SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_RELATION\} IN SHARE ROW EXCLUSIVE MODE/u,
+)
+const relationLockSource = source.slice(
+  source.indexOf('async function lockProductionRebindSchemaRelations'),
+  source.indexOf('async function loadCommerceSource'),
+)
+assert.ok(
+  relationLockSource.indexOf('IN SHARE ROW EXCLUSIVE MODE')
+    < relationLockSource.indexOf('IN ACCESS SHARE MODE'),
+  'the notification-policy write-conflicting lock must be acquired before relation attestations',
+)
+assert.ok(
+  applyTransactionSource.indexOf('assertTargetSchema')
+    < applyTransactionSource.indexOf('reconcileReviewedCallbacks')
+    && applyTransactionSource.indexOf('assertTargetKeyAttestation')
+      < applyTransactionSource.indexOf('reconcileReviewedCallbacks'),
+  'exact schema and key attestation must be rechecked before provider writes',
+)
 assert.ok(
   applyTransactionSource.indexOf('assertRebindPlanFreshness')
     < applyTransactionSource.indexOf('insertReviewedHistoryPolicy'),
@@ -526,9 +795,28 @@ for (const sourceAccountGlobalId of [
 ]) assert.match(runbook, new RegExp(sourceAccountGlobalId, 'u'))
 assert.match(runbook, /receipt_count = 1/u)
 assert.match(runbook, /policy_count = 1/u)
-assert.match(runbook, /exact_policy_match/u)
+assert.match(runbook, /exact_rebind_match/u)
+assert.match(runbook, /reviewed_plan_digest =\s*expected\.confirmed_plan_digest/u)
+assert.match(
+  runbook,
+  /reviewed_target_account_global_id =\s*account_evidence\.target_account_global_id/u,
+)
 assert.match(runbook, /more than 15 minutes old/u)
 assert.match(runbook, /more than 5 seconds ahead of the target database clock/u)
+assert.match(runbook, /export-receipt/u)
+assert.match(
+  runbook,
+  /Never\s+reuse\s+an\s+old\s+plan\s+after\s+a\s+partial\s+Shopify\s+provider\s+mutation/u,
+)
+assert.match(
+  runbook,
+  /re-reads and locks the exact selected source\s+cutover fence, integration account, and credential generation/u,
+)
+assert.match(runbook, /Hosted production may\s+read the two compiled Shopify demo sandboxes only/u)
+assert.match(runbook, /carrierServiceVerified: false/u)
+assert.match(runbook, /checkoutPackRegenerationAllowed: false/u)
+assert.match(runbook, /Orders.*Refresh/u)
+assert.match(runbook, /shopify-fulfillment-notification-v1/u)
 
 const evidenceDirectory = mkdtempSync(path.join(tmpdir(), 'clawpilot-rebind-evidence-'))
 try {

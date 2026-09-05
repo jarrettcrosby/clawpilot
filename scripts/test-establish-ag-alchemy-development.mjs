@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import vm from 'node:vm'
 import * as globalIds from '../app_src/lib/globalIds.mjs'
 import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 import {
   APPROVED_SHOPIFY_READ_SCOPES,
   DISPOSABLE_REHEARSAL_CONFIRMATION,
@@ -65,6 +66,9 @@ function loadCommerceCrypto() {
       }
       if (specifier === '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs') {
         return commerceOrderRevisionEvidenceKeyConfig
+      }
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
       }
       return nodeRequire(specifier)
     },

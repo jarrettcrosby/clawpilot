@@ -1,8 +1,13 @@
 import { syncShopifyInventory } from '@/lib/integrations/commerceInventory'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   claimShopifyInventoryRefreshJobsInPostgres,
   completeShopifyInventoryRefreshJobInPostgres,
   failShopifyInventoryRefreshJobInPostgres,
+  parkShopifyInventoryRefreshForRuntimeMaintenanceInPostgres,
   parkShopifyInventoryRefreshForStoreSyncPauseInPostgres,
   queueAutomaticShopifyInventoryRefreshesInPostgres,
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
@@ -97,6 +102,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
   let commerceStorageMaintenance = await maintainInventoryCommerceStorageSafely(
     input.workerId,
   )
+  assertIntegrationCredentialProviderIoReady()
   const automatic = await queueAutomaticShopifyInventoryRefreshesInPostgres()
   let followUpQueued = 0
   const requestedLimit = Math.max(
@@ -110,6 +116,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
   let cancelled = 0
   let parked = 0
   for (let index = 0; index < requestedLimit; index += 1) {
+    assertIntegrationCredentialProviderIoReady()
     const [job] = await claimShopifyInventoryRefreshJobsInPostgres({
       limit: 1,
       workerId: input.workerId,
@@ -182,12 +189,22 @@ export async function processShopifyInventoryRefreshOutbox(input: {
       if (completion.status === 'succeeded') {
         completed += 1
         if (completion.followUpRequired) {
+          assertIntegrationCredentialProviderIoReady()
           const followUp =
             await queueAutomaticShopifyInventoryRefreshesInPostgres()
           followUpQueued += followUp.queued
         }
       } else cancelled += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled([
+          parkShopifyInventoryRefreshForRuntimeMaintenanceInPostgres({
+            job,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          }),
+        ])
+        throw error
+      }
       if (isStoreSyncReadPause(error)) {
         const disposition =
           await parkShopifyInventoryRefreshForStoreSyncPauseInPostgres({ job })

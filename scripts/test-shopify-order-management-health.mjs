@@ -390,7 +390,21 @@ assert.ok(
   'Missing order-management structure must enter the global migration error',
 )
 
-function loadRoute({ durable, structureApplied }) {
+function loadRoute({
+  durable,
+  structureApplied,
+  runtimeReadiness = {
+    mode: 'strict',
+    status: 'verified',
+    keyId: 'test-integration-v1',
+    databaseIdentity: '750aa268-0e31-4065-a99c-4016e4d4fab1',
+    recordDigest: 'a'.repeat(64),
+    deploymentReady: true,
+    providerIoReady: true,
+    proofVerified: true,
+    proofRefreshed: true,
+  },
+}) {
   let healthReads = 0
   let mainQuery = null
   const runtime = Object.freeze({
@@ -477,6 +491,11 @@ function loadRoute({ durable, structureApplied }) {
       query: async () => ({ rows: [{ operator_id: 'operator' }] }),
     },
     '@/lib/persistence/postgres': { query },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+      integrationCredentialRuntimeEnforcementRequired: () => true,
+      refreshIntegrationCredentialRuntimeReadiness: async () =>
+        runtimeReadiness,
+    },
     '@/lib/persistence/operationsCommandReceiptHealth': {
       OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY: 'command receipt health',
     },
@@ -699,6 +718,33 @@ const processing = await executeScenario({
 })
 assert.equal(processing.responseStatus, 200)
 assert.equal(processing.body.status, 'ok')
+assert.deepEqual(processing.body.integrationCredentialRuntime, {
+  mode: 'strict',
+  status: 'verified',
+  deploymentReady: true,
+  providerIoReady: true,
+  proofVerified: true,
+  proofRefreshed: true,
+  maintenance: false,
+})
+assert.ok(
+  !JSON.stringify(processing.body.integrationCredentialRuntime).includes(
+    'test-integration-v1',
+  ),
+  'public health must not expose integration key IDs',
+)
+assert.ok(
+  !JSON.stringify(processing.body.integrationCredentialRuntime).includes(
+    '750aa268-0e31-4065-a99c-4016e4d4fab1',
+  ),
+  'public health must not expose the database identity',
+)
+assert.ok(
+  !JSON.stringify(processing.body.integrationCredentialRuntime).includes(
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  ),
+  'public health must not expose the attestation record digest',
+)
 assert.equal(processing.body.shopifyOrderManagement.status, 'processing')
 assert.deepEqual(processing.body.shopifyOrderManagement.runtime, {
   available: false,
@@ -723,6 +769,47 @@ assert.ok(
     || warning.includes('Shopify order management has unknown')),
   'Active processing with a current lease must remain informational',
 )
+
+const adoptionMaintenance = await executeScenario({
+  durable: baseDurable,
+  structureApplied: false,
+  runtimeReadiness: {
+    mode: 'adoption',
+    status: 'adoption_required',
+    deploymentReady: true,
+    providerIoReady: false,
+    proofVerified: true,
+    proofRefreshed: true,
+  },
+})
+assert.equal(adoptionMaintenance.responseStatus, 503)
+assert.equal(adoptionMaintenance.body.status, 'error')
+assert.equal(
+  adoptionMaintenance.body.integrationCredentialRuntime.providerIoReady,
+  false,
+)
+assert.ok(adoptionMaintenance.body.errors.includes(
+  'Required database migrations are not applied.',
+))
+assert.ok(adoptionMaintenance.body.warnings.includes(
+  'Integration credential adoption mode is active; provider access is disabled.',
+))
+
+const healthyAdoptionMaintenance = await executeScenario({
+  durable: baseDurable,
+  structureApplied: true,
+  runtimeReadiness: {
+    mode: 'adoption',
+    status: 'adoption_required',
+    deploymentReady: true,
+    providerIoReady: false,
+    proofVerified: true,
+    proofRefreshed: true,
+  },
+})
+assert.equal(healthyAdoptionMaintenance.responseStatus, 200)
+assert.equal(healthyAdoptionMaintenance.body.status, 'maintenance')
+assert.deepEqual(healthyAdoptionMaintenance.body.errors, [])
 
 const disabled = await executeScenario({
   durable: { ...baseDurable, processing: 0 },

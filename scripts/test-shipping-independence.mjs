@@ -155,6 +155,9 @@ const oneOffRouteModule = runTypeScript(
         throw new Error('Unexpected pack call in void permission contract')
       },
     },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse: () => null,
+    },
     '@/lib/persistence/operationOneOffShipping': {
       readOneOffCarrierGroupExecutionModeInPostgres: async () => routeExecutionMode,
       voidOperationsOneOffCarrierGroupInPostgres: async (input) => {
