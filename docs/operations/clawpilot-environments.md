@@ -84,6 +84,121 @@ The loopback override applies only to this Mac. An iPhone or Watch requires a
 separately trusted certificate and LAN or VPN DNS path to the Mac; do not expose
 the unauthenticated local fixture runtime to the public internet.
 
+### Authenticated Remote-Local Access
+
+`dev.aiapp.eigenracing.com` can remain the browser-visible development origin
+while the app runs on this Mac, but the ordinary `scripts/dev-start.sh` process
+must never be exposed directly. It deliberately uses an authentication-disabled
+file fixture and binds to loopback for that reason.
+
+The supported remote-local topology uses a dedicated Vercel gateway project
+rooted at `infra/vercel-remote-local-gateway`, a stable Tailscale Funnel HTTPS
+origin, and a second loopback-only Caddy listener on port 4102:
+
+```text
+browser -> dev.aiapp.eigenracing.com (Vercel TLS)
+        -> stable *.ts.net Funnel origin (TLS)
+        -> 127.0.0.1:4102 (Caddy)
+        -> 127.0.0.1:4002 (authenticated ClawPilot runtime)
+```
+
+There are three independent checks before a browser reaches the application.
+Vercel
+overwrites `X-ClawPilot-Remote-Local-Ingress` with a secret held only in Vercel
+and on the Mac; Caddy rejects requests without the exact value. Caddy then
+requires an operator username and password using a one-way password hash.
+Finally, ClawPilot itself must require its normal durable Postgres-backed user
+session. A
+request sent directly to the discoverable Funnel hostname therefore fails even
+if it supplies a forged public host header. Caddy removes both the gateway
+secret and Basic authorization header before forwarding to ClawPilot.
+
+Generate the two local inputs without writing plaintext credentials to Git:
+
+```bash
+export CLAWPILOT_REMOTE_LOCAL_INGRESS_SECRET="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+export CLAWPILOT_REMOTE_LOCAL_PASSWORD_HASH="$(caddy hash-password)"
+./scripts/manage-remote-local-development.sh prepare
+```
+
+The password command prompts without echoing input and produces the required
+bcrypt hash. Supply the same ingress
+secret to the dedicated Vercel gateway as the encrypted
+`CLAWPILOT_REMOTE_LOCAL_INGRESS_SECRET` environment variable. Set
+`CLAWPILOT_REMOTE_LOCAL_ORIGIN` to the exact stable `https://*.ts.net` Funnel
+origin with no trailing slash. Never use a `NEXT_PUBLIC_*` variable for either
+value.
+
+The ingress manager does not start ClawPilot. Before using it, separately start
+a production-like local build on `127.0.0.1:4002` against a dedicated,
+fully-migrated non-production Postgres database. It must use at least:
+
+```text
+APP_AUTH_REQUIRED=1
+CLAWPILOT_STORAGE=postgres
+CLAWPILOT_DB_FALLBACK_TO_FILE=false
+CLAWPILOT_PUBLIC_URL=https://dev.aiapp.eigenracing.com
+CLAWPILOT_EXECUTION_ENABLED=0
+CLAWPILOT_COMMERCE_INTAKE_ENABLED=0
+CLAWPILOT_COMMERCE_ORDER_REVISION_APPLY_ENABLED=0
+CLAWPILOT_SHOPIFY_ORDER_TEST_WRITES_ENABLED=0
+CLAWPILOT_SHOPIFY_ORDER_PRODUCTION_WRITES_ENABLED=0
+CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED=0
+QUICKBOOKS_WRITES_ENABLED=0
+CAREER_SITE_SUBMISSIONS_ENABLED=0
+CAREER_SITE_AGENTS_ENABLED=0
+CAREER_SITE_LINKEDIN_ENABLED=0
+CRM_ENABLED=0
+CLAWPILOT_REPOSITORY_RUNNER_ENABLED=0
+CLAWPILOT_PRINT_AGENT_RELEASE_ENABLED=0
+AI_RADAR_ENABLED=false
+```
+
+The database URL, application/session credentials, auth-mail or SSO identity,
+and encryption keys remain server-only and are not stored in this repository.
+Do not point this runtime at the production database or reuse production
+provider credentials. The ordinary `scripts/dev-start.sh` fixture is not a
+substitute: it hardcodes file storage and `APP_AUTH_REQUIRED=0`.
+Set `CLAWPILOT_REMOTE_LOCAL_DATABASE_FINGERPRINT` for the ingress manager to
+the exact `databaseFingerprint` returned by this isolated runtime's
+`/api/persistence/status`. `start-ingress` and `status` fail closed when it is
+missing, malformed, or different, preventing a healthy but incorrect database
+from being exposed.
+Disable the separate loopback hostname override before remote-local operation;
+otherwise this Mac resolves the branded domain locally instead of through the
+Vercel gateway. Never run the loopback-domain `enable` action while the public
+remote-local ingress is active.
+
+After separately validating a complete application login/session locally and
+reviewing and approving the Vercel project/domain assignment and Funnel
+enablement, start only the authenticated Mac-side ingress with:
+
+```bash
+./scripts/manage-remote-local-development.sh start-ingress
+./scripts/manage-remote-local-development.sh funnel-command
+```
+
+The second command only prints the required Tailscale command; it does not run
+it. `start-ingress` fails closed unless the upstream root redirects to the exact
+HTTPS login origin, `/login` is available, an unauthenticated protected API
+returns 401, and `/api/persistence/status` reports a healthy Postgres authority.
+`status` repeats those checks and proves that the ingress is loopback-only, a
+direct request receives 404, and a Vercel-secret-only request still receives
+the Basic-auth 401. Stop the ingress with `stop-ingress`; manage the application
+runtime separately. Disabling Funnel and changing the Vercel domain or
+environment remain explicit infrastructure actions.
+
+The Vercel gateway route matches only the exact branded host; Vercel project
+aliases receive 404, and external-origin caching is disabled. Vercel external
+routing retains the branded URL and proxies ordinary request
+methods, bodies, cookies, and response headers for all matched paths, including
+Next.js assets and APIs. It is not an offline replica: the Mac and Tailscale
+must be online, Funnel has non-configurable bandwidth limits, and Vercel's
+reserved `/.well-known` handling is not supplied by this catch-all gateway.
+This isolated remote-local runtime still has none of the retired hosted-development
+Postgres, SuiteCRM, worker, provider, webhook, or callback authority described
+below.
+
 ### Retired Hosted-Development Operations
 
 The local origin preserves same-origin browser behavior; it does not recreate
