@@ -34,11 +34,40 @@ function parseNontransactionalStatements(file, sql) {
   return statements
 }
 
-export async function applyMigrationSqlForTest(client, file, sql) {
+async function recordMigration(client, file, checksum) {
+  await client.query(
+    'ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text',
+  )
+  await client.query(
+    `INSERT INTO schema_migrations (filename, checksum)
+     VALUES ($1, $2)`,
+    [file, checksum],
+  )
+}
+
+export async function applyMigrationSqlForTest(
+  client,
+  file,
+  sql,
+  options = {},
+) {
+  const checksum = options.checksum || null
   const nontransactionalStatements = parseNontransactionalStatements(file, sql)
   if (nontransactionalStatements) {
     for (const statement of nontransactionalStatements) {
       await client.query(statement)
+    }
+    if (checksum) {
+      await client.query('BEGIN')
+      try {
+        await recordMigration(client, file, checksum)
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw new Error(`Migration ${file} could not be recorded`, {
+          cause: error,
+        })
+      }
     }
     return
   }
@@ -46,6 +75,7 @@ export async function applyMigrationSqlForTest(client, file, sql) {
   await client.query('BEGIN')
   try {
     await client.query(sql)
+    if (checksum) await recordMigration(client, file, checksum)
     await client.query('COMMIT')
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined)
