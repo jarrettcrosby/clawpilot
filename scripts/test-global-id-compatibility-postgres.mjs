@@ -10,6 +10,8 @@ import { resolve } from 'node:path'
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = requireFromApp('pg')
 const root = process.cwd()
+const NONTRANSACTIONAL_DIRECTIVE = '-- clawpilot:migration-mode=nontransactional'
+const STATEMENT_BREAK = '-- clawpilot:migration-statement-break'
 
 function command(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -44,9 +46,19 @@ function migrationFiles() {
 
 async function applyMigrations(client, files) {
   for (const file of files) {
+    const sql = readFileSync(resolve(root, 'db/migrations', file), 'utf8')
+    if (sql.trimStart().startsWith(NONTRANSACTIONAL_DIRECTIVE)) {
+      const statements = sql
+        .split(STATEMENT_BREAK)
+        .map((statement) => statement.trim())
+        .filter(Boolean)
+      assert.ok(statements.length > 0, `${file} has no nontransactional statements`)
+      for (const statement of statements) await client.query(statement)
+      continue
+    }
     await client.query('BEGIN')
     try {
-      await client.query(readFileSync(resolve(root, 'db/migrations', file), 'utf8'))
+      await client.query(sql)
       await client.query('COMMIT')
     } catch (error) {
       await client.query('ROLLBACK')
