@@ -553,6 +553,8 @@ export const OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL = String.raw`
 export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_MIGRATION_CHECKSUM =
   '082763c4db98dd3c53498b3e35c57edc7dbddec1ee4b7568040e14aab29efaee'
 export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT = 47
+export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_PRE_0350_ARTIFACT_HASH =
+  '2134de8f34c8e6d644363498fc46e06df25880d21aee29eeb6f1eb4ff4365c93'
 export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH =
   '636e18fec91118651ad765b3470d80661e8a64ed2f985b5be0f78cd605f3a201'
 
@@ -618,7 +620,15 @@ export const OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL = String.raw`
           kind || '|' || identity || '|' || definition,
           pg_catalog.chr(10) ORDER BY kind, identity
         ), 'UTF8'
-      ), 'sha256'), 'hex') = '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH}'
+      ), 'sha256'), 'hex') = CASE WHEN EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0350_operations_commerce_order_history_exclusions.sql'
+          AND checksum =
+            '76335d56e966a7f6fe7959401df7345e98e76c342824261b55a4a25e93781369'
+      ) THEN '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_HASH}'
+      ELSE '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_PRE_0350_ARTIFACT_HASH}'
+      END
     FROM artifacts
   )
 `
