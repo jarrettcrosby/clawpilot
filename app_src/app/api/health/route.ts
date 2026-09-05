@@ -456,8 +456,9 @@ const SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL = String.raw`
 `
 
 // Exact structural attestation for 0299 plus the 0317 simulation-readiness
-// correction. Migration checksums pin every backfill/rewrite, while function
-// hashes and catalog checks detect runtime drift after migration application.
+// correction and the 0354 migrated-authority rating fence. Migration checksums
+// pin every backfill/rewrite, while phase-aware function hashes and catalog
+// checks detect runtime drift after migration application.
 const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
   EXISTS (
     SELECT 1 FROM public.schema_migrations
@@ -485,6 +486,29 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
     )
   )
   AND (
+    NOT EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename =
+        '0354_operations_sales_shipping_workspace_migration_safety.sql'
+    )
+    OR (
+      EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0354_operations_sales_shipping_workspace_migration_safety.sql'
+          AND checksum =
+            '322e822d66cc6b6e9d4fd9d662fe3e1064db7b9fe08279e7024e9644e422c399'
+      )
+      AND EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0309_operations_measured_packaging_evidence.sql'
+          AND checksum =
+            '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
+      )
+    )
+  )
+  AND (
     SELECT pg_catalog.count(installed.oid) = 34
       AND pg_catalog.encode(public.digest(pg_catalog.convert_to(pg_catalog.string_agg(
         pg_catalog.concat_ws('|',
@@ -504,6 +528,28 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
           ))
         ), E'\n' ORDER BY required.signature
       ), 'UTF8'), 'sha256'), 'hex') = CASE
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0354_operations_sales_shipping_workspace_migration_safety.sql'
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0305_operations_commerce_rollout_contract.sql'
+            AND checksum =
+              'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
+        )
+        THEN 'ec1e699fff0e0e1e90b6415081c3cb0cb80d36bdd7e0642401c0f32a10174371'
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0354_operations_sales_shipping_workspace_migration_safety.sql'
+        )
+        THEN 'b599b5047d42b8f4e4b1dd29898d7b4d50bb241bdb1e5f031e8c95f5197414f6'
         WHEN EXISTS (
           SELECT 1
           FROM public.schema_migrations

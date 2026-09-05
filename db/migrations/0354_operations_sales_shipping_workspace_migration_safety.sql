@@ -3,6 +3,8 @@
 -- credentials, account-number ciphertext, webhook secrets, cursors, and
 -- provider payload/state are deliberately forbidden.
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS operations_commerce_workspace_migration_cutover_fences (
   organization_id uuid NOT NULL
     REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
@@ -970,7 +972,7 @@ ON audit_events
 FOR EACH ROW EXECUTE FUNCTION protect_commerce_workspace_migration_receipt();
 
 CREATE OR REPLACE FUNCTION
-  operations_shopify_carrier_configuration_allows_rating(
+  public.operations_shopify_carrier_configuration_allows_rating(
     configuration jsonb,
     requested_environment text
   )
@@ -1049,6 +1051,10 @@ AS $$
     ELSE false
   END;
 $$;
+
+ALTER FUNCTION
+  public.operations_shopify_carrier_configuration_allows_rating(jsonb, text)
+  SET search_path = pg_catalog, public, pg_temp;
 
 COMMENT ON TABLE operations_commerce_workspace_migration_cutover_fences IS
   'Explicit source-side cutover fence for selected commerce and carrier integrations. Migration also takes NOWAIT SHARE locks before snapshotting selected and queue tables.';
