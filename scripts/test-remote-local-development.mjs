@@ -47,7 +47,8 @@ assert.ok(route.transforms.some(
     && transform.args === 'https',
 ))
 
-assert.match(manager, /http:\/\/127\.0\.0\.1:\$\{?INGRESS_PORT/)
+assert.match(manager, /printf 'http:\/\/:\%s/)
+assert.match(manager, /printf '  bind 127\.0\.0\.1/)
 assert.match(manager, /@vercel header %s %s/)
 assert.match(manager, /basic_auth/)
 assert.match(manager, /reverse_proxy 127\.0\.0\.1:4002/)
@@ -61,6 +62,11 @@ assert.match(manager, /CLAWPILOT_REMOTE_LOCAL_DATABASE_FINGERPRINT/)
 assert.match(manager, /require_expected_database_fingerprint/)
 assert.match(manager, /ps -p "\$pid" -o command=/)
 assert.match(manager, /PID \$pid is not the managed Caddy process/)
+assert.match(manager, /Caddy did not adapt to one loopback-only listener/)
+assert.match(manager, /loopback_only_listener 4002/)
+assert.match(manager, /authenticated app must listen only on loopback port 4002/)
+assert.match(manager, /if ! "\$0" status; then/)
+assert.match(manager, /stop_ingress >\/dev\/null \|\| true/)
 assert.match(manager, /protected API did not return 401/)
 assert.match(manager, /did not redirect to the exact HTTPS login origin/)
 assert.doesNotMatch(manager, /"\$REPO_ROOT\/scripts\/dev-start\.sh"/)
@@ -85,6 +91,8 @@ try {
     stdio: 'pipe',
   })
   const caddyfile = readFileSync(join(stateRoot, 'Caddyfile'), 'utf8')
+  assert.match(caddyfile, /http:\/\/:4102 \{/)
+  assert.match(caddyfile, /bind 127\.0\.0\.1/)
   assert.match(caddyfile, new RegExp(`X-ClawPilot-Remote-Local-Ingress ${secret}`))
   assert.match(caddyfile, /basic_auth \{/)
   assert.match(caddyfile, /operator \$2[aby]\$/)
@@ -94,6 +102,16 @@ try {
   execFileSync('caddy', ['validate', '--config', join(stateRoot, 'Caddyfile'), '--adapter', 'caddyfile'], {
     stdio: 'pipe',
   })
+  const adapted = JSON.parse(execFileSync(
+    'caddy',
+    ['adapt', '--config', join(stateRoot, 'Caddyfile'), '--adapter', 'caddyfile'],
+    { encoding: 'utf8' },
+  ))
+  const servers = Object.values(adapted.apps?.http?.servers || {})
+  assert.ok(servers.length > 0)
+  assert.ok(servers.every((server) => (
+    JSON.stringify(server.listen) === JSON.stringify(['127.0.0.1:4102'])
+  )))
 
   assert.throws(() => execFileSync('/bin/bash', [managerUrl.pathname, 'prepare'], {
     env: {

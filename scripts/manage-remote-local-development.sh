@@ -76,6 +76,7 @@ require_expected_database_fingerprint() {
 
 write_caddyfile() {
   require_tool caddy
+  require_tool python3
   require_secret_inputs
   umask 077
   mkdir -p "$STATE_ROOT"
@@ -87,7 +88,8 @@ write_caddyfile() {
 
   {
     printf '{\n  admin off\n}\n\n'
-    printf 'http://127.0.0.1:%s {\n' "$INGRESS_PORT"
+    printf 'http://:%s {\n' "$INGRESS_PORT"
+    printf '  bind 127.0.0.1\n'
     printf '  @vercel header %s %s\n' "$INGRESS_HEADER" "$secret"
     printf '  handle @vercel {\n'
     printf '    basic_auth {\n'
@@ -110,6 +112,26 @@ write_caddyfile() {
   chmod 600 "$CADDYFILE"
   caddy fmt --overwrite "$CADDYFILE" >/dev/null
   caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null
+  local adapted
+  adapted="$(caddy adapt --config "$CADDYFILE" --adapter caddyfile 2>/dev/null)"
+  if ! python3 - "$adapted" "$INGRESS_PORT" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+
+expected = [f"127.0.0.1:{sys.argv[2]}"]
+servers = payload.get("apps", {}).get("http", {}).get("servers", {})
+if not servers or any(server.get("listen") != expected for server in servers.values()):
+    raise SystemExit(1)
+PY
+  then
+    echo "Refusing ingress: Caddy did not adapt to one loopback-only listener." >&2
+    return 1
+  fi
   echo "Prepared authenticated loopback ingress: $CADDYFILE"
 }
 
@@ -132,10 +154,31 @@ running_pid() {
   return 1
 }
 
+loopback_only_listener() {
+  local port="$1"
+  local listeners
+  listeners="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR > 1 { print $9 }')"
+  if [[ -z "$listeners" ]]; then
+    return 1
+  fi
+  if printf '%s\n' "$listeners" \
+    | grep -Evq '^(127\.0\.0\.1|\[::1\]):'; then
+    return 1
+  fi
+  printf '%s\n' "$listeners" \
+    | grep -Eq '^(127\.0\.0\.1|\[::1\]):'
+}
+
 verify_authenticated_upstream() {
   require_tool curl
+  require_tool lsof
   require_tool python3
   require_expected_database_fingerprint
+  if ! loopback_only_listener 4002; then
+    echo "Refusing ingress: the authenticated app must listen only on loopback port 4002." >&2
+    return 1
+  fi
   local forwarded_headers=(
     -H "Host: $DOMAIN"
     -H "X-Forwarded-Host: $DOMAIN"
@@ -213,7 +256,11 @@ start_ingress() {
     echo "Authenticated ingress failed to start. See $LOG_FILE" >&2
     exit 1
   fi
-  "$0" status
+  if ! "$0" status; then
+    stop_ingress >/dev/null || true
+    echo "Authenticated ingress failed its post-start checks and was stopped." >&2
+    exit 1
+  fi
 }
 
 stop_ingress() {
@@ -248,15 +295,8 @@ status_local() {
     failed=1
   fi
 
-  if ! lsof -nP -iTCP:"$INGRESS_PORT" -sTCP:LISTEN 2>/dev/null \
-    | awk 'NR > 1 { print $9 }' \
-    | grep -Eq '^(127\.0\.0\.1|\[::1\]):'; then
+  if ! loopback_only_listener "$INGRESS_PORT"; then
     echo "binding: no loopback listener on $INGRESS_PORT"
-    failed=1
-  elif lsof -nP -iTCP:"$INGRESS_PORT" -sTCP:LISTEN 2>/dev/null \
-    | awk 'NR > 1 { print $9 }' \
-    | grep -Evq '^(127\.0\.0\.1|\[::1\]):'; then
-    echo "binding: unexpected non-loopback listener on $INGRESS_PORT"
     failed=1
   else
     echo "binding: loopback-only on $INGRESS_PORT"
