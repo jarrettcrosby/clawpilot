@@ -143,7 +143,7 @@ Do not apply until all of these are true:
    identity-mismatched, or generation-mismatched grant as unusable.
    Fulfillment recovery-budget migration 0359 must also be present with the
    release-pinned checksum
-   `1bd515490a8c30ac412b03a17e4d37dc434376efa773cb0a723633195dcbe8f2`.
+   `f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11`.
    Health must verify its exact ledger row, non-null integer column with default
    zero, validated recovery-budget check, and ready partial index. This keeps
    the claim attempt as a monotonic fencing token while credential-maintenance

@@ -488,7 +488,7 @@ assert.ok(railwayStart.includes('application did not pass health validation'))
 const healthRoute = read('app_src/app/api/health/route.ts')
 for (const fragment of [
   '0359_operations_commerce_fulfillment_recovery_budget.sql',
-  '1bd515490a8c30ac412b03a17e4d37dc434376efa773cb0a723633195dcbe8f2',
+  'f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11',
   'AS operations_commerce_fulfillment_recovery_budget_applied',
   '&& row?.operations_commerce_fulfillment_recovery_budget_applied',
   '|| !row?.operations_commerce_fulfillment_recovery_budget_applied',
