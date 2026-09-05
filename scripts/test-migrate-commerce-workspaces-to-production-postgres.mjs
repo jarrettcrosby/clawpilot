@@ -162,7 +162,9 @@ async function allocate(client, prefix) {
 }
 
 async function reserveExactGlobalReference(client, referenceCode) {
-  const match = /^(g[a-z]{1,4})([0-9]{7})$/u.exec(referenceCode)
+  const match = /^(g[a-z]{1,4})((?:[0-9]{7}|[0-9a-v]{12}))$/u.exec(
+    referenceCode,
+  )
   assert.ok(match, `Invalid exact Global ID test fixture: ${referenceCode}`)
   const [, prefix, numberValue] = match
   await client.query(
