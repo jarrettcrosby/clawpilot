@@ -2,6 +2,10 @@ import {
   fetchCommerceProviderImage,
 } from '@/lib/integrations/commerceProviderImageFetch'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   selectCommerceProviderImageSource,
   withCurrentCommerceProviderImageSources,
   type CommerceProviderImageSource,
@@ -11,6 +15,7 @@ import {
   claimCommerceProductImageImportJobsInPostgres,
   completeCommerceProductImageImportJobInPostgres,
   failCommerceProductImageImportJobInPostgres,
+  parkCommerceProductImageImportForRuntimeMaintenanceInPostgres,
   parkCommerceProductImageImportForStoreSyncPauseInPostgres,
   recordCommerceProductImageImportWorkerHeartbeatInPostgres,
   resolveWaitingCommerceProductImageImportJobsInPostgres,
@@ -119,6 +124,7 @@ export type CommerceProductImageImportWorkerResult = {
 }
 
 type WorkerDependencies = {
+  assertProviderIoReady: typeof assertIntegrationCredentialProviderIoReady
   resolveWaiting: typeof resolveWaitingCommerceProductImageImportJobsInPostgres
   claim: typeof claimCommerceProductImageImportJobsInPostgres
   assertCurrent: typeof assertCommerceProductImageImportClaimCurrentInPostgres
@@ -130,10 +136,13 @@ type WorkerDependencies = {
   complete: typeof completeCommerceProductImageImportJobInPostgres
   fail: typeof failCommerceProductImageImportJobInPostgres
   park: typeof parkCommerceProductImageImportForStoreSyncPauseInPostgres
+  parkRuntime:
+    typeof parkCommerceProductImageImportForRuntimeMaintenanceInPostgres
   heartbeat: typeof recordCommerceProductImageImportWorkerHeartbeatInPostgres
 }
 
 const defaultDependencies: WorkerDependencies = {
+  assertProviderIoReady: assertIntegrationCredentialProviderIoReady,
   resolveWaiting: resolveWaitingCommerceProductImageImportJobsInPostgres,
   claim: claimCommerceProductImageImportJobsInPostgres,
   assertCurrent: assertCommerceProductImageImportClaimCurrentInPostgres,
@@ -144,6 +153,7 @@ const defaultDependencies: WorkerDependencies = {
   complete: completeCommerceProductImageImportJobInPostgres,
   fail: failCommerceProductImageImportJobInPostgres,
   park: parkCommerceProductImageImportForStoreSyncPauseInPostgres,
+  parkRuntime: parkCommerceProductImageImportForRuntimeMaintenanceInPostgres,
   heartbeat: recordCommerceProductImageImportWorkerHeartbeatInPostgres,
 }
 
@@ -250,6 +260,7 @@ async function processBoundedCommerceProductImageImports(
 ): Promise<CommerceProductImageImportWorkerResult> {
   const result = emptyResult()
   const limit = boundedLimit(input.limit)
+  dependencies.assertProviderIoReady()
   const resolved = await dependencies.resolveWaiting({
     updatedBy: input.workerId,
     limit: Math.min(MAX_WAITING_RESOLUTIONS, Math.max(10, limit * 10)),
@@ -260,6 +271,7 @@ async function processBoundedCommerceProductImageImports(
 
   const sourceReads = new Map<string, readonly CommerceProviderImageSource[]>()
   for (let index = 0; index < limit; index += 1) {
+    dependencies.assertProviderIoReady()
     const [claim] = await dependencies.claim({
       workerId: input.workerId,
       limit: 1,
@@ -282,6 +294,7 @@ async function processBoundedCommerceProductImageImports(
         // One durable automatic-read lease owns both source discovery and the
         // selected byte fetch. The public manual source seam owns its own
         // lease, so the worker never nests transactions or pool connections.
+        dependencies.assertProviderIoReady()
         completion = await dependencies.withSources({
           organizationId: claim.organizationId,
           accountGlobalId: claim.accountGlobalId,
@@ -306,6 +319,7 @@ async function processBoundedCommerceProductImageImports(
               leaseToken: claim.leaseToken,
               workerId: input.workerId,
             })
+            dependencies.assertProviderIoReady()
             const image = await dependencies.fetchImage({ url: selected.url })
             result.fetched += 1
             return dependencies.complete({
@@ -328,6 +342,7 @@ async function processBoundedCommerceProductImageImports(
           providerImageId: claim.providerImageId,
           locatorSha256: claim.locatorSha256,
         })
+        dependencies.assertProviderIoReady()
         completion = await dependencies.withProviderReadFence({
           organizationId: claim.organizationId,
           integrationAccountId: claim.integrationAccountId,
@@ -342,6 +357,7 @@ async function processBoundedCommerceProductImageImports(
               leaseToken: claim.leaseToken,
               workerId: input.workerId,
             })
+            dependencies.assertProviderIoReady()
             const image = await dependencies.fetchImage({ url: selected.url })
             result.fetched += 1
             return dependencies.complete({
@@ -362,6 +378,24 @@ async function processBoundedCommerceProductImageImports(
       void completion
       result.succeeded += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        try {
+          const disposition = await dependencies.parkRuntime({
+            organizationId: claim.organizationId,
+            jobId: claim.jobId,
+            leaseToken: claim.leaseToken,
+            workerId: input.workerId,
+            errorCode: String(
+              (error as { code?: unknown }).code || '',
+            ),
+          })
+          if (disposition.parked) result.parked += 1
+          else result.leaseLost += 1
+        } catch {
+          result.leaseLost += 1
+        }
+        throw error
+      }
       const code = safeErrorCode(error)
       if (storeSyncReadPaused(error)) {
         try {

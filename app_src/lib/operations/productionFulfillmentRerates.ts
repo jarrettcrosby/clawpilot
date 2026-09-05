@@ -14,6 +14,9 @@ import {
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import { carrierAccountNumberFingerprint } from '@/lib/integrations/carrierCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   createActiveCarrierDispatchRerateBinding,
   type ActiveCarrierBillingRelationship,
   type ActiveCarrierDispatchAddressSnapshot,
@@ -1645,7 +1648,8 @@ export async function prepareProductionFulfillmentRerateAttemptInPostgres(
             ),
           },
         )
-      } catch {
+      } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         fail(
           'OPERATIONS_PRODUCTION_RERATE_REQUEST_INTEGRITY_INVALID',
           'Prepared carrier request failed the exact account, address, and rate-only integrity check',

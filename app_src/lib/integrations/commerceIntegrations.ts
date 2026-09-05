@@ -1,5 +1,12 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
+  commerceReadCredentialEligible,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
   decryptFaireOAuthPendingCredential,
   decryptCommerceCredential,
   encryptFaireOAuthPendingCredential,
@@ -184,6 +191,7 @@ export class CommerceIntegrationRequestError extends Error {
 }
 
 function sanitize(error: unknown): CommerceIntegrationRequestError {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof CommerceIntegrationRequestError) return error
   if (
     error
@@ -547,6 +555,7 @@ export async function startFaireOAuthCommerce(input: {
   orderHistoryMode?: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const applicationId = normalizeFaireApplicationId(input.applicationId)
     const applicationSecret = normalizeFaireApplicationSecret(
@@ -603,6 +612,7 @@ export async function startFaireOAuthCommerce(input: {
 
 export async function purgeExpiredFaireOAuthCommerce() {
   try {
+    assertIntegrationCredentialProviderIoReady()
     return await purgeExpiredFaireOAuthInstallationsInPostgres()
   } catch (error) {
     throw sanitize(error)
@@ -616,6 +626,7 @@ export async function discardFaireOAuthCommerce(input: {
   state: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const state = faireOAuthState(input.state)
     const stateHash = createHash('sha256').update(state).digest('hex')
@@ -638,6 +649,7 @@ export async function completeFaireOAuthCommerce(input: {
   authorizationCode: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const state = faireOAuthState(input.state)
     const stateHash = createHash('sha256').update(state).digest('hex')
@@ -747,6 +759,7 @@ export async function completeFaireOAuthCommerce(input: {
 export async function getCommerceIntegrationsState(
   organizationIdValue: unknown,
 ) {
+  assertIntegrationCredentialProviderIoReady()
   const organizationId = normalizeCommerceOrganizationId(organizationIdValue)
   const project = createCommerceIntegrationsStateProjector()
   await purgeExpiredShopifyOrderPreviewsInPostgres()
@@ -829,6 +842,7 @@ export async function connectShopifyCommerce(input: {
   orderHistoryMode?: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const orderHistoryMode = normalizeCommerceOrderHistoryMode(
       input.orderHistoryMode,
@@ -920,6 +934,7 @@ export async function connectFaireCommerce(input: {
   orderHistoryMode?: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const orderHistoryMode = normalizeCommerceOrderHistoryMode(
       input.orderHistoryMode,
@@ -1116,6 +1131,7 @@ export async function clearShopifyOrderPreview(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const runtime = await shopifyPreviewAccount(input)
     return clearShopifyOrderPreviewInPostgres({
       runtime,
@@ -1138,6 +1154,7 @@ export async function importShopifyOrderPreview(input: {
     input.idempotencyKey,
   )
   try {
+    assertIntegrationCredentialProviderIoReady()
     runtime = await shopifyPreviewFetchRuntime(input)
     const providerDeadlineAt =
       Date.now() + SHOPIFY_ORDER_PREVIEW_PROVIDER_BUDGET_MS
@@ -1357,6 +1374,7 @@ async function verifyStoredConnection(
         discoveryErrorCode: null,
       }
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const code = error instanceof ShopifyCommerceClientError
         || error instanceof ShopifyOrderWebhookError
         ? error.code
@@ -1563,6 +1581,7 @@ export async function testCommerceConnection(input: {
   const requestedAt = new Date()
   const idempotencyKey = randomUUID()
   try {
+    assertIntegrationCredentialProviderIoReady()
     runtime = await storedRuntime(input)
     const verified = await verifyStoredConnection(runtime)
     const completedAt = new Date()
@@ -1648,6 +1667,7 @@ async function registerShopifyWebhookSubscriptionGroup(input: {
   const requestedAt = new Date()
   const idempotencyKey = randomUUID()
   try {
+    assertIntegrationCredentialProviderIoReady()
     runtime = await storedRuntime(input)
     if (runtime.provider !== 'shopify') {
       throw new CommerceIntegrationRequestError(
@@ -1799,6 +1819,7 @@ export async function recoverShopifyOrderWebhookCommandKey(input: {
   confirmation: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const runtime = await storedRuntime(input)
     if (runtime.provider !== 'shopify') {
       throw new CommerceIntegrationRequestError(
@@ -1852,6 +1873,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
   confirmation: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const runtime = await storedRuntime(input)
     if (runtime.provider !== 'shopify') {
       throw new CommerceIntegrationRequestError(
@@ -1985,6 +2007,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
         )
         return { providerCredential, readiness, recovery }
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         const sanitized = sanitize(error)
         if (
           (command.status === 'prepared' || command.status === 'recoverable')
@@ -2066,6 +2089,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
       currentCallbackUri: webhookUrl(runtime.globalId),
       mutationPlan: plan,
     })
+    assertIntegrationCredentialProviderIoReady()
     const revalidated = await storedRuntime(input)
     if (
       revalidated.organizationId !== runtime.organizationId
@@ -2108,6 +2132,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
       typeof reconcileShopifyOrderWebhookSubscriptions
     >>
     try {
+      assertIntegrationCredentialProviderIoReady()
       result = await reconcileShopifyOrderWebhookSubscriptions(
         providerCredential,
         {
@@ -2117,6 +2142,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
         },
       )
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const sanitized = sanitize(error)
       const dispatch = error instanceof ShopifyOrderWebhookDispatchError
         ? error
@@ -2225,6 +2251,7 @@ export async function setCommerceIntegrationEnabled(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     if (typeof input.enabled !== 'boolean') {
       throw new CommerceIntegrationRequestError(
         'Commerce enabled state must be true or false',
@@ -2297,6 +2324,7 @@ export async function setShopifyFulfillmentNotificationPolicy(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
     const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
     if (
@@ -2359,6 +2387,7 @@ export async function disconnectCommerceIntegration(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const runtime = await storedRuntime(input)
     return disconnectCommerceCredentialInPostgres({
       organizationId: runtime.organizationId,
@@ -2398,6 +2427,7 @@ export async function receiveShopifyWebhook(input: {
   providerTriggeredAt: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const accountGlobalId = normalizeCommerceAccountGlobalId(
       input.accountGlobalId,
     )
@@ -2417,8 +2447,10 @@ export async function receiveShopifyWebhook(input: {
     )
     if (
       !runtime
-      || runtime.status === 'error'
-      || runtime.verificationStatus !== 'verified'
+      || !commerceReadCredentialEligible(runtime, {
+        developmentRequiresActive: true,
+        capability: 'webhook_hydration',
+      })
     ) {
       throw new CommerceIntegrationRequestError(
         'Shopify webhook destination is unavailable',

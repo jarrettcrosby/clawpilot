@@ -3174,6 +3174,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
+          },
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/postgres': postgres,
         },
@@ -3464,6 +3467,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
                 'Canonical planning acceptance does not hash Shopify fulfillment attempts',
               )
             },
+          },
+          '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+            isIntegrationCredentialRuntimeGateError: () => false,
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,

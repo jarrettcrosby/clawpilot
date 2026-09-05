@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   shopifyInventoryRuntimeAvailable,
 } from '@/lib/integrations/commerceInventory'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
@@ -38,6 +41,26 @@ function authorized(req: NextRequest) {
   )
 }
 
+function runtimeMaintenanceResponse(error: unknown) {
+  if (!isIntegrationCredentialRuntimeGateError(error)) return null
+  const code = String((error as { code?: unknown }).code || '')
+  return NextResponse.json({
+    ok: false,
+    maintenance: true,
+    retryable: true,
+    code,
+    error: 'Integration credential runtime is temporarily unavailable',
+  }, {
+    status: 503,
+    headers: {
+      'Cache-Control': 'no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Retry-After': '60',
+    },
+  })
+}
+
 async function maintainRouteCommerceStorageSafely() {
   try {
     return await maintainCommerceStorageInPostgres({
@@ -71,8 +94,13 @@ async function runShopifyLane(input: {
     return { result, heartbeatAt: heartbeat.checkedAt }
   } catch (error) {
     await recordShopifyInventoryRefreshWorkerHeartbeatInPostgres({
-      phase: 'failed',
+      phase: isIntegrationCredentialRuntimeGateError(error)
+        ? 'maintenance'
+        : 'failed',
       workerId: input.workerId,
+      errorCode: isIntegrationCredentialRuntimeGateError(error)
+        ? String((error as { code?: unknown }).code || '')
+        : undefined,
       resource: 'inventory',
       readOnly: true,
       providerWrites: 0,
@@ -100,8 +128,13 @@ async function runFaireLane(input: {
     return { result, heartbeatAt: heartbeat.checkedAt }
   } catch (error) {
     await recordFaireInventoryPollWorkerHeartbeatInPostgres({
-      phase: 'failed',
+      phase: isIntegrationCredentialRuntimeGateError(error)
+        ? 'maintenance'
+        : 'failed',
       workerId: input.workerId,
+      errorCode: isIntegrationCredentialRuntimeGateError(error)
+        ? String((error as { code?: unknown }).code || '')
+        : undefined,
     }).catch(() => undefined)
     throw error
   }
@@ -153,6 +186,14 @@ export async function POST(req: NextRequest) {
   ])
   // Both bounded lanes always settle before either error is rethrown, so a
   // provider-specific failure cannot prevent the other provider from working.
+  if (shopifyLane.status === 'rejected') {
+    const maintenance = runtimeMaintenanceResponse(shopifyLane.reason)
+    if (maintenance) return maintenance
+  }
+  if (faireLane.status === 'rejected') {
+    const maintenance = runtimeMaintenanceResponse(faireLane.reason)
+    if (maintenance) return maintenance
+  }
   if (shopifyLane.status === 'rejected') throw shopifyLane.reason
   if (faireLane.status === 'rejected') throw faireLane.reason
   const shopify = shopifyLane.value?.result || null

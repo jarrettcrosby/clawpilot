@@ -811,6 +811,12 @@ async function verify(databaseUrl, fixtures) {
     {
       '@/lib/operations/commerceStoreSync': domain,
       '@/lib/auditWriter': { async recordAuditEvent() {} },
+      '@/lib/integrations/commerceReadRuntime': loadTypeScript(
+        'app_src/lib/integrations/commerceReadRuntime.ts',
+      ),
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+        isIntegrationCredentialRuntimeGateError: () => false,
+      },
       '@/lib/persistence/postgres': postgresAdapter(pool),
     },
   )
@@ -2314,6 +2320,151 @@ async function verify(databaseUrl, fixtures) {
   }
 }
 
+async function verifyPost0350Health(databaseUrl) {
+  const databaseName = 'clawpilot_store_sync_post_0350'
+  const post0350Url = new URL(databaseUrl)
+  post0350Url.pathname = `/${databaseName}`
+  const adminPool = new Pool({ connectionString: databaseUrl, max: 1 })
+  try {
+    await adminPool.query(`CREATE DATABASE ${databaseName}`)
+  } finally {
+    await adminPool.end()
+  }
+
+  const pool = new Pool({ connectionString: post0350Url.toString(), max: 1 })
+  const client = await pool.connect()
+  try {
+    const files = migrations()
+    const migration =
+      '0350_operations_commerce_order_history_exclusions.sql'
+    const migrationIndex = files.indexOf(migration)
+    assert.ok(migrationIndex > 0, '0350 history-exclusion migration is missing')
+    for (const file of files.slice(0, migrationIndex + 1)) {
+      await applyMigration(client, file)
+    }
+  } finally {
+    client.release()
+  }
+
+  try {
+    assert.deepEqual(
+      await readStoreSyncOperatorBindingCatalog(pool),
+      {
+        binding_count: 45,
+        binding_hash:
+          'b8dcf5dd48bc901d4217f554d1fe58a20537e3f97b10d1990947747d69f4a3d9',
+      },
+      '0350 must extend the exact Store sync CHECK-operator catalog',
+    )
+    assert.equal(
+      await storeSyncFunctionHealth(pool),
+      true,
+      '0350 must preserve the Store sync function contract',
+    )
+    assert.equal(
+      await storeSyncRewrittenFunctionHealth(pool),
+      true,
+      '0350 must preserve the rewritten-function contract',
+    )
+    assert.equal(
+      await storeSyncStructureHealth(pool),
+      true,
+      '0350 exact schema and guard catalog must pass Store sync health',
+    )
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+      '0350 must retain the legacy-writer-compatible rollout phase',
+    )
+
+    const checksumClient = await pool.connect()
+    try {
+      await checksumClient.query('BEGIN')
+      await checksumClient.query(
+        `UPDATE public.schema_migrations
+         SET checksum = repeat('0', 64)
+         WHERE filename =
+           '0350_operations_commerce_order_history_exclusions.sql'`,
+      )
+      assert.equal(
+        await storeSyncStructureHealth(checksumClient),
+        false,
+        '0350 checksum drift must fail Store sync structure health',
+      )
+      assert.equal(
+        await storeSyncAuthorityContract(checksumClient),
+        'invalid',
+        '0350 checksum drift must invalidate Store sync authority',
+      )
+    } finally {
+      await checksumClient.query('ROLLBACK').catch(() => {})
+      checksumClient.release()
+    }
+
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE OR REPLACE FUNCTION
+         guard_commerce_order_history_lease_exclusion()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER guard_commerce_order_history_lease_exclusion_write
+       ON operations_commerce_store_sync_read_leases`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_read_leases
+         ALTER COLUMN history_exclusion_code
+         SET DEFAULT 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED'`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_read_leases
+         DROP CONSTRAINT commerce_store_sync_history_exclusion_valid;
+       ALTER TABLE operations_commerce_store_sync_read_leases
+         ADD CONSTRAINT commerce_store_sync_history_exclusion_valid
+         CHECK (true)`,
+    )
+
+    const strictClient = await pool.connect()
+    try {
+      await strictClient.query('BEGIN')
+      await strictClient.query(
+        `INSERT INTO public.schema_migrations (filename, checksum)
+         VALUES ('0305_operations_commerce_rollout_contract.sql', $1)`,
+        [futureCommerceRolloutContractChecksum],
+      )
+      for (const table of [
+        'operations_commerce_intake_read_intents',
+        'operations_commerce_product_image_observation_sets',
+        'operations_commerce_product_image_import_jobs',
+      ]) {
+        await strictClient.query(
+          `ALTER TABLE ${table}
+             ALTER COLUMN provider_read_authority DROP DEFAULT`,
+        )
+      }
+      assert.equal(
+        await storeSyncStructureHealth(strictClient),
+        true,
+        '0350 must preserve exact strict-explicit structure health',
+      )
+      assert.equal(
+        await storeSyncAuthorityContract(strictClient),
+        'strict-explicit',
+        '0350 must preserve the strict-explicit rollout phase',
+      )
+    } finally {
+      await strictClient.query('ROLLBACK').catch(() => {})
+      strictClient.release()
+    }
+  } finally {
+    await pool.end()
+  }
+}
+
 async function main() {
   const migrationSource = readFileSync(
     resolve(root, 'db/migrations/0298_operations_commerce_store_sync_controls.sql'),
@@ -2532,6 +2683,7 @@ async function main() {
       await pool.end()
     }
     await verify(databaseUrl, fixtures)
+    await verifyPost0350Health(databaseUrl)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
       cwd: root,

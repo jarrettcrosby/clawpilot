@@ -18,6 +18,7 @@ import {
   databaseEndpointFingerprint,
   datasetCounts,
   digest,
+  materializedMigrationLineageProjection,
   manifestDigest,
   parseArguments,
   sanitizeJson,
@@ -95,6 +96,98 @@ const canonicalA = canonicalJson({ z: 1, a: Buffer.from('safe') })
 const canonicalB = canonicalJson({ a: Buffer.from('safe'), z: 1 })
 assert.equal(canonicalA, canonicalB)
 assert.equal(digest({ z: 1, a: 2 }), digest({ a: 2, z: 1 }))
+
+const migratedAccountLineage = {
+  id: 'integration-id',
+  global_id: 'gia0000001',
+  organization_id: 'organization-id',
+  provider: 'shopify',
+  integration_type: 'commerce',
+  environment: 'sandbox',
+  display_name: 'Shopify demo',
+  status: 'disabled',
+  configuration: { migrationRequiresCredentialRebind: true },
+  credential_reference: null,
+  external_account_id: null,
+  commerce_credential_generation: 0,
+  receipt_intake_enabled: false,
+  created_by: CONFIRMED_OWNER_EMAIL,
+  updated_by: CONFIRMED_OWNER_EMAIL,
+  created_at: '2026-09-04T00:00:00.000Z',
+  updated_at: '2026-09-04T00:00:00.000Z',
+}
+const reboundAccountLineage = {
+  ...migratedAccountLineage,
+  status: 'active',
+  configuration: { shopDomain: 'verified.example.test' },
+  credential_reference: 'commerce-credential:integration-id:v1',
+  external_account_id: 'verified.example.test',
+  commerce_credential_generation: 1,
+  receipt_intake_enabled: true,
+  updated_by: 'operator@example.test',
+  updated_at: '2026-09-05T00:00:00.000Z',
+}
+assert.equal(
+  digest(materializedMigrationLineageProjection(
+    'operations_integration_accounts', migratedAccountLineage,
+  )),
+  digest(materializedMigrationLineageProjection(
+    'operations_integration_accounts', reboundAccountLineage,
+  )),
+)
+assert.notEqual(
+  digest(materializedMigrationLineageProjection(
+    'operations_integration_accounts', reboundAccountLineage,
+  )),
+  digest(materializedMigrationLineageProjection(
+    'operations_integration_accounts', {
+      ...reboundAccountLineage,
+      provider: 'faire',
+    },
+  )),
+)
+
+const staleIdentifierLineage = {
+  organization_id: 'organization-id',
+  integration_account_id: 'integration-id',
+  entity_type: 'crm.organization',
+  entity_global_id: 'ga0000001',
+  external_id: 'provider-customer-1',
+  status: 'stale',
+  match_method: null,
+  match_evidence: {
+    source: SCRIPT_VERSION,
+    sourceEntityGlobalIdSha256: 'a'.repeat(64),
+    migrationProviderIdentityFence: true,
+  },
+  last_verified_at: '2026-09-04T00:00:00.000Z',
+  created_at: '2026-09-04T00:00:00.000Z',
+}
+assert.equal(
+  digest(materializedMigrationLineageProjection(
+    'operations_external_identifiers', staleIdentifierLineage,
+  )),
+  digest(materializedMigrationLineageProjection(
+    'operations_external_identifiers', {
+      ...staleIdentifierLineage,
+      status: 'active',
+      match_method: 'provider_verified',
+      match_evidence: { migrationProviderIdentityVerified: true },
+      last_verified_at: '2026-09-05T00:00:00.000Z',
+    },
+  )),
+)
+assert.notEqual(
+  digest(materializedMigrationLineageProjection(
+    'operations_external_identifiers', staleIdentifierLineage,
+  )),
+  digest(materializedMigrationLineageProjection(
+    'operations_external_identifiers', {
+      ...staleIdentifierLineage,
+      external_id: 'provider-customer-tampered',
+    },
+  )),
+)
 
 const manifest = {
   format: MANIFEST_FORMAT,

@@ -19,6 +19,9 @@ assert.deepEqual(options.requiredSchedules, ['DAILY', 'WEEKLY', 'MONTHLY'])
 assert.equal(options.maxAgeHours, 30)
 assert.equal(options.projectId, 'project-1')
 
+const transitionalDefaults = parseArgs(['--project-id', 'project-1'], {})
+assert.deepEqual(transitionalDefaults.environments, ['development', 'production'])
+
 const baseVolume = {
   environmentId: 'environment-1',
   service: 'Postgres',

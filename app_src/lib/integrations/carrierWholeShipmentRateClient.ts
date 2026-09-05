@@ -4,6 +4,10 @@ import {
   type CarrierRuntimeCredential,
 } from '@/lib/integrations/carrierCredentialClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   parseCarrierWholeShipmentRateResponse,
   sealPreparedCarrierWholeShipmentRateRequest,
   type ParsedCarrierWholeShipmentRateResponse,
@@ -268,6 +272,7 @@ export async function executeCarrierWholeShipmentRateRequest(
       )
     }
 
+    assertIntegrationCredentialProviderIoReady()
     const response = await fetchImpl(executableRequest.endpoint, {
       method: executableRequest.method,
       headers: {
@@ -316,6 +321,7 @@ export async function executeCarrierWholeShipmentRateRequest(
       throw invalidResponse()
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof CarrierWholeShipmentRateClientError) throw error
     if (error instanceof CarrierCredentialClientError) {
       throw mapCredentialError(error)

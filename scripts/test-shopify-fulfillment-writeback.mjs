@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -71,6 +72,9 @@ function load(mocks) {
           SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
             'test-pro-bakery-bites.myshopify.com',
         }
+      }
+      if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+        return integrationCredentialRuntimeGate
       }
       return nodeRequire(specifier)
     },

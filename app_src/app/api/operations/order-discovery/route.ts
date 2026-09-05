@@ -4,6 +4,8 @@ import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
+import { isIntegrationCredentialRuntimeGateError } from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 import {
   processCommerceOrderReconciliation,
 } from '@/lib/commerceOrderReconciliationWorker'
@@ -343,6 +345,9 @@ export async function POST(req: NextRequest) {
     })
     return response(completed.body, completed.status)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) {
+      return integrationCredentialRuntimeMaintenanceResponse(error)!
+    }
     const failure = errorResult(error)
     if (receipt) {
       try {

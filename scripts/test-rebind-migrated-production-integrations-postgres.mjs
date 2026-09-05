@@ -16,21 +16,33 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
-  MANAGED_REBIND_MATERIAL_FORMAT,
+  INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
+} from '../app_src/lib/integrations/integrationCredentialKeyAttestation.mjs'
+import {
+  PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
+} from './production-rebind-history-schema-attestation.mjs'
+
+import {
   MIGRATION_MANIFEST_FORMAT,
   MIGRATION_MAPPING_FORMAT,
   MIGRATION_SCRIPT_VERSION,
+  REBIND_PLAN_MAX_AGE_MS,
+  REBIND_PLAN_MAX_FUTURE_SKEW_MS,
   SOURCE_DATABASE_IDENTITY,
   TARGET_DATABASE_IDENTITY,
   applyRebind,
   applyValidatedMaterials,
+  buildManagedRebindMaterial,
   carrierAddressFingerprint,
   databaseEndpointFingerprint,
   digest,
   exportCommittedReceipt,
   main,
   managedRebindMaterialDigest,
+  managedSourceAuthorityApprovalToken,
   planRebind,
+  plannedHistoryPolicyEvidence,
   sha256,
 } from './rebind-migrated-production-integrations.mjs'
 
@@ -39,6 +51,26 @@ const { Pool } = requireFromApp('pg')
 const actor = 'migration-test@example.com'
 const sourceKey = 'source-provider-rebind-fixture-key-00000000000000000001'
 const targetKey = 'target-provider-rebind-fixture-key-00000000000000000002'
+const targetKeyId = 'production-cutover-test-v1'
+const targetSchemaAttestation = Object.freeze({
+  format: PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  postgresMajor: 16,
+  migrations: PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
+  schemaDigest: 'a'.repeat(64),
+})
+const targetSchemaAttester = async () => targetSchemaAttestation
+const targetKeyAttestationVerifier = async ({ secret, keyId }) => {
+  if (secret !== targetKey || keyId !== targetKeyId) {
+    throw new Error('fixture key attestation rejected')
+  }
+  return Object.freeze({
+    status: 'verified',
+    keyId,
+    recordDigest: 'b'.repeat(64),
+    databaseIdentity: TARGET_DATABASE_IDENTITY,
+    attestationVersion: INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
+  })
+}
 const address = Object.freeze({
   line1: '101 Jegs Place',
   line2: null,
@@ -142,9 +174,78 @@ async function waitForPostgres(databaseUrl) {
   throw new Error('Disposable PostgreSQL did not become ready')
 }
 
+const historyPolicyMigration = readFileSync(
+  new URL('../db/migrations/0349_operations_commerce_order_history_policy.sql', import.meta.url),
+  'utf8',
+)
+const historyPolicySchemaStart = historyPolicyMigration.indexOf(
+  'CREATE TABLE operations_commerce_order_history_policies',
+)
+const historyPolicySchemaEnd = historyPolicyMigration.indexOf('\nWITH frozen AS', historyPolicySchemaStart)
+assert.ok(historyPolicySchemaStart >= 0 && historyPolicySchemaEnd > historyPolicySchemaStart)
+const historyPolicySchema = historyPolicyMigration.slice(
+  historyPolicySchemaStart,
+  historyPolicySchemaEnd,
+)
+const hostedProductionSandboxReadAuthoritySchema = readFileSync(
+  new URL(
+    '../db/migrations/0358_operations_hosted_production_sandbox_read_authority.sql',
+    import.meta.url,
+  ),
+  'utf8',
+)
+
 const schema = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE app_settings (key text PRIMARY KEY, value jsonb NOT NULL);
+CREATE TABLE app_users (email text PRIMARY KEY);
+INSERT INTO app_users(email) VALUES ('migration-test@example.com');
+CREATE TABLE schema_migrations (filename text PRIMARY KEY, checksum text NOT NULL);
+CREATE TABLE crm_reference_registry (id uuid PRIMARY KEY DEFAULT gen_random_uuid());
+CREATE TABLE operations_commerce_intake_continuations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_intake_read_intents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_oauth_installations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_order_candidates (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_order_workbench (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_fulfillment_exports (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_product_image_import_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_webhook_receipts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
+CREATE TABLE operations_commerce_workspace_migration_cutover_fences (
+  organization_id uuid NOT NULL,
+  integration_account_id uuid NOT NULL,
+  migration_name text NOT NULL,
+  state text NOT NULL,
+  frozen_by text NOT NULL,
+  frozen_at timestamptz NOT NULL,
+  released_by text,
+  released_at timestamptz,
+  reason text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (organization_id, integration_account_id)
+);
+CREATE TABLE operations_integration_credential_key_attestations (
+  singleton_id smallint PRIMARY KEY
+);
+CREATE TABLE operations_order_shipment_address_working_copies (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid()
+);
 CREATE TABLE workspace_organizations (id uuid PRIMARY KEY, reference_code text UNIQUE NOT NULL);
 CREATE TABLE operations_integration_accounts (
   id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
@@ -166,13 +267,7 @@ CREATE TABLE operations_commerce_credentials (
   created_by text, updated_by text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(),
   PRIMARY KEY (organization_id, integration_account_id)
 );
-CREATE TABLE operations_commerce_order_history_policies (
-  organization_id uuid NOT NULL, integration_account_id uuid NOT NULL,
-  provider text NOT NULL, history_mode text NOT NULL,
-  ingestion_floor timestamptz, frozen_at timestamptz NOT NULL,
-  configured_by text, created_at timestamptz DEFAULT now(),
-  PRIMARY KEY (organization_id, integration_account_id)
-);
+${historyPolicySchema}
 CREATE TABLE operations_carrier_credentials (
   organization_id uuid NOT NULL, integration_account_id uuid NOT NULL,
   credential_ciphertext bytea NOT NULL, credential_iv bytea NOT NULL, credential_tag bytea NOT NULL,
@@ -197,7 +292,31 @@ CREATE TABLE operations_carrier_accounts (
 );
 CREATE TABLE operations_warehouses (
   id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
-  address jsonb NOT NULL, status text NOT NULL
+  address jsonb NOT NULL, status text NOT NULL,
+  UNIQUE (organization_id, id)
+);
+CREATE TABLE operations_locations (
+  id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
+  warehouse_id uuid NOT NULL, code text NOT NULL, name text NOT NULL, status text NOT NULL,
+  UNIQUE (organization_id, id), UNIQUE (organization_id, warehouse_id, id)
+);
+CREATE TABLE operations_inventory_pools (
+  id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
+  name text NOT NULL, status text NOT NULL,
+  UNIQUE (organization_id, id)
+);
+CREATE TABLE operations_commerce_inventory_location_mappings (
+  id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
+  integration_account_id uuid NOT NULL, external_location_id text NOT NULL,
+  external_location_name text NOT NULL, external_location_address jsonb NOT NULL DEFAULT '{}',
+  warehouse_id uuid NOT NULL, location_id uuid NOT NULL, inventory_pool_id uuid NOT NULL,
+  mapping_method text NOT NULL, active boolean NOT NULL DEFAULT false,
+  row_version bigint NOT NULL DEFAULT 0, ownership_classification text NOT NULL DEFAULT 'unknown',
+  provider_snapshot_json jsonb NOT NULL DEFAULT '{}', provider_snapshot_hash text,
+  provider_observed_at timestamptz, inventory_import_enabled boolean NOT NULL DEFAULT false,
+  created_by text, updated_by text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(),
+  UNIQUE (organization_id, integration_account_id, external_location_id),
+  UNIQUE (organization_id, integration_account_id, id)
 );
 CREATE TABLE operations_carrier_account_migration_placeholders (
   id uuid PRIMARY KEY, global_id text UNIQUE NOT NULL, organization_id uuid NOT NULL,
@@ -258,6 +377,7 @@ CREATE TABLE audit_events (
   created_at timestamptz DEFAULT now()
 );
 CREATE UNIQUE INDEX audit_events_event_key_fixture ON audit_events(event_key) WHERE event_key IS NOT NULL;
+${hostedProductionSandboxReadAuthoritySchema}
 CREATE TABLE fixture_fail_activation (enabled boolean NOT NULL DEFAULT false);
 INSERT INTO fixture_fail_activation VALUES (false);
 
@@ -336,21 +456,37 @@ FOR EACH ROW EXECUTE FUNCTION fixture_guard_activation();
 
 function fixture() {
   const sourceOrg = randomUUID()
-  const targetOrg = randomUUID()
+  const targetOrg = '33785418-9927-4e10-a492-d3a44b9b6f21'
   const authorityOrg = randomUUID()
   const externalId = 'gid://shopify/Shop/987654321'
+  const faireExternalId = 'brand-fixture-987654321'
   const directNumber = 'UPS-TEST-1234'
   const authorityNumber = 'FEDEX-TEST-1073'
+  const targetWarehouseId = randomUUID()
+  const targetLocationId = randomUUID()
+  const targetInventoryPoolId = randomUUID()
+  const shopifyExternalLocationId = 'gid://shopify/Location/987654321'
   const directFingerprint = accountFingerprint(
     sourceKey, sourceOrg, 'ups_rest', 'production', directNumber,
   )
   const addressFingerprint = carrierAddressFingerprint(address)
   const accounts = {
     commerce: {
-      sourceId: randomUUID(), sourceGlobalId: 'gia1000001', provider: 'shopify',
-      integrationType: 'commerce', environment: 'production',
+      sourceId: randomUUID(), sourceGlobalId: 'gia9286799', provider: 'shopify',
+      integrationType: 'commerce', environment: 'sandbox',
       externalAccountIdSha256: sha256(externalId),
       targetId: randomUUID(), targetGlobalId: 'gia2000001', externalId,
+      sourceInventoryLocationMappingId: randomUUID(),
+      targetInventoryLocationMappingId: randomUUID(),
+      targetInventoryLocationMappingGlobalId: 'gilm2000001',
+      targetWarehouseId, targetLocationId, targetInventoryPoolId,
+      shopifyExternalLocationId,
+    },
+    faire: {
+      sourceId: randomUUID(), sourceGlobalId: 'gia1000004', provider: 'faire',
+      integrationType: 'commerce', environment: 'production',
+      externalAccountIdSha256: sha256(faireExternalId),
+      targetId: randomUUID(), targetGlobalId: 'gia2000004', externalId: faireExternalId,
     },
     direct: {
       sourceId: randomUUID(), sourceGlobalId: 'gia1000002',
@@ -381,15 +517,18 @@ function fixture() {
       sourceOrganizationReference: 'ga1000001',
       targetOrganizationId: targetOrg,
       targetOrganizationReference: 'ga2000001',
-      accounts: [accounts.commerce, accounts.direct, accounts.authority].map((account) => {
-        const copy = { ...account }
-        for (const key of [
-          'targetId', 'targetGlobalId', 'targetCarrierId', 'targetCarrierGlobalId',
-          'externalId', 'directNumber', 'authorityNumber', 'authorityIntegrationId',
-          'authorityCarrierId',
-        ]) delete copy[key]
-        return Object.freeze(copy)
-      }),
+      accounts: [accounts.commerce, accounts.faire, accounts.direct, accounts.authority]
+        .map((account) => {
+          const copy = { ...account }
+          for (const key of [
+            'targetId', 'targetGlobalId', 'targetCarrierId', 'targetCarrierGlobalId',
+            'externalId', 'directNumber', 'authorityNumber', 'authorityIntegrationId',
+            'authorityCarrierId', 'targetInventoryLocationMappingId',
+            'targetInventoryLocationMappingGlobalId', 'targetWarehouseId',
+            'targetLocationId', 'targetInventoryPoolId', 'shopifyExternalLocationId',
+          ]) delete copy[key]
+          return Object.freeze(copy)
+        }),
     },
   }
 }
@@ -402,14 +541,20 @@ async function seedSource(client, data) {
   const commerceCredential = encrypt(JSON.stringify({
     provider: 'shopify', authMode: 'shopify_client_credentials',
     clientId: 'fixture-shopify-client', clientSecret: 'fixture-shopify-client-secret',
-  }), sourceKey, commerceAad(sourceOrg, 'shopify', 'production', accounts.commerce.externalId))
+  }), sourceKey, commerceAad(
+    sourceOrg,
+    'shopify',
+    accounts.commerce.environment,
+    accounts.commerce.externalId,
+  ))
   await client.query(
     `INSERT INTO operations_integration_accounts (
        id, global_id, organization_id, provider, integration_type, environment,
        display_name, status, configuration, external_account_id,
        commerce_credential_generation, receipt_intake_enabled, created_by, updated_by
-     ) VALUES ($1,$2,$3,'shopify','commerce','production','Fixture Shopify','active',$4::jsonb,$5,1,true,$6,$6)`,
+     ) VALUES ($1,$2,$3,'shopify','commerce',$4,'Fixture Shopify','active',$5::jsonb,$6,1,true,$7,$7)`,
     [accounts.commerce.sourceId, accounts.commerce.sourceGlobalId, sourceOrg,
+      accounts.commerce.environment,
       JSON.stringify({ shopDomain: 'fixture-shop.myshopify.com' }), accounts.commerce.externalId, actor],
   )
   await client.query(
@@ -418,6 +563,31 @@ async function seedSource(client, data) {
        'verified',now(),$7,$7,now(),now())`,
     [sourceOrg, accounts.commerce.sourceId, accounts.commerce.externalId,
       commerceCredential.ciphertext, commerceCredential.iv, commerceCredential.tag, actor],
+  )
+  const faireCredential = encrypt(JSON.stringify({
+    provider: 'faire', authMode: 'faire_brand_token',
+    accessToken: 'fixture-faire-access-token',
+  }), sourceKey, commerceAad(
+    sourceOrg,
+    'faire',
+    'production',
+    accounts.faire.externalId,
+  ))
+  await client.query(
+    `INSERT INTO operations_integration_accounts (
+       id, global_id, organization_id, provider, integration_type, environment,
+       display_name, status, configuration, external_account_id,
+       commerce_credential_generation, receipt_intake_enabled, created_by, updated_by
+     ) VALUES ($1,$2,$3,'faire','commerce','production','Fixture Faire','active',$4::jsonb,$5,1,false,$6,$6)`,
+    [accounts.faire.sourceId, accounts.faire.sourceGlobalId, sourceOrg,
+      JSON.stringify({ brandId: accounts.faire.externalId }), accounts.faire.externalId, actor],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_credentials VALUES (
+       $1,$2,$3,'faire_brand_token',$4,$5,$6,1,'oken','verified',now(),NULL,
+       'not_applicable',NULL,$7,$7,now(),now())`,
+    [sourceOrg, accounts.faire.sourceId, accounts.faire.externalId,
+      faireCredential.ciphertext, faireCredential.iv, faireCredential.tag, actor],
   )
   const credentialValue = { clientId: 'fixture-ups-client-1234', clientSecret: 'fixture-ups-secret', accountNumber: null }
   const credential = encrypt(
@@ -450,6 +620,29 @@ async function seedSource(client, data) {
       accounts.direct.sourceAccountNumberFingerprint, JSON.stringify(address),
       accounts.direct.sourceAddressFingerprint, actor],
   )
+  await client.query(
+    `INSERT INTO operations_integration_accounts (
+       id,global_id,organization_id,provider,integration_type,environment,display_name,status,
+       configuration,created_by,updated_by
+     ) VALUES ($1,$2,$3,'fedex_rest','carrier','sandbox','Fixture delegated FedEx',
+               'active','{}',$4,$4)`,
+    [accounts.authority.sourceId, accounts.authority.sourceGlobalId, sourceOrg, actor],
+  )
+  for (const sourceAccount of Object.values(accounts)) {
+    await client.query(
+      `INSERT INTO operations_commerce_workspace_migration_cutover_fences (
+         organization_id,integration_account_id,migration_name,state,frozen_by,frozen_at,reason
+       ) VALUES ($1,$2,$3,'frozen',$4,$5,$6)`,
+      [
+        sourceOrg,
+        sourceAccount.sourceId,
+        MIGRATION_SCRIPT_VERSION,
+        actor,
+        '2026-09-04T12:00:00.000Z',
+        `Fixture cutover fence for ${sourceAccount.sourceGlobalId}`,
+      ],
+    )
+  }
 }
 
 async function seedTarget(client, data, bindings) {
@@ -499,7 +692,19 @@ async function seedTarget(client, data, bindings) {
   )
   await client.query(
     `INSERT INTO operations_warehouses VALUES ($1,'gwh1234567',$2,$3::jsonb,'active')`,
-    [randomUUID(), targetOrg, JSON.stringify(address)],
+    [accounts.commerce.targetWarehouseId, targetOrg, JSON.stringify(address)],
+  )
+  await client.query(
+    `INSERT INTO operations_locations (
+       id,global_id,organization_id,warehouse_id,code,name,status
+     ) VALUES ($1,'gwl2000001',$2,$3,'PICK-01','Fixture pick face','active')`,
+    [accounts.commerce.targetLocationId, targetOrg, accounts.commerce.targetWarehouseId],
+  )
+  await client.query(
+    `INSERT INTO operations_inventory_pools (
+       id,global_id,organization_id,name,status
+     ) VALUES ($1,'gip2000001',$2,'Fixture available inventory','active')`,
+    [accounts.commerce.targetInventoryPoolId, targetOrg],
   )
   for (const account of Object.values(accounts)) {
     const config = {
@@ -549,7 +754,7 @@ async function seedTarget(client, data, bindings) {
         account.environment, SOURCE_DATABASE_IDENTITY, bindings.source, bindings.target,
         account.sourceGlobalId, providerIdentity,
         account.integrationType === 'commerce' ? account.externalAccountIdSha256 : null,
-        `fixture-migration:${account.sourceGlobalId}`, actor],
+        'fixture-migration-receipt', actor],
     )
     if (account.integrationType === 'commerce') {
       await client.query(
@@ -557,6 +762,31 @@ async function seedTarget(client, data, bindings) {
            $1,$2,'paused',true,1,'Awaiting provider rebind',$3,$3,now(),now())`,
         [targetOrg, account.targetId, actor],
       )
+      if (account === accounts.commerce) {
+        await client.query(
+          `INSERT INTO operations_commerce_inventory_location_mappings (
+             id,global_id,organization_id,integration_account_id,
+             external_location_id,external_location_name,external_location_address,
+             warehouse_id,location_id,inventory_pool_id,mapping_method,active,row_version,
+             ownership_classification,provider_snapshot_json,provider_snapshot_hash,
+             provider_observed_at,inventory_import_enabled,created_by,updated_by
+           ) VALUES (
+             $1,$2,$3,$4,$5,'Fixture provider location','{}'::jsonb,$6,$7,$8,
+             'manual',false,0,'unknown','{}'::jsonb,NULL,NULL,false,$9,$9
+           )`,
+          [
+            account.targetInventoryLocationMappingId,
+            account.targetInventoryLocationMappingGlobalId,
+            targetOrg,
+            account.targetId,
+            account.shopifyExternalLocationId,
+            account.targetWarehouseId,
+            account.targetLocationId,
+            account.targetInventoryPoolId,
+            actor,
+          ],
+        )
+      }
       continue
     }
     const isAuthority = account === accounts.authority
@@ -637,6 +867,12 @@ function artifacts(data, bindings) {
         { id: account.targetCarrierId, reference: account.targetCarrierGlobalId },
       ]),
     ),
+    operations_commerce_inventory_location_mappings: {
+      [data.accounts.commerce.sourceInventoryLocationMappingId]: {
+        id: data.accounts.commerce.targetInventoryLocationMappingId,
+        reference: data.accounts.commerce.targetInventoryLocationMappingGlobalId,
+      },
+    },
   }
   const result = { key: workspace.key, disposition: 'created', mapping: mappingValue }
   const mapping = {
@@ -653,8 +889,18 @@ function artifacts(data, bindings) {
   const payload = {
     scriptVersion: MIGRATION_SCRIPT_VERSION,
     manifestDigest: manifest.manifestDigest,
-    source: { databaseIdentity: SOURCE_DATABASE_IDENTITY, endpointSha256: bindings.source },
-    target: { databaseIdentity: TARGET_DATABASE_IDENTITY, endpointSha256: bindings.target },
+    source: {
+      databaseIdentity: SOURCE_DATABASE_IDENTITY,
+      endpointSha256: bindings.source,
+      organizationId: workspace.sourceOrganizationId,
+      organizationReference: workspace.sourceOrganizationReference,
+    },
+    target: {
+      databaseIdentity: TARGET_DATABASE_IDENTITY,
+      endpointSha256: bindings.target,
+      organizationId: workspace.targetOrganizationId,
+      organizationReference: workspace.targetOrganizationReference,
+    },
     mapping: mappingValue,
     providerIdentityFenceDigest: digest({ fixture: 'fences' }),
     sourceAuthorityDependencies: [],
@@ -669,51 +915,115 @@ function artifacts(data, bindings) {
 }
 
 function managedMaterial(data, artifact, bindings) {
-  const material = {
-    format: MANAGED_REBIND_MATERIAL_FORMAT,
+  return buildManagedRebindMaterial({
     actor,
-    migrationManifestDigest: artifact.manifest.manifestDigest,
-    migrationMappingDigest: digest(artifact.mapping),
-    targetDatabaseIdentity: TARGET_DATABASE_IDENTITY,
-    targetDatabaseEndpointSha256: bindings.target,
-    targetOrganizationId: data.targetOrg,
-    targetIntegrationAccountId: data.accounts.authority.targetId,
-    targetIntegrationAccountGlobalId: data.accounts.authority.targetGlobalId,
-    targetCarrierAccountId: data.accounts.authority.targetCarrierId,
-    targetCarrierAccountGlobalId: data.accounts.authority.targetCarrierGlobalId,
-    sourceAccountGlobalId: data.accounts.authority.sourceGlobalId,
-    provider: 'fedex_rest',
-    environment: 'sandbox',
-    authority: {
-      organizationReference: 'ga5122758',
-      integrationGlobalId: 'gia7335302',
-      carrierAccountGlobalId: 'gac2368052',
-    },
-    approved: true,
-    credential: {
+    manifest: artifact.manifest,
+    mapping: artifact.mapping,
+    bindings,
+    workspace: data.workspace,
+    account: data.accounts.authority,
+    secretInput: {
       clientId: 'fresh-target-fedex-client-9088',
       clientSecret: 'fresh-target-fedex-secret',
+      accountNumber: data.accounts.authority.authorityNumber,
     },
-    accountNumber: data.accounts.authority.authorityNumber,
+    approvalToken: managedSourceAuthorityApprovalToken(data.accounts.authority),
+  })
+}
+
+function readyShopifyWebhookEvidence(targetGlobalId) {
+  const desiredUri = `https://aiapp.eigenracing.com/api/integrations/commerce/shopify/webhooks/${targetGlobalId}`
+  const definitions = [
+    ['scopeWebhookSubscriptions', ['app/scopes_update']],
+    ['webhookSubscriptions', [
+      'inventory_items/create', 'inventory_items/delete', 'inventory_items/update',
+      'inventory_levels/connect', 'inventory_levels/disconnect', 'inventory_levels/update',
+    ]],
+    ['catalogWebhookSubscriptions', [
+      'products/create', 'products/delete', 'products/update',
+    ]],
+    ['orderWebhookSubscriptions', [
+      'orders/create', 'orders/updated', 'orders/edited', 'orders/cancelled',
+      'orders/paid', 'orders/fulfilled', 'orders/partially_fulfilled',
+    ]],
+  ]
+  const groups = Object.fromEntries(definitions.map(([key, topics]) => [key, {
+    subscriptionGroup: key,
+    desiredUri,
+    actions: [],
+    ready: true,
+    observed: topics.map((topic, index) => ({
+      providerIdSha256: sha256(`${key}:${index}`),
+      topic,
+      uriSha256: sha256(desiredUri),
+      format: 'JSON',
+      includeFields: key === 'orderWebhookSubscriptions'
+        ? ['admin_graphql_api_id', 'updated_at']
+        : [],
+      exact: true,
+    })),
+  }]))
+  return {
+    desiredUri,
+    groups,
+    actions: [],
+    ready: true,
+    observed: definitions.flatMap(([key]) => groups[key].observed.map((entry) => ({
+      subscriptionGroup: key,
+      ...entry,
+    }))),
   }
-  material.materialDigest = managedRebindMaterialDigest(material)
-  return material
+}
+
+function fixtureShopifyLocation(data) {
+  return {
+    id: data.accounts.commerce.shopifyExternalLocationId,
+    name: 'Fixture provider location',
+    isActive: true,
+    activatable: false,
+    shipsInventory: true,
+    fulfillsOnlineOrders: true,
+    isFulfillmentService: false,
+    fulfillmentService: null,
+    address: {
+      address1: address.line1,
+      address2: '',
+      city: address.city,
+      provinceCode: address.region,
+      countryCode: address.countryCode,
+      zip: address.postalCode,
+    },
+  }
 }
 
 function fakeVerifier(data) {
   return {
     async commerce(account, credential, _configuration, targetGlobalId) {
+      if (account.provider === 'faire') {
+        assert.equal(credential.accessToken, 'fixture-faire-access-token')
+        return {
+          externalAccountId: data.accounts.faire.externalId,
+          identitySha256: sha256(data.accounts.faire.externalId),
+          accountName: 'Fixture Faire brand',
+          operationalProbe: 'orders_read_only',
+          providerMutationCount: 0,
+        }
+      }
+      assert.equal(account.provider, 'shopify')
       assert.equal(credential.clientSecret, 'fixture-shopify-client-secret')
+      const locations = [fixtureShopifyLocation(data)]
       return {
         externalAccountId: data.accounts.commerce.externalId,
         identitySha256: sha256(data.accounts.commerce.externalId),
         accountName: 'Fixture shop',
         shopDomain: 'fixture-shop.myshopify.com',
-        grantedScopes: ['read_orders', 'read_products'],
+        grantedScopes: ['read_inventory', 'read_locations', 'read_orders', 'read_products'],
+        locations,
+        locationSetSha256: digest({ schema: 'shopify-location-set-v1', locations }),
         desiredUri: `https://aiapp.eigenracing.com/api/integrations/commerce/shopify/webhooks/${targetGlobalId}`,
-        webhooks: { ready: true, actions: [], observed: [] },
+        webhooks: readyShopifyWebhookEvidence(targetGlobalId),
         runtime: { fake: true },
-        operationalProbe: 'identity_scopes_webhooks_read_only',
+        operationalProbe: 'identity_scopes_webhooks_locations_read_only',
         providerMutationCount: 0,
       }
     },
@@ -764,19 +1074,17 @@ async function runAcceptance(sourceUrl, targetUrl) {
       [actor, data.targetOrg, JSON.stringify(artifact.payload), 'fixture-migration-receipt'],
     )
     const baseInput = {
-      actor, source, target, sourceKey, targetKey, bindings,
+      actor, source, target, sourceKey, targetKey, targetKeyId, bindings,
       manifest: artifact.manifest, mapping: artifact.mapping,
       workspaces: [data.workspace], verifier: fakeVerifier(data),
+      targetSchemaAttester,
+      targetKeyAttestationVerifier,
     }
     const inputFor = (account, extra = {}) => ({
       ...baseInput,
       selectedAccountGlobalId: account.sourceGlobalId,
       ...extra,
     })
-    await assert.rejects(
-      planRebind(inputFor(data.accounts.direct)),
-      /lacks the immutable provider rebind receipt guard/u,
-    )
     await target.query(readFileSync(
       new URL(
         '../db/migrations/0355_operations_migrated_provider_rebind_receipt_immutability.sql',
@@ -784,6 +1092,90 @@ async function runAcceptance(sourceUrl, targetUrl) {
       ),
       'utf8',
     ))
+    const readTargetWriteSurface = async () => (await target.query(
+      `SELECT jsonb_build_object(
+         'integrationAccounts', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value) ORDER BY row_value.id::text)
+           FROM operations_integration_accounts row_value
+         ), '[]'::jsonb),
+         'commerceCredentials', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_commerce_credentials row_value
+         ), '[]'::jsonb),
+         'carrierCredentials', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_carrier_credentials row_value
+         ), '[]'::jsonb),
+         'carrierAccounts', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value) ORDER BY row_value.id::text)
+           FROM operations_carrier_accounts row_value
+         ), '[]'::jsonb),
+         'carrierPlaceholders', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_carrier_account_migration_placeholders row_value
+         ), '[]'::jsonb),
+         'providerFences', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_commerce_migration_provider_identity_fences row_value
+         ), '[]'::jsonb),
+         'syncControls', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_commerce_store_sync_controls row_value
+         ), '[]'::jsonb),
+         'historyPolicies', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_commerce_order_history_policies row_value
+         ), '[]'::jsonb),
+         'syncCursors', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text,
+                                     row_value.resource)
+           FROM operations_commerce_sync_cursors row_value
+         ), '[]'::jsonb),
+         'notificationPolicies', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value)
+                            ORDER BY row_value.organization_id::text,
+                                     row_value.integration_account_id::text)
+           FROM operations_shopify_fulfillment_notification_policies row_value
+         ), '[]'::jsonb),
+         'auditEvents', COALESCE((
+           SELECT jsonb_agg(to_jsonb(row_value) ORDER BY row_value.id::text)
+           FROM audit_events row_value
+         ), '[]'::jsonb)
+       ) AS state`,
+    )).rows[0].state
+    const wrongKeyTargetBefore = await readTargetWriteSurface()
+    let wrongKeyProviderCalls = 0
+    await assert.rejects(
+      planRebind(inputFor(data.accounts.direct, {
+        targetKey: 'wrong-target-provider-rebind-key-00000000000000000003',
+        verifier: {
+          async commerce() { wrongKeyProviderCalls += 1 },
+          async carrier() { wrongKeyProviderCalls += 1 },
+          async reconcileShopify() { wrongKeyProviderCalls += 1 },
+        },
+      })),
+      /rejected the configured integration credential key/u,
+    )
+    assert.equal(wrongKeyProviderCalls, 0)
+    assert.deepEqual(
+      await readTargetWriteSurface(),
+      wrongKeyTargetBefore,
+      'wrong target key must leave the entire rebind write surface byte-identical',
+    )
     await assert.rejects(
       planRebind({ ...baseInput, selectedAccountGlobalId: 'gia9999999' }),
       /Exactly one compiled source provider Global ID must be selected/u,
@@ -848,6 +1240,122 @@ async function runAcceptance(sourceUrl, targetUrl) {
     })
 
     await target.query('UPDATE fixture_fail_activation SET enabled = false')
+    const readCarrierReceiptStageExistingState = () => target.query(
+      `SELECT to_jsonb(account) AS account,
+              to_jsonb(fence) AS fence,
+              to_jsonb(placeholder) AS placeholder
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_carrier_account_migration_placeholders placeholder
+         ON placeholder.organization_id = account.organization_id
+        AND placeholder.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.direct.targetId],
+    )
+    const carrierReceiptStageBaseline = await readCarrierReceiptStageExistingState()
+    assert.equal(carrierReceiptStageBaseline.rowCount, 1)
+    await target.query(`
+      CREATE FUNCTION fixture_fail_carrier_rebind_receipt_after_writes()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      DECLARE
+        target_integration_id uuid;
+      BEGIN
+        IF NEW.event_type <> 'operations.migrated_provider_rebind.completed'
+          OR NEW.payload#>>'{providers,0,provider}' <> 'ups_rest'
+        THEN
+          RETURN NEW;
+        END IF;
+
+        SELECT account.id
+        INTO target_integration_id
+        FROM operations_integration_accounts account
+        WHERE account.organization_id = NEW.organization_id
+          AND account.global_id = NEW.payload#>>'{providers,0,targetAccountGlobalId}'
+          AND account.integration_type = 'carrier'
+          AND account.status = 'active'
+          AND account.credential_reference IS NOT NULL;
+
+        IF target_integration_id IS NULL
+          OR (SELECT count(*)
+              FROM operations_carrier_credentials credential
+              WHERE credential.organization_id = NEW.organization_id
+                AND credential.integration_account_id = target_integration_id) <> 1
+          OR (SELECT count(*)
+              FROM operations_carrier_accounts carrier
+              WHERE carrier.organization_id = NEW.organization_id
+                AND carrier.integration_account_id = target_integration_id
+                AND carrier.status = 'active') <> 1
+          OR NOT EXISTS (
+              SELECT 1
+              FROM operations_carrier_account_migration_placeholders placeholder
+              WHERE placeholder.organization_id = NEW.organization_id
+                AND placeholder.integration_account_id = target_integration_id
+                AND placeholder.state = 'materialized'
+            )
+          OR NOT EXISTS (
+              SELECT 1
+              FROM operations_commerce_migration_provider_identity_fences fence
+              WHERE fence.organization_id = NEW.organization_id
+                AND fence.integration_account_id = target_integration_id
+                AND fence.verification_state = 'verified'
+            )
+        THEN
+          RAISE EXCEPTION 'fixture observed incomplete carrier writes before receipt';
+        END IF;
+
+        RAISE EXCEPTION 'fixture requested carrier receipt-stage rollback';
+      END;
+      $$;
+
+      CREATE TRIGGER fixture_fail_carrier_rebind_receipt_after_writes
+      BEFORE INSERT ON audit_events
+      FOR EACH ROW
+      EXECUTE FUNCTION fixture_fail_carrier_rebind_receipt_after_writes();
+    `)
+    try {
+      await assert.rejects(
+        applyWithDedicatedClients(source, target, {
+          ...directInput,
+          plan: directPlan.plan,
+          confirmDigest: directPlan.plan.planDigest,
+        }),
+        /fixture requested carrier receipt-stage rollback/u,
+      )
+    } finally {
+      await target.query(`
+        DROP TRIGGER fixture_fail_carrier_rebind_receipt_after_writes ON audit_events;
+        DROP FUNCTION fixture_fail_carrier_rebind_receipt_after_writes();
+      `)
+    }
+    assert.deepEqual(
+      (await readCarrierReceiptStageExistingState()).rows,
+      carrierReceiptStageBaseline.rows,
+      'receipt-stage failure must restore every column of each updated carrier row',
+    )
+    const carrierReceiptStageRolledBack = await target.query(
+      `SELECT
+         (SELECT count(*)::integer
+          FROM operations_carrier_credentials credential
+          WHERE credential.organization_id = $1::uuid
+            AND credential.integration_account_id = $2::uuid) AS credential_count,
+         (SELECT count(*)::integer
+          FROM operations_carrier_accounts carrier
+          WHERE carrier.organization_id = $1::uuid
+            AND carrier.integration_account_id = $2::uuid) AS account_count,
+         (SELECT count(*)::integer
+          FROM audit_events event
+          WHERE event.organization_id = $1::uuid
+            AND event.event_type = 'operations.migrated_provider_rebind.completed'
+            AND event.payload->>'planDigest' = $3) AS receipt_count`,
+      [data.targetOrg, data.accounts.direct.targetId, directPlan.plan.planDigest],
+    )
+    assert.deepEqual(carrierReceiptStageRolledBack.rows[0], {
+      credential_count: 0,
+      account_count: 0,
+      receipt_count: 0,
+    })
     const directReceipt = await applyWithDedicatedClients(source, target, {
       ...directInput,
       plan: directPlan.plan,
@@ -891,6 +1399,8 @@ async function runAcceptance(sourceUrl, targetUrl) {
           TARGET_RAILWAY_ENVIRONMENT_NAME: 'production',
           TARGET_DATABASE_URL: targetUrl,
           TARGET_DATABASE_ENDPOINT_SHA256: bindings.target,
+          TARGET_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY: targetKey,
+          INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID: targetKeyId,
           PGSSLMODE: 'disable',
         },
         manifest: artifact.manifest,
@@ -898,6 +1408,8 @@ async function runAcceptance(sourceUrl, targetUrl) {
         plan: directPlan.plan,
         workspaces: [data.workspace],
         allowTestBoundary: true,
+        targetSchemaAttester,
+        targetKeyAttestationVerifier,
         poolFactory(connectionString) {
           recoveryPoolCreations += 1
           assert.equal(connectionString, targetUrl)
@@ -925,7 +1437,28 @@ async function runAcceptance(sourceUrl, targetUrl) {
       /already rebound/u,
     )
 
-    const commerceInput = inputFor(data.accounts.commerce)
+    const commerceWithoutHistory = inputFor(data.accounts.commerce)
+    await assert.rejects(
+      planRebind(commerceWithoutHistory),
+      /--history-mode is required/u,
+    )
+    await assert.rejects(
+      planRebind({ ...commerceWithoutHistory, historyMode: 'provider_all' }),
+      /order-history choice is invalid/u,
+    )
+    await assert.rejects(
+      planRebind({ ...commerceWithoutHistory, historyMode: 'unbounded' }),
+      /order-history choice is invalid/u,
+    )
+    await assert.rejects(
+      planRebind({ ...directInput, historyMode: 'last_30_days' }),
+      /accepted only for a commerce provider rebind plan/u,
+    )
+    const commercePlanInput = {
+      ...commerceWithoutHistory,
+      historyMode: 'last_30_days',
+    }
+    const commerceApplyInput = commerceWithoutHistory
     const postMigrationPolicy = await target.query(
       `SELECT count(*)::integer AS count
        FROM operations_commerce_order_history_policies
@@ -933,49 +1466,27 @@ async function runAcceptance(sourceUrl, targetUrl) {
       [data.targetOrg, data.accounts.commerce.targetId],
     )
     assert.equal(postMigrationPolicy.rows[0].count, 0)
-    await assert.rejects(
-      planRebind(commerceInput),
-      /requires one frozen target order-history policy/u,
-    )
-    await target.query(
-      `INSERT INTO operations_commerce_order_history_policies (
-         organization_id,integration_account_id,provider,history_mode,
-         ingestion_floor,frozen_at,configured_by
-       ) VALUES (
-         $1::uuid,$2::uuid,'shopify','last_30_days',
-         '2026-08-05T12:00:00.000Z','2026-09-04T12:00:00.000Z',NULL
-       )`,
-      [data.targetOrg, data.accounts.commerce.targetId],
-    )
-    await assert.rejects(
-      planRebind(commerceInput),
-      /target order-history policy attribution is invalid/u,
-    )
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET configured_by = 'different-operator@example.com'
-       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
-      [data.targetOrg, data.accounts.commerce.targetId],
-    )
-    await assert.rejects(
-      planRebind(commerceInput),
-      /target order-history policy attribution is invalid/u,
-    )
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET configured_by = $3
-       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
-      [data.targetOrg, data.accounts.commerce.targetId, actor],
-    )
-    const commercePlan = await planRebind(commerceInput)
+    const commercePlan = await planRebind(commercePlanInput)
     assert.equal(commercePlan.plan.providers.length, 1)
     assert.equal(commercePlan.plan.selectedSourceAccountGlobalId, data.accounts.commerce.sourceGlobalId)
+    const policyFrozenAt = commercePlan.plan.createdAt
+    const policyIngestionFloor = new Date(
+      new Date(policyFrozenAt).getTime() - 30 * 24 * 60 * 60 * 1000,
+    ).toISOString()
     assert.deepEqual(commercePlan.plan.providers[0].orderHistoryPolicy, {
       provider: 'shopify',
       historyMode: 'last_30_days',
-      ingestionFloor: '2026-08-05T12:00:00.000Z',
-      frozenAt: '2026-09-04T12:00:00.000Z',
+      ingestionFloor: policyIngestionFloor,
+      frozenAt: policyFrozenAt,
       configuredBy: actor,
+    })
+    assert.deepEqual(commercePlan.plan.providers[0].fulfillmentNotificationPolicy, {
+      policyVersion: 'shopify-fulfillment-notification-v1',
+      notifyCustomerDefault: false,
+      revision: 1,
+      changeReason: 'Safe default established during approved production rebind',
+      createdBy: actor,
+      updatedBy: actor,
     })
     assert.match(
       commercePlan.plan.providers[0].targetPlaceholder.configuration.configurationSha256,
@@ -996,24 +1507,100 @@ async function runAcceptance(sourceUrl, targetUrl) {
       /^[a-f0-9]{64}$/u,
     )
     assert.equal(JSON.stringify(commercePlan.plan).includes('fixture-shopify-client-secret'), false)
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET ingestion_floor = '2026-08-06T12:00:00.000Z'
+    const plannedPolicyCount = await target.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_order_history_policies
        WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
       [data.targetOrg, data.accounts.commerce.targetId],
     )
+    assert.equal(plannedPolicyCount.rows[0].count, 0, 'planning must not create history policy')
+    const freshnessDatabaseNow = new Date((await target.query(
+      `SELECT date_trunc('milliseconds', clock_timestamp()) AS target_database_now`,
+    )).rows[0].target_database_now)
+    const planAt = (createdAt) => {
+      const candidate = structuredClone(commercePlan.plan)
+      candidate.createdAt = createdAt
+      candidate.providers[0].orderHistoryPolicy = plannedHistoryPolicyEvidence({
+        account: data.accounts.commerce,
+        actor,
+        historyMode: 'last_30_days',
+        frozenAt: createdAt,
+      })
+      candidate.planDigest = reviewedPlanDigest(candidate)
+      return candidate
+    }
+    let expiredPlanProviderReads = 0
+    const freshnessVerifier = {
+      ...fakeVerifier(data),
+      async commerce(...values) {
+        expiredPlanProviderReads += 1
+        return fakeVerifier(data).commerce(...values)
+      },
+    }
+    const expiredPlan = planAt(new Date(
+      freshnessDatabaseNow.getTime() - REBIND_PLAN_MAX_AGE_MS - 1_000,
+    ).toISOString())
     await assert.rejects(
       applyWithDedicatedClients(source, target, {
-        ...commerceInput,
+        ...commerceApplyInput,
+        verifier: freshnessVerifier,
+        plan: expiredPlan,
+        confirmDigest: expiredPlan.planDigest,
+      }),
+      /reviewed rebind plan expired/u,
+    )
+    const futurePlan = planAt(new Date(
+      freshnessDatabaseNow.getTime() + REBIND_PLAN_MAX_FUTURE_SKEW_MS + 60_000,
+    ).toISOString())
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
+        verifier: freshnessVerifier,
+        plan: futurePlan,
+        confirmDigest: futurePlan.planDigest,
+      }),
+      /ahead of the target database clock/u,
+    )
+    assert.equal(expiredPlanProviderReads, 0, 'invalid plan time must fail before provider reads')
+    await target.query(
+      `INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       ) VALUES ($1::uuid, $2::uuid, 'shopify', 'new_orders_only', now(), now(), $3)`,
+      [data.targetOrg, data.accounts.commerce.targetId, actor],
+    )
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
         plan: commercePlan.plan,
         confirmDigest: commercePlan.plan.planDigest,
       }),
-      /reviewed rebind provider evidence no longer matches/u,
+      /target order-history policy must be absent before rebind/u,
+    )
+    await target.query('ALTER TABLE operations_commerce_order_history_policies DISABLE TRIGGER commerce_order_history_policy_guard')
+    await target.query(
+      `DELETE FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await target.query('ALTER TABLE operations_commerce_order_history_policies ENABLE TRIGGER commerce_order_history_policy_guard')
+    await target.query(
+      `INSERT INTO operations_shopify_fulfillment_notification_policies (
+         organization_id, integration_account_id, policy_version,
+         notify_customer_default, revision, change_reason, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify-fulfillment-notification-v1',
+         true, 7, 'Fixture unsafe pre-existing policy', $3, $3
+       )`,
+      [data.targetOrg, data.accounts.commerce.targetId, actor],
+    )
+    await assert.rejects(
+      planRebind(commercePlanInput),
+      /target Shopify fulfillment notification policy must be absent before rebind/u,
     )
     await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET ingestion_floor = '2026-08-05T12:00:00.000Z'
-      WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      `DELETE FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
       [data.targetOrg, data.accounts.commerce.targetId],
     )
     const assertPostValidationDriftRejected = async (mutate, restore) => {
@@ -1038,7 +1625,7 @@ async function runAcceptance(sourceUrl, targetUrl) {
       try {
         await assert.rejects(
           applyWithDedicatedClients(source, target, {
-            ...commerceInput,
+            ...commerceApplyInput,
             verifier: driftVerifier,
             plan: commercePlan.plan,
             confirmDigest: commercePlan.plan.planDigest,
@@ -1078,6 +1665,339 @@ async function runAcceptance(sourceUrl, targetUrl) {
         [data.targetOrg, data.accounts.commerce.targetId],
       ),
     )
+    await assertPostValidationDriftRejected(
+      () => target.query(
+        `INSERT INTO operations_shopify_fulfillment_notification_policies (
+           organization_id, integration_account_id, policy_version,
+           notify_customer_default, revision, change_reason, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, 'shopify-fulfillment-notification-v1',
+           true, 7, 'Fixture unsafe concurrent policy', $3, $3
+         )`,
+        [data.targetOrg, data.accounts.commerce.targetId, actor],
+      ),
+      () => target.query(
+        `DELETE FROM operations_shopify_fulfillment_notification_policies
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      ),
+    )
+    const policyWriter = await target.connect()
+    let reconciliationLockChecks = 0
+    try {
+      await policyWriter.query("SET lock_timeout = '250ms'")
+      const lockBaseVerifier = fakeVerifier(data)
+      const lockVerifier = {
+        ...lockBaseVerifier,
+        async reconcileShopify(...values) {
+          reconciliationLockChecks += 1
+          await assert.rejects(
+            policyWriter.query(
+              `INSERT INTO operations_shopify_fulfillment_notification_policies (
+                 organization_id, integration_account_id, policy_version,
+                 notify_customer_default, revision, change_reason, created_by, updated_by
+               ) VALUES (
+                 $1::uuid, $2::uuid, 'shopify-fulfillment-notification-v1',
+                 true, 99, 'Fixture concurrent policy write', $3, $3
+               )`,
+              [data.targetOrg, data.accounts.commerce.targetId, actor],
+            ),
+            /canceling statement due to lock timeout/u,
+            'notification-policy DML must remain blocked during provider reconciliation',
+          )
+          await lockBaseVerifier.reconcileShopify(...values)
+          throw new Error('fixture abort after notification-policy lock check')
+        },
+      }
+      await assert.rejects(
+        applyWithDedicatedClients(source, target, {
+          ...commerceApplyInput,
+          verifier: lockVerifier,
+          plan: commercePlan.plan,
+          confirmDigest: commercePlan.plan.planDigest,
+        }),
+        /fixture abort after notification-policy lock check/u,
+      )
+      assert.equal(
+        reconciliationLockChecks,
+        1,
+        'the write-conflicting notification-policy lock must cover provider reconciliation',
+      )
+    } finally {
+      await policyWriter.query("RESET lock_timeout").catch(() => undefined)
+      policyWriter.release()
+      await target.query(
+        `DELETE FROM operations_shopify_fulfillment_notification_policies
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      )
+    }
+    const postLockCheckPolicy = await target.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    assert.equal(
+      postLockCheckPolicy.rows[0].count,
+      0,
+      'the blocked concurrent writer and rolled-back apply must leave no policy row',
+    )
+    const rollbackBaseVerifier = fakeVerifier(data)
+    let postPolicyInsertReconciliations = 0
+    const postPolicyInsertFailureVerifier = {
+      ...rollbackBaseVerifier,
+      async reconcileShopify(...values) {
+        postPolicyInsertReconciliations += 1
+        await rollbackBaseVerifier.reconcileShopify(...values)
+        throw new Error('fixture post-policy-insert reconciliation failure')
+      },
+    }
+    await assert.rejects(
+      applyWithDedicatedClients(source, target, {
+        ...commerceApplyInput,
+        verifier: postPolicyInsertFailureVerifier,
+        plan: commercePlan.plan,
+        confirmDigest: commercePlan.plan.planDigest,
+      }),
+      /fixture post-policy-insert reconciliation failure/u,
+    )
+    assert.equal(
+      postPolicyInsertReconciliations,
+      1,
+      'failure injection must execute after the reviewed history-policy insert',
+    )
+    const commerceRolledBack = await target.query(
+      `SELECT account.status AS account_status,
+              account.external_account_id,
+              account.credential_reference,
+              account.commerce_credential_generation,
+              account.receipt_intake_enabled,
+              fence.verification_state,
+              control.desired_state AS sync_desired_state,
+              control.explicit_choice AS sync_explicit_choice,
+              control.revision::integer AS sync_revision,
+              (SELECT count(*)::integer
+               FROM operations_commerce_order_history_policies history
+               WHERE history.organization_id = account.organization_id
+                 AND history.integration_account_id = account.id) AS history_policy_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_credentials credential
+               WHERE credential.organization_id = account.organization_id
+                 AND credential.integration_account_id = account.id) AS credential_count,
+              (SELECT count(*)::integer
+               FROM audit_events event
+               WHERE event.organization_id = account.organization_id
+                 AND event.event_type = 'operations.migrated_provider_rebind.completed'
+                 AND event.payload->>'planDigest' = $3) AS receipt_count
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, commercePlan.plan.planDigest],
+    )
+    assert.deepEqual(commerceRolledBack.rows[0], {
+      account_status: 'disabled',
+      external_account_id: null,
+      credential_reference: null,
+      commerce_credential_generation: 0,
+      receipt_intake_enabled: false,
+      verification_state: 'awaiting_provider_identity',
+      sync_desired_state: 'paused',
+      sync_explicit_choice: true,
+      sync_revision: 1,
+      history_policy_count: 0,
+      credential_count: 0,
+      receipt_count: 0,
+    })
+    const readReceiptStageExistingState = () => target.query(
+      `SELECT to_jsonb(account) AS account,
+              to_jsonb(fence) AS fence,
+              to_jsonb(control) AS control
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    const receiptStageBaseline = await readReceiptStageExistingState()
+    assert.equal(receiptStageBaseline.rowCount, 1)
+    await target.query(`
+      CREATE FUNCTION fixture_fail_completed_rebind_receipt_after_writes()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      DECLARE
+        target_integration_id uuid;
+      BEGIN
+        IF NEW.event_type <> 'operations.migrated_provider_rebind.completed' THEN
+          RETURN NEW;
+        END IF;
+
+        SELECT account.id
+        INTO target_integration_id
+        FROM operations_integration_accounts account
+        WHERE account.organization_id = NEW.organization_id
+          AND account.global_id = NEW.payload#>>'{providers,0,targetAccountGlobalId}'
+          AND account.integration_type = 'commerce'
+          AND account.provider = 'shopify'
+          AND account.status = 'active'
+          AND account.external_account_id IS NOT NULL
+          AND account.credential_reference IS NOT NULL
+          AND account.commerce_credential_generation = 1
+          AND account.receipt_intake_enabled = true;
+
+        IF target_integration_id IS NULL
+          OR (SELECT count(*)
+              FROM operations_commerce_credentials credential
+              WHERE credential.organization_id = NEW.organization_id
+                AND credential.integration_account_id = target_integration_id) <> 1
+          OR (SELECT count(*)
+              FROM operations_commerce_order_history_policies history
+              WHERE history.organization_id = NEW.organization_id
+                AND history.integration_account_id = target_integration_id) <> 1
+          OR (SELECT count(*)
+              FROM operations_commerce_sync_cursors cursor_state
+              WHERE cursor_state.organization_id = NEW.organization_id
+                AND cursor_state.integration_account_id = target_integration_id) <> 5
+          OR (SELECT count(*)
+              FROM operations_shopify_fulfillment_notification_policies policy
+              WHERE policy.organization_id = NEW.organization_id
+                AND policy.integration_account_id = target_integration_id
+                AND policy.policy_version = 'shopify-fulfillment-notification-v1'
+                AND policy.notify_customer_default = false
+                AND policy.revision = 1
+                AND policy.change_reason = 'Safe default established during approved production rebind'
+                AND policy.created_by = NEW.actor
+                AND policy.updated_by = NEW.actor) <> 1
+          OR NOT EXISTS (
+              SELECT 1
+              FROM operations_commerce_migration_provider_identity_fences fence
+              WHERE fence.organization_id = NEW.organization_id
+                AND fence.integration_account_id = target_integration_id
+                AND fence.verification_state = 'verified'
+                AND fence.verified_external_account_id_sha256 IS NOT NULL
+            )
+          OR NOT EXISTS (
+              SELECT 1
+              FROM operations_commerce_store_sync_controls control
+              WHERE control.organization_id = NEW.organization_id
+                AND control.integration_account_id = target_integration_id
+                AND control.desired_state = 'running'
+                AND control.explicit_choice = true
+                AND control.revision = 2
+            )
+        THEN
+          RAISE EXCEPTION 'fixture observed incomplete commerce writes before receipt';
+        END IF;
+
+        RAISE EXCEPTION 'fixture requested commerce receipt-stage rollback';
+      END;
+      $$;
+
+      CREATE TRIGGER fixture_fail_completed_rebind_receipt_after_writes
+      BEFORE INSERT ON audit_events
+      FOR EACH ROW
+      EXECUTE FUNCTION fixture_fail_completed_rebind_receipt_after_writes();
+    `)
+    try {
+      await assert.rejects(
+        applyWithDedicatedClients(source, target, {
+          ...commerceApplyInput,
+          verifier: rollbackBaseVerifier,
+          plan: commercePlan.plan,
+          confirmDigest: commercePlan.plan.planDigest,
+        }),
+        /fixture requested commerce receipt-stage rollback/u,
+      )
+    } finally {
+      await target.query(`
+        DROP TRIGGER fixture_fail_completed_rebind_receipt_after_writes ON audit_events;
+        DROP FUNCTION fixture_fail_completed_rebind_receipt_after_writes();
+      `)
+    }
+    const receiptStageExistingState = await readReceiptStageExistingState()
+    assert.deepEqual(
+      receiptStageExistingState.rows,
+      receiptStageBaseline.rows,
+      'receipt-stage failure must restore every column of each updated commerce row',
+    )
+    const receiptStageRolledBack = await target.query(
+      `SELECT account.status AS account_status,
+              account.external_account_id,
+              account.credential_reference,
+              account.commerce_credential_generation,
+              account.receipt_intake_enabled,
+              fence.verification_state,
+              fence.verified_external_account_id_sha256,
+              control.desired_state AS sync_desired_state,
+              control.explicit_choice AS sync_explicit_choice,
+              control.revision::integer AS sync_revision,
+              (SELECT count(*)::integer
+               FROM operations_commerce_order_history_policies history
+               WHERE history.organization_id = account.organization_id
+                 AND history.integration_account_id = account.id) AS history_policy_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_credentials credential
+               WHERE credential.organization_id = account.organization_id
+                 AND credential.integration_account_id = account.id) AS credential_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_sync_cursors cursor_state
+               WHERE cursor_state.organization_id = account.organization_id
+                 AND cursor_state.integration_account_id = account.id) AS cursor_count,
+              (SELECT count(*)::integer
+               FROM operations_shopify_fulfillment_notification_policies policy
+               WHERE policy.organization_id = account.organization_id
+                 AND policy.integration_account_id = account.id) AS notification_policy_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_hosted_production_sandbox_read_authorizations authority
+               WHERE authority.organization_id = account.organization_id
+                 AND authority.integration_account_id = account.id) AS hosted_authority_count,
+              (SELECT count(*)::integer
+               FROM operations_commerce_inventory_location_mappings mapping
+               WHERE mapping.organization_id = account.organization_id
+                 AND mapping.integration_account_id = account.id
+                 AND mapping.active = true) AS active_location_mapping_count,
+              (SELECT count(*)::integer
+               FROM audit_events event
+               WHERE event.organization_id = account.organization_id
+                 AND event.event_type = 'operations.migrated_provider_rebind.completed'
+                 AND event.payload->>'planDigest' = $3) AS receipt_count
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_migration_provider_identity_fences fence
+         ON fence.organization_id = account.organization_id
+        AND fence.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, commercePlan.plan.planDigest],
+    )
+    assert.deepEqual(receiptStageRolledBack.rows[0], {
+      account_status: 'disabled',
+      external_account_id: null,
+      credential_reference: null,
+      commerce_credential_generation: 0,
+      receipt_intake_enabled: false,
+      verification_state: 'awaiting_provider_identity',
+      verified_external_account_id_sha256: null,
+      sync_desired_state: 'paused',
+      sync_explicit_choice: true,
+      sync_revision: 1,
+      history_policy_count: 0,
+      credential_count: 0,
+      cursor_count: 0,
+      notification_policy_count: 0,
+      hosted_authority_count: 0,
+      active_location_mapping_count: 0,
+      receipt_count: 0,
+    })
     const baseConcurrencyVerifier = fakeVerifier(data)
     let validationArrivals = 0
     let releaseValidations
@@ -1104,7 +2024,7 @@ async function runAcceptance(sourceUrl, targetUrl) {
     let concurrentResults
     try {
       const concurrentInput = {
-        ...commerceInput,
+        ...commerceApplyInput,
         verifier: concurrentVerifier,
         plan: commercePlan.plan,
         confirmDigest: commercePlan.plan.planDigest,
@@ -1131,6 +2051,541 @@ async function runAcceptance(sourceUrl, targetUrl) {
     const commerceReceipt = fulfilled[0].value
     assert.equal(commerceReceipt.receipts.length, 1)
     assert.equal(commerceReceipt.providerWrites, 0)
+    const commerceCutoverState = await target.query(
+      `SELECT
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'catalog'
+         ) AS catalog_current,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'images'
+         ) AS images_current,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'inventory'
+         ) AS inventory_current,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'orders_history'
+         ) AS orders_history_current,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'webhook_hydration'
+         ) AS webhook_hydration_current,
+         operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'provider_write'
+         ) AS provider_write_current`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    assert.deepEqual(commerceCutoverState.rows[0], {
+      catalog_current: true,
+      images_current: true,
+      inventory_current: true,
+      orders_history_current: true,
+      webhook_hydration_current: true,
+      provider_write_current: false,
+    })
+    const materializedLocationRouting = await target.query(
+      `SELECT external_location_id, external_location_name, external_location_address,
+              mapping_method, active, row_version::integer,
+              ownership_classification, provider_snapshot_json,
+              provider_snapshot_hash, provider_observed_at IS NOT NULL AS provider_observed,
+              inventory_import_enabled
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    assert.deepEqual(materializedLocationRouting.rows, [{
+      external_location_id: data.accounts.commerce.shopifyExternalLocationId,
+      external_location_name: 'Fixture provider location',
+      external_location_address: fixtureShopifyLocation(data).address,
+      mapping_method: 'manual',
+      active: true,
+      row_version: 1,
+      ownership_classification: 'merchant_managed',
+      provider_snapshot_json: fixtureShopifyLocation(data),
+      provider_snapshot_hash: digest({
+        schema: 'shopify-location-snapshot-v1',
+        location: fixtureShopifyLocation(data),
+      }),
+      provider_observed: true,
+      inventory_import_enabled: true,
+    }])
+    const commerceCommittedEvent = await target.query(
+      `SELECT payload
+       FROM audit_events
+       WHERE organization_id = $1::uuid
+         AND event_type = 'operations.migrated_provider_rebind.completed'
+         AND payload->>'planDigest' = $2`,
+      [data.targetOrg, commercePlan.plan.planDigest],
+    )
+    assert.equal(commerceCommittedEvent.rowCount, 1)
+    const commercePostState = commerceCommittedEvent.rows[0].payload.providers[0].materializedPostState
+    assert.deepEqual(commercePostState.carrierServiceReadiness, {
+      status: 'operator_registration_and_callback_verification_required',
+      acceptedWithPlanDigest: commercePlan.plan.planDigest,
+      providerMutationDuringRebind: false,
+      carrierServiceVerified: false,
+      checkoutPackRegenerationAllowed: false,
+    })
+    assert.equal(
+      commercePostState.shopifyLocationRouting.providerLocationSetSha256,
+      digest({ schema: 'shopify-location-set-v1', locations: [fixtureShopifyLocation(data)] }),
+    )
+    await target.query('BEGIN')
+    try {
+      await target.query(
+        `UPDATE operations_integration_accounts
+         SET status = 'error'
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      )
+      await target.query(
+        `UPDATE operations_commerce_hosted_production_sandbox_read_authorizations
+         SET state = 'revoked', revoked_by = $3, revoked_at = clock_timestamp(),
+             revocation_reason = 'Fixture emergency revocation after account error'
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid
+           AND authorization_version = 1`,
+        [data.targetOrg, data.accounts.commerce.targetId, actor],
+      )
+      const revoked = await target.query(
+        `SELECT operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'orders_history'
+         ) AS current`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      )
+      assert.equal(revoked.rows[0].current, false)
+    } finally {
+      await target.query('ROLLBACK')
+    }
+    await target.query('BEGIN')
+    try {
+      await target.query(
+        `UPDATE operations_commerce_hosted_production_sandbox_read_authorizations
+         SET state = 'revoked', revoked_by = $3, revoked_at = clock_timestamp(),
+             revocation_reason = 'Fixture reviewed renewal predecessor revocation'
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid
+           AND authorization_version = 1`,
+        [data.targetOrg, data.accounts.commerce.targetId, actor],
+      )
+      await target.query(
+        `INSERT INTO operations_commerce_hosted_production_sandbox_read_authorizations (
+           organization_id,integration_account_id,authorization_version,state,capabilities,
+           provider_writes_enabled,automatic_order_promotion_enabled,
+           authorized_credential_generation,verified_external_account_id_sha256,
+           migration_receipt_event_key,authorized_by,authorized_at,expires_at,reason
+         ) VALUES (
+           $1::uuid,$2::uuid,2,'active',
+           ARRAY['catalog','images','inventory','orders_history','webhook_hydration']::text[],
+           false,false,1,$3,'fixture-migration-receipt',$4,
+           clock_timestamp(),clock_timestamp() + interval '30 days',
+           'Fixture reviewed renewal with the same verified provider identity'
+         )`,
+        [
+          data.targetOrg,
+          data.accounts.commerce.targetId,
+          data.accounts.commerce.externalAccountIdSha256,
+          actor,
+        ],
+      )
+      const renewed = await target.query(
+        `SELECT operations_commerce_hosted_production_sandbox_read_is_current(
+           $1::uuid, $2::uuid, 'orders_history'
+         ) AS current`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      )
+      assert.equal(renewed.rows[0].current, true)
+    } finally {
+      await target.query('ROLLBACK')
+    }
+    await assert.rejects(
+      target.query(
+        `INSERT INTO operations_commerce_hosted_production_sandbox_read_authorizations (
+           organization_id,integration_account_id,authorization_version,state,capabilities,
+           provider_writes_enabled,automatic_order_promotion_enabled,
+           authorized_credential_generation,verified_external_account_id_sha256,
+           migration_receipt_event_key,authorized_by,authorized_at,expires_at,reason
+         ) VALUES (
+           $1::uuid,$2::uuid,2,'active',
+           ARRAY['catalog','images','inventory','orders_history','webhook_hydration']::text[],
+           false,false,1,$3,'fixture-migration-receipt',$4,
+           clock_timestamp() + interval '1 day',clock_timestamp() + interval '31 days',
+           'Fixture future dated authority must fail closed at the database boundary'
+         )`,
+        [
+          data.targetOrg,
+          data.accounts.commerce.targetId,
+          data.accounts.commerce.externalAccountIdSha256,
+          actor,
+        ],
+      ),
+      /cannot begin in the future/u,
+    )
+    const materializedNotificationPolicy = await target.query(
+      `SELECT policy_version, notify_customer_default, revision,
+              change_reason, created_by, updated_by
+       FROM operations_shopify_fulfillment_notification_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    assert.deepEqual(materializedNotificationPolicy.rows, [{
+      policy_version: 'shopify-fulfillment-notification-v1',
+      notify_customer_default: false,
+      revision: 1,
+      change_reason: 'Safe default established during approved production rebind',
+      created_by: actor,
+      updated_by: actor,
+    }])
+    const materializedCommerce = await target.query(
+      `SELECT account.configuration, account.external_account_id,
+              account.credential_reference, account.commerce_credential_generation,
+              account.receipt_intake_enabled,
+              credential.credential_ciphertext,
+              control.desired_state AS sync_desired_state,
+              control.revision AS sync_revision
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    const commerceState = materializedCommerce.rows[0]
+    assert.equal(commerceState.receipt_intake_enabled, true)
+    assert.equal(commerceState.sync_desired_state, 'running')
+    assert.equal(commerceState.sync_revision, '2')
+    assert.equal(
+      commerceState.configuration.acceptedReceiptTopics.length,
+      10,
+      'retained receipt intake stays limited to the control-plane privacy boundary',
+    )
+    assert.deepEqual(commerceState.configuration.acceptedReceiptTopics, [
+      'app/scopes_update',
+      'inventory_items/create',
+      'inventory_items/delete',
+      'inventory_items/update',
+      'inventory_levels/connect',
+      'inventory_levels/disconnect',
+      'inventory_levels/update',
+      'products/create',
+      'products/delete',
+      'products/update',
+    ])
+    assert.deepEqual(
+      commerceState.configuration.scopeWebhookSubscriptions.requiredTopics,
+      ['app/scopes_update'],
+    )
+    assert.equal(commerceState.configuration.scopeWebhookSubscriptions.ready, true)
+    assert.equal(commerceState.configuration.webhookSubscriptions.requiredTopics.length, 6)
+    assert.equal(commerceState.configuration.webhookSubscriptions.ready, true)
+    assert.equal(commerceState.configuration.catalogWebhookSubscriptions.requiredTopics.length, 3)
+    assert.equal(commerceState.configuration.catalogWebhookSubscriptions.ready, true)
+    assert.equal(commerceState.configuration.orderWebhookSubscriptions.requiredTopics.length, 7)
+    assert.deepEqual(
+      commerceState.configuration.orderWebhookSubscriptions.requiredTopics,
+      [
+        'orders/cancelled',
+        'orders/create',
+        'orders/edited',
+        'orders/fulfilled',
+        'orders/paid',
+        'orders/partially_fulfilled',
+        'orders/updated',
+      ],
+      'persisted order-topic evidence must satisfy the runtime exact-lineage checker',
+    )
+    assert.deepEqual(
+      commerceState.configuration.orderWebhookSubscriptions.requiredIncludeFields,
+      ['admin_graphql_api_id', 'updated_at'],
+    )
+    assert.equal(commerceState.configuration.orderWebhookSubscriptions.subscriptionReady, true)
+    assert.equal(commerceState.configuration.orderWebhookSubscriptions.exactReadProcessorReady, true)
+    const assertCommerceRecoveryBlocked = async (pattern) => {
+      await assert.rejects(
+        exportCommittedReceipt({
+          ...commerceApplyInput,
+          plan: commercePlan.plan,
+          confirmDigest: commercePlan.plan.planDigest,
+        }),
+        pattern,
+      )
+    }
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = configuration - 'scopeWebhookSubscriptions'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/access-scope safety runtime subscription evidence/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        data.targetOrg,
+        data.accounts.commerce.targetId,
+        JSON.stringify(commerceState.configuration),
+      ],
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = configuration - 'lastVerifiedAt'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/receipt-intake configuration is incomplete/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = $3::jsonb
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        data.targetOrg,
+        data.accounts.commerce.targetId,
+        JSON.stringify(commerceState.configuration),
+      ],
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET external_account_id = 'gid://shopify/Shop/999999999'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET external_account_id = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, commerceState.external_account_id],
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET credential_reference = 'commerce-credential:stale:v0'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET credential_reference = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, commerceState.credential_reference],
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET commerce_credential_generation = 2
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    const rotatedAuthority = await target.query(
+      `SELECT operations_commerce_hosted_production_sandbox_read_is_current(
+         $1::uuid, $2::uuid, 'orders_history'
+       ) AS current`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    assert.equal(
+      rotatedAuthority.rows[0].current,
+      false,
+      'an old grant must not survive a commerce credential generation change',
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET commerce_credential_generation = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        data.targetOrg,
+        data.accounts.commerce.targetId,
+        commerceState.commerce_credential_generation,
+      ],
+    )
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET receipt_intake_enabled = false
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `UPDATE operations_integration_accounts
+       SET receipt_intake_enabled = true
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await target.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'paused'
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'running'
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await target.query(
+      `DELETE FROM operations_commerce_sync_cursors
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid
+         AND resource = 'orders'`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/committed commerce rebind post-state is incomplete/u)
+    await target.query(
+      `INSERT INTO operations_commerce_sync_cursors (
+         organization_id, integration_account_id, resource,
+         provider_cursor, high_watermark, reconciliation_status,
+         records_seen, records_applied, records_held, consecutive_failures,
+         last_error_code, last_started_at, last_completed_at
+       ) VALUES ($1::uuid, $2::uuid, 'orders', NULL, NULL, 'idle', 0, 0, 0, 0, NULL, NULL, NULL)`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await target.query(
+      `UPDATE operations_commerce_credentials
+       SET credential_ciphertext = set_byte(
+         credential_ciphertext, 0, get_byte(credential_ciphertext, 0) # 1
+       )
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assertCommerceRecoveryBlocked(/could not be decrypted/u)
+    await target.query(
+      `UPDATE operations_commerce_credentials
+       SET credential_ciphertext = $3
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [
+        data.targetOrg,
+        data.accounts.commerce.targetId,
+        commerceState.credential_ciphertext,
+      ],
+    )
+    await target.query(
+      `UPDATE operations_shopify_fulfillment_notification_policies
+       SET notify_customer_default = true,
+           revision = 2,
+           change_reason = 'Fixture unsafe post-commit drift'
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId],
+    )
+    await assert.rejects(
+      exportCommittedReceipt({
+        ...commerceApplyInput,
+        plan: commercePlan.plan,
+        confirmDigest: commercePlan.plan.planDigest,
+      }),
+      /Shopify fulfillment notification policy is missing or invalid/u,
+    )
+    await target.query(
+      `UPDATE operations_shopify_fulfillment_notification_policies
+       SET notify_customer_default = false,
+           revision = 1,
+           change_reason = 'Safe default established during approved production rebind',
+           created_by = $3,
+           updated_by = $3
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.commerce.targetId, actor],
+    )
+    assert.deepEqual(
+      await exportCommittedReceipt({
+        ...commerceApplyInput,
+        plan: commercePlan.plan,
+        confirmDigest: commercePlan.plan.planDigest,
+      }),
+      commerceReceipt,
+    )
+
+    const faireInput = inputFor(data.accounts.faire)
+    await assert.rejects(
+      planRebind(faireInput),
+      /--history-mode is required/u,
+    )
+    const fairePlan = await planRebind({ ...faireInput, historyMode: 'provider_all' })
+    assert.equal(fairePlan.plan.providers.length, 1)
+    assert.equal(fairePlan.plan.providers[0].provider, 'faire')
+    assert.equal(
+      fairePlan.plan.providers[0].callback.disposition,
+      'not_applicable_provider_has_no_documented_webhooks',
+    )
+    assert.deepEqual(fairePlan.plan.providers[0].orderHistoryPolicy, {
+      provider: 'faire',
+      historyMode: 'provider_all',
+      ingestionFloor: null,
+      frozenAt: fairePlan.plan.createdAt,
+      configuredBy: actor,
+    })
+    assert.equal(fairePlan.plan.providers[0].fulfillmentNotificationPolicy, null)
+    const faireReceipt = await applyWithDedicatedClients(source, target, {
+      ...faireInput,
+      plan: fairePlan.plan,
+      confirmDigest: fairePlan.plan.planDigest,
+    })
+    assert.equal(faireReceipt.status, 'committed')
+    assert.equal(faireReceipt.receipts.length, 1)
+    assert.equal(faireReceipt.providerWrites, 0)
+    const fairePostState = await target.query(
+      `SELECT account.status, account.receipt_intake_enabled,
+              credential.verification_status,
+              credential.webhook_verification_status,
+              control.desired_state AS sync_desired_state,
+              (SELECT count(*)::integer
+                 FROM operations_commerce_sync_cursors cursor
+                WHERE cursor.organization_id = account.organization_id
+                  AND cursor.integration_account_id = account.id) AS cursor_count
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls control
+         ON control.organization_id = account.organization_id
+        AND control.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+      [data.targetOrg, data.accounts.faire.targetId],
+    )
+    assert.deepEqual(fairePostState.rows, [{
+      status: 'active',
+      receipt_intake_enabled: false,
+      verification_status: 'verified',
+      webhook_verification_status: 'not_applicable',
+      sync_desired_state: 'running',
+      cursor_count: 5,
+    }])
+    assert.deepEqual(
+      await exportCommittedReceipt({
+        ...faireInput,
+        plan: fairePlan.plan,
+        confirmDigest: fairePlan.plan.planDigest,
+      }),
+      faireReceipt,
+      'valid Faire not_applicable webhook status must support receipt recovery',
+    )
+    await target.query(
+      `UPDATE operations_commerce_credentials
+       SET webhook_verification_status = 'verified', webhook_verified_at = now()
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.faire.targetId],
+    )
+    await assert.rejects(
+      exportCommittedReceipt({
+        ...faireInput,
+        plan: fairePlan.plan,
+        confirmDigest: fairePlan.plan.planDigest,
+      }),
+      /committed commerce rebind post-state is incomplete/u,
+      'Faire receipt recovery must reject a webhook status that implies Shopify semantics',
+    )
+    await target.query(
+      `UPDATE operations_commerce_credentials
+       SET webhook_verification_status = 'not_applicable', webhook_verified_at = NULL
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      [data.targetOrg, data.accounts.faire.targetId],
+    )
+    assert.deepEqual(
+      await exportCommittedReceipt({
+        ...faireInput,
+        plan: fairePlan.plan,
+        confirmDigest: fairePlan.plan.planDigest,
+      }),
+      faireReceipt,
+    )
 
     const authorityBefore = await target.query(
       `SELECT credential_ciphertext, credential_iv, credential_tag
@@ -1141,6 +2596,23 @@ async function runAcceptance(sourceUrl, targetUrl) {
     const authorityInput = inputFor(data.accounts.authority, {
       managedRebindMaterial: managedMaterial(data, artifact, bindings),
     })
+    assert.throws(
+      () => buildManagedRebindMaterial({
+        actor,
+        manifest: artifact.manifest,
+        mapping: artifact.mapping,
+        bindings,
+        workspace: data.workspace,
+        account: data.accounts.authority,
+        secretInput: {
+          clientId: 'fresh-target-fedex-client-9088',
+          clientSecret: 'fresh-target-fedex-secret',
+          accountNumber: data.accounts.authority.authorityNumber,
+        },
+        approvalToken: 'approve:wrong-authority',
+      }),
+      /source-authority approval changed/u,
+    )
     await assert.rejects(
       planRebind({
         ...authorityInput,
@@ -1246,15 +2718,25 @@ async function runAcceptance(sourceUrl, targetUrl) {
     const substitutedMaterial = structuredClone(authorityInput.managedRebindMaterial)
     substitutedMaterial.credential.clientSecret = 'fresh-target-fedex-secret-substitute'
     substitutedMaterial.materialDigest = managedRebindMaterialDigest(substitutedMaterial)
+    let substitutedProviderCalls = 0
+    const substitutedVerifier = {
+      ...authorityInput.verifier,
+      async carrier(...values) {
+        substitutedProviderCalls += 1
+        return authorityInput.verifier.carrier(...values)
+      },
+    }
     await assert.rejects(
       applyWithDedicatedClients(source, target, {
         ...authorityInput,
+        verifier: substitutedVerifier,
         managedRebindMaterial: substitutedMaterial,
         plan: authorityPlan.plan,
         confirmDigest: authorityPlan.plan.planDigest,
       }),
-      /reviewed rebind provider evidence no longer matches/u,
+      /managed carrier input does not match the confirmed rebind plan/u,
     )
+    assert.equal(substitutedProviderCalls, 0, 'changed apply secrets must not reach the provider')
     const authorityReceipt = await applyWithDedicatedClients(source, target, {
       ...authorityInput,
       plan: authorityPlan.plan,
@@ -1281,14 +2763,40 @@ async function runAcceptance(sourceUrl, targetUrl) {
            WHERE organization_id = $1::uuid AND state = 'materialized') AS carriers,
          (SELECT count(*)::integer FROM operations_commerce_sync_cursors
            WHERE organization_id = $1::uuid) AS fresh_cursors,
+         (SELECT count(*)::integer FROM operations_commerce_order_history_policies
+           WHERE organization_id = $1::uuid) AS history_policies,
+         (SELECT count(*)::integer FROM operations_shopify_fulfillment_notification_policies
+           WHERE organization_id = $1::uuid) AS notification_policies,
          (SELECT count(*)::integer FROM audit_events
            WHERE organization_id = $1::uuid
              AND event_type = 'operations.migrated_provider_rebind.completed') AS receipts`,
       [data.targetOrg],
     )
     assert.deepEqual(materialized.rows[0], {
-      active: 3, carriers: 2, fresh_cursors: 5, receipts: 3,
+      active: 4,
+      carriers: 2,
+      fresh_cursors: 10,
+      history_policies: 2,
+      notification_policies: 1,
+      receipts: 4,
     })
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_commerce_order_history_policies
+         SET history_mode = 'new_orders_only'
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      ),
+      /commerce order history policy is immutable/u,
+    )
+    await assert.rejects(
+      target.query(
+        `DELETE FROM operations_commerce_order_history_policies
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      ),
+      /commerce order history policy is immutable/u,
+    )
     const immutableReceipt = await target.query(
       `SELECT id::text FROM audit_events
        WHERE organization_id = $1::uuid

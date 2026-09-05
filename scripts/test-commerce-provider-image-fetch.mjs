@@ -7,6 +7,8 @@ import { resolve } from 'node:path'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import * as runtimeGate from './lib/integration-credential-runtime-test-double.mjs'
+
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(
@@ -72,6 +74,7 @@ const providerImages = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/crm/productImageAssets': productImageAssets,
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs': runtimeGate,
       sharp: sharpModule,
     },
   },
@@ -250,6 +253,44 @@ async function expectCode(promise, code, secrets = []) {
   })
 }
 
+test('preserves typed credential maintenance at the final provider boundary', async () => {
+  const maintenanceError = new runtimeGate.IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+  let providerCalls = 0
+  const gatedProviderImages = loadTypeScriptModule(
+    'app_src/lib/integrations/commerceProviderImageFetch.ts',
+    {
+      mocks: {
+        '@/lib/crm/productImageAssets': productImageAssets,
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+          ...runtimeGate,
+          assertIntegrationCredentialProviderIoReady() {
+            throw maintenanceError
+          },
+        },
+        sharp: sharpModule,
+      },
+    },
+  )
+
+  await assert.rejects(
+    gatedProviderImages.fetchCommerceProviderImage(
+      { url: 'https://images.vendor.com/item.png' },
+      safeDependencies({
+        async fetch() {
+          providerCalls += 1
+          return response({
+            headers: { 'content-type': 'image/png' },
+          }).response
+        },
+      }),
+    ),
+    (error) => error === maintenanceError,
+  )
+  assert.equal(providerCalls, 0)
+})
+
 test('prefers public IPv4 from dual-stack DNS and returns validated bytes only', async () => {
   const requests = []
   const lookups = []
@@ -380,6 +421,7 @@ test('native HTTPS transport preserves authority while using only the pinned add
     {
       mocks: {
         '@/lib/crm/productImageAssets': productImageAssets,
+        '@/lib/integrations/integrationCredentialRuntimeGate.mjs': runtimeGate,
         'node:https': {
           request(url, options, callback) {
             capturedUrl = url

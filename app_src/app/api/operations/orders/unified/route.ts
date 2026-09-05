@@ -14,6 +14,9 @@ import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import {
@@ -57,6 +60,8 @@ function requestError(code: string, message: string, status = 400): never {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return response({
       ok: false,

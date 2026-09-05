@@ -7,6 +7,9 @@ import {
   ShopifyOrderRevisionError,
 } from '@/lib/integrations/shopifyOrderRevision'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   captureCommerceOrderRevisionObservationInPostgres,
   CommerceOrderRevisionDispositionError,
   failManagerCommerceOrderRevisionRefreshInPostgres,
@@ -135,6 +138,7 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
       }),
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const errorCode = providerErrorCode(error)
     const retryWithNewIdempotencyKey = await failManagerCommerceOrderRevisionRefreshInPostgres({
       claim,

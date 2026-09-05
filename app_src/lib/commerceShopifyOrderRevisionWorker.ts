@@ -4,11 +4,16 @@ import {
   ShopifyOrderRevisionError,
 } from '@/lib/integrations/shopifyOrderRevision'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   assertCommerceOrderRevisionStoreSyncRunningInPostgres,
   captureCommerceOrderRevisionObservationInPostgres,
   claimCommerceOrderRevisionTargetsInPostgres,
   CommerceOrderRevisionStoreSyncPausedError,
   failCommerceOrderRevisionTargetInPostgres,
+  parkCommerceOrderRevisionTargetForRuntimeMaintenanceInPostgres,
   parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
 import {
@@ -47,6 +52,7 @@ export async function processShopifyOrderRevisions(input: {
     || process.env.HOSTNAME
     || randomUUID()
   )).slice(0, 200)
+  assertIntegrationCredentialProviderIoReady()
   const claims = await claimCommerceOrderRevisionTargetsInPostgres({
     provider: 'shopify',
     workerId,
@@ -57,7 +63,8 @@ export async function processShopifyOrderRevisions(input: {
   let failed = 0
   let parked = 0
   const failureCodes: Record<string, number> = {}
-  for (const claim of claims) {
+  for (let claimIndex = 0; claimIndex < claims.length; claimIndex += 1) {
+    const claim = claims[claimIndex]
     try {
       await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)
       const result =
@@ -69,6 +76,7 @@ export async function processShopifyOrderRevisions(input: {
           intentKey: `${claim.targetId}:${claim.leaseToken}`,
           acquiredBy: workerId,
           read: async (providerReadLease) => {
+            assertIntegrationCredentialProviderIoReady()
             const evidence = await inspectShopifyCanonicalOrderRevision(claim)
             return captureCommerceOrderRevisionObservationInPostgres({
               claim,
@@ -88,6 +96,16 @@ export async function processShopifyOrderRevisions(input: {
       captured += 1
       if (result.changed) changed += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) {
+        await Promise.allSettled(claims.slice(claimIndex).map(async (pendingClaim) => (
+          await parkCommerceOrderRevisionTargetForRuntimeMaintenanceInPostgres({
+            claim: pendingClaim,
+            workerId,
+            errorCode: String((error as { code?: unknown }).code || ''),
+          })
+        )))
+        throw error
+      }
       if (
         error instanceof CommerceOrderRevisionStoreSyncPausedError
         || isStoreSyncReadPause(error)

@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   CarrierCredentialClientError,
   verifyCarrierCredential,
   type CarrierRuntimeCredential,
@@ -116,6 +120,7 @@ function billingFlag(value: unknown, defaultValue: boolean) {
 }
 
 function sanitize(error: unknown): CarrierIntegrationRequestError {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof CarrierIntegrationRequestError) return error
   if (
     error
@@ -340,6 +345,7 @@ export async function assertCarrierRateTestArtifactCapability(input: {
   provider: unknown
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const integrationAccountId = String(input.integrationAccountId || '').trim()
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -411,6 +417,7 @@ export async function updateCarrierCredential(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
@@ -491,6 +498,7 @@ export async function createCarrierAccount(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const normalized = carrierAccountWrite(input)
     await requireUserManagedCarrierConnection(normalized)
     if (!normalized.accountNumber) {
@@ -517,6 +525,7 @@ export async function updateCarrierAccount(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const normalized = carrierAccountWrite(input)
     await requireUserManagedCarrierConnection(normalized)
     return updateCarrierAccountInPostgres({
@@ -537,6 +546,7 @@ export async function setCarrierAccountStatus(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     if (input.status !== 'active' && input.status !== 'disabled') {
       throw new CarrierIntegrationRequestError('Carrier account status must be active or disabled')
     }
@@ -565,6 +575,7 @@ export async function deleteCarrierAccount(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const dimensions = {
       organizationId: normalizeCarrierOrganizationId(input.organizationId),
       provider: normalizeDirectCarrierProvider(input.provider),
@@ -587,7 +598,10 @@ export async function testCarrierCredential(input: {
   environment: unknown
   actorEmail: string
 }) {
+  let providerIoReady = false
   try {
+    assertIntegrationCredentialProviderIoReady()
+    providerIoReady = true
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
@@ -610,8 +624,12 @@ export async function testCarrierCredential(input: {
       errorCode: null,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const sanitized = sanitize(error)
-    if (sanitized.code !== 'CARRIER_DELEGATION_SOURCE_MANAGED') {
+    if (
+      providerIoReady
+      && sanitized.code !== 'CARRIER_DELEGATION_SOURCE_MANAGED'
+    ) {
       try {
         await markCarrierCredentialVerificationInPostgres({
           organizationId: normalizeCarrierOrganizationId(input.organizationId),
@@ -783,7 +801,7 @@ export async function resolveCarrierProductionShippingRuntime(input: {
   try {
     if (!carrierProductionLabelAuthorizationAllowed()) {
       throw new CarrierIntegrationRequestError(
-        'Production label purchase is available only in production or the trusted Railway development service',
+        'Production label purchase is available only in the trusted Railway production service',
         403,
         'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
@@ -922,6 +940,7 @@ export async function setCarrierProductionLabelEnabled(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     if (provider !== 'ups_rest' && provider !== 'fedex_rest') {
@@ -933,7 +952,7 @@ export async function setCarrierProductionLabelEnabled(input: {
     }
     if (input.enabled === true && !carrierProductionLabelAuthorizationAllowed()) {
       throw new CarrierIntegrationRequestError(
-        'Production label purchase can be authorized only in production or the trusted Railway development service',
+        'Production label purchase can be authorized only in the trusted Railway production service',
         403,
         'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
@@ -1178,6 +1197,7 @@ export async function testCarrierSandboxRate(input: {
   let selection: SandboxBillingSelection | null = null
   let fixture: CarrierSandboxRateFixture | null = null
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
@@ -1260,6 +1280,7 @@ export async function testCarrierSandboxRate(input: {
       evidenceGlobalId,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const sanitized = sanitize(error)
     if (
       runtime
@@ -1326,6 +1347,7 @@ export async function testCarrierSandboxShipmentRate(input: {
   let selection: SandboxBillingSelection | null = null
   let fixture: CarrierSandboxShipmentRateFixture | null = null
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(
       input.organizationId,
     )
@@ -1423,6 +1445,7 @@ export async function testCarrierSandboxShipmentRate(input: {
       evidenceGlobalId,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const sanitized = sanitize(error)
     let rateEvidenceGlobalId: string | null = null
     if (
@@ -1504,6 +1527,7 @@ export async function setCarrierIntegrationEnabled(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const environment = normalizeCarrierEnvironment(input.environment)
@@ -1543,6 +1567,7 @@ export async function disconnectCarrierCredential(input: {
   actorEmail: string
 }) {
   try {
+    assertIntegrationCredentialProviderIoReady()
     const dimensions = {
       organizationId: normalizeCarrierOrganizationId(input.organizationId),
       provider: normalizeDirectCarrierProvider(input.provider),

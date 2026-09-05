@@ -48,6 +48,9 @@ import {
   shopifyFulfillmentAttemptSignatureHashCandidates,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   assertShopifyOrderPlanningAuthorityHash,
   inspectShopifyOrderPlanningAuthority,
   normalizeShopifyOrderPlanningAuthoritySnapshot,
@@ -4538,6 +4541,7 @@ async function readOrderDetail(
       }))
       shadowPreparationReady = true
     } catch (caught) {
+      if (isIntegrationCredentialRuntimeGateError(caught)) throw caught
       shadowPreparationBlockedReason = caught instanceof Error
         ? caught.message
         : 'Checkout, sealed carton, and carrier evidence is incomplete.'
@@ -10043,6 +10047,7 @@ export async function prepareOperationsShipmentExecutionFromPostgres(input: {
       return result
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     await failCommandReceipt(command.receipt.id, error)
     throw error
   }
@@ -15082,6 +15087,7 @@ export async function planOperationsOrderFromPostgres(input: {
       return result
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const normalizedError = normalizeShopifyPlanningError(error)
     await failCommandReceipt(command.receipt.id, normalizedError)
     throw normalizedError
@@ -18284,6 +18290,7 @@ export async function reconcileShopifyExternalFulfillmentFromPostgres(input: {
       return result
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     await failCommandReceipt(command.receipt.id, error)
     throw error
   }
@@ -20108,6 +20115,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       return result
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     await failCommandReceipt(command.receipt.id, error)
     throw error
   }
@@ -21473,6 +21481,10 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       )
     }
   } catch (error) {
+    // Runtime maintenance is neither a provider outcome nor a business
+    // failure. Leave the durable export/provider claims unresolved so the
+    // fenced recovery path can resume after credential services recover.
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     state = 'failed'
     const faireAttemptIntegrityFailure = (
       claimed.row.provider === 'faire'
@@ -21743,6 +21755,7 @@ export async function retryOperationsCommerceFulfillmentExportFromPostgres(input
     ))
     return result
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     await failCommandReceipt(command.receipt.id, error)
     throw error
   }
@@ -23495,6 +23508,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
     )
     return result
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (!committed) {
       await failCommandReceipt(command.receipt.id, error)
     }

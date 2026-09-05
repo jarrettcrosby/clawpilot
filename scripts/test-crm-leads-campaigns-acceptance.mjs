@@ -249,7 +249,25 @@ async function waitForHttp(url, serverLogs) {
     try {
       const response = await fetch(url)
       if (response.ok) return
-      lastError = new Error(`HTTP ${response.status}`)
+      const responseText = await response.text()
+      const responseBody = responseText.slice(0, 2000)
+      if (response.status === 503) {
+        try {
+          const health = JSON.parse(responseText)
+          if (
+            health?.database?.status === 'reachable'
+            && health?.database?.migrationsCurrent === true
+            && health?.integrationCredentialRuntime?.deploymentReady === true
+          ) {
+            return
+          }
+        } catch {
+          // Retain the bounded raw response in the final readiness error.
+        }
+      }
+      lastError = new Error(
+        `HTTP ${response.status}${responseBody ? `: ${responseBody}` : ''}`,
+      )
     } catch (error) {
       lastError = error
     }
@@ -1014,6 +1032,11 @@ async function main() {
         APP_LOGIN_EMAIL: actorEmail,
         APP_SESSION_SECRET: sessionSecret,
         AGENT_CREDENTIAL_ENCRYPTION_KEY: sessionSecret,
+        INTEGRATION_CREDENTIAL_ENCRYPTION_KEY: sessionSecret,
+        INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID: 'crm-acceptance-v1',
+        INTEGRATION_CREDENTIAL_ATTESTATION_MODE: 'adoption',
+        INTEGRATION_CREDENTIAL_ATTESTATION_ADOPTION_DEADLINE:
+          new Date(Date.now() + 60 * 60 * 1000).toISOString(),
         MATON_BASE_URL: 'https://crm-acceptance.gateway.maton.ai',
         NODE_OPTIONS: [
           process.env.NODE_OPTIONS,

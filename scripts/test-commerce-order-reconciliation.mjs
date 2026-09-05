@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -50,6 +51,12 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     ...globals,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
       if (specifier === '@/lib/integrations/commerceReadRuntime') {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceReadRuntime.ts',
@@ -3319,7 +3326,13 @@ includes(route, [
   'health?.faireUnattributedAttentionRequired',
   "phase: 'started'",
   "phase: 'completed'",
+  "phase: 'maintenance'",
   "phase: 'failed'",
+  'await Promise.allSettled([(async () => {',
+  'return maintenance',
+  'isIntegrationCredentialRuntimeGateError(error)',
+  'status: 503',
+  "'Retry-After': '60'",
   'providerReadOnly: true',
   "commerceReadRuntimeMode?.() === 'development'",
   'shopifyAutomaticOrderPromotionHealthSnapshot',

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { ReadableStream } from 'node:stream/web'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -29,6 +30,12 @@ function load(path, dependencies = {}) {
   const module = { exports: {} }
   const localRequire = (specifier) => {
     if (Object.hasOwn(dependencies, specifier)) return dependencies[specifier]
+    if (
+      specifier
+      === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+    ) {
+      return integrationCredentialRuntimeGate
+    }
     return nodeRequire(specifier)
   }
   const sandbox = {
@@ -65,6 +72,10 @@ function load(path, dependencies = {}) {
 
 const credentialCrypto = load(
   'app_src/lib/integrations/brokeredTransportCredentialCrypto.ts',
+  {
+    './integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
+  },
 )
 const wwexFoundation = load(
   'app_src/lib/integrations/wwexSpeedshipFoundation.ts',

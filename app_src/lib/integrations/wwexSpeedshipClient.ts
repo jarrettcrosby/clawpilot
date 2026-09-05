@@ -3,6 +3,10 @@ import {
   type WwexSpeedshipCredential,
 } from '@/lib/integrations/brokeredTransportCredentialCrypto'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   parseWwexLtlShopResponse,
   parseWwexLtlTenderResponse,
   parseWwexSmallpackSchedulePickupResponse,
@@ -357,6 +361,7 @@ async function accessToken(input: {
 }) {
   let response: Response
   try {
+    assertIntegrationCredentialProviderIoReady()
     response = await input.fetchImpl(WWEX_SPEEDSHIP_RUNTIME_ENDPOINTS.sandbox.token, {
       method: 'POST',
       headers: {
@@ -373,7 +378,8 @@ async function accessToken(input: {
       redirect: 'error',
       signal: input.signal,
     })
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const timedOut = input.signal.aborted && !input.externalAbort()
     throw clientError(
       timedOut
@@ -469,6 +475,7 @@ async function flowRequest<Result>(input: {
     let response: Response
     try {
       mutationStarted = input.mutation
+      assertIntegrationCredentialProviderIoReady()
       response = await fetchImpl(endpoint, {
         method: 'POST',
         headers: {
@@ -481,7 +488,8 @@ async function flowRequest<Result>(input: {
         redirect: 'error',
         signal: abort.controller.signal,
       })
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const timedOut = abort.controller.signal.aborted && !abort.externalAbort()
       throw clientError(
         timedOut

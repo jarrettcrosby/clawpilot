@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -100,6 +101,9 @@ vm.runInNewContext(output, {
     }
     if (specifier === '@/lib/persistence/commerceIntegrations') {
       return { readCommerceRuntimeCredentialFromPostgres() {} }
+    }
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+      return integrationCredentialRuntimeGate
     }
     return requireFromApp(specifier)
   },

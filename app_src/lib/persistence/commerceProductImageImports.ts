@@ -829,6 +829,7 @@ async function accountCredentialIsCurrent(
          AND account.provider = $3
          AND ${commerceReadAccountSql('account', {
            developmentRequiresActive: true,
+           capability: 'images',
          })}
          AND account.commerce_credential_generation = $4
          AND credential.credential_version = $4
@@ -3230,14 +3231,17 @@ export async function failCommerceProductImageImportJobInPostgres(input: {
   })
 }
 
-export async function parkCommerceProductImageImportForStoreSyncPauseInPostgres(
-  input: {
-    organizationId: string
-    jobId: string
-    leaseToken: string
-    workerId: string
-  },
-) {
+async function parkCommerceProductImageImportInPostgres(input: {
+  organizationId: string
+  jobId: string
+  leaseToken: string
+  workerId: string
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Commerce product image import parking reason is invalid')
+  }
   const organizationId = requiredTrimmed(
     input.organizationId,
     'Organization ID',
@@ -3254,7 +3258,7 @@ export async function parkCommerceProductImageImportForStoreSyncPauseInPostgres(
          claimed_by = NULL,
          claimed_at = NULL,
          lease_expires_at = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $6,
          available_at = statement_timestamp(),
          completed_at = NULL,
          updated_by = $5,
@@ -3265,9 +3269,42 @@ export async function parkCommerceProductImageImportForStoreSyncPauseInPostgres(
        AND lease_token = $3::uuid
        AND claimed_by = $4
      RETURNING id`,
-    [organizationId, jobId, leaseToken, workerId, workerId],
+    [
+      organizationId,
+      jobId,
+      leaseToken,
+      workerId,
+      workerId,
+      input.errorCode,
+    ],
   )
   return { parked: parked.rowCount === 1 }
+}
+
+export async function parkCommerceProductImageImportForStoreSyncPauseInPostgres(
+  input: {
+    organizationId: string
+    jobId: string
+    leaseToken: string
+    workerId: string
+  },
+) {
+  return parkCommerceProductImageImportInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkCommerceProductImageImportForRuntimeMaintenanceInPostgres(
+  input: {
+    organizationId: string
+    jobId: string
+    leaseToken: string
+    workerId: string
+    errorCode: string
+  },
+) {
+  return parkCommerceProductImageImportInPostgres(input)
 }
 
 type PersistedCommerceProductImageFanoutTarget = {

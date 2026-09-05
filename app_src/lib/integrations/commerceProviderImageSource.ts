@@ -10,6 +10,9 @@ import {
   commerceReadCredentialEligible,
 } from '@/lib/integrations/commerceReadRuntime'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   getFaireProduct,
   probeFaireBrandProfile,
 } from '@/lib/integrations/faireCommerceClient'
@@ -520,6 +523,7 @@ export async function withCurrentCommerceProviderImageSources<T>(input: {
     !runtime
     || !commerceReadCredentialEligible(runtime, {
       developmentRequiresActive: true,
+      capability: 'images',
     })
   ) {
     fail(
@@ -561,6 +565,7 @@ export async function withCurrentCommerceProviderImageSources<T>(input: {
                   input.requireExactOrderedSet === true,
               })
         } catch (error) {
+          if (isIntegrationCredentialRuntimeGateError(error)) throw error
           if (error instanceof CommerceProviderImageSourceError) throw error
           fail(
             'COMMERCE_PROVIDER_IMAGE_SOURCE_READ_FAILED',

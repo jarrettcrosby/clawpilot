@@ -56,7 +56,7 @@ const SHOPIFY_WAREHOUSE_STARTER_LOCATIONS = Object.freeze([
 ])
 const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
-  { developmentRequiresActive: true },
+  { developmentRequiresActive: true, capability: 'inventory' },
 )
 
 export class CommerceInventoryPersistenceError extends Error {

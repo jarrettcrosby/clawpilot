@@ -164,6 +164,15 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           'app_src/lib/integrations/commerceShopifyAutomaticPromotion.ts',
         )
       }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return {
+          assertIntegrationCredentialProviderIoReady: () => {},
+          isIntegrationCredentialRuntimeGateError: () => false,
+        }
+      }
       return nodeRequire(specifier)
     },
     ...globals,

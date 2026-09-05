@@ -1,11 +1,16 @@
 import { readCommerceOrderHistoryPage } from '@/lib/integrations/commerceOrderHistory'
 import { SHOPIFY_HISTORY_PAGE_MAX_PROVIDER_READS } from '@/lib/integrations/commerceOrderHistoryReadLimits'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   appendCommerceOrderBackfillPageInPostgres,
   claimCommerceOrderBackfillsInPostgres,
   ensureContinuousCommerceOrderPollsInPostgres,
   failCommerceOrderBackfillInPostgres,
   materializeDeferredCommerceOrderHistoryRefreshesInPostgres,
+  parkCommerceOrderBackfillForRuntimeMaintenanceInPostgres,
   parkCommerceOrderBackfillForStoreSyncPauseInPostgres,
   readCommerceOrderBackfillCursorFromPostgres,
   readCommerceOrderSyncCursorKeyReadinessFromPostgres,
@@ -71,6 +76,7 @@ export async function processCommerceOrderHistory(input: {
   const limit = Math.max(1, Math.min(Number(input.limit || 1), 2))
   const sensitiveEvidenceRedaction =
     await redactExpiredCommerceOrderSensitiveEvidenceInPostgres({ limit: 250 })
+  assertIntegrationCredentialProviderIoReady()
   // Full-history intent has priority over opening a new continuous-poll slot.
   // The second pass below consumes an intent released by a poll that reaches a
   // terminal state during this same drain.
@@ -100,18 +106,23 @@ export async function processCommerceOrderHistory(input: {
     | 'provider_read_limit'
     | 'queue_empty'
     | 'terminal' = initialClaimWithinDeadline ? 'queue_empty' : 'deadline'
-  let jobs = initialClaimWithinDeadline
-    ? await claimCommerceOrderBackfillsInPostgres({
-        workerId: input.workerId,
-        limit,
-      })
-    : []
+  let jobs = [] as Awaited<ReturnType<
+    typeof claimCommerceOrderBackfillsInPostgres
+  >>
+  if (initialClaimWithinDeadline) {
+    assertIntegrationCredentialProviderIoReady()
+    jobs = await claimCommerceOrderBackfillsInPostgres({
+      workerId: input.workerId,
+      limit,
+    })
+  }
 
   while (jobs.length) {
     claimWaves += 1
     claimed += jobs.length
     let waveHasContinuation = false
-    for (const job of jobs) {
+    for (let jobIndex = 0; jobIndex < jobs.length; jobIndex += 1) {
+      const job = jobs[jobIndex]
       // A wave is only claimed when enough page and worst-case provider-read
       // budget remains for every lease. Never abandon a claimed lease merely
       // because the deadline passes while its provider read is in flight.
@@ -169,6 +180,15 @@ export async function processCommerceOrderHistory(input: {
           waveHasContinuation = true
         }
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) {
+          await Promise.allSettled(jobs.slice(jobIndex).map(async (claimedJob) => (
+            await parkCommerceOrderBackfillForRuntimeMaintenanceInPostgres({
+              job: claimedJob,
+              errorCode: String((error as { code?: unknown }).code || ''),
+            })
+          )))
+          throw error
+        }
         if (isStoreSyncReadPause(error)) {
           const disposition =
             await parkCommerceOrderBackfillForStoreSyncPauseInPostgres({ job })
@@ -214,12 +234,14 @@ export async function processCommerceOrderHistory(input: {
       remainingPages,
       Math.floor(remainingReadReservations / MAX_PROVIDER_READS_PER_PAGE),
     )
+    assertIntegrationCredentialProviderIoReady()
     jobs = await claimCommerceOrderBackfillsInPostgres({
       workerId: input.workerId,
       limit: nextLimit,
     })
     if (!jobs.length) drainStopReason = 'queue_empty'
   }
+  assertIntegrationCredentialProviderIoReady()
   const deferredAfterDrain =
     await materializeDeferredCommerceOrderHistoryRefreshesInPostgres({ limit })
   const [health, cursorKeyReadiness] = await Promise.all([

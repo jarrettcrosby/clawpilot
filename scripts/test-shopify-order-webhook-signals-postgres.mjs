@@ -171,6 +171,9 @@ async function verify(databaseUrl, ids) {
         },
       },
       '@/lib/integrations/shopifyOrderWebhook': shopifyOrderWebhook,
+      '@/lib/integrations/commerceReadRuntime': {
+        commerceReadAccountSql: () => "account.status = 'active'",
+      },
       '@/lib/persistence/postgres': acknowledgmentTestAdapter,
       '@/lib/persistence/commerceOrderSync': commerceOrderSync,
     },

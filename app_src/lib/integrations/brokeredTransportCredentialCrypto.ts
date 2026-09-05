@@ -1,4 +1,8 @@
 import crypto from 'node:crypto'
+import {
+  integrationCredentialRuntimeEncryptionKey,
+  isIntegrationCredentialRuntimeGateError,
+} from './integrationCredentialRuntimeGate.mjs'
 
 export type BrokeredTransportProvider = 'wwex_speedship' | 'rl_carriers'
 export type BrokeredTransportEnvironment = 'sandbox' | 'production'
@@ -116,27 +120,13 @@ export function normalizeBrokeredTransportCredential(
   }
 }
 
-function encryptionKey() {
-  const dedicated = String(
-    process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY
-    || process.env.AGENT_CREDENTIAL_ENCRYPTION_KEY
-    || '',
-  )
-  const hosted = Boolean(
-    process.env.RAILWAY_ENVIRONMENT_NAME
-    || process.env.RAILWAY_ENVIRONMENT_ID
-    || process.env.RAILWAY_PROJECT_ID
-    || process.env.RAILWAY_ENVIRONMENT
-    || process.env.VERCEL,
-  )
-  if (hosted && dedicated.length < 32) {
-    throw new Error('Transport credential encryption is not configured')
+function withEncryptionKey<T>(operation: (key: Buffer) => T): T {
+  const key = integrationCredentialRuntimeEncryptionKey()
+  try {
+    return operation(key)
+  } finally {
+    key.fill(0)
   }
-  const secret = dedicated || String(process.env.APP_SESSION_SECRET || '')
-  if (secret.length < 32) {
-    throw new Error('Transport credential encryption is not configured')
-  }
-  return crypto.createHash('sha256').update(secret).digest()
 }
 
 function authenticatedData(
@@ -201,25 +191,31 @@ export function brokeredTransportCredentialCommandRequestHash(
   ) {
     throw new Error('Transport connection name is invalid')
   }
-  const requestKey = crypto
-    .createHmac('sha256', encryptionKey())
-    .update('clawpilot:brokered-transport:credential-command-request:v1', 'utf8')
-    .digest()
-  return crypto
-    .createHmac('sha256', requestKey)
-    .update(authenticatedData(
-      organizationValue,
-      provider,
-      environment,
-    ))
-    .update('\0', 'utf8')
-    .update(JSON.stringify({
-      provider,
-      environment,
-      displayName,
-      credential,
-    }), 'utf8')
-    .digest('hex')
+  return withEncryptionKey((key) => {
+    const requestKey = crypto
+      .createHmac('sha256', key)
+      .update('clawpilot:brokered-transport:credential-command-request:v1', 'utf8')
+      .digest()
+    try {
+      return crypto
+        .createHmac('sha256', requestKey)
+        .update(authenticatedData(
+          organizationValue,
+          provider,
+          environment,
+        ))
+        .update('\0', 'utf8')
+        .update(JSON.stringify({
+          provider,
+          environment,
+          displayName,
+          credential,
+        }), 'utf8')
+        .digest('hex')
+    } finally {
+      requestKey.fill(0)
+    }
+  })
 }
 
 /**
@@ -238,19 +234,25 @@ export function wwexSpeedshipBillingAccountFingerprint(
     3,
     64,
   )
-  const key = crypto
-    .createHmac('sha256', encryptionKey())
-    .update('clawpilot:wwex-speedship:billing-account-fingerprint:v1', 'utf8')
-    .digest()
-  return crypto
-    .createHmac('sha256', key)
-    .update(authenticatedData(
-      organizationValue,
-      'wwex_speedship',
-      environmentValue,
-    ))
-    .update(accountNumber, 'utf8')
-    .digest('hex')
+  return withEncryptionKey((encryptionKey) => {
+    const key = crypto
+      .createHmac('sha256', encryptionKey)
+      .update('clawpilot:wwex-speedship:billing-account-fingerprint:v1', 'utf8')
+      .digest()
+    try {
+      return crypto
+        .createHmac('sha256', key)
+        .update(authenticatedData(
+          organizationValue,
+          'wwex_speedship',
+          environmentValue,
+        ))
+        .update(accountNumber, 'utf8')
+        .digest('hex')
+    } finally {
+      key.fill(0)
+    }
+  })
 }
 
 export function encryptBrokeredTransportCredential(
@@ -262,17 +264,19 @@ export function encryptBrokeredTransportCredential(
   const provider = normalizeBrokeredTransportProvider(providerValue)
   const credential = normalizeBrokeredTransportCredential(provider, credentialValue)
   const iv = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
-  cipher.setAAD(authenticatedData(
-    organizationValue,
-    provider,
-    environmentValue,
-  ))
-  const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(credential), 'utf8'),
-    cipher.final(),
-  ])
-  return { ciphertext, iv, tag: cipher.getAuthTag() }
+  return withEncryptionKey((key) => {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(authenticatedData(
+      organizationValue,
+      provider,
+      environmentValue,
+    ))
+    const ciphertext = Buffer.concat([
+      cipher.update(JSON.stringify(credential), 'utf8'),
+      cipher.final(),
+    ])
+    return { ciphertext, iv, tag: cipher.getAuthTag() }
+  })
 }
 
 export function decryptBrokeredTransportCredential(
@@ -283,19 +287,22 @@ export function decryptBrokeredTransportCredential(
 ) {
   try {
     const provider = normalizeBrokeredTransportProvider(providerValue)
-    const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), encrypted.iv)
-    decipher.setAAD(authenticatedData(
-      organizationValue,
-      provider,
-      environmentValue,
-    ))
-    decipher.setAuthTag(encrypted.tag)
-    const value = JSON.parse(Buffer.concat([
-      decipher.update(encrypted.ciphertext),
-      decipher.final(),
-    ]).toString('utf8'))
-    return normalizeBrokeredTransportCredential(provider, value)
-  } catch {
+    return withEncryptionKey((key) => {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, encrypted.iv)
+      decipher.setAAD(authenticatedData(
+        organizationValue,
+        provider,
+        environmentValue,
+      ))
+      decipher.setAuthTag(encrypted.tag)
+      const value = JSON.parse(Buffer.concat([
+        decipher.update(encrypted.ciphertext),
+        decipher.final(),
+      ]).toString('utf8'))
+      return normalizeBrokeredTransportCredential(provider, value)
+    })
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new Error('Stored transport credential could not be decrypted')
   }
 }

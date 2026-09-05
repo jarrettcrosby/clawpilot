@@ -23,6 +23,9 @@ import {
   encryptCommerceOrderSyncCursor,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   resolveCommerceOrderRevisionEvidenceKeyConfig,
   summarizeCommerceOrderRevisionEvidenceKeyReadiness,
 } from '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
@@ -60,6 +63,7 @@ const BACKFILL_GLOBAL_ID_PATTERN = /^gcob(?:[0-9]{7}|[0-9a-v]{12})$/u
 const HASH_PATTERN = /^[a-f0-9]{64}$/u
 const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
   developmentRequiresActive: true,
+  capability: 'orders_history',
 })
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
@@ -3405,7 +3409,8 @@ export async function readCommerceOrderBackfillCursorFromPostgres(
       aadVersion: row.cursor_aad_version,
     }, job.organizationId, job.accountGlobalId, job.provider, job.id,
     job.pageCount, job.queryHash).orderCursor
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new CommerceOrderSyncError(
       'COMMERCE_ORDER_SYNC_CURSOR_INVALID',
       'Historical order continuation evidence is invalid',
@@ -3980,9 +3985,14 @@ export async function failCommerceOrderBackfillInPostgres(input: {
   }
 }
 
-export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
-  input: { job: CommerceOrderBackfillJob },
-) {
+async function parkCommerceOrderBackfillInPostgres(input: {
+  job: CommerceOrderBackfillJob
+  errorCode: string
+}) {
+  if (!/^INTEGRATION_CREDENTIAL_RUNTIME_[A-Z0-9_]{1,96}$/u.test(input.errorCode)
+      && input.errorCode !== 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED') {
+    throw new Error('Commerce order backfill parking reason is invalid')
+  }
   const result = await query(
     `UPDATE operations_commerce_order_backfill_sessions
      SET status = 'pending',
@@ -3992,7 +4002,7 @@ export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
          locked_by = NULL,
          lock_token = NULL,
          lease_expires_at = NULL,
-         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         last_error_code = $5,
          completed_at = NULL,
          updated_at = now()
      WHERE organization_id = $1::uuid
@@ -4006,12 +4016,28 @@ export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
       input.job.id,
       input.job.globalId,
       input.job.lockToken,
+      input.errorCode,
     ],
   )
   return {
     parked: result.rowCount === 1,
     providerWrites: 0 as const,
   }
+}
+
+export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
+  input: { job: CommerceOrderBackfillJob },
+) {
+  return parkCommerceOrderBackfillInPostgres({
+    ...input,
+    errorCode: 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  })
+}
+
+export async function parkCommerceOrderBackfillForRuntimeMaintenanceInPostgres(
+  input: { job: CommerceOrderBackfillJob; errorCode: string },
+) {
+  return parkCommerceOrderBackfillInPostgres(input)
 }
 
 export async function readCommerceOrderSyncStateFromPostgres(input: {

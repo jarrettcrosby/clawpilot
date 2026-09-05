@@ -6,6 +6,9 @@ import {
 import {
   FaireProductImageRefreshError,
 } from '@/lib/integrations/faireProductImageRefreshTypes'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { commerceReadRuntimeAvailable } from '@/lib/integrations/commerceIntake'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -35,6 +38,8 @@ function fail(code: string, message: string, status = 400): never {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof FaireProductImageRefreshError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }

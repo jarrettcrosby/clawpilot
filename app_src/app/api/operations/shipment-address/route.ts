@@ -8,6 +8,9 @@ import {
   type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   OperationsOrderShipmentAddressError,
@@ -182,6 +185,8 @@ async function requestBody(req: NextRequest) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return response({ ok: false, code: 'UNAUTHORIZED', error: 'Unauthorized' }, 401)
   }

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
 import { emailBodyPreview } from '../app_src/lib/crm/emailBodyPreview.mjs'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (relative) => readFile(path.join(root, relative), 'utf8')
@@ -349,6 +350,8 @@ const persistenceRuntime = loadTypeScript(
       COMMERCE_ORDER_SYNC_CURSOR_AAD_VERSION:
         'commerce-order-sync-cursor-aad-v1',
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/commerceStoreSync': {
       commerceStoreSyncRunningSql: () => 'TRUE',
     },
@@ -371,6 +374,8 @@ const cryptoRuntime = loadTypeScript(
     '@/lib/persistence/config': { isHostedRuntime: () => hosted },
     '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs':
       keyConfiguration,
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
   },
 )
 const historyRuntime = loadTypeScript(
@@ -1473,6 +1478,9 @@ const adapterHistoryRuntime = loadTypeScript(
   'app_src/lib/integrations/commerceOrderHistory.ts',
   history,
   {
+    '@/lib/integrations/commerceReadRuntime': {
+      commerceReadCredentialEligible: () => true,
+    },
     '@/lib/integrations/commerceCapabilities': {
       hasEffectiveShopifyScope: (scopes, expected) => scopes.includes(expected),
     },
@@ -2378,6 +2386,8 @@ const workerRuntime = loadTypeScript(
   'app_src/lib/commerceOrderHistoryWorker.ts',
   worker,
   {
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/commerceOrderHistory': {
       async readCommerceOrderHistoryPage(input) {
         workerCalls.push(['read', input.providerCursor])

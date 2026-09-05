@@ -6,6 +6,12 @@ import {
 import {
   refreshCommerceOrderRevisionFromProvider,
 } from '@/lib/operations/commerceOrderRevisionCommands'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
+  integrationCredentialRuntimeMaintenanceResponse,
+} from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   CommerceOrderRevisionDispositionError,
@@ -220,6 +226,7 @@ export async function POST(req: NextRequest) {
           code: null,
         })
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         const code = safeFailureCode(error)
         counts.failed += 1
         failedByCode[code] = (failedByCode[code] || 0) + 1
@@ -256,6 +263,8 @@ export async function POST(req: NextRequest) {
     })
     return response({ ok: true, result })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) return maintenance
     if (error instanceof Error && error.message === 'Unauthorized') {
       return response({ ok: false, error: 'Unauthorized' }, 401)
     }

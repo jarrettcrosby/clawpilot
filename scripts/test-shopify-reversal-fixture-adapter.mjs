@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -59,6 +60,9 @@ vm.runInNewContext(output, {
         SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID:
           'gid://shopify/ProductVariant/51028106608887',
       }
+    }
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeGate.mjs') {
+      return integrationCredentialRuntimeGate
     }
     if (specifier === '@/lib/persistence/shopifyReversalFixture') {
       return {

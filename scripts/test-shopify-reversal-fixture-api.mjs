@@ -57,6 +57,9 @@ vm.runInNewContext(output, {
   exports: module.exports,
   module,
   require(specifier) {
+    if (specifier === '@/lib/integrations/integrationCredentialRuntimeHttp') {
+      return { integrationCredentialRuntimeMaintenanceResponse: () => null }
+    }
     if (specifier === 'node:crypto') return crypto
     if (specifier === 'next/server') {
       return {

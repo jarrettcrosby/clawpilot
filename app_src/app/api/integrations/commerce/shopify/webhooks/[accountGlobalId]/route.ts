@@ -4,6 +4,7 @@ import {
   receiveShopifyWebhook,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import {
   normalizeCommerceAccountGlobalId,
 } from '@/lib/integrations/commerceCredentialCrypto'
@@ -32,6 +33,8 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   const sanitized = sanitizedCommerceIntegrationError(error)
   return json(
     { ok: false, error: sanitized.message, code: sanitized.code },
@@ -119,6 +122,17 @@ export async function POST(
     }))
     return json({ ok: true, duplicate: result.duplicate })
   } catch (error) {
+    const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+    if (maintenance) {
+      console.warn('[shopify-webhook-ingress]', JSON.stringify({
+        ok: false,
+        accountGlobalId,
+        topic,
+        code: 'INTEGRATION_CREDENTIAL_RUNTIME_MAINTENANCE',
+        status: 503,
+      }))
+      return maintenance
+    }
     const sanitized = sanitizedCommerceIntegrationError(error)
     console.warn('[shopify-webhook-ingress]', JSON.stringify({
       ok: false,

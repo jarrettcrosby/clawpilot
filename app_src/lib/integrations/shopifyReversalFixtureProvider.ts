@@ -11,6 +11,9 @@ import {
 import {
   assertShopifyReversalFixtureOrderClaimCurrentInPostgres,
 } from '@/lib/persistence/shopifyReversalFixture'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_LINE_ITEM_GID =
@@ -751,7 +754,8 @@ export async function createShopifyReversalFixtureOrder(
       operationName: 'ClawPilotReversalFixtureOrderCreate',
       variables,
     }, options)
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new ShopifyReversalFixtureProviderError(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN',
       'Shopify order creation did not return a verifiable outcome; reconcile this exact attempt before any other fixture write',

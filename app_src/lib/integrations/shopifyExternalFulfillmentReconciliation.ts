@@ -18,6 +18,10 @@ import {
   type ShopifyExternalFulfillmentTarget,
 } from '@/lib/integrations/shopifyExternalFulfillmentEvidence'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 
@@ -136,6 +140,7 @@ export async function inspectShopifyExternalFulfillment(input: {
     providerWrites: 0
   }
 > {
+  assertIntegrationCredentialProviderIoReady()
   const runtime = await dependencies.readRuntimeCredential({
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
@@ -160,7 +165,8 @@ export async function inspectShopifyExternalFulfillment(input: {
       runtime.environment,
       runtime.externalAccountId,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     throw new ShopifyExternalFulfillmentReconciliationError(
       'SHOPIFY_EXTERNAL_FULFILLMENT_CREDENTIAL_INVALID',
       'Stored Shopify credentials could not be decrypted',
@@ -178,11 +184,13 @@ export async function inspectShopifyExternalFulfillment(input: {
     runtime.configuration.shopDomain,
   )
   try {
+    assertIntegrationCredentialProviderIoReady()
     const grant = await dependencies.requestAccessToken({
       shopDomain,
       clientId: credential.clientId,
       clientSecret: credential.clientSecret,
     })
+    assertIntegrationCredentialProviderIoReady()
     const probe = await dependencies.probeConnection({
       shopDomain,
       accessToken: grant.accessToken,
@@ -203,6 +211,7 @@ export async function inspectShopifyExternalFulfillment(input: {
         `Shopify must grant ${missingScopes.join(' and ')} for fulfillment reconciliation`,
       )
     }
+    assertIntegrationCredentialProviderIoReady()
     const data = await dependencies.readOrder<{ order?: unknown }>(
       { shopDomain, accessToken: grant.accessToken },
       {
@@ -228,6 +237,7 @@ export async function inspectShopifyExternalFulfillment(input: {
       providerWrites: 0,
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     if (error instanceof ShopifyExternalFulfillmentReconciliationError) {
       throw error
     }

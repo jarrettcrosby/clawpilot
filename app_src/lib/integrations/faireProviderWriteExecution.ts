@@ -14,6 +14,9 @@ import type {
 import type {
   CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -1257,6 +1260,7 @@ export async function executeFaireProviderWrite(
       )
     }
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return finalize({
       claim,
       dependencies,
@@ -1280,6 +1284,7 @@ export async function executeFaireProviderWrite(
     )
     providerReference = providerProductReference(result, claim)
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const knownZeroWrite = explicitlyRejectedWithoutWrite(error)
     const outcome = knownZeroWrite ? 'failed' : 'unknown'
     return finalize({

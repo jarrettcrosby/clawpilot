@@ -561,6 +561,12 @@ function loadOperationalFaireRoute(
       CommerceIntegrationRequestError: IntegrationError,
       sanitizedCommerceIntegrationError: (error) => error,
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
+      isIntegrationCredentialRuntimeGateError: () => false,
+    },
+    '@/lib/integrations/integrationCredentialRuntimeHttp': {
+      integrationCredentialRuntimeMaintenanceResponse: () => null,
+    },
     '@/lib/integrations/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityError: IntegrationError,
       inspectShopifyOrderPlanningAuthority: async () => {

@@ -83,8 +83,8 @@ assert.match(
 )
 assert.match(
   healthSource,
-  /\{ status: errors\.length > 0 \? 503 : 200 \}/u,
-  'Any global health error, including 0289 drift, must return HTTP 503',
+  /status:\s*errors\.length > 0\s*\?\s*503\s*:\s*200/u,
+  'Any global health error, including 0289 drift during key adoption, must return HTTP 503',
 )
 
 function command(file, args, options = {}) {

@@ -14,6 +14,13 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  commerceReadAccountSql,
+  type CommerceReadCapability,
+} from '@/lib/integrations/commerceReadRuntime'
+import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
 
 const ORGANIZATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -47,6 +54,34 @@ export type CommerceStoreSyncProviderReadLease = {
   controlRevision: number
   activationRevision: number
   expiresAt: string
+}
+
+function providerReadCapability(
+  readKind: CommerceStoreSyncProviderReadKind,
+): CommerceReadCapability {
+  switch (readKind) {
+    case 'catalog_intake':
+      return 'catalog'
+    case 'product_image_import':
+      return 'images'
+    case 'shopify_inventory':
+    case 'faire_inventory_poll':
+      return 'inventory'
+    case 'shopify_webhook_hydration':
+      return 'webhook_hydration'
+    case 'order_history':
+    case 'order_revision':
+      return 'orders_history'
+  }
+}
+
+function providerReadAccountSql(
+  alias: string,
+  readKind: CommerceStoreSyncProviderReadKind,
+) {
+  return commerceReadAccountSql(alias, {
+    capability: providerReadCapability(readKind),
+  })
 }
 
 type StoreSyncRow = {
@@ -168,7 +203,7 @@ async function acquireProviderReadLease(input: {
          AND account.id = $2::uuid
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
-         AND account.status = 'active'
+         AND ${providerReadAccountSql('account', input.readKind)}
          AND operations_commerce_provider_read_authority_is_current(
            account.organization_id,
            account.id,
@@ -250,6 +285,7 @@ async function renewProviderReadLease(input: {
   organizationId: string
   integrationAccountId: string
   leaseId: string
+  readKind: CommerceStoreSyncProviderReadKind
 }) {
   const result = await query(
     `UPDATE operations_commerce_store_sync_read_leases
@@ -259,17 +295,22 @@ async function renewProviderReadLease(input: {
      WHERE id = $3::uuid
        AND organization_id = $1::uuid
        AND integration_account_id = $2::uuid
+       AND read_kind = $5
        AND released_at IS NULL
        AND expires_at > clock_timestamp()
        AND EXISTS (
          SELECT 1
          FROM operations_commerce_store_sync_controls control
+         JOIN operations_integration_accounts account
+           ON account.organization_id = control.organization_id
+          AND account.id = control.integration_account_id
          WHERE control.organization_id =
                  operations_commerce_store_sync_read_leases.organization_id
            AND control.integration_account_id =
                  operations_commerce_store_sync_read_leases.integration_account_id
            AND control.revision =
                  operations_commerce_store_sync_read_leases.control_revision
+           AND ${providerReadAccountSql('account', input.readKind)}
            AND operations_commerce_provider_read_authority_is_current(
              control.organization_id,
              control.integration_account_id,
@@ -282,6 +323,7 @@ async function renewProviderReadLease(input: {
       input.integrationAccountId,
       input.leaseId,
       PROVIDER_READ_LEASE_SECONDS,
+      input.readKind,
     ],
   )
   if (!result.rows[0]) throw new CommerceStoreSyncProviderReadLeaseError()
@@ -291,6 +333,7 @@ async function releaseProviderReadLease(input: {
   organizationId: string
   integrationAccountId: string
   leaseId: string
+  readKind: CommerceStoreSyncProviderReadKind
   releaseReason: 'completed' | 'failed'
 }) {
   const result = await query<{ release_reason: string | null }>(
@@ -300,6 +343,7 @@ async function releaseProviderReadLease(input: {
      WHERE id = $3::uuid
        AND organization_id = $1::uuid
        AND integration_account_id = $2::uuid
+       AND read_kind = $5
        AND released_at IS NULL
        AND (
          $4 <> 'completed'
@@ -310,12 +354,16 @@ async function releaseProviderReadLease(input: {
              AND EXISTS (
              SELECT 1
              FROM operations_commerce_store_sync_controls control
+             JOIN operations_integration_accounts account
+               ON account.organization_id = control.organization_id
+              AND account.id = control.integration_account_id
              WHERE control.organization_id =
                      operations_commerce_store_sync_read_leases.organization_id
                AND control.integration_account_id =
                      operations_commerce_store_sync_read_leases.integration_account_id
                AND control.revision =
                      operations_commerce_store_sync_read_leases.control_revision
+               AND ${providerReadAccountSql('account', input.readKind)}
                AND operations_commerce_provider_read_authority_is_current(
                  control.organization_id,
                  control.integration_account_id,
@@ -331,6 +379,7 @@ async function releaseProviderReadLease(input: {
       input.integrationAccountId,
       input.leaseId,
       input.releaseReason,
+      input.readKind,
     ],
   )
   if (result.rows[0]) return
@@ -380,6 +429,9 @@ export async function assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
      JOIN operations_commerce_store_sync_controls control
        ON control.organization_id = lease.organization_id
       AND control.integration_account_id = lease.integration_account_id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = lease.organization_id
+      AND account.id = lease.integration_account_id
      WHERE lease.id = $3::uuid
        AND lease.organization_id = $1::uuid
        AND lease.integration_account_id = $2::uuid
@@ -391,13 +443,14 @@ export async function assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
        AND lease.released_at IS NULL
        AND lease.expires_at > clock_timestamp()
        AND control.revision = lease.control_revision
+       AND ${providerReadAccountSql('account', input.readKind)}
        AND operations_commerce_provider_read_authority_is_current(
          lease.organization_id,
          lease.integration_account_id,
          lease.authority_kind
        )
      LIMIT 1
-     FOR SHARE OF lease, control`,
+     FOR SHARE OF lease, control, account`,
     [
       input.organizationId,
       input.integrationAccountId,
@@ -505,6 +558,7 @@ export async function withCommerceStoreSyncProviderReadFenceInPostgres<T>(
           organizationId: input.organizationId,
           integrationAccountId: input.integrationAccountId,
           leaseId: lease.id,
+          readKind: input.readKind,
         })
       } catch (error) {
         renewalError = error
@@ -513,22 +567,37 @@ export async function withCommerceStoreSyncProviderReadFenceInPostgres<T>(
   }, PROVIDER_READ_HEARTBEAT_INTERVAL_MS)
   timer.unref?.()
   let succeeded = false
+  let runtimeMaintenance = false
   try {
     const result = await input.read(lease)
     await renewal
     if (renewalError) throw renewalError
     succeeded = true
     return result
+  } catch (error) {
+    runtimeMaintenance = isIntegrationCredentialRuntimeGateError(error)
+    throw error
   } finally {
     finished = true
     clearInterval(timer)
-    await renewal
-    await releaseProviderReadLease({
-      organizationId: input.organizationId,
-      integrationAccountId: input.integrationAccountId,
-      leaseId: lease.id,
-      releaseReason: succeeded ? 'completed' : 'failed',
-    })
+    const release = async () => {
+      await renewal
+      await releaseProviderReadLease({
+        organizationId: input.organizationId,
+        integrationAccountId: input.integrationAccountId,
+        leaseId: lease.id,
+        readKind: input.readKind,
+        releaseReason: succeeded ? 'completed' : 'failed',
+      })
+    }
+    if (runtimeMaintenance) {
+      // Releasing the lease is best-effort during credential maintenance. A
+      // database/lease cleanup failure must not replace the typed outage that
+      // lets routes and workers return 503 or park claimed work for retry.
+      await Promise.allSettled([release()])
+    } else {
+      await release()
+    }
   }
 }
 

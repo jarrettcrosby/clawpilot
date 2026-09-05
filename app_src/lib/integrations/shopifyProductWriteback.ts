@@ -15,6 +15,10 @@ import {
   type ShopifyConnectionProbe,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  assertIntegrationCredentialProviderIoReady,
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   assertRedactedCommerceExternalEffectEvidence,
   claimCommerceExternalEffectsInPostgres,
   commerceExternalEffectHash,
@@ -1060,6 +1064,7 @@ export async function executeShopifyProductMediaAbsenceRead(
     ...DEFAULT_MEDIA_ABSENCE_DEPENDENCIES,
     ...overrides,
   }
+  assertIntegrationCredentialProviderIoReady()
   const runtime = await dependencies.readRuntimeCredential({
     organizationId,
     accountGlobalId,
@@ -1085,6 +1090,7 @@ export async function executeShopifyProductMediaAbsenceRead(
   const shopDomain = normalizeShopifyShopDomain(
     runtime.configuration.shopDomain,
   )
+  assertIntegrationCredentialProviderIoReady()
   const grant = await dependencies.requestAccessToken(
     {
       shopDomain,
@@ -1097,6 +1103,7 @@ export async function executeShopifyProductMediaAbsenceRead(
     shopDomain,
     accessToken: grant.accessToken,
   }
+  assertIntegrationCredentialProviderIoReady()
   const probe = await dependencies.probeConnection(
     providerCredential,
     { timeoutMs: 10_000 },
@@ -1112,6 +1119,7 @@ export async function executeShopifyProductMediaAbsenceRead(
     )
   }
   assertScopeInBoth(grant.grantedScopes, probe)
+  assertIntegrationCredentialProviderIoReady()
   const provider = await dependencies.readProductMedia(
     providerCredential,
     productGid,
@@ -1165,6 +1173,7 @@ export async function executeShopifyProductMediaStatusRead(
     ...DEFAULT_MEDIA_STATUS_DEPENDENCIES,
     ...overrides,
   }
+  assertIntegrationCredentialProviderIoReady()
   const runtime = await dependencies.readRuntimeCredential({
     organizationId,
     accountGlobalId,
@@ -1190,6 +1199,7 @@ export async function executeShopifyProductMediaStatusRead(
   const shopDomain = normalizeShopifyShopDomain(
     runtime.configuration.shopDomain,
   )
+  assertIntegrationCredentialProviderIoReady()
   const grant = await dependencies.requestAccessToken(
     {
       shopDomain,
@@ -1202,6 +1212,7 @@ export async function executeShopifyProductMediaStatusRead(
     shopDomain,
     accessToken: grant.accessToken,
   }
+  assertIntegrationCredentialProviderIoReady()
   const probe = await dependencies.probeConnection(
     providerCredential,
     { timeoutMs: 10_000 },
@@ -1217,6 +1228,7 @@ export async function executeShopifyProductMediaStatusRead(
     )
   }
   assertScopeInBoth(grant.grantedScopes, probe)
+  assertIntegrationCredentialProviderIoReady()
   return dependencies.readMediaStatus(
     providerCredential,
     mediaImageGid,
@@ -1326,7 +1338,8 @@ function decryptShopifyCredential(
       runtime.environment,
       runtime.externalAccountId,
     )
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     writebackError(
       'SHOPIFY_PRODUCT_WRITEBACK_CREDENTIAL_INVALID',
       'The verified Shopify credential could not be used',
@@ -1419,6 +1432,9 @@ async function finalizeFailure(input: {
   stage: string
   providerMutationAttempted: boolean
 }): Promise<never> {
+  // Runtime-attestation loss is neither a provider rejection nor an unknown
+  // provider outcome. Keep the no-replay claim unresolved for reconciliation.
+  if (isIntegrationCredentialRuntimeGateError(input.error)) throw input.error
   const outcome = input.providerMutationAttempted
     && !providerExplicitlyRejected(input.error)
     ? 'unknown'
@@ -1636,6 +1652,7 @@ export async function executeShopifyProductWriteback(
       prepared.globalId,
     )
   }
+  assertIntegrationCredentialProviderIoReady()
 
   let claims: ClaimedCommerceExternalEffect[]
   try {
@@ -1648,6 +1665,7 @@ export async function executeShopifyProductWriteback(
       leaseSeconds: 60,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     writebackError(
       safeErrorCode(
         error,
@@ -1670,6 +1688,10 @@ export async function executeShopifyProductWriteback(
   }
   const claim = claims[0]
   assertClaimMatches(claim, prepared, normalized)
+  // The proof can be revoked while the durable claim is acquired. Recheck
+  // before any credential or provider work and leave the exact claim for the
+  // existing reconciliation path if maintenance begins.
+  assertIntegrationCredentialProviderIoReady()
 
   let runtime: CommerceRuntimeCredentialRecord | null
   try {
@@ -1695,6 +1717,7 @@ export async function executeShopifyProductWriteback(
     const shopDomain = normalizeShopifyShopDomain(
       runtime.configuration.shopDomain,
     )
+    assertIntegrationCredentialProviderIoReady()
     const grant = await dependencies.requestAccessToken(
       {
         shopDomain,
@@ -1707,6 +1730,7 @@ export async function executeShopifyProductWriteback(
       shopDomain,
       accessToken: grant.accessToken,
     }
+    assertIntegrationCredentialProviderIoReady()
     const probe = await dependencies.probeConnection(
       providerCredential,
       { timeoutMs: 10_000 },
@@ -1735,6 +1759,7 @@ export async function executeShopifyProductWriteback(
 
   let providerResult: ShopifyProductWritebackProviderResult
   try {
+    assertIntegrationCredentialProviderIoReady()
     providerResult = await dependencies.mutateProduct(
       providerCredential,
       {

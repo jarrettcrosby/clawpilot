@@ -268,6 +268,8 @@ export const DATASET_ORDER = Object.freeze([
   'operations_product_channel_states',
   'operations_warehouses',
   'operations_locations',
+  'operations_inventory_pools',
+  'operations_commerce_inventory_location_mappings',
   'operations_packaging_materials',
   'operations_packaging_material_stock',
   'operations_product_pack_profiles',
@@ -291,6 +293,8 @@ export const GENERATED_REFERENCE_PREFIX = Object.freeze({
   operations_product_channel_states: ['global_id', 'gpcs'],
   operations_warehouses: ['global_id', 'gwh'],
   operations_locations: ['global_id', 'gwl'],
+  operations_inventory_pools: ['global_id', 'gip'],
+  operations_commerce_inventory_location_mappings: ['global_id', 'gilm'],
   operations_packaging_materials: ['global_id', 'gmat'],
   operations_packaging_material_stock: ['global_id', 'gmas'],
   operations_product_pack_profiles: ['global_id', 'gpph'],
@@ -312,6 +316,8 @@ const TABLE_ID_COLUMN = Object.freeze({
   operations_product_channel_states: 'id',
   operations_warehouses: 'id',
   operations_locations: 'id',
+  operations_inventory_pools: 'id',
+  operations_commerce_inventory_location_mappings: 'id',
   operations_packaging_materials: 'id',
   operations_packaging_material_stock: 'id',
   operations_product_pack_profiles: 'id',
@@ -346,6 +352,8 @@ export const TARGET_SCOPE_COLUMN = Object.freeze({
   operations_product_channel_states: 'pipeline_id',
   operations_warehouses: 'organization_id',
   operations_locations: 'organization_id',
+  operations_inventory_pools: 'organization_id',
+  operations_commerce_inventory_location_mappings: 'organization_id',
   operations_packaging_materials: 'organization_id',
   operations_packaging_material_stock: 'organization_id',
   operations_product_pack_profiles: 'pipeline_id',
@@ -1144,6 +1152,11 @@ async function loadWorkspaceData(client, workspace, options = {}) {
   const pipeline = workspace.source.pipelineId
   const accounts = selectedAccountIds(workspace)
   const commerceAccounts = selectedCommerceAccountIds(workspace)
+  const shopifyAccounts = workspace.source.accounts
+    .filter((account) => (
+      account.integrationType === 'commerce' && account.provider === 'shopify'
+    ))
+    .map((account) => account.id)
   const carrierAccounts = selectedCarrierAccountIds(workspace)
   const excludedOrganizations = workspace.source.excludedOrganizationReferences
   const excludedContacts = workspace.source.excludedContactReferences
@@ -1244,6 +1257,32 @@ async function loadWorkspaceData(client, workspace, options = {}) {
     `SELECT * FROM operations_locations
      WHERE organization_id = $1::uuid AND warehouse_id = $2::uuid ORDER BY id`,
     [org, warehouseId])
+  const selectedLocationIds = data.operations_locations.map((row) => row.id)
+  data.operations_commerce_inventory_location_mappings = shopifyAccounts.length
+    ? await rows(client,
+      `SELECT *
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = ANY($2::uuid[])
+         AND warehouse_id = $3::uuid
+         AND location_id = ANY($4::uuid[])
+       ORDER BY integration_account_id, external_location_id, id`,
+      [org, shopifyAccounts, warehouseId, selectedLocationIds])
+    : []
+  const selectedInventoryPoolIds = [
+    ...new Set(data.operations_commerce_inventory_location_mappings
+      .map((row) => row.inventory_pool_id)),
+  ]
+  data.operations_inventory_pools = selectedInventoryPoolIds.length
+    ? await rows(client,
+      `SELECT *
+       FROM operations_inventory_pools
+       WHERE organization_id = $1::uuid
+         AND pipeline_id = $2::uuid
+         AND id = ANY($3::uuid[])
+       ORDER BY id`,
+      [org, pipeline, selectedInventoryPoolIds])
+    : []
   data.operations_packaging_materials = await rows(client,
     `SELECT * FROM operations_packaging_materials
      WHERE organization_id = $1::uuid ORDER BY id`, [org])
@@ -2360,6 +2399,15 @@ const FK_REMAP = Object.freeze({
     warehouse_id: ['operations_warehouses', false],
     parent_location_id: ['operations_locations', true],
   }),
+  operations_inventory_pools: Object.freeze({
+    owner_customer_id: ['crm_organizations', true],
+  }),
+  operations_commerce_inventory_location_mappings: Object.freeze({
+    integration_account_id: ['operations_integration_accounts', false],
+    warehouse_id: ['operations_warehouses', false],
+    location_id: ['operations_locations', false],
+    inventory_pool_id: ['operations_inventory_pools', false],
+  }),
   operations_packaging_material_stock: Object.freeze({
     packaging_material_id: ['operations_packaging_materials', false],
     warehouse_id: ['operations_warehouses', false],
@@ -2733,6 +2781,19 @@ function transformRow(
     row.materialized_at = null
     row.created_by = actor
   }
+  if (table === 'operations_commerce_inventory_location_mappings') {
+    // Preserve the operator's exact routing intent, but never preserve source
+    // provider observations or make the route live before target-side provider
+    // identity and location-set verification succeeds.
+    row.mapping_method = 'manual'
+    row.active = false
+    row.row_version = 0
+    row.ownership_classification = 'unknown'
+    row.provider_snapshot_json = {}
+    row.provider_snapshot_hash = null
+    row.provider_observed_at = null
+    row.inventory_import_enabled = false
+  }
   if (
     table === 'operations_product_barcodes'
     && row.barcode_source === 'internal'
@@ -2796,6 +2857,8 @@ export function validateDatasetClosure(data, workspace) {
   const mappings = selectedIds(data, 'operations_product_mappings')
   const channelStates = selectedIds(data, 'operations_product_channel_states')
   const warehouses = selectedIds(data, 'operations_warehouses')
+  const locations = selectedIds(data, 'operations_locations')
+  const inventoryPools = selectedIds(data, 'operations_inventory_pools')
   const materials = selectedIds(data, 'operations_packaging_materials')
   const profiles = selectedIds(data, 'operations_product_pack_profiles')
   const versions = selectedIds(data, 'operations_product_pack_profile_versions')
@@ -2825,6 +2888,11 @@ export function validateDatasetClosure(data, workspace) {
   assertSelectedReference(data.operations_product_channel_states, 'product_id', products, 'operations_product_channel_states.product_id', true)
   assertSelectedReference(data.operations_product_channel_states, 'product_mapping_id', mappings, 'operations_product_channel_states.product_mapping_id', true)
   assertSelectedReference(data.operations_locations, 'warehouse_id', warehouses, 'operations_locations.warehouse_id')
+  assertSelectedReference(data.operations_inventory_pools, 'owner_customer_id', organizations, 'operations_inventory_pools.owner_customer_id', true)
+  assertSelectedReference(data.operations_commerce_inventory_location_mappings, 'integration_account_id', accounts, 'operations_commerce_inventory_location_mappings.integration_account_id')
+  assertSelectedReference(data.operations_commerce_inventory_location_mappings, 'warehouse_id', warehouses, 'operations_commerce_inventory_location_mappings.warehouse_id')
+  assertSelectedReference(data.operations_commerce_inventory_location_mappings, 'location_id', locations, 'operations_commerce_inventory_location_mappings.location_id')
+  assertSelectedReference(data.operations_commerce_inventory_location_mappings, 'inventory_pool_id', inventoryPools, 'operations_commerce_inventory_location_mappings.inventory_pool_id')
   assertSelectedReference(data.operations_packaging_material_stock, 'packaging_material_id', materials, 'operations_packaging_material_stock.packaging_material_id')
   assertSelectedReference(data.operations_packaging_material_stock, 'warehouse_id', warehouses, 'operations_packaging_material_stock.warehouse_id')
   assertSelectedReference(data.operations_product_pack_profiles, 'product_id', products, 'operations_product_pack_profiles.product_id')
@@ -3138,6 +3206,133 @@ function receiptIdentityDigest(payload) {
   return digest(identity)
 }
 
+const MATERIALIZED_DATASET_ATTESTATION_FORMAT =
+  'clawpilot-migration-materialized-lineage-row-digests-v2'
+
+const MATERIALIZED_ROW_REBIND_MUTABLE_COLUMNS = Object.freeze({
+  operations_integration_accounts: Object.freeze([
+    'status',
+    'configuration',
+    'credential_reference',
+    'external_account_id',
+    'commerce_credential_generation',
+    'receipt_intake_enabled',
+    'updated_by',
+    'updated_at',
+  ]),
+  operations_carrier_account_migration_placeholders: Object.freeze([
+    'state',
+    'target_account_number_fingerprint',
+    'materialized_by',
+    'materialized_at',
+    'updated_at',
+  ]),
+  operations_commerce_inventory_location_mappings: Object.freeze([
+    'external_location_name',
+    'external_location_address',
+    'active',
+    'row_version',
+    'ownership_classification',
+    'provider_snapshot_json',
+    'provider_snapshot_hash',
+    'provider_observed_at',
+    'inventory_import_enabled',
+    'updated_by',
+    'updated_at',
+  ]),
+  operations_external_identifiers: Object.freeze([
+    'status',
+    'match_method',
+    'match_evidence',
+    'last_verified_at',
+  ]),
+  crm_organizations: Object.freeze([
+    'sync_status',
+    'sync_error',
+    'suitecrm_synced_at',
+    'updated_at',
+  ]),
+  crm_contacts: Object.freeze([
+    'sync_status',
+    'sync_error',
+    'suitecrm_synced_at',
+    'updated_at',
+  ]),
+  crm_products: Object.freeze([
+    'sync_status',
+    'sync_error',
+    'suitecrm_synced_at',
+    'updated_at',
+  ]),
+})
+
+// A migration receipt proves which target identities and relationships were
+// materialized. It must remain verifiable after the separately authorized
+// provider rebind and SuiteCRM projection workers advance lifecycle evidence.
+// Only those explicitly sanctioned mutable columns are omitted; provider,
+// environment, Global IDs, foreign-key lineage, provider external IDs, and all
+// other migrated business data remain covered by the per-row digest.
+export function materializedMigrationLineageProjection(table, row) {
+  if (!DATASET_ORDER.includes(table) || !row || typeof row !== 'object') {
+    fail(`Cannot attest an unsupported materialized row: ${table}`)
+  }
+  const projection = structuredClone(row)
+  for (const column of MATERIALIZED_ROW_REBIND_MUTABLE_COLUMNS[table] || []) {
+    delete projection[column]
+  }
+  return projection
+}
+
+async function materializedDatasetAttestation(client, workspace) {
+  const state = await loadTargetState(client, workspace)
+  const tables = {}
+  for (const table of DATASET_ORDER) {
+    const rowDigests = (state[table] || [])
+      .map((row) => digest(materializedMigrationLineageProjection(table, row)))
+      .sort()
+    tables[table] = {
+      count: rowDigests.length,
+      rowDigests,
+      tableDigest: digest(rowDigests),
+    }
+  }
+  return {
+    format: MATERIALIZED_DATASET_ATTESTATION_FORMAT,
+    tables,
+    attestationDigest: digest(tables),
+  }
+}
+
+function validateMaterializedDatasetAttestation(attestation, counts, workspace) {
+  if (
+    attestation?.format !== MATERIALIZED_DATASET_ATTESTATION_FORMAT
+    || !attestation.tables
+    || typeof attestation.tables !== 'object'
+    || Array.isArray(attestation.tables)
+    || !SHA256.test(attestation.attestationDigest || '')
+    || digest(attestation.tables) !== attestation.attestationDigest
+    || canonicalJson(Object.keys(attestation.tables).sort())
+      !== canonicalJson([...DATASET_ORDER].sort())
+  ) fail(`${workspace.key} migration receipt materialized-row attestation is invalid`)
+  for (const table of DATASET_ORDER) {
+    const tableAttestation = attestation.tables[table]
+    if (
+      !tableAttestation
+      || !Number.isSafeInteger(tableAttestation.count)
+      || tableAttestation.count < 0
+      || tableAttestation.count !== Number(counts?.[table] || 0)
+      || !Array.isArray(tableAttestation.rowDigests)
+      || tableAttestation.rowDigests.length !== tableAttestation.count
+      || tableAttestation.rowDigests.some((rowDigest) => !SHA256.test(rowDigest))
+      || canonicalJson(tableAttestation.rowDigests)
+        !== canonicalJson([...tableAttestation.rowDigests].sort())
+      || !SHA256.test(tableAttestation.tableDigest || '')
+      || digest(tableAttestation.rowDigests) !== tableAttestation.tableDigest
+    ) fail(`${workspace.key} migration receipt ${table} row digests are invalid`)
+  }
+  return attestation
+}
+
 async function providerIdentityFenceProjection(client, organizationId) {
   return rows(client,
     `SELECT integration_account_id::text, provider, integration_type,
@@ -3238,10 +3433,23 @@ function validateReceiptPayload(payload, workspace, manifest) {
     || receiptIdentityDigest(payload) !== payload.receiptIdentityDigest) {
     fail(`${workspace.key} migration receipt identity digest is invalid`)
   }
+  validateMaterializedDatasetAttestation(
+    payload.materializedDatasetAttestation,
+    payload.counts,
+    workspace,
+  )
   return payload
 }
 
 async function assertReceiptMaterialization(client, workspace, payload) {
+  const observedDatasetAttestation = await materializedDatasetAttestation(
+    client,
+    workspace,
+  )
+  if (
+    canonicalJson(observedDatasetAttestation)
+      !== canonicalJson(payload.materializedDatasetAttestation)
+  ) fail(`${workspace.key} migration receipt materialized rows changed`)
   for (const [table, tableMapping] of Object.entries(payload.mapping)) {
     const idColumn = TABLE_ID_COLUMN[table]
     if (!idColumn || !tableMapping || typeof tableMapping !== 'object') continue
@@ -3386,6 +3594,35 @@ async function assertPlaceholderPostState(client, workspace) {
       || control.effective_running !== false
     ))
   ) fail(`${workspace.key} target Store sync controls are not explicitly paused`)
+  const locationMappings = await rows(client,
+    `SELECT mapping.id::text, account.provider, account.environment,
+            mapping.active, mapping.inventory_import_enabled,
+            mapping.row_version, mapping.mapping_method,
+            mapping.ownership_classification,
+            mapping.provider_snapshot_json,
+            mapping.provider_snapshot_hash,
+            mapping.provider_observed_at
+     FROM operations_commerce_inventory_location_mappings mapping
+     JOIN operations_integration_accounts account
+       ON account.organization_id = mapping.organization_id
+      AND account.id = mapping.integration_account_id
+     WHERE mapping.organization_id = $1::uuid
+     ORDER BY mapping.integration_account_id, mapping.external_location_id`,
+    [workspace.target.organizationId])
+  if (locationMappings.some((mapping) => (
+    mapping.provider !== 'shopify'
+    || !['sandbox', 'production'].includes(mapping.environment)
+    || mapping.active !== false
+    || mapping.inventory_import_enabled !== false
+    || Number(mapping.row_version) !== 0
+    || mapping.mapping_method !== 'manual'
+    || mapping.ownership_classification !== 'unknown'
+    || canonicalJson(mapping.provider_snapshot_json) !== canonicalJson({})
+    || mapping.provider_snapshot_hash !== null
+    || mapping.provider_observed_at !== null
+  ))) {
+    fail(`${workspace.key} migrated Shopify location-routing intent is not an inactive credential-free placeholder`)
+  }
   const historyPolicies = await client.query(
     `SELECT count(*)::integer AS count
      FROM operations_commerce_order_history_policies
@@ -3474,6 +3711,10 @@ async function recordMigrationReceipt(
     client,
     workspace.target.organizationId,
   )
+  const materializedRows = await materializedDatasetAttestation(
+    client,
+    workspace,
+  )
   const payload = {
     scriptVersion: SCRIPT_VERSION,
     manifestDigest: plan.manifestDigest,
@@ -3508,6 +3749,7 @@ async function recordMigrationReceipt(
     providerConnectionsCreated: 0,
     credentialRowsCopied: 0,
     carrierAccountSecretRowsCopied: 0,
+    materializedDatasetAttestation: materializedRows,
   }
   payload.receiptIdentityDigest = receiptIdentityDigest(payload)
   const result = await client.query(

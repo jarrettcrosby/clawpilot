@@ -7,6 +7,9 @@ import {
   readCurrentCommerceProviderImageSources,
 } from '@/lib/integrations/commerceProviderImageSource'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   createFaireCommerceClient,
   type FaireCommerceClient,
   type FaireCommerceClientOptions,
@@ -792,6 +795,7 @@ export async function executeFaireProductImagePublish(
     }
     client = dependencies.createClient(clientOptions(grant, credential))
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return finalize({
       dependencies,
       grant,
@@ -839,6 +843,7 @@ export async function executeFaireProductImagePublish(
       actorEmail: input.actorEmail,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return finalize({
       dependencies,
       grant,
@@ -898,6 +903,7 @@ export async function executeFaireProductImagePublish(
       actorEmail: input.actorEmail,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     try {
       await dependencies.recordProviderStep({
         organizationId: grant.organizationId,
@@ -1095,6 +1101,7 @@ export async function reconcileFaireProductImagePublish(
       acquiredBy: reconciledBy,
     })
   } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     const errorCode = safeCode(
       error,
       'FAIRE_PRODUCT_IMAGE_RECONCILIATION_READ_FAILED',

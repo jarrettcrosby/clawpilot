@@ -31,6 +31,9 @@ import {
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import type { CarrierShippingDiagnosticParcel } from '@/lib/integrations/carrierShippingDiagnosticRate'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   buildCarrierSandboxRateFixture,
   carrierSandboxPartyFingerprint,
   carrierSandboxRateRequestEvidence,
@@ -86,6 +89,7 @@ function contentHash(value: Uint8Array) {
 }
 
 function carrierActionError(error: unknown) {
+  if (isIntegrationCredentialRuntimeGateError(error)) throw error
   if (error instanceof OperationsRequestError) return error
   if (error instanceof CarrierSandboxLabelError) {
     return new OperationsRequestError(error.code, error.message, error.status)
@@ -141,6 +145,7 @@ async function finalizePreparedFailure(input: {
   attemptGlobalId: string
   error: unknown
 }) {
+  if (isIntegrationCredentialRuntimeGateError(input.error)) throw input.error
   const detail = failureDetail(input.error)
   try {
     await finalizeCarrierRateTestLabelAttemptFailureInPostgres({

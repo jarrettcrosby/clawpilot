@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
@@ -35,6 +36,12 @@ function loadTypeScriptModule(path, mocks = {}) {
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
       }
       if (specifier === '@/lib/integrations/commerceOrderHistoryReadLimits') {
         return loadTypeScriptModule('app_src/lib/integrations/commerceOrderHistoryReadLimits.ts')

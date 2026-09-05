@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 
 const root = process.cwd()
 const nodeRequire = createRequire(import.meta.url)
@@ -72,6 +73,22 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeHttp'
+      ) {
+        return {
+          integrationCredentialRuntimeMaintenanceResponse() {
+            return null
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -93,6 +110,46 @@ process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY =
 
 const credentialCrypto = loadTypeScriptModule(
   'app_src/lib/integrations/brokeredTransportCredentialCrypto.ts',
+  {
+    mocks: {
+      './integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
+    },
+  },
+)
+const brokeredRuntimeGateFixture =
+  credentialCrypto.encryptBrokeredTransportCredential({
+    authKind: 'oauth_client_credentials',
+    clientId: 'runtime-gate-client',
+    clientSecret: firstSecret,
+    audience: 'runtime-gate-audience',
+  }, organizationId, 'wwex_speedship', 'sandbox')
+const brokeredRuntimeGateError =
+  new integrationCredentialRuntimeGate.IntegrationCredentialRuntimeGateError(
+    'INTEGRATION_CREDENTIAL_RUNTIME_PROOF_STALE',
+  )
+const unavailableCredentialCrypto = loadTypeScriptModule(
+  'app_src/lib/integrations/brokeredTransportCredentialCrypto.ts',
+  {
+    mocks: {
+      './integrationCredentialRuntimeGate.mjs': {
+        ...integrationCredentialRuntimeGate,
+        integrationCredentialRuntimeEncryptionKey() {
+          throw brokeredRuntimeGateError
+        },
+      },
+    },
+  },
+)
+assert.throws(
+  () => unavailableCredentialCrypto.decryptBrokeredTransportCredential(
+    brokeredRuntimeGateFixture,
+    organizationId,
+    'wwex_speedship',
+    'sandbox',
+  ),
+  (error) => error === brokeredRuntimeGateError,
+  'brokered transport decryption must preserve typed runtime maintenance',
 )
 
 const database = {
@@ -401,6 +458,8 @@ const integrationService = loadTypeScriptModule(
           auditEvents.push(plain(event))
         },
       },
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
       '@/lib/integrations/brokeredTransportCredentialCrypto': credentialCrypto,
       '@/lib/integrations/wwexSpeedshipClient': {
         WwexSpeedshipClientError: class WwexSpeedshipClientError extends Error {},
@@ -433,6 +492,13 @@ const integrationService = loadTypeScriptModule(
       },
     },
   },
+)
+assert.throws(
+  () => integrationService.sanitizedBrokeredTransportIntegrationError(
+    brokeredRuntimeGateError,
+  ),
+  (error) => error === brokeredRuntimeGateError,
+  'brokered transport sanitization must preserve typed runtime maintenance',
 )
 
 const route = loadTypeScriptModule(

@@ -15,6 +15,16 @@ app_visible: false
 
 This plan converts the distributed operations target into independently reviewable slices. Each phase must leave the database consistent, the module disabled or usable for its approved scope, and the next phase optional. No phase may claim a production provider based only on a mock, fixture, sandbox, compiled adapter, or unverified credential.
 
+This plan preserves the delivery history written when a hosted Railway
+development environment existed. That environment is now retired. Current
+pre-production evidence comes from the `dev` branch, local fixtures, and
+disposable PostgreSQL tests. Railway production is the only intended live
+authority after cutover acceptance; the application Vercel project remains a
+transitional legacy surface until its production-scoped variables and domain
+authority are removed through the gated retirement procedure. Accordingly,
+the dated "development environment" statements below are historical evidence,
+not descriptions of a currently running hosted environment.
+
 The [Distributed Operations](../modules/distributed-operations.md) contract defines target behavior. The [integration and gap map](../maps/distributed-operations-integration-gap-map.md) distinguishes existing ClawPilot services, the implemented `0081`/`0082` foundation plus `0084` command-result hardening, and the remaining provider and operating gaps.
 
 ## Cross-Phase Gates

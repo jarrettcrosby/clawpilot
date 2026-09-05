@@ -17,6 +17,9 @@ import {
   commerceReadRuntimeMode,
 } from '@/lib/integrations/commerceReadRuntime'
 import {
+  isIntegrationCredentialRuntimeGateError,
+} from '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+import {
   getFaireProduct,
   getFaireOrder,
   listFaireInventory,
@@ -1131,7 +1134,8 @@ async function completeShopifyOrderLines(input: {
       },
       rejection: null,
     }
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return rejected('COMMERCE_ORDER_RECORD_INVALID')
   }
 }
@@ -1369,7 +1373,7 @@ function normalizationContext(
 async function runtimeFor(input: {
   organizationId: unknown
   accountGlobalId: unknown
-}, options: { reconciliationRead?: boolean } = {}) {
+}) {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
   const runtime = await readCommerceRuntimeCredentialFromPostgres({
@@ -1390,10 +1394,9 @@ async function runtimeFor(input: {
       'COMMERCE_INTAKE_CONNECTION_ERROR',
     )
   }
-  if (
-    options.reconciliationRead
-    && !commerceReadCredentialEligible(runtime)
-  ) {
+  if (!commerceReadCredentialEligible(runtime, {
+    capability: 'orders_history',
+  })) {
     throw new CommerceIntegrationRequestError(
       commerceReadRuntimeMode() === 'production'
         ? 'Production reconciliation requires an active verified production commerce account'
@@ -2156,6 +2159,7 @@ async function withAutomaticCustomerResolution(
       if (resolution.status === 'created') created += 1
       else matched += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       failed += 1
       const code = error instanceof CommerceIntegrationRequestError
         ? error.code
@@ -2276,7 +2280,8 @@ async function withAutomaticShopifyOrderPromotion(
       runGlobalId,
       expectedCohortHash: gate.cohortHash,
     })
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return {
       ...command,
       automaticShopifyOrderPromotion: {
@@ -2329,7 +2334,8 @@ async function withAutomaticShopifyOrderPromotion(
             attentionRequired: true as const,
             reasonCode: target.reasonCode,
           }
-    } catch {
+    } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       failed += 1
       const code =
         'COMMERCE_SHOPIFY_ORDER_AUTO_PROMOTION_PROVENANCE_FAILED'
@@ -2473,6 +2479,7 @@ async function withAutomaticShopifyOrderPromotion(
       }
       promoted += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const code = automaticShopifyPromotionFailureCode(error)
       const outcome = await markAttention({
         candidateGlobalId: target.candidateGlobalId,
@@ -2580,7 +2587,8 @@ async function withAutomaticFaireOrderPromotion(
       runtime: input.runtime,
       runGlobalId,
     })
-  } catch {
+  } catch (error) {
+    if (isIntegrationCredentialRuntimeGateError(error)) throw error
     return {
       ...command,
       automaticFaireOrderPromotion: {
@@ -2777,6 +2785,7 @@ async function withAutomaticFaireOrderPromotion(
       })
       promoted += 1
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       const code = automaticFairePromotionFailureCode(error)
       if (automaticFairePromotionCanonicalRace(code)) {
         held += 1
@@ -2911,7 +2920,10 @@ async function executeCommerceIntakeCommandInternal(
       readCommerceIntakeStateFromPostgres({
         organizationId,
         accountGlobalId,
-      }).catch(() => null),
+      }).catch((error) => {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
+        return null
+      }),
       readCommerceOrderReconciliationStateInPostgres({
         organizationId,
         accountGlobalId,
@@ -2996,13 +3008,16 @@ async function executeCommerceIntakeCommandInternal(
     const intake = await readCommerceIntakeStateFromPostgres({
       organizationId,
       accountGlobalId,
-    }).catch(() => null)
+    }).catch((error) => {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
+      return null
+    })
     return { command, intake }
   }
   const runtime = await runtimeFor({
     organizationId: input.organizationId,
     accountGlobalId: input.body.accountGlobalId,
-  }, { reconciliationRead })
+  })
   if (
     options.expectedCredentialVersion !== undefined
     && (
@@ -3328,6 +3343,7 @@ async function executeCommerceIntakeCommandInternal(
       readIntentId = prepared.id
       page = prepared
     } catch (error) {
+      if (isIntegrationCredentialRuntimeGateError(error)) throw error
       if (
         continuationRunGlobalId
         && !(error instanceof CommerceIntegrationRequestError)
@@ -3467,6 +3483,7 @@ async function executeCommerceIntakeCommandInternal(
           responseHash: durable.responseHash,
         }
       } catch (error) {
+        if (isIntegrationCredentialRuntimeGateError(error)) throw error
         const sanitized = sanitizedCommerceIntegrationError(error)
         await markCommerceIntakeProviderReadUncertainInPostgres({
           ...shared,
@@ -4042,7 +4059,7 @@ export async function readCommerceShopifyOrderRevisionEnvelope(input: {
   externalOrderId: string
   expectedCredentialVersion: number
 }) {
-  const runtime = await runtimeFor(input, { reconciliationRead: true })
+  const runtime = await runtimeFor(input)
   if (
     runtime.provider !== 'shopify'
     || runtime.integrationAccountId !== input.integrationAccountId

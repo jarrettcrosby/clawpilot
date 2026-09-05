@@ -153,6 +153,9 @@ const commerceOrderRevisionGate = {
   async assertCommerceOrderRevisionExecutionCurrent() {},
   CommerceOrderRevisionGateError: class extends Error {},
 }
+const integrationCredentialRuntimeGate = {
+  isIntegrationCredentialRuntimeGateError: () => false,
+}
 const orderShipTo = loadTypeScriptModule(
   'app_src/lib/operations/orderShipTo.ts',
 )
@@ -165,6 +168,8 @@ const carrierSandboxRate = loadTypeScriptModule(
         throw new Error('Production rerate fixture does not request carrier credentials')
       },
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/integrations/carrierWholeShipmentRateFoundation': {
       FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
       UPS_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
@@ -184,6 +189,8 @@ const operationsOrderShipmentAddress = loadTypeScriptModule(
       },
     },
     '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/orderShipTo': orderShipTo,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -219,6 +226,8 @@ const productionRerates = loadTypeScriptModule(
         throw new Error('Unexpected account fingerprinting in finalizer test')
       },
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/activeCarrierDispatchSnapshot': {
       createActiveCarrierDispatchRerateBinding() {
         providerBoundaryCallCount.value += 1
@@ -260,6 +269,8 @@ const productionReratesForDispatch = loadTypeScriptModule(
         throw new Error('Dispatch preparation must not read a raw account number')
       },
     },
+    '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+      integrationCredentialRuntimeGate,
     '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
     '@/lib/operations/orderShipTo': orderShipTo,
     '@/lib/persistence/operationsOrderShipmentAddress':

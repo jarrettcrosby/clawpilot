@@ -1566,6 +1566,38 @@ async function runAcceptance(sourceUrl, targetUrl, directory) {
     )
     assertPrivateFile(recoveredMapping)
 
+    const tamperedExternalId = 'external-customer-1-tampered'
+    const tamperedIdentifier = await target.query(
+      `UPDATE operations_external_identifiers
+       SET external_id = $3
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_id = 'external-customer-1'
+       RETURNING entity_global_id`,
+      [firstFixture.targetScaffold.organizationId, firstTargetAccountId,
+        tamperedExternalId],
+    )
+    assert.equal(tamperedIdentifier.rowCount, 1)
+    const tamperedReceiptMapping = join(directory, 'tampered-receipt-mapping.json')
+    await assert.rejects(
+      runMigration(
+        exportArguments(planPath, plan.manifestDigest, tamperedReceiptMapping),
+        environment,
+        runtime,
+      ),
+      /migration receipt materialized rows changed/u,
+    )
+    assert.equal(existsSync(tamperedReceiptMapping), false)
+    assert.equal((await target.query(
+      `UPDATE operations_external_identifiers
+       SET external_id = 'external-customer-1'
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_id = $3`,
+      [firstFixture.targetScaffold.organizationId, firstTargetAccountId,
+        tamperedExternalId],
+    )).rowCount, 1)
+
     await assert.rejects(
       target.query(
         `UPDATE audit_events SET subject = 'changed'

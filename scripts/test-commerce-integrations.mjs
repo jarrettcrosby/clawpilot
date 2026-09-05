@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import * as integrationCredentialRuntimeGate from './lib/integration-credential-runtime-test-double.mjs'
 import * as globalIds from '../app_src/lib/globalIds.mjs'
 import * as commerceOrderRevisionEvidenceKeyConfig from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
 
@@ -63,6 +64,22 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      ) {
+        return integrationCredentialRuntimeGate
+      }
+      if (
+        specifier
+        === '@/lib/integrations/integrationCredentialRuntimeHttp'
+      ) {
+        return {
+          integrationCredentialRuntimeMaintenanceResponse() {
+            return null
+          },
+        }
       }
       return nodeRequire(specifier)
     },
@@ -650,6 +667,8 @@ const routeUnderMutationTest = loadTypeScriptModule(
   'app_src/app/api/integrations/commerce/route.ts',
   {
     mocks: {
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
       'next/server': {
         NextResponse: {
           json(payload, init) {
@@ -830,7 +849,7 @@ assert.ok(
 const integrationsDoc = read('docs/modules/user-integrations.md')
 includes(integrationsDoc, [
   'scripts/establish-ag-alchemy-development.mjs',
-  'limited to the Railway development database',
+  'limited to the frozen, retirement-bound Railway development database',
   'read-only identity/scope GraphQL query',
   'operator-approved read-only set `read_all_orders`',
   '`read_merchant_managed_fulfillment_orders`',
@@ -1487,6 +1506,8 @@ const cryptoModule = loadTypeScriptModule(
   {
     mocks: {
       '@/lib/globalIds.mjs': globalIds,
+      '@/lib/integrations/integrationCredentialRuntimeGate.mjs':
+        integrationCredentialRuntimeGate,
       '@/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs':
         commerceOrderRevisionEvidenceKeyConfig,
       '@/lib/persistence/config': { isHostedRuntime: () => false },

@@ -19,6 +19,7 @@ import {
   startFaireOAuthCommerce,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
+import { integrationCredentialRuntimeMaintenanceResponse } from '@/lib/integrations/integrationCredentialRuntimeHttp'
 import {
   commerceIntakeRuntimeAvailable,
   commerceReadRuntimeAvailable,
@@ -66,6 +67,8 @@ function json(payload: Record<string, unknown>, status = 200) {
 }
 
 function errorResponse(error: unknown) {
+  const maintenance = integrationCredentialRuntimeMaintenanceResponse(error)
+  if (maintenance) return maintenance
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json(
       { ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' },

@@ -13,9 +13,9 @@ app_visible: false
 
 ## Topology
 
-Each Railway environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot service reaches the V8 API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. SuiteCRM 8 native media is not exposed by V8, so the optional native Product-image projection uses a separate least-privilege SuiteCRM user and the same cookie-session plus CSRF flow used by SuiteCRM's own UI. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin.
+The sole Railway production environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot production service reaches the V8 API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. SuiteCRM 8 native media is not exposed by V8, so the optional native Product-image projection uses a separate least-privilege SuiteCRM user and the same cookie-session plus CSRF flow used by SuiteCRM's own UI. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin. Local, remote-local, and Vercel preview runtimes must not receive these credentials or act as SuiteCRM workers.
 
-`SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical origin, with no trailing slash, path, credentials, query, or fragment. ClawPilot uses `https://crm.eigenracing.com` in production and `https://dev.crm.eigenracing.com` in development. SuiteCRM is a standalone service and must not be nested under the ClawPilot `aiapp` hostname.
+`SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical production origin, with no trailing slash, path, credentials, query, or fragment. ClawPilot uses `https://crm.eigenracing.com`. The former `https://dev.crm.eigenracing.com` origin is retired migration history, not an active service or deployment target. SuiteCRM is a standalone service and must not be nested under the ClawPilot `aiapp` hostname.
 
 The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
@@ -43,7 +43,7 @@ ClawPilot service:
 - `SUITECRM_BASE_URL=http://suitecrm.railway.internal:<port>`
 - the same exact `SUITECRM_PUBLIC_URL`
 - the same `SUITECRM_ADMIN_USER`
-- `SUITECRM_ADMIN_PORTAL_URL`, pointing to that environment's Railway `suitecrm` Variables page
+- `SUITECRM_ADMIN_PORTAL_URL`, pointing to production's Railway `suitecrm` Variables page
 - the same `SUITECRM_CLIENT_ID` and `SUITECRM_CLIENT_SECRET`
 - `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1`, only after the native-media user and permissions below are ready
 - `SUITECRM_MEDIA_USERNAME`, for a dedicated non-admin native-media user
@@ -71,7 +71,7 @@ Railway Postgres is authoritative for ClawPilot users, pipeline ownership, CRM i
 
 Each user has one workspace organization. The configured owner organization is the root, invited users receive member organizations beneath their inviter, and every pipeline belongs to its owner's workspace organization. Customer organizations are children of that pipeline organization, and contacts reference their customer organization. Owner/admin users can inspect and reparent member organizations from the CRM hierarchy panel.
 
-Set `CLAWPILOT_ROOT_ORGANIZATION_NAME` to the same company name in development and production before migration `0021_crm_identity_and_organization_hierarchy.sql` is applied. Workspace accounts use global deterministic SuiteCRM IDs. Customer organizations use normalized names within a pipeline; contacts use normalized email, or normalized name plus organization when email is absent. Workbook row numbers are not identities.
+Set `CLAWPILOT_ROOT_ORGANIZATION_NAME` to the reviewed production company name before migration `0021_crm_identity_and_organization_hierarchy.sql` is applied. The retired hosted-development environment historically used the same value during migration rehearsal; that history does not create a second current configuration target. Workspace accounts use global deterministic SuiteCRM IDs. Customer organizations use normalized names within a pipeline; contacts use normalized email, or normalized name plus organization when email is absent. Workbook row numbers are not identities.
 
 Migration `0021` consolidates existing organization/contact duplicates, remaps dependent records, and queues idempotent SuiteCRM deletions for the redundant native records. It deliberately does not deduplicate opportunities or interactions because repeated deals and touchpoints may be valid.
 
@@ -98,15 +98,15 @@ ClawPilot Product projections include SuiteCRM's native `currency_id`. USD resol
 
 ## First Install
 
-1. Create MariaDB and the SuiteCRM service in development.
-2. Attach the SuiteCRM volume at `/var/lib/suitecrm` before the first deployment.
-3. Create the SuiteCRM public Railway domain, set its exact HTTPS origin as `SUITECRM_PUBLIC_URL` on both services, and set the private service URL only as ClawPilot's `SUITECRM_BASE_URL`.
-4. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
-5. Generate separate random credentials for the forward media user and reverse reader user/client. Put each complete credential group on the SuiteCRM service and deploy it. Confirm the boot log reports `SuiteCRM image service principals and exact ACLs are ready`; the container creates the two non-admin users, dedicated roles, and reverse OAuth client and fails boot if any exact postcondition is absent.
-6. Put those same exact credentials on every ClawPilot runtime that can process SuiteCRM image work. Review the two managed roles in native SuiteCRM, bind every `SUITECRM_PRODUCT_IMAGE_READ_*` attestation variable to the generated reverse user/client, then explicitly set `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1` and `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED=1` on ClawPilot.
-7. Enable the remaining CRM variables on the ClawPilot development service and apply migration `0020_crm_gateway_and_reporting.sql`.
-8. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
-9. Repeat in production only after development reconciliation succeeds.
+1. Complete container, migration, and integration tests against disposable local services with synthetic data and no production credential.
+2. Create MariaDB and the SuiteCRM service in Railway production.
+3. Attach the SuiteCRM volume at `/var/lib/suitecrm` before the first deployment.
+4. Create the SuiteCRM public Railway domain, set its exact HTTPS origin as `SUITECRM_PUBLIC_URL` on both production services, and set the private service URL only as ClawPilot's `SUITECRM_BASE_URL`.
+5. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
+6. Generate separate random credentials for the forward media user and reverse reader user/client. Put each complete credential group on the SuiteCRM service and deploy it. Confirm the boot log reports `SuiteCRM image service principals and exact ACLs are ready`; the container creates the two non-admin users, dedicated roles, and reverse OAuth client and fails boot if any exact postcondition is absent.
+7. Put those same exact credentials only on the Railway production ClawPilot service. Review the two managed roles in native SuiteCRM, bind every `SUITECRM_PRODUCT_IMAGE_READ_*` attestation variable to the generated reverse user/client, then explicitly set `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1` and `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED=1` on ClawPilot.
+8. Enable the remaining CRM variables on the ClawPilot production service and let the normal Railway predeploy path apply migration `0020_crm_gateway_and_reporting.sql`.
+9. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
 
 ### Native Product-image activation and proof
 
@@ -128,7 +128,7 @@ After apply, let the normal SuiteCRM outbox poller drain the item. Check `/api/h
 
 For the reverse proof, confirm `/api/health` at `suiteCrmProductImageIngestion` reports `enabled: true`, `ready: true`, a current `completed` heartbeat, and `providerWrites: 0`. Change the test Product image in native SuiteCRM, let `/api/crm/integrations/process` complete the bounded discover/verify sweep, and verify a new immutable observation and provenance row appears with `importedPrimary` or `importedSecondary` incremented. Re-reading an unchanged image must increment neither import count nor provider writes; a deterministic ClawPilot filename is echo-suppressed.
 
-After the Global ID metadata is live, refresh historical records and meeting subpanel links from each environment's ClawPilot service shell:
+After the Global ID metadata is live, refresh historical records and meeting subpanel links from the Railway production ClawPilot service shell:
 
 ```bash
 CLAWPILOT_BACKFILL_CONFIRM=global-id-v1 npm run crm:backfill-suitecrm
@@ -146,7 +146,7 @@ The matching worker processes each reproject in this order:
 2. Create the native Call or Meeting with the same permanent `gi` Global ID, business timestamp, status, duration, assignment, and verified relationships.
 3. For a companion `gi` history row already linked to a canonical `gm` Meeting, stop after deleting the duplicate Note. The `gm` Meeting remains the only native activity projection.
 
-Do not run a separate ad hoc production update for this conversion. Deploy the SuiteCRM metadata and application worker that understand Calls and `reproject_record`, run the normal migration once in development, and drain `/api/crm/outbox/process`. Verify:
+Do not run a separate ad hoc production update for this conversion. Prove the migration and worker against a disposable PostgreSQL/SuiteCRM fixture, then deploy the SuiteCRM metadata and application worker that understand Calls and `reproject_record`. Let the normal Railway production predeploy path run the migration once and drain `/api/crm/outbox/process`. Verify:
 
 - a planned Call appears under the related Account's or Contact's **Activities**;
 - held and not-held Calls appear under **History**;
@@ -155,7 +155,7 @@ Do not run a separate ad hoc production update for this conversion. Deploy the S
 - a canonical `gm` Meeting has no duplicate `gi` Note or second native Meeting;
 - workbook-imported activity dates still match their original source `Date`.
 
-Repeat the same migration, drain, and checks in production only after development passes.
+Record the production migration, drain, and checks as the release evidence. A Vercel preview or remote-local UI check cannot substitute for that Railway production evidence.
 
 ### Duplicate Contact consolidation
 
@@ -178,7 +178,7 @@ npm run crm:merge-contacts -- \
 
 The merge keeps the survivor's local ID, public reference, and SuiteCRM ID; fills only missing survivor data; rewires local relationships; keeps the duplicate public reference as a permanent alias; and records an append-only tombstone. SuiteCRM work is dependency-ordered: update the survivor, update affected activity relationships, then delete the duplicate Contact. If the validation finds conflicting emails, organizations, names, in-flight work, an app-user identity, an unknown Contact foreign key, or an activity whose relationship payload cannot be reconstructed safely, the transaction stops without mutation.
 
-After deploying the native Note-to-Contact relationship contract, queue the historical Note repair from each environment using an explicit audit actor:
+After deploying the native Note-to-Contact relationship contract, queue the historical Note repair from Railway production using an explicit audit actor:
 
 ```bash
 CLAWPILOT_BACKFILL_CONFIRM=interaction-contacts-v1 \
