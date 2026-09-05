@@ -13,9 +13,22 @@ ALTER TABLE operations_commerce_fulfillment_exports
 -- every claimed attempt counted toward the automatic ceiling. A rerun does not
 -- overwrite post-migration zero-budget maintenance parks because only the
 -- transient NULL backfill is eligible.
+--
+-- The pre-0359 immutability trigger rejects every update to succeeded and
+-- unsupported exports, including this one-time value initialization. Disable
+-- only that trigger inside this migration transaction, perform the exact
+-- NULL-to-attempts backfill, and restore it before any constraint or index is
+-- installed. PostgreSQL rolls the trigger state back with the transaction if
+-- any statement fails.
+ALTER TABLE operations_commerce_fulfillment_exports
+  DISABLE TRIGGER protect_operations_commerce_fulfillment_export_write;
+
 UPDATE operations_commerce_fulfillment_exports
 SET automatic_recovery_attempts = attempts
 WHERE automatic_recovery_attempts IS NULL;
+
+ALTER TABLE operations_commerce_fulfillment_exports
+  ENABLE TRIGGER protect_operations_commerce_fulfillment_export_write;
 
 ALTER TABLE operations_commerce_fulfillment_exports
   ALTER COLUMN automatic_recovery_attempts SET DEFAULT 0,
