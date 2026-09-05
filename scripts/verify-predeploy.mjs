@@ -196,7 +196,7 @@ for (const requiredFragment of [
   'OPERATIONS_TRACKING_URL_EVIDENCE_ARTIFACT_COUNT = 42',
   '5b448cb504fbc42d6dfe2f8ecef643bb0a5576255b30658f598d2be21a20a800',
   'OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_ARTIFACT_COUNT = 47',
-  '2134de8f34c8e6d644363498fc46e06df25880d21aee29eeb6f1eb4ff4365c93',
+  '636e18fec91118651ad765b3470d80661e8a64ed2f985b5be0f78cd605f3a201',
   '${OPERATIONS_TRACKING_URL_EVIDENCE_HEALTH_SQL}',
   '${OPERATIONS_NATIVE_ACTIVITY_EVIDENCE_HEALTH_SQL}',
   'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
@@ -873,6 +873,7 @@ if (String(railway?.deploy?.preDeployCommand || '') !== 'bash scripts/predeploy-
 const railwayPredeploy = readFileSync(resolve(root, 'scripts/predeploy-railway.sh'), 'utf8')
 for (const requiredCommand of [
   'npm run mail:verify',
+  'npm run db:preflight:commerce-storage',
   'npm run db:migrate',
   'npm run verify:commerce-order-revision-evidence-keys',
   'npm run demo:seed',
@@ -881,6 +882,12 @@ for (const requiredCommand of [
   if (!railwayPredeploy.includes(requiredCommand)) {
     fail(`scripts/predeploy-railway.sh must run "${requiredCommand}"`)
   }
+}
+if (
+  railwayPredeploy.indexOf('npm run db:preflight:commerce-storage')
+    >= railwayPredeploy.indexOf('npm run db:migrate')
+) {
+  fail('Commerce storage preflight must run before database migrations')
 }
 const revisionEvidenceKeyGatePosition = railwayPredeploy.indexOf(
   'npm run verify:commerce-order-revision-evidence-keys',

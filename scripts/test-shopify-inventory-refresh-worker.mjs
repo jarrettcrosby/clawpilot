@@ -80,6 +80,36 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/commerceStorageMaintenance') {
+        return {
+          async maintainCommerceStorageInPostgres() {
+            return {
+              schemaAvailable: true,
+              executed: false,
+              status: 'not_due',
+              errorCode: null,
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+          commerceStorageMaintenanceFailureResult(error) {
+            return {
+              schemaAvailable: false,
+              executed: false,
+              status: 'failed',
+              errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+              intakePayloads: { rows: 0, bytes: 0 },
+              legacyInventoryCaptures: { rows: 0, bytes: 0 },
+              inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+              inventoryObservationAliases: { rows: 0, bytes: 0 },
+              inventoryLevels: { rows: 0, bytes: 0 },
+            }
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -200,6 +230,15 @@ assert.match(
   persistence,
   /DO UPDATE SET[\s\S]*?requested_dirty_version = EXCLUDED\.requested_dirty_version[\s\S]*?status = 'pending'[\s\S]*?available_at = now\(\)[\s\S]*?EXCLUDED\.requested_dirty_version >[\s\S]*?operations_shopify_inventory_refresh_jobs[\s\S]*?\.requested_dirty_version/,
   'Automatic scheduling may only expedite a failed refresh for a newer webhook dirty version',
+)
+
+const inventoryWorkerSource = read(
+  'app_src/lib/shopifyInventoryRefreshWorker.ts',
+)
+assert.match(
+  inventoryWorkerSource,
+  /left\.status === 'lease_lost' \|\| right\.status === 'lease_lost'[\s\S]*?\? 'lease_lost'[\s\S]*?left\.status === 'failed'/,
+  'A lost storage-maintenance lease must not be masked by a later completed pass',
 )
 assert.match(
   persistence,
@@ -913,6 +952,7 @@ assert.equal(
   'A replayed pre-claim provider capture must not acknowledge a newer webhook dirty version',
 )
 const trace = {
+  storageMaintenance: [],
   claim: [],
   renew: [],
   heartbeat: [],
@@ -935,6 +975,35 @@ const worker = loadTypeScriptModule(
             replayed: false,
             effectiveIdempotencyKey: 'manager-owned-overlap-key',
             inventoryRunGlobalId: 'gir1234567',
+          }
+        },
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres(input) {
+          trace.storageMaintenance.push(input)
+          return {
+            schemaAvailable: true,
+            executed: true,
+            status: 'completed',
+            errorCode: null,
+            intakePayloads: { rows: 1000, bytes: 8192 },
+            legacyInventoryCaptures: { rows: 25, bytes: 4096 },
+            inventorySnapshotPayloads: { rows: 250, bytes: 16384 },
+            inventoryObservationAliases: { rows: 1000, bytes: 4096 },
+            inventoryLevels: { rows: 5000, bytes: 65536 },
+          }
+        },
+        commerceStorageMaintenanceFailureResult(error) {
+          return {
+            schemaAvailable: false,
+            executed: false,
+            status: 'failed',
+            errorCode: error?.code || 'COMMERCE_STORAGE_MAINTENANCE_FAILED',
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
           }
         },
       },
@@ -974,6 +1043,29 @@ assert.equal(completed.claimed, 1)
 assert.equal(completed.completed, 1)
 assert.equal(completed.providerWrites, 0)
 assert.equal(completed.orderQuantityAdjustment, 0)
+assert.deepEqual(JSON.parse(JSON.stringify(trace.storageMaintenance)), [
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
+    inventoryLevelLimit: 10000,
+    workerId: 'worker-one:commerce-storage',
+  },
+  {
+    intakeLimit: 1000,
+    legacyCaptureLimit: 25,
+    inventorySnapshotLimit: 250,
+    inventoryAliasLimit: 5000,
+    inventoryLevelLimit: 10000,
+    workerId: 'worker-one:commerce-storage',
+  },
+])
+assert.equal(completed.commerceStorageMaintenance.inventoryLevels.rows, 10000)
+assert.equal(
+  completed.commerceStorageMaintenance.inventorySnapshotPayloads.rows,
+  500,
+)
 assert.equal(trace.sync.length, 1)
 assert.equal(trace.claim.length, 1)
 assert.equal(trace.claim[0].limit, 1)
@@ -1106,6 +1198,155 @@ assert.equal(leaseTrace.fail.length, 1)
 assert.equal(
   leaseTrace.fail[0].error.code,
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+)
+
+let claimsAfterMaintenanceFailure = 0
+const maintenanceFailureWorker = loadTypeScriptModule(
+  'app_src/lib/shopifyInventoryRefreshWorker.ts',
+  {
+    mocks: {
+      '@/lib/integrations/commerceInventory': {
+        async syncShopifyInventory() {
+          assert.fail('no job should be available in this scenario')
+        },
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres() {
+          const error = new Error('simulated maintenance failure')
+          error.code = 'SIMULATED_STORAGE_FAILURE'
+          throw error
+        },
+        commerceStorageMaintenanceFailureResult(error) {
+          return {
+            schemaAvailable: false,
+            executed: false,
+            status: 'failed',
+            errorCode: error.code,
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
+          }
+        },
+      },
+      '@/lib/persistence/shopifyInventoryRefresh': {
+        async queueAutomaticShopifyInventoryRefreshesInPostgres() {
+          return { queued: 0, cancelled: 0 }
+        },
+        async claimShopifyInventoryRefreshJobsInPostgres() {
+          claimsAfterMaintenanceFailure += 1
+          return []
+        },
+      },
+    },
+  },
+)
+const maintenanceIsolated =
+  await maintenanceFailureWorker.processShopifyInventoryRefreshOutbox({
+    limit: 1,
+    workerId: 'worker-maintenance-failure',
+  })
+assert.equal(claimsAfterMaintenanceFailure, 1)
+assert.equal(maintenanceIsolated.claimed, 0)
+assert.equal(maintenanceIsolated.commerceStorageMaintenance.status, 'failed')
+assert.equal(
+  maintenanceIsolated.commerceStorageMaintenance.errorCode,
+  'SIMULATED_STORAGE_FAILURE',
+)
+
+let disabledRouteMaintenanceCalls = 0
+let disabledRouteProviderCalls = 0
+const disabledRouteModule = loadTypeScriptModule(
+  'app_src/app/api/integrations/commerce/inventory/process/route.ts',
+  {
+    mocks: {
+      'next/server': {
+        NextRequest: class NextRequest {},
+        NextResponse: {
+          json(body, init = {}) {
+            return { body, status: init.status || 200 }
+          },
+        },
+      },
+      '@/lib/integrations/commerceInventory': {
+        shopifyInventoryRuntimeAvailable: () => false,
+      },
+      '@/lib/persistence/config': {
+        isPostgresStorageEnabled: () => true,
+      },
+      '@/lib/persistence/commerceStorageMaintenance': {
+        async maintainCommerceStorageInPostgres(input) {
+          disabledRouteMaintenanceCalls += 1
+          assert.equal(input.workerId, 'commerce-inventory-process-route')
+          return {
+            schemaAvailable: true,
+            executed: false,
+            status: 'not_due',
+            errorCode: null,
+            intakePayloads: { rows: 0, bytes: 0 },
+            legacyInventoryCaptures: { rows: 0, bytes: 0 },
+            inventorySnapshotPayloads: { rows: 0, bytes: 0 },
+            inventoryObservationAliases: { rows: 0, bytes: 0 },
+            inventoryLevels: { rows: 0, bytes: 0 },
+          }
+        },
+        commerceStorageMaintenanceFailureResult() {
+          assert.fail('disabled-route maintenance must not fail')
+        },
+      },
+      '@/lib/persistence/shopifyInventoryRefresh': {
+        async recordShopifyInventoryRefreshWorkerHeartbeatInPostgres() {
+          assert.fail('disabled Shopify lane must not write a heartbeat')
+        },
+      },
+      '@/lib/persistence/faireInventoryPolling': {
+        async recordFaireInventoryPollWorkerHeartbeatInPostgres() {
+          assert.fail('disabled Faire lane must not write a heartbeat')
+        },
+      },
+      '@/lib/faireInventoryPollingWorker': {
+        faireInventoryPollingRuntimeAvailable: () => false,
+        async processFaireInventoryPollOutbox() {
+          disabledRouteProviderCalls += 1
+        },
+      },
+      '@/lib/shopifyInventoryRefreshWorker': {
+        async processShopifyInventoryRefreshOutbox() {
+          disabledRouteProviderCalls += 1
+        },
+      },
+    },
+  },
+)
+const routeSecretBefore = process.env.PIPELINE_OUTBOX_WORKER_SECRET
+const disabledRouteSecret = 'i'.repeat(40)
+process.env.PIPELINE_OUTBOX_WORKER_SECRET = disabledRouteSecret
+let disabledRouteResponse
+try {
+  disabledRouteResponse = await disabledRouteModule.POST({
+    headers: {
+      get(name) {
+        return name === 'authorization'
+          ? `Bearer ${disabledRouteSecret}`
+          : null
+      },
+    },
+  })
+} finally {
+  if (routeSecretBefore === undefined) {
+    delete process.env.PIPELINE_OUTBOX_WORKER_SECRET
+  } else {
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET = routeSecretBefore
+  }
+}
+assert.equal(disabledRouteResponse.status, 200)
+assert.equal(disabledRouteResponse.body.skipped, true)
+assert.equal(disabledRouteMaintenanceCalls, 1)
+assert.equal(disabledRouteProviderCalls, 0)
+assert.equal(
+  disabledRouteResponse.body.commerceStorageMaintenance.status,
+  'not_due',
 )
 
 const route = read(

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "routes": [
+    {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "^dev\\.aiapp\\.eigenracing\\.com$"
+        }
+      ],
+      "dest": "${CLAWPILOT_REMOTE_LOCAL_ORIGIN}/$1",
+      "env": [
+        "CLAWPILOT_REMOTE_LOCAL_ORIGIN"
+      ],
+      "respectOriginCacheControl": false,
+      "transforms": [
+        {
+          "type": "request.headers",
+          "op": "set",
+          "target": {
+            "key": "x-clawpilot-remote-local-ingress"
+          },
+          "args": "$CLAWPILOT_REMOTE_LOCAL_INGRESS_SECRET",
+          "env": [
+            "CLAWPILOT_REMOTE_LOCAL_INGRESS_SECRET"
+          ]
+        },
+        {
+          "type": "request.headers",
+          "op": "set",
+          "target": {
+            "key": "x-forwarded-host"
+          },
+          "args": "dev.aiapp.eigenracing.com"
+        },
+        {
+          "type": "request.headers",
+          "op": "set",
+          "target": {
+            "key": "x-forwarded-proto"
+          },
+          "args": "https"
+        }
+      ]
+    },
+    {
+      "src": "/(.*)",
+      "status": 404
+    }
+  ]
+}

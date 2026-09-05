@@ -3,25 +3,21 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Order review and CRM communications",
-      "summary": "Review orders without losing your place, see provider activity and tracking history, read imported email cleanly, and choose verified email senders and connected calendars. Sign-in codes stay out of customer interactions.",
+      "title": "Production consolidation and commerce migration",
+      "summary": "Consolidate selected commerce workspaces into the production environment with guarded data transfer, bounded order history, storage controls, and separately verified provider reconnection. Local development remains isolated behind authenticated access.",
       "features": [
-        "Orders supports paged review, sorting and filters with navigation state preserved in the URL",
-        "CRM email shows readable text and safe clickable links while preserving the original saved message",
-        "Email sender selection includes the connected account's verified primary address and accepted aliases",
-        "Meeting scheduling keeps the connected calendar choice separate from email sender selection",
-        "Shopify order history includes available provider activity messages and author names, with partial-history coverage shown explicitly"
+        "Selected commerce workspaces can be transferred into an existing production organization without replacing production-owned data",
+        "Each sales channel and shipping provider is reviewed and reconnected independently before it can run in production",
+        "Order-history coverage is selected per sales channel so operators can retain relevant history without loading an unlimited backlog",
+        "Commerce storage maintenance keeps current order evidence while retiring superseded payloads and bounding retained snapshots",
+        "Authenticated local development can use the development hostname without exposing its database or application listeners directly"
       ],
       "fixes": [
-        "Refreshing a stale order result preserves the selected page, filters and open order whenever that page still exists",
-        "Order history omits redundant generic tracking rows while keeping every distinct tracking number and change",
-        "Concurrent order refreshes use consistent account and store-control locking",
-        "Renamed Gmail accounts are checked against their current provider identity before sending",
-        "ClawPilot sign-in-code emails are excluded before CRM message storage or customer association",
-        "Delayed CRM synchronization cannot restore an archived interaction",
-        "Meeting calendar choice, duration and location mode survive CRM synchronization",
-        "New tracking links are retained without rewriting original order-history evidence",
-        "An account-bound self-delivery setting keeps branded sign-in codes visible in the operator's Inbox"
+        "Migration plans bind exact source and target identities, row counts, checksums and immutable receipts before any apply step",
+        "Production provider credentials are never copied from another organization; target credentials require fresh, account-bound authorization",
+        "Provider reconnection rejects concurrent configuration, capability, history-policy or store-sync changes",
+        "Database health accepts only the verified rolling migration phases and rejects changed migration bytes or unsafe function configuration",
+        "Provider and migration safety suites now run as part of the standard release test gate"
       ]
     }
   }

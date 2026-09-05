@@ -68,6 +68,9 @@ import {
 import {
   downgradeShopifyOrderWebhookPolicyAfterDiscoveryWithClient,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
+import type {
+  CommerceOrderHistoryMode,
+} from '@/lib/integrations/commerceOrderHistoryPolicy'
 
 type TimestampValue = string | Date
 
@@ -99,6 +102,9 @@ type CommerceConnectionRow = {
     | 'verified'
     | null
   webhook_verified_at: TimestampValue | null
+  order_history_mode: CommerceOrderHistoryMode | null
+  order_history_ingestion_floor: TimestampValue | null
+  order_history_frozen_at: TimestampValue | null
   updated_at: TimestampValue
 }
 
@@ -178,6 +184,11 @@ export type CommerceIntegrationAccountState = {
   webhookVerificationStatus: 'not_applicable' | 'unverified' | 'verified'
   webhookVerifiedAt: string | null
   configuration: Record<string, unknown>
+  orderHistoryPolicy: null | {
+    mode: CommerceOrderHistoryMode
+    ingestionFloor: string | null
+    frozenAt: string
+  }
   fulfillmentNotificationPolicy:
     | ShopifyFulfillmentNotificationPolicyState
     | {
@@ -232,6 +243,7 @@ export type FaireOAuthInstallationRecord = {
   redirectUrl: string
   displayName: string | null
   requestedScopes: string[]
+  orderHistoryMode: CommerceOrderHistoryMode
   applicationIdLastFour: string
   encrypted: EncryptedCommerceValue
   expiresAt: string
@@ -270,6 +282,9 @@ const CONNECTION_SELECT = `SELECT
     credential.last_error_code,
     credential.webhook_verification_status,
     credential.webhook_verified_at,
+    history.history_mode AS order_history_mode,
+    history.ingestion_floor AS order_history_ingestion_floor,
+    history.frozen_at AS order_history_frozen_at,
     GREATEST(
       account.updated_at,
       COALESCE(credential.updated_at, account.updated_at)
@@ -277,7 +292,10 @@ const CONNECTION_SELECT = `SELECT
   FROM operations_integration_accounts account
   LEFT JOIN operations_commerce_credentials credential
     ON credential.organization_id = account.organization_id
-   AND credential.integration_account_id = account.id`
+   AND credential.integration_account_id = account.id
+  LEFT JOIN operations_commerce_order_history_policies history
+    ON history.organization_id = account.organization_id
+   AND history.integration_account_id = account.id`
 
 function cursorState(row: CommerceCursorRow): CommerceSyncCursorState {
   return {
@@ -338,6 +356,14 @@ function accountState(
       row.webhook_verification_status || 'not_applicable',
     webhookVerifiedAt: iso(row.webhook_verified_at),
     configuration: row.configuration || {},
+    orderHistoryPolicy:
+      row.order_history_mode && row.order_history_frozen_at
+        ? {
+            mode: row.order_history_mode,
+            ingestionFloor: iso(row.order_history_ingestion_floor),
+            frozenAt: iso(row.order_history_frozen_at) as string,
+          }
+        : null,
     fulfillmentNotificationPolicy: row.provider === 'shopify'
       ? {
           mode: 'clawpilot_explicit',
@@ -773,6 +799,7 @@ export async function createFaireOAuthInstallationInPostgres(input: {
   redirectUrl: string
   displayName: string | null
   requestedScopes: string[]
+  orderHistoryMode: CommerceOrderHistoryMode
   applicationIdLastFour: string
   encrypted: EncryptedCommerceValue
   expiresAt: string
@@ -787,10 +814,11 @@ export async function createFaireOAuthInstallationInPostgres(input: {
          organization_id, provider, browser_session_id, actor_email,
          state_hash, redirect_url, display_name, requested_scopes,
          application_id_last_four, application_credential_ciphertext,
-         application_credential_iv, application_credential_tag, expires_at
+         application_credential_iv, application_credential_tag,
+         order_history_mode, expires_at
        ) VALUES (
          $1::uuid, 'faire', $2::uuid, $3, $4, $5, $6, $7::text[],
-         $8, $9, $10, $11, $12::timestamptz
+         $8, $9, $10, $11, $12, $13::timestamptz
        )
        ON CONFLICT (organization_id, provider, browser_session_id)
        DO UPDATE SET
@@ -804,6 +832,7 @@ export async function createFaireOAuthInstallationInPostgres(input: {
            EXCLUDED.application_credential_ciphertext,
          application_credential_iv = EXCLUDED.application_credential_iv,
          application_credential_tag = EXCLUDED.application_credential_tag,
+         order_history_mode = EXCLUDED.order_history_mode,
          created_at = now(),
          expires_at = EXCLUDED.expires_at`,
       [
@@ -818,6 +847,7 @@ export async function createFaireOAuthInstallationInPostgres(input: {
         input.encrypted.ciphertext,
         input.encrypted.iv,
         input.encrypted.tag,
+        input.orderHistoryMode,
         input.expiresAt,
       ],
     )
@@ -863,6 +893,7 @@ export async function claimFaireOAuthInstallationInPostgres(input: {
       redirect_url: string
       display_name: string | null
       requested_scopes: string[]
+      order_history_mode: CommerceOrderHistoryMode
       application_id_last_four: string
       application_credential_ciphertext: Buffer
       application_credential_iv: Buffer
@@ -884,6 +915,7 @@ export async function claimFaireOAuthInstallationInPostgres(input: {
          redirect_url,
          display_name,
          requested_scopes,
+         order_history_mode,
          application_id_last_four,
          application_credential_ciphertext,
          application_credential_iv,
@@ -906,6 +938,7 @@ export async function claimFaireOAuthInstallationInPostgres(input: {
       redirectUrl: row.redirect_url,
       displayName: row.display_name,
       requestedScopes: row.requested_scopes,
+      orderHistoryMode: row.order_history_mode,
       applicationIdLastFour: row.application_id_last_four,
       encrypted: {
         ciphertext: row.application_credential_ciphertext,
@@ -930,6 +963,7 @@ export async function writeCommerceCredentialInPostgres(input: {
   webhookVerificationStatus: 'not_applicable' | 'unverified'
   resources: CommerceSyncResource[]
   actorEmail: string
+  orderHistoryMode: CommerceOrderHistoryMode
   faireOAuthGrant?: {
     requestedScopes: string[]
     tokenType: 'BEARER'
@@ -1060,6 +1094,60 @@ export async function writeCommerceCredentialInPostgres(input: {
         'The commerce connection is permanently bound to its original provider account',
       )
     }
+    const migratedIdentity = existingAccount.rows[0]
+      ? await client.query<{
+          expected_external_account_id_sha256: string
+          reconnect_eligible: boolean
+          verification_state: 'awaiting_provider_identity' | 'verified'
+        }>(
+          `SELECT expected_external_account_id_sha256,
+                  reconnect_eligible,
+                  verification_state
+           FROM operations_commerce_migration_provider_identity_fences
+           WHERE organization_id = $1::uuid
+             AND integration_account_id = $2::uuid
+           FOR UPDATE`,
+          [input.organizationId, existingAccount.rows[0].id],
+        )
+      : { rows: [] }
+    if (migratedIdentity.rows[0]) {
+      const fence = migratedIdentity.rows[0]
+      const observedExternalAccountHash = createHash('sha256')
+        .update(input.externalAccountId)
+        .digest('hex')
+      if (!fence.reconnect_eligible) {
+        throw new Error(
+          'This migrated commerce placeholder is not approved for production reconnection',
+        )
+      }
+      if (observedExternalAccountHash !== fence.expected_external_account_id_sha256) {
+        throw new Error(
+          'The provider account does not match the identity approved for this migrated workspace',
+        )
+      }
+      const verifiedFence = await client.query(
+        `UPDATE operations_commerce_migration_provider_identity_fences
+         SET verification_state = 'verified',
+             verified_external_account_id_sha256 = $3,
+             verified_by = $4,
+             verified_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND expected_external_account_id_sha256 = $3
+           AND reconnect_eligible = true
+           AND verification_state = 'awaiting_provider_identity'`,
+        [
+          input.organizationId,
+          existingAccount.rows[0].id,
+          observedExternalAccountHash,
+          input.actorEmail,
+        ],
+      )
+      if (fence.verification_state === 'awaiting_provider_identity' && verifiedFence.rowCount !== 1) {
+        throw new Error('The migrated provider identity fence changed during reconnection')
+      }
+    }
     const accountResult = await client.query<{
       id: string
       global_id: string
@@ -1102,6 +1190,50 @@ export async function writeCommerceCredentialInPostgres(input: {
       ],
     )
     const account = accountResult.rows[0]
+    await client.query(
+      `WITH frozen AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS at
+       )
+       INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       )
+       SELECT $1::uuid, $2::uuid, $3, $4,
+              CASE $4
+                WHEN 'provider_all' THEN NULL
+                WHEN 'last_7_days' THEN frozen.at - interval '7 days'
+                WHEN 'last_30_days' THEN frozen.at - interval '30 days'
+                WHEN 'last_60_days' THEN frozen.at - interval '60 days'
+                ELSE frozen.at
+              END,
+              frozen.at,
+              $5
+       FROM frozen
+       ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
+      [
+        input.organizationId,
+        account.id,
+        input.provider,
+        input.orderHistoryMode,
+        input.actorEmail,
+      ],
+    )
+    if (migratedIdentity.rows[0]) {
+      await client.query(
+        `UPDATE operations_external_identifiers
+         SET status = 'active',
+             last_verified_at = clock_timestamp(),
+             match_evidence = match_evidence || jsonb_build_object(
+               'migrationProviderIdentityVerified', true,
+               'migrationProviderIdentityVerifiedAt', clock_timestamp()
+             )
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND status = 'stale'
+           AND match_evidence->>'migrationProviderIdentityFence' = 'true'`,
+        [input.organizationId, account.id],
+      )
+    }
     if (input.provider === 'shopify') {
       await ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
         organizationId: input.organizationId,

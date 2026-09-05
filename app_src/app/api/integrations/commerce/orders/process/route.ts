@@ -28,6 +28,10 @@ import {
 import {
   redactExpiredCommerceOrderSensitiveEvidenceInPostgres,
 } from '@/lib/persistence/commerceOrderSync'
+import {
+  commerceStorageMaintenanceFailureResult,
+  maintainCommerceStorageInPostgres,
+} from '@/lib/persistence/commerceStorageMaintenance'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -40,6 +44,16 @@ function authorized(req: NextRequest) {
   const left = Buffer.from(expected)
   const right = Buffer.from(provided)
   return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+async function maintainRouteCommerceStorageSafely() {
+  try {
+    return await maintainCommerceStorageInPostgres({
+      workerId: 'commerce-orders-process-route',
+    })
+  } catch (error) {
+    return commerceStorageMaintenanceFailureResult(error)
+  }
 }
 
 function safeCommerceOrderHistoryFailureCode(error: unknown) {
@@ -200,6 +214,9 @@ export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   }
+  const commerceStorageMaintenance = isPostgresStorageEnabled()
+    ? await maintainRouteCommerceStorageSafely()
+    : null
   if (!commerceReadRuntimeAvailable()) {
     const [protectedSnapshotPurge, orderSensitiveEvidenceRedaction] =
       isPostgresStorageEnabled()
@@ -214,6 +231,7 @@ export async function POST(req: NextRequest) {
       reason: 'commerce-read-reconciliation-disabled',
       protectedSnapshotPurge,
       orderSensitiveEvidenceRedaction,
+      commerceStorageMaintenance,
       automaticShopifyOrderPromotion:
         shopifyAutomaticOrderPromotionHealthSnapshot(),
       automaticFaireOrderPromotion:
@@ -279,6 +297,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       ...completedResult,
+      routeCommerceStorageMaintenance: commerceStorageMaintenance,
       heartbeatAt: heartbeat.checkedAt,
     })
   } catch (error) {

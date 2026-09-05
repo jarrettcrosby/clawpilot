@@ -49,7 +49,10 @@ includes(workflow, 'git apply --check', 'clean patch application')
 includes(workflow, 'run: npm run check', 'clean validation gate')
 includes(workflow, 'X-ClawPilot-Signature: sha256=$SIGNATURE', 'signed callback')
 includes(workflow, 'https://aiapp.eigenracing.com/api/agents/repository-runs/report', 'production callback allowlist')
-includes(workflow, 'https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report', 'development callback allowlist')
+assert.ok(
+  !workflow.includes('https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report'),
+  'retired development callback must not remain allowlisted',
+)
 assert.ok(!workflow.includes('https://*.eigenracing.com'), 'patch workflow must not accept wildcard callback hosts')
 assert.ok(!workflow.includes('contents: write'), 'patch workflow must not receive source write permission')
 assert.ok(!workflow.includes('pull-requests: write'), 'patch workflow must not receive pull request permission')

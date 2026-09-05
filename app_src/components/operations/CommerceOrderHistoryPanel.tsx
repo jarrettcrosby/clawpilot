@@ -20,6 +20,12 @@ import { nativeActivityCoverageFromPayload, presentCommerceOrderTimelineEvents }
 import { NativeActivityCoverageNotice, NativeActivityText } from '@/components/operations/CommerceNativeActivity'
 
 type CommerceProvider = 'shopify' | 'faire'
+type OrderHistoryPolicy = {
+  mode: 'new_orders_only' | 'last_7_days' | 'last_30_days'
+    | 'last_60_days' | 'provider_all'
+  ingestionFloor: string | null
+  frozenAt: string
+}
 
 type HistoryItem = {
   observationGlobalId: string
@@ -76,6 +82,7 @@ type HistoryResponse = {
   state?: {
     provider: CommerceProvider
     authority: 'provider'
+    orderHistoryPolicy: OrderHistoryPolicy | null
     readiness?: {
       blockers?: string[]
       coverageBasis?: string
@@ -135,6 +142,27 @@ function timestamp(value: string | null | undefined) {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(parsed)
+}
+
+function historyWindowLabel(
+  policy: OrderHistoryPolicy | null,
+  provider: CommerceProvider,
+) {
+  if (!policy) {
+    return provider === 'shopify'
+      ? 'Shopify · configured history window · read only'
+      : 'Faire · configured history window · read only'
+  }
+  const labelByMode = {
+    new_orders_only: 'new orders after connection',
+    last_7_days: 'prior 7 days',
+    last_30_days: 'prior 30 days',
+    last_60_days: 'prior 60 days',
+    provider_all: 'all provider-available history',
+  }
+  return `${provider === 'shopify' ? 'Shopify' : 'Faire'} · ${
+    labelByMode[policy.mode]
+  } · read only`
 }
 
 function money(minor: number | null, currency: string | null) {
@@ -456,9 +484,7 @@ export default function CommerceOrderHistoryPanel({
               Order history
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {provider === 'shopify'
-                ? 'Shopify · last 60 days · read only'
-                : 'Faire · provider-available history · read only'}
+              {historyWindowLabel(state?.orderHistoryPolicy || null, provider)}
             </Typography>
           </Box>
           <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
@@ -507,9 +533,14 @@ export default function CommerceOrderHistoryPanel({
             Shopify Return objects are not included because this connection has not granted read_returns. Order, cancellation, refund, fulfillment, and shipment history remain available.
           </Alert>
         ) : null}
-        {latest?.completenessState === 'shopify_fixed_window_read_attempt_complete' ? (
+        {[
+          'shopify_fixed_window_read_attempt_complete',
+          'shopify_configured_window_read_attempt_complete',
+        ].includes(latest?.completenessState || '') ? (
           <Alert severity="info">
-            The 60-day Shopify read completed with standard recent-order access. Shopify did not attest the oldest rolling-window edge; read_all_orders is required for full-window completeness evidence.
+            The configured Shopify history read completed with standard
+            recent-order access. Shopify did not attest the oldest window edge;
+            read_all_orders is required for full-window completeness evidence.
           </Alert>
         ) : null}
 

@@ -14363,6 +14363,7 @@ export async function planOperationsOrderFromPostgres(input: {
       }
 
       type PlanningPositionRow = PositionRow & {
+        inventory_sync_run_id: string | null
         inventory_level_id: string | null
         inventory_level_global_id: string | null
         provider_committed_quantity: string | null
@@ -14397,12 +14398,22 @@ export async function planOperationsOrderFromPostgres(input: {
                  position.on_hand_quantity::text,
                  position.reserved_quantity::text,
                  position.source_authority,
+                 level.sync_run_id::text AS inventory_sync_run_id,
                  level.id::text AS inventory_level_id,
                  level.global_id AS inventory_level_global_id,
                  level.provider_committed_quantity::text
                    AS provider_committed_quantity,
                  NULL::text AS available_whole_units
                FROM operations_commerce_inventory_levels level
+               JOIN operations_commerce_inventory_sync_runs evidence_run
+                 ON evidence_run.organization_id = level.organization_id
+                AND evidence_run.integration_account_id =
+                      level.integration_account_id
+                AND evidence_run.id = $2::uuid
+                AND level.sync_run_id = COALESCE(
+                  evidence_run.source_level_set_run_id,
+                  evidence_run.id
+                )
                JOIN operations_inventory_positions position
                  ON position.organization_id = level.organization_id
                 AND position.id = level.inventory_position_id
@@ -14416,7 +14427,6 @@ export async function planOperationsOrderFromPostgres(input: {
                  ON pool.organization_id = position.organization_id
                 AND pool.id = position.pool_id
                WHERE level.organization_id = $1::uuid
-                 AND level.sync_run_id = $2::uuid
                  AND level.product_id = $3::uuid
                  AND level.warehouse_id = $4::uuid
                  AND level.pipeline_id = $5::uuid
@@ -14507,6 +14517,7 @@ export async function planOperationsOrderFromPostgres(input: {
                  position.on_hand_quantity::text,
                  position.reserved_quantity::text,
                  position.source_authority,
+                 NULL::text AS inventory_sync_run_id,
                  NULL::text AS inventory_level_id,
                  NULL::text AS inventory_level_global_id,
                  NULL::text AS provider_committed_quantity,
@@ -14634,7 +14645,7 @@ export async function planOperationsOrderFromPostgres(input: {
                 ? 'provider_commitment'
                 : 'local_balance',
               position.source_authority === 'shopify'
-                ? order.evidence_inventory_sync_run_id
+                ? position.inventory_sync_run_id
                 : null,
               position.source_authority === 'shopify'
                 ? position.inventory_level_id

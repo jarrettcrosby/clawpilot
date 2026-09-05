@@ -31,6 +31,9 @@ import {
   normalizeCommerceOrderObservationInput,
   type CommerceOrderObservationInput,
 } from '@/lib/persistence/commerceOrderSync'
+import {
+  assessCommerceOrderHistoryAdmissionWithClient,
+} from '@/lib/persistence/commerceOrderHistoryAdmission'
 
 const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
@@ -1406,11 +1409,37 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         'Shopify exact-order read claim is stale',
       )
     }
-    const persisted = await insertExactObservation(
+    const admission = await assessCommerceOrderHistoryAdmissionWithClient(
       client,
-      input.claim,
-      observation,
+      {
+        organizationId: input.claim.organizationId,
+        integrationAccountId: input.claim.integrationAccountId,
+        provider: 'shopify',
+        externalOrderId: observation.externalOrderId,
+        providerCreatedAt: observation.providerCreatedAt,
+      },
     )
+    if (admission.reason === 'policy_missing') {
+      conflict(
+        'COMMERCE_ORDER_HISTORY_POLICY_MISSING',
+        'The immutable order-history policy is unavailable',
+      )
+    }
+    if (admission.reason === 'provider_created_at_required') {
+      conflict(
+        'COMMERCE_ORDER_HISTORY_POLICY_EVIDENCE_INVALID',
+        'Provider order creation time is required by the frozen history policy',
+      )
+    }
+    const persisted = admission.admitted
+      ? await insertExactObservation(client, input.claim, observation)
+      : {
+          row: null,
+          appended: 0,
+          preserved: 0,
+          linesAppended: 0,
+          eventsAppended: 0,
+        }
     const read = await client.query<{ global_id: string }>(
       `INSERT INTO operations_shopify_order_webhook_reads (
          organization_id, integration_account_id, target_id,
@@ -1419,11 +1448,13 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
          external_order_id, claimed_provider_updated_at,
          observed_provider_updated_at, source_hash,
          read_all_orders_scope_observed, return_history_scope_observed,
-         provider_read_count, provider_write_count, observed_at
+         provider_read_count, provider_write_count, observed_at,
+         history_exclusion_code, excluded_provider_created_at
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7::uuid,
          $8, $9, $10, $11::timestamptz, $12::timestamptz, $13,
-         $14, $15, $17, 0, $16::timestamptz
+         $14, $15, $17, 0, $16::timestamptz, $18,
+         $19::timestamptz
        )
        RETURNING global_id`,
       [
@@ -1433,7 +1464,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.claim.capturedDirtyVersion,
         input.claim.lockToken,
         input.claim.signalGlobalId,
-        persisted.row.id,
+        persisted.row?.id || null,
         input.claim.credentialGeneration,
         input.claim.policyRevision,
         input.claim.externalOrderId,
@@ -1444,6 +1475,10 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         input.returnHistoryScopeObserved,
         observation.observedAt,
         observation.providerReadCount,
+        admission.admitted
+          ? null
+          : 'COMMERCE_ORDER_HISTORY_POLICY_EXCLUDED',
+        admission.admitted ? null : observation.providerCreatedAt,
       ],
     )
     const completed = await client.query<{
@@ -1506,6 +1541,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         capturedDirtyVersion: input.claim.capturedDirtyVersion,
         appended: persisted.appended,
         preserved: persisted.preserved,
+        historyExcluded: !admission.admitted,
         providerReads: observation.providerReadCount,
         providerWrites: 0,
       },
@@ -1521,6 +1557,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
       eventsAppended: persisted.eventsAppended,
       providerReads: observation.providerReadCount,
       providerWrites: 0 as const,
+      historyExcluded: !admission.admitted,
     })
   })
 }

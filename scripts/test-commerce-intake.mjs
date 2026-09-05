@@ -93,6 +93,14 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/operations/commerceStoreSync.ts',
         )
       }
+      if (
+        specifier
+        === '@/lib/persistence/commerceOrderHistoryAdmission'
+      ) {
+        return loadTypeScriptModule(
+          'app_src/lib/persistence/commerceOrderHistoryAdmission.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceStoreSync') {
         return {
           async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
@@ -2658,6 +2666,7 @@ assert.notEqual(
 
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const actorEmail = 'manager@example.test'
+const operationalOrderWindowStart = '2026-07-01T00:00:00.000Z'
 const shopifyRuntime = {
   organizationId,
   integrationAccountId: '22222222-2222-4222-8222-222222222222',
@@ -2931,6 +2940,11 @@ const service = loadTypeScriptModule(
         async listFaireOrders(_options, listOptions) {
           providerReads.faireOrders += 1
           assert.equal(listOptions.limit, 50)
+          assert.equal(
+            listOptions.updatedAtMin,
+            operationalOrderWindowStart,
+            'Faire operational reads must carry the frozen intake boundary',
+          )
           if (!listOptions.cursor) {
             return {
               orders: [{
@@ -3091,6 +3105,10 @@ const service = loadTypeScriptModule(
             )
             assert.match(request.query, /maxDeliveryDateTime/)
             assert.match(request.variables.query, /^status:any/)
+            assert.match(
+              request.variables.query,
+              new RegExp(` updated_at:>='${operationalOrderWindowStart}'`),
+            )
             assert.doesNotMatch(request.variables.query, /\btest:false\b/)
             if (!request.variables.after) {
               return {
@@ -3413,7 +3431,9 @@ const service = loadTypeScriptModule(
               ).padStart(12, '0')}`,
               batchNumber: 1,
               previousRunGlobalId: null,
-              windowStart: null,
+              windowStart: input.resource === 'orders'
+                ? operationalOrderWindowStart
+                : null,
               windowEnd: '2026-07-26T12:00:00.000Z',
               queryHash: 'c'.repeat(64),
               orderCursor: null,

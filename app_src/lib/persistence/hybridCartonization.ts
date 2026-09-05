@@ -1819,7 +1819,7 @@ async function readLatestInventoryRun(
 ) {
   const result = await client.query<InventoryRunRow>(
     `SELECT
-       run.id::text,
+       COALESCE(run.source_level_set_run_id, run.id)::text AS id,
        run.global_id,
        run.provider_fetched_at,
        run.completed_at

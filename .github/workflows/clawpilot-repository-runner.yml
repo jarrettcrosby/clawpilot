@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$CALLBACK_URL" in
-            https://aiapp.eigenracing.com/api/agents/repository-runs/report|https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
+            https://aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
             *) echo "Unapproved ClawPilot callback URL" >&2; exit 1 ;;
           esac
           [[ ${#REPORT_SECRET} -ge 32 ]]
@@ -265,7 +265,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$CALLBACK_URL" in
-            https://aiapp.eigenracing.com/api/agents/repository-runs/report|https://dev.aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
+            https://aiapp.eigenracing.com/api/agents/repository-runs/report) ;;
             *) echo "Unapproved ClawPilot callback URL" >&2; exit 1 ;;
           esac
           [[ ${#REPORT_SECRET} -ge 32 ]]

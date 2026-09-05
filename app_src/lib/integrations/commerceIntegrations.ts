@@ -108,6 +108,9 @@ import {
   ShopifyOrderWebhookSignalPersistenceError,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
+  normalizeCommerceOrderHistoryMode,
+} from '@/lib/integrations/commerceOrderHistoryPolicy'
+import {
   claimShopifyOrderWebhookReconciliationInPostgres,
   failShopifyOrderWebhookPreDispatchInPostgres,
   finalizeShopifyOrderWebhookReconciliationInPostgres,
@@ -541,6 +544,7 @@ export async function startFaireOAuthCommerce(input: {
   applicationId: unknown
   applicationSecret: unknown
   scopeProfile?: unknown
+  orderHistoryMode?: unknown
 }) {
   try {
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
@@ -554,6 +558,10 @@ export async function startFaireOAuthCommerce(input: {
       faireOAuthCallbackUrl(),
     )
     const requestedScopes = faireOAuthRequestedScopes(input.scopeProfile)
+    const orderHistoryMode = normalizeCommerceOrderHistoryMode(
+      input.orderHistoryMode,
+      'faire',
+    )
     const expiresAt = new Date(
       Date.now() + FAIRE_OAUTH_INSTALLATION_TTL_MS,
     ).toISOString()
@@ -572,6 +580,7 @@ export async function startFaireOAuthCommerce(input: {
       redirectUrl,
       displayName: optionalDisplayName(input.displayName),
       requestedScopes,
+      orderHistoryMode,
       applicationIdLastFour: applicationId.slice(-4),
       encrypted,
       expiresAt,
@@ -720,6 +729,7 @@ export async function completeFaireOAuthCommerce(input: {
       webhookVerificationStatus: 'not_applicable',
       resources: FAIRE_SYNC_RESOURCES,
       actorEmail: input.actorEmail,
+      orderHistoryMode: pending.orderHistoryMode,
       faireOAuthGrant: {
         requestedScopes: [...pending.requestedScopes],
         tokenType: grant.tokenType,
@@ -816,9 +826,14 @@ export async function connectShopifyCommerce(input: {
   clientId: unknown
   clientSecret: unknown
   actorEmail: string
+  orderHistoryMode?: unknown
 }) {
   try {
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const orderHistoryMode = normalizeCommerceOrderHistoryMode(
+      input.orderHistoryMode,
+      'shopify',
+    )
     const environment = normalizeCommerceEnvironment(
       input.environment,
       'shopify',
@@ -890,6 +905,7 @@ export async function connectShopifyCommerce(input: {
       webhookVerificationStatus: 'unverified',
       resources: SHOPIFY_SYNC_RESOURCES,
       actorEmail: input.actorEmail,
+      orderHistoryMode,
     })
   } catch (error) {
     throw sanitize(error)
@@ -901,9 +917,14 @@ export async function connectFaireCommerce(input: {
   displayName?: unknown
   accessToken: unknown
   actorEmail: string
+  orderHistoryMode?: unknown
 }) {
   try {
     const organizationId = normalizeCommerceOrganizationId(input.organizationId)
+    const orderHistoryMode = normalizeCommerceOrderHistoryMode(
+      input.orderHistoryMode,
+      'faire',
+    )
     const environment: CommerceEnvironment = 'production'
     const token = accessToken(input.accessToken, 'Faire')
     const profile = await probeFaireBrandProfile({ accessToken: token })
@@ -947,6 +968,7 @@ export async function connectFaireCommerce(input: {
       webhookVerificationStatus: 'not_applicable',
       resources: FAIRE_SYNC_RESOURCES,
       actorEmail: input.actorEmail,
+      orderHistoryMode,
     })
   } catch (error) {
     throw sanitize(error)
