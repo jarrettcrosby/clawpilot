@@ -90,7 +90,7 @@ command('docker', [
   '-e', 'POSTGRES_PASSWORD=runtime_gate_test',
   '-e', 'POSTGRES_DB=postgres',
   '-p', `127.0.0.1:${port}:5432`,
-  'postgres:16-alpine',
+  'postgres:18-alpine',
 ], { timeout: 60_000 })
 command('docker', ['start', container], { timeout: 60_000 })
 
