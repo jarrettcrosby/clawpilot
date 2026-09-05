@@ -74,7 +74,17 @@ function productionReadSql(alias, capability = 'orders_history') {
     + `${alias}.environment = 'sandbox' AND `
     + 'operations_commerce_hosted_production_sandbox_read_is_current('
     + `${alias}.organization_id, ${alias}.id, '${capability}'`
-    + ')))'
+    + '))))'
+}
+
+function assertBalancedSqlParentheses(sql) {
+  let depth = 0
+  for (const character of sql) {
+    if (character === '(') depth += 1
+    if (character === ')') depth -= 1
+    assert.ok(depth >= 0, 'production read SQL closes an unopened parenthesis')
+  }
+  assert.equal(depth, 0, 'production read SQL has an unclosed parenthesis')
 }
 
 withEnvironment({ CLAWPILOT_ENV: 'production' }, () => {
@@ -142,6 +152,9 @@ withEnvironment({
   assert.equal(
     runtime.commerceReadAccountSql('account', { capability: 'inventory' }),
     productionReadSql('account', 'inventory'),
+  )
+  assertBalancedSqlParentheses(
+    runtime.commerceReadAccountSql('account', { capability: 'inventory' }),
   )
   assert.throws(
     () => runtime.commerceReadAccountSql('account', { capability: 'provider_write' }),
