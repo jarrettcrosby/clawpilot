@@ -272,6 +272,34 @@ async function receiptWriterContract(pool) {
   return String(result.rows[0]?.contract || '')
 }
 
+async function projectFrozenCommerceContractPredecessor(client) {
+  // 0305 is a frozen rollout-contract fixture for the exact 0299-era schema.
+  // Later additive migrations legitimately extend the read-lease table, so
+  // remove only those post-contract additions inside the caller's rollback
+  // transaction before exercising the frozen contraction.
+  const result = await client.query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'operations_commerce_store_sync_read_leases'
+         AND column_name = 'history_exclusion_code'
+     ) AS applied`,
+  )
+  if (result.rows[0]?.applied !== true) return
+  await client.query(
+    `DROP TRIGGER IF EXISTS
+       guard_commerce_order_history_lease_exclusion_write
+       ON public.operations_commerce_store_sync_read_leases;
+     DROP FUNCTION IF EXISTS
+       public.guard_commerce_order_history_lease_exclusion();
+     ALTER TABLE public.operations_commerce_store_sync_read_leases
+       DROP COLUMN history_exclusion_code,
+       DROP COLUMN history_excluded_external_order_id,
+       DROP COLUMN history_excluded_provider_created_at`,
+  )
+}
+
 async function tamper(pool, sql, message) {
   await pool.query('BEGIN')
   try {
@@ -307,6 +335,7 @@ async function rejectCommerceContractPredecessor(
   try {
     await client.query('BEGIN')
     await client.query(tamperSql)
+    await projectFrozenCommerceContractPredecessor(client)
     await assert.rejects(
       client.query(futureCommerceRolloutContractMigration),
       expectedError,
@@ -936,6 +965,7 @@ async function exercise(pool) {
       'invalid',
       'An extra bridge binding must invalidate the exposed writer phase',
     )
+    await projectFrozenCommerceContractPredecessor(pool)
     await assert.rejects(
       pool.query(futureCommerceRolloutContractMigration),
       /exact receipt-writer trigger/u,
@@ -965,6 +995,7 @@ async function exercise(pool) {
        RETURNS trigger LANGUAGE plpgsql
        AS $$ BEGIN RETURN NEW; END $$`,
     )
+    await projectFrozenCommerceContractPredecessor(rejectedContractClient)
     await assert.rejects(
       rejectedContractClient.query(futureCommerceRolloutContractMigration),
       /requires the exact receipt-writer bridge/u,
@@ -1092,6 +1123,7 @@ async function exercise(pool) {
     await contractClient.query('BEGIN')
     // db-migrate executes the exact SQL before recording its checksum in the
     // same transaction. Keep this order identical to the production runner.
+    await projectFrozenCommerceContractPredecessor(contractClient)
     await contractClient.query(futureCommerceRolloutContractMigration)
     await contractClient.query(
       `INSERT INTO public.schema_migrations (filename, checksum)
