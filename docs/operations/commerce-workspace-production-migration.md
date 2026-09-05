@@ -327,10 +327,79 @@ and remains excluded unless a separately reviewed change says otherwise.
   Any missing/mismatched authority returns BLOCK.
 - Sandbox stays sandbox. A production database location is not evidence that a
   sandbox provider identity became production-capable.
-- Choose/freeze commerce history policy before reads. Do not copy DEV history
+- Choose the commerce history mode in the reviewed rebind plan. Planning proves
+  that no target policy exists and performs no write. Apply inserts the exact
+  digest-bound policy inside the same serializable transaction that activates
+  the provider and writes its immutable receipt. Do not copy DEV history
   policy, cursors, webhooks, high-watermarks, or carrier/provider state.
 - Run one reconnect at a time and verify the receipt/fence state before the
   next. Never edit a fence or placeholder manually to bypass a failed check.
+
+Create and review one commerce plan at a time. Supported Shopify choices are
+`new_orders_only`, `last_7_days`, `last_30_days`, and `last_60_days`; Faire also
+supports `provider_all`. Apply takes the choice only from the confirmed plan,
+so a second history flag is deliberately rejected:
+
+```bash
+npm run rebind:migrated-production-providers -- plan \
+  --actor '<approved operator email>' \
+  --manifest '/secure/operator/path/commerce-migration-plan.json' \
+  --mapping '/secure/operator/path/commerce-migration-mapping.json' \
+  --source-account-global-id '<compiled commerce Global ID>' \
+  --history-mode 'last_30_days' \
+  --output '/secure/operator/path/provider-rebind-plan.json'
+
+npm run rebind:migrated-production-providers -- apply \
+  --actor '<approved operator email>' \
+  --manifest '/secure/operator/path/commerce-migration-plan.json' \
+  --mapping '/secure/operator/path/commerce-migration-mapping.json' \
+  --source-account-global-id '<same compiled commerce Global ID>' \
+  --plan '/secure/operator/path/provider-rebind-plan.json' \
+  --confirm-digest '<reviewed planDigest>' \
+  --receipt-output '/secure/operator/path/provider-rebind-receipt.json'
+```
+
+For each managed AG carrier, store exactly one three-field JSON object
+`{"clientId":"...","clientSecret":"...","accountNumber":"..."}` in macOS
+Keychain or an equivalent password manager. Never put those values in command
+arguments, environment variables, terminal output, the repository, or a synced
+folder. Feed the same record to plan and apply over an inherited pipe descriptor;
+the process rejects stdin, terminals, and regular files. The non-secret approval
+tokens are exact compiled authority bindings:
+
+- FedEx `approve:gia3106288:ga5122758:gia7335302:gac2368052:*1073`
+- UPS `approve:gia5910262:ga5122758:gia2057284:gac5139730:*3574`
+
+```bash
+exec 3< <(security find-generic-password -s 'clawpilot-cutover-ag-fedex' -w)
+npm run rebind:migrated-production-providers -- plan \
+  --actor '<approved operator email>' \
+  --manifest '/secure/operator/path/commerce-migration-plan.json' \
+  --mapping '/secure/operator/path/commerce-migration-mapping.json' \
+  --source-account-global-id 'gia3106288' \
+  --managed-rebind-secrets-fd 3 \
+  --confirm-managed-source-authority \
+  'approve:gia3106288:ga5122758:gia7335302:gac2368052:*1073' \
+  --output '/secure/operator/path/fedex-rebind-plan.json'
+exec 3<&-
+
+exec 3< <(security find-generic-password -s 'clawpilot-cutover-ag-fedex' -w)
+npm run rebind:migrated-production-providers -- apply \
+  --actor '<approved operator email>' \
+  --manifest '/secure/operator/path/commerce-migration-plan.json' \
+  --mapping '/secure/operator/path/commerce-migration-mapping.json' \
+  --source-account-global-id 'gia3106288' \
+  --managed-rebind-secrets-fd 3 \
+  --plan '/secure/operator/path/fedex-rebind-plan.json' \
+  --confirm-digest '<reviewed planDigest>' \
+  --receipt-output '/secure/operator/path/fedex-rebind-receipt.json'
+exec 3<&-
+```
+
+The plan and receipt contain only non-secret authority evidence, last-four
+evidence, a commitment digest, and a target-keyed material fingerprint. Remove
+temporary Keychain records only after receipt recovery and signed-in smoke
+checks succeed.
 
 ## Postflight
 
@@ -347,8 +416,9 @@ For each target:
    target organizations contain zero carrier credential/account secret rows.
    For AG, confirm the receipt authority digest resolves to the two unchanged,
    active, verified Suburbia source authorities before any activation.
-5. Confirm no order-history policy exists until the supported provider
-   connection workflow freezes one.
+5. Confirm no order-history policy exists after migration and before each
+   commerce rebind plan. After apply, confirm exactly one immutable policy
+   matches the reviewed provider, mode, floor, frozen time, and operator.
 6. Confirm the production owner remains
    `jarrett@suburbiasandwichco.com` and no BPO alias user was created.
 7. Confirm the exact target SuiteCRM outbox count and canonical CRM source

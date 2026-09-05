@@ -286,6 +286,60 @@ function parsePrivateJson(input, label) {
   return value
 }
 
+const MANAGED_SECRET_INPUT_MAX_BYTES = 16 * 1024
+
+export function readBoundedSecretJsonFd(fdValue, label = 'Managed carrier secret input') {
+  const fd = Number(fdValue)
+  if (!Number.isSafeInteger(fd) || fd < 3 || fd > 255) {
+    fail(`${label} file descriptor is invalid`)
+  }
+  const raw = Buffer.alloc(MANAGED_SECRET_INPUT_MAX_BYTES + 1)
+  try {
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFIFO()) fail(`${label} must come from an anonymous or named pipe`)
+    let length = 0
+    while (length < raw.length) {
+      const bytesRead = fs.readSync(fd, raw, length, raw.length - length, null)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    if (length > MANAGED_SECRET_INPUT_MAX_BYTES) fail(`${label} exceeds the safe size limit`)
+    let value
+    try {
+      value = JSON.parse(raw.subarray(0, length).toString('utf8').trim())
+    } catch {
+      fail(`${label} is not valid JSON`)
+    }
+    assertExactObjectKeys(
+      value,
+      ['clientId', 'clientSecret', 'accountNumber'],
+      label,
+    )
+    return {
+      clientId: boundedPrintableAscii(value.clientId, 'Managed carrier client ID', 3, 512),
+      clientSecret: boundedPrintableAscii(
+        value.clientSecret,
+        'Managed carrier client secret',
+        8,
+        4096,
+      ),
+      accountNumber: boundedPrintableAscii(
+        value.accountNumber,
+        'Managed carrier account number',
+        4,
+        128,
+      ),
+    }
+  } finally {
+    raw.fill(0)
+    try {
+      fs.closeSync(fd)
+    } catch {
+      // The descriptor may already have been closed by a failed inherited-pipe read.
+    }
+  }
+}
+
 function assertExactObjectKeys(value, expectedKeys, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     fail(`${label} must be one object`)
@@ -1193,7 +1247,7 @@ export function createProviderVerifier(runtime = {}) {
   })
 }
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   const args = [...argv]
   const command = args.shift()
   if (!['plan', 'apply', 'export-receipt'].includes(command)) {
@@ -1211,11 +1265,35 @@ function parseArguments(argv) {
   if (command === 'plan') required.push('--output')
   else required.push('--plan', '--confirm-digest', '--receipt-output')
   for (const flag of required) if (!text(values[flag])) fail(`${flag} is required`)
-  const allowed = new Set([...required, '--managed-rebind-material'])
+  const allowed = new Set([
+    ...required,
+    '--history-mode',
+    '--managed-rebind-secrets-fd',
+    '--confirm-managed-source-authority',
+  ])
   for (const flag of Object.keys(values)) if (!allowed.has(flag)) fail(`Unsupported option: ${flag}`)
-  if (command === 'export-receipt' && values['--managed-rebind-material']) {
-    fail('--managed-rebind-material is not accepted when exporting committed evidence')
+  if (
+    command === 'export-receipt'
+    && (values['--managed-rebind-secrets-fd'] || values['--confirm-managed-source-authority'])
+  ) {
+    fail('Managed carrier secret input is not accepted when exporting committed evidence')
   }
+  if (command !== 'plan' && values['--history-mode']) {
+    fail('--history-mode is accepted only when planning a commerce provider rebind')
+  }
+  if (command !== 'plan' && values['--confirm-managed-source-authority']) {
+    fail('--confirm-managed-source-authority is accepted only during plan review')
+  }
+  const managedFdRaw = text(values['--managed-rebind-secrets-fd'])
+  if (managedFdRaw && !/^\d{1,3}$/u.test(managedFdRaw)) {
+    fail('--managed-rebind-secrets-fd must be an inherited descriptor from 3 through 255')
+  }
+  const managedRebindSecretsFd = managedFdRaw ? Number(managedFdRaw) : undefined
+  if (
+    managedRebindSecretsFd !== undefined
+    && (!Number.isSafeInteger(managedRebindSecretsFd)
+      || managedRebindSecretsFd < 3 || managedRebindSecretsFd > 255)
+  ) fail('--managed-rebind-secrets-fd must be an inherited descriptor from 3 through 255')
   const actor = text(values['--actor']).toLowerCase()
   if (!EMAIL.test(actor)) fail('--actor must be an email address')
   return {
@@ -1224,7 +1302,9 @@ function parseArguments(argv) {
     manifest: values['--manifest'],
     mapping: values['--mapping'],
     selectedAccountGlobalId: text(values['--source-account-global-id']),
-    managedRebindMaterial: values['--managed-rebind-material'],
+    historyMode: text(values['--history-mode']) || undefined,
+    managedRebindSecretsFd,
+    confirmManagedSourceAuthority: text(values['--confirm-managed-source-authority']) || undefined,
     output: values['--output'],
     plan: values['--plan'],
     confirmDigest: text(values['--confirm-digest']).toLowerCase(),
@@ -1499,6 +1579,28 @@ async function assertTargetSchema(client) {
       'migrated-provider-rebind:migrated-production-provider-rebind-v1:',
     )
   ) fail('Target database lacks the immutable provider rebind receipt guard')
+  const historyGuardResult = await client.query(
+    `SELECT trigger.tgenabled,
+            procedure.proname,
+            pg_get_triggerdef(trigger.oid) AS trigger_definition,
+            pg_get_functiondef(procedure.oid) AS function_definition
+     FROM pg_trigger trigger
+     JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
+     WHERE trigger.tgrelid = 'operations_commerce_order_history_policies'::regclass
+       AND trigger.tgname = 'commerce_order_history_policy_guard'
+       AND trigger.tgisinternal = false`,
+  )
+  const historyGuard = historyGuardResult.rows[0]
+  const historyTrigger = String(historyGuard?.trigger_definition || '')
+  const historyFunction = String(historyGuard?.function_definition || '')
+  if (
+    historyGuardResult.rowCount !== 1
+    || !['O', 'A'].includes(historyGuard.tgenabled)
+    || historyGuard.proname !== 'protect_commerce_order_history_policy'
+    || !/BEFORE\s+(?=[^\n]*INSERT)(?=[^\n]*UPDATE)(?=[^\n]*DELETE)/u.test(historyTrigger)
+    || !historyFunction.includes("IF TG_OP <> 'INSERT' THEN")
+    || !historyFunction.includes('commerce order history policy is immutable')
+  ) fail('Target database lacks the immutable commerce order-history policy guard')
 }
 
 async function loadCommerceSource(source, workspace, account) {
@@ -1667,6 +1769,37 @@ function historyPolicyEvidence(row, account, expectedActor) {
   }
 }
 
+export function plannedHistoryPolicyEvidence({ account, actor, historyMode, frozenAt }) {
+  const mode = text(historyMode)
+  const frozen = new Date(frozenAt)
+  const configuredBy = text(actor).toLowerCase()
+  if (
+    account?.integrationType !== 'commerce'
+    || !['shopify', 'faire'].includes(account.provider)
+    || !COMMERCE_HISTORY_MODES.includes(mode)
+    || (account.provider === 'shopify' && mode === 'provider_all')
+    || !EMAIL.test(configuredBy)
+    || Number.isNaN(frozen.getTime())
+    || frozen.toISOString() !== text(frozenAt)
+  ) fail(`${account?.sourceGlobalId || 'Selected provider'} order-history choice is invalid`)
+  const days = {
+    new_orders_only: 0,
+    last_7_days: 7,
+    last_30_days: 30,
+    last_60_days: 60,
+  }
+  const ingestionFloor = mode === 'provider_all'
+    ? null
+    : new Date(frozen.getTime() - days[mode] * 24 * 60 * 60 * 1000).toISOString()
+  return historyPolicyEvidence({
+    history_provider: account.provider,
+    history_mode: mode,
+    ingestion_floor: ingestionFloor,
+    frozen_at: frozen.toISOString(),
+    configured_by: configuredBy,
+  }, account, configuredBy)
+}
+
 function targetConfigurationEvidence(configuration, account) {
   const value = safeJson(configuration)
   assertNoSecrets(value, `${account.sourceGlobalId} target placeholder configuration`)
@@ -1753,11 +1886,113 @@ export function managedRebindMaterialDigest(material) {
   return digest(copy)
 }
 
+export function managedSourceAuthorityApprovalToken(account) {
+  if (
+    account?.integrationType !== 'carrier'
+    || account.rebindMode !== 'source_authority'
+    || !GLOBAL_ID.test(account.sourceGlobalId || '')
+    || !GLOBAL_ID.test(account.authorityIntegrationGlobalId || '')
+    || !GLOBAL_ID.test(account.authorityCarrierAccountGlobalId || '')
+    || !/^\d{4}$/u.test(account.expectedLastFour || '')
+  ) fail('Managed carrier source-authority approval binding is invalid')
+  return [
+    'approve',
+    account.sourceGlobalId,
+    AG_AUTHORITY_ORGANIZATION_REFERENCE,
+    account.authorityIntegrationGlobalId,
+    account.authorityCarrierAccountGlobalId,
+    `*${account.expectedLastFour}`,
+  ].join(':')
+}
+
+export function buildManagedRebindMaterial({
+  actor,
+  manifest,
+  mapping,
+  bindings,
+  workspace,
+  account,
+  secretInput,
+  approvalToken,
+}) {
+  if (text(approvalToken) !== managedSourceAuthorityApprovalToken(account)) {
+    fail(`${account?.sourceGlobalId || 'Selected provider'} source-authority approval changed`)
+  }
+  const configuredBy = text(actor).toLowerCase()
+  if (!EMAIL.test(configuredBy)) fail('Managed carrier reauthentication actor is invalid')
+  assertExactObjectKeys(
+    secretInput,
+    ['clientId', 'clientSecret', 'accountNumber'],
+    'Managed carrier secret input',
+  )
+  const clientId = boundedPrintableAscii(
+    secretInput.clientId,
+    'Managed carrier client ID',
+    3,
+    512,
+  )
+  const clientSecret = boundedPrintableAscii(
+    secretInput.clientSecret,
+    'Managed carrier client secret',
+    8,
+    4096,
+  )
+  const accountNumber = boundedPrintableAscii(
+    secretInput.accountNumber,
+    'Managed carrier account number',
+    4,
+    128,
+  )
+  if (accountNumber.slice(-4) !== account.expectedLastFour) {
+    fail(`${account.sourceGlobalId} managed carrier account identity changed`)
+  }
+  const identity = targetIdentity(mapping, workspace, account)
+  const material = {
+    format: MANAGED_REBIND_MATERIAL_FORMAT,
+    actor: configuredBy,
+    migrationManifestDigest: manifest.manifestDigest,
+    migrationMappingDigest: digest(mapping),
+    targetDatabaseIdentity: TARGET_DATABASE_IDENTITY,
+    targetDatabaseEndpointSha256: bindings.target,
+    targetOrganizationId: workspace.targetOrganizationId,
+    targetIntegrationAccountId: identity.integrationId,
+    targetIntegrationAccountGlobalId: identity.integrationGlobalId,
+    targetCarrierAccountId: identity.carrierAccountId,
+    targetCarrierAccountGlobalId: identity.carrierAccountGlobalId,
+    sourceAccountGlobalId: account.sourceGlobalId,
+    provider: account.provider,
+    environment: account.environment,
+    authority: {
+      organizationReference: AG_AUTHORITY_ORGANIZATION_REFERENCE,
+      integrationGlobalId: account.authorityIntegrationGlobalId,
+      carrierAccountGlobalId: account.authorityCarrierAccountGlobalId,
+    },
+    approved: true,
+    credential: { clientId, clientSecret },
+    accountNumber,
+  }
+  material.materialDigest = managedRebindMaterialDigest(material)
+  return material
+}
+
 function managedRebindMaterialFingerprint(targetKey, material) {
   return crypto.createHmac('sha256', derivedKey(targetKey))
     .update('clawpilot:managed-carrier-reauthentication-material:v1\0', 'utf8')
     .update(canonicalJson(material), 'utf8')
     .digest('hex')
+}
+
+function assertReviewedManagedMaterialCommitment(input, account) {
+  if (account.rebindMode !== 'source_authority') return
+  const material = input.managedRebindMaterial
+  const reviewed = input.plan?.providers?.[0]
+  if (
+    !material || typeof material !== 'object' || Array.isArray(material)
+    || material.materialDigest !== managedRebindMaterialDigest(material)
+    || material.materialDigest !== reviewed?.approvalArtifactDigest
+    || managedRebindMaterialFingerprint(input.targetKey, material)
+      !== reviewed?.reauthenticationMaterialFingerprintSha256
+  ) fail(`${account.sourceGlobalId} managed carrier input does not match the confirmed rebind plan`)
 }
 
 function managedRebindMaterial(input, workspace, account, authority, identity) {
@@ -1854,7 +2089,14 @@ function managedRebindMaterial(input, workspace, account, authority, identity) {
   }
 }
 
-async function loadTargetPlaceholder(target, workspace, account, identity, bindings, actor) {
+async function loadTargetPlaceholder(
+  target,
+  workspace,
+  account,
+  identity,
+  bindings,
+  plannedHistoryPolicy,
+) {
   const result = await target.query(
     `SELECT integration.id::text, integration.global_id, integration.provider,
             integration.integration_type, integration.environment,
@@ -1901,15 +2143,14 @@ async function loadTargetPlaceholder(target, workspace, account, identity, bindi
     || row.configuration?.migrationRequiresCredentialRebind !== true
     || row.configuration?.migrationRequiresProviderIdentityVerification !== true
   )) fail(`${account.sourceGlobalId} target placeholder is not fail-closed`)
+  if (alreadyVerified) return row
   if (account.integrationType === 'commerce') {
     if (
       row.source_provider_identity_sha256 !== account.externalAccountIdSha256
       || row.expected_external_account_id_sha256 !== account.externalAccountIdSha256
     ) fail(`${account.sourceGlobalId} target commerce identity fence changed`)
-    const policy = await target.query(
-      `SELECT provider AS history_provider, history_mode, ingestion_floor,
-              frozen_at, configured_by,
-              control.desired_state AS sync_desired_state,
+    const control = await target.query(
+      `SELECT control.desired_state AS sync_desired_state,
               control.explicit_choice AS sync_explicit_choice,
               control.revision AS sync_revision,
               control.reason AS sync_reason,
@@ -1917,19 +2158,29 @@ async function loadTargetPlaceholder(target, workspace, account, identity, bindi
               control.updated_by AS sync_updated_by,
               control.created_at::text AS sync_created_at,
               control.updated_at::text AS sync_updated_at
-       FROM operations_commerce_order_history_policies history
-       JOIN operations_commerce_store_sync_controls control
-         ON control.organization_id = history.organization_id
-        AND control.integration_account_id = history.integration_account_id
-       WHERE history.organization_id = $1::uuid
-         AND history.integration_account_id = $2::uuid`,
+       FROM operations_commerce_store_sync_controls control
+       WHERE control.organization_id = $1::uuid
+         AND control.integration_account_id = $2::uuid`,
       [workspace.targetOrganizationId, identity.integrationId],
     )
-    if (policy.rowCount !== 1) {
-      fail(`${account.sourceGlobalId} requires one frozen target order-history policy`)
+    if (control.rowCount !== 1) {
+      fail(`${account.sourceGlobalId} requires one explicit Paused Store sync control`)
     }
-    row.historyPolicy = historyPolicyEvidence(policy.rows[0], account, actor)
-    row.storeSyncControl = storeSyncControlEvidence(policy.rows[0], account)
+    const policy = await target.query(
+      `SELECT 1
+       FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    if (policy.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} target order-history policy must be absent before rebind`)
+    }
+    if (!plannedHistoryPolicy) {
+      fail(`${account.sourceGlobalId} requires an explicitly reviewed order-history choice`)
+    }
+    row.historyPolicy = plannedHistoryPolicy
+    row.storeSyncControl = storeSyncControlEvidence(control.rows[0], account)
   } else {
     const placeholder = await target.query(
       `SELECT id::text, global_id, provider, environment, display_name,
@@ -2215,7 +2466,7 @@ async function collectValidatedMaterials(input) {
         account,
         identity,
         input.bindings,
-        input.actor,
+        input.plannedHistoryPolicy,
       )
       if (placeholder.verification_state === 'verified') {
         fail(`${account.sourceGlobalId} is already rebound; export the committed rebind receipt instead`)
@@ -2391,12 +2642,12 @@ function redactedMaterialProjection(materials) {
   return materials.map((material) => material.redacted)
 }
 
-function buildPlanArtifact(input, materials) {
+function buildPlanArtifact(input, materials, createdAt) {
   const workspaces = input.workspaces || WORKSPACES
   const artifact = {
     format: PLAN_FORMAT,
     scriptVersion: SCRIPT_VERSION,
-    createdAt: new Date().toISOString(),
+    createdAt,
     actor: input.actor,
     selectedSourceAccountGlobalId: input.selectedAccountGlobalId,
     migrationManifestDigest: input.manifest.manifestDigest,
@@ -3052,8 +3303,6 @@ async function lockReviewedTargetAccount(client, material, actor) {
               account.credential_reference, account.commerce_credential_generation,
               account.receipt_intake_enabled, account.configuration,
               fence.verification_state,
-              history.provider AS history_provider, history.history_mode,
-              history.ingestion_floor, history.frozen_at, history.configured_by,
               control.desired_state AS sync_desired_state,
               control.explicit_choice AS sync_explicit_choice,
               control.revision AS sync_revision,
@@ -3066,14 +3315,11 @@ async function lockReviewedTargetAccount(client, material, actor) {
        JOIN operations_commerce_migration_provider_identity_fences fence
          ON fence.organization_id = account.organization_id
         AND fence.integration_account_id = account.id
-       JOIN operations_commerce_order_history_policies history
-         ON history.organization_id = account.organization_id
-        AND history.integration_account_id = account.id
        JOIN operations_commerce_store_sync_controls control
          ON control.organization_id = account.organization_id
         AND control.integration_account_id = account.id
        WHERE account.organization_id = $1::uuid AND account.id = $2::uuid
-       FOR UPDATE OF account, fence, history, control`,
+       FOR UPDATE OF account, fence, control`,
       [workspace.targetOrganizationId, identity.integrationId],
     )
     const state = locked.rows[0]
@@ -3087,9 +3333,17 @@ async function lockReviewedTargetAccount(client, material, actor) {
         !== canonicalJson(material.placeholder.targetConfiguration)
       || canonicalJson(storeSyncControlEvidence(state, account))
         !== canonicalJson(material.placeholder.storeSyncControl)
-      || canonicalJson(historyPolicyEvidence(state, account, actor))
-        !== canonicalJson(material.placeholder.historyPolicy)
     ) fail(`${account.sourceGlobalId} commerce placeholder changed before provider reconciliation`)
+    const policy = await client.query(
+      `SELECT 1
+       FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [workspace.targetOrganizationId, identity.integrationId],
+    )
+    if (policy.rowCount !== 0) {
+      fail(`${account.sourceGlobalId} commerce placeholder changed before provider reconciliation`)
+    }
     return
   }
   const locked = await client.query(
@@ -3136,6 +3390,34 @@ async function lockReviewedTargetAccount(client, material, actor) {
   ) fail(`${account.sourceGlobalId} carrier placeholder changed before provider reconciliation`)
 }
 
+async function insertReviewedHistoryPolicy(client, material, actor) {
+  if (material.account.integrationType !== 'commerce') return
+  const { workspace, account, identity, placeholder } = material
+  const policy = placeholder.historyPolicy
+  const inserted = await client.query(
+    `INSERT INTO operations_commerce_order_history_policies (
+       organization_id, integration_account_id, provider, history_mode,
+       ingestion_floor, frozen_at, configured_by
+     ) VALUES ($1::uuid, $2::uuid, $3, $4, $5::timestamptz, $6::timestamptz, $7)
+     RETURNING provider AS history_provider, history_mode, ingestion_floor,
+               frozen_at, configured_by`,
+    [
+      workspace.targetOrganizationId,
+      identity.integrationId,
+      policy.provider,
+      policy.historyMode,
+      policy.ingestionFloor,
+      policy.frozenAt,
+      actor,
+    ],
+  )
+  if (
+    inserted.rowCount !== 1
+    || canonicalJson(historyPolicyEvidence(inserted.rows[0], account, actor))
+      !== canonicalJson(policy)
+  ) fail(`${account.sourceGlobalId} reviewed order-history policy was not inserted atomically`)
+}
+
 export async function applyValidatedMaterials(input, materials, plan) {
   if (
     !Array.isArray(materials)
@@ -3157,6 +3439,7 @@ export async function applyValidatedMaterials(input, materials, plan) {
       input.workspaces || WORKSPACES,
     )
     assertReviewedPlan(plan, input, materials)
+    await insertReviewedHistoryPolicy(input.target, materials[0], input.actor)
     const providerWrites = await reconcileReviewedCallbacks(materials, input.verifier)
     for (const material of materials) {
       if (material.account.integrationType === 'commerce') {
@@ -3196,6 +3479,23 @@ export async function applyValidatedMaterials(input, materials, plan) {
 
 export async function planRebind(input) {
   const workspaces = input.workspaces || WORKSPACES
+  const selected = selectedProviderScope({ ...input, workspaces })
+  const historyMode = text(input.historyMode)
+  if (selected.account.integrationType === 'commerce' && !historyMode) {
+    fail('--history-mode is required when planning a commerce provider rebind')
+  }
+  if (selected.account.integrationType !== 'commerce' && historyMode) {
+    fail('--history-mode is accepted only for a commerce provider rebind plan')
+  }
+  const createdAt = new Date().toISOString()
+  const plannedHistoryPolicy = selected.account.integrationType === 'commerce'
+    ? plannedHistoryPolicyEvidence({
+      account: selected.account,
+      actor: input.actor,
+      historyMode,
+      frozenAt: createdAt,
+    })
+    : null
   await assertDatabaseBoundary(input.source, input.target)
   await assertTargetSchema(input.target)
   assertMigrationArtifacts(
@@ -3211,12 +3511,39 @@ export async function planRebind(input) {
     input.mapping,
     workspaces,
   )
-  const materials = await collectValidatedMaterials({ ...input, workspaces })
-  return { plan: buildPlanArtifact({ ...input, workspaces }, materials), materials }
+  const materials = await collectValidatedMaterials({
+    ...input,
+    workspaces,
+    plannedHistoryPolicy,
+  })
+  return {
+    plan: buildPlanArtifact({ ...input, workspaces }, materials, createdAt),
+    materials,
+  }
 }
 
 export async function applyRebind(input) {
   const workspaces = input.workspaces || WORKSPACES
+  if (text(input.historyMode)) {
+    fail('--history-mode is not accepted during apply; use the reviewed plan choice')
+  }
+  assertPlanEnvelope(input.plan, { ...input, workspaces })
+  const selected = selectedProviderScope({ ...input, workspaces })
+  assertReviewedManagedMaterialCommitment(input, selected.account)
+  let plannedHistoryPolicy = null
+  if (selected.account.integrationType === 'commerce') {
+    const reviewedPolicy = input.plan.providers?.[0]?.orderHistoryPolicy
+    const recomputedPolicy = plannedHistoryPolicyEvidence({
+      account: selected.account,
+      actor: input.actor,
+      historyMode: reviewedPolicy?.historyMode,
+      frozenAt: input.plan.createdAt,
+    })
+    if (canonicalJson(reviewedPolicy) !== canonicalJson(recomputedPolicy)) {
+      fail('The reviewed order-history policy is not derived from the confirmed rebind plan')
+    }
+    plannedHistoryPolicy = recomputedPolicy
+  }
   await assertDatabaseBoundary(input.source, input.target)
   await assertTargetSchema(input.target)
   assertMigrationArtifacts(
@@ -3232,7 +3559,11 @@ export async function applyRebind(input) {
     input.mapping,
     workspaces,
   )
-  const materials = await collectValidatedMaterials({ ...input, workspaces })
+  const materials = await collectValidatedMaterials({
+    ...input,
+    workspaces,
+    plannedHistoryPolicy,
+  })
   assertReviewedPlan(input.plan, { ...input, workspaces }, materials)
   const result = await applyValidatedMaterials({ ...input, workspaces }, materials, input.plan)
   return buildReceiptArtifact(input, input.plan, result.receipts)
@@ -3423,6 +3754,9 @@ export async function main(runtime = {}) {
   if (runtime.workspaces && runtime.allowTestBoundary !== true) {
     fail('Workspace allowlist overrides are test-only')
   }
+  if (runtime.managedRebindMaterial !== undefined && runtime.allowTestBoundary !== true) {
+    fail('Managed carrier runtime material overrides are test-only')
+  }
   const manifest = runtime.manifest || parsePrivateJson(args.manifest, 'Migration manifest')
   const mapping = runtime.mapping || parsePrivateJson(args.mapping, 'Migration mapping receipt')
   const workspaces = runtime.workspaces || WORKSPACES
@@ -3430,12 +3764,22 @@ export async function main(runtime = {}) {
     selectedAccountGlobalId: args.selectedAccountGlobalId,
     workspaces,
   })
+  if (
+    args.command === 'plan'
+    && selected.account.integrationType === 'commerce'
+    && !args.historyMode
+  ) fail('--history-mode is required when planning a commerce provider rebind')
+  if (
+    args.command === 'plan'
+    && selected.account.integrationType !== 'commerce'
+    && args.historyMode
+  ) fail('--history-mode is accepted only for a commerce provider rebind plan')
   const plan = args.command !== 'plan'
     ? (runtime.plan || parsePrivateJson(args.plan, 'Reviewed rebind plan'))
     : null
 
   if (args.command === 'export-receipt') {
-    if (runtime.managedRebindMaterial !== undefined || args.managedRebindMaterial) {
+    if (runtime.managedRebindMaterial !== undefined) {
       fail('Committed receipt export never accepts carrier reauthentication material')
     }
     assertTargetRailwayBoundary(environment)
@@ -3488,18 +3832,26 @@ export async function main(runtime = {}) {
   const targetKey = requiredSecret(environment, 'TARGET_INTEGRATION_CREDENTIAL_ENCRYPTION_KEY')
   if (sourceKey === targetKey) fail('Source and target encryption keys must be independently supplied')
   const bindings = endpointBindings(environment, sourceUrl, targetUrl)
-  const suppliedManagedMaterial = runtime.managedRebindMaterial
-    || (args.managedRebindMaterial
-      ? parsePrivateJson(args.managedRebindMaterial, 'Managed carrier reauthentication material')
-      : undefined)
-  if (
-    selected.account.rebindMode === 'source_authority'
-    && suppliedManagedMaterial === undefined
-  ) fail('--managed-rebind-material is required for a source-authority carrier rebind')
-  if (
-    selected.account.rebindMode !== 'source_authority'
-    && suppliedManagedMaterial !== undefined
-  ) fail('--managed-rebind-material is accepted only for a source-authority carrier rebind')
+  assertMigrationArtifacts(manifest, mapping, bindings, args.actor, workspaces)
+  let suppliedManagedMaterial = runtime.managedRebindMaterial
+  const managedFdSupplied = args.managedRebindSecretsFd !== undefined
+  const approvalSupplied = Boolean(args.confirmManagedSourceAuthority)
+  if (selected.account.rebindMode === 'source_authority') {
+    if (suppliedManagedMaterial !== undefined) {
+      if (managedFdSupplied || approvalSupplied) {
+        fail('Test carrier material cannot be combined with operator secret input')
+      }
+    } else {
+      if (!managedFdSupplied) {
+        fail('--managed-rebind-secrets-fd is required for a source-authority carrier rebind')
+      }
+      if (args.command === 'plan' && !approvalSupplied) {
+        fail('--confirm-managed-source-authority is required during source-authority plan review')
+      }
+    }
+  } else if (suppliedManagedMaterial !== undefined || managedFdSupplied || approvalSupplied) {
+    fail('Managed carrier secret input is accepted only for a source-authority rebind')
+  }
   const verifier = runtime.verifier || createProviderVerifier(runtime)
   const sourcePool = poolFor(sourceUrl, runtime)
   const targetPool = poolFor(targetUrl, runtime)
@@ -3510,6 +3862,38 @@ export async function main(runtime = {}) {
   try {
     await source.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
     sourceTransaction = true
+    await assertDatabaseBoundary(source, target)
+    await assertTargetSchema(target)
+    await assertCommittedMigrationReceipts(target, manifest, mapping, workspaces)
+    if (args.command === 'apply') {
+      assertPlanEnvelope(plan, {
+        actor: args.actor,
+        manifest,
+        mapping,
+        bindings,
+        workspaces,
+        selectedAccountGlobalId: args.selectedAccountGlobalId,
+        confirmDigest: args.confirmDigest,
+      })
+    }
+    if (selected.account.rebindMode === 'source_authority' && suppliedManagedMaterial === undefined) {
+      const secretInput = readBoundedSecretJsonFd(
+        args.managedRebindSecretsFd,
+        'Managed carrier secret input',
+      )
+      suppliedManagedMaterial = buildManagedRebindMaterial({
+        actor: args.actor,
+        manifest,
+        mapping,
+        bindings,
+        workspace: selected.workspace,
+        account: selected.account,
+        secretInput,
+        approvalToken: args.command === 'plan'
+          ? args.confirmManagedSourceAuthority
+          : managedSourceAuthorityApprovalToken(selected.account),
+      })
+    }
     if (args.command === 'plan') {
       await target.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
       targetReadTransaction = true
@@ -3525,6 +3909,7 @@ export async function main(runtime = {}) {
         verifier,
         workspaces,
         selectedAccountGlobalId: args.selectedAccountGlobalId,
+        historyMode: args.historyMode,
         managedRebindMaterial: suppliedManagedMaterial,
       })
       await target.query('COMMIT')

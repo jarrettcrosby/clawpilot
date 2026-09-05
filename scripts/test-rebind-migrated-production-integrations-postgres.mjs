@@ -16,7 +16,6 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
-  MANAGED_REBIND_MATERIAL_FORMAT,
   MIGRATION_MANIFEST_FORMAT,
   MIGRATION_MAPPING_FORMAT,
   MIGRATION_SCRIPT_VERSION,
@@ -24,12 +23,14 @@ import {
   TARGET_DATABASE_IDENTITY,
   applyRebind,
   applyValidatedMaterials,
+  buildManagedRebindMaterial,
   carrierAddressFingerprint,
   databaseEndpointFingerprint,
   digest,
   exportCommittedReceipt,
   main,
   managedRebindMaterialDigest,
+  managedSourceAuthorityApprovalToken,
   planRebind,
   sha256,
 } from './rebind-migrated-production-integrations.mjs'
@@ -173,6 +174,23 @@ CREATE TABLE operations_commerce_order_history_policies (
   configured_by text, created_at timestamptz DEFAULT now(),
   PRIMARY KEY (organization_id, integration_account_id)
 );
+CREATE FUNCTION protect_commerce_order_history_policy() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP <> 'INSERT' THEN
+    RAISE EXCEPTION 'commerce order history policy is immutable';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM operations_integration_accounts account
+    WHERE account.organization_id = NEW.organization_id
+      AND account.id = NEW.integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider = NEW.provider
+  ) THEN RAISE EXCEPTION 'commerce order history policy account is invalid'; END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER commerce_order_history_policy_guard
+BEFORE INSERT OR UPDATE OR DELETE ON operations_commerce_order_history_policies
+FOR EACH ROW EXECUTE FUNCTION protect_commerce_order_history_policy();
 CREATE TABLE operations_carrier_credentials (
   organization_id uuid NOT NULL, integration_account_id uuid NOT NULL,
   credential_ciphertext bytea NOT NULL, credential_iv bytea NOT NULL, credential_tag bytea NOT NULL,
@@ -669,35 +687,20 @@ function artifacts(data, bindings) {
 }
 
 function managedMaterial(data, artifact, bindings) {
-  const material = {
-    format: MANAGED_REBIND_MATERIAL_FORMAT,
+  return buildManagedRebindMaterial({
     actor,
-    migrationManifestDigest: artifact.manifest.manifestDigest,
-    migrationMappingDigest: digest(artifact.mapping),
-    targetDatabaseIdentity: TARGET_DATABASE_IDENTITY,
-    targetDatabaseEndpointSha256: bindings.target,
-    targetOrganizationId: data.targetOrg,
-    targetIntegrationAccountId: data.accounts.authority.targetId,
-    targetIntegrationAccountGlobalId: data.accounts.authority.targetGlobalId,
-    targetCarrierAccountId: data.accounts.authority.targetCarrierId,
-    targetCarrierAccountGlobalId: data.accounts.authority.targetCarrierGlobalId,
-    sourceAccountGlobalId: data.accounts.authority.sourceGlobalId,
-    provider: 'fedex_rest',
-    environment: 'sandbox',
-    authority: {
-      organizationReference: 'ga5122758',
-      integrationGlobalId: 'gia7335302',
-      carrierAccountGlobalId: 'gac2368052',
-    },
-    approved: true,
-    credential: {
+    manifest: artifact.manifest,
+    mapping: artifact.mapping,
+    bindings,
+    workspace: data.workspace,
+    account: data.accounts.authority,
+    secretInput: {
       clientId: 'fresh-target-fedex-client-9088',
       clientSecret: 'fresh-target-fedex-secret',
+      accountNumber: data.accounts.authority.authorityNumber,
     },
-    accountNumber: data.accounts.authority.authorityNumber,
-  }
-  material.materialDigest = managedRebindMaterialDigest(material)
-  return material
+    approvalToken: managedSourceAuthorityApprovalToken(data.accounts.authority),
+  })
 }
 
 function fakeVerifier(data) {
@@ -925,7 +928,28 @@ async function runAcceptance(sourceUrl, targetUrl) {
       /already rebound/u,
     )
 
-    const commerceInput = inputFor(data.accounts.commerce)
+    const commerceWithoutHistory = inputFor(data.accounts.commerce)
+    await assert.rejects(
+      planRebind(commerceWithoutHistory),
+      /--history-mode is required/u,
+    )
+    await assert.rejects(
+      planRebind({ ...commerceWithoutHistory, historyMode: 'provider_all' }),
+      /order-history choice is invalid/u,
+    )
+    await assert.rejects(
+      planRebind({ ...commerceWithoutHistory, historyMode: 'unbounded' }),
+      /order-history choice is invalid/u,
+    )
+    await assert.rejects(
+      planRebind({ ...directInput, historyMode: 'last_30_days' }),
+      /accepted only for a commerce provider rebind plan/u,
+    )
+    const commercePlanInput = {
+      ...commerceWithoutHistory,
+      historyMode: 'last_30_days',
+    }
+    const commerceApplyInput = commerceWithoutHistory
     const postMigrationPolicy = await target.query(
       `SELECT count(*)::integer AS count
        FROM operations_commerce_order_history_policies
@@ -933,48 +957,18 @@ async function runAcceptance(sourceUrl, targetUrl) {
       [data.targetOrg, data.accounts.commerce.targetId],
     )
     assert.equal(postMigrationPolicy.rows[0].count, 0)
-    await assert.rejects(
-      planRebind(commerceInput),
-      /requires one frozen target order-history policy/u,
-    )
-    await target.query(
-      `INSERT INTO operations_commerce_order_history_policies (
-         organization_id,integration_account_id,provider,history_mode,
-         ingestion_floor,frozen_at,configured_by
-       ) VALUES (
-         $1::uuid,$2::uuid,'shopify','last_30_days',
-         '2026-08-05T12:00:00.000Z','2026-09-04T12:00:00.000Z',NULL
-       )`,
-      [data.targetOrg, data.accounts.commerce.targetId],
-    )
-    await assert.rejects(
-      planRebind(commerceInput),
-      /target order-history policy attribution is invalid/u,
-    )
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET configured_by = 'different-operator@example.com'
-       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
-      [data.targetOrg, data.accounts.commerce.targetId],
-    )
-    await assert.rejects(
-      planRebind(commerceInput),
-      /target order-history policy attribution is invalid/u,
-    )
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET configured_by = $3
-       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
-      [data.targetOrg, data.accounts.commerce.targetId, actor],
-    )
-    const commercePlan = await planRebind(commerceInput)
+    const commercePlan = await planRebind(commercePlanInput)
     assert.equal(commercePlan.plan.providers.length, 1)
     assert.equal(commercePlan.plan.selectedSourceAccountGlobalId, data.accounts.commerce.sourceGlobalId)
+    const policyFrozenAt = commercePlan.plan.createdAt
+    const policyIngestionFloor = new Date(
+      new Date(policyFrozenAt).getTime() - 30 * 24 * 60 * 60 * 1000,
+    ).toISOString()
     assert.deepEqual(commercePlan.plan.providers[0].orderHistoryPolicy, {
       provider: 'shopify',
       historyMode: 'last_30_days',
-      ingestionFloor: '2026-08-05T12:00:00.000Z',
-      frozenAt: '2026-09-04T12:00:00.000Z',
+      ingestionFloor: policyIngestionFloor,
+      frozenAt: policyFrozenAt,
       configuredBy: actor,
     })
     assert.match(
@@ -996,26 +990,35 @@ async function runAcceptance(sourceUrl, targetUrl) {
       /^[a-f0-9]{64}$/u,
     )
     assert.equal(JSON.stringify(commercePlan.plan).includes('fixture-shopify-client-secret'), false)
-    await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET ingestion_floor = '2026-08-06T12:00:00.000Z'
+    const plannedPolicyCount = await target.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_commerce_order_history_policies
        WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
       [data.targetOrg, data.accounts.commerce.targetId],
     )
+    assert.equal(plannedPolicyCount.rows[0].count, 0, 'planning must not create history policy')
+    await target.query(
+      `INSERT INTO operations_commerce_order_history_policies (
+         organization_id, integration_account_id, provider, history_mode,
+         ingestion_floor, frozen_at, configured_by
+       ) VALUES ($1::uuid, $2::uuid, 'shopify', 'new_orders_only', now(), now(), $3)`,
+      [data.targetOrg, data.accounts.commerce.targetId, actor],
+    )
     await assert.rejects(
       applyWithDedicatedClients(source, target, {
-        ...commerceInput,
+        ...commerceApplyInput,
         plan: commercePlan.plan,
         confirmDigest: commercePlan.plan.planDigest,
       }),
-      /reviewed rebind provider evidence no longer matches/u,
+      /target order-history policy must be absent before rebind/u,
     )
+    await target.query('ALTER TABLE operations_commerce_order_history_policies DISABLE TRIGGER commerce_order_history_policy_guard')
     await target.query(
-      `UPDATE operations_commerce_order_history_policies
-       SET ingestion_floor = '2026-08-05T12:00:00.000Z'
-      WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+      `DELETE FROM operations_commerce_order_history_policies
+       WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
       [data.targetOrg, data.accounts.commerce.targetId],
     )
+    await target.query('ALTER TABLE operations_commerce_order_history_policies ENABLE TRIGGER commerce_order_history_policy_guard')
     const assertPostValidationDriftRejected = async (mutate, restore) => {
       const baseVerifier = fakeVerifier(data)
       let mutated = false
@@ -1038,7 +1041,7 @@ async function runAcceptance(sourceUrl, targetUrl) {
       try {
         await assert.rejects(
           applyWithDedicatedClients(source, target, {
-            ...commerceInput,
+            ...commerceApplyInput,
             verifier: driftVerifier,
             plan: commercePlan.plan,
             confirmDigest: commercePlan.plan.planDigest,
@@ -1104,7 +1107,7 @@ async function runAcceptance(sourceUrl, targetUrl) {
     let concurrentResults
     try {
       const concurrentInput = {
-        ...commerceInput,
+        ...commerceApplyInput,
         verifier: concurrentVerifier,
         plan: commercePlan.plan,
         confirmDigest: commercePlan.plan.planDigest,
@@ -1141,6 +1144,23 @@ async function runAcceptance(sourceUrl, targetUrl) {
     const authorityInput = inputFor(data.accounts.authority, {
       managedRebindMaterial: managedMaterial(data, artifact, bindings),
     })
+    assert.throws(
+      () => buildManagedRebindMaterial({
+        actor,
+        manifest: artifact.manifest,
+        mapping: artifact.mapping,
+        bindings,
+        workspace: data.workspace,
+        account: data.accounts.authority,
+        secretInput: {
+          clientId: 'fresh-target-fedex-client-9088',
+          clientSecret: 'fresh-target-fedex-secret',
+          accountNumber: data.accounts.authority.authorityNumber,
+        },
+        approvalToken: 'approve:wrong-authority',
+      }),
+      /source-authority approval changed/u,
+    )
     await assert.rejects(
       planRebind({
         ...authorityInput,
@@ -1246,15 +1266,25 @@ async function runAcceptance(sourceUrl, targetUrl) {
     const substitutedMaterial = structuredClone(authorityInput.managedRebindMaterial)
     substitutedMaterial.credential.clientSecret = 'fresh-target-fedex-secret-substitute'
     substitutedMaterial.materialDigest = managedRebindMaterialDigest(substitutedMaterial)
+    let substitutedProviderCalls = 0
+    const substitutedVerifier = {
+      ...authorityInput.verifier,
+      async carrier(...values) {
+        substitutedProviderCalls += 1
+        return authorityInput.verifier.carrier(...values)
+      },
+    }
     await assert.rejects(
       applyWithDedicatedClients(source, target, {
         ...authorityInput,
+        verifier: substitutedVerifier,
         managedRebindMaterial: substitutedMaterial,
         plan: authorityPlan.plan,
         confirmDigest: authorityPlan.plan.planDigest,
       }),
-      /reviewed rebind provider evidence no longer matches/u,
+      /managed carrier input does not match the confirmed rebind plan/u,
     )
+    assert.equal(substitutedProviderCalls, 0, 'changed apply secrets must not reach the provider')
     const authorityReceipt = await applyWithDedicatedClients(source, target, {
       ...authorityInput,
       plan: authorityPlan.plan,
@@ -1281,14 +1311,33 @@ async function runAcceptance(sourceUrl, targetUrl) {
            WHERE organization_id = $1::uuid AND state = 'materialized') AS carriers,
          (SELECT count(*)::integer FROM operations_commerce_sync_cursors
            WHERE organization_id = $1::uuid) AS fresh_cursors,
+         (SELECT count(*)::integer FROM operations_commerce_order_history_policies
+           WHERE organization_id = $1::uuid) AS history_policies,
          (SELECT count(*)::integer FROM audit_events
            WHERE organization_id = $1::uuid
              AND event_type = 'operations.migrated_provider_rebind.completed') AS receipts`,
       [data.targetOrg],
     )
     assert.deepEqual(materialized.rows[0], {
-      active: 3, carriers: 2, fresh_cursors: 5, receipts: 3,
+      active: 3, carriers: 2, fresh_cursors: 5, history_policies: 1, receipts: 3,
     })
+    await assert.rejects(
+      target.query(
+        `UPDATE operations_commerce_order_history_policies
+         SET history_mode = 'new_orders_only'
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      ),
+      /commerce order history policy is immutable/u,
+    )
+    await assert.rejects(
+      target.query(
+        `DELETE FROM operations_commerce_order_history_policies
+         WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+        [data.targetOrg, data.accounts.commerce.targetId],
+      ),
+      /commerce order history policy is immutable/u,
+    )
     const immutableReceipt = await target.query(
       `SELECT id::text FROM audit_events
        WHERE organization_id = $1::uuid
