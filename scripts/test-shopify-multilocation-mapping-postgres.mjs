@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
@@ -24,30 +24,11 @@ function command(file, args, options = {}) {
   }).trim()
 }
 
-function migrationFiles() {
-  return readdirSync(resolve(root, 'db/migrations'))
-    .filter((name) => /^\d+_.+\.sql$/u.test(name))
-    .sort((left, right) => left.localeCompare(right))
-}
-
-async function applyMigration(client, filename) {
-  const sql = readFileSync(resolve(root, 'db/migrations', filename), 'utf8')
-  await client.query('BEGIN')
-  try {
-    await client.query(sql)
-    await client.query(
-      'ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text',
-    )
-    await client.query(
-      `INSERT INTO schema_migrations (filename, checksum)
-       VALUES ($1, $2)`,
-      [filename, createHash('sha256').update(sql).digest('hex')],
-    )
-    await client.query('COMMIT')
-  } catch (error) {
-    await client.query('ROLLBACK')
-    throw new Error(`Migration ${filename} failed`, { cause: error })
-  }
+function applyMigrations(databaseUrl) {
+  command('npm', ['run', 'db:migrate'], {
+    env: { ...process.env, DATABASE_URL: databaseUrl },
+    timeout: 180_000,
+  })
 }
 
 async function waitForPostgres(databaseUrl) {
@@ -911,7 +892,6 @@ async function seed(client) {
 async function exercise(pool) {
   const client = await pool.connect()
   try {
-    for (const file of migrationFiles()) await applyMigration(client, file)
     await seed(client)
   } finally {
     client.release()
@@ -1271,6 +1251,7 @@ async function main() {
       'Supplied mapping-test database must be a local disposable database',
     )
     await waitForPostgres(suppliedDatabaseUrl)
+    applyMigrations(suppliedDatabaseUrl)
     const pool = new Pool({ connectionString: suppliedDatabaseUrl, max: 4 })
     try {
       await exercise(pool)
@@ -1303,6 +1284,7 @@ async function main() {
       + `${port}/shopify_mapping`
     )
     await waitForPostgres(databaseUrl)
+    applyMigrations(databaseUrl)
     const pool = new Pool({ connectionString: databaseUrl, max: 4 })
     try {
       await exercise(pool)
