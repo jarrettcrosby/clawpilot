@@ -481,6 +481,11 @@ const integrationService = loadTypeScriptModule(
         SHOPIFY_ORDER_PREVIEW_POLICY_VERSION: 'test-v1',
         ShopifyOrderPreviewError: StubProviderError,
       },
+      '@/lib/integrations/commerceOrderHistoryPolicy': {
+        normalizeCommerceOrderHistoryMode(value) {
+          return String(value || 'new_orders_only')
+        },
+      },
       '@/lib/persistence/commerceIntegrations': {
         async readCommerceWebhookCredentialFromPostgres() {
           return webhookRuntime
