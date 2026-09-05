@@ -114,6 +114,53 @@ async function expectHealthTamper(pool, healthSql, sql, label) {
   )
 }
 
+async function expectHealthChecksumFallthroughRejected(
+  pool,
+  healthSql,
+  { prepareOlderPhaseSql, hiddenMigrations, corruptedMigration, label },
+) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(prepareOlderPhaseSql)
+    for (const filename of hiddenMigrations) {
+      await client.query(
+        `UPDATE public.schema_migrations
+         SET filename = $2
+         WHERE filename = $1`,
+        [filename, `${filename}.tamper-hidden`],
+      )
+    }
+    assert.equal(
+      await healthApplied(client, healthSql),
+      true,
+      `${label} must first restore the exact older trigger phase`,
+    )
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET filename = $1, checksum = repeat('0', 64)
+       WHERE filename = $2`,
+      [corruptedMigration, `${corruptedMigration}.tamper-hidden`],
+    )
+    assert.equal(
+      await healthApplied(client, healthSql),
+      false,
+      `${label} must reject a present later phase with the wrong checksum`,
+    )
+    await client.query('ROLLBACK')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+  assert.equal(
+    await healthApplied(pool, healthSql),
+    true,
+    `${label} rollback must restore exact reconciliation health`,
+  )
+}
+
 async function seed(pool) {
   const organizationId = '03030000-0000-4000-8000-000000000001'
   const accountId = '03030000-0000-4000-8000-000000000002'
@@ -253,6 +300,61 @@ async function exercise(pool) {
      WHERE filename =
        '0316_operations_commerce_fulfillment_authority_leases.sql'`,
     'wrong 0316 migration checksum',
+  )
+  for (const migrationFilename of [
+    '0353_operations_commerce_workspace_migration_safety.sql',
+    '0354_operations_sales_shipping_workspace_migration_safety.sql',
+  ]) {
+    await expectHealthTamper(
+      pool,
+      health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename = '${migrationFilename}'`,
+      `wrong ${migrationFilename} checksum`,
+    )
+  }
+  await expectHealthChecksumFallthroughRejected(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    {
+      prepareOlderPhaseSql: `
+        DROP TRIGGER protect_active_migrated_source_authority_integration_write
+          ON public.operations_integration_accounts;
+        DROP TRIGGER enforce_migrated_commerce_provider_identity_write
+          ON public.operations_integration_accounts;
+        CREATE TRIGGER enforce_migrated_commerce_provider_identity_write
+          BEFORE UPDATE OF provider, environment, external_account_id, status
+          ON public.operations_integration_accounts
+          FOR EACH ROW EXECUTE FUNCTION
+            public.enforce_migrated_commerce_provider_identity()
+      `,
+      hiddenMigrations: [
+        '0354_operations_sales_shipping_workspace_migration_safety.sql',
+      ],
+      corruptedMigration:
+        '0354_operations_sales_shipping_workspace_migration_safety.sql',
+      label: '0354 checksum fallthrough',
+    },
+  )
+  await expectHealthChecksumFallthroughRejected(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    {
+      prepareOlderPhaseSql: `
+        DROP TRIGGER protect_active_migrated_source_authority_integration_write
+          ON public.operations_integration_accounts;
+        DROP TRIGGER enforce_migrated_commerce_provider_identity_write
+          ON public.operations_integration_accounts
+      `,
+      hiddenMigrations: [
+        '0354_operations_sales_shipping_workspace_migration_safety.sql',
+        '0353_operations_commerce_workspace_migration_safety.sql',
+      ],
+      corruptedMigration:
+        '0353_operations_commerce_workspace_migration_safety.sql',
+      label: '0353 checksum fallthrough',
+    },
   )
   await expectHealthTamper(
     pool,
@@ -1035,6 +1137,14 @@ async function main() {
         )
         for (const file of files.slice(leaseIndex)) {
           await applyMigration(client, file)
+          assert.equal(
+            await healthApplied(
+              client,
+              health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+            ),
+            true,
+            `Shopify webhook reconciliation health changed after ${file}`,
+          )
         }
       } finally {
         client.release()
