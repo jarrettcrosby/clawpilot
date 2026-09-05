@@ -119,7 +119,7 @@ export function commerceReadAccountSql(
       + `${alias}.environment = 'sandbox' AND `
       + 'operations_commerce_hosted_production_sandbox_read_is_current('
       + `${alias}.organization_id, ${alias}.id, '${capability}'`
-      + ')))'
+      + '))))'
   }
   return options.developmentRequiresActive
     ? `${alias}.status = 'active'`
