@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
 import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
 import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
@@ -2913,8 +2913,19 @@ function readLogTailUtf8(path: string, bytes: number): string {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const checkedAt = Date.now()
+  if (request?.nextUrl.searchParams.get('probe') === 'liveness') {
+    return NextResponse.json({
+      status: 'ok',
+      probe: 'liveness',
+      checkedAt,
+    }, {
+      headers: {
+        'Cache-Control': 'no-store, max-age=0',
+      },
+    })
+  }
   const railwayRuntime = Boolean(
     process.env.RAILWAY_ENVIRONMENT_NAME
     || process.env.RAILWAY_ENVIRONMENT_ID

@@ -129,10 +129,11 @@ npm run start &
 APP_PID=$!
 
 HEALTH_URL="http://127.0.0.1:${PORT:-4002}/api/health"
+LIVENESS_URL="${HEALTH_URL}?probe=liveness"
 READY=0
 for _attempt in $(seq 1 120); do
   kill -0 "$APP_PID" 2>/dev/null || fail "application exited before readiness validation"
-  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then(() => process.exit(0)).catch(() => process.exit(1))' "$HEALTH_URL"; then
+  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$LIVENESS_URL"; then
     READY=1
     break
   fi
