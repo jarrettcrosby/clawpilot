@@ -2915,12 +2915,52 @@ function readLogTailUtf8(path: string, bytes: number): string {
 
 export async function GET(request: NextRequest) {
   const checkedAt = Date.now()
-  if (request?.nextUrl.searchParams.get('probe') === 'liveness') {
+  const probe = request?.nextUrl.searchParams.get('probe')
+  if (probe === 'liveness') {
     return NextResponse.json({
       status: 'ok',
       probe: 'liveness',
       checkedAt,
     }, {
+      headers: {
+        'Cache-Control': 'no-store, max-age=0',
+      },
+    })
+  }
+
+  if (probe === 'readiness') {
+    const storage = getStorageDriver()
+    if (storage !== 'postgres') {
+      return NextResponse.json({
+        status: 'error',
+        probe: 'readiness',
+        database: 'not-configured',
+        credentialStore: 'not-configured',
+        checkedAt,
+      }, {
+        status: 503,
+        headers: {
+          'Cache-Control': 'no-store, max-age=0',
+        },
+      })
+    }
+
+    const [databaseResult, credentialStoreResult] = await Promise.allSettled([
+      query('SELECT 1 AS ready'),
+      queryAgentCredentials('SELECT 1 AS ready'),
+    ])
+    const ready = databaseResult.status === 'fulfilled'
+      && credentialStoreResult.status === 'fulfilled'
+    return NextResponse.json({
+      status: ready ? 'ok' : 'error',
+      probe: 'readiness',
+      database: databaseResult.status === 'fulfilled' ? 'reachable' : 'unreachable',
+      credentialStore: credentialStoreResult.status === 'fulfilled'
+        ? 'reachable'
+        : 'unreachable',
+      checkedAt,
+    }, {
+      status: ready ? 200 : 503,
       headers: {
         'Cache-Control': 'no-store, max-age=0',
       },

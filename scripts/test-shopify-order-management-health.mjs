@@ -393,6 +393,8 @@ assert.ok(
 function loadRoute({
   durable,
   structureApplied,
+  databaseReady = true,
+  credentialStoreReady = true,
   runtimeReadiness = {
     mode: 'strict',
     status: 'verified',
@@ -435,6 +437,9 @@ function loadRoute({
   })
   const query = async (sql) => {
     const statement = String(sql)
+    if (statement.includes('SELECT 1 AS ready') && !databaseReady) {
+      throw new Error('database unavailable')
+    }
     if (statement.includes('AS operations_shopify_order_management_applied')) {
       mainQuery = statement
       return { rows: [mainRow] }
@@ -489,7 +494,12 @@ function loadRoute({
       isHostedRuntime: () => true,
     },
     '@/lib/persistence/agentCredentials': {
-      query: async () => ({ rows: [{ operator_id: 'operator' }] }),
+      query: async (sql) => {
+        if (String(sql).includes('SELECT 1 AS ready') && !credentialStoreReady) {
+          throw new Error('credential store unavailable')
+        }
+        return { rows: [{ operator_id: 'operator' }] }
+      },
     },
     '@/lib/persistence/postgres': { query },
     '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
@@ -731,6 +741,59 @@ assert.equal(typeof livenessBody.checkedAt, 'number')
 assert.equal(livenessLoaded.getMainQuery(), null)
 assert.equal(livenessLoaded.getHealthReads(), 0)
 assert.equal(livenessLoaded.getRuntimeReadinessReads(), 0)
+
+const readinessLoaded = loadRoute({
+  durable: baseDurable,
+  structureApplied: true,
+})
+const readinessResponse = await readinessLoaded.GET({
+  nextUrl: new URL('https://example.test/api/health?probe=readiness'),
+})
+const readinessBody = JSON.parse(JSON.stringify(await readinessResponse.json()))
+assert.equal(readinessResponse.status, 200)
+assert.equal(readinessBody.status, 'ok')
+assert.equal(readinessBody.probe, 'readiness')
+assert.equal(readinessBody.database, 'reachable')
+assert.equal(readinessBody.credentialStore, 'reachable')
+assert.equal(typeof readinessBody.checkedAt, 'number')
+assert.equal(readinessLoaded.getMainQuery(), null)
+assert.equal(readinessLoaded.getHealthReads(), 0)
+assert.equal(readinessLoaded.getRuntimeReadinessReads(), 0)
+
+for (const readinessFailure of [
+  {
+    databaseReady: false,
+    credentialStoreReady: true,
+    database: 'unreachable',
+    credentialStore: 'reachable',
+  },
+  {
+    databaseReady: true,
+    credentialStoreReady: false,
+    database: 'reachable',
+    credentialStore: 'unreachable',
+  },
+]) {
+  const failedReadinessLoaded = loadRoute({
+    durable: baseDurable,
+    structureApplied: true,
+    ...readinessFailure,
+  })
+  const failedReadinessResponse = await failedReadinessLoaded.GET({
+    nextUrl: new URL('https://example.test/api/health?probe=readiness'),
+  })
+  const failedReadinessBody = JSON.parse(JSON.stringify(
+    await failedReadinessResponse.json(),
+  ))
+  assert.equal(failedReadinessResponse.status, 503)
+  assert.equal(failedReadinessBody.status, 'error')
+  assert.equal(failedReadinessBody.probe, 'readiness')
+  assert.equal(failedReadinessBody.database, readinessFailure.database)
+  assert.equal(
+    failedReadinessBody.credentialStore,
+    readinessFailure.credentialStore,
+  )
+}
 
 const processing = await executeScenario({
   durable: baseDurable,

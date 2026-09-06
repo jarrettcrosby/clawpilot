@@ -1043,8 +1043,8 @@ if (!backupAudit.includes("const DEFAULT_ENVIRONMENTS = ['development', 'product
 }
 
 const railway = readJson('railway.json')
-if (String(railway?.deploy?.healthcheckPath || '') !== '/api/health') {
-  fail('railway.json deploy.healthcheckPath must be "/api/health"')
+if (String(railway?.deploy?.healthcheckPath || '') !== '/api/health?probe=readiness') {
+  fail('railway.json deploy.healthcheckPath must be "/api/health?probe=readiness"')
 }
 
 if (!String(railway?.deploy?.startCommand || '').includes('npm run start:railway')) {
@@ -1086,33 +1086,47 @@ if (
 
 const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'utf8')
 if (!railwayStart.includes('npm run release:record')) {
-  fail('scripts/start-railway.sh must record a release after runtime health validation')
+  fail('scripts/start-railway.sh must record a release after runtime readiness validation')
 }
 const livenessProbePosition = railwayStart.indexOf('"$LIVENESS_URL"')
 const livenessWorkerStartPosition = railwayStart.indexOf(
   'node scripts/pipeline-outbox-poller.mjs &',
 )
-const fullHealthProbePosition = railwayStart.lastIndexOf('"$HEALTH_URL"')
+const readinessProbePosition = railwayStart.lastIndexOf('"$READINESS_URL"')
 if (
   !railwayStart.includes('LIVENESS_URL="${HEALTH_URL}?probe=liveness"')
+  || !railwayStart.includes('READINESS_URL="${HEALTH_URL}?probe=readiness"')
   || !railwayStart.includes('response.ok ? 0 : 1')
+  || !railwayStart.includes('AbortSignal.timeout(10000)')
+  || !railwayStart.includes('for _attempt in $(seq 1 25)')
   || livenessProbePosition < 0
   || livenessWorkerStartPosition <= livenessProbePosition
-  || fullHealthProbePosition <= livenessWorkerStartPosition
+  || readinessProbePosition <= livenessWorkerStartPosition
 ) {
-  fail('Railway startup must use liveness before workers and full health after workers')
+  fail('Railway startup must use liveness before workers and bounded readiness after workers')
 }
 const livenessHealthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
 )
 for (const requiredLivenessContract of [
-  "request?.nextUrl.searchParams.get('probe') === 'liveness'",
+  "const probe = request?.nextUrl.searchParams.get('probe')",
+  "probe === 'liveness'",
   "probe: 'liveness'",
   "'Cache-Control': 'no-store, max-age=0'",
 ]) {
   if (!livenessHealthRoute.includes(requiredLivenessContract)) {
     fail(`Health liveness contract is missing: ${requiredLivenessContract}`)
+  }
+}
+for (const requiredReadinessContract of [
+  "probe === 'readiness'",
+  "query('SELECT 1 AS ready')",
+  "queryAgentCredentials('SELECT 1 AS ready')",
+  "probe: 'readiness'",
+]) {
+  if (!livenessHealthRoute.includes(requiredReadinessContract)) {
+    fail(`Health readiness contract is missing: ${requiredReadinessContract}`)
   }
 }
 for (const requiredIntegrationCredentialGate of [
@@ -1155,18 +1169,20 @@ if (
   fail('Railway adoption maintenance must suppress and safely omit the outbox poller')
 }
 
-const healthGatePosition = railwayStart.indexOf('[[ "$HEALTHY" == "1" ]]')
+const readinessGatePosition = railwayStart.indexOf(
+  '[[ "$READINESS_CONFIRMED" == "1" ]]',
+)
 const toastBackfillPosition = railwayStart.indexOf('npm run toast:activate-payment-date-backfill')
 const releaseRecordPosition = railwayStart.indexOf('npm run release:record')
 if (
-  healthGatePosition < 0
-  || toastBackfillPosition < healthGatePosition
+  readinessGatePosition < 0
+  || toastBackfillPosition < readinessGatePosition
   || releaseRecordPosition < toastBackfillPosition
 ) {
-  fail('scripts/start-railway.sh must activate staged Toast backfills after health and before release recording')
+  fail('scripts/start-railway.sh must activate staged Toast backfills after readiness and before release recording')
 }
-if (releaseRecordPosition < healthGatePosition) {
-  fail('scripts/start-railway.sh must record releases only after runtime health validation')
+if (releaseRecordPosition < readinessGatePosition) {
+  fail('scripts/start-railway.sh must record releases only after runtime readiness validation')
 }
 
 for (const requiredPath of [

@@ -130,6 +130,7 @@ APP_PID=$!
 
 HEALTH_URL="http://127.0.0.1:${PORT:-4002}/api/health"
 LIVENESS_URL="${HEALTH_URL}?probe=liveness"
+READINESS_URL="${HEALTH_URL}?probe=readiness"
 READY=0
 for _attempt in $(seq 1 120); do
   kill -0 "$APP_PID" 2>/dev/null || fail "application exited before readiness validation"
@@ -148,20 +149,21 @@ else
   echo "[railway-start] integration credential adoption maintenance is active; the pipeline outbox poller is suppressed" >&2
 fi
 
-HEALTHY=0
-for _attempt in $(seq 1 120); do
-  kill -0 "$APP_PID" 2>/dev/null || fail "application exited before health validation"
+READINESS_CONFIRMED=0
+for _attempt in $(seq 1 25); do
+  kill -0 "$APP_PID" 2>/dev/null || fail "application exited before readiness validation"
   if [[ -n "$WORKER_PID" ]]; then
     kill -0 "$WORKER_PID" 2>/dev/null \
-      || fail "runtime worker exited before health validation"
+      || fail "runtime worker exited before readiness validation"
   fi
-  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(3000) }).then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))' "$HEALTH_URL"; then
-    HEALTHY=1
+  if node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(10000) }).then(async (response) => { const body = await response.json().catch(() => null); process.exit(response.ok && body?.status === "ok" && body?.probe === "readiness" ? 0 : 1) }).catch(() => process.exit(1))' "$READINESS_URL"; then
+    READINESS_CONFIRMED=1
     break
   fi
   sleep 1
 done
-[[ "$HEALTHY" == "1" ]] || fail "application did not pass health validation within 120 seconds"
+[[ "$READINESS_CONFIRMED" == "1" ]] \
+  || fail "application did not pass readiness validation within 300 seconds"
 
 if [[ "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" == "strict" ]]; then
   npm run toast:activate-payment-date-backfill
