@@ -1773,7 +1773,9 @@ async function faireEnvelope(
       }
     : await listFaireOrders(options, {
         cursor: page.orderCursor,
-        updatedAtMin: page.windowStart,
+        // Faire's opaque cursor carries the provider-defined continuation.
+        // The provider rejects continuation requests that repeat updated_at_min.
+        ...(page.orderCursor ? {} : { updatedAtMin: page.windowStart }),
         limit: FAIRE_ORDER_PAGE_SIZE,
       })
   const orderNodes = faireCollection(providerPage, 'orders')
