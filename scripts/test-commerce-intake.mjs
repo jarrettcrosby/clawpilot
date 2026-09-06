@@ -3016,12 +3016,12 @@ const service = loadTypeScriptModule(
         async listFaireOrders(_options, listOptions) {
           providerReads.faireOrders += 1
           assert.equal(listOptions.limit, 50)
-          assert.equal(
-            listOptions.updatedAtMin,
-            operationalOrderWindowStart,
-            'Faire operational reads must carry the frozen intake boundary',
-          )
           if (!listOptions.cursor) {
+            assert.equal(
+              listOptions.updatedAtMin,
+              operationalOrderWindowStart,
+              'Faire root operational reads must carry the frozen intake boundary',
+            )
             return {
               orders: [{
                 id: 'faire-order-1',
@@ -3031,6 +3031,11 @@ const service = loadTypeScriptModule(
             }
           }
           assert.equal(listOptions.cursor, 'faire-orders-page-2')
+          assert.equal(
+            listOptions.updatedAtMin,
+            undefined,
+            'Faire continuation reads must rely on the opaque cursor without repeating the frozen boundary',
+          )
           return { orders: [{
             id: 'faire-order-2',
             brand_id: faireRuntime.externalAccountId,
