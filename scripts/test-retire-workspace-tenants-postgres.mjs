@@ -164,6 +164,18 @@ async function installFixture(client) {
       description text NOT NULL,
       created_at timestamptz NOT NULL
     );
+    CREATE TABLE tenant_delegations (
+      id uuid PRIMARY KEY,
+      platform_organization_id uuid NOT NULL
+        REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+      account_owner_organization_id uuid NOT NULL
+        REFERENCES workspace_organizations(id) ON DELETE RESTRICT
+    );
+    CREATE TABLE empty_tenant_relation (
+      id uuid PRIMARY KEY,
+      executing_organization_id uuid NOT NULL
+        REFERENCES workspace_organizations(id) ON DELETE RESTRICT
+    );
     CREATE TABLE crm_organizations (
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE RESTRICT,
@@ -397,6 +409,12 @@ async function installFixture(client) {
      VALUES ($1, $2, $3, 'Safe retained asset', $4)`,
     [safeAssetId, safeAssetReference, safeOrganizationId, fixedTime],
   )
+  await client.query(
+    `INSERT INTO tenant_delegations (
+       id, platform_organization_id, account_owner_organization_id
+     ) VALUES ($1, $2, $3)`,
+    [randomUUID(), APPROVED_TARGETS[0].organizationId, safeOrganizationId],
+  )
   return { aliasReference, safeAssetId, safeAssetReference }
 }
 
@@ -450,8 +468,33 @@ try {
       databaseEndpointFingerprint(databaseUrl),
   }
   const planPath = join(artifacts, 'reviewed-plan.json')
+  const blockedPlanPath = join(artifacts, 'blocked-plan.json')
+  const invalidIdentityPlanPath = join(artifacts, 'invalid-identity-plan.json')
   const receiptPath = join(artifacts, 'receipt.json')
   const before = await pool.query('SELECT count(*)::integer AS count FROM workspace_organizations')
+  await pool.query(
+    'UPDATE workspace_organizations SET organization_type = $1 WHERE id = $2',
+    ['root', APPROVED_TARGETS[0].organizationId],
+  )
+  await assert.rejects(
+    () => run([
+      ...commonFlags(), '--output', invalidIdentityPlanPath,
+    ], environment, { pool }),
+    /scaffold identity mismatch/u,
+  )
+  await pool.query(
+    'UPDATE workspace_organizations SET organization_type = $1 WHERE id = $2',
+    ['member', APPROVED_TARGETS[0].organizationId],
+  )
+  const blocked = await run([
+    ...commonFlags(), '--output', blockedPlanPath,
+  ], environment, { pool })
+  assert.equal(blocked.applyReady, false)
+  const blockedManifest = JSON.parse(readFileSync(blockedPlanPath, 'utf8'))
+  assert.deepEqual(blockedManifest.scope.blockers.crossTenantRows, [{
+    table: 'tenant_delegations', column: 'account_owner_organization_id', count: 1,
+  }])
+  await pool.query('DELETE FROM tenant_delegations')
   const planResult = await run([
     ...commonFlags(), '--output', planPath,
   ], environment, { pool })
@@ -470,6 +513,12 @@ try {
   assert.equal(manifest.scope.blockers.relationCycles.length, 0)
   assert.equal(manifest.scope.blockers.preservedRestricts.length, 0)
   assert.equal(manifest.scope.blockers.crossTenantRows.length, 0)
+  assert.equal(manifest.scope.blockers.unclassifiedOrganizationRoles.length, 0)
+  assert.ok(manifest.lockedRelations.some((relation) => relation.name === 'empty_tenant_relation'))
+  assert.ok(manifest.organizationOwnership.roles.some((role) => (
+    role.table === 'tenant_delegations'
+      && role.column === 'account_owner_organization_id'
+  )))
 
   const applyBase = [
     'apply', ...commonFlags(),
@@ -477,6 +526,12 @@ try {
     '--confirm-digest', manifest.manifestDigest,
     '--receipt-output', receiptPath,
   ]
+  await pool.query('CREATE TABLE post_plan_catalog_drift (id uuid PRIMARY KEY)')
+  await assert.rejects(
+    () => run(applyBase, environment, { pool }),
+    /relation lock catalog drifted/u,
+  )
+  await pool.query('DROP TABLE post_plan_catalog_drift')
   await assert.rejects(
     () => run(applyBase, environment, { pool }),
     /SuiteCRM is not called/u,
@@ -504,6 +559,19 @@ try {
   ], environment, { pool })
   assert.equal(verified.ok, true)
   assert.equal(verified.suiteCrmRecordsRetainedExternally, 3)
+  const realDateNow = Date.now
+  const futureNow = realDateNow() + (31 * 60 * 1000)
+  Date.now = () => futureNow
+  try {
+    const expiredPlanVerification = await run([
+      'verify', ...commonFlags(),
+      '--manifest', planPath,
+      '--confirm-digest', manifest.manifestDigest,
+    ], environment, { pool })
+    assert.equal(expiredPlanVerification.ok, true)
+  } finally {
+    Date.now = realDateNow
+  }
 
   const targetIds = APPROVED_TARGETS.map((target) => target.organizationId)
   const remainingTargets = await pool.query(
@@ -576,6 +644,21 @@ try {
       [receipt.rows[0].id],
     ),
     /immutable/u,
+  )
+  await pool.query(
+    'ALTER TABLE workspace_tenant_retirement_receipts DISABLE TRIGGER reject_workspace_tenant_retirement_receipt_write',
+  )
+  await pool.query(
+    `UPDATE workspace_tenant_retirement_receipts SET receipt_digest = $1 WHERE id = $2`,
+    ['f'.repeat(64), receipt.rows[0].id],
+  )
+  await assert.rejects(
+    () => run([
+      'verify', ...commonFlags(),
+      '--manifest', planPath,
+      '--confirm-digest', manifest.manifestDigest,
+    ], environment, { pool }),
+    /receipt digest is invalid/u,
   )
   await assert.rejects(
     () => pool.query('DELETE FROM tenant_assets WHERE id = $1', [fixture.safeAssetId]),

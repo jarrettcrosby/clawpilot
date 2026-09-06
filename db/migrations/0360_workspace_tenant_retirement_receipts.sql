@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS workspace_tenant_retirement_receipts (
     jsonb_typeof(target_organizations) = 'array'
     AND jsonb_array_length(target_organizations) > 0
   ),
+  lock_catalog_digest text NOT NULL CHECK (lock_catalog_digest ~ '^[a-f0-9]{64}$'),
+  locked_relations jsonb NOT NULL CHECK (
+    jsonb_typeof(locked_relations) = 'array'
+    AND jsonb_array_length(locked_relations) > 0
+  ),
   scope_digest text NOT NULL CHECK (scope_digest ~ '^[a-f0-9]{64}$'),
   scope_counts jsonb NOT NULL CHECK (jsonb_typeof(scope_counts) = 'object'),
   retired_references text[] NOT NULL,
@@ -38,6 +43,7 @@ CREATE TABLE IF NOT EXISTS workspace_tenant_retirement_receipts (
   external_system_disposition jsonb NOT NULL CHECK (
     jsonb_typeof(external_system_disposition) = 'object'
   ),
+  deleted_counts jsonb NOT NULL CHECK (jsonb_typeof(deleted_counts) = 'object'),
   verification jsonb NOT NULL CHECK (jsonb_typeof(verification) = 'object'),
   completed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );

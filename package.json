@@ -225,7 +225,7 @@
     "crm:delete-unresolved-interactions": "node scripts/delete-unresolved-crm-interactions.mjs",
     "crm:retire-production-test-data": "node scripts/retire-production-test-data.mjs",
     "tenants:retire": "node scripts/retire-workspace-tenants.mjs",
-    "test:tenant-retirement": "node scripts/test-retire-workspace-tenants.mjs && node scripts/test-retire-workspace-tenants-postgres.mjs",
+    "test:tenant-retirement": "node scripts/test-retire-workspace-tenants.mjs && node scripts/test-retire-workspace-tenants-postgres.mjs && node scripts/test-retire-workspace-tenants-full-schema-postgres.mjs",
     "crm:migrate-sales-to-episcs": "node scripts/migrate-sales-pipeline-to-episcs.mjs",
     "crm:reconcile-ag-commerce-product-names": "node scripts/reconcile-ag-alchemy-commerce-product-names.mjs",
     "crm:reproject-suitecrm-product-image": "node scripts/requeue-suitecrm-native-product-image.mjs",

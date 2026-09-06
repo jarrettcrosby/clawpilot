@@ -16,6 +16,7 @@ import {
   canonicalJson,
   computeDeletionOrder,
   databaseEndpointFingerprint,
+  deriveOrganizationOwnership,
   digest,
   manifestDigest,
   parseArguments,
@@ -34,29 +35,37 @@ const common = [
   ...exactTargets,
 ]
 
-assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v1')
-assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v1')
-assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v1')
+assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v2')
+assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v2')
+assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v2')
 assert.equal(PRODUCTION_DATABASE_IDENTITY, '0474a18c-649c-491b-bea1-7da006d21d81')
 assert.deepEqual(APPROVED_TARGETS.map((target) => ({
   organizationId: target.organizationId,
   referenceCode: target.referenceCode,
   name: target.name,
+  organizationType: target.organizationType,
+  parentId: target.parentId,
 })), [
   {
     organizationId: '33785418-9927-4e10-a492-d3a44b9b6f21',
     referenceCode: 'ga42g1438l4j2s',
     name: 'AG Alchemy, LLC',
+    organizationType: 'member',
+    parentId: null,
   },
   {
     organizationId: '3b9ceada-a4ff-4363-8e78-6069dee76328',
     referenceCode: 'gakrnoh15krp9n',
     name: 'French Florist',
+    organizationType: 'member',
+    parentId: null,
   },
   {
     organizationId: 'c8fcf491-cf8c-469a-b03c-0026a762752c',
     referenceCode: 'gac10cb46e3rpl',
     name: 'Test Pro Bakery Bites',
+    organizationType: 'member',
+    parentId: null,
   },
 ])
 
@@ -176,6 +185,46 @@ assert.deepEqual(
   ).ordered.map((relation) => relation.name),
   ['crm_organizations', 'pipeline_spaces', 'workspace_organizations'],
 )
+
+const ownershipRelations = [
+  {
+    oid: '1', schema: 'public', name: 'workspace_organizations', kind: 'r',
+    columns: [{ name: 'id', typeOid: '2950' }, { name: 'parent_id', typeOid: '2950' }],
+  },
+  {
+    oid: '2', schema: 'public', name: 'rate_accounts', kind: 'r',
+    columns: [
+      { name: 'id', typeOid: '2950' },
+      { name: 'platform_organization_id', typeOid: '2950' },
+      { name: 'account_owner_organization_id', typeOid: '2950' },
+    ],
+  },
+  {
+    oid: '3', schema: 'public', name: 'executions', kind: 'r',
+    columns: [{ name: 'executing_organization_id', typeOid: '2950' }],
+  },
+]
+const ownershipForeignKeys = [
+  {
+    name: 'rate_platform_fk', child_oid: '2', parent_oid: '1',
+    childColumns: ['platform_organization_id'], parentColumns: ['id'],
+  },
+  {
+    name: 'rate_owner_fk', child_oid: '2', parent_oid: '1',
+    childColumns: ['account_owner_organization_id'], parentColumns: ['id'],
+  },
+  {
+    name: 'execution_owner_fk', child_oid: '3', parent_oid: '2',
+    childColumns: ['executing_organization_id'], parentColumns: ['account_owner_organization_id'],
+  },
+]
+const ownership = deriveOrganizationOwnership(ownershipRelations, ownershipForeignKeys)
+assert.deepEqual(ownership.unclassified, [])
+assert.deepEqual(ownership.roles.map(({ table, column }) => `${table}.${column}`), [
+  'executions.executing_organization_id',
+  'rate_accounts.account_owner_organization_id',
+  'rate_accounts.platform_organization_id',
+])
 assert.deepEqual(
   computeDeletionOrder(['a', 'b'], [['a', 'b'], ['b', 'a']]).cycles,
   ['a', 'b'],
@@ -192,6 +241,9 @@ for (const expected of [
   'workspace_tenant_retirement_scope',
   'pg_catalog.pg_constraint',
   'IN ACCESS EXCLUSIVE MODE',
+  'lockCatalogDigest',
+  'unclassifiedOrganizationRoles',
+  'Committed retirement receipt digest is invalid',
   'DISABLE TRIGGER',
   'Post-delete relational absence verification failed',
   'postCommitVerification',
@@ -210,6 +262,8 @@ for (const forbidden of [
 }
 assert.match(migration, /workspace_tenant_retirement_receipts/u)
 assert.match(migration, /BEFORE UPDATE OR DELETE/u)
+assert.match(migration, /locked_relations/u)
+assert.match(migration, /deleted_counts/u)
 assert.match(migration, /retirement receipts are immutable/u)
 assert.doesNotMatch(migration, /REFERENCES\s+workspace_organizations/iu)
 

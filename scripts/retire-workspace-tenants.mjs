@@ -15,9 +15,9 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-export const SCRIPT_VERSION = 'workspace-tenant-retirement-v1'
-export const PLAN_FORMAT = 'clawpilot-workspace-tenant-retirement-plan-v1'
-export const RECEIPT_FORMAT = 'clawpilot-workspace-tenant-retirement-receipt-v1'
+export const SCRIPT_VERSION = 'workspace-tenant-retirement-v2'
+export const PLAN_FORMAT = 'clawpilot-workspace-tenant-retirement-plan-v2'
+export const RECEIPT_FORMAT = 'clawpilot-workspace-tenant-retirement-receipt-v2'
 export const PRODUCTION_DATABASE_IDENTITY = '0474a18c-649c-491b-bea1-7da006d21d81'
 export const PRODUCTION_RAILWAY_PROJECT_ID = 'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
 export const PRODUCTION_RAILWAY_ENVIRONMENT_ID = '058ce52f-1d3b-44bb-afe2-0df2bf24efb9'
@@ -31,18 +31,24 @@ export const APPROVED_TARGETS = Object.freeze([
     organizationId: '33785418-9927-4e10-a492-d3a44b9b6f21',
     referenceCode: 'ga42g1438l4j2s',
     name: 'AG Alchemy, LLC',
+    organizationType: 'member',
+    parentId: null,
   }),
   Object.freeze({
     key: 'french-florist',
     organizationId: '3b9ceada-a4ff-4363-8e78-6069dee76328',
     referenceCode: 'gakrnoh15krp9n',
     name: 'French Florist',
+    organizationType: 'member',
+    parentId: null,
   }),
   Object.freeze({
     key: 'test-pro-bakery-bites',
     organizationId: 'c8fcf491-cf8c-469a-b03c-0026a762752c',
     referenceCode: 'gac10cb46e3rpl',
     name: 'Test Pro Bakery Bites',
+    organizationType: 'member',
+    parentId: null,
   }),
 ])
 
@@ -50,11 +56,19 @@ const SHA256 = /^[a-f0-9]{64}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u
 const REFERENCE = /^g[a-z]{1,4}(?:[0-9]{7}|[0-9a-v]{12})$/u
-const DIRECT_SCOPE_COLUMNS = new Set([
-  'organization_id',
-  'workspace_organization_id',
-  'organization_root_id',
-  'root_organization_id',
+// These UUIDs identify CRM accounts inside a workspace, not workspace tenants.
+// Every other organization-like UUID column must be proven reachable from
+// workspace_organizations.id through runtime foreign-key column mappings. A
+// new unclassified role is therefore a plan blocker, not an implicit guess.
+const REVIEWED_NON_TENANT_ORGANIZATION_COLUMNS = new Set([
+  'crm_contacts.organization_id',
+  'crm_interactions.organization_id',
+  'crm_leads.organization_id',
+  'crm_meetings.organization_id',
+  'crm_opportunities.organization_id',
+  'crm_organizations.parent_organization_id',
+  // Audit history is deliberately retained and verified separately.
+  'audit_events.organization_id',
 ])
 const PRESERVED_TABLES = new Set([
   'app_settings',
@@ -152,6 +166,115 @@ export function quoteIdentifier(value) {
 
 function qualified(relation) {
   return `${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)}`
+}
+
+function relationColumnKey(tableOid, column) {
+  return `${tableOid}:${column}`
+}
+
+function isOrganizationLikeUuid(column) {
+  return column.typeOid === '2950'
+    && /(?:^|_)organization(?:_[a-z0-9]+)*_id$/u.test(column.name)
+}
+
+function relationDescriptor(relation) {
+  return { schema: relation.schema, name: relation.name, kind: relation.kind }
+}
+
+export function deriveOrganizationOwnership(relations, foreignKeys) {
+  const relationByOid = new Map(relations.map((relation) => [relation.oid, relation]))
+  const workspace = relations.find((relation) => (
+    relation.schema === 'public' && relation.name === 'workspace_organizations'
+  ))
+  if (!workspace?.columns.some((column) => column.name === 'id' && column.typeOid === '2950')) {
+    fail('workspace_organizations.id UUID ownership root is missing')
+  }
+
+  const paths = new Map([[relationColumnKey(workspace.oid, 'id'), [
+    'workspace_organizations.id',
+  ]]])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const foreignKey of foreignKeys) {
+      const child = relationByOid.get(foreignKey.child_oid)
+      const parent = relationByOid.get(foreignKey.parent_oid)
+      if (!child || !parent) continue
+      foreignKey.childColumns.forEach((childColumn, index) => {
+        const parentColumn = foreignKey.parentColumns[index]
+        const parentKey = relationColumnKey(parent.oid, parentColumn)
+        const childKey = relationColumnKey(child.oid, childColumn)
+        if (!paths.has(parentKey) || paths.has(childKey)) return
+        paths.set(childKey, [
+          ...paths.get(parentKey),
+          `${foreignKey.name}:${child.name}.${childColumn}`,
+        ])
+        changed = true
+      })
+    }
+  }
+
+  const roles = []
+  const reviewedNonTenant = []
+  const unclassified = []
+  for (const relation of relations) {
+    for (const column of relation.columns.filter(isOrganizationLikeUuid)) {
+      const key = relationColumnKey(relation.oid, column.name)
+      const display = `${relation.name}.${column.name}`
+      if (paths.has(key)) {
+        roles.push({ table: relation.name, column: column.name, path: paths.get(key) })
+        continue
+      }
+      const nonTenantForeignKey = foreignKeys.find((foreignKey) => (
+        foreignKey.child_oid === relation.oid
+        && foreignKey.childColumns.some((childColumn, index) => (
+          childColumn === column.name
+          && !paths.has(relationColumnKey(
+            foreignKey.parent_oid,
+            foreignKey.parentColumns[index],
+          ))
+        ))
+      ))
+      if (nonTenantForeignKey) {
+        const parent = relationByOid.get(nonTenantForeignKey.parent_oid)
+        reviewedNonTenant.push({
+          table: relation.name,
+          column: column.name,
+          reason: `foreign_entity:${parent?.name || 'unknown'}:${nonTenantForeignKey.name}`,
+        })
+      } else if (REVIEWED_NON_TENANT_ORGANIZATION_COLUMNS.has(display)) {
+        reviewedNonTenant.push({
+          table: relation.name,
+          column: column.name,
+          reason: 'explicit_preserved_or_hierarchy_review',
+        })
+      } else {
+        unclassified.push({ table: relation.name, column: column.name })
+      }
+    }
+  }
+  const compare = (left, right) => (
+    left.table.localeCompare(right.table) || left.column.localeCompare(right.column)
+  )
+  roles.sort(compare)
+  reviewedNonTenant.sort(compare)
+  unclassified.sort(compare)
+  return { roles, reviewedNonTenant, unclassified }
+}
+
+async function loadLockCatalog(client) {
+  const result = await client.query(
+    `SELECT namespace.nspname AS schema, relation.relname AS name,
+            relation.relkind::text AS kind
+     FROM pg_catalog.pg_class relation
+     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = 'public'
+       AND relation.relkind IN ('r', 'p')
+       AND relation.relpersistence <> 't'
+     ORDER BY namespace.nspname, relation.relname, relation.relkind`,
+  )
+  const relations = result.rows.map(relationDescriptor)
+  return { relations, digest: digest(relations) }
 }
 
 function requireSingle(values, flag) {
@@ -394,7 +517,7 @@ async function loadCatalog(client) {
      FROM pg_catalog.pg_class relation
      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
      WHERE namespace.nspname = 'public'
-       AND relation.relkind = 'r'
+       AND relation.relkind IN ('r', 'p')
      ORDER BY namespace.nspname, relation.relname`,
   )
   const columnsResult = await client.query(
@@ -405,7 +528,7 @@ async function loadCatalog(client) {
      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
      JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = relation.oid
      WHERE namespace.nspname = 'public'
-       AND relation.relkind = 'r'
+       AND relation.relkind IN ('r', 'p')
        AND attribute.attnum > 0
        AND NOT attribute.attisdropped
      ORDER BY relation.oid, attribute.attnum`,
@@ -463,6 +586,9 @@ async function loadCatalog(client) {
       .filter((column) => column.table_oid === row.oid)
       .map((column) => ({ name: column.name, typeOid: column.type_oid, type: column.type })),
   }))
+  if (relations.some((relation) => relation.kind === 'p')) {
+    fail('Partitioned public tables require an explicit retirement implementation')
+  }
   const relationByOid = new Map(relations.map((relation) => [relation.oid, relation]))
   const foreignKeys = foreignKeysResult.rows.map((row) => ({
     ...row,
@@ -478,6 +604,7 @@ async function loadCatalog(client) {
     definition: row.definition,
     definitionDigest: sha256(row.definition),
   }))
+  const organizationOwnership = deriveOrganizationOwnership(relations, foreignKeys)
   const catalogProjection = {
     relations: relations.map((relation) => ({
       schema: relation.schema,
@@ -498,14 +625,20 @@ async function loadCatalog(client) {
     deleteTriggers: triggers.map(({ table, name, enabled, definitionDigest }) => ({
       table, name, enabled, definitionDigest,
     })),
+    organizationOwnership,
   }
   return {
     relations,
     relationByOid,
     foreignKeys,
     triggers,
+    organizationOwnership,
     digest: digest(catalogProjection),
   }
+}
+
+export async function inspectRuntimeCatalog(client) {
+  return loadCatalog(client)
 }
 
 async function exactTargets(client, targets) {
@@ -525,7 +658,9 @@ async function exactTargets(client, targets) {
     const observed = byId.get(expected.organizationId)
     if (!observed
       || observed.reference_code !== expected.referenceCode
-      || observed.name !== expected.name) {
+      || observed.name !== expected.name
+      || observed.organization_type !== expected.organizationType
+      || observed.parent_id !== expected.parentId) {
       fail(`Production scaffold identity mismatch for ${expected.key}`)
     }
   }
@@ -547,10 +682,15 @@ async function assertOperatorOwnsTargets(client, actor, targets) {
   }
 }
 
-function relationSeedPredicate(relation) {
+function relationSeedPredicate(relation, ownership) {
   const predicates = []
+  const roleColumns = new Set(
+    ownership.roles
+      .filter((role) => role.table === relation.name)
+      .map((role) => role.column),
+  )
   for (const column of relation.columns) {
-    if (column.typeOid === '2950' && DIRECT_SCOPE_COLUMNS.has(column.name)) {
+    if (column.typeOid === '2950' && roleColumns.has(column.name)) {
       predicates.push(
         `candidate.${quoteIdentifier(column.name)} = ANY(scope_input.target_ids)`,
       )
@@ -588,7 +728,7 @@ async function prepareScope(client, catalog, targets, pipelines) {
   const pipelineIdValues = pipelines.map((pipeline) => pipeline.id)
   for (const relation of catalog.relations) {
     if (PRESERVED_TABLES.has(relation.name)) continue
-    const predicate = relationSeedPredicate(relation)
+    const predicate = relationSeedPredicate(relation, catalog.organizationOwnership)
     if (!predicate) continue
     await client.query(
       `WITH scope_input AS (
@@ -875,8 +1015,13 @@ async function crossTenantScopeBlockers(client, catalog, selectedRelations, targ
   const blockers = []
   const targetIds = targets.map((target) => target.organizationId)
   for (const relation of selectedRelations) {
+    const roleColumns = new Set(
+      catalog.organizationOwnership.roles
+        .filter((role) => role.table === relation.name)
+        .map((role) => role.column),
+    )
     for (const column of relation.columns.filter((item) => (
-      item.typeOid === '2950' && DIRECT_SCOPE_COLUMNS.has(item.name)
+      item.typeOid === '2950' && roleColumns.has(item.name)
     ))) {
       const result = await client.query(
         `SELECT count(*)::integer AS count
@@ -884,9 +1029,8 @@ async function crossTenantScopeBlockers(client, catalog, selectedRelations, targ
          JOIN workspace_tenant_retirement_scope selected
            ON selected.table_oid = $1::oid
           AND selected.row_tid = candidate.ctid::text
-         JOIN workspace_organizations scoped_workspace
-           ON scoped_workspace.id = candidate.${quoteIdentifier(column.name)}
-         WHERE NOT scoped_workspace.id = ANY($2::uuid[])`,
+         WHERE candidate.${quoteIdentifier(column.name)} IS NOT NULL
+           AND NOT candidate.${quoteIdentifier(column.name)} = ANY($2::uuid[])`,
         [relation.oid, targetIds],
       )
       const count = Number(result.rows[0]?.count || 0)
@@ -969,6 +1113,7 @@ async function scopeSummary(client, catalog, targets) {
     [targets.map((target) => target.organizationId)],
   )
   const blockers = {
+    unclassifiedOrganizationRoles: catalog.organizationOwnership.unclassified,
     relationCycles: order.cycles,
     selfReferences,
     preservedRestricts,
@@ -1028,6 +1173,7 @@ async function buildPlan(client, options, endpointProof) {
   const observedTargets = await exactTargets(client, options.targets)
   await assertOperatorOwnsTargets(client, options.actor, options.targets)
   const pipelines = await pipelineIds(client, options.targets)
+  const lockCatalog = await loadLockCatalog(client)
   const catalog = await loadCatalog(client)
   const scope = await prepareScope(client, catalog, options.targets, pipelines)
   const plan = {
@@ -1047,7 +1193,10 @@ async function buildPlan(client, options, endpointProof) {
     targets: options.targets,
     observedTargets,
     pipelines,
+    lockCatalogDigest: lockCatalog.digest,
+    lockedRelations: lockCatalog.relations,
     catalogDigest: catalog.digest,
+    organizationOwnership: catalog.organizationOwnership,
     scope: publicScope(scope),
     externalSystems: {
       suiteCrm: {
@@ -1064,7 +1213,7 @@ async function buildPlan(client, options, endpointProof) {
   return { plan, catalog, scope }
 }
 
-function assertManifest(manifest, options, endpointProof) {
+function assertManifest(manifest, options, endpointProof, { requireFresh }) {
   if (manifest?.format !== PLAN_FORMAT || manifest?.scriptVersion !== SCRIPT_VERSION) {
     fail('Manifest format or script version is not supported')
   }
@@ -1075,9 +1224,11 @@ function assertManifest(manifest, options, endpointProof) {
   const createdAt = Date.parse(manifest.createdAt)
   const age = Date.now() - createdAt
   if (!Number.isFinite(createdAt)
-    || age > PLAN_MAX_AGE_MS
     || age < -PLAN_MAX_FUTURE_SKEW_MS) {
-    fail('Reviewed retirement plan is stale or future-dated')
+    fail('Reviewed retirement plan is invalid or future-dated')
+  }
+  if (requireFresh && age > PLAN_MAX_AGE_MS) {
+    fail('Reviewed retirement plan is stale')
   }
   if (manifest.environment !== 'production'
     || manifest.railwayProjectId !== options.railwayProjectId
@@ -1102,22 +1253,47 @@ function assertScopeUnchanged(manifest, current, catalog) {
 }
 
 async function lockApplyRelations(client, manifest) {
-  const names = new Set([
-    ...manifest.scope.deleteOrder,
-    'app_users',
-    'audit_events',
-    'crm_reference_registry',
-    'short_link_clicks',
-    'short_links',
-    'workspace_tenant_retirement_receipts',
-  ])
-  const ordered = [...names].sort()
-  if (ordered.length) {
-    await client.query(
-      `LOCK TABLE ${ordered.map((name) => `public.${quoteIdentifier(name)}`).join(', ')}
-       IN ACCESS EXCLUSIVE MODE`,
-    )
+  if (!Array.isArray(manifest.lockedRelations) || manifest.lockedRelations.length === 0
+    || digest(manifest.lockedRelations) !== manifest.lockCatalogDigest) {
+    fail('Reviewed full relation lock catalog is missing or invalid')
   }
+  const normalized = manifest.lockedRelations.map((relation) => ({
+    schema: relation?.schema,
+    name: relation?.name,
+    kind: relation?.kind,
+  }))
+  if (normalized.some((relation) => (
+    relation.schema !== 'public'
+      || !text(relation.name)
+      || !['r', 'p'].includes(relation.kind)
+  ))) {
+    fail('Reviewed full relation lock catalog is not canonical')
+  }
+  const sorted = [...normalized].sort((left, right) => (
+    left.schema.localeCompare(right.schema)
+      || left.name.localeCompare(right.name)
+      || left.kind.localeCompare(right.kind)
+  ))
+  if (new Set(normalized.map((relation) => `${relation.schema}.${relation.name}`)).size
+    !== normalized.length
+    || canonicalJson(normalized) !== canonicalJson(sorted)) {
+    fail('Reviewed full relation lock catalog is not canonical')
+  }
+  const ordered = manifest.lockedRelations.map((relation) => (
+    `${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)}`
+  ))
+  // This is intentionally the first snapshot-relevant apply operation. Every
+  // ordinary/partitioned public relation, including empty tenant tables and
+  // preserved handlers, is locked before the runtime scope is recomputed.
+  await client.query(
+    `LOCK TABLE ${ordered.join(', ')} IN ACCESS EXCLUSIVE MODE`,
+  )
+  const observed = await loadLockCatalog(client)
+  if (observed.digest !== manifest.lockCatalogDigest
+    || canonicalJson(observed.relations) !== canonicalJson(manifest.lockedRelations)) {
+    fail('Runtime relation lock catalog drifted after plan approval')
+  }
+  return observed
 }
 
 function restoreTriggerSql(trigger) {
@@ -1349,6 +1525,8 @@ function receiptProjection(manifest, scope, endpointProof, deleted, absence) {
     databaseEndpointSha256: endpointProof.endpointSha256,
     actorEmail: manifest.actor,
     targets: manifest.targets,
+    lockCatalogDigest: manifest.lockCatalogDigest,
+    lockedRelations: manifest.lockedRelations,
     scopeDigest: scope.scopeDigest,
     scopeCounts: scope.counts,
     retiredReferences: scope.references,
@@ -1368,13 +1546,13 @@ async function insertReceipt(client, receipt) {
        plan_digest, receipt_digest, script_version, environment,
        railway_project_id, railway_environment_id, database_identity,
        database_endpoint_sha256, actor_email, target_organizations,
-       scope_digest, scope_counts, retired_references,
+       lock_catalog_digest, locked_relations, scope_digest, scope_counts, retired_references,
        disabled_delete_triggers, retired_short_links, suitecrm_records,
-       external_system_disposition, verification
+       external_system_disposition, deleted_counts, verification
      ) VALUES (
        $1, $2, $3, $4, $5::uuid, $6::uuid, $7::uuid, $8, $9,
-       $10::jsonb, $11, $12::jsonb, $13::text[], $14::jsonb,
-       $15::jsonb, $16::jsonb, $17::jsonb, $18::jsonb
+       $10::jsonb, $11, $12::jsonb, $13, $14::jsonb, $15::text[], $16::jsonb,
+       $17::jsonb, $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb
      )
      RETURNING id::text, completed_at`,
     [
@@ -1388,6 +1566,8 @@ async function insertReceipt(client, receipt) {
       receipt.databaseEndpointSha256,
       receipt.actorEmail,
       JSON.stringify(receipt.targets),
+      receipt.lockCatalogDigest,
+      JSON.stringify(receipt.lockedRelations),
       receipt.scopeDigest,
       JSON.stringify(receipt.scopeCounts),
       receipt.retiredReferences,
@@ -1395,6 +1575,7 @@ async function insertReceipt(client, receipt) {
       JSON.stringify(receipt.retiredShortLinks),
       JSON.stringify(receipt.suiteCrmRecords),
       JSON.stringify(receipt.externalSystemDisposition),
+      JSON.stringify(receipt.deleted),
       JSON.stringify(receipt.verification),
     ],
   )
@@ -1434,6 +1615,7 @@ async function applyManifest(client, manifest, options, endpointProof) {
   try {
     await client.query(`SET LOCAL lock_timeout = '15s'`)
     await client.query(`SET LOCAL statement_timeout = '10min'`)
+    await lockApplyRelations(client, manifest)
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
       [SCRIPT_VERSION],
@@ -1444,7 +1626,6 @@ async function applyManifest(client, manifest, options, endpointProof) {
         [`workspace-tenant-retirement:${target.organizationId}`],
       )
     }
-    await lockApplyRelations(client, manifest)
     await databaseIdentity(client)
     await assertReceiptMigration(client)
     const existingReceipt = await client.query(
@@ -1456,6 +1637,10 @@ async function applyManifest(client, manifest, options, endpointProof) {
     await assertOperatorOwnsTargets(client, options.actor, options.targets)
     const pipelines = await pipelineIds(client, options.targets)
     const catalog = await loadCatalog(client)
+    const lockedCatalogCheck = await loadLockCatalog(client)
+    if (lockedCatalogCheck.digest !== manifest.lockCatalogDigest) {
+      fail('Runtime relation lock catalog changed while recomputing scope')
+    }
     const scope = await prepareScope(client, catalog, options.targets, pipelines)
     assertScopeUnchanged(manifest, scope, catalog)
     if (scope.suiteCrmRecords.length > 0
@@ -1489,6 +1674,32 @@ async function applyManifest(client, manifest, options, endpointProof) {
   }
 }
 
+export function storedReceiptProjection(row) {
+  return {
+    format: RECEIPT_FORMAT,
+    scriptVersion: row.script_version,
+    planDigest: row.plan_digest,
+    environment: row.environment,
+    railwayProjectId: row.railway_project_id,
+    railwayEnvironmentId: row.railway_environment_id,
+    databaseIdentity: row.database_identity,
+    databaseEndpointSha256: row.database_endpoint_sha256,
+    actorEmail: row.actor_email,
+    targets: row.target_organizations,
+    lockCatalogDigest: row.lock_catalog_digest,
+    lockedRelations: row.locked_relations,
+    scopeDigest: row.scope_digest,
+    scopeCounts: row.scope_counts,
+    retiredReferences: row.retired_references,
+    retiredShortLinks: row.retired_short_links,
+    disabledDeleteTriggers: row.disabled_delete_triggers,
+    suiteCrmRecords: row.suitecrm_records,
+    deleted: row.deleted_counts,
+    verification: row.verification,
+    externalSystemDisposition: row.external_system_disposition,
+  }
+}
+
 async function verifyCommitted(client, manifest, options, endpointProof) {
   await databaseIdentity(client)
   await assertReceiptMigration(client)
@@ -1496,23 +1707,33 @@ async function verifyCommitted(client, manifest, options, endpointProof) {
     `SELECT id::text, plan_digest, receipt_digest, script_version, environment,
             railway_project_id::text, railway_environment_id::text,
             database_identity::text, database_endpoint_sha256, actor_email,
-            target_organizations, scope_digest, scope_counts,
+            target_organizations, lock_catalog_digest, locked_relations,
+            scope_digest, scope_counts,
             retired_references, disabled_delete_triggers, retired_short_links,
-            suitecrm_records,
-            external_system_disposition, verification, completed_at
+            suitecrm_records, external_system_disposition, deleted_counts,
+            verification, completed_at
      FROM workspace_tenant_retirement_receipts
      WHERE plan_digest = $1`,
     [manifest.manifestDigest],
   )
   if (result.rows.length !== 1) fail('No unique committed retirement receipt exists')
   const row = result.rows[0]
-  if (row.environment !== 'production'
+  const storedProjection = storedReceiptProjection(row)
+  if (digest(storedProjection) !== row.receipt_digest) {
+    fail('Committed retirement receipt digest is invalid')
+  }
+  if (row.plan_digest !== manifest.manifestDigest
+    || row.script_version !== SCRIPT_VERSION
+    || row.environment !== 'production'
     || row.railway_project_id !== options.railwayProjectId
     || row.railway_environment_id !== options.railwayEnvironmentId
     || row.database_identity !== PRODUCTION_DATABASE_IDENTITY
     || row.database_endpoint_sha256 !== endpointProof.endpointSha256
     || row.actor_email !== options.actor
+    || row.lock_catalog_digest !== manifest.lockCatalogDigest
+    || canonicalJson(row.locked_relations) !== canonicalJson(manifest.lockedRelations)
     || row.scope_digest !== manifest.scope.scopeDigest
+    || canonicalJson(row.scope_counts) !== canonicalJson(manifest.scope.counts)
     || canonicalJson(row.target_organizations) !== canonicalJson(options.targets)) {
     fail('Committed retirement receipt does not match the reviewed boundary')
   }
@@ -1581,7 +1802,9 @@ export async function run(argv = process.argv.slice(2), environment = process.en
       }
     }
     const manifest = readPrivateJson(options.manifest, 'Retirement manifest')
-    assertManifest(manifest, options, endpointProof)
+    assertManifest(manifest, options, endpointProof, {
+      requireFresh: options.command === 'apply',
+    })
     if (options.command === 'apply') {
       const client = await pool.connect()
       let applied
