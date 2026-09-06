@@ -46,7 +46,7 @@ assert.deepEqual(APPROVED_TARGETS.map((target) => ({
   {
     organizationId: '33785418-9927-4e10-a492-d3a44b9b6f21',
     referenceCode: 'ga42g1438l4j2s',
-    name: 'AG Alchemy',
+    name: 'AG Alchemy, LLC',
   },
   {
     organizationId: '3b9ceada-a4ff-4363-8e78-6069dee76328',
@@ -76,7 +76,7 @@ assert.throws(
 assert.throws(
   () => validateTargetArguments([
     ...shuffledTargetValues.slice(0, 2),
-    `${APPROVED_TARGETS[0].organizationId}|${APPROVED_TARGETS[0].referenceCode}|AG Alchemy, LLC`,
+    `${APPROVED_TARGETS[0].organizationId}|${APPROVED_TARGETS[0].referenceCode}|AG Alchemy`,
   ]),
   /allowlist mismatch|unique/u,
 )

@@ -30,7 +30,7 @@ export const APPROVED_TARGETS = Object.freeze([
     key: 'ag-alchemy',
     organizationId: '33785418-9927-4e10-a492-d3a44b9b6f21',
     referenceCode: 'ga42g1438l4j2s',
-    name: 'AG Alchemy',
+    name: 'AG Alchemy, LLC',
   }),
   Object.freeze({
     key: 'french-florist',
