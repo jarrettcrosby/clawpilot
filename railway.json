@@ -15,7 +15,7 @@
   "deploy": {
     "startCommand": "npm run start:railway",
     "preDeployCommand": "bash scripts/predeploy-railway.sh",
-    "healthcheckPath": "/api/health",
+    "healthcheckPath": "/api/health?probe=readiness",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
