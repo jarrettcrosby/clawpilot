@@ -2,6 +2,10 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
+  hasIso3166Alpha2Shape,
+  normalizeCountryCode,
+} from '@/lib/country'
+import {
   commerceCustomerEvidenceFingerprint,
   decryptCommerceIntakeReadResult,
   decryptCommerceIntakeContinuation,
@@ -692,14 +696,16 @@ function partyValue(
 
 function completeAddress(value: Record<string, unknown> | null) {
   if (!value) return false
-  return [
+  const required = [
     value.name,
     value.line1,
     value.city,
     value.region,
     value.postalCode,
-    value.countryCode || value.country,
   ].every((item) => typeof item === 'string' && item.trim())
+  return required && hasIso3166Alpha2Shape(normalizeCountryCode(
+    value.countryCode || value.country,
+  ))
 }
 
 function normalizedAddress(value: Record<string, unknown>): CandidateAddress {
@@ -710,7 +716,7 @@ function normalizedAddress(value: Record<string, unknown>): CandidateAddress {
     city: String(value.city || '').trim(),
     region: String(value.regionCode || value.region || '').trim(),
     postalCode: String(value.postalCode || '').trim(),
-    country: String(value.countryCode || value.country || '').trim().toUpperCase(),
+    country: normalizeCountryCode(value.countryCode || value.country) || '',
   }
 }
 
@@ -12118,7 +12124,7 @@ export async function confirmCommerceCandidateAddressInPostgres(input: {
     }
     const supplied = {
       ...input.address,
-      country: input.address.country.toUpperCase(),
+      country: normalizeCountryCode(input.address.country) || '',
     }
     if (!completeAddress(supplied)) {
       intakeError(

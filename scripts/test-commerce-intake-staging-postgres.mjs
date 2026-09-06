@@ -56,6 +56,9 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '../country.ts' || specifier === '@/lib/country') {
+        return loadTypeScriptModule('app_src/lib/country.ts')
+      }
       if (specifier === '@/lib/integrations/commerceReadRuntime') {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceReadRuntime.ts',

@@ -48,7 +48,7 @@ import {
 } from '@/lib/operations/commerceNormalization'
 
 export const FAIRE_COMMERCE_NORMALIZER_VERSION =
-  'faire-commerce-normalizer-v8' as const
+  'faire-commerce-normalizer-v9' as const
 
 type FaireSource = Readonly<Record<string, unknown>>
 

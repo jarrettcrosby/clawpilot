@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
+// Node's focused strip-types tests need the explicit extension.
+// @ts-expect-error TypeScript extension imports are intentionally used for Node tests.
+import { hasIso3166Alpha2Shape, normalizeCountryCode } from '../country.ts'
 
 export const COMMERCE_NORMALIZATION_ENVELOPE_VERSION =
   'commerce-normalization-envelope-v1' as const
@@ -1236,6 +1239,16 @@ function availableText(value: unknown): CommerceDataField<string> {
     : availableCommerceField(text)
 }
 
+function normalizedCountryCodeField(
+  field: CommerceDataField<string>,
+): CommerceDataField<string> {
+  if (field.state !== 'available') return field
+  const value = normalizeCountryCode(field.value)
+  return value === null
+    ? unavailableCommerceField()
+    : availableCommerceField(value)
+}
+
 export function commerceAddressFromRecord(
   recordValue: unknown,
   options: Readonly<{
@@ -1284,7 +1297,7 @@ export function commerceAddressFromRecord(
     regionCode: field('regionCode'),
     postalCode: field('postalCode'),
     country: field('country'),
-    countryCode: field('countryCode'),
+    countryCode: normalizedCountryCodeField(field('countryCode')),
     phone: field('phone'),
   }))
 }
@@ -1294,14 +1307,16 @@ export function commerceAddressIsComplete(
 ): boolean {
   if (field.state !== 'available') return false
   const address = field.value
+  const country = address.countryCode.state === 'available'
+    ? address.countryCode.value
+    : address.country.state === 'available'
+      ? address.country.value
+      : null
   return (
     address.line1.state === 'available'
     && address.city.state === 'available'
     && address.postalCode.state === 'available'
-    && (
-      address.countryCode.state === 'available'
-      || address.country.state === 'available'
-    )
+    && hasIso3166Alpha2Shape(normalizeCountryCode(country))
   )
 }
 
