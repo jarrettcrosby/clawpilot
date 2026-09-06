@@ -1,3 +1,7 @@
+// Node's focused strip-types tests need the explicit extension.
+// @ts-expect-error TypeScript extension imports are intentionally used for Node tests.
+import { hasIso3166Alpha2Shape, normalizeCountryCode } from '../country.ts'
+
 export const ORDER_SHIP_TO_FIELDS = [
   'name',
   'line1',
@@ -61,10 +65,8 @@ export function normalizeOrderShipToDraft(
     city: normalizedText(value?.city),
     region: normalizedText(value?.region),
     postalCode: normalizedText(value?.postalCode),
-    country: (
-      normalizedText(value?.country)
-      || normalizedText(value?.countryCode)
-    )?.toUpperCase() || null,
+    country: normalizeCountryCode(value?.country)
+      || normalizeCountryCode(value?.countryCode),
   }
 }
 
@@ -88,7 +90,7 @@ export function orderShipToIssues(
   for (const field of REQUIRED_FIELDS) {
     if (!value[field]) issues.push({ field, code: 'required' })
   }
-  if (value.country && !/^[A-Z]{2}$/u.test(value.country)) {
+  if (value.country && !hasIso3166Alpha2Shape(value.country)) {
     const requiredCountry = issues.findIndex((issue) => (
       issue.field === 'country' && issue.code === 'required'
     ))

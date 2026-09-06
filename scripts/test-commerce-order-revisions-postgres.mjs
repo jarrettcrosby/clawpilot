@@ -156,6 +156,9 @@ export function loadTypeScriptModule(path, mocks = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '../country.ts' || specifier === '@/lib/country') {
+        return loadTypeScriptModule('app_src/lib/country.ts', mocks)
+      }
       if (specifier === '@/lib/persistence/commerceOrderTrackingUrlEvidence') {
         return loadTypeScriptModule('app_src/lib/persistence/commerceOrderTrackingUrlEvidence.ts', mocks)
       }

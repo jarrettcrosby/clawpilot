@@ -91,6 +91,9 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       ) {
         return integrationCredentialRuntimeGate
       }
+      if (specifier === '@/lib/country') {
+        return loadTypeScriptModule('app_src/lib/country.ts')
+      }
       if (
         specifier
         === '@/lib/integrations/integrationCredentialRuntimeHttp'
@@ -1523,6 +1526,11 @@ for (const exportName of [
     `Commerce intake persistence must export ${exportName}`,
   )
 }
+includes(persistenceSource, [
+  "country: normalizeCountryCode(input.address.country) || ''",
+  'canonicalJson(providerAddress) === canonicalJson(supplied)',
+  'encryptCommerceCandidateSnapshot(\n      supplied,',
+], 'Canonical country normalization at candidate address confirmation boundary')
 includes(persistenceSource, [
   'catalogSyncResetRequested',
   'COMMERCE_PRODUCT_INTAKE_POLICY_UNCHANGED',
@@ -3048,7 +3056,7 @@ const service = loadTypeScriptModule(
       },
       '@/lib/integrations/faireCommerceNormalizer': {
         FAIRE_COMMERCE_NORMALIZER_VERSION:
-          'faire-commerce-normalizer-v8',
+          'faire-commerce-normalizer-v9',
         normalizeFaireCommerce(source) {
           normalizedSources.faire = source
           if (source.inventories) {
@@ -5114,7 +5122,7 @@ try {
   assert.ok(
     providerReservations.some((reservation) => (
       reservation.runtime.provider === 'faire'
-      && reservation.adapterVersion === 'faire-commerce-normalizer-v8'
+      && reservation.adapterVersion === 'faire-commerce-normalizer-v9'
     )),
     'Faire provider-attempt evidence must record the current normalizer',
   )

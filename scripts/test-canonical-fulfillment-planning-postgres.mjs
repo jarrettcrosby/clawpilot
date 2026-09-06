@@ -137,6 +137,9 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '../country.ts') {
+        return loadTypeScriptModule('app_src/lib/country.ts')
+      }
       return nodeRequire(specifier)
     },
   }

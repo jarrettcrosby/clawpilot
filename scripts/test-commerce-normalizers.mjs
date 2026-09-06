@@ -66,10 +66,46 @@ function loadTypeScriptModule(path, mocks = {}) {
 }
 
 const commonPath = 'app_src/lib/operations/commerceNormalization.ts'
+const countryCodeNormalizationPath =
+  'app_src/lib/country.ts'
 const shopifyPath =
   'app_src/lib/integrations/shopifyCommerceNormalizer.ts'
 const fairePath = 'app_src/lib/integrations/faireCommerceNormalizer.ts'
-const common = loadTypeScriptModule(commonPath)
+const countryCodeNormalization = loadTypeScriptModule(
+  countryCodeNormalizationPath,
+)
+const common = loadTypeScriptModule(commonPath, {
+  '../country.ts': countryCodeNormalization,
+})
+const providerAddressWithIso3Country = common.commerceAddressFromRecord({
+  address1: '1408 3rd St NW',
+  city: 'Great Falls',
+  state_code: 'MT',
+  postal_code: '59404',
+  country: 'United States',
+  country_code: 'USA',
+})
+assert.equal(
+  addressProjection(providerAddressWithIso3Country).countryCode,
+  'US',
+  'Shared address projection must normalize known ISO3 provider values',
+)
+assert.equal(
+  common.commerceAddressIsComplete(providerAddressWithIso3Country),
+  true,
+  'Normalized provider addresses must pass the same alpha-2 rule used by the workbench',
+)
+assert.equal(
+  common.commerceAddressIsComplete(common.commerceAddressFromRecord({
+    address1: '1408 3rd St NW',
+    city: 'Great Falls',
+    state_code: 'MT',
+    postal_code: '59404',
+    country_code: 'UNKNOWN',
+  })),
+  false,
+  'Unknown provider country values must fail closed',
+)
 assert.equal(common.commerceLinePackFactsRequired({
   requiresShipping: true,
   unitMultiplier: null,
@@ -421,7 +457,7 @@ const faireSource = {
       state_code: 'NY',
       postal_code: '11201',
       country: 'United States',
-      country_code: 'US',
+      country_code: 'USA',
       phone_number: '+15555550100',
     },
     ship_after: '2026-08-01T15:00:00Z',
@@ -458,6 +494,12 @@ const faireNormalized = faire.normalizeFaireCommerce(
     externalAccountId: 'brand-1',
     apiVersion: 'external-api-v2',
   },
+)
+
+assert.equal(
+  addressProjection(faireNormalized.orders[0].shipTo).countryCode,
+  'US',
+  'Faire ISO3 country aliases must normalize before order readiness checks',
 )
 
 assert.equal(
@@ -800,7 +842,7 @@ assert.deepEqual(
 )
 assert.equal(
   faireExternalOrderV2Normalized.normalizerVersion,
-  'faire-commerce-normalizer-v8',
+  'faire-commerce-normalizer-v9',
 )
 assert.deepEqual(
   headerMoneyProjection(faireExternalOrderV2NormalizedOrder),

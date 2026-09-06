@@ -79,7 +79,7 @@ test('allows a user to clear a field and reports only compact field issues', () 
   ])
 })
 
-test('retains an invalid country as editable data instead of rejecting the draft', () => {
+test('normalizes a known provider country alias before readiness validation', () => {
   const address = normalizeOrderShipToDraft({
     name: 'Vendor Receiving',
     line1: '100 Woodward Ave',
@@ -89,7 +89,46 @@ test('retains an invalid country as editable data instead of rejecting the draft
     country: 'usa',
   })
 
-  assert.equal(address.country, 'USA')
+  assert.equal(address.country, 'US')
+  assert.equal(orderShipToReadiness(address), 'carrier_ready')
+  assert.deepEqual(orderShipToIssues(address), [])
+})
+
+test('normalizes punctuation, country names, and supported ISO3 aliases', () => {
+  for (const [input, expected] of [
+    ['U.S.A.', 'US'],
+    ['United States of America', 'US'],
+    ['can', 'CA'],
+    ['Canada', 'CA'],
+    ['mex', 'MX'],
+    ['Mexico', 'MX'],
+    ['gbr', 'GB'],
+    ['United Kingdom', 'GB'],
+  ]) {
+    const address = normalizeOrderShipToDraft({
+      name: 'Vendor Receiving',
+      line1: '100 Woodward Ave',
+      city: 'Detroit',
+      region: 'MI',
+      postalCode: '48226',
+      country: input,
+    })
+    assert.equal(address.country, expected)
+    assert.equal(orderShipToReadiness(address), 'carrier_ready')
+  }
+})
+
+test('retains an unknown country value and fails closed', () => {
+  const address = normalizeOrderShipToDraft({
+    name: 'Vendor Receiving',
+    line1: '100 Woodward Ave',
+    city: 'Detroit',
+    region: 'MI',
+    postalCode: '48226',
+    country: 'unknown-country',
+  })
+
+  assert.equal(address.country, 'UNKNOWN-COUNTRY')
   assert.equal(orderShipToReadiness(address), 'incomplete')
   assert.deepEqual(orderShipToIssues(address), [
     { field: 'country', code: 'invalid_format' },
