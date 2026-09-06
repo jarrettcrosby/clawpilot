@@ -662,6 +662,45 @@ assert.equal(
   false,
   'a known-platform job alert is discovery spam, not a real conversation',
 )
+const linkedInNotification = {
+  ...baseMessageSignals,
+  senderEmail: 'messages-noreply@linkedin.com',
+  subject: 'A recruiter sent you a message',
+  snippet: 'I reviewed your background for our Vice President, Supply Chain opening.',
+  bodyText: 'Would you be open to a quick call about this role? Schedule a call with me. Recommended jobs in your area.',
+  sourceUrls: ['https://www.linkedin.com/comm/messaging/thread/abc123'],
+  labelIds: ['CATEGORY_SOCIAL'],
+  listUnsubscribe: '<https://www.linkedin.com/comm/settings>',
+  autoSubmitted: 'auto-generated',
+}
+const shortInterviewFollowup = {
+  ...baseMessageSignals,
+  senderEmail: 'recruiter@employer.com', subject: 'Re: Phone Screen',
+  snippet: 'Thursday works for me.', bodyText: 'See you then.',
+}
+assert.equal(gmailSources.careerGmailMessageRelevance(shortInterviewFollowup).sentThreadEligible, true)
+assert.equal(gmailSources.careerGmailMessageIsRelevant(shortInterviewFollowup), false, 'a terse reply alone is not proof')
+assert.equal(gmailSources.careerGmailMessageRelevance({ ...shortInterviewFollowup, sentThreadMatched: true }).reason, 'sent-thread')
+assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...shortInterviewFollowup, subject: 'Re: Thursday', sentThreadMatched: true }), false,
+  'arbitrary personal conversations must not become job mail merely because the user replied')
+assert.equal(gmailSources.careerGmailMessageRelevance(linkedInNotification).reason, 'linkedin-message-notification')
+assert.equal(gmailSources.careerGmailMessageIsRelevant({
+  ...linkedInNotification,
+  snippet: 'Interview for Director of Operations',
+  bodyText: 'Please share your availability for an interview with the hiring team.',
+}), true, 'specific interview message notifications survive the social wrapper')
+for (const changes of [
+  { subject: 'Job alert: Vice President of Supply Chain' },
+  { subject: 'A recruiter viewed your profile' },
+  { subject: 'Weekly message digest' },
+  { sourceUrls: [] },
+  { sourceUrls: ['https://linkedin.com.evil.test/messaging/thread/abc123'] },
+  { senderEmail: 'notifications@other-board.com' },
+  { snippet: 'You have a new message', bodyText: 'Open LinkedIn to view your message.' },
+  { snippet: 'Director of Admissions invites you', bodyText: 'Would you be open to an admissions interview for our MBA program?' },
+  { labelIds: ['SPAM'] },
+]) assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...linkedInNotification, ...changes }), false,
+  `LinkedIn notification must fail closed: ${JSON.stringify(changes)}`)
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,

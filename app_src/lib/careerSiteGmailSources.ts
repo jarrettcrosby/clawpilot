@@ -40,7 +40,7 @@ const MAX_GMAIL_PAGE_TOKEN_CHARS = 2_048
 const MAX_THREAD_EVIDENCE_MESSAGES = 100
 const MAX_GMAIL_PROVIDER_JSON_BYTES = 8 * 1024 * 1024
 const GMAIL_PROVIDER_RATE_LIMIT_RETRY_DELAYS_MS = [1_000, 2_000] as const
-export const CAREER_GMAIL_IMMUTABLE_QUERY = '{recruiter recruiting "talent acquisition" "hiring manager" interview assessment "phone screen" "your application" "application update" "next steps" subject:(job OR role OR position OR opportunity OR application OR interview OR assessment)} -in:spam -in:trash -in:sent -in:drafts'
+export const CAREER_GMAIL_IMMUTABLE_QUERY = '{recruiter recruiting "talent acquisition" "hiring manager" interview assessment "phone screen" "your application" "application update" "next steps" subject:(job OR role OR position OR opportunity OR application OR interview OR assessment) (from:linkedin.com subject:(message OR inmail))} -in:spam -in:trash -in:sent -in:drafts'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 type ActiveGmailConnection = ActiveMatonGatewayConnection & {
@@ -64,6 +64,7 @@ type CareerGmailMessageSignals = {
   precedence: string
   autoSubmitted: string
   sentThreadMatched?: boolean
+  sourceUrls?: readonly string[]
 }
 
 const DIRECT_RECRUITING_PATTERN = /\b(?:recruiter|recruiting|talent acquisition|talent partner|hiring manager|headhunter|executive search|sourcer|sourcing (?:for|a candidate))\b/i
@@ -126,6 +127,7 @@ function domainMatches(senderEmail: string, candidates: readonly string[]): bool
 
 export type CareerGmailRelevanceReason =
   | 'human-recruiter'
+  | 'linkedin-message-notification'
   | 'application-process'
   | 'sent-thread'
   | 'excluded-folder'
@@ -212,6 +214,25 @@ export function careerGmailMessageRelevance(
     && /\b(?:hiring manager|requisition|job application|employment application)\b/i.test(searchable)
   )
   const personalizedRoleOutreach = humanOutreach && roleEvidence
+  // This is a Gmail copy of a specific message, not access to LinkedIn's inbox.
+  // Platform notification wrappers may carry social/unsubscribe headers; only
+  // concrete employment text plus a real messaging link can override those.
+  const linkedInMessageNotification = (
+    domainMatches(input.senderEmail, ['linkedin.com'])
+    && /\b(?:sent you (?:a |an )?(?:message|inmail)|new (?:message|inmail)|inmail from|message from)\b/i.test(subject)
+    && !/\b(?:digest|roundup|connection request|invitation|viewed your profile|mentioned you|recommended|job alerts?)\b/i.test(subject)
+    && roleEvidence
+    && (humanOutreach || (processTraffic && concreteEmployment))
+    && (input.sourceUrls || []).some((value) => {
+      try {
+        const url = new URL(value)
+        return url.protocol === 'https:'
+          && ['linkedin.com', 'www.linkedin.com'].includes(url.hostname)
+          && !url.username && !url.password && !url.port
+          && /^\/(?:comm\/)?messaging\//.test(url.pathname)
+      } catch { return false }
+    })
+  )
   const independentEmploymentProvenance = (
     employmentContext
     || recruitingSender
@@ -241,6 +262,7 @@ export function careerGmailMessageRelevance(
   const bookingPromotion = (
     BOOKING_CTA_PATTERN.test(searchable)
     && (bulkDistribution || MARKETING_SUBJECT_PATTERN.test(subject))
+    && !linkedInMessageNotification
   )
   const nonEmployment = (
     (STRONG_NON_EMPLOYMENT_PATTERN.test(searchable) && !unmistakableEmploymentProvenance)
@@ -288,6 +310,7 @@ export function careerGmailMessageRelevance(
     || (bulkDistribution
       && jobAlertBody
       && !strongApplicationProcess
+      && !linkedInMessageNotification
       && !personalizedRecruiterEvidence)
   )
 
@@ -320,6 +343,15 @@ export function careerGmailMessageRelevance(
       relevant: false,
       reason: 'media-or-technical',
       evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+
+  if (linkedInMessageNotification) {
+    return {
+      relevant: true,
+      reason: 'linkedin-message-notification',
+      evidence: ['linkedin-email-notification', 'message-link', 'concrete-role', 'employment-conversation'],
       sentThreadEligible: false,
     }
   }
@@ -359,7 +391,7 @@ export function careerGmailMessageRelevance(
   const sentThreadEligible = (
     !bulkDistribution
     && !MARKETING_SUBJECT_PATTERN.test(subject)
-    && roleEvidence
+    && (roleEvidence || (interview && INTERVIEW_PATTERN.test(subject)))
     && (
       EXPLICIT_JOB_CONTEXT_PATTERN.test(searchable)
       || employmentContext
@@ -823,6 +855,12 @@ async function getMessage(input: {
   const bodyText = parsed.bodyText.slice(0, MAX_GMAIL_BODY_TEXT_CHARS).trim()
   const snippet = parsed.snippet.slice(0, MAX_GMAIL_SNIPPET_CHARS).trim()
   if (!bodyText && !snippet) return null
+  let urls: string[]
+  try {
+    urls = extractPublicHttpsUrls([snippet, bodyText, ...rawMessageUrlSources(payload as GmailMessage)])
+  } catch {
+    urls = extractPublicHttpsUrls([snippet, bodyText])
+  }
   const signals: CareerGmailMessageSignals = {
     senderEmail,
     subject: parsed.subject,
@@ -834,6 +872,7 @@ async function getMessage(input: {
     feedbackId: header(payload.payload as GmailMessagePart, 'feedback-id'),
     precedence: header(payload.payload as GmailMessagePart, 'precedence'),
     autoSubmitted: header(payload.payload as GmailMessagePart, 'auto-submitted'),
+    sourceUrls: urls,
   }
   let relevance = careerGmailMessageRelevance(signals)
   if (
@@ -853,16 +892,6 @@ async function getMessage(input: {
     }
   }
   if (!relevance.relevant) return null
-  let urls: string[]
-  try {
-    urls = extractPublicHttpsUrls([
-      snippet,
-      bodyText,
-      ...rawMessageUrlSources(payload as GmailMessage),
-    ])
-  } catch {
-    urls = extractPublicHttpsUrls([snippet, bodyText])
-  }
   return {
     accountEmail: input.connection.accountEmail,
     externalMessageId: parsed.externalMessageId,
