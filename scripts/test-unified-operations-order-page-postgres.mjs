@@ -754,6 +754,54 @@ async function seedProductionScaleRows(client, fixture, rowCount) {
   }
 }
 
+async function seedProductionOrderEventHistory(client, fixture, revisionsPerOrder) {
+  await client.query('SET session_replication_role = replica')
+  try {
+    await client.query(
+      `WITH history AS (
+         SELECT source_order.id AS order_id,
+                source_order.external_order_id,
+                generated.revision,
+                row_number() OVER (
+                  ORDER BY source_order.id, generated.revision
+                ) AS sequence
+         FROM operations_orders source_order
+         CROSS JOIN generate_series(1, $3::integer) generated(revision)
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.external_order_id LIKE 'bulk-shopify-order-%'
+       )
+       INSERT INTO operations_commerce_order_event_observations (
+         id, global_id, organization_id, integration_account_id,
+         observation_id, order_id, provider, external_order_id,
+         external_event_id, external_subject_id, event_hash, event_kind,
+         event_status, attribution_source, sensitive_evidence_expires_at,
+         occurred_at, observed_at, created_at
+       )
+       SELECT gen_random_uuid(),
+              'gcoe' || lpad((2000000 + history.sequence)::text, 7, '0'),
+              $1::uuid, $2::uuid, gen_random_uuid(), history.order_id,
+              'shopify', history.external_order_id,
+              'bulk-event-' || history.sequence::text,
+              'bulk-subject-' || history.revision::text,
+              md5(history.external_order_id || ':' || history.revision::text)
+                || md5(history.revision::text || ':' || history.external_order_id),
+              'order_updated', 'open', 'provider_system',
+              now() + interval '30 days',
+              now() - ($3::integer - history.revision) * interval '1 minute',
+              now() - ($3::integer - history.revision) * interval '1 minute',
+              now() - ($3::integer - history.revision) * interval '1 minute'
+       FROM history`,
+      [
+        fixture.organizationId,
+        fixture.shopifyAccountId,
+        revisionsPerOrder,
+      ],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+  }
+}
+
 async function withReadOnlyJitDisabledTransaction(client, action) {
   await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
   try {
@@ -958,6 +1006,7 @@ async function verifyProductionIndex(databaseUrl) {
     assert.equal(serviceJitAfterCommit, defaultJitSetting)
 
     await seedProductionScaleRows(client, fixture, 8_400)
+    await seedProductionOrderEventHistory(client, fixture, 8)
     await withReadOnlyJitDisabledTransaction(client, async () => {
       const scaledPage = await readAndExplain({
         ...baseInput,
@@ -969,6 +1018,27 @@ async function verifyProductionIndex(databaseUrl) {
       assert.equal(scaledPage.total, 8_404)
       assert.equal(scaledPage.offset, 3_950)
       assert.equal(scaledPage.entries.length, 50)
+      const scaledQuery = capturedQueries.at(-1)?.text || ''
+      assert.doesNotMatch(
+        scaledQuery,
+        /operations_commerce_order_event_observations/u,
+        'Order-date, order-number, and customer pages without evidence filters must not scan provider event history',
+      )
+      assert.doesNotMatch(
+        scaledQuery,
+        /operations_commerce_order_revision_(?:observations|reads)/u,
+        'Ordinary numbered pages must not scan canonical revision history',
+      )
+      assert.doesNotMatch(
+        scaledQuery,
+        /string_agg/u,
+        'Snapshot evidence must not concatenate the full result set',
+      )
+      assert.match(
+        scaledQuery,
+        /bit_xor\(\s*hashtextextended/u,
+        'Snapshot evidence must use bounded streaming aggregates',
+      )
       const scaledPlan = explainedPlans.at(-1)
       assert.ok(scaledPlan)
       assert.ok(

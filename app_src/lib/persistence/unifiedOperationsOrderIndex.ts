@@ -61,6 +61,39 @@ function sortSql(input: {
           row_id ASC`
 }
 
+function resultSetRevisionSql(sort: UnifiedOperationsOrderSort) {
+  const sortEvidence = sort === 'updated'
+    ? 'sortable.activity_at'
+    : sort === 'order_date'
+      ? 'sortable.ordered_at'
+      : sort === 'customer'
+        ? 'sortable.customer_key'
+        : `jsonb_build_array(
+             sortable.order_number_key,
+             sortable.shopify_numeric_rank,
+             sortable.shopify_number_length,
+             sortable.shopify_number
+           )`
+  const rowEvidence = `jsonb_build_array(
+    sortable.source_kind,
+    sortable.row_id::text,
+    sortable.provider,
+    sortable.integration_account_global_id,
+    sortable.external_order_id,
+    ${sortEvidence}
+  )::text`
+  return `CASE
+           WHEN count(*) = 0
+             THEN '${EMPTY_OPERATIONS_ORDER_RESULT_SET_REVISION}'
+           ELSE lpad(to_hex(COALESCE(bit_xor(
+                  hashtextextended(${rowEvidence}, 0)
+                ), 0)), 16, '0')
+             || lpad(to_hex(COALESCE(bit_xor(
+                  hashtextextended(${rowEvidence}, 1)
+                ), 0)), 16, '0')
+         END`
+}
+
 function validEntry(value: unknown): value is UnifiedOperationsOrderIndexEntry {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const entry = value as Partial<UnifiedOperationsOrderIndexEntry>
@@ -95,39 +128,32 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
     ? `%${input.search.replace(/[!%_]/gu, '!$&')}%`
     : null
   const orderBy = sortSql(input)
-  const result = await input.client.query<UnifiedIndexReadRow>(
-    `WITH canonical_context AS MATERIALIZED (
-       SELECT 'canonical'::text AS source_kind,
-              orders.id AS row_id,
-              orders.source_provider AS provider,
-              source_account.global_id AS integration_account_global_id,
-              orders.external_order_id,
-              orders.order_number,
-              customer.name AS customer_name,
-              date_trunc('milliseconds', COALESCE(
-                origin_candidate.provider_created_at,
-                origin_candidate.observed_at,
-                orders.imported_at,
-                orders.created_at
-              )) AS ordered_at,
-              order_activity.activity_at,
-              latest_tracking.tracking_number,
-              CASE
-                WHEN ${externallyFulfilledOrderSql('orders')}
-                  THEN 'fulfilled_externally'
-                ELSE orders.status::text
-              END AS display_status
-       FROM operations_orders orders
-       JOIN crm_organizations customer
-         ON customer.id = orders.customer_id
-        AND customer.pipeline_id = orders.pipeline_id
-       JOIN operations_integration_accounts source_account
-         ON source_account.organization_id = orders.organization_id
-        AND source_account.id = orders.integration_account_id
-       LEFT JOIN operations_commerce_order_candidates origin_candidate
-         ON origin_candidate.organization_id = orders.organization_id
-        AND origin_candidate.canonical_order_id = orders.id
-       LEFT JOIN LATERAL (
+  const values: unknown[] = []
+  const bind = (value: unknown, cast: string) => {
+    values.push(value)
+    return `$${values.length}${cast}`
+  }
+  const organizationParam = bind(input.organizationId, '::uuid')
+  const searchParam = searchPattern ? bind(searchPattern, '::text') : null
+  const statusParam = input.status ? bind(input.status, '::text') : null
+  const providerParam = input.provider ? bind(input.provider, '::text') : null
+  const trackingParam = input.tracking ? bind(input.tracking, '::text') : null
+  const updatedAfterParam = input.updatedAfter
+    ? bind(input.updatedAfter, '::timestamptz')
+    : null
+  const pageParam = bind(input.page, '::bigint')
+  const pageSizeParam = bind(input.pageSize, '::bigint')
+
+  // Ordinary page reads sort by provider order date and do not filter on
+  // mutable provider evidence. Keep those reads off the high-cardinality
+  // tracking and revision tables. The bounded hydration queries still return
+  // complete current detail for the selected page.
+  const needsTracking = Boolean(searchParam || trackingParam)
+  const needsActivity = input.sort === 'updated' || Boolean(updatedAfterParam)
+  const needsImportedTracking = needsTracking || needsActivity
+
+  const canonicalShipmentJoin = needsTracking || needsActivity
+    ? `LEFT JOIN LATERAL (
          SELECT candidate.tracking_number,
                 COALESCE(candidate.shipped_at, candidate.created_at)
                   AS activity_at
@@ -138,14 +164,20 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
                   candidate.created_at DESC,
                   candidate.id DESC
          LIMIT 1
-       ) latest_shipment ON true
-       LEFT JOIN LATERAL (
+       ) latest_shipment ON true`
+    : ''
+  const canonicalProviderTrackingJoin = needsTracking
+    ? `LEFT JOIN LATERAL (
          ${latestProviderTrackingSql('orders')}
-       ) latest_provider_tracking ON true
-       LEFT JOIN LATERAL (
+       ) latest_provider_tracking ON true`
+    : ''
+  const canonicalExternalReconciliationJoin = needsTracking || needsActivity
+    ? `LEFT JOIN LATERAL (
          ${latestExternalReconciliationTrackingSql('orders')}
-       ) latest_external_reconciliation ON true
-       LEFT JOIN LATERAL (
+       ) latest_external_reconciliation ON true`
+    : ''
+  const canonicalActivityJoins = needsActivity
+    ? `LEFT JOIN LATERAL (
          SELECT date_trunc('milliseconds', max(GREATEST(
                   event.occurred_at,
                   event.observed_at,
@@ -198,8 +230,10 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
          FROM operations_commerce_order_revision_reads provider_read
          WHERE provider_read.organization_id = orders.organization_id
            AND provider_read.order_id = orders.id
-       ) revision_read_activity ON true
-       LEFT JOIN LATERAL (
+       ) revision_read_activity ON true`
+    : ''
+  const canonicalLatestTrackingJoin = needsTracking
+    ? `LEFT JOIN LATERAL (
          SELECT evidence.tracking_number
          FROM (VALUES
            (latest_shipment.tracking_number, latest_shipment.activity_at, 1),
@@ -213,8 +247,10 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
                   evidence.activity_at DESC NULLS LAST,
                   evidence.source_priority ASC
          LIMIT 1
-       ) latest_tracking ON true
-       CROSS JOIN LATERAL (
+       ) latest_tracking ON true`
+    : ''
+  const canonicalActivityJoin = needsActivity
+    ? `CROSS JOIN LATERAL (
          SELECT date_trunc('milliseconds', GREATEST(
                   orders.updated_at,
                   COALESCE(latest_shipment.activity_at, orders.updated_at),
@@ -224,47 +260,231 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
                   COALESCE(revision_read_activity.activity_at, orders.updated_at),
                   COALESCE(latest_external_reconciliation.activity_at, orders.updated_at)
                 )) AS activity_at
-       ) order_activity
-       WHERE orders.organization_id = $1::uuid
+       ) order_activity`
+    : ''
+  const canonicalTrackingColumn = needsTracking
+    ? 'latest_tracking.tracking_number'
+    : 'NULL::text'
+  const canonicalActivityColumn = needsActivity
+    ? 'order_activity.activity_at'
+    : `date_trunc('milliseconds', orders.updated_at)`
+  const canonicalDisplayStatus = statusParam
+    ? `CASE
+         WHEN ${externallyFulfilledOrderSql('orders')}
+           THEN 'fulfilled_externally'
+         ELSE orders.status::text
+       END`
+    : 'orders.status::text'
+  const canonicalSearchPredicate = searchParam
+    ? `(
+         orders.order_number ILIKE ${searchParam} ESCAPE '!'
+         OR orders.global_id ILIKE ${searchParam} ESCAPE '!'
+         OR orders.external_order_id ILIKE ${searchParam} ESCAPE '!'
+         OR customer.name ILIKE ${searchParam} ESCAPE '!'
+         OR customer.reference_code ILIKE ${searchParam} ESCAPE '!'
+         OR latest_tracking.tracking_number ILIKE ${searchParam} ESCAPE '!'
+         OR EXISTS (
+           SELECT 1
+           FROM operations_current_order_lines line
+           LEFT JOIN crm_products product
+             ON product.pipeline_id = line.pipeline_id
+            AND product.id = line.product_id
+           WHERE line.organization_id = orders.organization_id
+             AND line.order_id = orders.id
+             AND (
+               line.channel_sku ILIKE ${searchParam} ESCAPE '!'
+               OR COALESCE(product.sku, '') ILIKE ${searchParam} ESCAPE '!'
+               OR product.reference_code ILIKE ${searchParam} ESCAPE '!'
+             )
+         )
+       )`
+    : 'TRUE'
+  const canonicalStatusPredicate = statusParam
+    ? input.status === 'fulfilled_externally'
+      ? externallyFulfilledOrderSql('orders')
+      : input.status === 'closed_externally'
+        ? 'FALSE'
+        : `(orders.status::text = ${statusParam}
+            AND NOT (${externallyFulfilledOrderSql('orders')}))`
+    : 'TRUE'
+  const canonicalProviderPredicate = providerParam
+    ? `orders.source_provider = ${providerParam}`
+    : 'TRUE'
+  const canonicalTrackingPredicate = trackingParam
+    ? `(
+         (${trackingParam} = 'present'
+          AND latest_tracking.tracking_number IS NOT NULL)
+         OR (${trackingParam} = 'missing'
+             AND latest_tracking.tracking_number IS NULL)
+       )`
+    : 'TRUE'
+  const canonicalUpdatedAfterPredicate = updatedAfterParam
+    ? `order_activity.activity_at > ${updatedAfterParam}`
+    : 'TRUE'
+
+  const importedTrackingJoin = needsImportedTracking
+    ? `LEFT JOIN LATERAL (
+         SELECT (array_remove(array_agg(
+                  subject_state.tracking_number
+                  ORDER BY subject_state.activity_at DESC,
+                           subject_state.subject_key,
+                           subject_state.event_id DESC
+                ), NULL))[1] AS tracking_number,
+                max(subject_state.activity_at) AS activity_at
+         FROM (
+           SELECT ranked.subject_key,
+                  ranked.event_id,
+                  ranked.tracking_number,
+                  ranked.activity_at
+           FROM (
+             SELECT COALESCE(NULLIF(btrim(event.external_subject_id), ''),
+                             '__order__') AS subject_key,
+                    event.id AS event_id,
+                    CASE
+                      WHEN event.sensitive_evidence_redacted_at IS NULL
+                       AND event.sensitive_evidence_expires_at > now()
+                        THEN NULLIF(btrim(event.tracking_number), '')
+                      ELSE NULL
+                    END AS tracking_number,
+                    date_trunc('milliseconds', GREATEST(
+                      event.occurred_at,
+                      event.observed_at,
+                      event.created_at
+                    )) AS activity_at,
+                    row_number() OVER (
+                      PARTITION BY COALESCE(
+                        NULLIF(btrim(event.external_subject_id), ''),
+                        '__order__'
+                      )
+                      ORDER BY GREATEST(
+                                 event.occurred_at,
+                                 event.observed_at,
+                                 event.created_at
+                               ) DESC,
+                               (NULLIF(btrim(event.tracking_number), '')
+                                  IS NOT NULL) DESC,
+                               event.external_event_id DESC NULLS LAST,
+                               event.id DESC
+                    ) AS subject_rank
+             FROM operations_commerce_order_event_observations event
+             WHERE event.organization_id = candidate.organization_id
+               AND event.integration_account_id = candidate.integration_account_id
+               AND event.provider = candidate.provider
+               AND event.external_order_id = candidate.external_order_id
+               AND event.event_kind = 'tracking_updated'
+           ) ranked
+           WHERE ranked.subject_rank = 1
+         ) subject_state
+       ) latest_tracking ON true`
+    : ''
+  const importedTrackingColumn = needsImportedTracking
+    ? 'latest_tracking.tracking_number'
+    : 'NULL::text'
+  const importedTrackingActivityColumn = needsImportedTracking
+    ? 'latest_tracking.activity_at'
+    : 'NULL::timestamptz'
+  const importedSearchPredicate = searchParam
+    ? `(
+         imported.global_id ILIKE ${searchParam} ESCAPE '!'
+         OR imported.order_number ILIKE ${searchParam} ESCAPE '!'
+         OR imported.external_order_id ILIKE ${searchParam} ESCAPE '!'
+         OR imported.integration_account_name ILIKE ${searchParam} ESCAPE '!'
+         OR imported.provider ILIKE ${searchParam} ESCAPE '!'
+         OR COALESCE(imported.customer_name, '') ILIKE ${searchParam} ESCAPE '!'
+         OR imported.tracking_number ILIKE ${searchParam} ESCAPE '!'
+         OR EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_candidate_lines line
+           LEFT JOIN crm_products product
+             ON product.pipeline_id = line.pipeline_id
+            AND product.id = line.product_id
+           WHERE line.organization_id = ${organizationParam}
+             AND line.integration_account_id = imported.integration_account_id
+             AND line.order_candidate_id IN (
+               imported.row_id,
+               imported.latest_provider_candidate_id
+             )
+             AND (
+               COALESCE(line.sku_snapshot, '') ILIKE ${searchParam} ESCAPE '!'
+               OR COALESCE(product.sku, '') ILIKE ${searchParam} ESCAPE '!'
+               OR product.reference_code ILIKE ${searchParam} ESCAPE '!'
+             )
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM operations_commerce_order_observations observation
+           JOIN operations_commerce_order_observation_lines line
+             ON line.organization_id = observation.organization_id
+            AND line.observation_id = observation.id
+           WHERE observation.organization_id = ${organizationParam}
+             AND observation.integration_account_id
+               = imported.integration_account_id
+             AND observation.provider = imported.provider
+             AND observation.external_order_id
+               = imported.external_order_id
+             AND COALESCE(line.sku, '') ILIKE ${searchParam} ESCAPE '!'
+         )
+       )`
+    : 'TRUE'
+  const importedStatusPredicate = statusParam
+    ? `imported.display_status = ${statusParam}`
+    : 'TRUE'
+  const importedProviderPredicate = providerParam
+    ? `imported.provider = ${providerParam}`
+    : 'TRUE'
+  const importedTrackingPredicate = trackingParam
+    ? `(
+         (${trackingParam} = 'present'
+          AND imported.tracking_number IS NOT NULL)
+         OR (${trackingParam} = 'missing'
+             AND imported.tracking_number IS NULL)
+       )`
+    : 'TRUE'
+  const importedUpdatedAfterPredicate = updatedAfterParam
+    ? `imported.activity_at > ${updatedAfterParam}`
+    : 'TRUE'
+  const resultSetRevision = resultSetRevisionSql(input.sort)
+  const result = await input.client.query<UnifiedIndexReadRow>(
+    `WITH canonical_context AS MATERIALIZED (
+       SELECT 'canonical'::text AS source_kind,
+              orders.id AS row_id,
+              orders.source_provider AS provider,
+              source_account.global_id AS integration_account_global_id,
+              orders.external_order_id,
+              orders.order_number,
+              customer.name AS customer_name,
+              date_trunc('milliseconds', COALESCE(
+                origin_candidate.provider_created_at,
+                origin_candidate.observed_at,
+                orders.imported_at,
+                orders.created_at
+              )) AS ordered_at,
+              ${canonicalActivityColumn} AS activity_at,
+              ${canonicalTrackingColumn} AS tracking_number,
+              ${canonicalDisplayStatus} AS display_status
+       FROM operations_orders orders
+       JOIN crm_organizations customer
+         ON customer.id = orders.customer_id
+        AND customer.pipeline_id = orders.pipeline_id
+       JOIN operations_integration_accounts source_account
+         ON source_account.organization_id = orders.organization_id
+        AND source_account.id = orders.integration_account_id
+       LEFT JOIN operations_commerce_order_candidates origin_candidate
+         ON origin_candidate.organization_id = orders.organization_id
+        AND origin_candidate.canonical_order_id = orders.id
+       ${canonicalShipmentJoin}
+       ${canonicalProviderTrackingJoin}
+       ${canonicalExternalReconciliationJoin}
+       ${canonicalActivityJoins}
+       ${canonicalLatestTrackingJoin}
+       ${canonicalActivityJoin}
+       WHERE orders.organization_id = ${organizationParam}
          AND orders.archived_at IS NULL
-         AND (
-           $2::text IS NULL
-           OR orders.order_number ILIKE $2 ESCAPE '!'
-           OR orders.global_id ILIKE $2 ESCAPE '!'
-           OR orders.external_order_id ILIKE $2 ESCAPE '!'
-           OR customer.name ILIKE $2 ESCAPE '!'
-           OR customer.reference_code ILIKE $2 ESCAPE '!'
-           OR latest_tracking.tracking_number ILIKE $2 ESCAPE '!'
-           OR EXISTS (
-             SELECT 1
-             FROM operations_current_order_lines line
-             LEFT JOIN crm_products product
-               ON product.pipeline_id = line.pipeline_id
-              AND product.id = line.product_id
-             WHERE line.organization_id = orders.organization_id
-               AND line.order_id = orders.id
-               AND (
-                 line.channel_sku ILIKE $2 ESCAPE '!'
-                 OR COALESCE(product.sku, '') ILIKE $2 ESCAPE '!'
-                 OR product.reference_code ILIKE $2 ESCAPE '!'
-               )
-           )
-         )
-         AND (
-           $3::text IS NULL
-           OR ($3::text = 'fulfilled_externally'
-               AND ${externallyFulfilledOrderSql('orders')})
-           OR ($3::text NOT IN ('fulfilled_externally', 'closed_externally')
-               AND orders.status::text = $3::text
-               AND NOT (${externallyFulfilledOrderSql('orders')}))
-         )
-         AND ($4::text IS NULL OR orders.source_provider = $4::text)
-         AND (
-           $5::text IS NULL
-           OR ($5::text = 'present' AND latest_tracking.tracking_number IS NOT NULL)
-           OR ($5::text = 'missing' AND latest_tracking.tracking_number IS NULL)
-         )
-         AND ($6::timestamptz IS NULL OR order_activity.activity_at > $6::timestamptz)
+         AND ${canonicalSearchPredicate}
+         AND ${canonicalStatusPredicate}
+         AND ${canonicalProviderPredicate}
+         AND ${canonicalTrackingPredicate}
+         AND ${canonicalUpdatedAfterPredicate}
      ), latest_live_candidates AS MATERIALIZED (
        SELECT DISTINCT ON (
          candidate.integration_account_id,
@@ -279,7 +499,7 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
         AND run.integration_account_id = candidate.integration_account_id
         AND run.pipeline_id = candidate.pipeline_id
         AND run.id = candidate.run_id
-       WHERE candidate.organization_id = $1::uuid
+       WHERE candidate.organization_id = ${organizationParam}
          AND candidate.canonical_order_id IS NULL
          AND candidate.workflow_state IN ('held', 'resolving', 'ready')
          AND candidate.expires_at > now()
@@ -314,7 +534,7 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
          ON retained_candidate.organization_id = retained.organization_id
         AND retained_candidate.integration_account_id = retained.integration_account_id
         AND retained_candidate.id = retained.candidate_id
-       WHERE retained.organization_id = $1::uuid
+       WHERE retained.organization_id = ${organizationParam}
          AND retained.canonical_order_id IS NULL
          AND retained_candidate.canonical_order_id IS NULL
          AND NOT EXISTS (
@@ -345,11 +565,11 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
               latest_observation.provider_created_at AS observation_created_at,
               latest_observation.provider_updated_at AS observation_updated_at,
               latest_observation.observed_at AS observation_observed_at,
-              latest_tracking.tracking_number,
-              latest_tracking.activity_at AS tracking_activity_at
+              ${importedTrackingColumn} AS tracking_number,
+              ${importedTrackingActivityColumn} AS tracking_activity_at
        FROM selected_candidate_ids selected
        JOIN operations_commerce_order_candidates candidate
-         ON candidate.organization_id = $1::uuid
+         ON candidate.organization_id = ${organizationParam}
         AND candidate.id = selected.candidate_id
        LEFT JOIN operations_commerce_order_workbench workbench
          ON workbench.organization_id = candidate.organization_id
@@ -423,59 +643,7 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
                   observation.id DESC
          LIMIT 1
        ) latest_observation ON true
-       LEFT JOIN LATERAL (
-         SELECT (array_remove(array_agg(
-                  subject_state.tracking_number
-                  ORDER BY subject_state.activity_at DESC,
-                           subject_state.subject_key,
-                           subject_state.event_id DESC
-                ), NULL))[1] AS tracking_number,
-                max(subject_state.activity_at) AS activity_at
-         FROM (
-           SELECT ranked.subject_key,
-                  ranked.event_id,
-                  ranked.tracking_number,
-                  ranked.activity_at
-           FROM (
-             SELECT COALESCE(NULLIF(btrim(event.external_subject_id), ''),
-                             '__order__') AS subject_key,
-                    event.id AS event_id,
-                    CASE
-                      WHEN event.sensitive_evidence_redacted_at IS NULL
-                       AND event.sensitive_evidence_expires_at > now()
-                        THEN NULLIF(btrim(event.tracking_number), '')
-                      ELSE NULL
-                    END AS tracking_number,
-                    date_trunc('milliseconds', GREATEST(
-                      event.occurred_at,
-                      event.observed_at,
-                      event.created_at
-                    )) AS activity_at,
-                    row_number() OVER (
-                      PARTITION BY COALESCE(
-                        NULLIF(btrim(event.external_subject_id), ''),
-                        '__order__'
-                      )
-                      ORDER BY GREATEST(
-                                 event.occurred_at,
-                                 event.observed_at,
-                                 event.created_at
-                               ) DESC,
-                               (NULLIF(btrim(event.tracking_number), '')
-                                  IS NOT NULL) DESC,
-                               event.external_event_id DESC NULLS LAST,
-                               event.id DESC
-                    ) AS subject_rank
-             FROM operations_commerce_order_event_observations event
-             WHERE event.organization_id = candidate.organization_id
-               AND event.integration_account_id = candidate.integration_account_id
-               AND event.provider = candidate.provider
-               AND event.external_order_id = candidate.external_order_id
-               AND event.event_kind = 'tracking_updated'
-           ) ranked
-           WHERE ranked.subject_rank = 1
-         ) subject_state
-       ) latest_tracking ON true
+       ${importedTrackingJoin}
      ), imported_context AS MATERIALIZED (
        SELECT 'imported'::text AS source_kind,
               base.row_id,
@@ -533,7 +701,7 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
          END AS id
        ) display_candidate
        JOIN operations_commerce_order_candidates display_snapshot
-         ON display_snapshot.organization_id = $1::uuid
+         ON display_snapshot.organization_id = ${organizationParam}
         AND display_snapshot.id = display_candidate.id
        JOIN operations_integration_accounts source_account
          ON source_account.organization_id = display_snapshot.organization_id
@@ -546,56 +714,11 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
      ), imported_filtered AS MATERIALIZED (
        SELECT imported.*
        FROM imported_context imported
-       WHERE (
-           $2::text IS NULL
-           OR imported.global_id ILIKE $2 ESCAPE '!'
-           OR imported.order_number ILIKE $2 ESCAPE '!'
-           OR imported.external_order_id ILIKE $2 ESCAPE '!'
-           OR imported.integration_account_name ILIKE $2 ESCAPE '!'
-           OR imported.provider ILIKE $2 ESCAPE '!'
-           OR COALESCE(imported.customer_name, '') ILIKE $2 ESCAPE '!'
-           OR imported.tracking_number ILIKE $2 ESCAPE '!'
-           OR EXISTS (
-             SELECT 1
-             FROM operations_commerce_order_candidate_lines line
-             LEFT JOIN crm_products product
-               ON product.pipeline_id = line.pipeline_id
-              AND product.id = line.product_id
-             WHERE line.organization_id = $1::uuid
-               AND line.integration_account_id = imported.integration_account_id
-               AND line.order_candidate_id IN (
-                 imported.row_id,
-                 imported.latest_provider_candidate_id
-               )
-               AND (
-                 COALESCE(line.sku_snapshot, '') ILIKE $2 ESCAPE '!'
-                 OR COALESCE(product.sku, '') ILIKE $2 ESCAPE '!'
-                 OR product.reference_code ILIKE $2 ESCAPE '!'
-               )
-           )
-           OR EXISTS (
-             SELECT 1
-             FROM operations_commerce_order_observations observation
-             JOIN operations_commerce_order_observation_lines line
-               ON line.organization_id = observation.organization_id
-              AND line.observation_id = observation.id
-             WHERE observation.organization_id = $1::uuid
-               AND observation.integration_account_id
-                 = imported.integration_account_id
-               AND observation.provider = imported.provider
-               AND observation.external_order_id
-                 = imported.external_order_id
-               AND COALESCE(line.sku, '') ILIKE $2 ESCAPE '!'
-           )
-         )
-         AND ($3::text IS NULL OR imported.display_status = $3::text)
-         AND ($4::text IS NULL OR imported.provider = $4::text)
-         AND (
-           $5::text IS NULL
-           OR ($5::text = 'present' AND imported.tracking_number IS NOT NULL)
-           OR ($5::text = 'missing' AND imported.tracking_number IS NULL)
-         )
-         AND ($6::timestamptz IS NULL OR imported.activity_at > $6::timestamptz)
+       WHERE ${importedSearchPredicate}
+         AND ${importedStatusPredicate}
+         AND ${importedProviderPredicate}
+         AND ${importedTrackingPredicate}
+         AND ${importedUpdatedAfterPredicate}
      ), unified_rows AS MATERIALIZED (
        SELECT canonical.* FROM canonical_context canonical
        UNION ALL
@@ -655,23 +778,7 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
        FROM unified_rows unified
      ), evidence AS MATERIALIZED (
        SELECT count(*)::bigint AS matching_total_count,
-              COALESCE(md5(string_agg(
-                jsonb_build_array(
-                  sortable.source_kind,
-                  sortable.row_id::text,
-                  sortable.provider,
-                  sortable.integration_account_global_id,
-                  sortable.external_order_id,
-                  sortable.order_number,
-                  sortable.customer_name,
-                  sortable.ordered_at,
-                  sortable.activity_at,
-                  sortable.tracking_number,
-                  sortable.display_status
-                )::text,
-                E'\n' ORDER BY sortable.source_kind, sortable.row_id
-              )), '${EMPTY_OPERATIONS_ORDER_RESULT_SET_REVISION}')
-                AS result_set_revision
+              ${resultSetRevision} AS result_set_revision
        FROM sortable_rows sortable
      ), ranked_rows AS MATERIALIZED (
        SELECT sortable.*,
@@ -681,8 +788,9 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
        SELECT CASE
          WHEN evidence.matching_total_count = 0 THEN 0::bigint
          ELSE LEAST(
-           (($7::bigint - 1) * $8::bigint),
-           ((evidence.matching_total_count - 1) / $8::bigint) * $8::bigint
+           ((${pageParam} - 1) * ${pageSizeParam}),
+           ((evidence.matching_total_count - 1) / ${pageSizeParam})
+             * ${pageSizeParam}
          )
        END AS page_offset
        FROM evidence
@@ -703,20 +811,11 @@ export async function readUnifiedOperationsOrderIndexPage(input: {
      CROSS JOIN page_bounds
      LEFT JOIN ranked_rows ranked
        ON ranked.position > page_bounds.page_offset
-      AND ranked.position <= page_bounds.page_offset + $8::bigint
+      AND ranked.position <= page_bounds.page_offset + ${pageSizeParam}
      GROUP BY evidence.matching_total_count,
               evidence.result_set_revision,
               page_bounds.page_offset`,
-    [
-      input.organizationId,
-      searchPattern,
-      input.status,
-      input.provider,
-      input.tracking,
-      input.updatedAfter,
-      input.page,
-      input.pageSize,
-    ],
+    values,
   )
   const row = result.rows[0]
   const total = Number(row?.matching_total_count ?? 0)
