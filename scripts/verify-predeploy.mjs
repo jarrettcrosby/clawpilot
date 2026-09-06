@@ -1088,6 +1088,33 @@ const railwayStart = readFileSync(resolve(root, 'scripts/start-railway.sh'), 'ut
 if (!railwayStart.includes('npm run release:record')) {
   fail('scripts/start-railway.sh must record a release after runtime health validation')
 }
+const livenessProbePosition = railwayStart.indexOf('"$LIVENESS_URL"')
+const livenessWorkerStartPosition = railwayStart.indexOf(
+  'node scripts/pipeline-outbox-poller.mjs &',
+)
+const fullHealthProbePosition = railwayStart.lastIndexOf('"$HEALTH_URL"')
+if (
+  !railwayStart.includes('LIVENESS_URL="${HEALTH_URL}?probe=liveness"')
+  || !railwayStart.includes('response.ok ? 0 : 1')
+  || livenessProbePosition < 0
+  || livenessWorkerStartPosition <= livenessProbePosition
+  || fullHealthProbePosition <= livenessWorkerStartPosition
+) {
+  fail('Railway startup must use liveness before workers and full health after workers')
+}
+const livenessHealthRoute = readFileSync(
+  resolve(root, 'app_src/app/api/health/route.ts'),
+  'utf8',
+)
+for (const requiredLivenessContract of [
+  "request?.nextUrl.searchParams.get('probe') === 'liveness'",
+  "probe: 'liveness'",
+  "'Cache-Control': 'no-store, max-age=0'",
+]) {
+  if (!livenessHealthRoute.includes(requiredLivenessContract)) {
+    fail(`Health liveness contract is missing: ${requiredLivenessContract}`)
+  }
+}
 for (const requiredIntegrationCredentialGate of [
   'require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY 32',
   'require_value INTEGRATION_CREDENTIAL_ENCRYPTION_KEY_ID 1',

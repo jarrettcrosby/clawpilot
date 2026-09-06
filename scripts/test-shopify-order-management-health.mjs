@@ -406,6 +406,7 @@ function loadRoute({
   },
 }) {
   let healthReads = 0
+  let runtimeReadinessReads = 0
   let mainQuery = null
   const runtime = Object.freeze({
     available: false,
@@ -493,8 +494,10 @@ function loadRoute({
     '@/lib/persistence/postgres': { query },
     '@/lib/integrations/integrationCredentialRuntimeGate.mjs': {
       integrationCredentialRuntimeEnforcementRequired: () => true,
-      refreshIntegrationCredentialRuntimeReadiness: async () =>
-        runtimeReadiness,
+      refreshIntegrationCredentialRuntimeReadiness: async () => {
+        runtimeReadinessReads += 1
+        return runtimeReadiness
+      },
     },
     '@/lib/persistence/operationsCommandReceiptHealth': {
       OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY: 'command receipt health',
@@ -685,6 +688,7 @@ function loadRoute({
   return {
     GET: loaded.exports.GET,
     getHealthReads: () => healthReads,
+    getRuntimeReadinessReads: () => runtimeReadinessReads,
     getMainQuery: () => mainQuery,
     secret,
   }
@@ -712,6 +716,22 @@ const baseDurable = {
   knownProviderWriteOutcomeCount: 7,
   knownProviderWriteSum: 7,
 }
+const livenessLoaded = loadRoute({
+  durable: baseDurable,
+  structureApplied: true,
+})
+const livenessResponse = await livenessLoaded.GET({
+  nextUrl: new URL('https://example.test/api/health?probe=liveness'),
+})
+const livenessBody = JSON.parse(JSON.stringify(await livenessResponse.json()))
+assert.equal(livenessResponse.status, 200)
+assert.equal(livenessBody.status, 'ok')
+assert.equal(livenessBody.probe, 'liveness')
+assert.equal(typeof livenessBody.checkedAt, 'number')
+assert.equal(livenessLoaded.getMainQuery(), null)
+assert.equal(livenessLoaded.getHealthReads(), 0)
+assert.equal(livenessLoaded.getRuntimeReadinessReads(), 0)
+
 const processing = await executeScenario({
   durable: baseDurable,
   structureApplied: true,

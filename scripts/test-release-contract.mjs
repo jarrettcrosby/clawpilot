@@ -486,6 +486,24 @@ const railwayStart = read('scripts/start-railway.sh')
 assert.ok(railwayStart.indexOf('/api/health') < railwayStart.indexOf('npm run release:record'))
 assert.ok(railwayStart.includes('application did not pass health validation'))
 const healthRoute = read('app_src/app/api/health/route.ts')
+const livenessProbePosition = railwayStart.indexOf('"$LIVENESS_URL"')
+const workerStartPosition = railwayStart.indexOf('node scripts/pipeline-outbox-poller.mjs &')
+const fullHealthProbePosition = railwayStart.lastIndexOf('"$HEALTH_URL"')
+assert.ok(railwayStart.includes('LIVENESS_URL="${HEALTH_URL}?probe=liveness"'))
+assert.ok(railwayStart.includes('response.ok ? 0 : 1'))
+assert.ok(
+  livenessProbePosition >= 0
+    && workerStartPosition > livenessProbePosition
+    && fullHealthProbePosition > workerStartPosition,
+  'Railway startup must use liveness before workers and full health after workers',
+)
+for (const fragment of [
+  "request?.nextUrl.searchParams.get('probe') === 'liveness'",
+  "probe: 'liveness'",
+  "'Cache-Control': 'no-store, max-age=0'",
+]) {
+  assert.ok(healthRoute.includes(fragment), `Health liveness contract missing ${fragment}`)
+}
 for (const fragment of [
   '0359_operations_commerce_fulfillment_recovery_budget.sql',
   'f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11',
