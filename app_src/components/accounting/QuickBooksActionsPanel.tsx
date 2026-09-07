@@ -66,7 +66,15 @@ type WriteRequest = {
 type ReferenceData = {
   customers: Array<{ id: string; displayName: string; companyName: string | null; email: string | null }>
   items: Array<{ id: string; name: string; itemType: string; unitPrice: number; description: string | null }>
-  accounts: Array<{ id: string; name: string; classification: string | null; accountType: string | null }>
+  accounts: Array<{
+    id: string
+    name: string
+    classification: string | null
+    accountType: string | null
+    accountSubType: string | null
+  }>
+  categories: Array<{ id: string; name: string }>
+  vendors: Array<{ id: string; displayName: string; companyName: string | null }>
 }
 
 type Workspace = {
@@ -92,7 +100,10 @@ type CustomerFormValue = {
 }
 type ItemFormValue = {
   name: string; itemType: string; sku: string; description: string; unitPrice: string
-  purchaseCost: string; incomeAccountId: string; expenseAccountId: string; taxable: boolean
+  purchaseInformationEnabled: boolean; purchaseDescription: string; purchaseCost: string
+  incomeAccountId: string; expenseAccountId: string; assetAccountId: string
+  preferredVendorId: string; parentCategoryId: string; taxable: boolean
+  quantityOnHand: string; inventoryStartDate: string; reorderPoint: string
 }
 type InvoiceFormValue = {
   customerId: string; transactionDate: string; dueDate: string; billingEmail: string; customerMemo: string
@@ -191,6 +202,17 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
       <DetailField label="Type" value={payload.itemType} />
       <DetailField label="SKU" value={payload.sku} />
       <DetailField label="Category" value={payload.parentCategoryName} />
+      <DetailField label="Sales price" value={payload.itemType ? money(Number(payload.unitPrice || 0)) : null} />
+      <DetailField label="Income account" value={payload.incomeAccountName} />
+      <DetailField label="Purchase description" value={payload.purchaseDescription} />
+      <DetailField label="Purchase cost" value={payload.purchaseInformationEnabled ? money(Number(payload.purchaseCost || 0)) : null} />
+      <DetailField label="Expense or COGS account" value={payload.expenseAccountName} />
+      <DetailField label="Preferred vendor" value={payload.preferredVendorName} />
+      <DetailField label="Inventory asset account" value={payload.assetAccountName} />
+      <DetailField label="Initial quantity on hand" value={payload.quantityOnHand} />
+      <DetailField label="Inventory as-of date" value={payload.inventoryStartDate} />
+      <DetailField label="Reorder point" value={payload.reorderPoint} />
+      <DetailField label="Taxable" value={payload.itemType ? (payload.taxable ? 'Yes' : 'No') : null} />
       <DetailField label="Toast source" value={payload.sourceName} />
       <DetailField label="Toast location" value={payload.sourceRestaurantGuid} />
       <DetailField label="Mapping scope" value={payload.mappingScope === 'location_override' ? 'Location override' : payload.mappingScope === 'organization_default' ? 'Organization default' : null} />
@@ -263,7 +285,9 @@ export default function QuickBooksActionsPanel({
   })
   const [item, setItem] = useState({
     name: '', itemType: 'Service', sku: '', description: '', unitPrice: '', purchaseCost: '',
-    incomeAccountId: '', expenseAccountId: '', taxable: false,
+    purchaseInformationEnabled: false, purchaseDescription: '',
+    incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
+    parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
   })
   const [invoice, setInvoice] = useState({
     customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '',
@@ -319,7 +343,12 @@ export default function QuickBooksActionsPanel({
     if (kind === 'customer.create') {
       setCustomer({ displayName: '', companyName: '', givenName: '', familyName: '', email: '', phone: '', notes: '', line1: '', line2: '', city: '', region: '', postalCode: '', country: '' })
     } else if (kind === 'item.create') {
-      setItem({ name: '', itemType: 'Service', sku: '', description: '', unitPrice: '', purchaseCost: '', incomeAccountId: '', expenseAccountId: '', taxable: false })
+      setItem({
+        name: '', itemType: 'Service', sku: '', description: '', unitPrice: '',
+        purchaseInformationEnabled: false, purchaseDescription: '', purchaseCost: '',
+        incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
+        parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+      })
     } else {
       setInvoice({ customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '' })
       setInvoiceLines([newLine()])
@@ -403,7 +432,12 @@ export default function QuickBooksActionsPanel({
   }
 
   const incomeAccounts = workspace?.referenceData.accounts.filter((account) => account.classification === 'Revenue' || /income/i.test(account.accountType || '')) || []
-  const expenseAccounts = workspace?.referenceData.accounts.filter((account) => account.classification === 'Expense' || /expense|cost of goods sold/i.test(account.accountType || '')) || []
+  const expenseAccounts = workspace?.referenceData.accounts.filter((account) => (
+    account.classification === 'Expense' || /expense|cost of goods sold/i.test(account.accountType || '')
+  )) || []
+  const inventoryAssetAccounts = workspace?.referenceData.accounts.filter((account) => (
+    /^inventory$/i.test(account.accountSubType || '')
+  )) || []
   const invoiceTotal = invoiceLines.reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.unitPrice || 0), 0)
   const productPostingOnly = workspace?.connection.postingOperations.length === 1
     && workspace.connection.postingOperations[0] === 'item.create'
@@ -508,7 +542,15 @@ export default function QuickBooksActionsPanel({
             <Divider />
             <Box flex={1} overflow="auto" p={2.5}>
               {formKind === 'customer.create' ? <CustomerForm value={customer} onChange={setCustomer} /> : null}
-              {formKind === 'item.create' ? <ItemForm value={item} onChange={setItem} incomeAccounts={incomeAccounts} expenseAccounts={expenseAccounts} /> : null}
+              {formKind === 'item.create' ? <ItemForm
+                value={item}
+                onChange={setItem}
+                incomeAccounts={incomeAccounts}
+                expenseAccounts={expenseAccounts}
+                assetAccounts={inventoryAssetAccounts}
+                categories={workspace?.referenceData.categories || []}
+                vendors={workspace?.referenceData.vendors || []}
+              /> : null}
               {formKind === 'invoice.create' && workspace ? (
                 <InvoiceForm
                   value={invoice}
@@ -588,23 +630,85 @@ function CustomerForm({ value, onChange }: { value: CustomerFormValue; onChange:
   )
 }
 
-function ItemForm({ value, onChange, incomeAccounts, expenseAccounts }: {
+function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccounts, categories, vendors }: {
   value: ItemFormValue
   onChange: (value: ItemFormValue) => void
   incomeAccounts: ReferenceData['accounts']
   expenseAccounts: ReferenceData['accounts']
+  assetAccounts: ReferenceData['accounts']
+  categories: ReferenceData['categories']
+  vendors: ReferenceData['vendors']
 }) {
-  const field = (key: Exclude<keyof ItemFormValue, 'taxable'>) => (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...value, [key]: event.target.value })
+  const field = (key: Exclude<keyof ItemFormValue, 'taxable' | 'purchaseInformationEnabled'>) => (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...value, [key]: event.target.value })
+  const isInventory = value.itemType === 'Inventory'
+  const purchasingEnabled = isInventory || value.purchaseInformationEnabled
+  const purchasingAccounts = isInventory
+    ? expenseAccounts.filter((account) => /^cost of goods sold$/i.test(account.accountType || ''))
+    : expenseAccounts
   return (
     <Stack spacing={2}>
       <TextField required label="Name" value={value.name} onChange={field('name')} sx={fieldSx} />
-      <TextField select required label="Type" value={value.itemType} onChange={field('itemType')} sx={fieldSx}><MenuItem value="Service">Service</MenuItem><MenuItem value="NonInventory">Non-inventory</MenuItem></TextField>
+      <TextField select required label="Type" value={value.itemType} onChange={(event) => {
+        const itemType = event.target.value
+        onChange({
+          ...value,
+          itemType,
+          purchaseInformationEnabled: itemType === 'Inventory' ? true : value.purchaseInformationEnabled,
+          assetAccountId: itemType === 'Inventory' ? value.assetAccountId : '',
+          quantityOnHand: itemType === 'Inventory' ? value.quantityOnHand : '0',
+          inventoryStartDate: itemType === 'Inventory' ? (value.inventoryStartDate || today()) : '',
+          reorderPoint: itemType === 'Inventory' ? value.reorderPoint : '',
+        })
+      }} sx={fieldSx}>
+        <MenuItem value="Service">Service</MenuItem>
+        <MenuItem value="NonInventory">Non-inventory</MenuItem>
+        <MenuItem value="Inventory">Inventory</MenuItem>
+      </TextField>
       <TextField label="SKU" value={value.sku} onChange={field('sku')} sx={fieldSx} />
-      <TextField label="Description" multiline minRows={3} value={value.description} onChange={field('description')} sx={fieldSx} />
-      <Box display="grid" gridTemplateColumns="1fr 1fr" gap={1.5}><TextField type="number" label="Sales price" value={value.unitPrice} onChange={field('unitPrice')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} /><TextField type="number" label="Purchase cost" value={value.purchaseCost} onChange={field('purchaseCost')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} /></Box>
+      <TextField select label="Category" value={value.parentCategoryId} onChange={field('parentCategoryId')} sx={fieldSx}>
+        <MenuItem value="">Uncategorized</MenuItem>
+        {categories.map((category) => <MenuItem key={category.id} value={category.id}>{category.name}</MenuItem>)}
+      </TextField>
+      <Typography fontWeight={700} pt={0.5}>Sales information</Typography>
+      <TextField label="Sales description" multiline minRows={3} value={value.description} onChange={field('description')} inputProps={{ maxLength: 4000 }} sx={fieldSx} />
+      <TextField type="number" label="Sales price or rate" value={value.unitPrice} onChange={field('unitPrice')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} />
       <TextField select required label="Income account" value={value.incomeAccountId} onChange={field('incomeAccountId')} sx={fieldSx}>{incomeAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}</TextField>
-      <TextField select label="Expense account" value={value.expenseAccountId} onChange={field('expenseAccountId')} sx={fieldSx}><MenuItem value="">None</MenuItem>{expenseAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}</TextField>
       <FormControlLabel control={<Checkbox checked={value.taxable} onChange={(event) => onChange({ ...value, taxable: event.target.checked })} />} label="Taxable" />
+      {!isInventory ? <FormControlLabel
+        control={<Checkbox checked={value.purchaseInformationEnabled} onChange={(event) => onChange({
+          ...value,
+          purchaseInformationEnabled: event.target.checked,
+          ...(event.target.checked ? {} : {
+            purchaseDescription: '', purchaseCost: '', expenseAccountId: '', preferredVendorId: '',
+          }),
+        })} />}
+        label="I purchase this product or service from a vendor"
+      /> : null}
+      {purchasingEnabled ? <>
+        <Typography fontWeight={700} pt={0.5}>Purchasing information</Typography>
+        <TextField label="Purchase description" multiline minRows={3} value={value.purchaseDescription} onChange={field('purchaseDescription')} inputProps={{ maxLength: 4000 }} sx={fieldSx} />
+        <TextField type="number" label="Purchase cost" value={value.purchaseCost} onChange={field('purchaseCost')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} />
+        <TextField select required label={isInventory ? 'Cost of goods sold account' : 'Expense account'} value={value.expenseAccountId} onChange={field('expenseAccountId')} sx={fieldSx}>
+          <MenuItem value="">Select account</MenuItem>
+          {purchasingAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}
+        </TextField>
+        <TextField select label="Preferred vendor" value={value.preferredVendorId} onChange={field('preferredVendorId')} sx={fieldSx}>
+          <MenuItem value="">None</MenuItem>
+          {vendors.map((vendor) => <MenuItem key={vendor.id} value={vendor.id}>{vendor.displayName}{vendor.companyName && vendor.companyName !== vendor.displayName ? ` · ${vendor.companyName}` : ''}</MenuItem>)}
+        </TextField>
+      </> : null}
+      {isInventory ? <>
+        <Typography fontWeight={700} pt={0.5}>Inventory information</Typography>
+        <TextField select required label="Inventory asset account" value={value.assetAccountId} onChange={field('assetAccountId')} sx={fieldSx}>
+          <MenuItem value="">Select account</MenuItem>
+          {assetAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}
+        </TextField>
+        <Box display="grid" gridTemplateColumns="1fr 1fr" gap={1.5}>
+          <TextField required type="number" label="Initial quantity on hand" value={value.quantityOnHand} onChange={field('quantityOnHand')} inputProps={{ min: 0, step: '0.000001' }} sx={fieldSx} />
+          <TextField required type="date" label="As of date" value={value.inventoryStartDate} onChange={field('inventoryStartDate')} InputLabelProps={{ shrink: true }} sx={fieldSx} />
+        </Box>
+        <TextField type="number" label="Reorder point" value={value.reorderPoint} onChange={field('reorderPoint')} inputProps={{ min: 0, step: '0.000001' }} sx={fieldSx} />
+      </> : null}
     </Stack>
   )
 }

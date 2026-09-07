@@ -181,7 +181,7 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
   const pageSize = Math.max(1, Math.min(Number(input.pageSize || 50), 100))
   const page = Math.max(1, Number(input.page || 1))
   const offset = (page - 1) * pageSize
-  const [connection, count, requests, targetRequest, customers, items, accounts] = await Promise.all([
+  const [connection, count, requests, targetRequest, customers, items, accounts, categories, vendors] = await Promise.all([
     query<{
       write_mode: 'disabled' | 'sandbox' | 'production'
       write_verified_at: string | null
@@ -242,11 +242,32 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
        ORDER BY name, quickbooks_item_id LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ id: string; name: string; classification: string | null; account_type: string | null }>(
-      `SELECT quickbooks_account_id AS id, fully_qualified_name AS name, classification, account_type
+    query<{
+      id: string
+      name: string
+      classification: string | null
+      account_type: string | null
+      account_sub_type: string | null
+    }>(
+      `SELECT quickbooks_account_id AS id, fully_qualified_name AS name,
+         classification, account_type, account_sub_type
        FROM quickbooks_accounts
        WHERE organization_id = $1::uuid AND active = true
        ORDER BY fully_qualified_name, quickbooks_account_id LIMIT 5000`,
+      [input.organizationId],
+    ),
+    query<{ id: string; name: string }>(
+      `SELECT quickbooks_item_id AS id, fully_qualified_name AS name
+       FROM quickbooks_items
+       WHERE organization_id = $1::uuid AND active = true AND lower(item_type) = 'category'
+       ORDER BY fully_qualified_name, quickbooks_item_id LIMIT 5000`,
+      [input.organizationId],
+    ),
+    query<{ id: string; display_name: string; company_name: string | null }>(
+      `SELECT quickbooks_vendor_id AS id, display_name, company_name
+       FROM quickbooks_vendors
+       WHERE organization_id = $1::uuid AND active = true
+       ORDER BY display_name, quickbooks_vendor_id LIMIT 5000`,
       [input.organizationId],
     ),
   ])
@@ -293,6 +314,13 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
         name: row.name,
         classification: row.classification,
         accountType: row.account_type,
+        accountSubType: row.account_sub_type,
+      })),
+      categories: categories.rows.map((row) => ({ id: row.id, name: row.name })),
+      vendors: vendors.rows.map((row) => ({
+        id: row.id,
+        displayName: row.display_name,
+        companyName: row.company_name,
       })),
     },
   }
@@ -621,6 +649,82 @@ function mappedItemSource(payload: QuickBooksWriteDraftPayload): QuickBooksItemD
     : null
 }
 
+async function cacheCreatedQuickBooksItem(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  input: { job: QuickBooksWriteJob; providerEntityId: string },
+) {
+  if (input.job.operationKind !== 'item.create') return
+  const item = input.job.requestPayload as QuickBooksItemDraft
+  const fullyQualifiedName = item.parentCategoryName
+    ? `${item.parentCategoryName}:${item.name}`
+    : item.name
+  await client.query(
+    `INSERT INTO quickbooks_items (
+       organization_id, quickbooks_item_id, name, fully_qualified_name, item_type, sku, description,
+       unit_price, purchase_cost, quantity_on_hand, track_quantity, income_account_id,
+       expense_account_id, asset_account_id, active, taxable, source_payload, synced_at
+     ) VALUES (
+       $1::uuid, $2, $3, $4, $5, $6, $7,
+       $8, $9, $10, $11, $12, $13, $14, true, $15, $16::jsonb, now()
+     )
+     ON CONFLICT (organization_id, quickbooks_item_id) DO UPDATE SET
+       name = EXCLUDED.name,
+       fully_qualified_name = EXCLUDED.fully_qualified_name,
+       item_type = EXCLUDED.item_type,
+       sku = EXCLUDED.sku,
+       description = EXCLUDED.description,
+       unit_price = EXCLUDED.unit_price,
+       purchase_cost = EXCLUDED.purchase_cost,
+       quantity_on_hand = EXCLUDED.quantity_on_hand,
+       track_quantity = EXCLUDED.track_quantity,
+       income_account_id = EXCLUDED.income_account_id,
+       expense_account_id = EXCLUDED.expense_account_id,
+       asset_account_id = EXCLUDED.asset_account_id,
+       active = true,
+       taxable = EXCLUDED.taxable,
+       source_payload = EXCLUDED.source_payload,
+       synced_at = now()`,
+    [
+      input.job.organizationId,
+      input.providerEntityId,
+      item.name,
+      fullyQualifiedName,
+      item.itemType,
+      item.sku,
+      item.description,
+      item.unitPrice,
+      item.purchaseCost,
+      item.quantityOnHand,
+      item.trackQuantity,
+      item.incomeAccountId,
+      item.expenseAccountId,
+      item.assetAccountId,
+      item.taxable,
+      JSON.stringify({
+        Id: input.providerEntityId,
+        Name: item.name,
+        FullyQualifiedName: fullyQualifiedName,
+        Type: item.itemType,
+        Sku: item.sku,
+        Description: item.description,
+        PurchaseDesc: item.purchaseDescription,
+        UnitPrice: item.unitPrice,
+        PurchaseCost: item.purchaseCost,
+        QtyOnHand: item.quantityOnHand,
+        TrackQtyOnHand: item.trackQuantity,
+        IncomeAccountRef: { value: item.incomeAccountId },
+        ExpenseAccountRef: item.expenseAccountId ? { value: item.expenseAccountId } : null,
+        AssetAccountRef: item.assetAccountId ? { value: item.assetAccountId } : null,
+        PrefVendorRef: item.preferredVendorId ? { value: item.preferredVendorId } : null,
+        ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
+        Taxable: item.taxable,
+        InvStartDate: item.inventoryStartDate,
+        ReorderPoint: item.reorderPoint,
+      }),
+    ],
+  )
+}
+
 async function createPosAccountingItemMappingIfAbsent(
   client: Parameters<Parameters<typeof withTransaction>[0]>[0],
   input: {
@@ -762,6 +866,10 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
       [input.job.id, input.job.lockToken, input.job.connectionId],
     )
     if (!lease.rows[0]) throw new Error('QuickBooks write lease was lost')
+    await cacheCreatedQuickBooksItem(client, {
+      job: input.job,
+      providerEntityId: input.providerEntityId,
+    })
     const posAccountingMapping = await createPosAccountingItemMappingIfAbsent(client, {
       job: input.job,
       providerEntityId: input.providerEntityId,

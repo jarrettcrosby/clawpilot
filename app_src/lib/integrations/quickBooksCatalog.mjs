@@ -64,6 +64,7 @@ export function parseQuickBooksCompanyInfo(payload) {
   const companyName = text(company.CompanyName, 200)
   if (!companyName) throw new Error('QuickBooks did not return a company name')
   return {
+    companyId: text(company.Id, 200) || null,
     companyName,
     country: text(company.Country, 10) || null,
     legalName: text(company.LegalName, 200) || null,

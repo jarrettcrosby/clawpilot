@@ -71,8 +71,9 @@ const quickBooksWritePersistenceMocks = {
 }
 
 assert.deepEqual(
-  parseQuickBooksCompanyInfo({ CompanyInfo: { CompanyName: ' Example Co ', Country: 'US' } }),
+  parseQuickBooksCompanyInfo({ CompanyInfo: { Id: 'realm-123', CompanyName: ' Example Co ', Country: 'US' } }),
   {
+    companyId: 'realm-123',
     companyName: 'Example Co',
     country: 'US',
     legalName: null,
@@ -514,7 +515,11 @@ for (const fragment of [
   'validateQuickBooksWriteDraft',
   'buildQuickBooksProviderPayload',
   "'customer.create', 'item.create', 'invoice.create'",
-  "itemType !== 'Service' && itemType !== 'NonInventory'",
+  "itemType !== 'Service' && itemType !== 'NonInventory' && itemType !== 'Inventory'",
+  'QUICKBOOKS_WRITE_ASSET_ACCOUNT_REQUIRED',
+  'PrefVendorRef',
+  'InvStartDate',
+  'ReorderPoint',
   "lower(item_type) = 'category'",
   'QUICKBOOKS_WRITE_PARENT_CATEGORY_INVALID',
   'Line ${index + 1} requires an active QuickBooks product or service',
@@ -533,10 +538,34 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
       if (source.includes('FROM quickbooks_accounts')) {
         return { rows: (params[1] || []).map((id) => ({
           quickbooks_account_id: id,
-          fully_qualified_name: id === 'income-1' ? 'Sales' : 'Cost of goods sold',
-          classification: id === 'income-1' ? 'Revenue' : 'Expense',
-          account_type: id === 'income-1' ? 'Income' : 'Cost of Goods Sold',
+          fully_qualified_name: id === 'income-1'
+            ? 'Sales'
+            : id === 'asset-1'
+              ? 'Inventory asset'
+              : id === 'ordinary-asset'
+                ? 'Prepaid expenses'
+                : id === 'ordinary-expense'
+                  ? 'Office supplies'
+                  : 'Cost of goods sold',
+          classification: id === 'income-1'
+            ? 'Revenue'
+            : id === 'asset-1' || id === 'ordinary-asset'
+              ? 'Asset'
+              : 'Expense',
+          account_type: id === 'income-1'
+            ? 'Income'
+            : id === 'asset-1' || id === 'ordinary-asset'
+              ? 'Other Current Asset'
+              : id === 'ordinary-expense'
+                ? 'Expense'
+                : 'Cost of Goods Sold',
+          account_sub_type: id === 'asset-1' ? 'Inventory' : id === 'ordinary-asset' ? 'OtherCurrentAssets' : null,
         })) }
+      }
+      if (source.includes('FROM quickbooks_vendors')) {
+        return { rows: params[0] === writeOrganizationId && params[1] === 'vendor-1' ? [{
+          quickbooks_vendor_id: 'vendor-1', display_name: 'Supply Co',
+        }] : [] }
       }
       if (source.includes('FROM quickbooks_customers')) {
         return { rows: params[1] === 'customer-1' ? [{ display_name: 'Acme Buyer', email: 'buyer@example.com' }] : [] }
@@ -595,6 +624,74 @@ const uncategorizedProviderItem = writePayloadModule.buildQuickBooksProviderPayl
 })
 assert.equal(Object.hasOwn(uncategorizedProviderItem, 'SubItem'), false)
 assert.equal(Object.hasOwn(uncategorizedProviderItem, 'ParentRef'), false)
+
+const salesOnlyDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.create',
+  payload: {
+    name: 'Sales only service', itemType: 'Service', unitPrice: 125,
+    incomeAccountId: 'income-1', purchaseInformationEnabled: false,
+    purchaseDescription: 'Stale hidden description', purchaseCost: 25,
+    expenseAccountId: 'expense-1', preferredVendorId: 'vendor-1',
+  },
+})
+assert.equal(salesOnlyDraft.payload.purchaseInformationEnabled, false)
+assert.equal(salesOnlyDraft.payload.purchaseDescription, null)
+assert.equal(salesOnlyDraft.payload.purchaseCost, 0)
+assert.equal(salesOnlyDraft.payload.expenseAccountId, null)
+assert.equal(salesOnlyDraft.payload.preferredVendorId, null)
+const providerSalesOnly = writePayloadModule.buildQuickBooksProviderPayload('item.create', salesOnlyDraft.payload)
+for (const purchaseField of ['PurchaseDesc', 'PurchaseCost', 'ExpenseAccountRef', 'PrefVendorRef']) {
+  assert.equal(Object.hasOwn(providerSalesOnly, purchaseField), false, `sales-only item leaked ${purchaseField}`)
+}
+
+const inventoryDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.create',
+  payload: {
+    name: 'Roasted beans', itemType: 'Inventory', sku: 'BEANS-12', description: '12 oz bag',
+    purchaseDescription: 'Wholesale roasted beans', unitPrice: 18, purchaseCost: 8,
+    incomeAccountId: 'income-1', expenseAccountId: 'expense-1', assetAccountId: 'asset-1',
+    preferredVendorId: 'vendor-1', quantityOnHand: 24, inventoryStartDate: '2026-09-01',
+    reorderPoint: 6, taxable: true,
+  },
+})
+assert.equal(inventoryDraft.payload.preferredVendorName, 'Supply Co')
+assert.equal(inventoryDraft.payload.assetAccountName, 'Inventory asset')
+const providerInventory = writePayloadModule.buildQuickBooksProviderPayload('item.create', inventoryDraft.payload)
+assert.deepEqual(JSON.parse(JSON.stringify(providerInventory)), {
+  Name: 'Roasted beans', Type: 'Inventory', Sku: 'BEANS-12', Description: '12 oz bag',
+  PurchaseDesc: 'Wholesale roasted beans', UnitPrice: 18, PurchaseCost: 8,
+  IncomeAccountRef: { value: 'income-1' }, ExpenseAccountRef: { value: 'expense-1' },
+  AssetAccountRef: { value: 'asset-1' }, PrefVendorRef: { value: 'vendor-1' },
+  Taxable: true, TrackQtyOnHand: true, QtyOnHand: 24, InvStartDate: '2026-09-01', ReorderPoint: 6,
+})
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId,
+    operationKind: 'item.create',
+    payload: {
+      name: 'Invalid inventory expense', itemType: 'Inventory', unitPrice: 18,
+      incomeAccountId: 'income-1', expenseAccountId: 'ordinary-expense', assetAccountId: 'asset-1',
+      quantityOnHand: 1, inventoryStartDate: '2026-09-01',
+    },
+  }),
+  /cost of goods sold account/,
+  'Inventory products must reject ordinary expense accounts',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId,
+    operationKind: 'item.create',
+    payload: {
+      name: 'Invalid inventory asset', itemType: 'Inventory', unitPrice: 18,
+      incomeAccountId: 'income-1', expenseAccountId: 'expense-1', assetAccountId: 'ordinary-asset',
+      quantityOnHand: 1, inventoryStartDate: '2026-09-01',
+    },
+  }),
+  /inventory asset account/,
+  'Inventory products must reject non-inventory asset accounts',
+)
 
 const mappedItemPayload = {
   name: 'Saratoga Sparkling 12 oz', itemType: 'NonInventory', unitPrice: 3.5,
@@ -1046,6 +1143,7 @@ assert.ok(!writePersistence.includes('console.'), 'QuickBooks write persistence 
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const actorEmail = 'manager@example.com'
 const company = {
+  companyId: 'realm-replacement',
   companyName: 'Replacement Books',
   country: 'US',
   legalName: null,
@@ -1074,8 +1172,44 @@ const integrationPersistenceModule = loadTypeScriptModule('app_src/lib/persisten
         const source = String(sql)
         integrationSqlCalls.push({ source, params })
         if (source.includes('SELECT maton_connection_id, company_name, country')) {
+          if (integrationScenario === 'rotate_same_company') {
+            return {
+              rows: [{
+                maton_connection_id: 'connection-old', company_name: 'Replacement Books', country: 'US',
+                company_profile: { companyId: 'realm-replacement' },
+              }],
+              rowCount: 1,
+            }
+          }
+          if (integrationScenario === 'rotate_legacy_same_name') {
+            return {
+              rows: [{
+                maton_connection_id: 'connection-old', company_name: 'Replacement Books', country: 'US',
+                company_profile: {},
+              }],
+              rowCount: 1,
+            }
+          }
+          if (integrationScenario === 'unchanged_legacy') {
+            return {
+              rows: [{
+                maton_connection_id: 'connection-legacy', company_name: 'Replacement Books', country: 'US',
+                company_profile: {},
+              }],
+              rowCount: 1,
+            }
+          }
+          if (integrationScenario === 'same_connection_different_company') {
+            return {
+              rows: [{
+                maton_connection_id: 'connection-new', company_name: 'Other Books', country: 'US',
+                company_profile: { companyId: 'realm-original' },
+              }],
+              rowCount: 1,
+            }
+          }
           return {
-            rows: [{ maton_connection_id: 'connection-old', company_name: 'Original Books', country: 'US' }],
+            rows: [{ maton_connection_id: 'connection-old', company_name: 'Original Books', country: 'US', company_profile: {} }],
             rowCount: 1,
           }
         }
@@ -1136,6 +1270,110 @@ assert.equal(
   integrationAuditEvents.find((event) => event.eventType === 'quickbooks.connection.bound').payload.invalidatedPosAccountingProfileCount,
   1,
 )
+
+integrationScenario = 'rotate_same_company'
+const sameCompanyCallStart = integrationSqlCalls.length
+const sameCompanyAuditStart = integrationAuditEvents.length
+await integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-rotated',
+  company,
+  actorEmail,
+})
+const sameCompanyCalls = integrationSqlCalls.slice(sameCompanyCallStart)
+const sameCompanyAudit = integrationAuditEvents.slice(sameCompanyAuditStart)
+assert.ok(
+  sameCompanyCalls.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')),
+  'A different provider connection must fail closed even when CompanyInfo.Id and display fields match',
+)
+assert.ok(
+  sameCompanyCalls.some((call) => call.source.includes('DELETE FROM quickbooks_items')),
+  'A different provider connection must clear the unproven catalog',
+)
+assert.ok(
+  !sameCompanyCalls.some((call) => call.source.includes('UPDATE quickbooks_write_requests') && call.source.includes('reviewed_maton_connection_id = $2')),
+  'A different provider connection must not retarget reviewed writes',
+)
+const sameCompanyBound = sameCompanyAudit.find((event) => event.eventType === 'quickbooks.connection.bound')
+assert.equal(sameCompanyBound.payload.bindingChanged, true)
+assert.equal(sameCompanyBound.payload.credentialRotated, false)
+assert.equal(sameCompanyBound.payload.writeVerificationReset, true)
+
+integrationScenario = 'rotate_legacy_same_name'
+const rotatedLegacyCallStart = integrationSqlCalls.length
+const rotatedLegacyAuditStart = integrationAuditEvents.length
+await integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-rotated-without-stable-id',
+  company: { ...company, companyId: '' },
+  actorEmail,
+})
+const rotatedLegacyCalls = integrationSqlCalls.slice(rotatedLegacyCallStart)
+const rotatedLegacyAudit = integrationAuditEvents.slice(rotatedLegacyAuditStart)
+assert.ok(
+  rotatedLegacyCalls.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')),
+  'Credential rotation without a stable provider connection must fail closed and invalidate POS item mappings',
+)
+assert.ok(
+  rotatedLegacyCalls.some((call) => call.source.includes('DELETE FROM quickbooks_items')),
+  'Credential rotation without a stable provider connection must clear the unproven catalog',
+)
+const rotatedLegacyBound = rotatedLegacyAudit.find((event) => event.eventType === 'quickbooks.connection.bound')
+assert.equal(rotatedLegacyBound.payload.bindingChanged, true)
+assert.equal(rotatedLegacyBound.payload.credentialRotated, false)
+assert.equal(rotatedLegacyBound.payload.writeVerificationReset, true)
+
+integrationScenario = 'unchanged_legacy'
+const unchangedLegacyCallStart = integrationSqlCalls.length
+const unchangedLegacyAuditStart = integrationAuditEvents.length
+await integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-legacy',
+  company: { ...company, companyId: '' },
+  actorEmail,
+})
+const unchangedLegacyCalls = integrationSqlCalls.slice(unchangedLegacyCallStart)
+const unchangedLegacyAudit = integrationAuditEvents.slice(unchangedLegacyAuditStart)
+assert.ok(
+  !unchangedLegacyCalls.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')),
+  'An unchanged legacy connection may preserve POS item mappings using the company-name and country fallback',
+)
+assert.ok(
+  !unchangedLegacyCalls.some((call) => call.source.includes('DELETE FROM quickbooks_items')),
+  'An unchanged legacy connection may retain its last known catalog',
+)
+const unchangedLegacyBound = unchangedLegacyAudit.find((event) => event.eventType === 'quickbooks.connection.bound')
+assert.equal(unchangedLegacyBound.payload.bindingChanged, false)
+assert.equal(unchangedLegacyBound.payload.credentialRotated, false)
+assert.equal(unchangedLegacyBound.payload.writeVerificationReset, false)
+
+integrationScenario = 'same_connection_different_company'
+const conflictingIdentityCallStart = integrationSqlCalls.length
+const conflictingIdentityAuditStart = integrationAuditEvents.length
+await integrationPersistenceModule.bindQuickBooksConnectionInPostgres({
+  organizationId,
+  ownerEmail: 'owner@example.com',
+  connectionId: 'connection-new',
+  company,
+  actorEmail,
+})
+const conflictingIdentityCalls = integrationSqlCalls.slice(conflictingIdentityCallStart)
+const conflictingIdentityAudit = integrationAuditEvents.slice(conflictingIdentityAuditStart)
+assert.ok(
+  conflictingIdentityCalls.some((call) => call.source.includes('UPDATE pos_accounting_catalog_mappings SET effective_to')),
+  'Changed company details on an unchanged connection must invalidate POS item mappings',
+)
+assert.ok(
+  conflictingIdentityCalls.some((call) => call.source.includes('DELETE FROM quickbooks_items')),
+  'Changed company details on an unchanged connection must clear the old company catalog',
+)
+const conflictingIdentityBound = conflictingIdentityAudit.find((event) => event.eventType === 'quickbooks.connection.bound')
+assert.equal(conflictingIdentityBound.payload.bindingChanged, true)
+assert.equal(conflictingIdentityBound.payload.credentialRotated, false)
+assert.equal(conflictingIdentityBound.payload.writeVerificationReset, true)
 
 integrationScenario = 'processing'
 const sqlCountBeforeBlockedRebind = integrationSqlCalls.length
@@ -2427,6 +2665,9 @@ const writeWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorke
     failQuickBooksWriteJobInPostgres: async () => false,
   },
   '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/persistence/posAccountingNotifications': {
+    reconcilePosAccountingIssueForQuickBooksRequestInPostgres: async () => null,
+  },
   '@/lib/quickBooksWritePolicy': {
     configuredQuickBooksWritePolicy: () => ({ enabled: false, mode: null, allowedOperations: [] }),
   },
@@ -2454,6 +2695,9 @@ const retryWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorke
     failQuickBooksWriteJobInPostgres: async () => { failedJobs += 1; return false },
   },
   '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/persistence/posAccountingNotifications': {
+    reconcilePosAccountingIssueForQuickBooksRequestInPostgres: async () => null,
+  },
   '@/lib/quickBooksWritePolicy': {
     configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['customer.create'] }),
   },

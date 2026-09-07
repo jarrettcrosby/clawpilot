@@ -8,6 +8,7 @@ import {
   failQuickBooksWriteJobInPostgres,
 } from '@/lib/persistence/quickBooksWrites'
 import { queueQuickBooksCatalogSyncInPostgres } from '@/lib/persistence/quickBooksIntegrations'
+import { reconcilePosAccountingIssueForQuickBooksRequestInPostgres } from '@/lib/persistence/posAccountingNotifications'
 import { configuredQuickBooksWritePolicy } from '@/lib/quickBooksWritePolicy'
 
 export async function processQuickBooksWriteOutbox(input: { limit?: number; workerId: string }) {
@@ -25,6 +26,7 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
   let failed = 0
   let dead = 0
   let catalogSyncWarnings = 0
+  let accountingNotificationWarnings = 0
   for (const job of jobs) {
     try {
       const provider = await createQuickBooksEntity({
@@ -55,6 +57,18 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
       if (becameDead) dead += 1
       else failed += 1
     }
+    if (job.operationKind === 'sales_receipt.create' || job.operationKind === 'journal_entry.create') {
+      try {
+        await reconcilePosAccountingIssueForQuickBooksRequestInPostgres({
+          organizationId: job.organizationId,
+          requestId: job.id,
+        })
+      } catch {
+        // The QuickBooks result is already committed. Alert reconciliation is
+        // retried by the stale accounting reconciler and must not rewrite it.
+        accountingNotificationWarnings += 1
+      }
+    }
   }
   return {
     enabled: true,
@@ -65,5 +79,6 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
     failed,
     dead,
     catalogSyncWarnings,
+    accountingNotificationWarnings,
   }
 }

@@ -197,7 +197,7 @@ Toast Analytics reporting is operational information, not a GAAP ledger. ClawPil
 - A draft must reconcile source coverage and pass mapping validation before approval is possible.
 - Posting requires a separately connected QuickBooks company, current organization authorization, an explicit approval, and an idempotency key.
 - Failed or ambiguous exports remain reviewable and retryable; they never silently fall back to another restaurant, organization, or QuickBooks company.
-- Accounting issue email is disabled by default and requires an organization accounting administrator to enable **Email issue alerts** on the effective accounting profile. Enabling it establishes a notification start date; ClawPilot does not backfill older business dates.
+- New accounting profiles enable **Email issue alerts** by default and establish their notification start date when created. An organization accounting administrator can turn alerts off at any time. Existing disabled profiles stay disabled during upgrade, and ClawPilot does not backfill older business dates.
 - Demo workspaces and reserved `.example`, `.invalid`, and `.test` recipients never enter the delivery queue. Activity remains available in-app without email delivery.
 - Agents may summarize a normalized draft but cannot retrieve Toast or QuickBooks credentials, change mappings, approve a draft, or post a transaction.
 - Account mapping uses the active organization's read-only QuickBooks catalog described in [QuickBooks Accounting Connector](quickbooks-accounting.md).

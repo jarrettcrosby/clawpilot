@@ -595,7 +595,7 @@ function defaultProfile(): PosAccountingProfile {
     depositChecksWithCash: false,
     openCheckPolicy: 'hold',
     batchHoldPolicy: 'hold_until_closed',
-    emailNotificationsEnabled: false,
+    emailNotificationsEnabled: true,
     emailNotificationsEnabledAt: null,
     createdBy: null,
     createdAt: null,

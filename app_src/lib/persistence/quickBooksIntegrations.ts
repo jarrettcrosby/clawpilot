@@ -43,6 +43,7 @@ type QuickBooksConnectionBindingRow = {
   maton_connection_id: string
   company_name: string
   country: string | null
+  company_profile: Record<string, unknown> | null
 }
 
 type CancelledQuickBooksWriteRow = {
@@ -367,21 +368,29 @@ export async function bindQuickBooksConnectionInPostgres(input: {
   await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
     const current = await client.query<QuickBooksConnectionBindingRow>(
-      `SELECT maton_connection_id, company_name, country
+      `SELECT maton_connection_id, company_name, country, company_profile
        FROM organization_quickbooks_connections
        WHERE organization_id = $1::uuid
        FOR UPDATE`,
       [input.organizationId],
     )
     const currentBinding = current.rows[0]
-    const bindingChanged = Boolean(currentBinding) && (
-      currentBinding.maton_connection_id !== input.connectionId
-      || currentBinding.company_name !== input.company.companyName
-      || currentBinding.country !== input.company.country
-    )
+    const credentialChanged = Boolean(currentBinding)
+      && currentBinding.maton_connection_id !== input.connectionId
+    // QuickBooks CompanyInfo.Id identifies the CompanyInfo entity inside a
+    // realm; it is not a cross-realm company identity. Only the already-bound
+    // Maton connection can prove continuity. A different connection must fail
+    // closed so a same-named company cannot inherit catalog data or mappings.
+    const sameProviderCompany = Boolean(currentBinding)
+      && !credentialChanged
+      && currentBinding.company_name === input.company.companyName
+      && currentBinding.country === input.company.country
+    const bindingChanged = Boolean(currentBinding) && !sameProviderCompany
     let cancelledWriteRequestCount = 0
-    if (bindingChanged) {
+    if (credentialChanged || bindingChanged) {
       await assertNoProcessingQuickBooksWrites(client, input.organizationId)
+    }
+    if (bindingChanged) {
       cancelledWriteRequestCount = await cancelUnpostedQuickBooksWrites({
         client,
         organizationId: input.organizationId,
@@ -417,24 +426,15 @@ export async function bindQuickBooksConnectionInPostgres(input: {
          catalog_sync_enabled = true,
          verified_at = now(),
          write_mode = CASE
-           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
-             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
-             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
-             THEN 'disabled'
+           WHEN $8::boolean THEN 'disabled'
            ELSE organization_quickbooks_connections.write_mode
          END,
          write_verified_at = CASE
-           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
-             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
-             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
-             THEN NULL
+           WHEN $8::boolean THEN NULL
            ELSE organization_quickbooks_connections.write_verified_at
          END,
          write_verified_by = CASE
-           WHEN organization_quickbooks_connections.maton_connection_id IS DISTINCT FROM EXCLUDED.maton_connection_id
-             OR organization_quickbooks_connections.company_name IS DISTINCT FROM EXCLUDED.company_name
-             OR organization_quickbooks_connections.country IS DISTINCT FROM EXCLUDED.country
-             THEN NULL
+           WHEN $8::boolean THEN NULL
            ELSE organization_quickbooks_connections.write_verified_by
          END,
          last_error_code = NULL,
@@ -447,14 +447,26 @@ export async function bindQuickBooksConnectionInPostgres(input: {
         input.company.companyName,
         input.company.country,
         JSON.stringify({
+          companyId: input.company.companyId,
           legalName: input.company.legalName,
           email: input.company.email,
           phone: input.company.phone,
           address: input.company.address,
         }),
         input.actorEmail,
+        bindingChanged,
       ],
     )
+    if (credentialChanged && !bindingChanged) {
+      await client.query(
+        `UPDATE quickbooks_write_requests
+         SET reviewed_maton_connection_id = $2, updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND reviewed_maton_connection_id <> $2
+           AND status IN ('draft', 'pending_approval', 'approved', 'failed', 'dead')`,
+        [input.organizationId, input.connectionId],
+      )
+    }
     await client.query(
       `UPDATE quickbooks_sync_outbox SET
          status = 'pending', attempt_count = 0, available_at = now(),
@@ -464,23 +476,25 @@ export async function bindQuickBooksConnectionInPostgres(input: {
        WHERE organization_id = $1::uuid AND sync_kind = 'catalog'`,
       [input.organizationId, input.actorEmail],
     )
-    await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_items WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_customers WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_classes WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_departments WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_tax_codes WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query('DELETE FROM quickbooks_financial_reports WHERE organization_id = $1::uuid', [input.organizationId])
-    await client.query(
-      `UPDATE toast_accounting_mappings SET
-         quickbooks_account_id = NULL, quickbooks_account_name = NULL,
-         updated_by = lower($2), updated_at = now()
-       WHERE organization_id = $1::uuid`,
-      [input.organizationId, input.actorEmail],
-    )
+    if (bindingChanged || !currentBinding) {
+      await client.query('DELETE FROM quickbooks_accounts WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_items WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_customers WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_vendors WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_classes WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_departments WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_tax_codes WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_transactions WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_attachments WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query('DELETE FROM quickbooks_financial_reports WHERE organization_id = $1::uuid', [input.organizationId])
+      await client.query(
+        `UPDATE toast_accounting_mappings SET
+           quickbooks_account_id = NULL, quickbooks_account_name = NULL,
+           updated_by = lower($2), updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [input.organizationId, input.actorEmail],
+      )
+    }
     await recordAuditEvent({
       actor: input.actorEmail,
       eventType: 'quickbooks.connection.bound',
@@ -491,6 +505,7 @@ export async function bindQuickBooksConnectionInPostgres(input: {
         companyName: input.company.companyName,
         country: input.company.country,
         bindingChanged,
+        credentialRotated: credentialChanged && !bindingChanged,
         writeVerificationReset: bindingChanged,
         cancelledWriteRequestCount,
         invalidatedPosAccountingProfileCount: invalidatedPosAccounting.profileCount,
@@ -1088,6 +1103,7 @@ export async function completeQuickBooksCatalogSyncInPostgres(input: {
         input.company.companyName,
         input.company.country,
         JSON.stringify({
+          companyId: input.company.companyId,
           legalName: input.company.legalName,
           email: input.company.email,
           phone: input.company.phone,

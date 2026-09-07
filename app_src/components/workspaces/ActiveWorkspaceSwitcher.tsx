@@ -75,6 +75,7 @@ export default function ActiveWorkspaceSwitcher() {
   const [businessName, setBusinessName] = useState('')
   const [demoOpening, setDemoOpening] = useState(false)
   const [error, setError] = useState('')
+  const [deepLinkWorkspaceHandled, setDeepLinkWorkspaceHandled] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -95,6 +96,35 @@ export default function ActiveWorkspaceSwitcher() {
   useEffect(() => {
     if (current?.organizationId) rememberWorkspaceVisit(current.organizationId)
   }, [current?.organizationId])
+
+  useEffect(() => {
+    if (!payload || !current || deepLinkWorkspaceHandled || switching) return
+    const organizationId = new URLSearchParams(window.location.search).get('organizationId')?.trim().toLowerCase() || ''
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(organizationId)
+      || organizationId === current.organizationId
+      || !payload.workspaces.some((workspace) => workspace.organizationId === organizationId)) {
+      setDeepLinkWorkspaceHandled(true)
+      return
+    }
+
+    setDeepLinkWorkspaceHandled(true)
+    setSwitching(organizationId)
+    setError('')
+    void fetch('/api/auth/workspace', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'switch', organizationId }),
+    }).then(async (response) => {
+      const result = await response.json() as WorkspaceMutationResponse
+      if (!response.ok || !result.ok || !result.activeWorkspace) {
+        throw new Error(result.error || 'Unable to open the linked business')
+      }
+      window.location.reload()
+    }).catch((caught) => {
+      setSwitching(null)
+      setError(caught instanceof Error ? caught.message : 'Unable to open the linked business')
+    })
+  }, [current, deepLinkWorkspaceHandled, payload, switching])
 
   if (!current) return null
 

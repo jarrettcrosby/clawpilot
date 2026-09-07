@@ -28,11 +28,12 @@ export type SendInvitationEmailInput = {
 export type SendPosAccountingIssueEmailInput = {
   to: string
   recipientName?: string | null
+  organizationId: string
   organizationName: string
   restaurantName: string
   restaurantGuid: string
   businessDate: string
-  issues: Array<{ title: string; detail: string }>
+  issues: Array<{ code: string; title: string; detail: string; action?: string }>
 }
 
 function assertEmail(value: string): string {
@@ -411,24 +412,39 @@ export async function sendInvitationEmail(input: SendInvitationEmailInput): Prom
   return sendMessage({ to, subject: `${inviterName} invited you to ClawPilot`, text, html })
 }
 
-export async function sendPosAccountingIssueEmail(
+function isMappingIssueCode(value: string) {
+  const code = value.toLowerCase()
+  return code === 'mapping_hold'
+    || code === 'payment_exception_clearing_conflict'
+    || code.endsWith('_mapping_required')
+    || code.startsWith('missing_mapping:')
+}
+
+export function buildPosAccountingIssueEmail(
   input: SendPosAccountingIssueEmailInput,
-): Promise<{ messageId: string | null }> {
+): MailContent {
   const to = assertEmail(input.to)
   const recipientName = String(input.recipientName || '').replace(/[\r\n]/g, ' ').trim().slice(0, 100)
+  const organizationId = String(input.organizationId || '').trim().toLowerCase()
   const organizationName = cleanHeader(String(input.organizationName || '').slice(0, 200), 'Organization name')
   const restaurantName = cleanHeader(String(input.restaurantName || '').slice(0, 200), 'Restaurant name')
   const restaurantGuid = String(input.restaurantGuid || '').trim().toLowerCase()
   const businessDate = String(input.businessDate || '').trim()
+  if (!/^[0-9a-f-]{36}$/.test(organizationId)) throw new Error('Organization is invalid')
   if (!/^[0-9a-f-]{36}$/.test(restaurantGuid)) throw new Error('Restaurant location is invalid')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) throw new Error('Business date is invalid')
   const issues = input.issues.slice(0, 25).map((issue) => ({
+    code: String(issue.code || 'accounting_hold').replace(/[\r\n]/g, ' ').trim().slice(0, 600),
     title: String(issue.title || 'Accounting item').replace(/[\r\n]/g, ' ').trim().slice(0, 240),
     detail: String(issue.detail || 'Review this accounting item in ClawPilot').replace(/[\r\n]/g, ' ').trim().slice(0, 600),
   }))
   if (!issues.length) throw new Error('At least one accounting issue is required')
+  const mappingRequired = issues.some((issue) => isMappingIssueCode(issue.code))
+  const heading = mappingRequired ? 'QuickBooks mapping required' : 'Accounting action required'
+  const callToAction = mappingRequired ? 'Fix mapping' : 'Review POS accounting'
 
   const actionUrl = new URL(appPublicUrl())
+  actionUrl.searchParams.set('organizationId', organizationId)
   actionUrl.searchParams.set('posView', 'accounting')
   actionUrl.searchParams.set('date', businessDate)
   actionUrl.searchParams.set('location', restaurantGuid)
@@ -439,7 +455,7 @@ export async function sendPosAccountingIssueEmail(
   const greeting = recipientName ? `Hi ${recipientName},` : 'Hello,'
   const issueLines = issues.map((issue) => `- ${issue.title}: ${issue.detail}`)
   const text = [
-    `ClawPilot accounting action required for ${restaurantName}`,
+    `${heading} for ${restaurantName}`,
     '',
     greeting,
     '',
@@ -447,7 +463,7 @@ export async function sendPosAccountingIssueEmail(
     '',
     ...issueLines,
     '',
-    `Review POS accounting: ${actionUrl.toString()}`,
+    `${callToAction}: ${actionUrl.toString()}`,
     '',
     `Organization: ${organizationName}`,
     'Once the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically.',
@@ -462,22 +478,30 @@ export async function sendPosAccountingIssueEmail(
     '<div style="max-width:600px;margin:0 auto;background:#1a1a23;border:1px solid #343741;border-radius:8px;overflow:hidden">',
     '<div style="padding:24px 28px 20px;border-bottom:3px solid #f2b76d">',
     `<img src="${escapeHtml(logoUrl)}" width="52" height="52" alt="" style="display:block;margin:0 0 16px">`,
-    '<p style="margin:0 0 8px;color:#f2b76d;font-size:12px;font-weight:700;text-transform:uppercase">Accounting action required</p>',
-    `<h1 style="margin:0;font-size:25px;line-height:1.25">${escapeHtml(restaurantName)}</h1>`,
-    `<p style="margin:8px 0 0;color:#b9bdc8">${escapeHtml(dateLabel)} · ${escapeHtml(organizationName)}</p>`,
+    '<p style="margin:0 0 8px;color:#f2b76d;font-size:12px;font-weight:700;text-transform:uppercase">Accounting posting issue</p>',
+    `<h1 style="margin:0;font-size:25px;line-height:1.25">${escapeHtml(heading)}</h1>`,
+    `<p style="margin:8px 0 0;color:#b9bdc8">${escapeHtml(restaurantName)} · ${escapeHtml(dateLabel)} · ${escapeHtml(organizationName)}</p>`,
     '</div>',
     '<div style="padding:24px 28px 28px">',
     `<p style="margin:0 0 16px;line-height:1.6">${escapeHtml(greeting)}</p>`,
     `<p style="margin:0 0 18px;line-height:1.6">${issues.length} accounting ${issues.length === 1 ? 'item requires' : 'items require'} review before this business date can be posted.</p>`,
     `<ul style="margin:0 0 22px;padding-left:20px">${issueHtml}</ul>`,
-    `<p style="margin:0 0 22px"><a href="${escapeHtml(actionUrl.toString())}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#a8c7fa;color:#071728;text-decoration:none;font-weight:700">Review POS accounting</a></p>`,
+    `<p style="margin:0 0 22px"><a href="${escapeHtml(actionUrl.toString())}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#a8c7fa;color:#071728;text-decoration:none;font-weight:700">${escapeHtml(callToAction)}</a></p>`,
     '<p style="margin:0;color:#8f94a1;font-size:13px;line-height:1.5">After the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically. Repeated checks do not create duplicate alerts unless the issue changes or recurs.</p>',
     '</div></div></body></html>',
   ].join('')
-  return sendMessage({
+  return {
     to,
-    subject: `Action required: ${restaurantName} accounting for ${businessDate}`,
+    subject: mappingRequired
+      ? `Mapping required: ${restaurantName} accounting for ${businessDate}`
+      : `Action required: ${restaurantName} accounting for ${businessDate}`,
     text,
     html,
-  })
+  }
+}
+
+export async function sendPosAccountingIssueEmail(
+  input: SendPosAccountingIssueEmailInput,
+): Promise<{ messageId: string | null }> {
+  return sendMessage(buildPosAccountingIssueEmail(input))
 }

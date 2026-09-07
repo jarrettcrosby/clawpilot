@@ -153,9 +153,8 @@ export function derivePosAccountingIssues(workspace: PosAccountingWorkspace): Po
 }
 
 export function posAccountingIssueFingerprint(issues: PosAccountingIssue[]) {
-  return crypto.createHash('sha256').update(JSON.stringify(
-    [...issues].sort((left, right) => left.code.localeCompare(right.code)),
-  )).digest('hex')
+  const identities = [...new Set(issues.map((issue) => issue.code))].sort()
+  return crypto.createHash('sha256').update(JSON.stringify(identities)).digest('hex')
 }
 
 function issueCodes(issues: PosAccountingIssue[]) {
@@ -439,9 +438,24 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
          AND source.business_date >= current_date - interval '1 day'
          AND issue.id IS NULL
        GROUP BY source.organization_id, source.restaurant_guid, source.business_date
+       UNION ALL
+       SELECT draft.organization_id, draft.restaurant_guid, draft.business_date,
+         draft.updated_at AS priority_at
+       FROM toast_accounting_export_drafts draft
+       LEFT JOIN pos_accounting_issue_states issue
+         ON issue.organization_id = draft.organization_id
+        AND issue.restaurant_guid = draft.restaurant_guid
+        AND issue.business_date = draft.business_date
+       WHERE draft.is_current = true
+         AND draft.business_date >= current_date - interval '1 day'
+         AND (issue.id IS NULL OR draft.updated_at > issue.last_seen_at)
+     ), ranked_candidates AS (
+       SELECT organization_id, restaurant_guid, business_date, MIN(priority_at) AS priority_at
+       FROM candidates
+       GROUP BY organization_id, restaurant_guid, business_date
      )
      SELECT organization_id::text, restaurant_guid::text, business_date::text
-     FROM candidates
+     FROM ranked_candidates
      ORDER BY priority_at, organization_id, restaurant_guid, business_date
      LIMIT $1`,
     [Math.max(1, Math.min(input.limit || 1, 4))],
@@ -461,6 +475,33 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
     }
   }
   return { checked: result.rows.length, reconciled, failed }
+}
+
+export async function reconcilePosAccountingIssueForQuickBooksRequestInPostgres(input: {
+  organizationId: string
+  requestId: string
+}) {
+  const result = await query<{
+    restaurant_guid: string
+    business_date: string
+  }>(
+    `SELECT batch.restaurant_guid::text, batch.business_date::text
+     FROM pos_accounting_posting_batches batch
+     WHERE batch.organization_id = $1::uuid
+       AND (
+         batch.sales_receipt_request_id = $2::uuid
+         OR batch.journal_entry_request_id = $2::uuid
+       )
+     LIMIT 1`,
+    [input.organizationId, input.requestId],
+  )
+  const scope = result.rows[0]
+  if (!scope) return null
+  return reconcilePosAccountingIssueForDateInPostgres({
+    organizationId: input.organizationId,
+    restaurantGuid: scope.restaurant_guid,
+    businessDate: scope.business_date,
+  })
 }
 
 function toNotificationJob(row: NotificationJobRow): PosAccountingNotificationJob {
@@ -650,6 +691,7 @@ export async function processPosAccountingNotificationOutbox(input: {
       const result = await sendPosAccountingIssueEmail({
         to: job.recipientEmail,
         recipientName: job.recipientName,
+        organizationId: job.organizationId,
         organizationName: job.organizationName,
         restaurantName: job.restaurantName,
         restaurantGuid: job.restaurantGuid,

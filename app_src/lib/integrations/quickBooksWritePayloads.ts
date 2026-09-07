@@ -30,18 +30,28 @@ export type QuickBooksItemMappingScope = 'organization_default' | 'location_over
 
 export type QuickBooksItemDraft = {
   name: string
-  itemType: 'Service' | 'NonInventory'
+  itemType: 'Service' | 'NonInventory' | 'Inventory'
   sku: string | null
   description: string | null
+  purchaseDescription: string | null
+  purchaseInformationEnabled: boolean
   unitPrice: number
   purchaseCost: number
   incomeAccountId: string
   incomeAccountName: string
   expenseAccountId: string | null
   expenseAccountName: string | null
+  assetAccountId: string | null
+  assetAccountName: string | null
+  preferredVendorId: string | null
+  preferredVendorName: string | null
   parentCategoryId: string | null
   parentCategoryName: string | null
   taxable: boolean
+  trackQuantity: boolean
+  quantityOnHand: number | null
+  inventoryStartDate: string | null
+  reorderPoint: number | null
   sourceKind: 'sales_item' | null
   sourceId: string | null
   sourceName: string | null
@@ -164,6 +174,11 @@ function numberValue(value: unknown, label: string, options: { min: number; max:
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_NUMBER_INVALID', `${label} is outside the supported range`)
   }
   return Math.round((parsed + Number.EPSILON) * 1_000_000) / 1_000_000
+}
+
+function optionalNumberValue(value: unknown, label: string, options: { min: number; max: number }): number | null {
+  if (value === '' || value === null || value === undefined) return null
+  return numberValue(value, label, { ...options, required: true })
 }
 
 function dateValue(value: unknown, label: string, required = false): string | null {
@@ -301,20 +316,46 @@ async function validateCustomerDraft(organizationId: string, raw: Record<string,
 
 async function validateItemDraft(organizationId: string, raw: Record<string, unknown>): Promise<QuickBooksItemDraft> {
   const itemType = String(raw.itemType || '')
-  if (itemType !== 'Service' && itemType !== 'NonInventory') {
-    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_TYPE_INVALID', 'Product type must be Service or Non-inventory')
+  if (itemType !== 'Service' && itemType !== 'NonInventory' && itemType !== 'Inventory') {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_TYPE_INVALID', 'Product type must be Service, Non-inventory, or Inventory')
   }
   const incomeAccountId = cleanText(raw.incomeAccountId, 'Income account', 200, true)!
-  const expenseAccountId = cleanText(raw.expenseAccountId, 'Expense account', 200)
+  const requestedExpenseAccountId = cleanText(raw.expenseAccountId, 'Expense account', 200)
+  const requestedAssetAccountId = cleanText(raw.assetAccountId, 'Inventory asset account', 200)
+  const requestedPreferredVendorId = cleanText(raw.preferredVendorId, 'Preferred vendor', 200)
   const parentCategoryId = cleanText(raw.parentCategoryId, 'QuickBooks category', 200)
-  const ids = [incomeAccountId, expenseAccountId].filter(Boolean) as string[]
+  const hasExplicitPurchasePreference = typeof raw.purchaseInformationEnabled === 'boolean'
+  const purchaseInformationEnabled = itemType === 'Inventory' || (hasExplicitPurchasePreference
+    ? raw.purchaseInformationEnabled === true
+    : Boolean(
+        requestedExpenseAccountId
+        || requestedPreferredVendorId
+        || String(raw.purchaseDescription || '').trim()
+        || (raw.purchaseCost !== '' && raw.purchaseCost !== null && raw.purchaseCost !== undefined)
+      ))
+  const expenseAccountId = purchaseInformationEnabled ? requestedExpenseAccountId : null
+  const assetAccountId = itemType === 'Inventory' ? requestedAssetAccountId : null
+  const preferredVendorId = purchaseInformationEnabled ? requestedPreferredVendorId : null
+  if (purchaseInformationEnabled && !expenseAccountId) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_EXPENSE_ACCOUNT_REQUIRED',
+      itemType === 'Inventory'
+        ? 'Inventory products require a cost of goods sold account'
+        : 'Select an expense account when purchase information is provided',
+    )
+  }
+  if (itemType === 'Inventory' && !assetAccountId) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ASSET_ACCOUNT_REQUIRED', 'Inventory products require an inventory asset account')
+  }
+  const ids = [incomeAccountId, expenseAccountId, assetAccountId].filter(Boolean) as string[]
   const accounts = await query<{
     quickbooks_account_id: string
     fully_qualified_name: string
     classification: string | null
     account_type: string | null
+    account_sub_type: string | null
   }>(
-    `SELECT quickbooks_account_id, fully_qualified_name, classification, account_type
+    `SELECT quickbooks_account_id, fully_qualified_name, classification, account_type, account_sub_type
      FROM quickbooks_accounts
      WHERE organization_id = $1::uuid AND quickbooks_account_id = ANY($2::text[]) AND active = true`,
     [organizationId, ids],
@@ -325,8 +366,20 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_INCOME_ACCOUNT_INVALID', 'Select an active QuickBooks income account')
   }
   const expense = expenseAccountId ? byId.get(expenseAccountId) : null
-  if (expenseAccountId && (!expense || (expense.classification !== 'Expense' && !/expense|cost of goods sold/i.test(expense.account_type || '')))) {
-    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_EXPENSE_ACCOUNT_INVALID', 'Select an active QuickBooks expense account')
+  const expenseAccountIsValid = itemType === 'Inventory'
+    ? /^cost of goods sold$/i.test(expense?.account_type || '')
+    : Boolean(expense && (expense.classification === 'Expense' || /expense|cost of goods sold/i.test(expense.account_type || '')))
+  if (expenseAccountId && !expenseAccountIsValid) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_EXPENSE_ACCOUNT_INVALID',
+      itemType === 'Inventory'
+        ? 'Select an active QuickBooks cost of goods sold account'
+        : 'Select an active QuickBooks expense account',
+    )
+  }
+  const asset = assetAccountId ? byId.get(assetAccountId) : null
+  if (assetAccountId && !/^inventory$/i.test(asset?.account_sub_type || '')) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ASSET_ACCOUNT_INVALID', 'Select an active QuickBooks inventory asset account')
   }
   const categoryResult = parentCategoryId
     ? await query<{ quickbooks_item_id: string; fully_qualified_name: string }>(
@@ -342,21 +395,57 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
   if (parentCategoryId && !parentCategory) {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_PARENT_CATEGORY_INVALID', 'Select an active QuickBooks product category')
   }
+  const vendorResult = preferredVendorId
+    ? await query<{ quickbooks_vendor_id: string; display_name: string }>(
+        `SELECT quickbooks_vendor_id, display_name
+         FROM quickbooks_vendors
+         WHERE organization_id = $1::uuid AND quickbooks_vendor_id = $2 AND active = true
+         LIMIT 1`,
+        [organizationId, preferredVendorId],
+      )
+    : { rows: [] }
+  const preferredVendor = vendorResult.rows[0]
+  if (preferredVendorId && !preferredVendor) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_PREFERRED_VENDOR_INVALID', 'Select an active QuickBooks vendor')
+  }
+  const inventoryStartDate = itemType === 'Inventory'
+    ? dateValue(raw.inventoryStartDate, 'Inventory as-of date', true)
+    : null
+  const quantityOnHand = itemType === 'Inventory'
+    ? optionalNumberValue(raw.quantityOnHand, 'Initial quantity on hand', { min: 0, max: 1_000_000_000 }) ?? 0
+    : null
+  const reorderPoint = itemType === 'Inventory'
+    ? optionalNumberValue(raw.reorderPoint, 'Reorder point', { min: 0, max: 1_000_000_000 })
+    : null
   const sourceContext = await validateItemSourceContext(organizationId, raw)
   return {
     name: cleanText(raw.name, 'Product or service name', 100, true)!,
     itemType,
     sku: cleanText(raw.sku, 'SKU', 100),
-    description: cleanText(raw.description, 'Description', 1_000),
+    description: cleanText(raw.description, 'Sales description', 4_000),
+    purchaseDescription: purchaseInformationEnabled
+      ? cleanText(raw.purchaseDescription, 'Purchase description', 4_000)
+      : null,
+    purchaseInformationEnabled,
     unitPrice: numberValue(raw.unitPrice, 'Sales price', { min: 0, max: 1_000_000_000 }),
-    purchaseCost: numberValue(raw.purchaseCost, 'Purchase cost', { min: 0, max: 1_000_000_000 }),
+    purchaseCost: purchaseInformationEnabled
+      ? numberValue(raw.purchaseCost, 'Purchase cost', { min: 0, max: 1_000_000_000 })
+      : 0,
     incomeAccountId,
     incomeAccountName: income.fully_qualified_name,
     expenseAccountId,
     expenseAccountName: expense?.fully_qualified_name || null,
+    assetAccountId: itemType === 'Inventory' ? assetAccountId : null,
+    assetAccountName: itemType === 'Inventory' ? asset?.fully_qualified_name || null : null,
+    preferredVendorId,
+    preferredVendorName: preferredVendor?.display_name || null,
     parentCategoryId,
     parentCategoryName: parentCategory?.fully_qualified_name || null,
     taxable: raw.taxable === true,
+    trackQuantity: itemType === 'Inventory',
+    quantityOnHand,
+    inventoryStartDate,
+    reorderPoint,
     ...sourceContext,
   }
 }
@@ -481,13 +570,20 @@ export function buildQuickBooksProviderPayload(
       Type: item.itemType,
       Sku: item.sku,
       Description: item.description,
+      PurchaseDesc: item.purchaseInformationEnabled ? item.purchaseDescription : null,
       UnitPrice: item.unitPrice,
-      PurchaseCost: item.purchaseCost,
+      PurchaseCost: item.purchaseInformationEnabled ? item.purchaseCost : null,
       IncomeAccountRef: { value: item.incomeAccountId },
-      ExpenseAccountRef: item.expenseAccountId ? { value: item.expenseAccountId } : null,
+      ExpenseAccountRef: item.purchaseInformationEnabled && item.expenseAccountId ? { value: item.expenseAccountId } : null,
+      AssetAccountRef: item.assetAccountId ? { value: item.assetAccountId } : null,
+      PrefVendorRef: item.purchaseInformationEnabled && item.preferredVendorId ? { value: item.preferredVendorId } : null,
       SubItem: item.parentCategoryId ? true : null,
       ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
       Taxable: item.taxable,
+      TrackQtyOnHand: item.itemType === 'Inventory' ? item.trackQuantity : null,
+      QtyOnHand: item.quantityOnHand,
+      InvStartDate: item.inventoryStartDate,
+      ReorderPoint: item.reorderPoint,
     })
   }
   if (operationKind === 'sales_receipt.create') {
