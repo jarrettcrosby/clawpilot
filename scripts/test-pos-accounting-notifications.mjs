@@ -32,6 +32,7 @@ function loadTypeScriptModule(path, mocks = {}) {
     console,
     Date,
     Error,
+    URL,
     exports: module.exports,
     module,
     process,
@@ -50,7 +51,8 @@ for (const fragment of [
   'FOR UPDATE OF outbox SKIP LOCKED',
   'issueFingerprint',
   'JSON.stringify(input.issues)',
-  "ON CONFLICT (issue_state_id, occurrence, recipient_email) DO NOTHING",
+  "ON CONFLICT (issue_state_id, occurrence, recipient_email) DO UPDATE SET",
+  "WHERE pos_accounting_notification_outbox.status IN ('pending', 'failed', 'cancelled')",
   "membership.organization_id = $1::uuid",
   "membership.permissions @> '{\"viewAccounting\":true,\"manageUserAccess\":true}'::jsonb",
   'email_notifications_enabled = true',
@@ -58,9 +60,33 @@ for (const fragment of [
   "recipient_email = 'demo-system@clawpilot.example'",
   "status = 'cancelled'",
   'sendPosAccountingIssueEmail',
+  'reconcilePosAccountingIssueForQuickBooksRequestInPostgres',
+  'reconcileOpenPosAccountingIssuesForMappedItemInPostgres',
+  'pos_accounting_posting_batches',
+  'batch.sales_receipt_request_id = $2::uuid',
+  'batch.journal_entry_request_id = $2::uuid',
+  'toast_accounting_export_drafts draft',
+  'draft.updated_at > issue.last_seen_at',
 ]) {
   assert.ok(notificationSource.includes(fragment), `POS accounting notification adapter missing ${fragment}`)
 }
+
+const notificationDefaultsMigration = read('db/migrations/0361_pos_accounting_alerts_default_on.sql')
+for (const fragment of [
+  'ALTER COLUMN email_notifications_enabled SET DEFAULT true',
+  'ALTER COLUMN email_notifications_enabled_at SET DEFAULT now()',
+  'Do not rewrite existing false/null preferences',
+]) {
+  assert.ok(
+    notificationDefaultsMigration.includes(fragment),
+    `POS accounting notification defaults migration missing ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  notificationDefaultsMigration,
+  /UPDATE\s+pos_accounting_profiles/i,
+  'Default-on rollout must not silently re-enable existing profile opt-outs',
+)
 
 const notifications = loadTypeScriptModule('app_src/lib/persistence/posAccountingNotifications.ts', {
   '@/lib/auditWriter': { recordAuditEvent: async () => {} },
@@ -111,6 +137,16 @@ const firstFingerprint = notifications.posAccountingIssueFingerprint(issues)
 const secondFingerprint = notifications.posAccountingIssueFingerprint([...issues].reverse())
 assert.match(firstFingerprint, /^[0-9a-f]{64}$/)
 assert.equal(firstFingerprint, secondFingerprint, 'Issue ordering must not cause duplicate notification occurrences')
+assert.equal(
+  firstFingerprint,
+  notifications.posAccountingIssueFingerprint(issues.map((issue) => ({
+    ...issue,
+    title: `${issue.title} changed`,
+    detail: `${issue.detail} changed`,
+    action: issue.action ? `${issue.action} changed` : undefined,
+  }))),
+  'Display-only issue changes must not create another notification occurrence',
+)
 assert.notEqual(firstFingerprint, notifications.posAccountingIssueFingerprint(issues.slice(1)))
 assert.equal(notifications.derivePosAccountingIssues({ ...workspace, preview: { available: false } }).length, 0)
 const canonicalIssues = notifications.derivePosAccountingIssues({
@@ -156,14 +192,211 @@ for (const reserved of [
 
 const mailSource = read('app_src/lib/matonMail.ts')
 for (const fragment of [
+  'buildPosAccountingIssueEmail',
   'sendPosAccountingIssueEmail',
+  "actionUrl.searchParams.set('organizationId', organizationId)",
   "actionUrl.searchParams.set('posView', 'accounting')",
   "actionUrl.searchParams.set('date', businessDate)",
   "actionUrl.searchParams.set('location', restaurantGuid)",
-  'Repeated checks do not create duplicate alerts',
+  'ClawPilot sends at most one alert per location and business date',
 ]) {
   assert.ok(mailSource.includes(fragment), `POS accounting email missing ${fragment}`)
 }
+
+const mail = loadTypeScriptModule('app_src/lib/matonMail.ts', {
+  '@/lib/maton': {
+    matonAuthMailFetch: async () => { throw new Error('Mail delivery is not expected in content tests') },
+    matonPlatformMailFetch: async () => { throw new Error('Mail delivery is not expected in content tests') },
+  },
+  '@/lib/publicUrl': { appPublicUrl: () => 'https://clawpilot.example.test' },
+  '@/lib/persistence/config': { isHostedRuntime: () => false },
+})
+const emailScope = {
+  to: 'accounting-owner@notifications.clawpilot.dev',
+  recipientName: 'Accounting Owner',
+  organizationId: '11111111-1111-4111-8111-111111111111',
+  organizationName: 'Test Organization',
+  restaurantName: 'Downtown',
+  restaurantGuid: '22222222-2222-4222-8222-222222222222',
+  businessDate: '2026-09-05',
+}
+const mappingEmail = mail.buildPosAccountingIssueEmail({
+  ...emailScope,
+  issues: [{
+    code: 'missing_mapping:sales_item:toast-item-1:item',
+    title: 'Map Breakfast sandwich',
+    detail: 'sales item needs a QuickBooks item mapping.',
+    action: 'Map product',
+  }],
+})
+assert.equal(mappingEmail.subject, 'Mapping required: Downtown accounting for 2026-09-05')
+assert.match(mappingEmail.text, /^QuickBooks mapping required for Downtown/)
+assert.match(mappingEmail.text, /Fix mapping: https:\/\/clawpilot\.example\.test\//)
+assert.match(mappingEmail.html, /<h1[^>]*>QuickBooks mapping required<\/h1>/)
+assert.match(mappingEmail.html, />Fix mapping<\/a>/)
+const mappingActionUrl = new URL(mappingEmail.text.match(/Fix mapping: (https:\/\/\S+)/)?.[1] || '')
+assert.equal(mappingActionUrl.searchParams.get('organizationId'), emailScope.organizationId)
+assert.equal(mappingActionUrl.searchParams.get('posView'), 'accounting')
+assert.equal(mappingActionUrl.searchParams.get('date'), emailScope.businessDate)
+assert.equal(mappingActionUrl.searchParams.get('location'), emailScope.restaurantGuid)
+assert.equal(mappingActionUrl.hash, '#pos')
+
+const workspaceSwitcherSource = read('app_src/components/workspaces/ActiveWorkspaceSwitcher.tsx')
+for (const fragment of [
+  "new URLSearchParams(window.location.search).get('organizationId')",
+  "body: JSON.stringify({ action: 'switch', organizationId })",
+  'window.location.reload()',
+]) {
+  assert.ok(workspaceSwitcherSource.includes(fragment), `Accounting deep link workspace switch missing ${fragment}`)
+}
+
+const providerFailureEmail = mail.buildPosAccountingIssueEmail({
+  ...emailScope,
+  issues: [{
+    code: 'provider_failure',
+    title: 'Retry the failed accounting post',
+    detail: 'QuickBooks rejected the accounting post.',
+  }],
+})
+assert.equal(providerFailureEmail.subject, 'Action required: Downtown accounting for 2026-09-05')
+assert.match(providerFailureEmail.html, /<h1[^>]*>Accounting action required<\/h1>/)
+assert.match(providerFailureEmail.html, />Review POS accounting<\/a>/)
+
+const quickBooksWorkerSource = read('app_src/lib/quickBooksWriteWorker.ts')
+for (const fragment of [
+  'reconcilePosAccountingIssueForQuickBooksRequestInPostgres',
+  'reconcileOpenPosAccountingIssuesForMappedItemInPostgres',
+  'accountingNotificationWarnings',
+  "job.operationKind === 'sales_receipt.create' || job.operationKind === 'journal_entry.create'",
+  'The QuickBooks result is already committed',
+]) {
+  assert.ok(quickBooksWorkerSource.includes(fragment), `QuickBooks write worker missing ${fragment}`)
+}
+
+const quickBooksWriteJobs = [
+  {
+    id: '33333333-3333-4333-8333-333333333333',
+    organizationId: emailScope.organizationId,
+    ownerEmail: emailScope.to,
+    connectionId: 'connection-1',
+    operationKind: 'journal_entry.create',
+    requestPayload: { transactionDate: emailScope.businessDate },
+    providerRequestId: 'cp-success',
+    requestFingerprint: 'a'.repeat(64),
+    attemptCount: 1,
+    maxAttempts: 5,
+    lockToken: '44444444-4444-4444-8444-444444444444',
+    writeMode: 'sandbox',
+  },
+  {
+    id: '55555555-5555-4555-8555-555555555555',
+    organizationId: emailScope.organizationId,
+    ownerEmail: emailScope.to,
+    connectionId: 'connection-1',
+    operationKind: 'journal_entry.create',
+    requestPayload: { transactionDate: emailScope.businessDate },
+    providerRequestId: 'cp-failure',
+    requestFingerprint: 'b'.repeat(64),
+    attemptCount: 1,
+    maxAttempts: 5,
+    lockToken: '66666666-6666-4666-8666-666666666666',
+    writeMode: 'sandbox',
+  },
+  {
+    id: '77777777-7777-4777-8777-777777777777',
+    organizationId: emailScope.organizationId,
+    ownerEmail: emailScope.to,
+    connectionId: 'connection-1',
+    operationKind: 'customer.create',
+    requestPayload: { displayName: 'Not a POS posting' },
+    providerRequestId: 'cp-customer-success',
+    requestFingerprint: 'e'.repeat(64),
+    attemptCount: 1,
+    maxAttempts: 5,
+    lockToken: '88888888-8888-4888-8888-888888888888',
+    writeMode: 'sandbox',
+  },
+  {
+    id: '99999999-9999-4999-8999-999999999999',
+    organizationId: emailScope.organizationId,
+    ownerEmail: emailScope.to,
+    connectionId: 'connection-1',
+    operationKind: 'item.create',
+    requestPayload: { name: 'Mapped item' },
+    providerRequestId: 'cp-item-success',
+    requestFingerprint: 'f'.repeat(64),
+    attemptCount: 1,
+    maxAttempts: 5,
+    lockToken: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    writeMode: 'sandbox',
+  },
+]
+const completedQuickBooksJobs = []
+const failedQuickBooksJobs = []
+const reconciledQuickBooksRequests = []
+const reconciledMappedItems = []
+const quickBooksWorker = loadTypeScriptModule('app_src/lib/quickBooksWriteWorker.ts', {
+  '@/lib/integrations/quickBooksClient': {
+    QuickBooksProviderWriteError: class extends Error {},
+    createQuickBooksEntity: async (input) => {
+      if (input.providerRequestId === 'cp-failure') throw new Error('QuickBooks provider failure')
+      return { entityType: 'JournalEntry', entityId: 'qb-journal-1', syncToken: '0' }
+    },
+  },
+  '@/lib/persistence/quickBooksWrites': {
+    QuickBooksWriteRequestError: class extends Error {},
+    claimQuickBooksWriteJobsInPostgres: async () => quickBooksWriteJobs,
+    completeQuickBooksWriteJobInPostgres: async ({ job }) => {
+      completedQuickBooksJobs.push(job.id)
+      return {
+        posAccountingMapping: job.operationKind === 'item.create'
+          ? {
+              active: true,
+              sourceRestaurantGuid: emailScope.restaurantGuid,
+              mappingScope: 'organization_default',
+            }
+          : null,
+      }
+    },
+    failQuickBooksWriteJobInPostgres: async ({ job }) => { failedQuickBooksJobs.push(job.id); return false },
+    validateQuickBooksWriteJobBeforeProviderInPostgres: async () => ({ posAccountingSource: null }),
+  },
+  '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/persistence/posAccountingNotifications': {
+    reconcileOpenPosAccountingIssuesForMappedItemInPostgres: async (input) => {
+      reconciledMappedItems.push(input)
+      return { checked: 2, reconciled: 1, failed: 1 }
+    },
+    reconcilePosAccountingIssueForQuickBooksRequestInPostgres: async (input) => {
+      reconciledQuickBooksRequests.push(input)
+      if (input.requestId === quickBooksWriteJobs[0].id) throw new Error('Temporary alert reconciliation failure')
+      return { status: 'open' }
+    },
+  },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({
+      enabled: true,
+      mode: 'sandbox',
+      allowedOperations: ['journal_entry.create', 'customer.create', 'item.create'],
+    }),
+  },
+})
+const quickBooksWorkerResult = await quickBooksWorker.processQuickBooksWriteOutbox({ workerId: 'notification-test' })
+assert.equal(quickBooksWorkerResult.succeeded, 3)
+assert.equal(quickBooksWorkerResult.failed, 1)
+assert.equal(quickBooksWorkerResult.dead, 0)
+assert.equal(quickBooksWorkerResult.accountingNotificationWarnings, 2)
+assert.deepEqual(completedQuickBooksJobs, [quickBooksWriteJobs[0].id, quickBooksWriteJobs[2].id, quickBooksWriteJobs[3].id])
+assert.deepEqual(failedQuickBooksJobs, [quickBooksWriteJobs[1].id])
+assert.deepEqual(
+  reconciledQuickBooksRequests.map((input) => `${input.organizationId}:${input.requestId}`),
+  quickBooksWriteJobs.slice(0, 2).map((job) => `${job.organizationId}:${job.id}`),
+)
+assert.deepEqual(JSON.parse(JSON.stringify(reconciledMappedItems)), [{
+  organizationId: emailScope.organizationId,
+  restaurantGuid: emailScope.restaurantGuid,
+  mappingScope: 'organization_default',
+}])
 
 function command(commandName, args, options = {}) {
   const result = spawnSync(commandName, args, {
@@ -269,16 +502,50 @@ async function runPostgresNotificationAcceptance() {
        ) VALUES ($1::uuid, $2::uuid, 'Acceptance Restaurant', 'Downtown', true, true, true, now())`,
       [organizationId, restaurantGuid],
     )
-    await pool.query(
+    const legacyOptOut = await pool.query(
       `INSERT INTO pos_accounting_profiles (
          organization_id, restaurant_guid, profile_revision,
          email_notifications_enabled, email_notifications_enabled_at, created_by
-       ) VALUES ($1::uuid, NULL, 1, false, NULL, $2)`,
+       ) VALUES ($1::uuid, NULL, 1, false, NULL, $2)
+       RETURNING id::text`,
       [organizationId, actorEmail],
+    )
+    await pool.query(notificationDefaultsMigration)
+    const preservedOptOut = await pool.query(
+      `SELECT email_notifications_enabled, email_notifications_enabled_at
+       FROM pos_accounting_profiles
+       WHERE id = $1::uuid`,
+      [legacyOptOut.rows[0].id],
+    )
+    assert.deepEqual(preservedOptOut.rows[0], {
+      email_notifications_enabled: false,
+      email_notifications_enabled_at: null,
+    }, 'Reapplying the default-on migration must preserve an existing opt-out')
+
+    const defaultOnRestaurantGuid = crypto.randomUUID()
+    await pool.query(
+      `INSERT INTO toast_locations (
+         organization_id, restaurant_guid, restaurant_name, location_name,
+         active, standard_access, selected, last_verified_at
+       ) VALUES ($1::uuid, $2::uuid, 'Acceptance Restaurant', 'Uptown', true, true, false, now())`,
+      [organizationId, defaultOnRestaurantGuid],
+    )
+    const defaultOnProfile = await pool.query(
+      `INSERT INTO pos_accounting_profiles (
+         organization_id, restaurant_guid, profile_revision, created_by
+       ) VALUES ($1::uuid, $2::uuid, 1, $3)
+       RETURNING email_notifications_enabled, email_notifications_enabled_at`,
+      [organizationId, defaultOnRestaurantGuid, actorEmail],
+    )
+    assert.equal(defaultOnProfile.rows[0].email_notifications_enabled, true)
+    assert.ok(
+      defaultOnProfile.rows[0].email_notifications_enabled_at instanceof Date,
+      'A new profile must receive a notification start timestamp with its default-on preference',
     )
 
     const location = { restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' }
     let databaseWorkspace = { ...workspace, location }
+    let forcedWorkspaceFailureDate = null
     const auditEvents = []
     const sentMessages = []
     const databaseNotifications = loadTypeScriptModule('app_src/lib/persistence/posAccountingNotifications.ts', {
@@ -293,7 +560,12 @@ async function runPostgresNotificationAcceptance() {
         },
       },
       '@/lib/persistence/posAccounting': {
-        readPosAccountingWorkspaceFromPostgres: async () => databaseWorkspace,
+        readPosAccountingWorkspaceFromPostgres: async (input) => {
+          if (input.businessDate === forcedWorkspaceFailureDate) {
+            throw new Error('Forced mapped-item reconciliation failure')
+          }
+          return databaseWorkspace
+        },
       },
       '@/lib/persistence/postgres': {
         acquireTransactionAdvisoryLock: async (client, key) => {
@@ -380,6 +652,31 @@ async function runPostgresNotificationAcceptance() {
       recipient_email: actorEmail,
     }])
 
+    databaseWorkspace = {
+      ...workspace,
+      location,
+      preview: {
+        ...workspace.preview,
+        journal: { ...workspace.preview.journal, balance: -9.5 },
+        salesReceipt: { ...workspace.preview.salesReceipt, unallocatedSubtotal: 99 },
+      },
+    }
+    const pendingDetailRefresh = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
+    assert.equal(pendingDetailRefresh.changed, false)
+    const pendingDelivery = await pool.query(
+      `SELECT status, occurrence, issues
+       FROM pos_accounting_notification_outbox
+       WHERE issue_state_id = $1::uuid`,
+      [issueState.rows[0].id],
+    )
+    assert.equal(pendingDelivery.rows[0].status, 'pending')
+    assert.equal(pendingDelivery.rows[0].occurrence, 1)
+    assert.match(
+      pendingDelivery.rows[0].issues.find((issue) => issue.code === 'journal_unbalanced').detail,
+      /9\.50/,
+      'A pending notification must refresh its issue details without creating a new occurrence',
+    )
+
     const delivered = await databaseNotifications.processPosAccountingNotificationOutbox({
       workerId: 'notification-acceptance',
     })
@@ -389,8 +686,68 @@ async function runPostgresNotificationAcceptance() {
     )
     assert.equal(sentMessages.length, 1)
     assert.equal(sentMessages[0].to, actorEmail)
+    assert.equal(sentMessages[0].organizationId, organizationId)
     assert.equal(sentMessages[0].restaurantGuid, restaurantGuid)
     assert.equal(sentMessages[0].businessDate, scope.businessDate)
+    assert.match(
+      sentMessages[0].issues.find((issue) => issue.code === 'journal_unbalanced').detail,
+      /9\.50/,
+      'The delivered email must use the latest same-occurrence issue details',
+    )
+
+    databaseWorkspace = {
+      ...workspace,
+      location,
+      preview: {
+        ...workspace.preview,
+        journal: { ...workspace.preview.journal, balance: -9.5 },
+        salesReceipt: { ...workspace.preview.salesReceipt, unallocatedSubtotal: 99 },
+      },
+    }
+    const updatedDetails = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
+    assert.equal(updatedDetails.changed, false, 'Changing issue amounts must not reopen or renotify the issue')
+    state = await pool.query(
+      `SELECT status, occurrence, notification_count, issues
+       FROM pos_accounting_issue_states
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
+      [organizationId, restaurantGuid, scope.businessDate],
+    )
+    assert.equal(state.rows[0].status, 'open')
+    assert.equal(state.rows[0].occurrence, 1)
+    assert.equal(state.rows[0].notification_count, 1)
+    assert.match(
+      state.rows[0].issues.find((issue) => issue.code === 'journal_unbalanced').detail,
+      /9\.50/,
+      'The persisted issue detail must still refresh without sending another email',
+    )
+    deliveries = await pool.query('SELECT occurrence, status FROM pos_accounting_notification_outbox ORDER BY occurrence')
+    assert.deepEqual(deliveries.rows, [{ occurrence: 1, status: 'succeeded' }])
+
+    databaseWorkspace = {
+      profile: { quickBooksBindingStatus: 'verified', openCheckPolicy: 'ignore' },
+      location,
+      preview: {
+        available: true,
+        readiness: {
+          allocationComplete: true,
+          openChecks: 0,
+          missingMappings: [{
+            sourceKind: 'sales_item',
+            sourceId: 'toast-item-1',
+            sourceName: 'Breakfast sandwich',
+            targetType: 'item',
+          }],
+        },
+        journal: { balanced: true, balance: 0 },
+        salesReceipt: { unallocatedSubtotal: 0 },
+      },
+    }
+    const shrunkIssueSet = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
+    assert.equal(shrunkIssueSet.changed, false, 'Removing same-day blockers must not create another alert occurrence')
+    assert.equal(shrunkIssueSet.issueCount, 1)
+    assert.equal(sentMessages.length, 1)
+    deliveries = await pool.query('SELECT occurrence, status FROM pos_accounting_notification_outbox ORDER BY occurrence')
+    assert.deepEqual(deliveries.rows, [{ occurrence: 1, status: 'succeeded' }])
 
     databaseWorkspace = { ...workspace, location, preview: { available: false } }
     const resolved = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
@@ -400,19 +757,173 @@ async function runPostgresNotificationAcceptance() {
     databaseWorkspace = { ...workspace, location }
     const reopened = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
     assert.equal(reopened.status, 'open')
-    assert.equal(reopened.occurrence, 2)
+    assert.equal(reopened.occurrence, 1)
     deliveries = await pool.query('SELECT occurrence, status FROM pos_accounting_notification_outbox ORDER BY occurrence')
-    assert.deepEqual(deliveries.rows, [
-      { occurrence: 1, status: 'succeeded' },
-      { occurrence: 2, status: 'pending' },
-    ])
+    assert.deepEqual(deliveries.rows, [{ occurrence: 1, status: 'succeeded' }])
     state = await pool.query('SELECT status, occurrence, notification_count FROM pos_accounting_issue_states')
-    assert.deepEqual(state.rows[0], { status: 'open', occurrence: 2, notification_count: 1 })
+    assert.deepEqual(state.rows[0], { status: 'open', occurrence: 1, notification_count: 1 })
+
+    databaseWorkspace = { ...workspace, location, preview: { available: false } }
+    const resolvedBeforeDraftUpdate = await databaseNotifications.reconcilePosAccountingIssueForDateInPostgres(scope)
+    assert.equal(resolvedBeforeDraftUpdate.status, 'resolved')
+    await pool.query(
+      `UPDATE pos_accounting_issue_states
+       SET last_seen_at = now() - interval '1 hour'
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
+      [organizationId, restaurantGuid, scope.businessDate],
+    )
+    const staleDraft = await pool.query(
+      `INSERT INTO toast_accounting_export_drafts (
+         organization_id, restaurant_guid, business_date, idempotency_key,
+         status, reconciliation_status, updated_at
+       ) VALUES ($1::uuid, $2::uuid, $3::date, $4, 'failed', 'ready', now())
+       RETURNING id::text`,
+      [organizationId, restaurantGuid, scope.businessDate, `notification-stale-draft:${organizationId}:${scope.businessDate}`],
+    )
+    databaseWorkspace = {
+      ...workspace,
+      location,
+      draft: { status: 'failed', lastError: 'QuickBooks account is inactive' },
+      preview: { available: false, readiness: { blockers: [] } },
+    }
+    forcedWorkspaceFailureDate = scope.businessDate
+    const failedStaleDraftReconciliation = await databaseNotifications.reconcileStaleOpenPosAccountingIssuesInPostgres({ limit: 4 })
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(failedStaleDraftReconciliation)),
+      { checked: 1, reconciled: 0, failed: 1 },
+      'A transient read failure must be persisted for retry instead of losing the newer draft candidate',
+    )
+    state = await pool.query('SELECT status, occurrence, notification_count, issues FROM pos_accounting_issue_states')
+    assert.equal(state.rows[0].status, 'open')
+    assert.equal(state.rows[0].occurrence, 1)
+    assert.equal(state.rows[0].notification_count, 1)
+    assert.equal(state.rows[0].issues[0].code, 'reconciliation_failed')
+    forcedWorkspaceFailureDate = null
+    await pool.query(
+      `UPDATE pos_accounting_issue_states
+       SET last_seen_at = now() - interval '1 hour'
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid AND business_date = $3::date`,
+      [organizationId, restaurantGuid, scope.businessDate],
+    )
+    const staleDraftReconciliation = await databaseNotifications.reconcileStaleOpenPosAccountingIssuesInPostgres({ limit: 4 })
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(staleDraftReconciliation)),
+      { checked: 1, reconciled: 1, failed: 0 },
+    )
+    state = await pool.query('SELECT status, occurrence, notification_count FROM pos_accounting_issue_states')
+    assert.deepEqual(state.rows[0], { status: 'open', occurrence: 1, notification_count: 1 })
+
+    const postingRequestId = crypto.randomUUID()
+    await pool.query(
+      `INSERT INTO quickbooks_write_requests (
+         id, organization_id, operation_kind, status, client_request_id,
+         provider_request_id, request_payload, request_fingerprint,
+         requested_by, reviewed_maton_connection_id
+       ) VALUES (
+         $1::uuid, $2::uuid, 'journal_entry.create', 'failed', $3::uuid,
+         $4, '{}'::jsonb, $5, $6, 'notification-test-connection'
+       )`,
+      [postingRequestId, organizationId, crypto.randomUUID(), `notification-${postingRequestId}`, 'c'.repeat(64), actorEmail],
+    )
+    await pool.query(
+      `INSERT INTO pos_accounting_posting_batches (
+         organization_id, draft_id, restaurant_guid, business_date, status,
+         request_fingerprint, journal_entry_request_id, requested_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::date, 'failed', $5, $6::uuid, $7)`,
+      [organizationId, staleDraft.rows[0].id, restaurantGuid, scope.businessDate, 'd'.repeat(64), postingRequestId, actorEmail],
+    )
+    const requestReconciliation = await databaseNotifications.reconcilePosAccountingIssueForQuickBooksRequestInPostgres({
+      organizationId,
+      requestId: postingRequestId,
+    })
+    assert.equal(requestReconciliation.status, 'open')
+    assert.equal(requestReconciliation.changed, false)
     assert.deepEqual(auditEvents.map((event) => event.eventType), [
       'pos.accounting.issue.opened',
       'pos.accounting.issue.resolved',
       'pos.accounting.issue.opened',
+      'pos.accounting.issue.resolved',
+      'pos.accounting.issue.opened',
     ])
+
+    const bulkRestaurantGuid = crypto.randomUUID()
+    await pool.query(
+      `INSERT INTO toast_locations (
+         organization_id, restaurant_guid, restaurant_name, location_name,
+         active, standard_access, selected, last_verified_at
+       ) VALUES ($1::uuid, $2::uuid, 'Acceptance Restaurant', 'Bulk Location', true, true, false, now())`,
+      [organizationId, bulkRestaurantGuid],
+    )
+    await pool.query(
+      `INSERT INTO pos_accounting_issue_states (
+         organization_id, restaurant_guid, business_date, status, issue_fingerprint,
+         issues, occurrence, opened_at, last_seen_at, created_at, updated_at
+       )
+       SELECT $1::uuid, $2::uuid, current_date - sequence.day, 'open', $3,
+         $4::jsonb, 1, now(), now() - interval '1 hour', now(), now()
+       FROM generate_series(1, 125) AS sequence(day)`,
+      [
+        organizationId,
+        bulkRestaurantGuid,
+        'e'.repeat(64),
+        JSON.stringify([{
+          code: 'missing_mapping:sales_item:bulk:item',
+          title: 'Map bulk item',
+          detail: 'Bulk item needs a QuickBooks item mapping.',
+        }]),
+      ],
+    )
+    await pool.query(
+      `INSERT INTO pos_accounting_notification_outbox (
+         issue_state_id, occurrence, issue_fingerprint, issues, recipient_email, status
+       )
+       SELECT issue.id, issue.occurrence, issue.issue_fingerprint, issue.issues, $3, 'pending'
+       FROM pos_accounting_issue_states issue
+       WHERE issue.organization_id = $1::uuid AND issue.restaurant_guid = $2::uuid`,
+      [organizationId, bulkRestaurantGuid, actorEmail],
+    )
+    const oldestBulkDate = await pool.query(
+      `SELECT min(business_date)::text AS business_date
+       FROM pos_accounting_issue_states
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid`,
+      [organizationId, bulkRestaurantGuid],
+    )
+    forcedWorkspaceFailureDate = oldestBulkDate.rows[0].business_date
+    databaseWorkspace = { ...workspace, location: { ...location, locationName: 'Bulk Location' }, preview: { available: false } }
+    const bulkReconciliation = await databaseNotifications.reconcileOpenPosAccountingIssuesForMappedItemInPostgres({
+      organizationId,
+      restaurantGuid: bulkRestaurantGuid,
+      mappingScope: 'location_override',
+    })
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(bulkReconciliation)),
+      { checked: 125, reconciled: 124, failed: 1 },
+      'Mapped-item completion must attempt every affected open date, including more than 100',
+    )
+    forcedWorkspaceFailureDate = null
+    const bulkRetry = await databaseNotifications.reconcileStaleOpenPosAccountingIssuesInPostgres({ limit: 4 })
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(bulkRetry)),
+      { checked: 1, reconciled: 1, failed: 0 },
+      'A failed historical mapped-item reconciliation must remain eligible for the durable stale-state retry path',
+    )
+    const bulkState = await pool.query(
+      `SELECT count(*) FILTER (WHERE status = 'open')::integer AS open_count,
+         count(*) FILTER (WHERE status = 'resolved')::integer AS resolved_count
+       FROM pos_accounting_issue_states
+       WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid`,
+      [organizationId, bulkRestaurantGuid],
+    )
+    assert.deepEqual(bulkState.rows[0], { open_count: 0, resolved_count: 125 })
+    const bulkDeliveries = await pool.query(
+      `SELECT count(*) FILTER (WHERE outbox.status IN ('pending', 'failed'))::integer AS deliverable_count,
+         count(*) FILTER (WHERE outbox.status = 'cancelled')::integer AS cancelled_count
+       FROM pos_accounting_notification_outbox outbox
+       JOIN pos_accounting_issue_states issue ON issue.id = outbox.issue_state_id
+       WHERE issue.organization_id = $1::uuid AND issue.restaurant_guid = $2::uuid`,
+      [organizationId, bulkRestaurantGuid],
+    )
+    assert.deepEqual(bulkDeliveries.rows[0], { deliverable_count: 0, cancelled_count: 125 })
     console.log('POS accounting notification disposable PostgreSQL acceptance passed')
   } finally {
     await pool?.end().catch(() => undefined)

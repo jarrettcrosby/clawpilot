@@ -71,6 +71,11 @@ type MappingDraft = {
   active: boolean
   suggested: boolean
   suggestionConfidence: string
+  scope: MappingScope | null
+  inherited: boolean
+  mappingRevision: number | null
+  validationStatus: string
+  validationReason: string
 }
 
 type ProductDraft = {
@@ -194,15 +199,21 @@ function mappingPayload(mapping: MappingDraft) {
   }
 }
 
-function mappingFromSource(source: DataRecord, current: DataRecord | undefined): MappingDraft {
+function mappingFromSource(
+  source: DataRecord,
+  current: DataRecord | undefined,
+  selectedScope: MappingScope,
+): MappingDraft {
   const sourceKind = text(source.sourceKind)
   const suggestedTarget = record(source.suggestedTarget)
   const hasCurrent = Boolean(current)
-  const currentIsUsable = Boolean(
-    current
-      && current.active !== false
-      && ['valid', 'unvalidated'].includes(text(current.validationStatus, 'unvalidated')),
-  )
+  const currentScopeValue = text(current?.scope)
+  const currentScope = currentScopeValue === 'organization_default' || currentScopeValue === 'location_override'
+    ? currentScopeValue
+    : hasCurrent
+      ? selectedScope
+      : null
+  const revision = Number(current?.mappingRevision)
   const suggested = !hasCurrent && Boolean(suggestedTarget.id)
   return {
     sourceKind,
@@ -211,10 +222,81 @@ function mappingFromSource(source: DataRecord, current: DataRecord | undefined):
     targetType: targetTypeFor(sourceKind, text(current?.targetType)),
     targetId: text(current?.targetId || suggestedTarget.id),
     targetName: text(current?.targetName || suggestedTarget.name),
-    active: hasCurrent ? currentIsUsable : suggested,
+    active: hasCurrent ? current?.active !== false : suggested,
     suggested,
     suggestionConfidence: suggested ? text(suggestedTarget.confidence, 'normalized') : '',
+    scope: currentScope,
+    inherited: selectedScope === 'location_override' && currentScope === 'organization_default',
+    mappingRevision: Number.isInteger(revision) && revision > 0 ? revision : null,
+    validationStatus: hasCurrent ? text(current?.validationStatus, 'unvalidated') : '',
+    validationReason: hasCurrent ? text(current?.validationReason) : '',
   }
+}
+
+function currentMappingsForScope(workspace: DataRecord, selectedScope: MappingScope) {
+  const mappingScopes = record(workspace.mappingScopes)
+  const organizationDefault = rows(mappingScopes.organizationDefault)
+  const locationOverride = rows(mappingScopes.locationOverride)
+  const effective = rows(mappingScopes.effective)
+  const hasScopedMappings = Array.isArray(mappingScopes.organizationDefault)
+    || Array.isArray(mappingScopes.locationOverride)
+    || Array.isArray(mappingScopes.effective)
+
+  if (!hasScopedMappings) return rows(workspace.mappings)
+  if (selectedScope === 'organization_default') return organizationDefault
+  if (Array.isArray(mappingScopes.effective)) return effective
+
+  const merged = new Map(organizationDefault.map((entry) => [
+    mappingDraftKey(text(entry.sourceKind), text(entry.sourceId)),
+    entry,
+  ]))
+  for (const entry of locationOverride) {
+    merged.set(mappingDraftKey(text(entry.sourceKind), text(entry.sourceId)), entry)
+  }
+  return [...merged.values()]
+}
+
+function profileForScope(workspace: DataRecord, selectedScope: MappingScope) {
+  const profiles = record(workspace.profiles)
+  const organizationDefault = record(profiles.organizationDefault)
+  const locationOverride = record(profiles.locationOverride)
+  if (selectedScope === 'organization_default') {
+    return Object.keys(organizationDefault).length ? organizationDefault : record(workspace.profile)
+  }
+  if (Object.keys(locationOverride).length) return locationOverride
+  if (Object.keys(organizationDefault).length) return organizationDefault
+  return record(workspace.profile)
+}
+
+function mappingDraftsForScope(workspace: DataRecord, selectedScope: MappingScope) {
+  const currentBySource = new Map(currentMappingsForScope(workspace, selectedScope).map((entry) => [
+    mappingDraftKey(text(entry.sourceKind), text(entry.sourceId)),
+    entry,
+  ]))
+  return rows(workspace.sourceCatalog).map((source) => (
+    mappingFromSource(
+      source,
+      currentBySource.get(mappingDraftKey(text(source.sourceKind), text(source.sourceId))),
+      selectedScope,
+    )
+  ))
+}
+
+function mappingIsUsable(mapping: MappingDraft) {
+  return mapping.active
+    && Boolean(mapping.targetId)
+    && (!mapping.validationStatus || ['valid', 'unvalidated'].includes(mapping.validationStatus))
+}
+
+function mappingValidationLabel(mapping: MappingDraft) {
+  if (!mapping.scope) return ''
+  if (!mapping.active) return 'Disabled'
+  if (mapping.validationStatus === 'missing_target') return 'Target missing'
+  if (mapping.validationStatus === 'missing_source') return 'Source missing'
+  if (mapping.validationStatus === 'stale') return 'Needs refresh'
+  if (mapping.validationStatus === 'invalid') return 'Invalid mapping'
+  if (mapping.validationStatus === 'unvalidated') return 'Not yet validated'
+  return ''
 }
 
 function ReadinessChip({ ready, readyLabel, waitingLabel }: {
@@ -229,6 +311,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [workspace, setWorkspace] = useState<DataRecord | null>(null)
   const [profile, setProfile] = useState<DataRecord>({})
   const [scope, setScope] = useState<MappingScope>('organization_default')
+  const [profileDirty, setProfileDirty] = useState(false)
   const [mappingDrafts, setMappingDrafts] = useState<MappingDraft[]>([])
   const [dirtyMappingKeys, setDirtyMappingKeys] = useState<Set<string>>(() => new Set())
   const [targetInputBySource, setTargetInputBySource] = useState<Record<string, string>>({})
@@ -253,6 +336,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const mappingsRef = useRef<HTMLDivElement | null>(null)
   const previewRef = useRef<HTMLDivElement | null>(null)
   const mappingRowRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const selectedScopeRef = useRef<MappingScope>('organization_default')
+  const scopeContextRef = useRef('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -270,20 +355,26 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         }
         const next = record(payload.accounting)
         const effectiveProfile = record(next.profile)
-        const effectiveMappings = rows(next.mappings)
         const nextCapabilities = record(payload.capabilities)
-        const currentBySource = new Map(effectiveMappings.map((entry) => [
-          `${text(entry.sourceKind)}:${text(entry.sourceId)}`,
-          entry,
-        ]))
-        setWorkspace({ ...next, capabilities: nextCapabilities })
-        setProfile(effectiveProfile)
-        setScope(nextCapabilities.canManage === true && text(effectiveProfile.scope) !== 'location_override'
+        const nextWorkspace = { ...next, capabilities: nextCapabilities }
+        const locationGuid = text(record(next.location).restaurantGuid)
+        const scopeContext = `${text(next.organizationId)}:${locationGuid}`
+        const initialScope = nextCapabilities.canManage === true && text(effectiveProfile.scope) !== 'location_override'
           ? 'organization_default'
-          : 'location_override')
-        setMappingDrafts(rows(next.sourceCatalog).map((source) => (
-          mappingFromSource(source, currentBySource.get(`${text(source.sourceKind)}:${text(source.sourceId)}`))
-        )))
+          : 'location_override'
+        const nextScope = scopeContextRef.current === scopeContext
+          ? selectedScopeRef.current
+          : initialScope
+        const availableScope = nextScope === 'location_override' && !locationGuid
+          ? 'organization_default'
+          : nextScope
+        scopeContextRef.current = scopeContext
+        selectedScopeRef.current = availableScope
+        setWorkspace(nextWorkspace)
+        setProfile(profileForScope(nextWorkspace, availableScope))
+        setProfileDirty(false)
+        setScope(availableScope)
+        setMappingDrafts(mappingDraftsForScope(nextWorkspace, availableScope))
         setDirtyMappingKeys(new Set())
         setTargetInputBySource({})
         setMappingError(null)
@@ -323,6 +414,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const protectedRevisionCount = draftHistory.filter((draft) => (
     ['approved', 'posting', 'posted'].includes(text(draft.status))
   )).length
+  const selectedProfileIsInherited = scope === 'location_override'
+    && Object.keys(record(record(workspace?.profiles).locationOverride)).length === 0
 
   useEffect(() => {
     if (!commandActive) return
@@ -397,11 +490,28 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     return () => window.clearTimeout(timer)
   }, [focusAction, loading, mappingDrafts, workspace])
 
-  const mappedCount = mappingDrafts.filter((entry) => entry.active && entry.targetId).length
+  const mappedCount = mappingDrafts.filter(mappingIsUsable).length
   const locationGuid = text(locationRecord.restaurantGuid)
 
   function updateProfile(field: string, value: unknown) {
     setProfile((current) => ({ ...current, [field]: value }))
+    setProfileDirty(true)
+  }
+
+  function changeConfigurationScope(nextScope: MappingScope) {
+    if (nextScope === scope || !workspace) return
+    if (dirtyMappingKeys.size > 0 || profileDirty) {
+      setMappingError('Save the current scope changes before switching configuration scope, or reload the page to discard them.')
+      return
+    }
+    selectedScopeRef.current = nextScope
+    setScope(nextScope)
+    setProfile(profileForScope(workspace, nextScope))
+    setProfileDirty(false)
+    setMappingDrafts(mappingDraftsForScope(workspace, nextScope))
+    setTargetInputBySource({})
+    setMappingError(null)
+    setNotice(null)
   }
 
   function toggleBreakoutDimension(dimension: string, checked: boolean) {
@@ -541,7 +651,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       })
       const payload = await response.json().catch(() => ({})) as DataRecord
       if (!response.ok || payload.ok !== true) throw new Error(text(payload.error, 'Accounting profile could not be saved'))
-      setNotice('Accounting profile saved as a new revision.')
+      setProfileDirty(false)
+      setNotice(`Accounting profile saved to ${scope === 'organization_default' ? 'the organization default' : 'this location override'} as a new revision.`)
       setReload((value) => value + 1)
     } catch (saveError) {
       setError((saveError as Error).message)
@@ -606,8 +717,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       }
       const changedCount = Number(payload.changedCount)
       setNotice(changedCount > 0
-        ? `${changedCount} accounting ${changedCount === 1 ? 'mapping' : 'mappings'} saved as a new revision.`
-        : 'The selected accounting mappings were already current.')
+        ? `${changedCount} accounting ${changedCount === 1 ? 'mapping' : 'mappings'} saved to ${scope === 'organization_default' ? 'the organization default' : 'this location override'} as a new revision.`
+        : `The selected ${scope === 'organization_default' ? 'organization default' : 'location override'} accounting mappings were already current.`)
       if (changedCount > 0) setMappingRegenerationDate(businessDate)
       setReload((value) => value + 1)
     } catch (saveError) {
@@ -873,7 +984,20 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
 
         <Divider sx={{ my: 1.75 }} />
         <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))', lg: 'repeat(4, minmax(0, 1fr))' }} gap={1.25}>
-          <TextField select label="Configuration scope" value={scope} onChange={(event) => setScope(event.target.value as MappingScope)} size="small" sx={controlSx} disabled={capabilities.canManage !== true}>
+          <TextField
+            select
+            label="Configuration scope"
+            value={scope}
+            onChange={(event) => changeConfigurationScope(event.target.value as MappingScope)}
+            helperText={scope === 'organization_default'
+              ? 'Showing organization-default profile and mappings.'
+              : selectedProfileIsInherited
+                ? 'Showing this location. The profile and rows labeled Inherited use organization defaults until changed.'
+                : 'Showing this location override and inherited organization defaults.'}
+            size="small"
+            sx={controlSx}
+            disabled={capabilities.canManage !== true}
+          >
             <MenuItem value="organization_default">Organization default</MenuItem>
             <MenuItem value="location_override" disabled={!locationGuid}>Location override</MenuItem>
           </TextField>
@@ -971,6 +1095,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               label="Email issue alerts"
             />
           </Tooltip>
+          {profile.exists !== true && profile.emailNotificationsEnabled === true ? (
+            <Typography variant="caption" color="text.secondary" alignSelf="center">
+              Alerts begin after this accounting profile is saved.
+            </Typography>
+          ) : null}
         </Box>
         <Divider sx={{ my: 1.5 }} />
         <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>Break out sales by</Typography>
@@ -1001,7 +1130,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               <Typography fontWeight={700}>Catalog mappings</Typography>
               <Chip size="small" variant="outlined" color={missingMappings.length ? 'warning' : 'success'} label={`${number(mappedCount)}/${number(sourceCatalog.length)} mapped`} />
             </Box>
-            <Typography variant="caption" color="text.secondary">Toast sources to stable QuickBooks targets</Typography>
+            <Typography variant="caption" color="text.secondary">
+              {scope === 'organization_default'
+                ? 'Organization-default Toast sources to stable QuickBooks targets'
+                : 'Location overrides with inherited organization defaults clearly labeled'}
+            </Typography>
           </Box>
           <Box display="flex" gap={1}>
             <TextField
@@ -1037,20 +1170,31 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           const options = targetOptions[mapping.targetType] || []
           const source = sourceByKey.get(`${mapping.sourceKind}:${mapping.sourceId}`)
           const sourceKey = mappingDraftKey(mapping.sourceKind, mapping.sourceId)
+          const mappingIsDirty = dirtyMappingKeys.has(sourceKey)
+          const validationLabel = mappingIsDirty ? '' : mappingValidationLabel(mapping)
+          const provenanceLabel = mappingIsDirty
+            ? `Unsaved ${scope === 'organization_default' ? 'organization default' : 'location override'}`
+            : mapping.inherited
+              ? 'Inherited organization default'
+              : mapping.scope === 'location_override'
+                ? 'Location override'
+                : mapping.scope === 'organization_default'
+                  ? 'Organization default'
+                  : ''
           const exactToastProductSource = mapping.sourceKind === 'sales_item'
             && UUID_PATTERN.test(mapping.sourceId)
             && ['menu', 'observed_and_menu'].includes(text(source?.catalogOrigin))
           const productSuggestion = exactToastProductSource ? record(source?.productCreationSuggestion) : {}
-          const selected: TargetOption | null = mapping.active
+          const selected: TargetOption | null = mapping.targetId && (mapping.active || !mappingIsDirty)
             ? options.find((entry) => entry.id === mapping.targetId)
-              || (mapping.targetId ? {
+              || {
                 id: mapping.targetId,
                 name: mapping.targetName || mapping.targetId,
-                detail: 'Saved target',
+                detail: mapping.validationStatus ? mapping.validationStatus.replaceAll('_', ' ') : 'Saved target',
                 classification: '',
                 accountType: '',
                 itemType: '',
-              } : null)
+              }
             : null
           return (
             <Box
@@ -1077,14 +1221,27 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               }}
             >
               <Box minWidth={0}>
-                <Box display="flex" gap={0.6} alignItems="center" minWidth={0}>
+                <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
                   <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
                   {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
                   {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
+                  {provenanceLabel ? <Chip
+                    data-testid="pos-mapping-provenance"
+                    size="small"
+                    color={mapping.inherited ? 'info' : 'default'}
+                    variant="outlined"
+                    label={provenanceLabel}
+                  /> : null}
+                  {validationLabel ? <Chip size="small" color="warning" variant="outlined" label={validationLabel} /> : null}
                 </Box>
                 <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                  {mapping.sourceKind.replaceAll('_', ' ')}{mapping.suggested ? ` | ${mapping.suggestionConfidence} name match` : ''}
+                  {mapping.sourceKind.replaceAll('_', ' ')}{mapping.suggested ? ` | ${mapping.suggestionConfidence} name match` : ''}{mapping.mappingRevision ? ` | revision ${mapping.mappingRevision}` : ''}
                 </Typography>
+                {!mappingIsDirty && mapping.validationReason ? (
+                  <Typography variant="caption" color="warning.main" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                    {mapping.validationReason}
+                  </Typography>
+                ) : null}
               </Box>
               <TextField
                 select
@@ -1263,7 +1420,15 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 getOptionLabel={(entry) => entry.name}
                 isOptionEqualToValue={(left, right) => left.id === right.id}
                 onChange={(_, value) => updateProductDraft({ expenseAccountId: value?.id || '' })}
-                renderInput={(params) => <TextField {...params} label="Expense account (optional)" sx={controlSx} />}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label={productDraft.purchaseCost.trim() ? 'Expense account' : 'Expense account (optional)'}
+                    helperText={productDraft.purchaseCost.trim() ? 'Required when a purchase cost is entered.' : undefined}
+                    required={Boolean(productDraft.purchaseCost.trim())}
+                    sx={controlSx}
+                  />
+                )}
               />
               <TextField label="Description" value={productDraft.description} onChange={(event) => updateProductDraft({ description: event.target.value })} multiline minRows={2} sx={controlSx} />
               <FormControlLabel control={<Switch checked={productDraft.taxable} onChange={(event) => updateProductDraft({ taxable: event.target.checked })} />} label="Taxable" />
@@ -1276,7 +1441,12 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             variant="contained"
             startIcon={preparingProduct ? <CircularProgress size={16} /> : <AddRounded />}
             onClick={() => { void prepareQuickBooksProduct() }}
-            disabled={preparingProduct || !productDraft?.name.trim() || !productDraft?.incomeAccountId}
+            disabled={
+              preparingProduct
+              || !productDraft?.name.trim()
+              || !productDraft?.incomeAccountId
+              || (Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId)
+            }
           >
             Prepare draft
           </Button>

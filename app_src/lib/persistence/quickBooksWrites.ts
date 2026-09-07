@@ -1,4 +1,5 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
 import type {
   QuickBooksItemDraft,
   QuickBooksWriteDraftPayload,
@@ -62,6 +63,13 @@ export type QuickBooksWriteJob = {
   maxAttempts: number
   lockToken: string
   writeMode: 'sandbox' | 'production'
+}
+
+export type QuickBooksWriteJobProviderReadiness = {
+  posAccountingSource: {
+    sourceName: string
+    sourceCatalogRevision: number
+  } | null
 }
 
 export class QuickBooksWriteRequestError extends Error {
@@ -181,7 +189,7 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
   const pageSize = Math.max(1, Math.min(Number(input.pageSize || 50), 100))
   const page = Math.max(1, Number(input.page || 1))
   const offset = (page - 1) * pageSize
-  const [connection, count, requests, targetRequest, customers, items, accounts] = await Promise.all([
+  const [connection, count, requests, targetRequest, customers, items, accounts, categories, vendors] = await Promise.all([
     query<{
       write_mode: 'disabled' | 'sandbox' | 'production'
       write_verified_at: string | null
@@ -242,11 +250,32 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
        ORDER BY name, quickbooks_item_id LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ id: string; name: string; classification: string | null; account_type: string | null }>(
-      `SELECT quickbooks_account_id AS id, fully_qualified_name AS name, classification, account_type
+    query<{
+      id: string
+      name: string
+      classification: string | null
+      account_type: string | null
+      account_sub_type: string | null
+    }>(
+      `SELECT quickbooks_account_id AS id, fully_qualified_name AS name,
+         classification, account_type, account_sub_type
        FROM quickbooks_accounts
        WHERE organization_id = $1::uuid AND active = true
        ORDER BY fully_qualified_name, quickbooks_account_id LIMIT 5000`,
+      [input.organizationId],
+    ),
+    query<{ id: string; name: string }>(
+      `SELECT quickbooks_item_id AS id, fully_qualified_name AS name
+       FROM quickbooks_items
+       WHERE organization_id = $1::uuid AND active = true AND lower(item_type) = 'category'
+       ORDER BY fully_qualified_name, quickbooks_item_id LIMIT 5000`,
+      [input.organizationId],
+    ),
+    query<{ id: string; display_name: string; company_name: string | null }>(
+      `SELECT quickbooks_vendor_id AS id, display_name, company_name
+       FROM quickbooks_vendors
+       WHERE organization_id = $1::uuid AND active = true
+       ORDER BY display_name, quickbooks_vendor_id LIMIT 5000`,
       [input.organizationId],
     ),
   ])
@@ -293,6 +322,13 @@ export async function readQuickBooksWriteWorkspaceInPostgres(input: {
         name: row.name,
         classification: row.classification,
         accountType: row.account_type,
+        accountSubType: row.account_sub_type,
+      })),
+      categories: categories.rows.map((row) => ({ id: row.id, name: row.name })),
+      vendors: vendors.rows.map((row) => ({
+        id: row.id,
+        displayName: row.display_name,
+        companyName: row.company_name,
       })),
     },
   }
@@ -435,6 +471,12 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
     }
 
     if (input.action === 'approve' || input.action === 'retry') {
+      await reservePosAccountingItemMappingForWrite(client, {
+        organizationId: input.organizationId,
+        requestId: current.id,
+        operationKind: current.operation_kind,
+        payload: current.request_payload,
+      })
       const connection = await client.query<{
         write_mode: 'disabled' | 'sandbox' | 'production'
         write_verified_at: string | null
@@ -621,12 +663,197 @@ function mappedItemSource(payload: QuickBooksWriteDraftPayload): QuickBooksItemD
     : null
 }
 
+export async function validateQuickBooksWriteJobBeforeProviderInPostgres(
+  job: QuickBooksWriteJob,
+): Promise<QuickBooksWriteJobProviderReadiness> {
+  if (job.operationKind !== 'item.create') return { posAccountingSource: null }
+  const item = mappedItemSource(job.requestPayload)
+  if (!item || !item.sourceId || !item.sourceRestaurantGuid || !item.mappingScope) {
+    return { posAccountingSource: null }
+  }
+  const result = await query<{
+    name: string
+    source_revision: string | Date
+  }>(
+    `SELECT name, source_revision
+     FROM toast_menu_catalog_items
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid = $2::uuid
+       AND source_provider = 'toast'
+       AND provider_item_id = $3
+       AND active = true AND archived = false
+     ORDER BY source_revision DESC, updated_at DESC, menu_guid, group_guid
+     LIMIT 1`,
+    [job.organizationId, item.sourceRestaurantGuid, item.sourceId],
+  )
+  const source = result.rows[0]
+  if (!source) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_STALE',
+      'The Toast item was archived or removed after this QuickBooks item was approved. Review the POS mapping before retrying.',
+      409,
+    )
+  }
+  const sourceCatalogRevision = new Date(source.source_revision).getTime()
+  if (!Number.isFinite(sourceCatalogRevision)) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_STALE',
+      'The current Toast item revision could not be verified. Refresh the POS catalog before retrying.',
+      409,
+    )
+  }
+  return {
+    posAccountingSource: {
+      sourceName: source.name,
+      sourceCatalogRevision,
+    },
+  }
+}
+
+async function reservePosAccountingItemMappingForWrite(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  input: {
+    organizationId: string
+    requestId: string
+    operationKind: QuickBooksWriteOperationKind
+    payload: QuickBooksWriteDraftPayload
+  },
+) {
+  if (input.operationKind !== 'item.create') return
+  const item = mappedItemSource(input.payload)
+  if (!item || !item.sourceId || !item.sourceRestaurantGuid || !item.mappingScope) return
+  const mappingRestaurantGuid = item.mappingScope === 'location_override' ? item.sourceRestaurantGuid : null
+  await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
+  const currentMapping = await client.query<{ id: string }>(
+    `SELECT id::text
+     FROM pos_accounting_catalog_mappings
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
+       AND source_kind = 'sales_item' AND source_id = $3
+       AND target_type = 'item' AND effective_to IS NULL
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, mappingRestaurantGuid, item.sourceId],
+  )
+  if (currentMapping.rows[0]) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_POS_MAPPING_EXISTS',
+      'This Toast item already has a current QuickBooks mapping. Update or reactivate that mapping instead of approving another QuickBooks item.',
+      409,
+    )
+  }
+  const otherReservation = await client.query<{ id: string }>(
+    `SELECT request.id::text
+     FROM quickbooks_write_requests request
+     WHERE request.organization_id = $1::uuid
+       AND request.id <> $2::uuid
+       AND request.operation_kind = 'item.create'
+       AND request.status IN ('approved', 'processing', 'failed', 'dead')
+       AND request.request_payload->>'sourceKind' = 'sales_item'
+       AND request.request_payload->>'sourceId' = $3
+       AND request.request_payload->>'mappingScope' = $4
+       AND (
+         $4 = 'organization_default'
+         OR request.request_payload->>'sourceRestaurantGuid' = $5
+       )
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, input.requestId, item.sourceId, item.mappingScope, item.sourceRestaurantGuid],
+  )
+  if (otherReservation.rows[0]) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_POS_MAPPING_RESERVED',
+      'Another approved QuickBooks item is already being created for this Toast item.',
+      409,
+    )
+  }
+}
+
+async function cacheCreatedQuickBooksItem(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  input: { job: QuickBooksWriteJob; providerEntityId: string },
+) {
+  if (input.job.operationKind !== 'item.create') return
+  const item = normalizeQuickBooksItemDraftForStoredCompatibility(
+    input.job.requestPayload,
+  ) as QuickBooksItemDraft
+  const fullyQualifiedName = item.parentCategoryName
+    ? `${item.parentCategoryName}:${item.name}`
+    : item.name
+  await client.query(
+    `INSERT INTO quickbooks_items (
+       organization_id, quickbooks_item_id, name, fully_qualified_name, item_type, sku, description,
+       unit_price, purchase_cost, quantity_on_hand, track_quantity, income_account_id,
+       expense_account_id, asset_account_id, active, taxable, source_payload, synced_at
+     ) VALUES (
+       $1::uuid, $2, $3, $4, $5, $6, $7,
+       $8, $9, $10, $11, $12, $13, $14, true, $15, $16::jsonb, now()
+     )
+     ON CONFLICT (organization_id, quickbooks_item_id) DO UPDATE SET
+       name = EXCLUDED.name,
+       fully_qualified_name = EXCLUDED.fully_qualified_name,
+       item_type = EXCLUDED.item_type,
+       sku = EXCLUDED.sku,
+       description = EXCLUDED.description,
+       unit_price = EXCLUDED.unit_price,
+       purchase_cost = EXCLUDED.purchase_cost,
+       quantity_on_hand = EXCLUDED.quantity_on_hand,
+       track_quantity = EXCLUDED.track_quantity,
+       income_account_id = EXCLUDED.income_account_id,
+       expense_account_id = EXCLUDED.expense_account_id,
+       asset_account_id = EXCLUDED.asset_account_id,
+       active = true,
+       taxable = EXCLUDED.taxable,
+       source_payload = EXCLUDED.source_payload,
+       synced_at = now()`,
+    [
+      input.job.organizationId,
+      input.providerEntityId,
+      item.name,
+      fullyQualifiedName,
+      item.itemType,
+      item.sku,
+      item.description,
+      item.unitPrice,
+      item.purchaseCost,
+      item.quantityOnHand,
+      item.trackQuantity,
+      item.incomeAccountId,
+      item.expenseAccountId,
+      item.assetAccountId,
+      item.taxable,
+      JSON.stringify({
+        Id: input.providerEntityId,
+        Name: item.name,
+        FullyQualifiedName: fullyQualifiedName,
+        Type: item.itemType,
+        Sku: item.sku,
+        Description: item.description,
+        PurchaseDesc: item.purchaseDescription,
+        UnitPrice: item.unitPrice,
+        PurchaseCost: item.purchaseCost,
+        QtyOnHand: item.quantityOnHand,
+        TrackQtyOnHand: item.trackQuantity,
+        IncomeAccountRef: { value: item.incomeAccountId },
+        ExpenseAccountRef: item.expenseAccountId ? { value: item.expenseAccountId } : null,
+        AssetAccountRef: item.assetAccountId ? { value: item.assetAccountId } : null,
+        PrefVendorRef: item.preferredVendorId ? { value: item.preferredVendorId } : null,
+        ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
+        Taxable: item.taxable,
+        InvStartDate: item.inventoryStartDate,
+        ReorderPoint: item.reorderPoint,
+      }),
+    ],
+  )
+}
+
 async function createPosAccountingItemMappingIfAbsent(
   client: Parameters<Parameters<typeof withTransaction>[0]>[0],
   input: {
     job: QuickBooksWriteJob
     providerEntityId: string
     createdBy: string | null
+    posAccountingSource: QuickBooksWriteJobProviderReadiness['posAccountingSource']
   },
 ): Promise<PosAccountingMappingResult | null> {
   if (input.job.operationKind !== 'item.create') return null
@@ -656,6 +883,9 @@ async function createPosAccountingItemMappingIfAbsent(
   )
   const existing = (await readCurrent()).rows[0]
   if (existing) {
+    if (!existing.active || existing.target_id !== input.providerEntityId) {
+      throw new Error('The reserved POS accounting mapping changed before the QuickBooks item completed')
+    }
     return {
       status: 'skipped_existing',
       mappingId: existing.id,
@@ -692,7 +922,7 @@ async function createPosAccountingItemMappingIfAbsent(
      ) VALUES (
        $1::uuid, $2::uuid, 'sales_item', $3, $4,
        'item', $5, $6, true, $7,
-       'valid', NULL, 0, 0, now(), $8
+       'valid', NULL, $9, 0, now(), $8
      )
      ON CONFLICT DO NOTHING
      RETURNING id::text, source_name, target_id, target_name, active, mapping_revision`,
@@ -700,17 +930,21 @@ async function createPosAccountingItemMappingIfAbsent(
       input.job.organizationId,
       mappingRestaurantGuid,
       item.sourceId,
-      item.sourceName,
+      input.posAccountingSource?.sourceName || item.sourceName,
       input.providerEntityId,
       item.name,
       mappingRevision,
       input.createdBy,
+      input.posAccountingSource?.sourceCatalogRevision || 0,
     ],
   )
   const mapping = inserted.rows[0]
   if (!mapping) {
     const concurrent = (await readCurrent()).rows[0]
     if (!concurrent) throw new Error('QuickBooks item was created but its POS accounting mapping could not be recorded')
+    if (!concurrent.active || concurrent.target_id !== input.providerEntityId) {
+      throw new Error('The reserved POS accounting mapping changed before the QuickBooks item completed')
+    }
     return {
       status: 'skipped_existing',
       mappingId: concurrent.id,
@@ -751,6 +985,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
   providerEntityType: string
   providerEntityId: string
   providerSyncToken: string | null
+  posAccountingSource?: QuickBooksWriteJobProviderReadiness['posAccountingSource']
 }) {
   return withTransaction(async (client) => {
     const lease = await client.query<{ approved_by: string | null }>(
@@ -766,6 +1001,11 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
       job: input.job,
       providerEntityId: input.providerEntityId,
       createdBy: lease.rows[0].approved_by,
+      posAccountingSource: input.posAccountingSource || null,
+    })
+    await cacheCreatedQuickBooksItem(client, {
+      job: input.job,
+      providerEntityId: input.providerEntityId,
     })
     const resultPayload = {
       entityType: input.providerEntityType,
