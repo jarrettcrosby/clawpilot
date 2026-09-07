@@ -1765,22 +1765,33 @@ const stableMenuCatalog = accounting.mergeStableToastMenuCatalog(
     providerItemId: '11111111-1111-4111-8111-111111111111',
     name: 'Daily sales',
     plu: 'DAILY-1',
+    sku: 'TOAST-DAILY-SKU',
+    description: 'Toast daily sales item',
+    imageUrl: 'https://images.example.test/daily-sales.jpg',
     price: 12.5,
   }, {
     itemGuid: '12121212-1212-4121-8121-121212121212',
     providerItemId: '12121212-1212-4121-8121-121212121212',
     name: 'ICED TEA | Blueberry Green',
     plu: 'TEA-1',
+    sku: null,
+    description: null,
+    imageUrl: null,
     price: 5.75,
   }],
 )
 const observedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'Daily sales')
 assert.equal(observedMenuItem.catalogOrigin, 'observed_and_menu')
-assert.equal(observedMenuItem.sku, 'DAILY-1')
+assert.equal(observedMenuItem.sku, 'TOAST-DAILY-SKU')
+assert.equal(observedMenuItem.description, 'Toast daily sales item')
+assert.equal(observedMenuItem.imageUrl, 'https://images.example.test/daily-sales.jpg')
 assert.equal(observedMenuItem.unitPrice, 12.5)
 const unobservedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'ICED TEA | Blueberry Green')
 assert.equal(unobservedMenuItem.catalogOrigin, 'menu')
 assert.equal(unobservedMenuItem.occurrenceCount, 0)
+assert.equal(unobservedMenuItem.sku, 'TEA-1')
+assert.equal(unobservedMenuItem.description, null)
+assert.equal(unobservedMenuItem.imageUrl, null)
 assert.equal(unobservedMenuItem.unitPrice, 5.75)
 
 const exactQuickBooksSuggestion = accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
@@ -1831,6 +1842,10 @@ assert.ok(posAccountingPanel.includes('<Button onClick={() => setPreparedProduct
 assert.ok(posAccountingPanel.includes('preparedProductDraft ? <Button color="inherit" size="small" onClick={() => reviewPreparedProductDraft(preparedProductDraft)}>Review draft</Button>'))
 assert.ok(posAccountingPanel.includes("Required when a purchase cost is entered."))
 assert.ok(posAccountingPanel.includes("Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId"))
+assert.ok(posAccountingPanel.includes('function ToastProductThumbnail'))
+assert.ok(posAccountingPanel.includes('sourceImageUrl: text(source?.imageUrl || suggestion.imageUrl)'))
+assert.ok(posAccountingPanel.includes('imageUrl={text(source?.imageUrl)}'))
+assert.ok(posAccountingPanel.includes('This remains a Toast and ClawPilot reference image. It is not attached to the QuickBooks product draft.'))
 
 const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
 assert.ok(accountingSection.includes('consumeAccountingDraftTarget(window.location.href)'))

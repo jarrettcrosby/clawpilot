@@ -66,6 +66,9 @@ export type ToastMenuCatalogItem = {
   providerItemId: string
   name: string
   plu: string | null
+  sku: string | null
+  description: string | null
+  imageUrl: string | null
   price: number | null
   visibility: string[]
   salesCategoryGuid: string | null
@@ -200,6 +203,26 @@ function visibilityList(value: unknown) {
     .map((entry) => cleanText(entry, 64)?.toUpperCase() || '')
     .filter(Boolean))]
     .slice(0, 32)
+}
+
+function toastMenuImageUrls(record: Record<string, unknown>) {
+  const candidates = Array.isArray(record.images) ? [...record.images, record.image] : [record.image]
+  const urls = new Set<string>()
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim()
+    if (!raw || raw.length > 2048) continue
+    try {
+      const parsed = new URL(raw)
+      if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.username || parsed.password) continue
+      parsed.hash = ''
+      const normalized = parsed.toString()
+      if (normalized.length <= 2048) urls.add(normalized)
+    } catch {
+      // An invalid provider image must not make the otherwise valid menu item unusable.
+    }
+    if (urls.size >= 8) break
+  }
+  return [...urls]
 }
 
 function catalogEntityState(record: Record<string, unknown>) {
@@ -531,6 +554,9 @@ function normalizeToastMenuCatalog(
         providerItemId: itemGuid,
         name: cleanText(itemRecord.name, 240) || 'Missing name',
         plu: cleanText(itemRecord.plu, 200),
+        sku: cleanText(itemRecord.sku, 200),
+        description: cleanText(itemRecord.description, 4_000),
+        imageUrl: toastMenuImageUrls(itemRecord)[0] || null,
         price: catalogPrice(itemRecord.price),
         visibility: visibilityList(itemRecord.visibility),
         salesCategoryGuid,

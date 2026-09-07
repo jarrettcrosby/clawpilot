@@ -22,6 +22,7 @@ const otherMenuGuid = '55555555-5555-4555-8555-555555555555'
 const groupGuid = '66666666-6666-4666-8666-666666666666'
 const otherGroupGuid = '77777777-7777-4777-8777-777777777777'
 const itemGuid = '88888888-8888-4888-8888-888888888888'
+const otherItemGuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const salesCategoryGuid = '99999999-9999-4999-8999-999999999999'
 const sourceRevision = '2026-07-19T15:00:00.000Z'
 const secretSentinel = 'toast-secret-must-never-leak-ABCD'
@@ -88,6 +89,15 @@ function verifySourceContracts() {
   ]) assert.ok(migration.includes(fragment), `POS catalog migration missing ${fragment}`)
   assert.ok(!/customer|guest|order_guid|email|phone/i.test(migration), 'POS catalog migration must not add customer or order PII')
 
+  const productMediaMigration = read('db/migrations/0364_toast_menu_item_product_media.sql')
+  for (const fragment of [
+    'ADD COLUMN IF NOT EXISTS sku text',
+    'ADD COLUMN IF NOT EXISTS description text',
+    'ADD COLUMN IF NOT EXISTS image_url text',
+    'toast_menu_catalog_items_image_url_valid',
+    "image_url ~ '^https://[^[:space:]]+$'",
+  ]) assert.ok(productMediaMigration.includes(fragment), `Toast product media migration missing ${fragment}`)
+
   const client = read('app_src/lib/integrations/toastClient.ts')
   for (const fragment of [
     "'/menus/v2/metadata'",
@@ -98,6 +108,10 @@ function verifySourceContracts() {
     "reason: 'menu_not_published'",
     'providerItemId',
     'providerSalesCategoryId',
+    'toastMenuImageUrls',
+    'sku: cleanText(itemRecord.sku, 200)',
+    'description: cleanText(itemRecord.description, 4_000)',
+    'imageUrl: toastMenuImageUrls(itemRecord)[0] || null',
   ]) assert.ok(client.includes(fragment), `Toast client missing ${fragment}`)
   assert.ok(client.indexOf("'/menus/v2/metadata'") < client.indexOf("'/menus/v2/menus'"), 'metadata must precede menus')
 
@@ -119,6 +133,8 @@ function verifySourceContracts() {
     'WHERE organization_id = $1::uuid',
     'location.organization_id = $1::uuid',
     'source_revision = $3::timestamptz',
+    'sku, description, image_url',
+    'imageUrl: row.image_url',
   ]) assert.ok(persistence.includes(fragment), `POS catalog persistence missing ${fragment}`)
   assert.ok(!persistence.includes('organization_toast_credentials'), 'Catalog read model must not query credentials')
   assert.ok(!persistence.includes('console.'), 'Catalog persistence must not log data or secrets')
@@ -153,7 +169,15 @@ function menuPayload(lastUpdated = sourceRevision) {
     name: 'Lunch special',
     guid: itemGuid,
     plu: 'PLU-42',
+    sku: 'TOAST-SKU-42',
+    description: 'House lunch special',
     price: 12.5,
+    image: 'https://legacy-images.example.test/lunch-special.jpg',
+    images: [
+      'http://images.example.test/not-secure.jpg',
+      'https://images.example.test/lunch-special.jpg#toast-preview',
+      'https://images.example.test/lunch-special.jpg',
+    ],
     visibility: ['POS', 'KIOSK'],
     salesCategory: { guid: salesCategoryGuid, name: 'Food', plu: 'FOOD' },
   }
@@ -182,7 +206,22 @@ function menuPayload(lastUpdated = sourceRevision) {
           guid: otherGroupGuid,
           name: 'Specials',
           visibility: ['POS'],
-          menuItems: [{ ...item, price: 15 }],
+          menuItems: [{
+            ...item,
+            price: 15,
+            images: [],
+            image: 'https://images.example.test/dinner-fallback.jpg',
+          }, {
+            ...item,
+            guid: otherItemGuid,
+            name: 'No photo special',
+            plu: null,
+            sku: null,
+            description: null,
+            price: 4.25,
+            images: [],
+            image: null,
+          }],
           menuGroups: [],
         }],
       },
@@ -242,10 +281,23 @@ async function verifyToastClient() {
   assert.equal(updated.catalog.providerRestaurantId, restaurantGuid)
   assert.equal(updated.catalog.menus.length, 2)
   assert.equal(updated.catalog.groups.length, 2)
-  assert.equal(updated.catalog.items.length, 2)
-  assert.deepEqual([...updated.catalog.items.map((item) => item.price)].sort((a, b) => a - b), [12.5, 15])
-  assert.equal(updated.catalog.items[0].providerItemId, itemGuid)
-  assert.equal(updated.catalog.items[0].plu, 'PLU-42')
+  assert.equal(updated.catalog.items.length, 3)
+  assert.deepEqual([...updated.catalog.items.map((item) => item.price)].sort((a, b) => a - b), [4.25, 12.5, 15])
+  const lunchItem = updated.catalog.items.find((item) => item.menuGuid === menuGuid && item.itemGuid === itemGuid)
+  assert.ok(lunchItem)
+  assert.equal(lunchItem.providerItemId, itemGuid)
+  assert.equal(lunchItem.plu, 'PLU-42')
+  assert.equal(lunchItem.sku, 'TOAST-SKU-42')
+  assert.equal(lunchItem.description, 'House lunch special')
+  assert.equal(lunchItem.imageUrl, 'https://images.example.test/lunch-special.jpg')
+  const dinnerFallbackItem = updated.catalog.items.find((item) => (
+    item.menuGuid === otherMenuGuid && item.itemGuid === itemGuid
+  ))
+  assert.ok(dinnerFallbackItem)
+  assert.equal(dinnerFallbackItem.imageUrl, 'https://images.example.test/dinner-fallback.jpg')
+  const noPhotoItem = updated.catalog.items.find((item) => item.itemGuid === otherItemGuid)
+  assert.ok(noPhotoItem)
+  assert.equal(noPhotoItem.imageUrl, null)
   assert.equal(updated.catalog.salesCategories[0].providerSalesCategoryId, salesCategoryGuid)
   assert.ok(!JSON.stringify(updated).includes(secretSentinel), 'normalized menu output leaked the Toast secret')
   for (const request of updatedScenario.requests.slice(1)) {
@@ -405,7 +457,16 @@ async function verifyRouteAuthorization() {
       '@/lib/persistence/posCatalog': {
         readPosCatalogFromPostgres: async (scopedOrganizationId) => {
           reads.push(scopedOrganizationId)
-          return { organizationId: scopedOrganizationId, sourceProvider: 'toast', items: [] }
+          return {
+            organizationId: scopedOrganizationId,
+            sourceProvider: 'toast',
+            items: [{
+              providerItemId: itemGuid,
+              sku: 'TOAST-SKU-42',
+              description: 'House lunch special',
+              imageUrl: 'https://images.example.test/lunch-special.jpg',
+            }],
+          }
         },
       },
       '@/lib/requestUser': {
@@ -438,6 +499,9 @@ async function verifyRouteAuthorization() {
   const firstTenant = await route.GET(getRequest)
   assert.equal(firstTenant.status, 200)
   assert.equal(firstTenant.body.catalog.organizationId, organizationId)
+  assert.equal(firstTenant.body.catalog.items[0].sku, 'TOAST-SKU-42')
+  assert.equal(firstTenant.body.catalog.items[0].description, 'House lunch special')
+  assert.equal(firstTenant.body.catalog.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
 
   actor = { ...actor, organizationId: otherOrganizationId }
   const secondTenant = await route.GET(getRequest)
@@ -509,7 +573,9 @@ function persistenceCatalog(revision = sourceRevision) {
     }],
     items: [{
       menuGuid, groupGuid, itemGuid, sourceProvider: 'toast', providerItemId: itemGuid,
-      name: 'Lunch special', plu: 'PLU-42', price: 12.5, visibility: ['POS'],
+      name: 'Lunch special', plu: 'PLU-42', sku: 'TOAST-SKU-42',
+      description: 'House lunch special', imageUrl: 'https://images.example.test/lunch-special.jpg',
+      price: 12.5, visibility: ['POS'],
       salesCategoryGuid, providerSalesCategoryId: salesCategoryGuid,
       active: true, archived: false, position: 0,
     }],
@@ -555,6 +621,7 @@ async function verifyDisposablePostgres() {
       );
     `)
     await pool.query(read('db/migrations/0070_toast_menu_catalog.sql'))
+    await pool.query(read('db/migrations/0364_toast_menu_item_product_media.sql'))
     await pool.query(
       `INSERT INTO workspace_organizations (id) VALUES ($1::uuid), ($2::uuid)`,
       [organizationId, otherOrganizationId],
@@ -612,6 +679,9 @@ async function verifyDisposablePostgres() {
     const orgBBefore = await persistence.readPosCatalogFromPostgres(otherOrganizationId)
     assert.equal(orgA.items.length, 1)
     assert.equal(orgA.items[0].providerItemId, itemGuid)
+    assert.equal(orgA.items[0].sku, 'TOAST-SKU-42')
+    assert.equal(orgA.items[0].description, 'House lunch special')
+    assert.equal(orgA.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
     assert.equal(orgBBefore.items.length, 0)
     assert.ok(!JSON.stringify(orgA).includes(secretSentinel), 'Postgres catalog read leaked a secret')
 
@@ -623,6 +693,28 @@ async function verifyDisposablePostgres() {
     const orgBAfter = await persistence.readPosCatalogFromPostgres(otherOrganizationId)
     assert.equal(orgBAfter.items.length, 1)
     assert.equal(orgBAfter.restaurants[0].name, 'Org B Restaurant')
+    assert.equal(orgBAfter.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
+
+    const noMediaRevision = '2026-07-19T15:30:00.000Z'
+    await persistence.replaceToastMenuCatalogInPostgres({
+      organizationId: otherOrganizationId,
+      restaurantName: 'Org B Restaurant',
+      catalog: {
+        ...snapshot,
+        sourceRevision: noMediaRevision,
+        restaurantTimeZone: 'America/Chicago',
+        items: snapshot.items.map((item) => ({
+          ...item,
+          sku: null,
+          description: null,
+          imageUrl: null,
+        })),
+      },
+    })
+    const orgBWithoutMedia = await persistence.readPosCatalogFromPostgres(otherOrganizationId)
+    assert.equal(orgBWithoutMedia.items[0].sku, null)
+    assert.equal(orgBWithoutMedia.items[0].description, null)
+    assert.equal(orgBWithoutMedia.items[0].imageUrl, null)
     assert.equal((await persistence.readPosCatalogFromPostgres(organizationId)).restaurants[0].name, 'Org A Restaurant')
 
     await persistence.recordToastMenuCatalogUnavailableInPostgres({

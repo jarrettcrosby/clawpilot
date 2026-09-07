@@ -83,6 +83,7 @@ type ProductDraft = {
   sourceKind: 'sales_item'
   sourceId: string
   sourceRestaurantGuid: string
+  sourceImageUrl: string
   mappingScope: MappingScope
   name: string
   itemType: 'Service' | 'NonInventory'
@@ -305,6 +306,37 @@ function ReadinessChip({ ready, readyLabel, waitingLabel }: {
   waitingLabel: string
 }) {
   return <Chip size="small" variant="outlined" color={ready ? 'success' : 'warning'} label={ready ? readyLabel : waitingLabel} />
+}
+
+function ToastProductThumbnail({ imageUrl, productName, size = 44 }: {
+  imageUrl: string
+  productName: string
+  size?: number
+}) {
+  const [failedImageUrl, setFailedImageUrl] = useState('')
+
+  if (!imageUrl || failedImageUrl === imageUrl) return null
+
+  return (
+    <Box
+      component="img"
+      src={imageUrl}
+      alt={`${productName || 'Toast product'} product image from Toast`}
+      loading="lazy"
+      decoding="async"
+      referrerPolicy="no-referrer"
+      onError={() => setFailedImageUrl(imageUrl)}
+      sx={{
+        width: size,
+        height: size,
+        flexShrink: 0,
+        borderRadius: '8px',
+        border: '1px solid rgba(255,255,255,0.12)',
+        backgroundColor: 'rgba(255,255,255,0.04)',
+        objectFit: 'cover',
+      }}
+    />
+  )
 }
 
 export default function PosAccountingPanel({ location, businessDate, revision, money, number, focusAction }: PosAccountingPanelProps) {
@@ -558,6 +590,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       sourceKind: 'sales_item',
       sourceId: mapping.sourceId,
       sourceRestaurantGuid: locationGuid,
+      sourceImageUrl: text(source?.imageUrl || suggestion.imageUrl),
       mappingScope: scope,
       name: text(suggestion.name, mapping.sourceName),
       itemType: text(suggestion.itemType) === 'Service' ? 'Service' : 'NonInventory',
@@ -1220,28 +1253,31 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 outlineOffset: -2,
               }}
             >
-              <Box minWidth={0}>
-                <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
-                  <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
-                  {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
-                  {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
-                  {provenanceLabel ? <Chip
-                    data-testid="pos-mapping-provenance"
-                    size="small"
-                    color={mapping.inherited ? 'info' : 'default'}
-                    variant="outlined"
-                    label={provenanceLabel}
-                  /> : null}
-                  {validationLabel ? <Chip size="small" color="warning" variant="outlined" label={validationLabel} /> : null}
-                </Box>
-                <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                  {mapping.sourceKind.replaceAll('_', ' ')}{mapping.suggested ? ` | ${mapping.suggestionConfidence} name match` : ''}{mapping.mappingRevision ? ` | revision ${mapping.mappingRevision}` : ''}
-                </Typography>
-                {!mappingIsDirty && mapping.validationReason ? (
-                  <Typography variant="caption" color="warning.main" display="block" sx={{ overflowWrap: 'anywhere' }}>
-                    {mapping.validationReason}
+              <Box minWidth={0} display="flex" alignItems="center" gap={1}>
+                <ToastProductThumbnail imageUrl={text(source?.imageUrl)} productName={mapping.sourceName} />
+                <Box minWidth={0} flex={1}>
+                  <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
+                    <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
+                    {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
+                    {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
+                    {provenanceLabel ? <Chip
+                      data-testid="pos-mapping-provenance"
+                      size="small"
+                      color={mapping.inherited ? 'info' : 'default'}
+                      variant="outlined"
+                      label={provenanceLabel}
+                    /> : null}
+                    {validationLabel ? <Chip size="small" color="warning" variant="outlined" label={validationLabel} /> : null}
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                    {mapping.sourceKind.replaceAll('_', ' ')}{mapping.suggested ? ` | ${mapping.suggestionConfidence} name match` : ''}{mapping.mappingRevision ? ` | revision ${mapping.mappingRevision}` : ''}
                   </Typography>
-                ) : null}
+                  {!mappingIsDirty && mapping.validationReason ? (
+                    <Typography variant="caption" color="warning.main" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                      {mapping.validationReason}
+                    </Typography>
+                  ) : null}
+                </Box>
               </Box>
               <TextField
                 select
@@ -1381,6 +1417,17 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               <Alert severity="info" sx={{ borderRadius: '8px' }}>
                 This creates an immutable draft only. The product is not added to QuickBooks until an authorized user reviews and approves it.
               </Alert>
+              {productDraft.sourceImageUrl ? (
+                <Box display="flex" alignItems="center" gap={1.25} sx={{ p: 1.25, border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px' }}>
+                  <ToastProductThumbnail imageUrl={productDraft.sourceImageUrl} productName={productDraft.name} size={72} />
+                  <Box minWidth={0}>
+                    <Typography variant="body2" fontWeight={650}>Toast product image</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      This remains a Toast and ClawPilot reference image. It is not attached to the QuickBooks product draft.
+                    </Typography>
+                  </Box>
+                </Box>
+              ) : null}
               <TextField label="Product name" value={productDraft.name} onChange={(event) => updateProductDraft({ name: event.target.value })} required sx={controlSx} />
               <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={1.25}>
                 <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'] })} sx={controlSx}>
