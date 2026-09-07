@@ -126,7 +126,7 @@ export const EXPECTED_SELECTED_SCOPE_COUNTS = Object.freeze({
 })
 export const EXPECTED_SPECIAL_SCOPE_COUNTS = Object.freeze({
   shortLinksRetired: 5,
-  preservedAuditEvents: 37,
+  preservedAuditEvents: 31,
 })
 export const PRODUCTION_DATABASE_BOUNDARY = Object.freeze({
   databaseIdentity: PRODUCTION_DATABASE_IDENTITY,
