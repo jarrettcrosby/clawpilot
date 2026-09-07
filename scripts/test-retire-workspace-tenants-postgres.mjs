@@ -17,6 +17,7 @@ import {
   APPROVED_TARGETS,
   CONFIRMED_OPERATOR_EMAIL,
   EXPECTED_SELECTED_SCOPE_COUNTS,
+  EXPECTED_SPECIAL_SCOPE_COUNTS,
   PRESERVED_SHARED_REFERENCE_CODES,
   PRODUCTION_DATABASE_IDENTITY,
   PRODUCTION_RAILWAY_ENVIRONMENT_ID,
@@ -50,6 +51,17 @@ const generatedReferences = [
 ]
 const validatedBackupSha256 = 'd'.repeat(64)
 const validatedBackupBytes = '29360128'
+const productionShapedAuditCountByTarget = Object.freeze({
+  'ag-alchemy': 12,
+  'french-florist': 8,
+  'test-pro-bakery-bites': 11,
+})
+
+assert.equal(
+  Object.values(productionShapedAuditCountByTarget)
+    .reduce((total, count) => total + count, 0),
+  EXPECTED_SPECIAL_SCOPE_COUNTS.preservedAuditEvents,
+)
 
 function command(executable, args) {
   return execFileSync(executable, args, {
@@ -673,7 +685,8 @@ async function installFixture(client) {
         [linkId, fixedTime],
       )
     }
-    const auditCount = index === 0 ? 13 : 12
+    const auditCount = productionShapedAuditCountByTarget[target.key]
+    assert.ok(Number.isInteger(auditCount), `Missing audit count for ${target.key}`)
     for (let auditIndex = 0; auditIndex < auditCount; auditIndex += 1) {
       await client.query(
         `INSERT INTO audit_events (
@@ -808,6 +821,7 @@ try {
   const planPath = join(artifacts, 'reviewed-plan.json')
   const blockedPlanPath = join(artifacts, 'blocked-plan.json')
   const outboxBlockedPlanPath = join(artifacts, 'outbox-blocked-plan.json')
+  const auditDriftBlockedPlanPath = join(artifacts, 'audit-drift-blocked-plan.json')
   const invalidIdentityPlanPath = join(artifacts, 'invalid-identity-plan.json')
   const receiptPath = join(artifacts, 'receipt.json')
   const missingMigrationPlanPath = join(artifacts, 'missing-migration-plan.json')
@@ -879,6 +893,33 @@ try {
     `UPDATE sync_outbox SET aggregate_id = $1 WHERE id = $2::uuid`,
     [APPROVED_TARGETS[2].crmOrganizationId, bakeryOutbox.rows[0].id],
   )
+  const auditDriftEventKey = 'fixture-audit-drift-extra'
+  await pool.query(
+    `INSERT INTO audit_events (
+       actor, event_type, event_key, aggregate_type, aggregate_id,
+       subject, organization_id, is_system, payload, created_at
+     ) VALUES ('fixture', 'fixture.created', $1, 'workspace', $2::uuid::text,
+       $3, $2::uuid, false, '{}'::jsonb, $4)`,
+    [
+      auditDriftEventKey,
+      APPROVED_TARGETS[0].organizationId,
+      APPROVED_TARGETS[0].name,
+      fixedTime,
+    ],
+  )
+  const auditDriftBlocked = await run([
+    ...commonFlags(), '--output', auditDriftBlockedPlanPath,
+  ], environment, testRuntime)
+  assert.equal(auditDriftBlocked.applyReady, false)
+  const auditDriftBlockedManifest = JSON.parse(
+    readFileSync(auditDriftBlockedPlanPath, 'utf8'),
+  )
+  assert.deepEqual(auditDriftBlockedManifest.scope.blockers.unexpectedSpecialCounts, [{
+    field: 'preservedAuditEvents',
+    expected: EXPECTED_SPECIAL_SCOPE_COUNTS.preservedAuditEvents,
+    observed: EXPECTED_SPECIAL_SCOPE_COUNTS.preservedAuditEvents + 1,
+  }])
+  await pool.query('DELETE FROM audit_events WHERE event_key = $1', [auditDriftEventKey])
   const planResult = await run([
     ...commonFlags(), '--output', planPath,
   ], environment, testRuntime)
@@ -973,7 +1014,10 @@ try {
   assert.equal(applied.verification.applicationUsersRemaining, 0)
   assert.equal(applied.verification.uuidOccurrences.length, 0)
   assert.equal(applied.verification.referenceOccurrences.length, 0)
-  assert.equal(applied.verification.preservedAuditEvents, 37)
+  assert.equal(
+    applied.verification.preservedAuditEvents,
+    EXPECTED_SPECIAL_SCOPE_COUNTS.preservedAuditEvents,
+  )
   assert.equal(applied.verification.preservation.ready, true)
   assert.equal(applied.verification.shortLinks.clicksRemaining, 0)
 
@@ -1127,7 +1171,11 @@ try {
      WHERE organization_id = ANY($1::uuid[])`,
     [targetIds],
   )
-  assert.equal(historicalAudits.rows[0].count, 37, 'Historical audit evidence is preserved')
+  assert.equal(
+    historicalAudits.rows[0].count,
+    EXPECTED_SPECIAL_SCOPE_COUNTS.preservedAuditEvents,
+    'Historical audit evidence is preserved',
+  )
   const receipt = await pool.query(
     'SELECT id::text, retired_short_links FROM workspace_tenant_retirement_receipts',
   )
