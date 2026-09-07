@@ -16,9 +16,9 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-export const SCRIPT_VERSION = 'workspace-tenant-retirement-v3'
-export const PLAN_FORMAT = 'clawpilot-workspace-tenant-retirement-plan-v3'
-export const RECEIPT_FORMAT = 'clawpilot-workspace-tenant-retirement-receipt-v3'
+export const SCRIPT_VERSION = 'workspace-tenant-retirement-v4'
+export const PLAN_FORMAT = 'clawpilot-workspace-tenant-retirement-plan-v4'
+export const RECEIPT_FORMAT = 'clawpilot-workspace-tenant-retirement-receipt-v4'
 export const PRODUCTION_DATABASE_IDENTITY = '0474a18c-649c-491b-bea1-7da006d21d81'
 export const PRODUCTION_DATABASE_NAME = 'railway'
 export const PRODUCTION_DATABASE_USER = 'postgres'
@@ -96,7 +96,7 @@ export const PROTECTED_LEGACY_CRM_ORGANIZATIONS = Object.freeze([
   }),
 ])
 export const PROTECTED_SHARED_PIPELINE = Object.freeze({
-  workspaceOrganizationId: 'ded21d68-746c-42e1-88ee-b1315afe6b84',
+  workspaceOrganizationId: '2263ecde-5e5a-4bd3-8a87-3cdbc1f63b11',
   pipelineId: 'b614e65d-250e-40a9-bb1e-fdbd18a1ec2c',
 })
 export const PRESERVED_SHARED_REFERENCE_CODES = Object.freeze(['gc3327424'])
@@ -117,11 +117,12 @@ export const EXPECTED_SELECTED_SCOPE_COUNTS = Object.freeze({
   crm_contact_source_aliases: 6,
   crm_contacts: 3,
   crm_organizations: 3,
+  document_embedding_jobs: 117,
   operations_activation_scopes: 2,
   pipeline_dropdown_catalogs: 3,
   pipeline_spaces: 3,
   project_boards: 6,
-  sync_outbox: 3,
+  sync_outbox: 12,
   workspace_organizations: 3,
 })
 export const EXPECTED_SPECIAL_SCOPE_COUNTS = Object.freeze({
@@ -1584,7 +1585,18 @@ async function selectedOutboxRecords(client, catalog) {
   if (!relation) fail('sync_outbox is missing from the runtime catalog')
   const result = await client.query(
     `SELECT candidate.id::text, candidate.aggregate_type, candidate.aggregate_id,
-            candidate.operation, candidate.target_system, candidate.status
+            candidate.operation, candidate.target_system, candidate.status,
+            candidate.attempts, candidate.processed_at IS NOT NULL AS processed,
+            candidate.idempotency_key,
+            (SELECT count(*)::integer
+             FROM public.sync_outbox duplicate
+             WHERE duplicate.target_system = candidate.target_system
+               AND duplicate.idempotency_key = candidate.idempotency_key
+            ) AS idempotency_key_uses,
+            candidate.payload->>'entity' AS payload_entity,
+            candidate.payload->>'localId' AS payload_local_id,
+            candidate.payload->>'pipelineId' AS payload_pipeline_id,
+            candidate.payload->>'suiteCrmId' AS payload_suitecrm_id
      FROM public.sync_outbox candidate
      JOIN workspace_tenant_retirement_scope selected
        ON selected.table_oid = $1::oid
@@ -1599,27 +1611,79 @@ async function selectedOutboxRecords(client, catalog) {
     operation: row.operation,
     targetSystem: row.target_system,
     status: row.status,
+    attempts: Number(row.attempts),
+    processed: row.processed === true,
+    idempotencyKeyValid: (() => {
+      const prefix = `crm:${row.payload_entity}:v4:${row.aggregate_id}:default:`
+      const key = text(row.idempotency_key)
+      return key.startsWith(prefix) && SHA256.test(key.slice(prefix.length))
+    })(),
+    idempotencyKeyUnique: Number(row.idempotency_key_uses) === 1,
+    payloadEntity: row.payload_entity,
+    payloadLocalId: row.payload_local_id,
+    payloadPipelineId: row.payload_pipeline_id,
+    payloadSuiteCrmId: row.payload_suitecrm_id,
   }))
 }
 
 function unexpectedOutboxRecords(records, targets) {
-  const expectedAggregateIds = targets.map((target) => target.crmOrganizationId).sort()
-  const observedAggregateIds = records.map((record) => record.aggregateId).sort()
-  if (canonicalJson(observedAggregateIds) !== canonicalJson(expectedAggregateIds)) {
+  const identity = (record) => ({
+    aggregateType: record.aggregateType,
+    aggregateId: record.aggregateId,
+    operation: record.operation,
+    targetSystem: record.targetSystem,
+    status: record.status,
+    attempts: record.attempts,
+    processed: record.processed,
+    idempotencyKeyValid: record.idempotencyKeyValid,
+    idempotencyKeyUnique: record.idempotencyKeyUnique,
+    payloadEntity: record.payloadEntity,
+    payloadLocalId: record.payloadLocalId,
+    payloadPipelineId: record.payloadPipelineId,
+    payloadSuiteCrmId: record.payloadSuiteCrmId,
+  })
+  const expected = targets.flatMap((target) => [
+    {
+      aggregateType: 'crm_organizations',
+      aggregateId: target.crmOrganizationId,
+      operation: 'upsert_record',
+      targetSystem: 'suitecrm',
+      status: 'succeeded',
+      attempts: 1,
+      processed: true,
+      idempotencyKeyValid: true,
+      idempotencyKeyUnique: true,
+      payloadEntity: 'organizations',
+      payloadLocalId: target.crmOrganizationId,
+      payloadPipelineId: target.pipelineId,
+      payloadSuiteCrmId: target.suiteCrmAccountId,
+    },
+    ...Array.from({ length: 3 }, () => ({
+      aggregateType: 'crm_contacts',
+      aggregateId: target.crmContactId,
+      operation: 'upsert_record',
+      targetSystem: 'suitecrm',
+      status: 'succeeded',
+      attempts: 1,
+      processed: true,
+      idempotencyKeyValid: true,
+      idempotencyKeyUnique: true,
+      payloadEntity: 'contacts',
+      payloadLocalId: target.crmContactId,
+      payloadPipelineId: target.pipelineId,
+      payloadSuiteCrmId: target.suiteCrmContactId,
+    })),
+  ]).sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)))
+  const observed = records.map(identity)
+    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)))
+  if (canonicalJson(observed) !== canonicalJson(expected)) {
     return [{
       reason: 'audited_outbox_identity_multiset_mismatch',
-      expected: expectedAggregateIds,
-      observed: observedAggregateIds,
+      expected,
+      observed,
     }]
   }
-  const expectedAggregateIdSet = new Set(expectedAggregateIds)
-  return records.filter((record) => (
-    record.aggregateType !== 'crm_organizations'
-      || !expectedAggregateIdSet.has(record.aggregateId)
-      || record.operation !== 'upsert_record'
-      || record.targetSystem !== 'suitecrm'
-      || record.status !== 'succeeded'
-  )).map((record) => ({ ...record, reason: 'audited_outbox_identity_mismatch' }))
+  return []
 }
 
 async function scopeSummary(client, catalog, targets) {
@@ -1664,11 +1728,15 @@ async function scopeSummary(client, catalog, targets) {
   }))
   const registryRows = await selectedReferences(client, catalog)
   const preservedReferenceSet = new Set(PRESERVED_SHARED_REFERENCE_CODES)
+  const belongsToPreservedReferenceFamily = (row) => (
+    preservedReferenceSet.has(row.reference_code)
+      || preservedReferenceSet.has(row.canonical_code)
+  )
   const preservedReferences = registryRows
-    .filter((row) => preservedReferenceSet.has(row.reference_code))
+    .filter(belongsToPreservedReferenceFamily)
     .map((row) => row.reference_code)
   const references = registryRows
-    .filter((row) => !preservedReferenceSet.has(row.reference_code))
+    .filter((row) => !belongsToPreservedReferenceFamily(row))
     .map((row) => row.reference_code)
   const suiteCrmRecords = await selectedSuiteCrmRecords(client, catalog)
   const shortLinks = await client.query(

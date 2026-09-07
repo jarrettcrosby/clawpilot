@@ -49,6 +49,7 @@ const generatedReferences = [
   'gex000000000005',
   'gex000000000006',
 ]
+const preservedSharedAliasReference = 'gc6000002'
 const validatedBackupSha256 = 'd'.repeat(64)
 const validatedBackupBytes = '29360128'
 const productionShapedAuditCountByTarget = Object.freeze({
@@ -212,6 +213,16 @@ async function installFixture(client) {
       title text NOT NULL,
       created_at timestamptz NOT NULL
     );
+    CREATE TABLE document_embedding_jobs (
+      document_id uuid PRIMARY KEY REFERENCES app_documents(id) ON DELETE CASCADE,
+      owner_email text NOT NULL REFERENCES app_users(email) ON DELETE CASCADE,
+      content_hash text NOT NULL,
+      status text NOT NULL DEFAULT 'pending',
+      attempts integer NOT NULL DEFAULT 0,
+      available_at timestamptz NOT NULL DEFAULT now(),
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE app_sessions (
       id uuid PRIMARY KEY,
       active_workspace_organization_id uuid NOT NULL
@@ -298,6 +309,9 @@ async function installFixture(client) {
       operation text NOT NULL,
       target_system text NOT NULL,
       status text NOT NULL,
+      attempts integer NOT NULL,
+      processed_at timestamptz,
+      idempotency_key text NOT NULL,
       payload jsonb NOT NULL,
       created_at timestamptz NOT NULL
     );
@@ -450,6 +464,12 @@ async function installFixture(client) {
      ) VALUES ($1, 'gex', $2, 'alias', $3, $3)`,
     [aliasReference, generatedReferences[0], fixedTime],
   )
+  await client.query(
+    `INSERT INTO crm_reference_registry (
+       reference_code, prefix, canonical_code, status, allocated_at, retired_at
+     ) VALUES ($1, 'gc', $2, 'alias', $3, $3)`,
+    [preservedSharedAliasReference, PRESERVED_SHARED_REFERENCE_CODES[0], fixedTime],
+  )
 
   for (const [organizationId, referenceCode, name] of retainedOrganizations) {
     await client.query(
@@ -589,10 +609,17 @@ async function installFixture(client) {
       )
     }
     for (let documentIndex = 0; documentIndex < 39; documentIndex += 1) {
+      const documentId = randomUUID()
       await client.query(
         `INSERT INTO app_documents (id, organization_id, title, created_at)
          VALUES ($1, $2, $3, $4)`,
-        [randomUUID(), target.organizationId, `${target.name} document ${documentIndex}`, fixedTime],
+        [documentId, target.organizationId, `${target.name} document ${documentIndex}`, fixedTime],
+      )
+      await client.query(
+        `INSERT INTO document_embedding_jobs (
+           document_id, owner_email, content_hash, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $4)`,
+        [documentId, CONFIRMED_OPERATOR_EMAIL, String(documentIndex).padStart(64, '0'), fixedTime],
       )
     }
     await client.query(
@@ -659,11 +686,43 @@ async function installFixture(client) {
     await client.query(
       `INSERT INTO sync_outbox (
          id, aggregate_type, aggregate_id, operation, target_system, status,
-         payload, created_at
+         attempts, processed_at, idempotency_key, payload, created_at
        ) VALUES ($1, 'crm_organizations', $2, 'upsert_record', 'suitecrm',
-         'succeeded', '{}'::jsonb, $3)`,
-      [randomUUID(), target.crmOrganizationId, fixedTime],
+         'succeeded', 1, $3, $4, $5::jsonb, $3)`,
+      [
+        randomUUID(),
+        target.crmOrganizationId,
+        fixedTime,
+        `crm:organizations:v4:${target.crmOrganizationId}:default:${String(index).padStart(64, '0')}`,
+        JSON.stringify({
+          entity: 'organizations',
+          localId: target.crmOrganizationId,
+          pipelineId: target.pipelineId,
+          suiteCrmId: target.suiteCrmAccountId,
+        }),
+      ],
     )
+    for (let outboxIndex = 0; outboxIndex < 3; outboxIndex += 1) {
+      await client.query(
+        `INSERT INTO sync_outbox (
+           id, aggregate_type, aggregate_id, operation, target_system, status,
+           attempts, processed_at, idempotency_key, payload, created_at
+         ) VALUES ($1, 'crm_contacts', $2, 'upsert_record', 'suitecrm',
+           'succeeded', 1, $3, $4, $5::jsonb, $3)`,
+        [
+          randomUUID(),
+          target.crmContactId,
+          fixedTime,
+          `crm:contacts:v4:${target.crmContactId}:default:${String((index * 3) + outboxIndex + 3).padStart(64, '0')}`,
+          JSON.stringify({
+            entity: 'contacts',
+            localId: target.crmContactId,
+            pipelineId: target.pipelineId,
+            suiteCrmId: target.suiteCrmContactId,
+          }),
+        ],
+      )
+    }
     const linkCount = index < 2 ? 2 : 1
     for (let linkIndex = 0; linkIndex < linkCount; linkIndex += 1) {
       const linkId = randomUUID()
@@ -718,6 +777,20 @@ async function installFixture(client) {
      ) VALUES ($1, $2, 'safe-retained-link', $3, $4, $4)`,
     [safeShortLinkId, CONFIRMED_OPERATOR_EMAIL, safeOrganizationId, fixedTime],
   )
+  const preservedAliasShortLinkId = '82e90a3c-e8b4-49f6-b926-bc7e6b719acb'
+  await client.query(
+    `INSERT INTO short_links (
+       id, owner_email, slug, organization_root_id, disabled_at, deleted_at,
+       created_at, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $5, $5, $5)`,
+    [
+      preservedAliasShortLinkId,
+      CONFIRMED_OPERATOR_EMAIL,
+      preservedSharedAliasReference,
+      safeOrganizationId,
+      fixedTime,
+    ],
+  )
   const safeShortLinkClick = await client.query(
     `INSERT INTO short_link_clicks (short_link_id, clicked_at)
      VALUES ($1, $2) RETURNING id`,
@@ -747,6 +820,7 @@ async function installFixture(client) {
     safeAssetId,
     safeAssetReference,
     safeDocumentId,
+    preservedAliasShortLinkId,
     safeShortLinkClickId: safeShortLinkClick.rows[0].id,
   }
 }
@@ -821,6 +895,7 @@ try {
   const planPath = join(artifacts, 'reviewed-plan.json')
   const blockedPlanPath = join(artifacts, 'blocked-plan.json')
   const outboxBlockedPlanPath = join(artifacts, 'outbox-blocked-plan.json')
+  const outboxSemanticBlockedPlanPath = join(artifacts, 'outbox-semantic-blocked-plan.json')
   const auditDriftBlockedPlanPath = join(artifacts, 'audit-drift-blocked-plan.json')
   const invalidIdentityPlanPath = join(artifacts, 'invalid-identity-plan.json')
   const receiptPath = join(artifacts, 'receipt.json')
@@ -893,6 +968,46 @@ try {
     `UPDATE sync_outbox SET aggregate_id = $1 WHERE id = $2::uuid`,
     [APPROVED_TARGETS[2].crmOrganizationId, bakeryOutbox.rows[0].id],
   )
+  const contactOutbox = await pool.query(
+    `SELECT id::text, idempotency_key, payload
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_contacts' AND aggregate_id = $1
+     ORDER BY id
+     LIMIT 1`,
+    [APPROVED_TARGETS[0].crmContactId],
+  )
+  assert.equal(contactOutbox.rows.length, 1)
+  await pool.query(
+    `UPDATE sync_outbox SET
+       idempotency_key = 'invalid-retirement-key',
+       payload = jsonb_set(payload, '{pipelineId}', to_jsonb($1::text))
+     WHERE id = $2::uuid`,
+    [safeOrganizationId, contactOutbox.rows[0].id],
+  )
+  const semanticOutboxBlocked = await run([
+    ...commonFlags(), '--output', outboxSemanticBlockedPlanPath,
+  ], environment, testRuntime)
+  assert.equal(semanticOutboxBlocked.applyReady, false)
+  const semanticOutboxBlockedManifest = JSON.parse(
+    readFileSync(outboxSemanticBlockedPlanPath, 'utf8'),
+  )
+  assert.equal(
+    semanticOutboxBlockedManifest.scope.blockers.unexpectedOutbox[0].reason,
+    'audited_outbox_identity_multiset_mismatch',
+  )
+  assert.ok(semanticOutboxBlockedManifest.scope.blockers.unexpectedOutbox[0].observed.some(
+    (record) => record.idempotencyKeyValid === false
+      && record.payloadPipelineId === safeOrganizationId,
+  ))
+  await pool.query(
+    `UPDATE sync_outbox SET idempotency_key = $1, payload = $2::jsonb
+     WHERE id = $3::uuid`,
+    [
+      contactOutbox.rows[0].idempotency_key,
+      JSON.stringify(contactOutbox.rows[0].payload),
+      contactOutbox.rows[0].id,
+    ],
+  )
   const auditDriftEventKey = 'fixture-audit-drift-extra'
   await pool.query(
     `INSERT INTO audit_events (
@@ -941,8 +1056,10 @@ try {
       && trigger.name === 'fixture_reject_short_link_click_delete'
   )))
   assert.equal(manifest.scope.shortLinks.length, 5)
-  assert.equal(manifest.scope.preservedReferences.length, 1)
-  assert.equal(manifest.scope.preservedReferences[0], PRESERVED_SHARED_REFERENCE_CODES[0])
+  assert.deepEqual(manifest.scope.preservedReferences, [
+    PRESERVED_SHARED_REFERENCE_CODES[0],
+    preservedSharedAliasReference,
+  ])
   assert.equal(manifest.scope.blockers.relationCycles.length, 0)
   assert.equal(manifest.scope.blockers.preservedForeignKeys.length, 0)
   assert.equal(manifest.scope.blockers.crossTenantRows.length, 0)
@@ -974,6 +1091,13 @@ try {
     /relation lock catalog drifted/u,
   )
   await pool.query('DROP TABLE post_plan_catalog_drift')
+  const organizationOutboxPayload = await pool.query(
+    `SELECT payload
+     FROM sync_outbox
+     WHERE aggregate_type = 'crm_organizations' AND aggregate_id = $1`,
+    [APPROVED_TARGETS[0].crmOrganizationId],
+  )
+  assert.equal(organizationOutboxPayload.rows.length, 1)
   await pool.query(
     `UPDATE sync_outbox SET payload = '{"drift":true}'::jsonb
      WHERE aggregate_id = $1`,
@@ -984,9 +1108,12 @@ try {
     /scope changed after plan approval/u,
   )
   await pool.query(
-    `UPDATE sync_outbox SET payload = '{}'::jsonb
-     WHERE aggregate_id = $1`,
-    [APPROVED_TARGETS[0].crmOrganizationId],
+    `UPDATE sync_outbox SET payload = $1::jsonb
+     WHERE aggregate_id = $2`,
+    [
+      JSON.stringify(organizationOutboxPayload.rows[0].payload),
+      APPROVED_TARGETS[0].crmOrganizationId,
+    ],
   )
   await assert.rejects(
     () => run(applyBase, environment, testRuntime),
@@ -1072,6 +1199,7 @@ try {
   )
   assert.equal(remainingTargets.rows[0].count, 0)
   for (const table of [
+    'document_embedding_jobs',
     'project_boards',
     'app_sessions',
     'crm_board_cards',
@@ -1155,6 +1283,27 @@ try {
     [PRESERVED_SHARED_REFERENCE_CODES[0]],
   )
   assert.deepEqual(sharedReference.rows[0], { status: 'active', retired_at: null })
+  const preservedSharedAlias = await pool.query(
+    `SELECT status, canonical_code, retired_at
+     FROM crm_reference_registry
+     WHERE reference_code = $1`,
+    [preservedSharedAliasReference],
+  )
+  assert.deepEqual(preservedSharedAlias.rows[0], {
+    status: 'alias',
+    canonical_code: PRESERVED_SHARED_REFERENCE_CODES[0],
+    retired_at: new Date(fixedTime),
+  })
+  const preservedAliasLink = await pool.query(
+    `SELECT organization_root_id::text, disabled_at, deleted_at
+     FROM short_links WHERE id = $1::uuid`,
+    [fixture.preservedAliasShortLinkId],
+  )
+  assert.deepEqual(preservedAliasLink.rows[0], {
+    organization_root_id: safeOrganizationId,
+    disabled_at: new Date(fixedTime),
+    deleted_at: new Date(fixedTime),
+  })
   const linkState = await pool.query(
     `SELECT count(*)::integer AS total,
             count(*) FILTER (
