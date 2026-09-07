@@ -934,12 +934,12 @@ test('POS accounting keeps organization defaults and location overrides visibly 
   const targetSelector = page.getByRole('combobox', { name: 'QuickBooks target' })
   await expect(scopeSelector).toHaveText('Organization default')
   await expect(targetSelector).toHaveValue(defaultTarget.name)
-  await expect(page.getByText('Organization default', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('pos-mapping-provenance')).toHaveText('Organization default')
 
   await scopeSelector.click()
   await page.getByRole('option', { name: 'Location override', exact: true }).click()
   await expect(targetSelector).toHaveValue(overrideTarget.name)
-  await expect(page.getByText('Location override', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('pos-mapping-provenance')).toHaveText('Location override')
   await expect(page.getByText('Target missing', { exact: true })).toBeVisible()
   await expect(page.getByText(/saved QuickBooks target is not in the current catalog/i)).toBeVisible()
 

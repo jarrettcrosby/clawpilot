@@ -238,7 +238,23 @@ async function queueRecipients(
          issue_state_id, occurrence, issue_fingerprint, issues, recipient_email,
          status, available_at, created_at, updated_at
        ) VALUES ($1::uuid, $2, $3, $4::jsonb, $5, 'pending', now(), now(), now())
-       ON CONFLICT (issue_state_id, occurrence, recipient_email) DO NOTHING`,
+       ON CONFLICT (issue_state_id, occurrence, recipient_email) DO UPDATE SET
+         issue_fingerprint = EXCLUDED.issue_fingerprint,
+         issues = EXCLUDED.issues,
+         status = CASE
+           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN 'pending'
+           ELSE pos_accounting_notification_outbox.status
+         END,
+         available_at = CASE
+           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN now()
+           ELSE pos_accounting_notification_outbox.available_at
+         END,
+         last_error = CASE
+           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN NULL
+           ELSE pos_accounting_notification_outbox.last_error
+         END,
+         updated_at = now()
+       WHERE pos_accounting_notification_outbox.status IN ('pending', 'failed', 'cancelled')`,
       [
         input.issueStateId,
         input.occurrence,
@@ -341,8 +357,13 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
       return { status: 'resolved' as const, changed: true, issueCount: 0, recipients: recipientEmails.length }
     }
 
-    const changed = !current || current.status !== 'open' || current.issue_fingerprint !== fingerprint
-    const occurrence = changed ? Number(current?.occurrence || 0) + 1 : current.occurrence
+    const currentIssueCodes = new Set((current?.issues || []).map((issue) => issue.code))
+    const addedIssueCode = issues.some((issue) => !currentIssueCodes.has(issue.code))
+    const changed = !current || current.status !== 'open' || addedIssueCode
+    // One issue-state row represents one POS location and business date. Keep
+    // its delivery occurrence stable so mapping changes or a same-day reopen
+    // refresh the UI without generating a second alert email for that date.
+    const occurrence = Number(current?.occurrence || 1)
     const stateResult = await client.query<{ id: string }>(
       `INSERT INTO pos_accounting_issue_states (
          organization_id, restaurant_guid, business_date, status, issue_fingerprint,
@@ -354,7 +375,7 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
          issues = EXCLUDED.issues, occurrence = EXCLUDED.occurrence,
          opened_at = CASE
            WHEN pos_accounting_issue_states.status = 'open'
-             AND pos_accounting_issue_states.issue_fingerprint = EXCLUDED.issue_fingerprint
+             AND pos_accounting_issue_states.occurrence = EXCLUDED.occurrence
              THEN pos_accounting_issue_states.opened_at
            ELSE now()
          END,
@@ -414,6 +435,24 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
 }
 
 export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { limit?: number } = {}) {
+  await query(
+    `WITH retired AS (
+       UPDATE pos_accounting_issue_states issue SET
+         status = 'resolved', resolved_at = now(), last_seen_at = now(), updated_at = now()
+       FROM toast_locations location
+       WHERE location.organization_id = issue.organization_id
+         AND location.restaurant_guid = issue.restaurant_guid
+         AND issue.status = 'open'
+         AND (location.active = false OR location.archived = true)
+       RETURNING issue.id
+     )
+     UPDATE pos_accounting_notification_outbox outbox SET
+       status = 'cancelled', last_error = 'The POS location is no longer active',
+       updated_at = now()
+     FROM retired
+     WHERE outbox.issue_state_id = retired.id
+       AND outbox.status IN ('pending', 'failed')`,
+  )
   const result = await query<{
     organization_id: string
     restaurant_guid: string
@@ -424,7 +463,6 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
          issue.last_seen_at AS priority_at
        FROM pos_accounting_issue_states issue
        WHERE issue.status = 'open'
-         AND issue.business_date >= current_date - interval '1 day'
          AND issue.last_seen_at < now() - interval '30 minutes'
        UNION ALL
        SELECT source.organization_id, source.restaurant_guid, source.business_date,
@@ -454,8 +492,12 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
        FROM candidates
        GROUP BY organization_id, restaurant_guid, business_date
      )
-     SELECT organization_id::text, restaurant_guid::text, business_date::text
-     FROM ranked_candidates
+     SELECT candidate.organization_id::text, candidate.restaurant_guid::text, candidate.business_date::text
+     FROM ranked_candidates candidate
+     JOIN toast_locations location
+       ON location.organization_id = candidate.organization_id
+      AND location.restaurant_guid = candidate.restaurant_guid
+      AND location.active = true AND location.archived = false
      ORDER BY priority_at, organization_id, restaurant_guid, business_date
      LIMIT $1`,
     [Math.max(1, Math.min(input.limit || 1, 4))],
@@ -472,6 +514,33 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
       reconciled += 1
     } catch {
       failed += 1
+      const retryIssue = [{
+        code: 'reconciliation_failed',
+        title: 'Refresh accounting issue status',
+        detail: 'ClawPilot will retry this POS accounting date automatically.',
+      }]
+      await query(
+        `INSERT INTO pos_accounting_issue_states (
+           organization_id, restaurant_guid, business_date, status, issue_fingerprint,
+           issues, occurrence, opened_at, last_seen_at, resolved_at, created_at, updated_at
+         ) VALUES ($1::uuid, $2::uuid, $3::date, 'open', $4, $5::jsonb, 1,
+           now(), now(), NULL, now(), now())
+         ON CONFLICT (organization_id, restaurant_guid, business_date) DO UPDATE SET
+           status = 'open', issue_fingerprint = EXCLUDED.issue_fingerprint,
+           issues = EXCLUDED.issues,
+           opened_at = CASE
+             WHEN pos_accounting_issue_states.status = 'resolved' THEN now()
+             ELSE pos_accounting_issue_states.opened_at
+           END,
+           last_seen_at = now(), resolved_at = NULL, updated_at = now()`,
+        [
+          row.organization_id,
+          row.restaurant_guid,
+          row.business_date,
+          posAccountingIssueFingerprint(retryIssue),
+          JSON.stringify(retryIssue),
+        ],
+      ).catch(() => undefined)
     }
   }
   return { checked: result.rows.length, reconciled, failed }
@@ -502,6 +571,44 @@ export async function reconcilePosAccountingIssueForQuickBooksRequestInPostgres(
     restaurantGuid: scope.restaurant_guid,
     businessDate: scope.business_date,
   })
+}
+
+export async function reconcileOpenPosAccountingIssuesForMappedItemInPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  mappingScope: 'organization_default' | 'location_override'
+}) {
+  const result = await query<{
+    restaurant_guid: string
+    business_date: string
+  }>(
+    `SELECT issue.restaurant_guid::text, issue.business_date::text
+     FROM pos_accounting_issue_states issue
+     WHERE issue.organization_id = $1::uuid
+       AND issue.status = 'open'
+       AND ($2 = 'organization_default' OR issue.restaurant_guid = $3::uuid)
+     ORDER BY issue.business_date DESC, issue.restaurant_guid`,
+    [
+      input.organizationId,
+      input.mappingScope,
+      input.restaurantGuid,
+    ],
+  )
+  let reconciled = 0
+  let failed = 0
+  for (const scope of result.rows) {
+    try {
+      await reconcilePosAccountingIssueForDateInPostgres({
+        organizationId: input.organizationId,
+        restaurantGuid: scope.restaurant_guid,
+        businessDate: scope.business_date,
+      })
+      reconciled += 1
+    } catch {
+      failed += 1
+    }
+  }
+  return { checked: result.rows.length, reconciled, failed }
 }
 
 function toNotificationJob(row: NotificationJobRow): PosAccountingNotificationJob {
@@ -616,7 +723,7 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
        issue.organization_id::text, organization.name AS organization_name,
        issue.restaurant_guid::text,
        COALESCE(location.location_name, location.restaurant_name) AS restaurant_name,
-       issue.business_date::text, claimed.issues, claimed.attempt_count,
+       issue.business_date::text, issue.issues, claimed.attempt_count,
        claimed.lock_token::text
      FROM claimed
      JOIN pos_accounting_issue_states issue ON issue.id = claimed.issue_state_id

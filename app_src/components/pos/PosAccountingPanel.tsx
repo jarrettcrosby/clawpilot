@@ -1095,6 +1095,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               label="Email issue alerts"
             />
           </Tooltip>
+          {profile.exists !== true && profile.emailNotificationsEnabled === true ? (
+            <Typography variant="caption" color="text.secondary" alignSelf="center">
+              Alerts begin after this accounting profile is saved.
+            </Typography>
+          ) : null}
         </Box>
         <Divider sx={{ my: 1.5 }} />
         <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>Break out sales by</Typography>
@@ -1220,7 +1225,13 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                   <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
                   {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
                   {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
-                  {provenanceLabel ? <Chip size="small" color={mapping.inherited ? 'info' : 'default'} variant="outlined" label={provenanceLabel} /> : null}
+                  {provenanceLabel ? <Chip
+                    data-testid="pos-mapping-provenance"
+                    size="small"
+                    color={mapping.inherited ? 'info' : 'default'}
+                    variant="outlined"
+                    label={provenanceLabel}
+                  /> : null}
                   {validationLabel ? <Chip size="small" color="warning" variant="outlined" label={validationLabel} /> : null}
                 </Box>
                 <Typography variant="caption" color="text.secondary" display="block" noWrap>
@@ -1409,7 +1420,15 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 getOptionLabel={(entry) => entry.name}
                 isOptionEqualToValue={(left, right) => left.id === right.id}
                 onChange={(_, value) => updateProductDraft({ expenseAccountId: value?.id || '' })}
-                renderInput={(params) => <TextField {...params} label="Expense account (optional)" sx={controlSx} />}
+                renderInput={(params) => (
+                  <TextField
+                    {...params}
+                    label={productDraft.purchaseCost.trim() ? 'Expense account' : 'Expense account (optional)'}
+                    helperText={productDraft.purchaseCost.trim() ? 'Required when a purchase cost is entered.' : undefined}
+                    required={Boolean(productDraft.purchaseCost.trim())}
+                    sx={controlSx}
+                  />
+                )}
               />
               <TextField label="Description" value={productDraft.description} onChange={(event) => updateProductDraft({ description: event.target.value })} multiline minRows={2} sx={controlSx} />
               <FormControlLabel control={<Switch checked={productDraft.taxable} onChange={(event) => updateProductDraft({ taxable: event.target.checked })} />} label="Taxable" />
@@ -1422,7 +1441,12 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             variant="contained"
             startIcon={preparingProduct ? <CircularProgress size={16} /> : <AddRounded />}
             onClick={() => { void prepareQuickBooksProduct() }}
-            disabled={preparingProduct || !productDraft?.name.trim() || !productDraft?.incomeAccountId}
+            disabled={
+              preparingProduct
+              || !productDraft?.name.trim()
+              || !productDraft?.incomeAccountId
+              || (Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId)
+            }
           >
             Prepare draft
           </Button>

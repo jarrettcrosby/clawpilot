@@ -2146,7 +2146,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       ...entry,
       mappings: sourceMappings,
       suggestedTarget,
-      productCreationSuggestion: entry.sourceKind === 'sales_item' && !hasActiveMapping && !suggestedTarget
+      productCreationSuggestion: entry.sourceKind === 'sales_item' && sourceMappings.length === 0 && !suggestedTarget
         ? {
             name: entry.sourceName,
             itemType: 'NonInventory' as const,
@@ -3255,6 +3255,32 @@ export async function savePosAccountingMappingsInPostgres(input: {
     const saved: PosAccountingMapping[] = []
     const changed: PosAccountingMapping[] = []
     for (const mapping of input.mappings) {
+      if (mapping.sourceKind === 'sales_item') {
+        const reserved = await client.query<{ id: string }>(
+          `SELECT request.id::text
+           FROM quickbooks_write_requests request
+           WHERE request.organization_id = $1::uuid
+             AND request.operation_kind = 'item.create'
+             AND request.status IN ('approved', 'processing', 'failed', 'dead')
+             AND request.request_payload->>'sourceKind' = 'sales_item'
+             AND request.request_payload->>'sourceId' = $2
+             AND request.request_payload->>'mappingScope' = $3
+             AND (
+               $3 = 'organization_default'
+               OR request.request_payload->>'sourceRestaurantGuid' = $4
+             )
+           LIMIT 1
+           FOR UPDATE`,
+          [input.organizationId, mapping.sourceId, input.scope, input.restaurantGuid],
+        )
+        if (reserved.rows[0]) {
+          throw new PosAccountingRequestError(
+            'POS_QUICKBOOKS_ITEM_MAPPING_WRITE_IN_PROGRESS',
+            'A QuickBooks item is currently being created for this POS item. Wait for it to finish or cancel the accounting change before editing the mapping.',
+            409,
+          )
+        }
+      }
       const sourceName = canonicalSourceNames.get(`${mapping.sourceKind}:${mapping.sourceId}`) || mapping.sourceName
       let validationStatus: PosAccountingMapping['validationStatus'] = 'unvalidated'
       let validationReason: string | null = null

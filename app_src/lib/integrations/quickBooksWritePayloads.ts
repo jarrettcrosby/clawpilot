@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
 import { query } from '@/lib/persistence/postgres'
 
 export const QUICKBOOKS_WRITE_OPERATIONS = [
@@ -283,6 +284,25 @@ async function validateItemSourceContext(
       'The Toast menu item was not found in the selected organization and location',
     )
   }
+  const mappingRestaurantGuid = mappingScope === 'location_override' ? restaurantGuid : null
+  const currentMapping = await query<{ id: string }>(
+    `SELECT id::text
+     FROM pos_accounting_catalog_mappings
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
+       AND source_kind = 'sales_item'
+       AND source_id = $3
+       AND target_type = 'item'
+       AND effective_to IS NULL
+     LIMIT 1`,
+    [organizationId, mappingRestaurantGuid, sourceId],
+  )
+  if (currentMapping.rows[0]) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_POS_MAPPING_EXISTS',
+      'This Toast item already has a current QuickBooks mapping. Update or reactivate that mapping instead of creating another QuickBooks item.',
+    )
+  }
   return {
     sourceKind: 'sales_item' as const,
     sourceId,
@@ -564,7 +584,7 @@ export function buildQuickBooksProviderPayload(
     })
   }
   if (operationKind === 'item.create') {
-    const item = payload as QuickBooksItemDraft
+    const item = normalizeQuickBooksItemDraftForStoredCompatibility(payload) as QuickBooksItemDraft
     return compactObject({
       Name: item.name,
       Type: item.itemType,

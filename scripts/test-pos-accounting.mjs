@@ -175,6 +175,19 @@ for (const fragment of [
   assert.ok(persistenceSource.includes(fragment), `POS accounting persistence missing ${fragment}`)
 }
 assert.equal(persistenceSource.includes('ON CONFLICT (organization_id, restaurant_guid)'), false)
+assert.match(
+  persistenceSource,
+  /function defaultProfile\(\)[\s\S]*?emailNotificationsEnabled: true,[\s\S]*?emailNotificationsEnabledAt: null/,
+  'A first-time POS accounting profile must default issue notifications on',
+)
+assert.ok(
+  persistenceSource.includes("entry.sourceKind === 'sales_item' && sourceMappings.length === 0 && !suggestedTarget"),
+  'A source with any current mapping, including an inactive mapping, must not offer mapped item creation',
+)
+assert.ok(
+  persistenceSource.includes('POS_QUICKBOOKS_ITEM_MAPPING_WRITE_IN_PROGRESS'),
+  'Mapping edits must honor approved source-linked QuickBooks item reservations',
+)
 
 const route = read('app_src/app/api/pos/accounting/route.ts')
 for (const fragment of [
@@ -201,6 +214,10 @@ assert.equal(route.includes('export async function POST'), true, 'Accounting rou
 assert.equal(route.includes('quickbooks_payload'), false, 'Accounting date commands must not post to QuickBooks')
 
 const panel = read('app_src/components/pos/PosAccountingPanel.tsx')
+assert.ok(
+  panel.includes('Alerts begin after this accounting profile is saved.'),
+  'The unsaved default-on preference must disclose when delivery becomes effective',
+)
 for (const fragment of [
   "capabilities.canPrepare === true && scope === 'location_override'",
   'disabled={capabilities.canManage !== true}',
@@ -1799,6 +1816,7 @@ assert.match(categoryGuardedMappings[0].validationReason, /active QuickBooks pro
 
 const quickBooksActionsPanel = read('app_src/components/accounting/QuickBooksActionsPanel.tsx')
 assert.ok(quickBooksActionsPanel.includes('<DetailField label="Category" value={payload.parentCategoryName} />'))
+assert.ok(quickBooksActionsPanel.includes('normalizeQuickBooksItemDraftForStoredCompatibility(request.requestPayload)'))
 assert.ok(quickBooksActionsPanel.includes('initialRequestId?: string | null'))
 assert.ok(quickBooksActionsPanel.includes('setSelected(request)'))
 assert.ok(quickBooksActionsPanel.includes("parameters.set('requestId', initialRequestToLoad.current)"))
@@ -1811,6 +1829,8 @@ assert.ok(posAccountingPanel.includes('open={Boolean(preparedProductDraft) && pr
 assert.ok(posAccountingPanel.includes('onClose={() => setPreparedProductDraftDialogOpen(false)}'))
 assert.ok(posAccountingPanel.includes('<Button onClick={() => setPreparedProductDraftDialogOpen(false)}>Later</Button>'))
 assert.ok(posAccountingPanel.includes('preparedProductDraft ? <Button color="inherit" size="small" onClick={() => reviewPreparedProductDraft(preparedProductDraft)}>Review draft</Button>'))
+assert.ok(posAccountingPanel.includes("Required when a purchase cost is entered."))
+assert.ok(posAccountingPanel.includes("Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId"))
 
 const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
 assert.ok(accountingSection.includes('consumeAccountingDraftTarget(window.location.href)'))

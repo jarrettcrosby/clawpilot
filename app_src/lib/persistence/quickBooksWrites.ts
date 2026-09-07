@@ -1,4 +1,5 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
 import type {
   QuickBooksItemDraft,
   QuickBooksWriteDraftPayload,
@@ -62,6 +63,13 @@ export type QuickBooksWriteJob = {
   maxAttempts: number
   lockToken: string
   writeMode: 'sandbox' | 'production'
+}
+
+export type QuickBooksWriteJobProviderReadiness = {
+  posAccountingSource: {
+    sourceName: string
+    sourceCatalogRevision: number
+  } | null
 }
 
 export class QuickBooksWriteRequestError extends Error {
@@ -463,6 +471,12 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
     }
 
     if (input.action === 'approve' || input.action === 'retry') {
+      await reservePosAccountingItemMappingForWrite(client, {
+        organizationId: input.organizationId,
+        requestId: current.id,
+        operationKind: current.operation_kind,
+        payload: current.request_payload,
+      })
       const connection = await client.query<{
         write_mode: 'disabled' | 'sandbox' | 'production'
         write_verified_at: string | null
@@ -649,12 +663,120 @@ function mappedItemSource(payload: QuickBooksWriteDraftPayload): QuickBooksItemD
     : null
 }
 
+export async function validateQuickBooksWriteJobBeforeProviderInPostgres(
+  job: QuickBooksWriteJob,
+): Promise<QuickBooksWriteJobProviderReadiness> {
+  if (job.operationKind !== 'item.create') return { posAccountingSource: null }
+  const item = mappedItemSource(job.requestPayload)
+  if (!item || !item.sourceId || !item.sourceRestaurantGuid || !item.mappingScope) {
+    return { posAccountingSource: null }
+  }
+  const result = await query<{
+    name: string
+    source_revision: string | Date
+  }>(
+    `SELECT name, source_revision
+     FROM toast_menu_catalog_items
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid = $2::uuid
+       AND source_provider = 'toast'
+       AND provider_item_id = $3
+       AND active = true AND archived = false
+     ORDER BY source_revision DESC, updated_at DESC, menu_guid, group_guid
+     LIMIT 1`,
+    [job.organizationId, item.sourceRestaurantGuid, item.sourceId],
+  )
+  const source = result.rows[0]
+  if (!source) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_STALE',
+      'The Toast item was archived or removed after this QuickBooks item was approved. Review the POS mapping before retrying.',
+      409,
+    )
+  }
+  const sourceCatalogRevision = new Date(source.source_revision).getTime()
+  if (!Number.isFinite(sourceCatalogRevision)) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_TOAST_SOURCE_STALE',
+      'The current Toast item revision could not be verified. Refresh the POS catalog before retrying.',
+      409,
+    )
+  }
+  return {
+    posAccountingSource: {
+      sourceName: source.name,
+      sourceCatalogRevision,
+    },
+  }
+}
+
+async function reservePosAccountingItemMappingForWrite(
+  client: Parameters<Parameters<typeof withTransaction>[0]>[0],
+  input: {
+    organizationId: string
+    requestId: string
+    operationKind: QuickBooksWriteOperationKind
+    payload: QuickBooksWriteDraftPayload
+  },
+) {
+  if (input.operationKind !== 'item.create') return
+  const item = mappedItemSource(input.payload)
+  if (!item || !item.sourceId || !item.sourceRestaurantGuid || !item.mappingScope) return
+  const mappingRestaurantGuid = item.mappingScope === 'location_override' ? item.sourceRestaurantGuid : null
+  await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
+  const currentMapping = await client.query<{ id: string }>(
+    `SELECT id::text
+     FROM pos_accounting_catalog_mappings
+     WHERE organization_id = $1::uuid
+       AND restaurant_guid IS NOT DISTINCT FROM $2::uuid
+       AND source_kind = 'sales_item' AND source_id = $3
+       AND target_type = 'item' AND effective_to IS NULL
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, mappingRestaurantGuid, item.sourceId],
+  )
+  if (currentMapping.rows[0]) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_POS_MAPPING_EXISTS',
+      'This Toast item already has a current QuickBooks mapping. Update or reactivate that mapping instead of approving another QuickBooks item.',
+      409,
+    )
+  }
+  const otherReservation = await client.query<{ id: string }>(
+    `SELECT request.id::text
+     FROM quickbooks_write_requests request
+     WHERE request.organization_id = $1::uuid
+       AND request.id <> $2::uuid
+       AND request.operation_kind = 'item.create'
+       AND request.status IN ('approved', 'processing', 'failed', 'dead')
+       AND request.request_payload->>'sourceKind' = 'sales_item'
+       AND request.request_payload->>'sourceId' = $3
+       AND request.request_payload->>'mappingScope' = $4
+       AND (
+         $4 = 'organization_default'
+         OR request.request_payload->>'sourceRestaurantGuid' = $5
+       )
+     LIMIT 1
+     FOR UPDATE`,
+    [input.organizationId, input.requestId, item.sourceId, item.mappingScope, item.sourceRestaurantGuid],
+  )
+  if (otherReservation.rows[0]) {
+    throw new QuickBooksWriteRequestError(
+      'QUICKBOOKS_WRITE_POS_MAPPING_RESERVED',
+      'Another approved QuickBooks item is already being created for this Toast item.',
+      409,
+    )
+  }
+}
+
 async function cacheCreatedQuickBooksItem(
   client: Parameters<Parameters<typeof withTransaction>[0]>[0],
   input: { job: QuickBooksWriteJob; providerEntityId: string },
 ) {
   if (input.job.operationKind !== 'item.create') return
-  const item = input.job.requestPayload as QuickBooksItemDraft
+  const item = normalizeQuickBooksItemDraftForStoredCompatibility(
+    input.job.requestPayload,
+  ) as QuickBooksItemDraft
   const fullyQualifiedName = item.parentCategoryName
     ? `${item.parentCategoryName}:${item.name}`
     : item.name
@@ -731,6 +853,7 @@ async function createPosAccountingItemMappingIfAbsent(
     job: QuickBooksWriteJob
     providerEntityId: string
     createdBy: string | null
+    posAccountingSource: QuickBooksWriteJobProviderReadiness['posAccountingSource']
   },
 ): Promise<PosAccountingMappingResult | null> {
   if (input.job.operationKind !== 'item.create') return null
@@ -760,6 +883,9 @@ async function createPosAccountingItemMappingIfAbsent(
   )
   const existing = (await readCurrent()).rows[0]
   if (existing) {
+    if (!existing.active || existing.target_id !== input.providerEntityId) {
+      throw new Error('The reserved POS accounting mapping changed before the QuickBooks item completed')
+    }
     return {
       status: 'skipped_existing',
       mappingId: existing.id,
@@ -796,7 +922,7 @@ async function createPosAccountingItemMappingIfAbsent(
      ) VALUES (
        $1::uuid, $2::uuid, 'sales_item', $3, $4,
        'item', $5, $6, true, $7,
-       'valid', NULL, 0, 0, now(), $8
+       'valid', NULL, $9, 0, now(), $8
      )
      ON CONFLICT DO NOTHING
      RETURNING id::text, source_name, target_id, target_name, active, mapping_revision`,
@@ -804,17 +930,21 @@ async function createPosAccountingItemMappingIfAbsent(
       input.job.organizationId,
       mappingRestaurantGuid,
       item.sourceId,
-      item.sourceName,
+      input.posAccountingSource?.sourceName || item.sourceName,
       input.providerEntityId,
       item.name,
       mappingRevision,
       input.createdBy,
+      input.posAccountingSource?.sourceCatalogRevision || 0,
     ],
   )
   const mapping = inserted.rows[0]
   if (!mapping) {
     const concurrent = (await readCurrent()).rows[0]
     if (!concurrent) throw new Error('QuickBooks item was created but its POS accounting mapping could not be recorded')
+    if (!concurrent.active || concurrent.target_id !== input.providerEntityId) {
+      throw new Error('The reserved POS accounting mapping changed before the QuickBooks item completed')
+    }
     return {
       status: 'skipped_existing',
       mappingId: concurrent.id,
@@ -855,6 +985,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
   providerEntityType: string
   providerEntityId: string
   providerSyncToken: string | null
+  posAccountingSource?: QuickBooksWriteJobProviderReadiness['posAccountingSource']
 }) {
   return withTransaction(async (client) => {
     const lease = await client.query<{ approved_by: string | null }>(
@@ -866,14 +997,15 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
       [input.job.id, input.job.lockToken, input.job.connectionId],
     )
     if (!lease.rows[0]) throw new Error('QuickBooks write lease was lost')
-    await cacheCreatedQuickBooksItem(client, {
-      job: input.job,
-      providerEntityId: input.providerEntityId,
-    })
     const posAccountingMapping = await createPosAccountingItemMappingIfAbsent(client, {
       job: input.job,
       providerEntityId: input.providerEntityId,
       createdBy: lease.rows[0].approved_by,
+      posAccountingSource: input.posAccountingSource || null,
+    })
+    await cacheCreatedQuickBooksItem(client, {
+      job: input.job,
+      providerEntityId: input.providerEntityId,
     })
     const resultPayload = {
       entityType: input.providerEntityType,

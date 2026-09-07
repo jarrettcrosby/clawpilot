@@ -33,6 +33,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import VerifiedOutlined from '@mui/icons-material/VerifiedOutlined'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
 type OperationKind = 'customer.create' | 'item.create' | 'invoice.create'
@@ -186,7 +187,9 @@ function DetailField({ label, value }: { label: string; value: unknown }) {
 }
 
 function RequestReview({ request, money }: { request: WriteRequest; money: (value: number) => string }) {
-  const payload = request.requestPayload
+  const payload = request.operationKind === 'item.create'
+    ? normalizeQuickBooksItemDraftForStoredCompatibility(request.requestPayload)
+    : request.requestPayload
   const mappingResult = dataRecord(request.resultPayload.posAccountingMapping)
   const lines = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : []
   return (

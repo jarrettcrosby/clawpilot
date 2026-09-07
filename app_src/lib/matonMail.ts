@@ -487,7 +487,7 @@ export function buildPosAccountingIssueEmail(
     `<p style="margin:0 0 18px;line-height:1.6">${issues.length} accounting ${issues.length === 1 ? 'item requires' : 'items require'} review before this business date can be posted.</p>`,
     `<ul style="margin:0 0 22px;padding-left:20px">${issueHtml}</ul>`,
     `<p style="margin:0 0 22px"><a href="${escapeHtml(actionUrl.toString())}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#a8c7fa;color:#071728;text-decoration:none;font-weight:700">${escapeHtml(callToAction)}</a></p>`,
-    '<p style="margin:0;color:#8f94a1;font-size:13px;line-height:1.5">After the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically. Repeated checks do not create duplicate alerts unless the issue changes or recurs.</p>',
+    '<p style="margin:0;color:#8f94a1;font-size:13px;line-height:1.5">After the underlying issue is corrected, ClawPilot will re-evaluate the business date automatically. ClawPilot sends at most one alert per location and business date; later changes remain visible in the app.</p>',
     '</div></div></body></html>',
   ].join('')
   return {
