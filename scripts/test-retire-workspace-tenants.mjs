@@ -45,9 +45,9 @@ const common = [
   ...exactTargets,
 ]
 
-assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v3')
-assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v3')
-assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v3')
+assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v4')
+assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v4')
+assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v4')
 assert.equal(PRODUCTION_DATABASE_IDENTITY, '0474a18c-649c-491b-bea1-7da006d21d81')
 assert.equal(PRODUCTION_DATABASE_NAME, 'railway')
 assert.equal(PRODUCTION_DATABASE_USER, 'postgres')
