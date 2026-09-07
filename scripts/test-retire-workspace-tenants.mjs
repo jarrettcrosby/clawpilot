@@ -8,6 +8,7 @@ import {
   APPROVED_TARGETS,
   CONFIRMED_OPERATOR_EMAIL,
   PLAN_FORMAT,
+  PRESERVED_SHARED_SHORT_LINK_SLUGS,
   PRODUCTION_DATABASE_IDENTITY,
   PRODUCTION_DATABASE_NAME,
   PRODUCTION_DATABASE_USER,
@@ -19,6 +20,7 @@ import {
   SCRIPT_VERSION,
   assertRuntimeEnvironment,
   canonicalJson,
+  classifyRetirementShortLinks,
   computeDeletionOrder,
   databaseEndpointFingerprint,
   deriveOrganizationOwnership,
@@ -48,6 +50,24 @@ const common = [
 assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v4')
 assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v4')
 assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v4')
+assert.deepEqual(PRESERVED_SHARED_SHORT_LINK_SLUGS, [
+  'gc3327424',
+  'mail-gc3327424',
+])
+assert.deepEqual(
+  classifyRetirementShortLinks([
+    { id: 'target', slug: 'ga42g1438l4j2s' },
+    { id: 'shared', slug: 'gc3327424' },
+    { id: 'shared-mail', slug: 'mail-gc3327424' },
+  ]),
+  {
+    retired: [{ id: 'target', slug: 'ga42g1438l4j2s' }],
+    preserved: [
+      { id: 'shared', slug: 'gc3327424' },
+      { id: 'shared-mail', slug: 'mail-gc3327424' },
+    ],
+  },
+)
 assert.equal(PRODUCTION_DATABASE_IDENTITY, '0474a18c-649c-491b-bea1-7da006d21d81')
 assert.equal(PRODUCTION_DATABASE_NAME, 'railway')
 assert.equal(PRODUCTION_DATABASE_USER, 'postgres')

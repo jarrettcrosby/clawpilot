@@ -19,6 +19,7 @@ import {
   EXPECTED_SELECTED_SCOPE_COUNTS,
   EXPECTED_SPECIAL_SCOPE_COUNTS,
   PRESERVED_SHARED_REFERENCE_CODES,
+  PRESERVED_SHARED_SHORT_LINK_SLUGS,
   PRODUCTION_DATABASE_IDENTITY,
   PRODUCTION_RAILWAY_ENVIRONMENT_ID,
   PRODUCTION_RAILWAY_PROJECT_ID,
@@ -26,7 +27,9 @@ import {
   PROTECTED_LEGACY_CRM_ORGANIZATIONS,
   PROTECTED_SHARED_PIPELINE,
   databaseEndpointFingerprint,
+  digest,
   run,
+  storedReceiptProjection,
 } from './retire-workspace-tenants.mjs'
 
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -40,6 +43,9 @@ const retainedOrganizations = [
   ['12cd804d-2e32-4cff-97a2-765c20caafbf', 'ga000000000003', 'Retained workspace three'],
   ['2497181c-670b-4234-98bd-8399cd403ebc', 'ga000000000004', 'Retained workspace four'],
 ]
+const alternateValidOrganizationId = retainedOrganizations[1][0]
+const alternateValidPipelineId = '6b2f30aa-0866-4e90-8c09-576acc703546'
+const alternateValidCrmOrganizationId = 'c7d8a39c-f19d-47f1-b650-8684b56b1288'
 const reviewerEmail = 'reviewer@example.test'
 const generatedReferences = [
   'gex000000000001',
@@ -190,6 +196,7 @@ async function installFixture(client) {
       crm_provider text NOT NULL,
       sync_enabled boolean NOT NULL,
       provisioning_status text NOT NULL,
+      reference_access_disabled boolean NOT NULL DEFAULT false,
       sheet_id text,
       drive_folder_id text,
       provisioning_sheet_id text,
@@ -318,6 +325,7 @@ async function installFixture(client) {
     CREATE TABLE short_links (
       id uuid PRIMARY KEY,
       owner_email text NOT NULL,
+      source_app text NOT NULL DEFAULT 'clawpilot-crm',
       slug text NOT NULL UNIQUE,
       organization_root_id uuid REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
       disabled_at timestamptz,
@@ -545,6 +553,34 @@ async function installFixture(client) {
        'ready', NULL, NULL, NULL, NULL, NULL, $3, $3)`,
     [PROTECTED_SHARED_PIPELINE.pipelineId, safeOrganizationId, fixedTime],
   )
+  await client.query(
+    `INSERT INTO pipeline_spaces (
+       id, name, workspace_organization_id, crm_provider, sync_enabled,
+       provisioning_status, sheet_id, drive_folder_id, provisioning_sheet_id,
+       google_service_account_email, google_shared_drive_id, created_at, updated_at
+     ) VALUES ($1, 'Alternate valid CRM pipeline', $2, 'suitecrm', false,
+       'ready', NULL, NULL, NULL, NULL, NULL, $3, $3)`,
+    [alternateValidPipelineId, alternateValidOrganizationId, fixedTime],
+  )
+  await client.query(
+    `INSERT INTO crm_organizations (
+       id, pipeline_id, reference_code, suitecrm_id, name, created_at
+     ) VALUES ($1, $2, $3, NULL, 'Alternate valid CRM customer', $4)`,
+    [alternateValidCrmOrganizationId, alternateValidPipelineId, generatedReferences[2], fixedTime],
+  )
+  await client.query(
+    `INSERT INTO crm_contacts (
+       id, pipeline_id, organization_id, reference_code, suitecrm_id,
+       full_name, created_at
+     ) VALUES ($1, $2, $3, $4, NULL, 'Alternate shared contact', $5)`,
+    [
+      randomUUID(),
+      alternateValidPipelineId,
+      alternateValidCrmOrganizationId,
+      PRESERVED_SHARED_REFERENCE_CODES[0],
+      fixedTime,
+    ],
+  )
   for (const [legacyIndex, legacy] of PROTECTED_LEGACY_CRM_ORGANIZATIONS.entries()) {
     await client.query(
       `INSERT INTO crm_organizations (
@@ -560,12 +596,22 @@ async function installFixture(client) {
       ],
     )
     for (let index = 0; index < legacy.contactCount; index += 1) {
+      const referenceCode = legacyIndex === 0 && index === 0
+        ? PRESERVED_SHARED_REFERENCE_CODES[0]
+        : null
       await client.query(
         `INSERT INTO crm_contacts (
            id, pipeline_id, organization_id, reference_code, suitecrm_id,
            full_name, created_at
-         ) VALUES ($1, $2, $3, NULL, NULL, $4, $5)`,
-        [randomUUID(), legacy.pipelineId, legacy.crmOrganizationId, `Legacy contact ${index}`, fixedTime],
+         ) VALUES ($1, $2, $3, $4, NULL, $5, $6)`,
+        [
+          randomUUID(),
+          legacy.pipelineId,
+          legacy.crmOrganizationId,
+          referenceCode,
+          `Legacy contact ${index}`,
+          fixedTime,
+        ],
       )
     }
     for (let index = 0; index < legacy.interactionCount; index += 1) {
@@ -723,27 +769,18 @@ async function installFixture(client) {
         ],
       )
     }
-    const linkCount = index < 2 ? 2 : 1
-    for (let linkIndex = 0; linkIndex < linkCount; linkIndex += 1) {
-      const linkId = randomUUID()
-      await client.query(
-        `INSERT INTO short_links (
-           id, owner_email, slug, organization_root_id, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $5)`,
-        [
-          linkId,
-          CONFIRMED_OPERATOR_EMAIL,
-          `retirement-link-${index}-${linkIndex}`,
-          target.organizationId,
-          fixedTime,
-        ],
-      )
-      await client.query(
-        `INSERT INTO short_link_clicks (short_link_id, clicked_at)
-         VALUES ($1, $2)`,
-        [linkId, fixedTime],
-      )
-    }
+    await client.query(
+      `INSERT INTO short_links (
+         id, owner_email, slug, organization_root_id, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $5)`,
+      [
+        randomUUID(),
+        CONFIRMED_OPERATOR_EMAIL,
+        target.referenceCode,
+        target.organizationId,
+        fixedTime,
+      ],
+    )
     const auditCount = productionShapedAuditCountByTarget[target.key]
     assert.ok(Number.isInteger(auditCount), `Missing audit count for ${target.key}`)
     for (let auditIndex = 0; auditIndex < auditCount; auditIndex += 1) {
@@ -762,6 +799,33 @@ async function installFixture(client) {
         ],
       )
     }
+  }
+
+  const sharedShortLinkIds = PRESERVED_SHARED_SHORT_LINK_SLUGS.map(() => randomUUID())
+  for (const [index, slug] of PRESERVED_SHARED_SHORT_LINK_SLUGS.entries()) {
+    await client.query(
+      `INSERT INTO short_links (
+         id, owner_email, slug, organization_root_id, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $5)`,
+      [
+        sharedShortLinkIds[index],
+        CONFIRMED_OPERATOR_EMAIL,
+        slug,
+        APPROVED_TARGETS[0].organizationId,
+        fixedTime,
+      ],
+    )
+  }
+  for (const sharedShortLinkId of [
+    sharedShortLinkIds[0],
+    sharedShortLinkIds[0],
+    sharedShortLinkIds[1],
+  ]) {
+    await client.query(
+      `INSERT INTO short_link_clicks (short_link_id, clicked_at)
+       VALUES ($1, $2)`,
+      [sharedShortLinkId, fixedTime],
+    )
   }
 
   const safeDocumentId = '00a4526a-d7bd-4e8a-8f57-357d0947a2e8'
@@ -821,6 +885,7 @@ async function installFixture(client) {
     safeAssetReference,
     safeDocumentId,
     preservedAliasShortLinkId,
+    sharedShortLinkIds,
     safeShortLinkClickId: safeShortLinkClick.rows[0].id,
   }
 }
@@ -1055,7 +1120,16 @@ try {
     trigger.table === 'short_link_clicks'
       && trigger.name === 'fixture_reject_short_link_click_delete'
   )))
-  assert.equal(manifest.scope.shortLinks.length, 5)
+  assert.equal(manifest.scope.shortLinks.length, 3)
+  assert.deepEqual(
+    manifest.scope.shortLinks.map((link) => link.slug).sort(),
+    APPROVED_TARGETS.map((target) => target.referenceCode).sort(),
+  )
+  assert.equal(manifest.scope.sharedShortLinks.length, 2)
+  assert.deepEqual(
+    manifest.scope.sharedShortLinks.map((link) => link.slug).sort(),
+    [...PRESERVED_SHARED_SHORT_LINK_SLUGS].sort(),
+  )
   assert.deepEqual(manifest.scope.preservedReferences, [
     PRESERVED_SHARED_REFERENCE_CODES[0],
     preservedSharedAliasReference,
@@ -1147,6 +1221,7 @@ try {
   )
   assert.equal(applied.verification.preservation.ready, true)
   assert.equal(applied.verification.shortLinks.clicksRemaining, 0)
+  assert.equal(applied.verification.shortLinks.preserved.valid, 2)
 
   const verified = await run([
     'verify', ...commonFlags(),
@@ -1314,7 +1389,35 @@ try {
      WHERE id = ANY($1::uuid[])`,
     [manifest.scope.shortLinks.map((link) => link.id)],
   )
-  assert.deepEqual(linkState.rows[0], { total: 5, retired: 5 })
+  assert.deepEqual(linkState.rows[0], { total: 3, retired: 3 })
+  const sharedLinkState = await pool.query(
+    `SELECT id::text, slug, organization_root_id::text, disabled_at, deleted_at
+     FROM short_links
+     WHERE id = ANY($1::uuid[])
+     ORDER BY slug`,
+    [fixture.sharedShortLinkIds],
+  )
+  assert.deepEqual(
+    sharedLinkState.rows.map((link) => ({
+      slug: link.slug,
+      organizationRootId: link.organization_root_id,
+      disabledAt: link.disabled_at,
+      deletedAt: link.deleted_at,
+    })),
+    [...PRESERVED_SHARED_SHORT_LINK_SLUGS].sort().map((slug) => ({
+      slug,
+      organizationRootId: safeOrganizationId,
+      disabledAt: null,
+      deletedAt: null,
+    })),
+  )
+  const sharedClickState = await pool.query(
+    `SELECT count(*)::integer AS count
+     FROM short_link_clicks
+     WHERE short_link_id = ANY($1::uuid[])`,
+    [fixture.sharedShortLinkIds],
+  )
+  assert.equal(sharedClickState.rows[0].count, 3, 'Shared click history is preserved')
   const historicalAudits = await pool.query(
     `SELECT count(*)::integer AS count FROM audit_events
      WHERE organization_id = ANY($1::uuid[])`,
@@ -1329,7 +1432,88 @@ try {
     'SELECT id::text, retired_short_links FROM workspace_tenant_retirement_receipts',
   )
   assert.equal(receipt.rows.length, 1)
-  assert.equal(receipt.rows[0].retired_short_links.length, 5)
+  assert.equal(receipt.rows[0].retired_short_links.length, 3)
+  await pool.query(
+    'ALTER TABLE workspace_tenant_retirement_receipts DISABLE TRIGGER reject_workspace_tenant_retirement_receipt_write',
+  )
+  await pool.query(
+    `UPDATE workspace_tenant_retirement_receipts
+     SET retired_short_links = retired_short_links || $1::jsonb
+     WHERE id = $2::uuid`,
+    [JSON.stringify(manifest.scope.sharedShortLinks), receipt.rows[0].id],
+  )
+  const legacyReceipt = await pool.query(
+    `SELECT id::text, plan_digest, receipt_digest, script_version, environment,
+            railway_project_id::text, railway_environment_id::text,
+            railway_service_id::text, database_identity::text, database_name, database_user,
+            postgres_system_identifier, database_endpoint_sha256, backup_evidence, actor_email,
+            target_organizations, lock_catalog_digest, locked_relations,
+            scope_digest, scope_counts,
+            retired_references, disabled_delete_triggers, retired_short_links,
+            suitecrm_records, external_system_disposition, deleted_counts,
+            verification, completed_at
+     FROM workspace_tenant_retirement_receipts
+     WHERE id = $1::uuid`,
+    [receipt.rows[0].id],
+  )
+  assert.equal(legacyReceipt.rows[0].retired_short_links.length, 5)
+  await pool.query(
+    `UPDATE short_links
+     SET disabled_at = $2,
+         organization_root_id = $3::uuid
+     WHERE id = ANY($1::uuid[])`,
+    [fixture.sharedShortLinkIds, fixedTime, alternateValidOrganizationId],
+  )
+  await pool.query(
+    `UPDATE workspace_tenant_retirement_receipts
+     SET receipt_digest = $1
+     WHERE id = $2::uuid`,
+    [digest(storedReceiptProjection(legacyReceipt.rows[0])), receipt.rows[0].id],
+  )
+  await pool.query(
+    'ALTER TABLE workspace_tenant_retirement_receipts ENABLE TRIGGER reject_workspace_tenant_retirement_receipt_write',
+  )
+  const legacyVerified = await run([
+    'verify', ...commonFlags(),
+    '--manifest', planPath,
+    '--confirm-digest', manifest.manifestDigest,
+  ], environment, testRuntime)
+  assert.equal(legacyVerified.ok, true)
+  assert.equal(legacyVerified.verification.shortLinks.expectedRetired, 3)
+  assert.equal(legacyVerified.verification.shortLinks.retired, 3)
+  assert.equal(legacyVerified.verification.shortLinks.expectedPreservedReceipt, 2)
+  assert.equal(legacyVerified.verification.shortLinks.preservedReceiptValid, 2)
+  assert.equal(legacyVerified.verification.shortLinks.clicksRemaining, 0)
+  assert.equal(legacyVerified.verification.shortLinks.preserved.valid, 2)
+  const reboundSharedLinks = await pool.query(
+    `SELECT DISTINCT organization_root_id::text AS organization_root_id
+     FROM short_links
+     WHERE id = ANY($1::uuid[])`,
+    [fixture.sharedShortLinkIds],
+  )
+  assert.deepEqual(reboundSharedLinks.rows, [{
+    organization_root_id: alternateValidOrganizationId,
+  }])
+  await pool.query(
+    `UPDATE pipeline_spaces
+     SET reference_access_disabled = true
+     WHERE id = $1::uuid`,
+    [alternateValidPipelineId],
+  )
+  await assert.rejects(
+    () => run([
+      'verify', ...commonFlags(),
+      '--manifest', planPath,
+      '--confirm-digest', manifest.manifestDigest,
+    ], environment, testRuntime),
+    /Committed tenant retirement no longer verifies/u,
+  )
+  await pool.query(
+    `UPDATE pipeline_spaces
+     SET reference_access_disabled = false
+     WHERE id = $1::uuid`,
+    [alternateValidPipelineId],
+  )
   await assert.rejects(
     () => pool.query(
       `UPDATE workspace_tenant_retirement_receipts
