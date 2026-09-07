@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import type { PoolClient } from 'pg'
+import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   isToastProjectedOrderAccountingActive,
@@ -595,7 +595,7 @@ function defaultProfile(): PosAccountingProfile {
     depositChecksWithCash: false,
     openCheckPolicy: 'hold',
     batchHoldPolicy: 'hold_until_closed',
-    emailNotificationsEnabled: false,
+    emailNotificationsEnabled: true,
     emailNotificationsEnabledAt: null,
     createdBy: null,
     createdAt: null,
@@ -1720,7 +1720,7 @@ export function buildPosAccountingPreview(input: {
       detail: 'Approved or posted evidence is immutable and cannot be replaced by a regenerated preview.',
       action: 'Review posting',
     }] : []),
-    ...(input.draftEvidence?.status === 'failed' || input.draftEvidence?.lastError ? [{
+    ...(input.draftEvidence?.status === 'failed' ? [{
       code: 'provider_failure',
       title: 'Retry the failed accounting post',
       detail: safeSourceName(input.draftEvidence?.lastError, 'QuickBooks rejected or failed the accounting post.'),
@@ -1836,19 +1836,36 @@ export function buildPosAccountingPreview(input: {
   }
 }
 
-async function resolveLocation(organizationId: string, restaurantGuid: string | null) {
-  const result = await query<LocationRow>(
-    `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, closeout_hour,
-       analytics_access, standard_access
-     FROM toast_locations
-     WHERE organization_id = $1::uuid
-       AND active = true AND archived = false
-       AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
-     ORDER BY CASE WHEN restaurant_guid = $2::uuid THEN 0 WHEN selected THEN 1 ELSE 2 END,
-       restaurant_name
-     LIMIT 1`,
-    [organizationId, restaurantGuid],
-  )
+async function resolveLocation(
+  organizationId: string,
+  restaurantGuid: string | null,
+  client?: PoolClient,
+) {
+  const result = client
+    ? await client.query<LocationRow>(
+      `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, closeout_hour,
+         analytics_access, standard_access
+       FROM toast_locations
+       WHERE organization_id = $1::uuid
+         AND active = true AND archived = false
+         AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
+       ORDER BY CASE WHEN restaurant_guid = $2::uuid THEN 0 WHEN selected THEN 1 ELSE 2 END,
+         restaurant_name
+       LIMIT 1`,
+      [organizationId, restaurantGuid],
+    )
+    : await query<LocationRow>(
+      `SELECT restaurant_guid::text, restaurant_name, location_name, timezone, closeout_hour,
+         analytics_access, standard_access
+       FROM toast_locations
+       WHERE organization_id = $1::uuid
+         AND active = true AND archived = false
+         AND ($2::uuid IS NULL OR restaurant_guid = $2::uuid)
+       ORDER BY CASE WHEN restaurant_guid = $2::uuid THEN 0 WHEN selected THEN 1 ELSE 2 END,
+         restaurant_name
+       LIMIT 1`,
+      [organizationId, restaurantGuid],
+    )
   if (!result.rows[0]) {
     throw new PosAccountingRequestError('POS_LOCATION_NOT_FOUND', 'The selected Toast location was not found', 404)
   }
@@ -1929,8 +1946,12 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
   restaurantGuid: string | null
   businessDate: string
   includeProtectedDraftEvidence?: boolean
+  client?: PoolClient
 }) {
-  const location = await resolveLocation(input.organizationId, input.restaurantGuid)
+  const readQuery = <T extends QueryResultRow = QueryResultRow>(text: string, values: unknown[] = []) => (
+    input.client ? input.client.query<T>(text, values) : query<T>(text, values)
+  )
+  const location = await resolveLocation(input.organizationId, input.restaurantGuid, input.client)
   const params = [input.organizationId, location.restaurant_guid]
   const [
     profileResult,
@@ -1950,7 +1971,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     draftResult,
     commandResult,
   ] = await Promise.all([
-    query<ProfileRow>(
+    readQuery<ProfileRow>(
       `SELECT ${PROFILE_SELECT}
        FROM pos_accounting_profiles
        WHERE organization_id = $1::uuid
@@ -1959,7 +1980,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        ORDER BY restaurant_guid NULLS FIRST, profile_revision DESC`,
       params,
     ),
-    query<MappingRow>(
+    readQuery<MappingRow>(
       `SELECT ${MAPPING_SELECT}
        FROM pos_accounting_catalog_mappings
        WHERE organization_id = $1::uuid
@@ -1968,7 +1989,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        ORDER BY restaurant_guid NULLS FIRST, source_kind, source_name, source_id, target_type`,
       params,
     ),
-    query<SourceOrderRow>(
+    readQuery<SourceOrderRow>(
       `SELECT ${SOURCE_ORDER_SELECT}
        FROM toast_pos_orders
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
@@ -1977,7 +1998,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       params,
     ),
-    query<SourceOrderRow>(
+    readQuery<SourceOrderRow>(
       `SELECT ${SOURCE_ORDER_SELECT}
        FROM toast_pos_orders
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
@@ -1990,7 +2011,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [...params, input.businessDate],
     ),
-    query<{
+    readQuery<{
       quickbooks_account_id: string; name: string; fully_qualified_name: string
       classification: string | null; account_type: string | null; account_sub_type: string | null
     }>(
@@ -2001,7 +2022,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{
+    readQuery<{
       quickbooks_item_id: string; name: string; fully_qualified_name: string
       item_type: string; sku: string | null; taxable: boolean
     }>(
@@ -2012,14 +2033,14 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ id: string }>(
+    readQuery<{ id: string }>(
       `SELECT quickbooks_item_id AS id
        FROM quickbooks_items
        WHERE organization_id = $1::uuid AND active = true
          AND lower(COALESCE(item_type, '')) <> 'category'`,
       [input.organizationId],
     ),
-    query<{
+    readQuery<{
       item_guid: string; provider_item_id: string; name: string; plu: string | null
       price: string | null
     }>(
@@ -2031,7 +2052,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       params,
     ),
-    query<{ quickbooks_customer_id: string; display_name: string; company_name: string | null }>(
+    readQuery<{ quickbooks_customer_id: string; display_name: string; company_name: string | null }>(
       `SELECT quickbooks_customer_id, display_name, company_name
        FROM quickbooks_customers
        WHERE organization_id = $1::uuid AND active = true
@@ -2039,7 +2060,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ quickbooks_vendor_id: string; display_name: string; company_name: string | null }>(
+    readQuery<{ quickbooks_vendor_id: string; display_name: string; company_name: string | null }>(
       `SELECT quickbooks_vendor_id, display_name, company_name
        FROM quickbooks_vendors
        WHERE organization_id = $1::uuid AND active = true
@@ -2047,7 +2068,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ quickbooks_tax_code_id: string; name: string; description: string | null; taxable: boolean }>(
+    readQuery<{ quickbooks_tax_code_id: string; name: string; description: string | null; taxable: boolean }>(
       `SELECT quickbooks_tax_code_id, name, description, taxable
        FROM quickbooks_tax_codes
        WHERE organization_id = $1::uuid AND active = true
@@ -2055,7 +2076,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ quickbooks_class_id: string; name: string; fully_qualified_name: string }>(
+    readQuery<{ quickbooks_class_id: string; name: string; fully_qualified_name: string }>(
       `SELECT quickbooks_class_id, name, fully_qualified_name
        FROM quickbooks_classes
        WHERE organization_id = $1::uuid AND active = true
@@ -2063,7 +2084,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{ quickbooks_department_id: string; name: string; fully_qualified_name: string }>(
+    readQuery<{ quickbooks_department_id: string; name: string; fully_qualified_name: string }>(
       `SELECT quickbooks_department_id, name, fully_qualified_name
        FROM quickbooks_departments
        WHERE organization_id = $1::uuid AND active = true
@@ -2071,7 +2092,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 5000`,
       [input.organizationId],
     ),
-    query<{
+    readQuery<{
       maton_connection_id: string; company_name: string; country: string | null; status: string
       verified_at: TimestampValue; last_catalog_synced_at: TimestampValue | null
     }>(
@@ -2081,7 +2102,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       LIMIT 1`,
       [input.organizationId],
     ),
-    query<DraftRow>(
+    readQuery<DraftRow>(
       `SELECT id::text, status, reconciliation_status, approved_by, approved_at, posted_at,
          quickbooks_transaction_id, draft_revision, generation_reason, generated_by,
          source_revision, supersedes_draft_id::text, is_current, last_error, created_at, updated_at
@@ -2092,7 +2113,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
        LIMIT 20`,
       [...params, input.businessDate],
     ),
-    query<CommandRow>(
+    readQuery<CommandRow>(
       `SELECT id::text, command_type, status, requested_by, expected_sync_kinds,
          result_draft_id::text, result_draft_revision, last_error,
          started_at, completed_at, created_at, updated_at
@@ -2146,7 +2167,7 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       ...entry,
       mappings: sourceMappings,
       suggestedTarget,
-      productCreationSuggestion: entry.sourceKind === 'sales_item' && !hasActiveMapping && !suggestedTarget
+      productCreationSuggestion: entry.sourceKind === 'sales_item' && sourceMappings.length === 0 && !suggestedTarget
         ? {
             name: entry.sourceName,
             itemType: 'NonInventory' as const,
@@ -3255,6 +3276,32 @@ export async function savePosAccountingMappingsInPostgres(input: {
     const saved: PosAccountingMapping[] = []
     const changed: PosAccountingMapping[] = []
     for (const mapping of input.mappings) {
+      if (mapping.sourceKind === 'sales_item') {
+        const reserved = await client.query<{ id: string }>(
+          `SELECT request.id::text
+           FROM quickbooks_write_requests request
+           WHERE request.organization_id = $1::uuid
+             AND request.operation_kind = 'item.create'
+             AND request.status IN ('approved', 'processing', 'failed', 'dead')
+             AND request.request_payload->>'sourceKind' = 'sales_item'
+             AND request.request_payload->>'sourceId' = $2
+             AND request.request_payload->>'mappingScope' = $3
+             AND (
+               $3 = 'organization_default'
+               OR request.request_payload->>'sourceRestaurantGuid' = $4
+             )
+           LIMIT 1
+           FOR UPDATE`,
+          [input.organizationId, mapping.sourceId, input.scope, input.restaurantGuid],
+        )
+        if (reserved.rows[0]) {
+          throw new PosAccountingRequestError(
+            'POS_QUICKBOOKS_ITEM_MAPPING_WRITE_IN_PROGRESS',
+            'A QuickBooks item is currently being created for this POS item. Wait for it to finish or cancel the accounting change before editing the mapping.',
+            409,
+          )
+        }
+      }
       const sourceName = canonicalSourceNames.get(`${mapping.sourceKind}:${mapping.sourceId}`) || mapping.sourceName
       let validationStatus: PosAccountingMapping['validationStatus'] = 'unvalidated'
       let validationReason: string | null = null

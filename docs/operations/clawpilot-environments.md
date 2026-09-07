@@ -1,7 +1,7 @@
 ---
 id: cp-ops-environments
 title: ClawPilot Environments and Deployment
-summary: Canonical repository, branches, local startup, production-only hosted target, gated Vercel retirement, validation, promotion, verification, and rollback.
+summary: Canonical repository, isolated Railway development and production environments, local startup, validation, promotion, verification, and rollback.
 status: active
 kind: operations-contract
 area: operations
@@ -17,7 +17,8 @@ app_visible: true
 - Active development branch: `dev`
 - Production branch: `main`
 - Historical local reference: `stable/4001`; it is not the hosted promotion target.
-- Promotion uses a reviewed pull request from `dev` to `main`. Code is promoted; runtime data is never copied from development into production.
+- Feature work enters `dev` through a reviewed pull request. Production promotion then uses a reviewed pull request from `dev` to `main`.
+- Railway `development` follows `dev`; Railway `production` follows `main`. Code is promoted, while runtime data, organizations, and credentials remain isolated and are never copied by branch promotion.
 
 ## Local Development
 
@@ -35,63 +36,32 @@ testable without weakening Railway or Vercel session enforcement. Keep a
 tool-managed startup shell alive while browser testing so its child process is
 not cleaned up.
 
-A temporary trusted-LAN test requires both an explicit non-loopback host and
-the separate security opt-in:
+A local runtime is optional test evidence only. It does not replace the hosted
+Railway development environment, must not claim `dev.aiapp.eigenracing.com`,
+and must not receive Railway data or provider credentials. The evaluated Mac
+hostname override and public remote-local replacement were abandoned. If a
+previous override or ingress is still present, keep it disabled and use the
+public development hostname only for Railway:
 
 ```bash
-CLAWPILOT_LOCAL_BIND_HOST=0.0.0.0 \
-  CLAWPILOT_LOCAL_ALLOW_LAN=1 \
-  ./scripts/dev-start.sh
+./scripts/manage-local-development-domain.sh disable
+./scripts/manage-remote-local-development.sh stop-ingress
+./scripts/dev-stop.sh
 ```
 
-This exposes an authentication-disabled fixture runtime to the local network.
-Use it only on a trusted temporary LAN, never port-forward it, and stop it with
-`./scripts/dev-stop.sh` as soon as the device test is complete. LAN clients use
-the Mac's explicit LAN address; the managed HTTPS development-domain proxy
-remains loopback-only.
+### Retired Remote-Local Design
 
-After the hosted Railway development environment is retired, this Mac may keep
-the familiar development origin without exposing the local runtime publicly:
+The following design is retained temporarily as implementation history while
+its supporting code is removed separately. It is not an active deployment
+option and none of its preparation, ingress, Funnel, or Vercel gateway commands
+may be used to replace Railway development.
 
-```bash
-brew install caddy mkcert
-./scripts/manage-local-development-domain.sh prepare
-./scripts/manage-local-development-domain.sh enable
-```
+The evaluated design would have kept `dev.aiapp.eigenracing.com` as the
+browser-visible origin while the app ran on this Mac. The ordinary
+`scripts/dev-start.sh` process must never be exposed directly; it deliberately
+uses an authentication-disabled file fixture and binds to loopback.
 
-`enable` requests one macOS administrator authorization, maps
-`dev.aiapp.eigenracing.com` to loopback only, trusts a local certificate, runs a
-loopback-bound HTTPS proxy, and starts the isolated runtime bound to
-`127.0.0.1:4002`. It
-does not change public DNS or Railway. Do not enable the override until the
-final hosted-development acceptance pass is complete, because the local
-mapping would otherwise make browser checks bypass Railway. Before recreating
-a hosted development environment, run
-`./scripts/manage-local-development-domain.sh disable` so the browser resumes
-using public DNS. Disable removes only the managed hosts block and local proxy
-service. It does not stop an already running local app and intentionally does
-not remove the shared mkcert CA from the macOS trust store; use
-`./scripts/dev-stop.sh` for the app, and treat CA removal as a separate,
-host-wide trust decision. The `dev` branch, Railway service definitions,
-append-only migrations, and a verified development database archive are
-retained for a future hosted restoration.
-
-After a reboot, rerun `./scripts/manage-local-development-domain.sh enable` to
-start the isolated app again; the command is idempotent. Use `status` to verify
-the hosts override, proxy, and HTTPS health together.
-
-The loopback override applies only to this Mac. An iPhone or Watch requires a
-separately trusted certificate and LAN or VPN DNS path to the Mac; do not expose
-the unauthenticated local fixture runtime to the public internet.
-
-### Authenticated Remote-Local Access
-
-`dev.aiapp.eigenracing.com` can remain the browser-visible development origin
-while the app runs on this Mac, but the ordinary `scripts/dev-start.sh` process
-must never be exposed directly. It deliberately uses an authentication-disabled
-file fixture and binds to loopback for that reason.
-
-The supported remote-local topology uses a dedicated Vercel gateway project
+The retired remote-local topology used a dedicated Vercel gateway project
 rooted at `infra/vercel-remote-local-gateway`, a stable Tailscale Funnel HTTPS
 origin, and a second loopback-only Caddy listener on port 4102:
 
@@ -229,42 +199,29 @@ methods, bodies, cookies, and response headers for all matched paths, including
 Next.js assets and APIs. It is not an offline replica: the Mac and Tailscale
 must be online, Funnel has non-configurable bandwidth limits, and Vercel's
 reserved `/.well-known` handling is not supplied by this catch-all gateway.
-This isolated remote-local runtime has none of the frozen, retirement-bound
-hosted-development Postgres, SuiteCRM, worker, provider, webhook, or callback
-authority described below.
+The retired design had no hosted Postgres, SuiteCRM, worker, provider, webhook,
+or callback authority and cannot be cited as development evidence.
 
-### Frozen Hosted-Development Operations Pending Retirement
+### Hosted Railway Development
 
-The local origin preserves same-origin browser behavior; it does not recreate
-the frozen Railway development stack retained only for the selective migration.
-The file-backed local fixture has no
-development Postgres or SuiteCRM authority, hosted worker lane, public webhook
-receiver, provider credentials, or durable provider callback identity.
-Consequently, the following previously hosted-development operations are not
-available through the local-domain override:
+Railway `development` remains the active non-production environment at
+`https://dev.aiapp.eigenracing.com`. It owns an isolated Postgres database,
+SuiteCRM stack, worker lane, provider configuration, sessions, and callbacks.
+Use it for authenticated development acceptance after the exact `dev` commit
+passes GitHub CI. It is not a migration source scheduled for retirement, and
+no organization or integration transfer from development to production is part
+of the active release plan.
 
-- AG Alchemy carrier-sandbox delegation and provider rate/label proof;
-- live Shopify development-store setup, location administration, provider
-  mutations, webhooks, and callback acceptance;
-- hosted SuiteCRM projections/search and background outbox, reconciliation,
-  repository-callback, or persistence/worker-heartbeat acceptance; and
-- any proof that depends on an exact Railway service, database fingerprint,
-  secret set, public callback URL, or retained hosted-development data.
+Local fixtures and disposable Postgres tests remain useful implementation
+evidence, but they do not replace hosted development health, persistence,
+worker, provider, or authenticated UI checks.
 
-Use deterministic self-tests and file fixtures for local behavior, disposable
-Postgres tests where a test explicitly provisions one, and protected Vercel
-previews for build and UI evidence. Live provider and durable worker acceptance
-runs only against production after review; local evidence must not be described
-as provider or hosted persistence proof. Restoring a true hosted non-production
-lane requires disabling the local override, provisioning isolated services and
-secrets, restoring the verified development archive, assigning and verifying
-its domains, and completing the normal authenticated acceptance gates before
-use.
-
-## Required Post-Cutover Hosted Topology
+## Required Hosted Topology
 
 This table is the accepted target, not a claim that the retirement is already
-complete. A read-only Vercel configuration audit on `2026-09-05` found the
+complete. Retirement here refers only to the legacy application Vercel runtime,
+not the retained Railway development environment. A read-only Vercel
+configuration audit on `2026-09-05` found the
 application project still carries production-scoped `DATABASE_URL`,
 `AGENT_CREDENTIAL_DATABASE_URL`, `CLAWPILOT_AUTH_SELF_DELIVERY`,
 `CLAWPILOT_AUTH_MAIL_ADDITIONAL_SENDERS`, `INTEGRATION_EVIDENCE_*`, and
@@ -280,58 +237,51 @@ this project, call it preview-only, or use it as production/preview evidence
 until the gated retirement steps below are complete. This inventory records
 variable names only; values remain secret and must not enter Git or logs.
 
-The Railway `development` environment is also still retained as the frozen
-source for the selective workspace migration. It remains a protected backup
-target and a billable resource until migration postflight, archive verification,
-and its distinct retirement acceptance receipt are complete. The production-only
-table below is therefore the required end state, not the current inventory.
+Railway development is retained as the permanent pre-production lane. The
+selective workspace migration and production-consolidation plan is abandoned.
 
-| Surface | Production |
-|---|---|
-| Branch | `main` |
-| Railway environment | `production` |
-| ClawPilot | `https://aiapp.eigenracing.com` |
-| SuiteCRM | `https://crm.eigenracing.com` |
-| Fulfillment optimizer | Isolated Railway service over `fulfillment-optimizer.railway.internal` |
-| Vercel | Protected preview/build/UI evidence only; no production runtime or data authority |
+| Surface | Development | Production |
+|---|---|---|
+| Branch | `dev` | `main` |
+| Railway environment | `development` | `production` |
+| ClawPilot | `https://dev.aiapp.eigenracing.com` | `https://aiapp.eigenracing.com` |
+| SuiteCRM | `https://dev.crm.eigenracing.com` | `https://crm.eigenracing.com` |
+| Fulfillment optimizer | Isolated Railway service over `fulfillment-optimizer.railway.internal` | Isolated Railway service over `fulfillment-optimizer.railway.internal` |
+| Vercel | No runtime or data authority | No runtime or data authority |
 
-After cutover acceptance, Railway is the sole production execution runtime. It runs the Next.js server,
-background outbox and agent workers, production Postgres, private SuiteCRM
-service, dedicated SuiteCRM MariaDB, and SuiteCRM volume. The Railway deployment
-path, including its predeploy gate and idempotent release-record check, is the
-sole authority for append-only Postgres migrations. Vercel provides protected
-Next.js previews and an independent build/UI check only; it does not serve the
-production application, replace Railway workers, run migrations, call
-production providers, or own durable writes.
+Railway is the execution and persistence runtime for both isolated environments.
+Each environment runs its own Next.js application, background workers, Postgres,
+SuiteCRM service, MariaDB, and volumes. The Railway deployment path, including
+its predeploy gate and idempotent release-record check, is the sole authority
+for append-only Postgres migrations. Vercel does not serve either application,
+replace Railway workers, run migrations, call providers, or own durable writes.
 
 The post-cutover contract prohibits every Vercel project or preview from receiving the production `DATABASE_URL`,
 `INTEGRATION_CREDENTIAL_ENCRYPTION_KEY`, production provider credentials,
 production session secrets, or another secret that confers production data or
 write authority. The audited legacy assignments above are cutover blockers, not
-exceptions to that rule. This prohibition also applies to the dedicated remote-local
-gateway: it holds only its scoped gateway configuration and proxies to the
-isolated local runtime described above.
+exceptions to that rule. The abandoned remote-local gateway is not part of the
+hosted topology and must not receive production or development authority.
 
-The target Railway topology hosts only the production environment. The `dev` source branch remains
-the reviewed integration branch, while local isolated development and protected
-Vercel previews provide pre-production build and UI evidence without a second
-always-on Railway database or service stack. Production retains PITR and
-scheduled backups.
+Both Railway environments retain their own backup and recovery controls. The
+`dev` branch is the reviewed integration branch; only its committed code moves
+to `main` after development acceptance.
 
-The `eigenracing.com` DNS zone is managed through Squarespace. Each Railway custom domain uses the exact CNAME and verification TXT values Railway issues for production. The shared domain is routing infrastructure only and does not import Eigen Racing product assumptions into ClawPilot.
+The `eigenracing.com` DNS zone is managed through Squarespace. Each Railway
+custom domain uses the exact CNAME and verification TXT values Railway issues
+for its environment. The shared domain is routing infrastructure only and does
+not import Eigen Racing product assumptions into ClawPilot.
 
 ## Environment Isolation
 
-In the accepted post-cutover state, production owns the durable Postgres and MariaDB databases, SuiteCRM volumes,
-users, sessions, platform credentials, boards, pipelines, Sheets, CRM
-projections, documents, releases, checkpoints, worker secrets, and short links.
-Local development uses isolated `data-dev` paths and protected Vercel previews
-must remain isolated from production data and secrets. A preview is build and UI
-evidence, not a production execution or persistence surface. Code promotion
-never copies runtime data or provider secrets. Any one-time legacy-development
-data transfer requires its own reviewed, selective manifest, excludes
-credentials and bulky polling evidence, and is verified before the retired
-environment is deleted.
+Development and production each own separate durable Postgres and MariaDB
+databases, SuiteCRM volumes, users, sessions, provider credentials, boards,
+pipelines, Sheets, CRM projections, documents, releases, checkpoints, worker
+secrets, and short links. Local development uses isolated `data-dev` paths and
+must not receive either hosted environment's data or secrets. Code promotion
+never copies runtime data, organizations, or provider credentials. No
+development-to-production data or integration migration is authorized by the
+normal release sequence.
 
 ## Implementation Gate
 
@@ -355,61 +305,30 @@ The owning active contract must be current before promotion. A clean committed-f
 
 ## Release Sequence
 
-1. Validate the exact reviewed commit from `dev` locally and in GitHub CI,
-   including affected routes and responsive UI when applicable. During the
-   current transition, do not deploy or cite the application Vercel project;
-   optional protected-preview evidence resumes only after steps 8 through 10.
-2. Update the owning active contract and release copy without waiting for a separate documentation request.
-3. Confirm the required Railway and provider backups before risky migrations or
-   destructive work. Until the Railway `development` migration source passes
-   postflight, is archived, and has an accepted retirement receipt, the default
-   backup audit must cover both `development` and `production`.
-4. Promote through a reviewed `dev` to `main` pull request.
-5. The Railway deployment path applies append-only Postgres migrations before starting the application and workers.
-6. Verify that Railway is running the exact reviewed commit, then wait for
-   `/api/health`, `/api/persistence/status`, and worker heartbeats. In `strict`
-   mode, `scripts/start-railway.sh` automatically runs the idempotent
-   `release:record` command after health succeeds; confirm that entry as
-   deployment-and-health evidence for this Railway start. It does not attest
-   workspace migration, provider rebind, Vercel retirement, or final cutover
-   acceptance. Adoption maintenance deliberately suppresses this record.
-7. Complete an authenticated production UI workflow against Railway at that exact commit. Preserve the health, persistence, worker, and UI evidence before changing Vercel.
-8. Audit and move every external callback, redirect, public-media origin,
-   short-link origin, authorized worker caller, monitor, and allowlist from the
-   application Vercel URL to the accepted Railway URL. This includes commerce,
-   carrier, Google, Maton, Apple, and OAuth surfaces. Stop if any external
-   dependency still requires the Vercel application deployment.
-9. Only after steps 7 and 8 are reviewed, remove the public Vercel production
-   alias and all legacy database, agent-credential-database,
-   authentication-mail, integration-evidence, SSO, provider, worker, and
-   session assignments from every application-project Vercel scope, not only
-   Production. Delete or disable every historical application Production
-   deployment so an artifact cannot retain or regain old variables through a
-   direct URL, promotion, redeploy, or rollback. Remove project automation
-   bypasses while preserving the separately scoped remote-local gateway.
-10. After Railway is reconfirmed healthy, revoke or rotate credentials that an
-    old Vercel artifact held: dedicated database roles/passwords, session and
-    worker secrets, Maton authority, provider OAuth/service credentials, and
-    webhook signing secrets. Expect session-secret rotation to sign users out.
-    Do not blindly rotate encryption or evidence keys; those require a separate
-    reviewed re-encryption/key-ring data migration. Re-audit names and scopes
-    without printing values.
-11. Confirm the application Vercel project contains no `DATABASE_URL`,
-    `AGENT_CREDENTIAL_DATABASE_URL`, production provider/session/integration-evidence
-    variables, production alias, reachable historical Production artifact, or
-    automation bypass, and that production/development builds fail closed.
-    Confirm historical URLs cannot reach production data or providers.
-    Until this succeeds, the cutover remains incomplete and Vercel is not accepted as preview-only.
-12. When an independent Vercel check is required after retirement, create a protected preview explicitly from the same Git commit SHA and verify its commit identity and affected render-only UI. Record that result as preview build/UI evidence only, never as production health or persistence evidence.
-13. After every selective migration and provider rebind receipt is secured,
-    migration postflight is complete, Vercel retirement is independently
-    verified, and the Railway `development` source is archived and retired,
-    preserve a separate non-secret cutover acceptance receipt with the exact
-    Railway commit and release-entry identity, migration and rebind receipt
-    digests, backup identifiers, authenticated smoke evidence, Vercel retirement
-    evidence, and DEV retirement evidence. This later receipt accepts the
-    overall cutover; it is not another `release:record` invocation and must not
-    relabel the startup release entry as migration or retirement proof.
+1. Validate the exact feature commit locally and in GitHub CI, including affected
+   routes and responsive UI when applicable, then merge its reviewed pull request
+   into `dev`.
+2. Wait for the exact resulting `dev` commit to pass its push CI and deploy to the
+   Railway `development` environment. The deployment path applies append-only
+   Postgres migrations before starting the application and workers.
+3. Verify the development commit through `/api/version`, `/api/runtime`,
+   `/api/health`, `/api/persistence/status`, worker heartbeats, and the affected
+   authenticated browser workflow.
+4. Update the owning active contract and release copy, then promote through a
+   reviewed `dev` to `main` pull request that cites the development evidence.
+5. Wait for the exact resulting `main` commit to pass its push CI and deploy to
+   Railway `production`. Verify the same runtime, persistence, worker, and
+   authenticated UI boundaries against production.
+6. In `strict` mode, `scripts/start-railway.sh` automatically runs the idempotent
+   `release:record` command after health succeeds. Confirm that entry as
+   deployment-and-health evidence for the production Railway start. Adoption
+   maintenance deliberately suppresses this record.
+
+Confirm the required environment and provider backups before risky migrations
+or destructive work. Normal code promotion does not copy data, organizations,
+or credentials between environments. The abandoned selective workspace
+migration, Railway-development retirement, production consolidation, and
+remote-local replacement are not release steps.
 
 Repository configuration temporarily disables Vercel Git deployments for every
 branch during the transition, and the Vercel build script rejects non-preview
@@ -425,11 +344,15 @@ do not run managed environment gates, and cannot mutate production. A
 migration-dependent preview is compile/UI evidence only until the Railway
 migration is deployed. Vercel builds never run `db:migrate`, and a Vercel
 deployment is never a production release or managed-mail verification surface.
+Until this succeeds, the cutover remains incomplete and Vercel is not accepted as preview-only.
 
 ## Deployed Verification
 
-Verify the Railway production custom domain after release-facing changes:
+Verify the Railway custom domains after release-facing changes, development
+before production:
 
+- `/api/version`
+- `/api/runtime`
 - `/api/health`
 - `/api/persistence/status`
 - `/api/agents`
@@ -443,14 +366,17 @@ the endpoint hostname must be `fulfillment-optimizer.railway.internal`, and
 configuration makes Railway application health fail. Verify the optimizer
 service's own health endpoint separately.
 
-`/api/persistence/status` must return a non-empty `databaseFingerprint` that
-matches the reviewed Railway production database identity. A missing or
-mismatched Railway identity is a release blocker. Do not configure or query a
-Vercel preview for the production fingerprint: its lack of production database
-authority is intentional, and preview output must not be cited as production
-runtime, migration, worker, or persistence proof.
+`/api/version` and `/api/runtime` must identify the exact expected branch and
+commit. `/api/persistence/status` must return a non-empty
+`databaseFingerprint` that matches the reviewed database identity for that
+environment. A missing, mismatched, or cross-environment identity is a release
+blocker. Do not configure or query a Vercel preview for either Railway
+fingerprint: its lack of hosted database authority is intentional, and preview
+output must not be cited as runtime, migration, worker, or persistence proof.
 
-Also validate the affected authenticated browser workflow. A green build does not replace live board, agent-thread, CRM, Sheet, POS, accounting, or mobile acceptance.
+Also validate the affected authenticated browser workflow first in development
+and then in production. A green build does not replace live board, agent-thread,
+CRM, Sheet, POS, accounting, or mobile acceptance.
 
 The `Deployed runtime monitor` GitHub workflow checks the production custom domain every 30 minutes without application credentials. It verifies the login boundary, Postgres persistence, migrations, SuiteCRM, pipeline, agent, research, Toast, QuickBooks, AI Radar, and document-embedding worker health. A failed scheduled run is an operational alert and must not be dismissed as a deployment-only failure.
 

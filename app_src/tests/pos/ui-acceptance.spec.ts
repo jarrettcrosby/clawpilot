@@ -819,3 +819,145 @@ test('POS accounting saves only one exact changed mapping from a catalog larger 
   expect(clearedMappings).toHaveLength(1)
   expect(clearedMappings[0]).toMatchObject({ targetId, targetName, active: false })
 })
+
+test('POS accounting keeps organization defaults and location overrides visibly separated', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  await mockPos(page)
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+
+  const sourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
+  const sourceName = 'Saratoga Springs - Sparkling Water'
+  const defaultTarget = { id: '35', name: 'Saratoga Sparkling 12 oz' }
+  const replacementTarget = { id: '36', name: 'Saratoga Sparkling 16 oz' }
+  const overrideTarget = { id: 'retired-35', name: 'Retired Saratoga Sparkling' }
+  const profile = {
+    id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01',
+    scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+    breakoutDimensions: [], trackSalesTax: true, memoMode: 'standard', customMemo: null,
+    customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+    autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+    batchHoldPolicy: 'hold', emailNotificationsEnabled: false,
+  }
+  const mapping = (
+    mappingScope: 'organization_default' | 'location_override',
+    target: { id: string; name: string },
+    revision: number,
+    validationStatus = 'valid',
+    validationReason: string | null = null,
+  ) => ({
+    id: `${mappingScope}-${revision}`,
+    scope: mappingScope,
+    sourceKind: 'sales_item', sourceId, sourceName,
+    targetType: 'item', targetId: target.id, targetName: target.name,
+    active: true, mappingRevision: revision,
+    validationStatus, validationReason,
+  })
+  let organizationDefault = mapping('organization_default', defaultTarget, 1)
+  const locationOverride = mapping(
+    'location_override',
+    overrideTarget,
+    2,
+    'missing_target',
+    'The saved QuickBooks target is not in the current catalog. Refresh QuickBooks or choose a replacement.',
+  )
+  const submittedBodies: Array<Record<string, unknown>> = []
+
+  await page.route((url) => url.pathname === '/api/pos/accounting', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      submittedBodies.push(body)
+      const submittedMapping = (body.mappings as Array<Record<string, unknown>>)[0]
+      organizationDefault = {
+        ...organizationDefault,
+        ...submittedMapping,
+        scope: 'organization_default',
+        mappingRevision: organizationDefault.mappingRevision + 1,
+        validationStatus: 'valid',
+        validationReason: null,
+      }
+      await route.fulfill({ json: { ok: true, mappings: [organizationDefault], changedCount: 1 } })
+      return
+    }
+    await route.fulfill({
+      json: {
+        ok: true,
+        capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+        accounting: {
+          organizationId: posSnapshot.organizationId,
+          location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+          profile,
+          profiles: { organizationDefault: profile, locationOverride: null, effective: profile },
+          quickBooks: {
+            configured: true, bound: true, companyName: 'Acceptance Books', status: 'active',
+            catalog: { accounts: 0, items: 2, taxCodes: 0, classes: 0, departments: 0 },
+          },
+          sourceCatalog: [{
+            sourceKind: 'sales_item', sourceId, sourceName, catalogOrigin: 'menu',
+            suggestedTarget: null, productCreationSuggestion: null,
+          }],
+          mappings: [locationOverride],
+          mappingScopes: {
+            organizationDefault: [organizationDefault],
+            locationOverride: [locationOverride],
+            effective: [locationOverride],
+          },
+          targets: {
+            accounts: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [], locations: [],
+            items: [
+              { id: defaultTarget.id, name: defaultTarget.name, fullyQualifiedName: defaultTarget.name, itemType: 'NonInventory' },
+              { id: replacementTarget.id, name: replacementTarget.name, fullyQualifiedName: replacementTarget.name, itemType: 'NonInventory' },
+            ],
+          },
+          preview: { readiness: { missingMappings: [] }, salesReceipt: {}, journal: {}, evidence: {} },
+          draft: null,
+          draftHistory: [],
+          latestCommand: null,
+        },
+      },
+    })
+  })
+
+  await page.goto('/#pos')
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  const closeGuide = page.getByRole('button', { name: 'Close POS guide' })
+  if (await closeGuide.isVisible()) await closeGuide.click()
+  await activatePos(page)
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+
+  const scopeSelector = page.getByRole('combobox', { name: 'Configuration scope' })
+  const targetSelector = page.getByRole('combobox', { name: 'QuickBooks target' })
+  await expect(scopeSelector).toHaveText('Organization default')
+  await expect(targetSelector).toHaveValue(defaultTarget.name)
+  await expect(page.getByTestId('pos-mapping-provenance')).toHaveText('Organization default')
+
+  await scopeSelector.click()
+  await page.getByRole('option', { name: 'Location override', exact: true }).click()
+  await expect(targetSelector).toHaveValue(overrideTarget.name)
+  await expect(page.getByTestId('pos-mapping-provenance')).toHaveText('Location override')
+  await expect(page.getByText('Target missing', { exact: true })).toBeVisible()
+  await expect(page.getByText(/saved QuickBooks target is not in the current catalog/i)).toBeVisible()
+
+  await scopeSelector.click()
+  await page.getByRole('option', { name: 'Organization default', exact: true }).click()
+  await expect(targetSelector).toHaveValue(defaultTarget.name)
+  await targetSelector.fill(replacementTarget.name)
+  await page.getByRole('option', { name: replacementTarget.name, exact: true }).click()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+
+  await expect.poll(() => submittedBodies.length).toBe(1)
+  expect(submittedBodies[0]).toMatchObject({ action: 'save-mappings', scope: 'organization_default' })
+  await expect(scopeSelector).toHaveText('Organization default')
+  await expect(targetSelector).toHaveValue(replacementTarget.name)
+  await expect(page.getByText('1 accounting mapping saved to the organization default as a new revision.')).toBeVisible()
+
+  await scopeSelector.click()
+  await page.getByRole('option', { name: 'Location override', exact: true }).click()
+  await expect(targetSelector).toHaveValue(overrideTarget.name)
+  await expect(page.getByText('Target missing', { exact: true })).toBeVisible()
+})
