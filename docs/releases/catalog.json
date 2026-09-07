@@ -3,21 +3,19 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Production consolidation and commerce migration",
-      "summary": "Consolidate selected commerce workspaces into the production environment with guarded data transfer, bounded order history, storage controls, and separately verified provider reconnection. Local development remains isolated behind authenticated access.",
+      "title": "POS accounting controls and daily alert hardening",
+      "summary": "Expand QuickBooks product setup, preserve Toast accounting mappings, and send at most one combined posting-failure email per eligible recipient, POS location, and business date.",
       "features": [
-        "Selected commerce workspaces can be transferred into an existing production organization without replacing production-owned data",
-        "Each sales channel and shipping provider is reviewed and reconnected independently before it can run in production",
-        "Order-history coverage is selected per sales channel so operators can retain relevant history without loading an unlimited backlog",
-        "Commerce storage maintenance keeps current order evidence while retiring superseded payloads and bounding retained snapshots",
-        "Authenticated local development can use the development hostname without exposing its database or application listeners directly"
+        "QuickBooks product and service drafts expose the supported accounting, tax, inventory, purchasing, sales, and classification fields",
+        "Toast-to-QuickBooks mappings remain bound to their exact source and QuickBooks company instead of being forgotten between reviews",
+        "Sales Receipt and Journal Entry posting failures for one POS location and business date are combined into one actionable email"
       ],
       "fixes": [
-        "Migration plans bind exact source and target identities, row counts, checksums and immutable receipts before any apply step",
-        "Production provider credentials are never copied from another organization; target credentials require fresh, account-bound authorization",
-        "Provider reconnection rejects concurrent configuration, capability, history-policy or store-sync changes",
-        "Database health accepts only the verified rolling migration phases and rejects changed migration bytes or unsafe function configuration",
-        "Provider and migration safety suites now run as part of the standard release test gate"
+        "Repeated checks, changed blockers, and same-day recurrence cannot create a second email slot for the same eligible recipient and POS location",
+        "Resolved, externally posted, cancelled, or unauthorized deliveries are suppressed immediately before send",
+        "Provider failures and ambiguous send outcomes are terminal and are not retried",
+        "Posting state changes and notification delivery are serialized so stale failures cannot be emailed after recovery",
+        "Runtime health requires the daily alert delivery-fence migration"
       ]
     }
   }
