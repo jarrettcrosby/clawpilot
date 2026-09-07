@@ -83,7 +83,7 @@ type ProductDraft = {
   sourceKind: 'sales_item'
   sourceId: string
   sourceRestaurantGuid: string
-  sourceImageUrl: string
+  sourceImagePath: string
   mappingScope: MappingScope
   name: string
   itemType: 'Service' | 'NonInventory'
@@ -308,24 +308,37 @@ function ReadinessChip({ ready, readyLabel, waitingLabel }: {
   return <Chip size="small" variant="outlined" color={ready ? 'success' : 'warning'} label={ready ? readyLabel : waitingLabel} />
 }
 
-function ToastProductThumbnail({ imageUrl, productName, size = 44 }: {
-  imageUrl: string
+function toastProductDetailPath(restaurantGuid: string, itemGuid: string) {
+  return `/api/pos/catalog/items/${encodeURIComponent(restaurantGuid)}/${encodeURIComponent(itemGuid)}`
+}
+
+function toastProductImagePath(restaurantGuid: string, itemGuid: string) {
+  return `${toastProductDetailPath(restaurantGuid, itemGuid)}/image`
+}
+
+function ToastProductThumbnail({ imagePath, productName, size = 44, fallbackLabel = '' }: {
+  imagePath: string
   productName: string
   size?: number
+  fallbackLabel?: string
 }) {
-  const [failedImageUrl, setFailedImageUrl] = useState('')
+  const [failedImagePath, setFailedImagePath] = useState('')
 
-  if (!imageUrl || failedImageUrl === imageUrl) return null
+  if (!imagePath) return null
+  if (failedImagePath === imagePath) {
+    return fallbackLabel ? (
+      <Typography variant="caption" color="text.secondary">{fallbackLabel}</Typography>
+    ) : null
+  }
 
   return (
     <Box
       component="img"
-      src={imageUrl}
+      src={imagePath}
       alt={`${productName || 'Toast product'} product image from Toast`}
       loading="lazy"
       decoding="async"
-      referrerPolicy="no-referrer"
-      onError={() => setFailedImageUrl(imageUrl)}
+      onError={() => setFailedImagePath(imagePath)}
       sx={{
         width: size,
         height: size,
@@ -357,6 +370,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [runningAccountingCommand, setRunningAccountingCommand] = useState<'reload-sales' | 'regenerate-accounting' | null>(null)
   const [preparingProduct, setPreparingProduct] = useState(false)
   const [productDraft, setProductDraft] = useState<ProductDraft | null>(null)
+  const [loadingProductDetail, setLoadingProductDetail] = useState(false)
+  const [productDetailError, setProductDetailError] = useState<string | null>(null)
   const [preparedProductDraft, setPreparedProductDraft] = useState<PreparedProductDraft | null>(null)
   const [preparedProductDraftDialogOpen, setPreparedProductDraftDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -368,8 +383,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const mappingsRef = useRef<HTMLDivElement | null>(null)
   const previewRef = useRef<HTMLDivElement | null>(null)
   const mappingRowRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  const productDetailControllerRef = useRef<AbortController | null>(null)
   const selectedScopeRef = useRef<MappingScope>('organization_default')
   const scopeContextRef = useRef('')
+
+  useEffect(() => () => productDetailControllerRef.current?.abort(), [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -569,6 +587,68 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     setMappingError(null)
   }
 
+  async function loadToastProductDetail(input: {
+    sourceId: string
+    restaurantGuid: string
+    initialSku: string
+    initialDescription: string
+  }) {
+    productDetailControllerRef.current?.abort()
+    const controller = new AbortController()
+    productDetailControllerRef.current = controller
+    setLoadingProductDetail(true)
+    setProductDetailError(null)
+    try {
+      const response = await fetch(toastProductDetailPath(input.restaurantGuid, input.sourceId), {
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+      const payload = await response.json().catch(() => ({})) as DataRecord
+      if (!response.ok || payload.ok !== true || !payload.item) {
+        throw new Error(text(payload.error, 'Toast product details could not be loaded'))
+      }
+      const item = record(payload.item)
+      if (
+        text(item.restaurantGuid).toLowerCase() !== input.restaurantGuid.toLowerCase()
+        || text(item.itemGuid).toLowerCase() !== input.sourceId.toLowerCase()
+      ) {
+        throw new Error('Toast product details did not match the selected item')
+      }
+      setProductDraft((current) => {
+        if (!current || current.sourceId !== input.sourceId || current.sourceRestaurantGuid !== input.restaurantGuid) {
+          return current
+        }
+        return {
+          ...current,
+          sku: current.sku === input.initialSku ? text(item.sku, current.sku) : current.sku,
+          description: current.description === input.initialDescription
+            ? text(item.description, current.description)
+            : current.description,
+          sourceImagePath: item.hasImage === true
+            ? toastProductImagePath(input.restaurantGuid, input.sourceId)
+            : '',
+        }
+      })
+    } catch (detailError) {
+      if ((detailError as Error).name !== 'AbortError') {
+        setProductDetailError((detailError as Error).message)
+      }
+    } finally {
+      if (productDetailControllerRef.current === controller) {
+        productDetailControllerRef.current = null
+        setLoadingProductDetail(false)
+      }
+    }
+  }
+
+  function closeProductDraft() {
+    productDetailControllerRef.current?.abort()
+    productDetailControllerRef.current = null
+    setLoadingProductDetail(false)
+    setProductDetailError(null)
+    setProductDraft(null)
+  }
+
   function openProductDraft(mapping: MappingDraft) {
     const source = sourceByKey.get(`${mapping.sourceKind}:${mapping.sourceId}`)
     const catalogOrigin = text(source?.catalogOrigin)
@@ -585,17 +665,19 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     const preferredIncomeAccount = incomeAccounts.find((entry) => /sales of product income/i.test(entry.name))
       || incomeAccounts.find((entry) => /sales|food|beverage/i.test(entry.name))
       || (incomeAccounts.length === 1 ? incomeAccounts[0] : null)
+    const initialSku = text(suggestion.sku)
+    const initialDescription = `Toast menu item from ${text(locationRecord.locationName || locationRecord.restaurantName, 'this Toast location')}`
     setProductDraft({
       clientRequestId: globalThis.crypto.randomUUID(),
       sourceKind: 'sales_item',
       sourceId: mapping.sourceId,
       sourceRestaurantGuid: locationGuid,
-      sourceImageUrl: text(source?.imageUrl || suggestion.imageUrl),
+      sourceImagePath: '',
       mappingScope: scope,
       name: text(suggestion.name, mapping.sourceName),
       itemType: text(suggestion.itemType) === 'Service' ? 'Service' : 'NonInventory',
-      sku: text(suggestion.sku),
-      description: text(suggestion.description, 'Toast menu item prepared by ClawPilot'),
+      sku: initialSku,
+      description: initialDescription,
       unitPrice: String(amount(suggestion.unitPrice) || ''),
       purchaseCost: String(amount(suggestion.purchaseCost) || ''),
       incomeAccountId: preferredIncomeAccount?.id || '',
@@ -606,6 +688,12 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     setPreparedProductDraft(null)
     setPreparedProductDraftDialogOpen(false)
     setError(null)
+    void loadToastProductDetail({
+      sourceId: mapping.sourceId,
+      restaurantGuid: locationGuid,
+      initialSku,
+      initialDescription,
+    })
   }
 
   function updateProductDraft(patch: Partial<ProductDraft>) {
@@ -655,7 +743,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       const requestId = text(record(payload.request).id)
       if (!requestId) throw new Error('QuickBooks product draft was prepared without a review reference')
       const prepared = { id: requestId, name: productDraft.name }
-      setProductDraft(null)
+      closeProductDraft()
       setPreparedProductDraft(prepared)
       setPreparedProductDraftDialogOpen(true)
       setNotice('QuickBooks product draft prepared. Review and approve it before the product is created.')
@@ -1254,7 +1342,12 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               }}
             >
               <Box minWidth={0} display="flex" alignItems="center" gap={1}>
-                <ToastProductThumbnail imageUrl={text(source?.imageUrl)} productName={mapping.sourceName} />
+                {exactToastProductSource && source?.hasImage === true ? (
+                  <ToastProductThumbnail
+                    imagePath={toastProductImagePath(locationGuid, mapping.sourceId)}
+                    productName={mapping.sourceName}
+                  />
+                ) : null}
                 <Box minWidth={0} flex={1}>
                   <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
                     <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
@@ -1405,7 +1498,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
 
       <Dialog
         open={Boolean(productDraft)}
-        onClose={() => { if (!preparingProduct) setProductDraft(null) }}
+        onClose={() => { if (!preparingProduct) closeProductDraft() }}
         fullWidth
         maxWidth="sm"
         PaperProps={{ sx: { borderRadius: '8px', bgcolor: '#171821', backgroundImage: 'none' } }}
@@ -1417,9 +1510,25 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               <Alert severity="info" sx={{ borderRadius: '8px' }}>
                 This creates an immutable draft only. The product is not added to QuickBooks until an authorized user reviews and approves it.
               </Alert>
-              {productDraft.sourceImageUrl ? (
+              {loadingProductDetail ? (
+                <Box display="flex" alignItems="center" gap={1}>
+                  <CircularProgress size={16} />
+                  <Typography variant="caption" color="text.secondary">Loading the latest Toast product details...</Typography>
+                </Box>
+              ) : null}
+              {productDetailError ? (
+                <Alert severity="warning" sx={{ borderRadius: '8px' }}>
+                  {productDetailError}. You can still prepare this draft with the current values.
+                </Alert>
+              ) : null}
+              {productDraft.sourceImagePath ? (
                 <Box display="flex" alignItems="center" gap={1.25} sx={{ p: 1.25, border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px' }}>
-                  <ToastProductThumbnail imageUrl={productDraft.sourceImageUrl} productName={productDraft.name} size={72} />
+                  <ToastProductThumbnail
+                    imagePath={productDraft.sourceImagePath}
+                    productName={productDraft.name}
+                    size={72}
+                    fallbackLabel="Toast image unavailable"
+                  />
                   <Box minWidth={0}>
                     <Typography variant="body2" fontWeight={650}>Toast product image</Typography>
                     <Typography variant="caption" color="text.secondary">
@@ -1483,13 +1592,14 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           ) : null}
         </DialogContent>
         <DialogActions sx={{ px: 3, py: 2 }}>
-          <Button onClick={() => setProductDraft(null)} disabled={preparingProduct}>Cancel</Button>
+          <Button onClick={closeProductDraft} disabled={preparingProduct}>Cancel</Button>
           <Button
             variant="contained"
             startIcon={preparingProduct ? <CircularProgress size={16} /> : <AddRounded />}
             onClick={() => { void prepareQuickBooksProduct() }}
             disabled={
               preparingProduct
+              || loadingProductDetail
               || !productDraft?.name.trim()
               || !productDraft?.incomeAccountId
               || (Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId)

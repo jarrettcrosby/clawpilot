@@ -1766,8 +1766,8 @@ const stableMenuCatalog = accounting.mergeStableToastMenuCatalog(
     name: 'Daily sales',
     plu: 'DAILY-1',
     sku: 'TOAST-DAILY-SKU',
-    description: 'Toast daily sales item',
-    imageUrl: 'https://images.example.test/daily-sales.jpg',
+    hasDescription: true,
+    hasImage: true,
     price: 12.5,
   }, {
     itemGuid: '12121212-1212-4121-8121-121212121212',
@@ -1775,23 +1775,23 @@ const stableMenuCatalog = accounting.mergeStableToastMenuCatalog(
     name: 'ICED TEA | Blueberry Green',
     plu: 'TEA-1',
     sku: null,
-    description: null,
-    imageUrl: null,
+    hasDescription: false,
+    hasImage: false,
     price: 5.75,
   }],
 )
 const observedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'Daily sales')
 assert.equal(observedMenuItem.catalogOrigin, 'observed_and_menu')
 assert.equal(observedMenuItem.sku, 'TOAST-DAILY-SKU')
-assert.equal(observedMenuItem.description, 'Toast daily sales item')
-assert.equal(observedMenuItem.imageUrl, 'https://images.example.test/daily-sales.jpg')
+assert.equal(observedMenuItem.hasDescription, true)
+assert.equal(observedMenuItem.hasImage, true)
 assert.equal(observedMenuItem.unitPrice, 12.5)
 const unobservedMenuItem = stableMenuCatalog.find((entry) => entry.sourceName === 'ICED TEA | Blueberry Green')
 assert.equal(unobservedMenuItem.catalogOrigin, 'menu')
 assert.equal(unobservedMenuItem.occurrenceCount, 0)
 assert.equal(unobservedMenuItem.sku, 'TEA-1')
-assert.equal(unobservedMenuItem.description, null)
-assert.equal(unobservedMenuItem.imageUrl, null)
+assert.equal(unobservedMenuItem.hasDescription, false)
+assert.equal(unobservedMenuItem.hasImage, false)
 assert.equal(unobservedMenuItem.unitPrice, 5.75)
 
 const exactQuickBooksSuggestion = accounting.suggestQuickBooksItemForPosSource(unobservedMenuItem, [{
@@ -1843,9 +1843,22 @@ assert.ok(posAccountingPanel.includes('preparedProductDraft ? <Button color="inh
 assert.ok(posAccountingPanel.includes("Required when a purchase cost is entered."))
 assert.ok(posAccountingPanel.includes("Boolean(productDraft?.purchaseCost.trim()) && !productDraft?.expenseAccountId"))
 assert.ok(posAccountingPanel.includes('function ToastProductThumbnail'))
-assert.ok(posAccountingPanel.includes('sourceImageUrl: text(source?.imageUrl || suggestion.imageUrl)'))
-assert.ok(posAccountingPanel.includes('imageUrl={text(source?.imageUrl)}'))
+assert.ok(posAccountingPanel.includes('function toastProductDetailPath(restaurantGuid: string, itemGuid: string)'))
+assert.ok(posAccountingPanel.includes('function toastProductImagePath(restaurantGuid: string, itemGuid: string)'))
+assert.ok(posAccountingPanel.includes("sourceImagePath: ''"))
+assert.ok(posAccountingPanel.includes('source?.hasImage === true'))
+assert.ok(posAccountingPanel.includes('void loadToastProductDetail({'))
+assert.ok(posAccountingPanel.includes("cache: 'no-store'"))
+assert.ok(posAccountingPanel.includes('item.hasImage === true'))
+assert.ok(posAccountingPanel.includes('Loading the latest Toast product details...'))
+assert.ok(posAccountingPanel.includes('Toast image unavailable'))
+assert.ok(posAccountingPanel.includes('You can still prepare this draft with the current values.'))
 assert.ok(posAccountingPanel.includes('This remains a Toast and ClawPilot reference image. It is not attached to the QuickBooks product draft.'))
+const quickBooksDraftPayload = posAccountingPanel.slice(
+  posAccountingPanel.indexOf("operationKind: 'item.create'"),
+  posAccountingPanel.indexOf('const payload = await response.json()', posAccountingPanel.indexOf("operationKind: 'item.create'")),
+)
+assert.equal(quickBooksDraftPayload.includes('sourceImagePath'), false, 'Toast image paths must not enter QuickBooks item drafts')
 
 const accountingSection = read('app_src/components/accounting/AccountingSection.tsx')
 assert.ok(accountingSection.includes('consumeAccountingDraftTarget(window.location.href)'))
@@ -2006,3 +2019,4 @@ for (const forbidden of [
 }
 
 console.log('POS accounting contracts passed')
+await import('./test-toast-product-media-security.mjs')

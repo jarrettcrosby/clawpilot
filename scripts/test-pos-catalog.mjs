@@ -134,7 +134,9 @@ function verifySourceContracts() {
     'location.organization_id = $1::uuid',
     'source_revision = $3::timestamptz',
     'sku, description, image_url',
-    'imageUrl: row.image_url',
+    'description IS NOT NULL AS has_description',
+    'image_url IS NOT NULL AS has_image',
+    'sourceImageUrl: row.image_url',
   ]) assert.ok(persistence.includes(fragment), `POS catalog persistence missing ${fragment}`)
   assert.ok(!persistence.includes('organization_toast_credentials'), 'Catalog read model must not query credentials')
   assert.ok(!persistence.includes('console.'), 'Catalog persistence must not log data or secrets')
@@ -463,8 +465,8 @@ async function verifyRouteAuthorization() {
             items: [{
               providerItemId: itemGuid,
               sku: 'TOAST-SKU-42',
-              description: 'House lunch special',
-              imageUrl: 'https://images.example.test/lunch-special.jpg',
+              hasDescription: true,
+              hasImage: true,
             }],
           }
         },
@@ -500,8 +502,10 @@ async function verifyRouteAuthorization() {
   assert.equal(firstTenant.status, 200)
   assert.equal(firstTenant.body.catalog.organizationId, organizationId)
   assert.equal(firstTenant.body.catalog.items[0].sku, 'TOAST-SKU-42')
-  assert.equal(firstTenant.body.catalog.items[0].description, 'House lunch special')
-  assert.equal(firstTenant.body.catalog.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
+  assert.equal(firstTenant.body.catalog.items[0].hasDescription, true)
+  assert.equal(firstTenant.body.catalog.items[0].hasImage, true)
+  assert.equal(Object.hasOwn(firstTenant.body.catalog.items[0], 'description'), false)
+  assert.equal(Object.hasOwn(firstTenant.body.catalog.items[0], 'imageUrl'), false)
 
   actor = { ...actor, organizationId: otherOrganizationId }
   const secondTenant = await route.GET(getRequest)
@@ -680,8 +684,17 @@ async function verifyDisposablePostgres() {
     assert.equal(orgA.items.length, 1)
     assert.equal(orgA.items[0].providerItemId, itemGuid)
     assert.equal(orgA.items[0].sku, 'TOAST-SKU-42')
-    assert.equal(orgA.items[0].description, 'House lunch special')
-    assert.equal(orgA.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
+    assert.equal(orgA.items[0].hasDescription, true)
+    assert.equal(orgA.items[0].hasImage, true)
+    assert.equal(Object.hasOwn(orgA.items[0], 'description'), false)
+    assert.equal(Object.hasOwn(orgA.items[0], 'imageUrl'), false)
+    const orgADetail = await persistence.readToastMenuCatalogItemDetailFromPostgres({
+      organizationId,
+      restaurantGuid,
+      itemGuid,
+    })
+    assert.equal(orgADetail.description, 'House lunch special')
+    assert.equal(orgADetail.sourceImageUrl, 'https://images.example.test/lunch-special.jpg')
     assert.equal(orgBBefore.items.length, 0)
     assert.ok(!JSON.stringify(orgA).includes(secretSentinel), 'Postgres catalog read leaked a secret')
 
@@ -693,7 +706,7 @@ async function verifyDisposablePostgres() {
     const orgBAfter = await persistence.readPosCatalogFromPostgres(otherOrganizationId)
     assert.equal(orgBAfter.items.length, 1)
     assert.equal(orgBAfter.restaurants[0].name, 'Org B Restaurant')
-    assert.equal(orgBAfter.items[0].imageUrl, 'https://images.example.test/lunch-special.jpg')
+    assert.equal(orgBAfter.items[0].hasImage, true)
 
     const noMediaRevision = '2026-07-19T15:30:00.000Z'
     await persistence.replaceToastMenuCatalogInPostgres({
@@ -713,8 +726,8 @@ async function verifyDisposablePostgres() {
     })
     const orgBWithoutMedia = await persistence.readPosCatalogFromPostgres(otherOrganizationId)
     assert.equal(orgBWithoutMedia.items[0].sku, null)
-    assert.equal(orgBWithoutMedia.items[0].description, null)
-    assert.equal(orgBWithoutMedia.items[0].imageUrl, null)
+    assert.equal(orgBWithoutMedia.items[0].hasDescription, false)
+    assert.equal(orgBWithoutMedia.items[0].hasImage, false)
     assert.equal((await persistence.readPosCatalogFromPostgres(organizationId)).restaurants[0].name, 'Org A Restaurant')
 
     await persistence.recordToastMenuCatalogUnavailableInPostgres({
