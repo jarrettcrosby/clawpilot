@@ -34,6 +34,17 @@ export type ToastCatalogRefreshTarget = {
 
 export type ToastCatalogUnavailableReason = 'menus_scope_required' | 'menu_not_published'
 
+export type ToastMenuCatalogItemDetail = {
+  restaurantGuid: string
+  itemGuid: string
+  name: string
+  sku: string | null
+  description: string | null
+  hasImage: boolean
+  sourceImageUrl: string | null
+  sourceRevision: string | null
+}
+
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
 }
@@ -42,6 +53,53 @@ function numeric(value: string | number | null | undefined) {
   if (value === null || value === undefined) return null
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
+}
+
+export async function readToastMenuCatalogItemDetailFromPostgres(input: {
+  organizationId: string
+  restaurantGuid: string
+  itemGuid: string
+}): Promise<ToastMenuCatalogItemDetail | null> {
+  const result = await query<{
+    restaurant_guid: string
+    item_guid: string
+    name: string
+    sku: string | null
+    description: string | null
+    image_url: string | null
+    source_revision: TimestampValue | null
+  }>(
+    `SELECT DISTINCT ON (item.item_guid)
+       item.restaurant_guid::text, item.item_guid::text, item.name, item.sku,
+       item.description, item.image_url, item.source_revision
+     FROM toast_menu_catalog_items item
+     INNER JOIN toast_locations location
+       ON location.organization_id = item.organization_id
+      AND location.restaurant_guid = item.restaurant_guid
+     WHERE item.organization_id = $1::uuid
+       AND item.restaurant_guid = $2::uuid
+       AND item.item_guid = $3::uuid
+       AND item.active = true
+       AND item.archived = false
+       AND location.standard_access = true
+       AND location.selected = true
+       AND location.active = true
+       AND location.archived = false
+     ORDER BY item.item_guid, item.source_revision DESC, item.updated_at DESC`,
+    [input.organizationId, input.restaurantGuid, input.itemGuid],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  return {
+    restaurantGuid: row.restaurant_guid,
+    itemGuid: row.item_guid,
+    name: row.name,
+    sku: row.sku || null,
+    description: row.description || null,
+    hasImage: Boolean(row.image_url),
+    sourceImageUrl: row.image_url || null,
+    sourceRevision: iso(row.source_revision),
+  }
 }
 
 export async function readToastCatalogRefreshTargetsInPostgres(
@@ -139,12 +197,15 @@ export async function readPosCatalogFromPostgres(organizationId: string) {
     query<{
       restaurant_guid: string; menu_guid: string; group_guid: string; item_guid: string
       source_provider: string; provider_item_id: string; name: string; plu: string | null
+      sku: string | null; has_description: boolean; has_image: boolean
       price: string | null; visibility: string[]; sales_category_guid: string | null
       provider_sales_category_id: string | null; active: boolean; archived: boolean; position: number
       source_revision: TimestampValue; synced_at: TimestampValue
     }>(
       `SELECT restaurant_guid::text, menu_guid::text, group_guid::text, item_guid::text,
-         source_provider, provider_item_id, name, plu, price::text, visibility,
+         source_provider, provider_item_id, name, plu, sku,
+         description IS NOT NULL AS has_description,
+         image_url IS NOT NULL AS has_image, price::text, visibility,
          sales_category_guid::text, provider_sales_category_id, active, archived, position,
          source_revision, synced_at
        FROM toast_menu_catalog_items
@@ -243,6 +304,9 @@ export async function readPosCatalogFromPostgres(organizationId: string) {
       providerItemId: row.provider_item_id,
       name: row.name,
       plu: row.plu,
+      sku: row.sku || null,
+      hasDescription: row.has_description === true,
+      hasImage: row.has_image === true,
       price: numeric(row.price),
       visibility: row.visibility,
       salesCategoryGuid: row.sales_category_guid,
@@ -536,23 +600,27 @@ export async function replaceToastMenuCatalogInPostgres(input: {
     await client.query(
       `INSERT INTO toast_menu_catalog_items (
          organization_id, restaurant_guid, menu_guid, group_guid, item_guid,
-         source_provider, provider_item_id, name, plu, price, visibility,
+         source_provider, provider_item_id, name, plu, sku, description, image_url, price, visibility,
          sales_category_guid, provider_sales_category_id, active, archived, position,
          source_revision, synced_at, created_at, updated_at
        )
        SELECT $1::uuid, $2::uuid, row."menuGuid"::uuid, row."groupGuid"::uuid,
-         row."itemGuid"::uuid, 'toast', row."providerItemId", row.name, row.plu, row.price,
+         row."itemGuid"::uuid, 'toast', row."providerItemId", row.name, row.plu,
+         row.sku, row.description, row."imageUrl", row.price,
          ARRAY(SELECT jsonb_array_elements_text(COALESCE(row.visibility, '[]'::jsonb))),
          row."salesCategoryGuid"::uuid, row."providerSalesCategoryId",
          row.active, row.archived, row.position, $3::timestamptz, now(), now(), now()
        FROM jsonb_to_recordset($4::jsonb) AS row(
          "menuGuid" text, "groupGuid" text, "itemGuid" text, "providerItemId" text,
-         name text, plu text, price numeric, visibility jsonb, "salesCategoryGuid" text,
+         name text, plu text, sku text, description text, "imageUrl" text,
+         price numeric, visibility jsonb, "salesCategoryGuid" text,
          "providerSalesCategoryId" text, active boolean, archived boolean, position integer
        )
        ON CONFLICT (organization_id, restaurant_guid, menu_guid, group_guid, item_guid) DO UPDATE SET
          source_provider = EXCLUDED.source_provider, provider_item_id = EXCLUDED.provider_item_id,
-         name = EXCLUDED.name, plu = EXCLUDED.plu, price = EXCLUDED.price,
+         name = EXCLUDED.name, plu = EXCLUDED.plu, sku = EXCLUDED.sku,
+         description = EXCLUDED.description, image_url = EXCLUDED.image_url,
+         price = EXCLUDED.price,
          visibility = EXCLUDED.visibility, sales_category_guid = EXCLUDED.sales_category_guid,
          provider_sales_category_id = EXCLUDED.provider_sales_category_id,
          active = EXCLUDED.active, archived = EXCLUDED.archived, position = EXCLUDED.position,

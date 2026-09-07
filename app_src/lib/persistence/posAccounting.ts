@@ -733,6 +733,8 @@ export type PosAccountingCatalogEntry = {
   lastSeenDate: string
   catalogOrigin: 'observed' | 'menu' | 'observed_and_menu'
   sku: string | null
+  hasDescription: boolean
+  hasImage: boolean
   unitPrice: number | null
 }
 
@@ -741,6 +743,9 @@ export type StableToastMenuCatalogItem = {
   providerItemId: string
   name: string
   plu: string | null
+  sku?: string | null
+  hasDescription?: boolean
+  hasImage?: boolean
   price: number | null
 }
 
@@ -939,6 +944,8 @@ export function discoverSafePosSourceCatalog(orders: SourceOrderRow[]): PosAccou
       lastSeenDate: businessDate,
       catalogOrigin: 'observed',
       sku: null,
+      hasDescription: false,
+      hasImage: false,
       unitPrice: null,
     })
   }
@@ -1065,7 +1072,9 @@ export function mergeStableToastMenuCatalog(
     const current = catalog.get(key)
     if (current) {
       current.catalogOrigin = 'observed_and_menu'
-      current.sku = menuItem.plu || current.sku
+      current.sku = menuItem.sku || menuItem.plu || current.sku
+      current.hasDescription = menuItem.hasDescription === true || current.hasDescription
+      current.hasImage = menuItem.hasImage === true || current.hasImage
       current.unitPrice = menuItem.price === null ? current.unitPrice : money(menuItem.price)
       continue
     }
@@ -1079,7 +1088,9 @@ export function mergeStableToastMenuCatalog(
       firstSeenDate: '',
       lastSeenDate: '',
       catalogOrigin: 'menu',
-      sku: menuItem.plu,
+      sku: menuItem.sku || menuItem.plu,
+      hasDescription: menuItem.hasDescription === true,
+      hasImage: menuItem.hasImage === true,
       unitPrice: menuItem.price === null ? null : money(menuItem.price),
     })
   }
@@ -2042,9 +2053,11 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
     ),
     readQuery<{
       item_guid: string; provider_item_id: string; name: string; plu: string | null
-      price: string | null
+      sku: string | null; has_description: boolean; has_image: boolean; price: string | null
     }>(
-      `SELECT DISTINCT ON (item_guid) item_guid::text, provider_item_id, name, plu, price::text
+      `SELECT DISTINCT ON (item_guid) item_guid::text, provider_item_id, name, plu,
+         sku, description IS NOT NULL AS has_description,
+         image_url IS NOT NULL AS has_image, price::text
        FROM toast_menu_catalog_items
        WHERE organization_id = $1::uuid AND restaurant_guid = $2::uuid
          AND active = true AND archived = false
@@ -2155,6 +2168,9 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
       providerItemId: row.provider_item_id,
       name: row.name,
       plu: row.plu,
+      sku: row.sku || null,
+      hasDescription: row.has_description === true,
+      hasImage: row.has_image === true,
       price: row.price === null ? null : money(row.price),
     })),
   ).map((entry) => {
@@ -2172,7 +2188,6 @@ export async function readPosAccountingWorkspaceFromPostgres(input: {
             name: entry.sourceName,
             itemType: 'NonInventory' as const,
             sku: entry.sku,
-            description: `Toast menu item from ${location.location_name || location.restaurant_name}`,
             unitPrice: entry.unitPrice || 0,
             purchaseCost: 0,
             taxable: true,
