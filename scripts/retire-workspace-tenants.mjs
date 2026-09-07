@@ -100,6 +100,12 @@ export const PROTECTED_SHARED_PIPELINE = Object.freeze({
   pipelineId: 'b614e65d-250e-40a9-bb1e-fdbd18a1ec2c',
 })
 export const PRESERVED_SHARED_REFERENCE_CODES = Object.freeze(['gc3327424'])
+export const PRESERVED_SHARED_SHORT_LINK_SLUGS = Object.freeze(
+  PRESERVED_SHARED_REFERENCE_CODES.flatMap((referenceCode) => [
+    referenceCode,
+    `mail-${referenceCode}`,
+  ]),
+)
 export const EXPECTED_PRESERVED_USER_COUNTS = Object.freeze({
   appUsers: 1,
   memberships: 7,
@@ -126,7 +132,8 @@ export const EXPECTED_SELECTED_SCOPE_COUNTS = Object.freeze({
   workspace_organizations: 3,
 })
 export const EXPECTED_SPECIAL_SCOPE_COUNTS = Object.freeze({
-  shortLinksRetired: 5,
+  shortLinksRetired: 3,
+  sharedShortLinksRehomed: 2,
   preservedAuditEvents: 31,
 })
 export const PRODUCTION_DATABASE_BOUNDARY = Object.freeze({
@@ -1739,15 +1746,28 @@ async function scopeSummary(client, catalog, targets) {
     .filter((row) => !belongsToPreservedReferenceFamily(row))
     .map((row) => row.reference_code)
   const suiteCrmRecords = await selectedSuiteCrmRecords(client, catalog)
-  const shortLinks = await client.query(
+  const sharedShortLinks = await client.query(
     `SELECT id::text, slug, organization_root_id::text
      FROM short_links
      WHERE organization_root_id = ANY($1::uuid[])
+       AND slug = ANY($2::text[])
+     ORDER BY id`,
+    [
+      targets.map((target) => target.organizationId),
+      PRESERVED_SHARED_SHORT_LINK_SLUGS,
+    ],
+  )
+  const shortLinks = await client.query(
+    `SELECT id::text, slug, organization_root_id::text
+     FROM short_links
+     WHERE (organization_root_id = ANY($1::uuid[])
+            AND NOT slug = ANY($3::text[]))
         OR slug = ANY($2::text[])
      ORDER BY id`,
     [
       targets.map((target) => target.organizationId),
       references,
+      PRESERVED_SHARED_SHORT_LINK_SLUGS,
     ],
   )
   const shortLinkClicks = await client.query(
@@ -1769,6 +1789,7 @@ async function scopeSummary(client, catalog, targets) {
   }))
   const specialCounts = {
     shortLinksRetired: shortLinks.rows.length,
+    sharedShortLinksRehomed: sharedShortLinks.rows.length,
     shortLinkClicksDeleted: Number(shortLinkClicks.rows[0]?.count || 0),
     preservedAuditEvents: Number(audits.rows[0]?.count || 0),
     applicationUsersReassignedOrDetached: userReplacements.length,
@@ -1794,6 +1815,11 @@ async function scopeSummary(client, catalog, targets) {
     selectedContentDigests,
     specialCounts,
     shortLinks: shortLinks.rows.map((row) => ({
+      id: row.id,
+      slug: row.slug,
+      organizationRootId: row.organization_root_id,
+    })),
+    sharedShortLinks: sharedShortLinks.rows.map((row) => ({
       id: row.id,
       slug: row.slug,
       organizationRootId: row.organization_root_id,
@@ -1825,6 +1851,7 @@ function publicScope(scope) {
     selectedContentDigests: scope.selectedContentDigests,
     specialCounts: scope.specialCounts,
     shortLinks: scope.shortLinks,
+    sharedShortLinks: scope.sharedShortLinks,
     references: scope.references,
     preservedReferences: scope.preservedReferences,
     registryStatuses: scope.registryStatuses,
@@ -2017,6 +2044,29 @@ async function restoreDeleteTriggers(client, triggers) {
   }
 }
 
+async function rehomeSharedShortLinks(client, sharedShortLinks) {
+  for (const link of sharedShortLinks) {
+    const result = await client.query(
+      `UPDATE short_links
+       SET organization_root_id = $2::uuid,
+           updated_at = clock_timestamp()
+       WHERE id = $1::uuid
+         AND organization_root_id = $3::uuid
+         AND slug = ANY($4::text[])`,
+      [
+        link.id,
+        PROTECTED_SHARED_PIPELINE.workspaceOrganizationId,
+        link.organizationRootId,
+        PRESERVED_SHARED_SHORT_LINK_SLUGS,
+      ],
+    )
+    if (result.rowCount !== 1) {
+      fail(`Shared short link could not be rehomed safely: ${link.slug}`)
+    }
+  }
+  return sharedShortLinks.length
+}
+
 async function retireShortLinks(client, shortLinks) {
   const linkIds = shortLinks.map((link) => link.id)
   const clicks = await client.query(
@@ -2121,6 +2171,18 @@ async function deleteScopedRows(client, catalog, scope) {
   return deleted
 }
 
+export function classifyRetirementShortLinks(shortLinks) {
+  const preservedSlugSet = new Set(PRESERVED_SHARED_SHORT_LINK_SLUGS)
+  return shortLinks.reduce((classified, link) => {
+    if (preservedSlugSet.has(text(link?.slug).toLowerCase())) {
+      classified.preserved.push(link)
+    } else {
+      classified.retired.push(link)
+    }
+    return classified
+  }, { retired: [], preserved: [] })
+}
+
 async function relationalAbsence(client, catalog, targets, references, shortLinks) {
   const targetIds = targets.map((target) => target.organizationId)
   const retiredUuidIds = targets.flatMap((target) => [
@@ -2176,21 +2238,69 @@ async function relationalAbsence(client, catalog, targets, references, shortLink
      WHERE reference_code = ANY($1::text[])`,
     [references],
   )
-  const links = await client.query(
-    `SELECT count(*)::integer AS total,
-            count(*) FILTER (
-              WHERE disabled_at IS NOT NULL AND deleted_at IS NOT NULL
-                AND organization_root_id IS NULL
-            )::integer AS retired
-     FROM short_links
-     WHERE id = ANY($1::uuid[])`,
-    [shortLinks.map((link) => link.id)],
+  const classifiedLinks = classifyRetirementShortLinks(shortLinks)
+  const relevantLinks = await client.query(
+    `SELECT link.id::text, link.owner_email, link.source_app, link.slug,
+            link.organization_root_id::text, link.disabled_at, link.deleted_at,
+            EXISTS (
+              SELECT 1
+              FROM workspace_organizations workspace
+              JOIN pipeline_spaces pipeline
+                ON pipeline.workspace_organization_id = workspace.id
+              JOIN crm_contacts contact
+                ON contact.pipeline_id = pipeline.id
+              WHERE workspace.id = link.organization_root_id
+                AND NOT workspace.id = ANY($3::uuid[])
+                AND pipeline.reference_access_disabled IS FALSE
+                AND lower(contact.reference_code) = CASE
+                  WHEN lower(link.slug) LIKE 'mail-%'
+                    THEN substring(lower(link.slug) FROM 6)
+                  ELSE lower(link.slug)
+                END
+            ) AS preserved_binding_valid
+     FROM short_links link
+     WHERE link.id = ANY($1::uuid[])
+        OR link.slug = ANY($2::text[])
+     ORDER BY link.id`,
+    [
+      shortLinks.map((link) => link.id),
+      PRESERVED_SHARED_SHORT_LINK_SLUGS,
+      targetIds,
+    ],
   )
+  const receiptLinkIds = new Set(shortLinks.map((link) => link.id))
+  const links = relevantLinks.rows.filter((link) => receiptLinkIds.has(link.id))
+  const linksById = new Map(links.map((link) => [link.id, link]))
+  const retiredLinkCount = classifiedLinks.retired.filter((expected) => {
+    const observed = linksById.get(expected.id)
+    return observed
+      && observed.slug === expected.slug
+      && observed.disabled_at !== null
+      && observed.deleted_at !== null
+      && observed.organization_root_id === null
+  }).length
+  const preservedReceiptLinkCount = classifiedLinks.preserved.filter((expected) => {
+    const observed = linksById.get(expected.id)
+    return observed
+      && observed.slug === expected.slug
+      && observed.owner_email === CONFIRMED_OPERATOR_EMAIL
+      && observed.source_app === 'clawpilot-crm'
+      && observed.deleted_at === null
+      && observed.preserved_binding_valid === true
+  }).length
+  const preservedSlugSet = new Set(PRESERVED_SHARED_SHORT_LINK_SLUGS)
+  const preservedLinks = relevantLinks.rows.filter((link) => preservedSlugSet.has(link.slug))
+  const validPreservedLinkCount = preservedLinks.filter((observed) => (
+    observed.owner_email === CONFIRMED_OPERATOR_EMAIL
+      && observed.source_app === 'clawpilot-crm'
+      && observed.deleted_at === null
+      && observed.preserved_binding_valid === true
+  )).length
   const linkClicks = await client.query(
     `SELECT count(*)::integer AS count
      FROM short_link_clicks
      WHERE short_link_id = ANY($1::uuid[])`,
-    [shortLinks.map((link) => link.id)],
+    [classifiedLinks.retired.map((link) => link.id)],
   )
   const audits = await client.query(
     `SELECT count(*)::integer AS count
@@ -2212,10 +2322,18 @@ async function relationalAbsence(client, catalog, targets, references, shortLink
       expected: references.length,
     },
     shortLinks: {
-      total: Number(links.rows[0]?.total || 0),
-      retired: Number(links.rows[0]?.retired || 0),
+      total: links.length,
       expected: shortLinks.length,
+      retired: retiredLinkCount,
+      expectedRetired: classifiedLinks.retired.length,
+      preservedReceiptValid: preservedReceiptLinkCount,
+      expectedPreservedReceipt: classifiedLinks.preserved.length,
       clicksRemaining: Number(linkClicks.rows[0]?.count || 0),
+      preserved: {
+        total: preservedLinks.length,
+        valid: validPreservedLinkCount,
+        expected: PRESERVED_SHARED_SHORT_LINK_SLUGS.length,
+      },
     },
   }
 }
@@ -2230,8 +2348,12 @@ function absenceReady(absence) {
     && absence.registry.total === absence.registry.expected
     && absence.registry.retired === absence.registry.expected
     && absence.shortLinks.total === absence.shortLinks.expected
-    && absence.shortLinks.retired === absence.shortLinks.expected
+    && absence.shortLinks.retired === absence.shortLinks.expectedRetired
+    && absence.shortLinks.preservedReceiptValid
+      === absence.shortLinks.expectedPreservedReceipt
     && absence.shortLinks.clicksRemaining === 0
+    && absence.shortLinks.preserved.total === absence.shortLinks.preserved.expected
+    && absence.shortLinks.preserved.valid === absence.shortLinks.preserved.expected
 }
 
 function receiptProjection(manifest, scope, endpointProof, deleted, absence) {
@@ -2398,6 +2520,12 @@ async function applyManifest(client, manifest, options, endpointProof, databaseB
     }
     await disableDeleteTriggers(client, scope.disabledDeleteTriggers)
     await detachUsersFromTargets(client, scope.userReplacements)
+    const sharedShortLinksRehomed = await rehomeSharedShortLinks(
+      client, scope.sharedShortLinks,
+    )
+    if (sharedShortLinksRehomed !== scope.specialCounts.sharedShortLinksRehomed) {
+      fail('Shared short-link rehome scope changed during apply')
+    }
     const shortLinks = await retireShortLinks(client, scope.shortLinks)
     if (shortLinks.links !== scope.specialCounts.shortLinksRetired
       || shortLinks.clicks !== scope.specialCounts.shortLinkClicksDeleted) {
