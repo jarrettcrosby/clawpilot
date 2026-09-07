@@ -447,6 +447,7 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
   approvalNote?: string | null
 }) {
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
     const current = await readWriteRequest(client, input.organizationId, input.requestId)
     let nextStatus: QuickBooksWriteRequestStatus
     if (input.action === 'submit') {
@@ -988,6 +989,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
   posAccountingSource?: QuickBooksWriteJobProviderReadiness['posAccountingSource']
 }) {
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.job.organizationId}`)
     const lease = await client.query<{ approved_by: string | null }>(
       `SELECT approved_by
        FROM quickbooks_write_requests
@@ -1073,6 +1075,7 @@ export async function failQuickBooksWriteJobInPostgres(input: {
   const dead = input.job.attemptCount >= input.job.maxAttempts
   const message = safeError(input.error)
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.job.organizationId}`)
     const failed = await client.query(
       `UPDATE quickbooks_write_requests SET
          status = $3, last_error_code = $4, last_error_message = $5,

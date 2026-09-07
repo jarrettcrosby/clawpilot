@@ -3470,6 +3470,7 @@ export async function GET(request: NextRequest) {
           pos_accounting_notifications_migration_applied: boolean
           quickbooks_write_binding_compatibility_migration_applied: boolean
           pos_accounting_notification_consent_migration_applied: boolean
+          pos_accounting_daily_alert_delivery_fence_migration_applied: boolean
           pos_accounting_date_commands_migration_applied: boolean
           pos_accounting_posting_outcomes_migration_applied: boolean
           external_pos_accounting_outcomes_migration_applied: boolean
@@ -3959,6 +3960,11 @@ export async function GET(request: NextRequest) {
                 FROM schema_migrations
                 WHERE filename = '0076_pos_accounting_notification_consent.sql'
               ) AS pos_accounting_notification_consent_migration_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename = '0363_pos_accounting_daily_alert_delivery_fence.sql'
+              ) AS pos_accounting_daily_alert_delivery_fence_migration_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8818,6 +8824,7 @@ export async function GET(request: NextRequest) {
             && row?.pos_accounting_notifications_migration_applied
             && row?.quickbooks_write_binding_compatibility_migration_applied
             && row?.pos_accounting_notification_consent_migration_applied
+            && row?.pos_accounting_daily_alert_delivery_fence_migration_applied
             && row?.pos_accounting_date_commands_migration_applied
             && row?.pos_accounting_posting_outcomes_migration_applied
             && row?.external_pos_accounting_outcomes_migration_applied
@@ -9447,6 +9454,7 @@ export async function GET(request: NextRequest) {
           || !row?.pos_accounting_notifications_migration_applied
           || !row?.quickbooks_write_binding_compatibility_migration_applied
           || !row?.pos_accounting_notification_consent_migration_applied
+          || !row?.pos_accounting_daily_alert_delivery_fence_migration_applied
           || !row?.pos_accounting_date_commands_migration_applied
           || !row?.pos_accounting_posting_outcomes_migration_applied
           || !row?.external_pos_accounting_outcomes_migration_applied
@@ -9650,6 +9658,7 @@ export async function GET(request: NextRequest) {
           && row?.pos_accounting_notifications_migration_applied
           && row?.quickbooks_write_binding_compatibility_migration_applied
           && row?.pos_accounting_notification_consent_migration_applied
+          && row?.pos_accounting_daily_alert_delivery_fence_migration_applied
           && row?.pos_accounting_date_commands_migration_applied
           && row?.pos_accounting_posting_outcomes_migration_applied
           && row?.external_pos_accounting_outcomes_migration_applied

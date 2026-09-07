@@ -956,11 +956,11 @@ async function runToastOutboxPostgresAcceptance() {
     await pool.query(
       `INSERT INTO pos_accounting_notification_outbox (
          issue_state_id, occurrence, issue_fingerprint, issues, recipient_email,
-         status, locked_at, locked_by, lock_token
+         status, attempt_count, delivery_reserved_at, locked_at, locked_by, lock_token
        ) VALUES
-         ($1::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'processing', now(), 'migration-test', gen_random_uuid()),
-         ($2::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', NULL, NULL, NULL),
-         ($3::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', NULL, NULL, NULL)`,
+         ($1::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', 0, NULL, NULL, NULL, NULL),
+         ($2::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', 0, NULL, NULL, NULL, NULL),
+         ($3::uuid, 1, $4, $5::jsonb, 'accounting-alerts@clawpilot.com', 'pending', 0, NULL, NULL, NULL, NULL)`,
       [
         migrationIssueByDate.get('2026-09-01'),
         migrationIssueByDate.get('2026-09-02'),

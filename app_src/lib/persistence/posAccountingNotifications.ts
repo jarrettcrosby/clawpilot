@@ -12,8 +12,6 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 
-const MAX_DELIVERY_ATTEMPTS = 6
-
 type PosAccountingWorkspace = Awaited<ReturnType<typeof readPosAccountingWorkspaceFromPostgres>>
 
 export type PosAccountingIssue = {
@@ -33,6 +31,20 @@ type IssueStateRow = {
 
 type NotificationRecipientRow = {
   email: string
+}
+
+type PostingNotificationRow = {
+  batch_id: string | null
+  batch_status: string | null
+  draft_status: string
+  review_outcome: string | null
+  posting_origin: string | null
+  sales_receipt_request_id: string | null
+  sales_receipt_status: string | null
+  sales_receipt_error: string | null
+  journal_entry_request_id: string | null
+  journal_entry_status: string | null
+  journal_entry_error: string | null
 }
 
 type NotificationJobRow = {
@@ -92,7 +104,7 @@ export function derivePosAccountingIssues(workspace: PosAccountingWorkspace): Po
         }
       })
     : []
-  const draftFailure = workspace.draft?.status === 'failed' || workspace.draft?.lastError
+  const draftFailure = workspace.draft?.status === 'failed'
     ? [{
         code: 'provider_failure',
         title: 'Retry the failed accounting post',
@@ -166,6 +178,116 @@ function issueSummary(issues: PosAccountingIssue[]) {
   return `${issues.length} accounting items require review`
 }
 
+const SETTLED_POSTING_REQUEST_STATUSES = new Set(['succeeded', 'dead', 'cancelled'])
+const POSTING_FAILURE_ISSUE_CODES = new Set([
+  'provider_failure',
+  'sales_receipt_provider_failure',
+  'journal_entry_provider_failure',
+])
+
+type PostingNotificationState = {
+  phase: 'unsettled' | 'settled' | 'suppressed'
+  issues: PosAccountingIssue[]
+}
+
+async function postingNotificationState(
+  client: PoolClient,
+  input: { organizationId: string; restaurantGuid: string; businessDate: string },
+  options: { lockPostingOutcome?: boolean } = {},
+): Promise<PostingNotificationState | null> {
+  const result = await client.query<PostingNotificationRow>(
+    `SELECT batch.id::text AS batch_id, batch.status AS batch_status,
+       draft.status AS draft_status,
+       draft.review_outcome,
+       draft.posting_origin,
+       batch.sales_receipt_request_id::text,
+       receipt.status AS sales_receipt_status,
+       receipt.last_error_message AS sales_receipt_error,
+       batch.journal_entry_request_id::text,
+       journal.status AS journal_entry_status,
+       journal.last_error_message AS journal_entry_error
+     FROM toast_accounting_export_drafts draft
+     LEFT JOIN pos_accounting_posting_batches batch
+       ON batch.organization_id = draft.organization_id
+      AND batch.draft_id = draft.id
+     LEFT JOIN quickbooks_write_requests receipt
+       ON receipt.organization_id = batch.organization_id
+      AND receipt.id = batch.sales_receipt_request_id
+     LEFT JOIN quickbooks_write_requests journal
+       ON journal.organization_id = batch.organization_id
+      AND journal.id = batch.journal_entry_request_id
+     WHERE draft.organization_id = $1::uuid
+       AND draft.restaurant_guid = $2::uuid
+       AND draft.business_date = $3::date
+       AND draft.is_current = true
+     ORDER BY draft.draft_revision DESC, draft.updated_at DESC, draft.id DESC
+     LIMIT 1
+     ${options.lockPostingOutcome ? 'FOR SHARE OF draft' : ''}`,
+    [input.organizationId, input.restaurantGuid, input.businessDate],
+  )
+  const posting = result.rows[0]
+  if (!posting) return null
+  const externallyPosted = posting.draft_status === 'posted'
+    && (
+      posting.review_outcome === 'externally_posted'
+      || posting.review_outcome === 'shogo_posted'
+      || posting.posting_origin === 'external'
+      || posting.posting_origin === 'shogo'
+    )
+  if (
+    externallyPosted
+    || posting.draft_status === 'posted'
+    || posting.batch_status === 'posted'
+    || posting.batch_status === 'cancelled'
+  ) {
+    return { phase: 'suppressed', issues: [] }
+  }
+  if (!posting.batch_id) return null
+
+  const receiptSettled = !posting.sales_receipt_request_id
+    || SETTLED_POSTING_REQUEST_STATUSES.has(posting.sales_receipt_status || '')
+  const journalSettled = SETTLED_POSTING_REQUEST_STATUSES.has(posting.journal_entry_status || '')
+  if (!receiptSettled || !journalSettled) return { phase: 'unsettled', issues: [] }
+
+  const issues: PosAccountingIssue[] = []
+  if (posting.sales_receipt_request_id && posting.sales_receipt_status === 'dead') {
+    issues.push({
+      code: 'sales_receipt_provider_failure',
+      title: 'Retry the failed sales receipt',
+      detail: cleanText(
+        posting.sales_receipt_error,
+        'QuickBooks did not post the Sales Receipt.',
+        1_000,
+      ),
+      action: 'Review Sales Receipt',
+    })
+  }
+  if (posting.journal_entry_request_id && posting.journal_entry_status === 'dead') {
+    issues.push({
+      code: 'journal_entry_provider_failure',
+      title: 'Retry the failed journal entry',
+      detail: cleanText(
+        posting.journal_entry_error,
+        'QuickBooks did not post the Journal Entry.',
+        1_000,
+      ),
+      action: 'Review Journal Entry',
+    })
+  }
+  return { phase: 'settled', issues }
+}
+
+function currentNotificationIssues(
+  workspace: PosAccountingWorkspace,
+  posting: PostingNotificationState | null,
+) {
+  if (!posting) return derivePosAccountingIssues(workspace)
+  if (posting.phase !== 'settled') return []
+  const issues = posting.issues.filter((issue) => POSTING_FAILURE_ISSUE_CODES.has(issue.code))
+  return [...new Map(issues.map((issue) => [issue.code, issue])).values()]
+    .sort((left, right) => left.code.localeCompare(right.code))
+}
+
 const RESERVED_RECIPIENT_DOMAIN = /(?:^|\.)(?:example|invalid|test)$/i
 const RESERVED_EXAMPLE_DOMAIN = /^example\.(?:com|org|net)$/i
 
@@ -216,7 +338,8 @@ async function authorizedRecipients(
            membership.permissions @> '{"viewAccounting":true,"manageUserAccess":true}'::jsonb
          )
        )
-     ORDER BY app_user.email`,
+     ORDER BY app_user.email
+     FOR SHARE OF membership, app_user, organization`,
     [organizationId, restaurantGuid, businessDate],
   )
   return result.rows.filter((recipient) => isDeliverablePosAccountingRecipient(recipient.email))
@@ -238,23 +361,35 @@ async function queueRecipients(
          issue_state_id, occurrence, issue_fingerprint, issues, recipient_email,
          status, available_at, created_at, updated_at
        ) VALUES ($1::uuid, $2, $3, $4::jsonb, $5, 'pending', now(), now(), now())
-       ON CONFLICT (issue_state_id, occurrence, recipient_email) DO UPDATE SET
+       ON CONFLICT (issue_state_id, recipient_email) DO UPDATE SET
+         occurrence = EXCLUDED.occurrence,
          issue_fingerprint = EXCLUDED.issue_fingerprint,
          issues = EXCLUDED.issues,
          status = CASE
-           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN 'pending'
+           WHEN pos_accounting_notification_outbox.status = 'cancelled'
+             AND pos_accounting_notification_outbox.attempt_count = 0
+             AND pos_accounting_notification_outbox.delivery_reserved_at IS NULL
+             THEN 'pending'
            ELSE pos_accounting_notification_outbox.status
          END,
          available_at = CASE
-           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN now()
+           WHEN pos_accounting_notification_outbox.status = 'cancelled'
+             AND pos_accounting_notification_outbox.attempt_count = 0
+             AND pos_accounting_notification_outbox.delivery_reserved_at IS NULL
+             THEN now()
            ELSE pos_accounting_notification_outbox.available_at
          END,
          last_error = CASE
-           WHEN pos_accounting_notification_outbox.status = 'cancelled' THEN NULL
+           WHEN pos_accounting_notification_outbox.status = 'cancelled'
+             AND pos_accounting_notification_outbox.attempt_count = 0
+             AND pos_accounting_notification_outbox.delivery_reserved_at IS NULL
+             THEN NULL
            ELSE pos_accounting_notification_outbox.last_error
          END,
          updated_at = now()
-       WHERE pos_accounting_notification_outbox.status IN ('pending', 'failed', 'cancelled')`,
+       WHERE pos_accounting_notification_outbox.status IN ('pending', 'cancelled')
+         AND pos_accounting_notification_outbox.attempt_count = 0
+         AND pos_accounting_notification_outbox.delivery_reserved_at IS NULL`,
       [
         input.issueStateId,
         input.occurrence,
@@ -271,20 +406,23 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
   restaurantGuid: string
   businessDate: string
 }) {
-  const workspace = await readPosAccountingWorkspaceFromPostgres({
-    organizationId: input.organizationId,
-    restaurantGuid: input.restaurantGuid,
-    businessDate: input.businessDate,
-  })
-  const issues = derivePosAccountingIssues(workspace)
-  const fingerprint = issues.length > 0 ? posAccountingIssueFingerprint(issues) : null
   const clearFingerprint = posAccountingIssueFingerprint([])
 
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
     await acquireTransactionAdvisoryLock(
       client,
       `pos-accounting-issue:${input.organizationId}:${input.restaurantGuid}:${input.businessDate}`,
     )
+    const workspace = await readPosAccountingWorkspaceFromPostgres({
+      organizationId: input.organizationId,
+      restaurantGuid: input.restaurantGuid,
+      businessDate: input.businessDate,
+      client,
+    })
+    const posting = await postingNotificationState(client, input)
+    const issues = currentNotificationIssues(workspace, posting)
+    const fingerprint = issues.length > 0 ? posAccountingIssueFingerprint(issues) : null
     const currentResult = await client.query<IssueStateRow>(
       `SELECT id::text, status, issue_fingerprint, issues, occurrence
        FROM pos_accounting_issue_states
@@ -331,9 +469,14 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
       )
       await client.query(
         `UPDATE pos_accounting_notification_outbox SET
-           status = 'cancelled', last_error = 'Accounting issue was resolved before delivery',
-           updated_at = now()
-         WHERE issue_state_id = $1::uuid AND status IN ('pending', 'failed')`,
+           status = CASE WHEN status = 'processing' THEN 'suppressed' ELSE 'cancelled' END,
+           last_error = CASE
+             WHEN status = 'processing'
+               THEN 'Accounting issue resolved after the one daily delivery slot was reserved; delivery was suppressed'
+             ELSE 'Accounting issue was resolved before delivery'
+           END,
+           locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
+         WHERE issue_state_id = $1::uuid AND status IN ('pending', 'processing')`,
         [current.id],
       )
       await recordAuditEvent({
@@ -388,10 +531,15 @@ export async function reconcilePosAccountingIssueForDateInPostgres(input: {
     if (changed) {
       await client.query(
         `UPDATE pos_accounting_notification_outbox SET
-           status = 'cancelled', last_error = 'A newer accounting issue occurrence replaced this delivery',
-           updated_at = now()
+           status = CASE WHEN status = 'processing' THEN 'suppressed' ELSE 'cancelled' END,
+           last_error = CASE
+             WHEN status = 'processing'
+               THEN 'The issue changed after the one daily delivery slot was reserved; delivery was suppressed'
+             ELSE 'A newer accounting issue occurrence replaced this delivery'
+           END,
+           locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
          WHERE issue_state_id = $1::uuid AND occurrence <> $2
-           AND status IN ('pending', 'failed')`,
+           AND status IN ('pending', 'processing')`,
         [issueStateId, occurrence],
       )
     }
@@ -447,11 +595,16 @@ export async function reconcileStaleOpenPosAccountingIssuesInPostgres(input: { l
        RETURNING issue.id
      )
      UPDATE pos_accounting_notification_outbox outbox SET
-       status = 'cancelled', last_error = 'The POS location is no longer active',
-       updated_at = now()
+       status = CASE WHEN outbox.status = 'processing' THEN 'suppressed' ELSE 'cancelled' END,
+       last_error = CASE
+         WHEN outbox.status = 'processing'
+           THEN 'The POS location was retired after the one daily delivery slot was reserved; delivery was suppressed'
+         ELSE 'The POS location is no longer active'
+       END,
+       locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
      FROM retired
      WHERE outbox.issue_state_id = retired.id
-       AND outbox.status IN ('pending', 'failed')`,
+       AND outbox.status IN ('pending', 'processing')`,
   )
   const result = await query<{
     organization_id: string
@@ -632,20 +785,30 @@ function toNotificationJob(row: NotificationJobRow): PosAccountingNotificationJo
 export async function claimPosAccountingNotificationsInPostgres(input: { limit: number; workerId: string }) {
   await query(
     `UPDATE pos_accounting_notification_outbox outbox SET
-       status = 'failed', available_at = now(), locked_at = NULL, locked_by = NULL,
-       lock_token = NULL, last_error = COALESCE(last_error, 'Notification worker lease expired'),
+       status = 'dead', locked_at = NULL, locked_by = NULL,
+       lock_token = NULL,
+       last_error = COALESCE(
+         last_error,
+         'The one daily delivery attempt has an ambiguous outcome and cannot be retried'
+       ),
        updated_at = now()
      WHERE outbox.status = 'processing'
        AND outbox.locked_at < now() - interval '15 minutes'`,
   )
   await query(
     `UPDATE pos_accounting_notification_outbox outbox SET
-       status = 'cancelled', locked_at = NULL, locked_by = NULL, lock_token = NULL,
-       last_error = 'Recipient no longer has accounting administration access', updated_at = now()
+       status = CASE WHEN outbox.status = 'processing' THEN 'suppressed' ELSE 'cancelled' END,
+       locked_at = NULL, locked_by = NULL, lock_token = NULL,
+       last_error = CASE
+         WHEN outbox.status = 'processing'
+           THEN 'Recipient access changed after the one daily delivery slot was reserved; delivery was suppressed'
+         ELSE 'Recipient no longer has accounting administration access'
+       END,
+       updated_at = now()
      FROM pos_accounting_issue_states issue
      JOIN workspace_organizations organization ON organization.id = issue.organization_id
      WHERE issue.id = outbox.issue_state_id
-       AND outbox.status IN ('pending', 'failed')
+       AND outbox.status IN ('pending', 'processing')
        AND (
          organization.is_demo = true
          OR outbox.recipient_email = 'demo-system@clawpilot.example'
@@ -698,7 +861,9 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
        FROM pos_accounting_notification_outbox outbox
        JOIN pos_accounting_issue_states issue ON issue.id = outbox.issue_state_id
        JOIN workspace_organizations organization ON organization.id = issue.organization_id
-       WHERE outbox.status IN ('pending', 'failed')
+       WHERE outbox.status = 'pending'
+         AND outbox.attempt_count = 0
+         AND outbox.delivery_reserved_at IS NULL
          AND outbox.available_at <= now()
          AND issue.status = 'open'
          AND issue.occurrence = outbox.occurrence
@@ -707,15 +872,42 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
          AND outbox.recipient_email !~* '@[^@]*\.(example|invalid|test)$'
          AND outbox.recipient_email !~* '@example\.(com|org|net)$'
          AND outbox.recipient_email !~* '@localhost$'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM pos_accounting_posting_batches batch
+           JOIN toast_accounting_export_drafts draft
+             ON draft.organization_id = batch.organization_id
+            AND draft.id = batch.draft_id
+            AND draft.is_current = true
+           LEFT JOIN quickbooks_write_requests receipt
+             ON receipt.organization_id = batch.organization_id
+            AND receipt.id = batch.sales_receipt_request_id
+           LEFT JOIN quickbooks_write_requests journal
+             ON journal.organization_id = batch.organization_id
+            AND journal.id = batch.journal_entry_request_id
+           WHERE batch.organization_id = issue.organization_id
+             AND batch.restaurant_guid = issue.restaurant_guid
+             AND batch.business_date = issue.business_date
+             AND (
+               (
+                 batch.sales_receipt_request_id IS NOT NULL
+                 AND COALESCE(receipt.status, '') NOT IN ('succeeded', 'dead', 'cancelled')
+               )
+               OR COALESCE(journal.status, '') NOT IN ('succeeded', 'dead', 'cancelled')
+             )
+         )
        ORDER BY outbox.available_at, outbox.created_at, outbox.id
        FOR UPDATE OF outbox SKIP LOCKED
-       LIMIT $1
+       LIMIT 1
      ), claimed AS (
        UPDATE pos_accounting_notification_outbox outbox SET
-         status = 'processing', attempt_count = outbox.attempt_count + 1,
-         locked_at = now(), locked_by = $2, lock_token = gen_random_uuid(), updated_at = now()
+         status = 'processing', attempt_count = 1, delivery_reserved_at = now(),
+         locked_at = now(), locked_by = $1, lock_token = gen_random_uuid(), updated_at = now()
        FROM candidates
        WHERE outbox.id = candidates.id
+         AND outbox.status = 'pending'
+         AND outbox.attempt_count = 0
+         AND outbox.delivery_reserved_at IS NULL
        RETURNING outbox.*
      )
      SELECT claimed.id::text AS outbox_id, claimed.issue_state_id::text,
@@ -733,16 +925,181 @@ export async function claimPosAccountingNotificationsInPostgres(input: { limit: 
       AND location.restaurant_guid = issue.restaurant_guid
      JOIN app_users app_user ON app_user.email = claimed.recipient_email
      ORDER BY claimed.created_at, claimed.id`,
-    [Math.max(1, Math.min(input.limit, 20)), cleanText(input.workerId, 'pos-notification-worker', 200)],
+    [cleanText(input.workerId, 'pos-notification-worker', 200)],
   )
   return result.rows.map(toNotificationJob)
 }
 
-export async function completePosAccountingNotificationInPostgres(input: {
-  job: PosAccountingNotificationJob
-  providerMessageId: string | null
-}) {
+async function markClaimedNotificationDead(
+  client: PoolClient,
+  input: { job: PosAccountingNotificationJob; error: string },
+) {
+  const result = await client.query(
+    `UPDATE pos_accounting_notification_outbox SET
+       status = 'dead', last_error = $3,
+       locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid
+     RETURNING id`,
+    [input.job.outboxId, input.job.lockToken, cleanText(input.error, 'Email delivery was not completed', 1_000)],
+  )
+  return Boolean(result.rows[0])
+}
+
+async function markClaimedNotificationSuppressed(
+  client: PoolClient,
+  input: { job: PosAccountingNotificationJob; reason: string },
+) {
+  const result = await client.query(
+    `UPDATE pos_accounting_notification_outbox SET
+       status = 'suppressed', last_error = $3,
+       locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
+     WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid
+     RETURNING id`,
+    [input.job.outboxId, input.job.lockToken, cleanText(input.reason, 'Email delivery was suppressed', 1_000)],
+  )
+  return Boolean(result.rows[0])
+}
+
+export async function deliverClaimedPosAccountingNotificationInPostgres(
+  job: PosAccountingNotificationJob,
+) {
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${job.organizationId}`)
+    await acquireTransactionAdvisoryLock(
+      client,
+      `pos-accounting-issue:${job.organizationId}:${job.restaurantGuid}:${job.businessDate}`,
+    )
+
+    const currentResult = await client.query<NotificationJobRow & {
+      outbox_status: string
+      issue_status: string
+      current_occurrence: number
+    }>(
+      `SELECT outbox.id::text AS outbox_id, outbox.issue_state_id::text,
+         outbox.status AS outbox_status, outbox.occurrence,
+         outbox.recipient_email, app_user.display_name AS recipient_name,
+         issue.organization_id::text, organization.name AS organization_name,
+         issue.restaurant_guid::text,
+         COALESCE(location.location_name, location.restaurant_name) AS restaurant_name,
+         issue.business_date::text, issue.issues, issue.status AS issue_status,
+         issue.occurrence AS current_occurrence, outbox.attempt_count,
+         outbox.lock_token::text
+       FROM pos_accounting_notification_outbox outbox
+       JOIN pos_accounting_issue_states issue ON issue.id = outbox.issue_state_id
+       JOIN workspace_organizations organization ON organization.id = issue.organization_id
+       JOIN toast_locations location
+         ON location.organization_id = issue.organization_id
+        AND location.restaurant_guid = issue.restaurant_guid
+       JOIN app_users app_user ON app_user.email = outbox.recipient_email
+       WHERE outbox.id = $1::uuid
+       FOR UPDATE OF outbox, issue`,
+      [job.outboxId],
+    )
+    const current = currentResult.rows[0]
+    if (
+      !current
+      || current.outbox_status !== 'processing'
+      || current.lock_token !== job.lockToken
+    ) {
+      return { status: 'suppressed' as const, attempted: false }
+    }
+
+    const currentJob = toNotificationJob(current)
+    const sameScope = currentJob.organizationId === job.organizationId
+      && currentJob.restaurantGuid === job.restaurantGuid
+      && currentJob.businessDate === job.businessDate
+    if (
+      !sameScope
+      || current.issue_status !== 'open'
+      || current.current_occurrence !== current.occurrence
+      || currentJob.issues.length === 0
+    ) {
+      await markClaimedNotificationSuppressed(client, {
+        job: currentJob,
+        reason: 'The accounting issue changed after the one daily delivery slot was reserved',
+      })
+      return { status: 'suppressed' as const, attempted: false }
+    }
+
+    const recipients = await authorizedRecipients(
+      client,
+      currentJob.organizationId,
+      currentJob.restaurantGuid,
+      currentJob.businessDate,
+    )
+    if (!recipients.some((recipient) => recipient.email.toLowerCase() === currentJob.recipientEmail)) {
+      await markClaimedNotificationSuppressed(client, {
+        job: currentJob,
+        reason: 'Recipient no longer has accounting administration access',
+      })
+      return { status: 'suppressed' as const, attempted: false }
+    }
+
+    const posting = await postingNotificationState(client, {
+      organizationId: currentJob.organizationId,
+      restaurantGuid: currentJob.restaurantGuid,
+      businessDate: currentJob.businessDate,
+    }, { lockPostingOutcome: true })
+    if (posting?.phase === 'unsettled' || posting?.phase === 'suppressed') {
+      await markClaimedNotificationSuppressed(client, {
+        job: currentJob,
+        reason: posting.phase === 'suppressed'
+          ? 'The accounting date was posted or cancelled after the one daily delivery slot was reserved'
+          : 'The posting result changed after the one daily delivery slot was reserved',
+      })
+      return { status: 'suppressed' as const, attempted: false }
+    }
+
+    const currentWorkspace = await readPosAccountingWorkspaceFromPostgres({
+      organizationId: currentJob.organizationId,
+      restaurantGuid: currentJob.restaurantGuid,
+      businessDate: currentJob.businessDate,
+      client,
+    })
+    const freshIssues = currentNotificationIssues(currentWorkspace, posting)
+    if (freshIssues.length === 0) {
+      await markClaimedNotificationSuppressed(client, {
+        job: currentJob,
+        reason: 'The accounting issue was resolved after the one daily delivery slot was reserved',
+      })
+      return { status: 'suppressed' as const, attempted: false }
+    }
+    const freshFingerprint = posAccountingIssueFingerprint(freshIssues)
+    await client.query(
+      `UPDATE pos_accounting_notification_outbox SET
+         issue_fingerprint = $3, issues = $4::jsonb, updated_at = now()
+       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid`,
+      [currentJob.outboxId, currentJob.lockToken, freshFingerprint, JSON.stringify(freshIssues)],
+    )
+    await client.query(
+      `UPDATE pos_accounting_issue_states SET
+         issue_fingerprint = $2, issues = $3::jsonb, last_seen_at = now(), updated_at = now()
+       WHERE id = $1::uuid AND status = 'open' AND occurrence = $4`,
+      [currentJob.issueStateId, freshFingerprint, JSON.stringify(freshIssues), currentJob.occurrence],
+    )
+    const deliveryJob = { ...currentJob, issues: freshIssues }
+
+    let providerMessageId: string | null = null
+    try {
+      const result = await sendPosAccountingIssueEmail({
+        to: deliveryJob.recipientEmail,
+        recipientName: deliveryJob.recipientName,
+        organizationId: deliveryJob.organizationId,
+        organizationName: deliveryJob.organizationName,
+        restaurantName: deliveryJob.restaurantName,
+        restaurantGuid: deliveryJob.restaurantGuid,
+        businessDate: deliveryJob.businessDate,
+        issues: deliveryJob.issues,
+      })
+      providerMessageId = result.messageId
+    } catch (error) {
+      await markClaimedNotificationDead(client, {
+        job: currentJob,
+        error: error instanceof Error ? error.message : 'Email delivery failed',
+      })
+      return { status: 'dead' as const, attempted: true }
+    }
+
     const completed = await client.query(
       `UPDATE pos_accounting_notification_outbox SET
          status = 'succeeded', sent_at = now(), provider_message_id = $3,
@@ -750,16 +1107,18 @@ export async function completePosAccountingNotificationInPostgres(input: {
          updated_at = now()
        WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid
        RETURNING id`,
-      [input.job.outboxId, input.job.lockToken, input.providerMessageId],
+      [currentJob.outboxId, currentJob.lockToken, providerMessageId],
     )
-    if (!completed.rows[0]) return false
+    if (!completed.rows[0]) {
+      throw new Error('POS accounting notification delivery reservation changed unexpectedly')
+    }
     await client.query(
       `UPDATE pos_accounting_issue_states SET
          last_notified_at = now(), notification_count = notification_count + 1, updated_at = now()
        WHERE id = $1::uuid`,
-      [input.job.issueStateId],
+      [currentJob.issueStateId],
     )
-    return true
+    return { status: 'succeeded' as const, attempted: true }
   })
 }
 
@@ -767,17 +1126,16 @@ export async function failPosAccountingNotificationInPostgres(input: {
   job: PosAccountingNotificationJob
   error: string
 }) {
-  const dead = input.job.attemptCount >= MAX_DELIVERY_ATTEMPTS
-  const retrySeconds = Math.min(3600, 30 * (2 ** Math.max(0, input.job.attemptCount - 1)))
   const result = await query(
     `UPDATE pos_accounting_notification_outbox SET
-       status = $3, available_at = CASE WHEN $3 = 'dead' THEN available_at ELSE now() + make_interval(secs => $5) END,
-       last_error = $4, locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
+       status = 'dead', last_error = $3,
+       locked_at = NULL, locked_by = NULL, lock_token = NULL, updated_at = now()
      WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2::uuid
      RETURNING id`,
-    [input.job.outboxId, input.job.lockToken, dead ? 'dead' : 'failed', cleanText(input.error, 'Email delivery failed', 1000), retrySeconds],
+    [input.job.outboxId, input.job.lockToken, cleanText(input.error, 'Email delivery outcome is ambiguous', 1_000)],
   )
-  return { accepted: Boolean(result.rows[0]), dead }
+  const accepted = Boolean(result.rows[0])
+  return { accepted, dead: accepted }
 }
 
 export async function processPosAccountingNotificationOutbox(input: {
@@ -789,34 +1147,34 @@ export async function processPosAccountingNotificationOutbox(input: {
     'pos-notification-worker',
     200,
   )
-  const jobs = await claimPosAccountingNotificationsInPostgres({ limit: input.limit || 2, workerId })
+  const limit = Math.max(1, Math.min(input.limit || 2, 20))
+  let claimed = 0
   let succeeded = 0
   let failed = 0
   let dead = 0
-  for (const job of jobs) {
+  while (claimed < limit) {
+    const jobs = await claimPosAccountingNotificationsInPostgres({ limit: 1, workerId })
+    const job = jobs[0]
+    if (!job) break
+    claimed += 1
     try {
-      const result = await sendPosAccountingIssueEmail({
-        to: job.recipientEmail,
-        recipientName: job.recipientName,
-        organizationId: job.organizationId,
-        organizationName: job.organizationName,
-        restaurantName: job.restaurantName,
-        restaurantGuid: job.restaurantGuid,
-        businessDate: job.businessDate,
-        issues: job.issues,
-      })
-      if (!await completePosAccountingNotificationInPostgres({ job, providerMessageId: result.messageId })) {
-        throw new Error('POS accounting notification worker lease expired')
+      const outcome = await deliverClaimedPosAccountingNotificationInPostgres(job)
+      if (outcome.status === 'succeeded') {
+        succeeded += 1
+      } else if (outcome.status === 'dead') {
+        dead += 1
+        if (outcome.attempted) failed += 1
       }
-      succeeded += 1
     } catch (error) {
       const outcome = await failPosAccountingNotificationInPostgres({
         job,
-        error: error instanceof Error ? error.message : 'Email delivery failed',
+        error: error instanceof Error
+          ? `Ambiguous delivery outcome: ${error.message}`
+          : 'Ambiguous email delivery outcome',
       })
       if (outcome.accepted) failed += 1
       if (outcome.dead) dead += 1
     }
   }
-  return { claimed: jobs.length, succeeded, failed, dead }
+  return { claimed, succeeded, failed, dead }
 }
