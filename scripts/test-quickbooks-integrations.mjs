@@ -1179,6 +1179,32 @@ for (const fragment of [
   'AND reviewed_maton_connection_id = $6',
 ]) includes(writePersistence, fragment, 'QuickBooks write persistence')
 assert.ok(!writePersistence.includes('console.'), 'QuickBooks write persistence must not log accounting payloads')
+const transitionWriteSource = writePersistence.slice(
+  writePersistence.indexOf('export async function transitionQuickBooksWriteRequestInPostgres'),
+  writePersistence.indexOf('export async function claimQuickBooksWriteJobsInPostgres'),
+)
+assert.ok(
+  transitionWriteSource.indexOf('acquireTransactionAdvisoryLock(client, `quickbooks-binding:')
+    < transitionWriteSource.indexOf('readWriteRequest(client'),
+  'A manual QuickBooks retry/cancellation must acquire the delivery fence before locking its child request',
+)
+const completeWriteSource = writePersistence.slice(
+  writePersistence.indexOf('export async function completeQuickBooksWriteJobInPostgres'),
+  writePersistence.indexOf('function safeError'),
+)
+assert.ok(
+  completeWriteSource.indexOf('acquireTransactionAdvisoryLock(client, `quickbooks-binding:')
+    < completeWriteSource.indexOf('SELECT approved_by'),
+  'QuickBooks completion must acquire the delivery fence before locking its child request',
+)
+const failWriteSource = writePersistence.slice(
+  writePersistence.indexOf('export async function failQuickBooksWriteJobInPostgres'),
+)
+assert.ok(
+  failWriteSource.indexOf('acquireTransactionAdvisoryLock(client, `quickbooks-binding:')
+    < failWriteSource.indexOf('UPDATE quickbooks_write_requests SET'),
+  'QuickBooks failure must acquire the delivery fence before mutating its child request',
+)
 
 const organizationId = '11111111-1111-4111-8111-111111111111'
 const actorEmail = 'manager@example.com'
@@ -1968,10 +1994,34 @@ for (const fragment of [
   'assertPreparedBatchMatchesCurrentPayloads',
   'fingerprintPosAccountingPostingPayloads',
   'FOR UPDATE OF batch, journal',
+  "new Set(['succeeded', 'dead', 'cancelled'])",
+  "const nextStatus: PostingBatchStatus = !bothSettled",
+  "['dead', 'cancelled'].includes(batch.sales_receipt_status || '')",
+  "['dead', 'cancelled'].includes(batch.journal_entry_status)",
+  'Sales Receipt:',
+  'Journal Entry:',
 ]) includes(posPostingPersistence, fragment, 'POS accounting posting persistence')
 const preparePostingSource = posPostingPersistence.slice(
   posPostingPersistence.indexOf('export async function preparePosAccountingPostingBatchInPostgres'),
   posPostingPersistence.indexOf('export async function approvePosAccountingPostingBatchInPostgres'),
+)
+const approvePostingSource = posPostingPersistence.slice(
+  posPostingPersistence.indexOf('export async function approvePosAccountingPostingBatchInPostgres'),
+  posPostingPersistence.indexOf('async function cancelPreparedPostingBatchForExternalEvidence'),
+)
+assert.ok(
+  approvePostingSource.indexOf('acquireTransactionAdvisoryLock(client, `quickbooks-binding:')
+    < approvePostingSource.indexOf('acquireTransactionAdvisoryLock(client, `pos-accounting-posting:'),
+  'POS posting retry approval must acquire the QuickBooks delivery fence before its batch lock',
+)
+const externalPostingSource = posPostingPersistence.slice(
+  posPostingPersistence.indexOf('export async function recordExternalPostingInPostgres'),
+  posPostingPersistence.indexOf('export async function recordMatchedExternalResultsInPostgres'),
+)
+assert.ok(
+  externalPostingSource.indexOf('acquireTransactionAdvisoryLock(client, `quickbooks-binding:')
+    < externalPostingSource.indexOf('acquireTransactionAdvisoryLock(client, `pos-accounting-posting:'),
+  'External posting must acquire the QuickBooks delivery fence before its draft lock',
 )
 assert.ok(
   preparePostingSource.indexOf('assertCanonicalDraftReadiness(draft)')

@@ -697,6 +697,7 @@ export async function approvePosAccountingPostingBatchInPostgres(input: {
 }) {
   const batchId = requiredUuid(input.batchId, 'Posting batch')
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
     await acquireTransactionAdvisoryLock(client, `pos-accounting-posting:${input.organizationId}:${batchId}`)
     const batch = await readBatch(client, input.organizationId, batchId)
     if (!batch) throw new PosAccountingPostingError('POS_ACCOUNTING_POSTING_BATCH_NOT_FOUND', 'The posting batch was not found', 404)
@@ -893,6 +894,7 @@ export async function recordExternalPostingInPostgres(input: {
   const providerName = requiredExternalProvider(input.providerName)
   const providerReference = optionalExternalReference(input.providerReference)
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.organizationId}`)
     await acquireTransactionAdvisoryLock(client, `pos-accounting-posting:${input.organizationId}:${draftId}`)
     const draftResult = await client.query<ExternalPostingDraftRow>(
       `SELECT draft.id::text, draft.restaurant_guid::text, draft.business_date::text,
@@ -1231,22 +1233,32 @@ export async function synchronizePosAccountingPostingBatchForRequest(
   )
   const batch = batchResult.rows[0]
   if (!batch) return null
+  const terminalRequestStatuses = new Set(['succeeded', 'dead', 'cancelled'])
+  const receiptSettled = !batch.sales_receipt_request_id
+    || terminalRequestStatuses.has(batch.sales_receipt_status || '')
+  const journalSettled = terminalRequestStatuses.has(batch.journal_entry_status)
   const receiptSucceeded = !batch.sales_receipt_request_id || batch.sales_receipt_status === 'succeeded'
   const journalSucceeded = batch.journal_entry_status === 'succeeded'
   const receiptFailed = Boolean(batch.sales_receipt_request_id)
-    && ['failed', 'dead'].includes(batch.sales_receipt_status || '')
-  const journalFailed = ['failed', 'dead'].includes(batch.journal_entry_status)
+    && ['dead', 'cancelled'].includes(batch.sales_receipt_status || '')
+  const journalFailed = ['dead', 'cancelled'].includes(batch.journal_entry_status)
+  const bothSettled = receiptSettled && journalSettled
   const bothSucceeded = receiptSucceeded && journalSucceeded
   const anySucceeded = (Boolean(batch.sales_receipt_request_id) && receiptSucceeded) || journalSucceeded
   const anyFailed = receiptFailed || journalFailed
-  const nextStatus: PostingBatchStatus = bothSucceeded
-    ? 'posted'
-    : anySucceeded && anyFailed
-      ? 'partial_failed'
-      : anyFailed
-        ? 'failed'
-        : 'posting'
-  const lastError = [batch.sales_receipt_error, batch.journal_entry_error].filter(Boolean).join(' | ') || null
+  const nextStatus: PostingBatchStatus = !bothSettled
+    ? 'posting'
+    : bothSucceeded
+      ? 'posted'
+      : anySucceeded && anyFailed
+        ? 'partial_failed'
+        : 'failed'
+  const lastError = nextStatus === 'failed' || nextStatus === 'partial_failed'
+    ? [
+        ...(receiptFailed ? [`Sales Receipt: ${batch.sales_receipt_error || 'QuickBooks did not post the Sales Receipt.'}`] : []),
+        ...(journalFailed ? [`Journal Entry: ${batch.journal_entry_error || 'QuickBooks did not post the Journal Entry.'}`] : []),
+      ].join(' | ') || null
+    : null
   await client.query(
     `UPDATE pos_accounting_posting_batches SET
        status = $3, last_error = $4,
