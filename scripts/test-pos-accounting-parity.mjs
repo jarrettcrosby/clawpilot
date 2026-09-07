@@ -188,6 +188,52 @@ function journalTransaction({
   }
 }
 
+function paymentExceptionsJournalTransaction({
+  id,
+  date,
+  documentNumber,
+  amount,
+  side,
+  accountId = 'account-payment-exceptions',
+  accountName = 'Payment Exceptions',
+  memo = `Toast ${date}`,
+}) {
+  const offsetSide = side === 'credit' ? 'Debit' : 'Credit'
+  const paymentExceptionsSide = side === 'credit' ? 'Credit' : 'Debit'
+  return journalTransaction({
+    id,
+    date,
+    documentNumber,
+    memo,
+    lines: [{
+      Id: '1', Amount: amount, DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: paymentExceptionsSide,
+        AccountRef: { value: accountId, name: accountName },
+      },
+    }, {
+      Id: '2', Amount: amount, DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: offsetSide,
+        AccountRef: { value: 'account-settlement-offset', name: 'Settlement offset' },
+      },
+    }],
+  })
+}
+
+function singleItemReceiptLines(amount) {
+  return [{
+    Id: '1', Amount: amount, DetailType: 'SalesItemLineDetail',
+    SalesItemLineDetail: {
+      ItemRef: { value: 'item-pos-sales', name: 'POS sales' },
+      Qty: '1',
+    },
+  }, {
+    Id: '2', Amount: amount, DetailType: 'SubTotalLineDetail',
+    SubTotalLineDetail: {},
+  }]
+}
+
 function accountingDraft({
   id,
   date,
@@ -258,7 +304,11 @@ function accountingDraft({
   }
 }
 
+const clearingReconciliation = loadTypeScriptModule(
+  'app_src/lib/accounting/posClearingReconciliation.ts',
+)
 const pure = loadTypeScriptModule('app_src/lib/persistence/posAccountingParity.ts', {
+  '@/lib/accounting/posClearingReconciliation': clearingReconciliation,
   '@/lib/persistence/postgres': {
     query: async () => {
       throw new Error('Pure parity helpers must not query Postgres')
@@ -830,6 +880,832 @@ assert.equal(journalOnlyCaptureBaseline.summary.journalOnlyCaptureCount, 1)
 assert.equal(journalOnlyCaptureBaseline.summary.unmatchedEvidence, 0)
 assert.equal(journalOnlyCaptureBaseline.journalOnlyCaptures[0].journalBalance.status, 'match')
 
+const julyCrossDayClearingBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: '260723-payment-exceptions-capture',
+    date: '2026-07-23',
+    documentNumber: '260723POS',
+    amount: '44.54',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: '260724-payment-exceptions-capture',
+    date: '2026-07-24',
+    documentNumber: '260724POS',
+    amount: '95.26',
+    side: 'credit',
+  })),
+  pure.normalizeSalesReceiptEvidence(receiptTransaction({
+    id: '260725-sales-receipt',
+    date: '2026-07-25',
+    documentNumber: '260725POS',
+    total: '139.80',
+    tax: '0.00',
+    lines: singleItemReceiptLines('139.80'),
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: '260725-payment-exceptions-release',
+    date: '2026-07-25',
+    documentNumber: '260725POS',
+    amount: '139.80',
+    side: 'debit',
+  })),
+], {
+  organizationId: ORGANIZATION_ID,
+  quickBooksCompanyId: 'qbo-company-test',
+  paymentExceptionAccounts: [{
+    accountId: 'account-payment-exceptions',
+    accountName: 'Payment Exceptions',
+  }],
+  asOfBusinessDate: '2026-07-25',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-07-23',
+    toBusinessDate: '2026-07-25',
+  }],
+})
+assert.equal(julyCrossDayClearingBaseline.summary.clearingLifecycleCount, 1)
+assert.equal(julyCrossDayClearingBaseline.summary.clearingStatusCounts.settled, 1)
+assert.equal(julyCrossDayClearingBaseline.summary.journalOnlyCaptureCount, 2)
+assert.equal(julyCrossDayClearingBaseline.summary.unmatchedGroups, 0)
+assert.equal(julyCrossDayClearingBaseline.summary.unmatchedEvidence, 0)
+assert.equal(julyCrossDayClearingBaseline.summary.ambiguousEvidence, 0)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].evidenceCoverage, 'cached_only')
+assert.deepEqual(
+  [...julyCrossDayClearingBaseline.clearingLifecycles[0].captureBusinessDates],
+  ['2026-07-23', '2026-07-24'],
+)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].capturedCents, 13980)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].releasedCents, 13980)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].appliedCents, 13980)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].outstandingCents, 0)
+assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].salesReceipts.length, 1)
+
+const julyDateFilteredTransactions = [
+  paymentExceptionsJournalTransaction({
+    id: '260724-date-filtered-capture',
+    date: '2026-07-24',
+    documentNumber: '260724POS',
+    amount: '95.26',
+    side: 'credit',
+  }),
+  receiptTransaction({
+    id: '260725-date-filtered-sales-receipt',
+    date: '2026-07-25',
+    documentNumber: '260725POS',
+    total: '139.80',
+    tax: '0.00',
+    lines: singleItemReceiptLines('139.80'),
+  }),
+  paymentExceptionsJournalTransaction({
+    id: '260725-date-filtered-release',
+    date: '2026-07-25',
+    documentNumber: '260725POS',
+    amount: '139.80',
+    side: 'debit',
+  }),
+]
+const julyDateFilteredReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: julyDateFilteredTransactions,
+  fullHistoryTransactions: julyDateFilteredTransactions,
+  clearingOpeningBalanceTransactions: [
+    paymentExceptionsJournalTransaction({
+      id: '260723-date-filtered-opening-capture',
+      date: '2026-07-23',
+      documentNumber: '260723POS',
+      amount: '44.54',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: '260723-date-filtered-wrong-account',
+      date: '2026-07-23',
+      documentNumber: '260723OTHER',
+      amount: '999.99',
+      side: 'credit',
+      accountId: 'account-not-payment-exceptions',
+      accountName: 'Other clearing',
+    }),
+  ],
+  historicalBaselineOptions: {
+    organizationId: ORGANIZATION_ID,
+    quickBooksCompanyId: 'qbo-company-test',
+    paymentExceptionAccounts: [{
+      accountId: 'account-payment-exceptions',
+      accountName: 'Payment Exceptions',
+    }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-25',
+    evidenceCoverageRanges: [{
+      fromBusinessDate: '2026-07-23',
+      toBusinessDate: '2026-07-25',
+    }],
+  },
+})
+assert.equal(julyDateFilteredReport.historicalBaseline.summary.clearingLifecycleCount, 1)
+assert.equal(julyDateFilteredReport.historicalBaseline.summary.clearingStatusCounts.settled, 0)
+assert.equal(julyDateFilteredReport.historicalBaseline.summary.clearingStatusCounts.ambiguous, 1)
+assert.equal(julyDateFilteredReport.historicalBaseline.summary.unmatchedGroups, 0)
+assert.equal(julyDateFilteredReport.historicalBaseline.summary.unmatchedEvidence, 0)
+assert.equal(julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].status, 'ambiguous')
+assert.equal(
+  julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].evidenceCoverage,
+  'cached_only',
+)
+assert.deepEqual(
+  [...julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].captureBusinessDates],
+  ['2026-07-23', '2026-07-24'],
+)
+assert.equal(julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].capturedCents, 13980)
+assert.equal(julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].releasedCents, 13980)
+assert.equal(julyDateFilteredReport.historicalBaseline.clearingLifecycles[0].outstandingCents, 0)
+
+const openingBalanceVisibilityReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: [],
+  fullHistoryTransactions: [],
+  clearingOpeningBalanceTransactions: [
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-settled-capture',
+      date: '2026-07-20',
+      documentNumber: '260720POS',
+      amount: '12.34',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-settled-release',
+      date: '2026-07-21',
+      documentNumber: '260721POS',
+      amount: '12.34',
+      side: 'debit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-unresolved-capture',
+      date: '2026-07-22',
+      documentNumber: '260722POS',
+      amount: '8.76',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-orphan-release',
+      date: '2026-07-19',
+      documentNumber: '260719POS',
+      amount: '7.65',
+      side: 'debit',
+    }),
+  ],
+  historicalBaselineOptions: {
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-25',
+    providerHistoryBoundaryProven: true,
+  },
+})
+assert.equal(openingBalanceVisibilityReport.historicalBaseline.summary.cachedTransactions, 0)
+assert.equal(openingBalanceVisibilityReport.historicalBaseline.summary.clearingLifecycleCount, 1)
+assert.equal(openingBalanceVisibilityReport.historicalBaseline.clearingLifecycles[0].status, 'pending')
+assert.equal(openingBalanceVisibilityReport.historicalBaseline.clearingLifecycles[0].capturedCents, 876)
+assert.equal(openingBalanceVisibilityReport.historicalBaseline.summary.unmatchedEvidence, 0)
+assert.equal(
+  JSON.stringify(openingBalanceVisibilityReport.historicalBaseline)
+    .includes('pre-range-orphan-release'),
+  false,
+)
+
+const partiallyReleasedOpeningBalanceReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: [paymentExceptionsJournalTransaction({
+    id: 'in-range-final-release',
+    date: '2026-07-24',
+    documentNumber: '260724POS',
+    amount: '60.00',
+    side: 'debit',
+  })],
+  fullHistoryTransactions: [paymentExceptionsJournalTransaction({
+    id: 'in-range-final-release',
+    date: '2026-07-24',
+    documentNumber: '260724POS',
+    amount: '60.00',
+    side: 'debit',
+  })],
+  clearingOpeningBalanceTransactions: [
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-partial-capture',
+      date: '2026-07-20',
+      documentNumber: '260720POS',
+      amount: '100.00',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'pre-range-partial-release',
+      date: '2026-07-21',
+      documentNumber: '260721POS',
+      amount: '40.00',
+      side: 'debit',
+    }),
+  ],
+  historicalBaselineOptions: {
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-24',
+    providerHistoryBoundaryProven: true,
+  },
+})
+assert.equal(partiallyReleasedOpeningBalanceReport.historicalBaseline.clearingLifecycles.length, 1)
+assert.equal(partiallyReleasedOpeningBalanceReport.historicalBaseline.clearingLifecycles[0].status, 'settled')
+assert.deepEqual(
+  [...partiallyReleasedOpeningBalanceReport.historicalBaseline.clearingLifecycles[0]
+    .releaseBusinessDates],
+  ['2026-07-21', '2026-07-24'],
+)
+assert.equal(
+  partiallyReleasedOpeningBalanceReport.historicalBaseline.clearingLifecycles[0].releasedCents,
+  10000,
+)
+
+const incompleteOpeningBalanceReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: julyDateFilteredTransactions,
+  fullHistoryTransactions: julyDateFilteredTransactions,
+  clearingOpeningBalanceTransactions: [paymentExceptionsJournalTransaction({
+    id: 'incomplete-opening-capture',
+    date: '2026-07-23',
+    documentNumber: '260723POS',
+    amount: '44.54',
+    side: 'credit',
+  })],
+  historicalBaselineOptions: {
+    organizationId: ORGANIZATION_ID,
+    quickBooksCompanyId: 'qbo-company-test',
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-25',
+    openingBalanceQueryTruncated: true,
+  },
+})
+assert.equal(incompleteOpeningBalanceReport.historicalBaseline.clearingLifecycles.length, 1)
+assert.equal(incompleteOpeningBalanceReport.historicalBaseline.clearingLifecycles[0].status, 'ambiguous')
+assert.match(
+  incompleteOpeningBalanceReport.historicalBaseline.clearingLifecycles[0].reviewReason,
+  /bounded opening-balance query/,
+)
+
+const incompleteOpeningSelectedOnlyReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: [
+    paymentExceptionsJournalTransaction({
+      id: 'incomplete-selected-only-capture',
+      date: '2026-07-24',
+      documentNumber: '260724POS',
+      amount: '44.54',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'incomplete-selected-only-release',
+      date: '2026-07-25',
+      documentNumber: '260725POS',
+      amount: '44.54',
+      side: 'debit',
+    }),
+  ],
+  fullHistoryTransactions: [
+    paymentExceptionsJournalTransaction({
+      id: 'incomplete-selected-only-capture',
+      date: '2026-07-24',
+      documentNumber: '260724POS',
+      amount: '44.54',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'incomplete-selected-only-release',
+      date: '2026-07-25',
+      documentNumber: '260725POS',
+      amount: '44.54',
+      side: 'debit',
+    }),
+  ],
+  clearingOpeningBalanceTransactions: [],
+  historicalBaselineOptions: {
+    organizationId: ORGANIZATION_ID,
+    quickBooksCompanyId: 'qbo-company-test',
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-25',
+    openingBalanceQueryTruncated: true,
+  },
+})
+assert.equal(incompleteOpeningSelectedOnlyReport.historicalBaseline.clearingLifecycles.length, 1)
+assert.equal(
+  incompleteOpeningSelectedOnlyReport.historicalBaseline.clearingLifecycles[0].status,
+  'ambiguous',
+)
+assert.match(
+  incompleteOpeningSelectedOnlyReport.historicalBaseline.clearingLifecycles[0].reviewReason,
+  /account offset cannot be treated as conclusive/,
+)
+
+const truncatedOpeningRetentionReport = pure.buildPosAccountingParityReport({
+  drafts: [],
+  transactions: [],
+  fullHistoryTransactions: [],
+  clearingOpeningBalanceTransactions: [
+    paymentExceptionsJournalTransaction({
+      id: 'truncated-opening-apparent-capture',
+      date: '2026-07-20',
+      documentNumber: '260720POS',
+      amount: '10.00',
+      side: 'credit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'truncated-opening-apparent-release',
+      date: '2026-07-21',
+      documentNumber: '260721POS',
+      amount: '10.00',
+      side: 'debit',
+    }),
+    paymentExceptionsJournalTransaction({
+      id: 'truncated-opening-orphan-release',
+      date: '2026-07-22',
+      documentNumber: '260722POS',
+      amount: '5.00',
+      side: 'debit',
+    }),
+  ],
+  historicalBaselineOptions: {
+    organizationId: ORGANIZATION_ID,
+    quickBooksCompanyId: 'qbo-company-test',
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    fromBusinessDate: '2026-07-24',
+    asOfBusinessDate: '2026-07-25',
+    openingBalanceQueryTruncated: true,
+  },
+})
+assert.equal(truncatedOpeningRetentionReport.historicalBaseline.clearingLifecycles.length, 2)
+assert.equal(
+  truncatedOpeningRetentionReport.historicalBaseline.clearingLifecycles.every(
+    (lifecycle) => lifecycle.status === 'ambiguous',
+  ),
+  true,
+)
+assert.equal(
+  JSON.stringify(truncatedOpeningRetentionReport.historicalBaseline)
+    .includes('truncated-opening-orphan-release'),
+  true,
+)
+
+const splitReleaseClearingBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-capture',
+    date: '2026-08-01',
+    documentNumber: '260801POS',
+    amount: '100.00',
+    side: 'credit',
+  })),
+  pure.normalizeSalesReceiptEvidence(receiptTransaction({
+    id: 'split-release-receipt-first',
+    date: '2026-08-02',
+    documentNumber: '260802POS',
+    total: '40.00',
+    tax: '0.00',
+    lines: singleItemReceiptLines('40.00'),
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-journal-first',
+    date: '2026-08-02',
+    documentNumber: '260802POS',
+    amount: '40.00',
+    side: 'debit',
+  })),
+  pure.normalizeSalesReceiptEvidence(receiptTransaction({
+    id: 'split-release-receipt-final',
+    date: '2026-08-03',
+    documentNumber: '260803POS',
+    total: '60.00',
+    tax: '0.00',
+    lines: singleItemReceiptLines('60.00'),
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-journal-final',
+    date: '2026-08-03',
+    documentNumber: '260803POS',
+    amount: '60.00',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-03',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-01',
+    toBusinessDate: '2026-08-03',
+  }],
+})
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles.length, 1)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].capturedCents, 10_000)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].releasedCents, 10_000)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].appliedCents, 10_000)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].outstandingCents, 0)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].releaseJournals.length, 2)
+assert.equal(splitReleaseClearingBaseline.clearingLifecycles[0].salesReceipts.length, 2)
+assert.equal(splitReleaseClearingBaseline.summary.unmatchedEvidence, 0)
+assert.deepEqual(
+  [...splitReleaseClearingBaseline.clearingLifecycles[0].releaseBusinessDates],
+  ['2026-08-02', '2026-08-03'],
+)
+
+const dateOnlyReceiptDoesNotBackRelease = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'date-only-capture',
+    date: '2026-08-04',
+    documentNumber: '260804POS',
+    amount: '50.00',
+    side: 'credit',
+  })),
+  pure.normalizeSalesReceiptEvidence({
+    ...receiptTransaction({
+      id: 'date-only-unrelated-receipt',
+      date: '2026-08-05',
+      documentNumber: '260805POS',
+      memo: '',
+      total: '50.00',
+      tax: '0.00',
+      lines: singleItemReceiptLines('50.00'),
+    }),
+    pos_accounting_origin: 'shogo',
+  }),
+  pure.normalizeJournalEntryEvidence({
+    ...paymentExceptionsJournalTransaction({
+      id: 'date-only-release',
+      date: '2026-08-05',
+      documentNumber: '260805POS',
+      memo: '',
+      amount: '50.00',
+      side: 'debit',
+    }),
+    pos_accounting_origin: 'shogo',
+  }),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-05',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-04',
+    toBusinessDate: '2026-08-05',
+  }],
+})
+assert.equal(dateOnlyReceiptDoesNotBackRelease.summary.dateFallbackPairs, 0)
+assert.equal(dateOnlyReceiptDoesNotBackRelease.clearingLifecycles.length, 1)
+assert.equal(dateOnlyReceiptDoesNotBackRelease.clearingLifecycles[0].status, 'settled')
+assert.equal(dateOnlyReceiptDoesNotBackRelease.clearingLifecycles[0].salesReceipts.length, 0)
+assert.equal(dateOnlyReceiptDoesNotBackRelease.clearingLifecycles[0].reviewReason, null)
+assert.equal(dateOnlyReceiptDoesNotBackRelease.summary.unmatchedEvidence, 1)
+assert.equal(dateOnlyReceiptDoesNotBackRelease.unmatchedGroups.length, 1)
+assert.equal(
+  dateOnlyReceiptDoesNotBackRelease.unmatchedGroups[0].evidence[0].providerTransactionId,
+  'date-only-unrelated-receipt',
+)
+
+const lateFutureOrderReleaseBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'late-future-order-capture',
+    date: '2026-07-01',
+    documentNumber: '260701POS',
+    amount: '75.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'late-future-order-release',
+    date: '2026-08-15',
+    documentNumber: '260815POS',
+    amount: '75.00',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-15',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-07-01',
+    toBusinessDate: '2026-08-15',
+  }],
+})
+assert.equal(lateFutureOrderReleaseBaseline.clearingLifecycles.length, 1)
+assert.equal(lateFutureOrderReleaseBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(lateFutureOrderReleaseBaseline.clearingLifecycles[0].appliedCents, 7_500)
+assert.equal(lateFutureOrderReleaseBaseline.clearingLifecycles[0].salesReceipts.length, 0)
+assert.equal(lateFutureOrderReleaseBaseline.summary.unmatchedGroups, 0)
+assert.equal(lateFutureOrderReleaseBaseline.summary.unmatchedEvidence, 0)
+
+const splitReleaseWithoutReceiptBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-no-receipt-capture',
+    date: '2026-08-20',
+    documentNumber: '260820POS',
+    amount: '100.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-no-receipt-first',
+    date: '2026-08-21',
+    documentNumber: '260821POS',
+    amount: '40.00',
+    side: 'debit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'split-release-no-receipt-final',
+    date: '2026-08-22',
+    documentNumber: '260822POS',
+    amount: '60.00',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-22',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-20',
+    toBusinessDate: '2026-08-22',
+  }],
+})
+assert.equal(splitReleaseWithoutReceiptBaseline.clearingLifecycles.length, 1)
+assert.equal(splitReleaseWithoutReceiptBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(splitReleaseWithoutReceiptBaseline.clearingLifecycles[0].releaseJournals.length, 2)
+assert.equal(splitReleaseWithoutReceiptBaseline.clearingLifecycles[0].salesReceipts.length, 0)
+assert.equal(splitReleaseWithoutReceiptBaseline.summary.unmatchedGroups, 0)
+assert.equal(splitReleaseWithoutReceiptBaseline.summary.unmatchedEvidence, 0)
+
+const aggregateClearingCohortBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'aggregate-clearing-capture-40',
+    date: '2026-08-20',
+    documentNumber: '260820POS-A',
+    amount: '40.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'aggregate-clearing-capture-90',
+    date: '2026-08-21',
+    documentNumber: '260821POS-A',
+    amount: '90.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'aggregate-clearing-release-100',
+    date: '2026-08-22',
+    documentNumber: '260822POS-A',
+    amount: '100.00',
+    side: 'debit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'aggregate-clearing-release-30',
+    date: '2026-08-23',
+    documentNumber: '260823POS-A',
+    amount: '30.00',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-23',
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-20',
+    toBusinessDate: '2026-08-23',
+  }],
+})
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles.length, 1)
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].capturedCents, 13_000)
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].releasedCents, 13_000)
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].appliedCents, 13_000)
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].outstandingCents, 0)
+assert.equal(aggregateClearingCohortBaseline.clearingLifecycles[0].releaseJournals.length, 2)
+assert.equal(aggregateClearingCohortBaseline.summary.unmatchedGroups, 0)
+assert.equal(aggregateClearingCohortBaseline.summary.unmatchedEvidence, 0)
+
+const chronologyBlockedClearingBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'chronology-blocked-capture-40',
+    date: '2026-08-20',
+    documentNumber: '260820POS-B',
+    amount: '40.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'chronology-blocked-capture-90',
+    date: '2026-08-21',
+    documentNumber: '260821POS-B',
+    amount: '90.00',
+    side: 'credit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'chronology-blocked-release-100',
+    date: '2026-08-22',
+    documentNumber: '260822POS-B',
+    amount: '100.00',
+    side: 'debit',
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'chronology-blocked-release-40',
+    date: '2026-08-23',
+    documentNumber: '260823POS-B',
+    amount: '40.00',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-23',
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-20',
+    toBusinessDate: '2026-08-23',
+  }],
+})
+assert.equal(chronologyBlockedClearingBaseline.clearingLifecycles.length, 1)
+assert.equal(chronologyBlockedClearingBaseline.summary.clearingStatusCounts.settled, 0)
+assert.equal(chronologyBlockedClearingBaseline.summary.clearingStatusCounts.ambiguous, 1)
+assert.equal(chronologyBlockedClearingBaseline.clearingLifecycles[0].status, 'ambiguous')
+assert.equal(chronologyBlockedClearingBaseline.clearingLifecycles[0].appliedCents, 0)
+assert.equal(chronologyBlockedClearingBaseline.clearingLifecycles[0].outstandingCents, 13_000)
+assert.equal(chronologyBlockedClearingBaseline.clearingLifecycles[0].unappliedReleaseCents, 14_000)
+assert.deepEqual(
+  Array.from(
+    chronologyBlockedClearingBaseline.clearingLifecycles[0].releaseJournals,
+    (row) => row.providerTransactionId,
+  ),
+  ['chronology-blocked-release-100', 'chronology-blocked-release-40'],
+)
+assert.equal(chronologyBlockedClearingBaseline.summary.unmatchedGroups, 2)
+assert.equal(chronologyBlockedClearingBaseline.summary.unmatchedEvidence, 2)
+assert.deepEqual(
+  Array.from(chronologyBlockedClearingBaseline.unmatchedGroups)
+    .flatMap((group) => Array.from(group.evidence, (row) => row.providerTransactionId))
+    .sort(),
+  ['chronology-blocked-release-100', 'chronology-blocked-release-40'].sort(),
+)
+
+const multiAccountConflictBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(journalTransaction({
+    id: 'multi-account-payment-exceptions-conflict',
+    date: '2026-08-24',
+    documentNumber: '260824POS-CONFLICT',
+    lines: [{
+      Id: '1', Amount: '10.00', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Debit',
+        AccountRef: { value: 'account-payment-exceptions', name: 'Payment Exceptions' },
+      },
+    }, {
+      Id: '2', Amount: '10.00', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Credit',
+        AccountRef: { value: 'account-payment-exceptions', name: 'Payment Exceptions' },
+      },
+    }, {
+      Id: '3', Amount: '20.00', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Debit',
+        AccountRef: { value: 'account-payment-exceptions-alt', name: 'Payment Exceptions Alt' },
+      },
+    }, {
+      Id: '4', Amount: '20.00', DetailType: 'JournalEntryLineDetail',
+      JournalEntryLineDetail: {
+        PostingType: 'Credit',
+        AccountRef: { value: 'account-payment-exceptions-alt', name: 'Payment Exceptions Alt' },
+      },
+    }],
+  })),
+], {
+  paymentExceptionAccounts: [
+    { accountId: 'account-payment-exceptions' },
+    { accountId: 'account-payment-exceptions-alt' },
+  ],
+  asOfBusinessDate: '2026-08-24',
+})
+assert.equal(multiAccountConflictBaseline.clearingLifecycles.length, 2)
+assert.deepEqual(
+  Array.from(multiAccountConflictBaseline.clearingLifecycles, (row) => [
+      row.paymentExceptionsAccountId,
+      row.capturedCents,
+      row.releasedCents,
+      row.status,
+    ])
+    .sort((left, right) => left[0].localeCompare(right[0])),
+  [
+    ['account-payment-exceptions', 1_000, 1_000, 'ambiguous'],
+    ['account-payment-exceptions-alt', 2_000, 2_000, 'ambiguous'],
+  ],
+)
+
+const debitOnlyUnpairedBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'debit-without-capture-or-receipt',
+    date: '2026-08-01',
+    documentNumber: '260801POS',
+    amount: '44.54',
+    side: 'debit',
+  })),
+], {
+  paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+  asOfBusinessDate: '2026-08-01',
+  overdueGraceDays: 3,
+})
+assert.equal(debitOnlyUnpairedBaseline.summary.journalOnlyCaptureCount, 0)
+assert.equal(debitOnlyUnpairedBaseline.clearingLifecycles.length, 1)
+assert.equal(debitOnlyUnpairedBaseline.clearingLifecycles[0].status, 'ambiguous')
+assert.equal(debitOnlyUnpairedBaseline.clearingLifecycles[0].captureJournals.length, 0)
+assert.equal(
+  debitOnlyUnpairedBaseline.clearingLifecycles[0].releaseJournal.providerTransactionId,
+  'debit-without-capture-or-receipt',
+)
+
+const renamedAccountBaseline = pure.buildHistoricalPosAccountingBaseline([
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'renamed-account-capture',
+    date: '2026-08-10',
+    documentNumber: '260810POS',
+    amount: '25.00',
+    side: 'credit',
+    accountName: 'Deferred tender holding',
+  })),
+  pure.normalizeSalesReceiptEvidence(receiptTransaction({
+    id: 'renamed-account-receipt',
+    date: '2026-08-12',
+    documentNumber: '260812POS',
+    total: '25.00',
+    tax: '0.00',
+    lines: singleItemReceiptLines('25.00'),
+  })),
+  pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+    id: 'renamed-account-release',
+    date: '2026-08-12',
+    documentNumber: '260812POS',
+    amount: '25.00',
+    side: 'debit',
+    accountName: 'Deferred tender holding',
+  })),
+], {
+  paymentExceptionAccounts: [{
+    accountId: 'account-payment-exceptions',
+    accountName: 'Payment Exceptions before rename',
+  }],
+  asOfBusinessDate: '2026-08-12',
+  overdueGraceDays: 3,
+  evidenceCoverageRanges: [{
+    fromBusinessDate: '2026-08-10',
+    toBusinessDate: '2026-08-12',
+  }],
+})
+assert.equal(renamedAccountBaseline.clearingLifecycles.length, 1)
+assert.equal(renamedAccountBaseline.clearingLifecycles[0].status, 'settled')
+assert.equal(
+  renamedAccountBaseline.clearingLifecycles[0].accountMatchBasis,
+  'configured_account_id',
+)
+assert.equal(
+  renamedAccountBaseline.clearingLifecycles[0].paymentExceptionsAccountName,
+  'Deferred tender holding',
+)
+
+function agedCaptureBaseline(evidenceCoverageRanges, providerHistoryBoundaryProven = false) {
+  return pure.buildHistoricalPosAccountingBaseline([
+    pure.normalizeJournalEntryEvidence(paymentExceptionsJournalTransaction({
+      id: `aged-capture-${evidenceCoverageRanges.length ? 'complete' : 'cached'}`,
+      date: '2026-08-20',
+      documentNumber: '260820POS',
+      amount: '30.00',
+      side: 'credit',
+    })),
+  ], {
+    paymentExceptionAccounts: [{ accountId: 'account-payment-exceptions' }],
+    asOfBusinessDate: '2026-08-24',
+    overdueGraceDays: 3,
+    evidenceCoverageRanges,
+    providerHistoryBoundaryProven,
+  })
+}
+
+const cachedOnlyAgedCapture = agedCaptureBaseline([])
+assert.equal(cachedOnlyAgedCapture.clearingLifecycles.length, 1)
+assert.equal(cachedOnlyAgedCapture.clearingLifecycles[0].status, 'pending')
+assert.equal(cachedOnlyAgedCapture.clearingLifecycles[0].evidenceCoverage, 'cached_only')
+
+const forwardOnlyCoverageAgedCapture = agedCaptureBaseline([{
+  fromBusinessDate: '2026-08-20',
+  toBusinessDate: '2026-08-24',
+}])
+assert.equal(forwardOnlyCoverageAgedCapture.clearingLifecycles.length, 1)
+assert.equal(forwardOnlyCoverageAgedCapture.clearingLifecycles[0].status, 'pending')
+assert.equal(forwardOnlyCoverageAgedCapture.clearingLifecycles[0].evidenceCoverage, 'cached_only')
+
+const completeCoverageAgedCapture = agedCaptureBaseline([{
+  fromBusinessDate: '2026-08-20',
+  toBusinessDate: '2026-08-24',
+}], true)
+assert.equal(completeCoverageAgedCapture.clearingLifecycles.length, 1)
+assert.equal(completeCoverageAgedCapture.clearingLifecycles[0].status, 'pending')
+assert.equal(completeCoverageAgedCapture.clearingLifecycles[0].evidenceCoverage, 'complete')
+assert.equal(completeCoverageAgedCapture.clearingLifecycles[0].reviewReason, null)
+
 const sqlCalls = []
 async function queryMock(source, parameters = []) {
   sqlCalls.push({ source, parameters })
@@ -851,6 +1727,8 @@ async function queryMock(source, parameters = []) {
       connection_status: 'active',
       last_catalog_synced_at: '2026-09-16T12:00:00.000Z',
       last_pos_evidence_synced_at: '2026-09-16T12:00:00.000Z',
+      quickbooks_company_id: 'qbo-company-test',
+      maton_connection_id: 'maton-connection-test',
       sync_status: 'succeeded',
       sync_completed_at: '2026-09-16T12:00:00.000Z',
       sales_receipt_count: '49',
@@ -858,12 +1736,29 @@ async function queryMock(source, parameters = []) {
       drafts_newer_than_evidence: '0',
     }] }
   }
+  if (source.includes('FROM pos_accounting_catalog_mappings mapping')) {
+    return { rows: [{
+      account_id: 'account-payment-exceptions',
+      account_name: 'Payment Exceptions',
+    }] }
+  }
+  if (source.includes("event.event_type = 'quickbooks.pos_evidence.refreshed'")) {
+    return { rows: [{
+      from_business_date: '2025-03-14',
+      to_business_date: '2026-09-15',
+    }] }
+  }
+  if (source.includes("transaction.entity_type = 'JournalEntry'")
+    && source.includes('transaction.transaction_date < $2::date')) {
+    return { rows: [] }
+  }
   if (source.includes('LEFT JOIN toast_locations location')) return { rows: [] }
   if (source.includes('SELECT transaction.entity_type')) return { rows: historicalTransactions }
   throw new Error(`Unexpected parity query: ${source}`)
 }
 
 const reader = loadTypeScriptModule('app_src/lib/persistence/posAccountingParity.ts', {
+  '@/lib/accounting/posClearingReconciliation': clearingReconciliation,
   '@/lib/persistence/postgres': { query: queryMock },
 })
 const postgresReport = await reader.readPosAccountingParityReportInPostgres({
@@ -898,11 +1793,12 @@ assert.equal(postgresReport.historicalPagination.totalPages, 5)
 assert.equal(postgresReport.historicalPagination.pairPages, 5)
 assert.equal(postgresReport.historicalPagination.postingBundlePages, 0)
 assert.equal(postgresReport.historicalPagination.journalOnlyCapturePages, 0)
+assert.equal(postgresReport.historicalPagination.clearingLifecyclePages, 0)
 assert.equal(postgresReport.historicalPagination.unmatchedPages, 1)
 assert.equal(JSON.stringify(postgresReport).includes('source_payload'), false)
 assert.equal(JSON.stringify(postgresReport).includes('rawSourcePayloadSecret'), false)
 
-assert.equal(sqlCalls.length, 5)
+assert.equal(sqlCalls.length, 8)
 for (const call of sqlCalls) {
   assert.match(call.source.trim(), /^(SELECT|WITH)\b/)
   assert.doesNotMatch(call.source, /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b/i)
@@ -919,6 +1815,7 @@ assert.equal(sqlCalls.some((call) => call.source.includes('AS scheduled_for_futu
 assert.equal(sqlCalls.some((call) => call.source.includes("IN ('SalesReceipt', 'JournalEntry')")), true)
 const fullHistoryQuery = sqlCalls.find((call) =>
   call.source.includes('SELECT transaction.entity_type')
+    && call.source.includes("transaction.entity_type IN ('SalesReceipt', 'JournalEntry')")
     && call.source.includes('transaction.transaction_date IS NOT NULL'))
 assert.ok(fullHistoryQuery)
 assert.deepEqual([...fullHistoryQuery.parameters], [
@@ -926,11 +1823,123 @@ assert.deepEqual([...fullHistoryQuery.parameters], [
   '2025-03-14',
   '2026-09-15',
 ])
+assert.match(fullHistoryQuery.source, /transaction\.transaction_date >= \$2/)
+assert.match(fullHistoryQuery.source, /transaction\.transaction_date <= \$3/)
 assert.doesNotMatch(fullHistoryQuery.source, /ANY\(\$2::date\[\]\)/)
 assert.doesNotMatch(fullHistoryQuery.source, /\bLIMIT\b/)
 
+const openingBalanceQuery = sqlCalls.find((call) =>
+  call.source.includes("transaction.entity_type = 'JournalEntry'")
+    && call.source.includes('transaction.transaction_date < $2::date'))
+assert.ok(openingBalanceQuery)
+assert.deepEqual([...openingBalanceQuery.parameters], [
+  ORGANIZATION_ID,
+  '2025-03-14',
+  ['account-payment-exceptions'],
+  1001,
+])
+assert.match(openingBalanceQuery.source, /transaction\.transaction_date < \$2::date/)
+assert.match(openingBalanceQuery.source, /jsonb_path_query/)
+assert.match(openingBalanceQuery.source, /JournalEntryLineDetail/)
+assert.match(openingBalanceQuery.source, /AccountRef,value/)
+assert.match(openingBalanceQuery.source, /cardinality\(\$3::text\[\]\)/)
+assert.match(openingBalanceQuery.source, /LIMIT \$4::integer/)
+assert.doesNotMatch(openingBalanceQuery.source, /transaction\.transaction_date <= \$3::date/)
+assert.doesNotMatch(openingBalanceQuery.source, /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b/i)
+
+const paymentExceptionMappingsQuery = sqlCalls.find((call) =>
+  call.source.includes('FROM pos_accounting_catalog_mappings mapping'))
+assert.ok(paymentExceptionMappingsQuery)
+assert.match(paymentExceptionMappingsQuery.source, /mapping\.effective_to IS NULL/)
+
+const evidenceCoverageQuery = sqlCalls.find((call) =>
+  call.source.includes("event.event_type = 'quickbooks.pos_evidence.refreshed'"))
+assert.ok(evidenceCoverageQuery)
+assert.doesNotMatch(evidenceCoverageQuery.source, /connection\.verified_at/)
+assert.match(evidenceCoverageQuery.source, /quickbooks\.connection\.bound/)
+
+const warningQueryCalls = []
+const warningReader = loadTypeScriptModule('app_src/lib/persistence/posAccountingParity.ts', {
+  '@/lib/accounting/posClearingReconciliation': clearingReconciliation,
+  '@/lib/persistence/postgres': {
+    query: async (source, parameters = []) => {
+      warningQueryCalls.push({ source, parameters })
+      if (source.includes('count(*)::text AS total_dates FROM evidence_dates')) {
+        return { rows: [{ total_dates: '1' }] }
+      }
+      if (source.includes('SELECT evidence_date::text AS business_date')) {
+        return { rows: [{ business_date: '2026-07-20' }] }
+      }
+      if (source.includes('EXISTS (') && source.includes('sales_receipt_count')) {
+        return { rows: [{
+          configured: true,
+          connection_status: 'active',
+          last_catalog_synced_at: '2026-07-20T12:00:00.000Z',
+          last_pos_evidence_synced_at: '2026-07-20T12:00:00.000Z',
+          quickbooks_company_id: 'qbo-company-test',
+          maton_connection_id: 'maton-connection-test',
+          sync_status: 'succeeded',
+          sync_completed_at: '2026-07-20T12:00:00.000Z',
+          sales_receipt_count: '0',
+          journal_entry_count: '1',
+          drafts_newer_than_evidence: '0',
+        }] }
+      }
+      if (source.includes('FROM pos_accounting_catalog_mappings mapping')) return { rows: [] }
+      if (source.includes("event.event_type = 'quickbooks.pos_evidence.refreshed'")) {
+        return { rows: [] }
+      }
+      if (source.includes("transaction.entity_type = 'JournalEntry'")
+        && source.includes('transaction.transaction_date < $2::date')) {
+        return { rows: Array.from({ length: 1001 }, () => ({})) }
+      }
+      if (source.includes('LEFT JOIN toast_locations location')) return { rows: [] }
+      if (source.includes('SELECT transaction.entity_type')) {
+        return { rows: [paymentExceptionsJournalTransaction({
+          id: 'legacy-warning-capture',
+          date: '2026-07-20',
+          documentNumber: '260720POS',
+          amount: '10.00',
+          side: 'credit',
+        })] }
+      }
+      throw new Error(`Unexpected warning parity query: ${source}`)
+    },
+  },
+})
+const warningReport = await warningReader.readPosAccountingParityReportInPostgres({
+  organizationId: ORGANIZATION_ID,
+  fromBusinessDate: '2026-07-20',
+  toBusinessDate: '2026-07-20',
+  historyPage: 2,
+  historyPageSize: 1,
+})
+assert.equal(warningReport.historicalBaseline.clearingLifecycles.length, 0)
+assert.equal(warningReport.historicalPagination.clearingLifecyclePages, 1)
+assert.equal(
+  warningReport.warnings.some((warning) => warning.includes('legacy account name')),
+  true,
+)
+assert.equal(
+  warningReport.warnings.some((warning) => warning.includes('organization and QuickBooks account level')),
+  true,
+)
+assert.equal(
+  warningReport.warnings.some((warning) => warning.includes('1000 most recent cached earlier')),
+  true,
+)
+assert.equal(
+  warningReport.warnings.some((warning) => warning.includes('provider history before the selected range')),
+  true,
+)
+const warningOpeningQuery = warningQueryCalls.find((call) =>
+  call.source.includes("transaction.entity_type = 'JournalEntry'")
+    && call.source.includes('transaction.transaction_date < $2::date'))
+assert.equal(warningOpeningQuery.parameters[3], 1001)
+
 const detailCalls = []
 const detailReader = loadTypeScriptModule('app_src/lib/persistence/posAccountingParity.ts', {
+  '@/lib/accounting/posClearingReconciliation': clearingReconciliation,
   '@/lib/persistence/postgres': {
     query: async (source, parameters = []) => {
       detailCalls.push({ source, parameters })
@@ -1012,8 +2021,55 @@ assert.match(parityPanel, /scheduled for fulfillment/)
 assert.match(parityPanel, /Tips belong in the[\s\S]*payment Journal Entry[\s\S]*excluded from the Sales Receipt total/)
 assert.match(parityPanel, /Preorder lifecycles/)
 assert.match(parityPanel, /Recognized multi-document posting bundles/)
-assert.match(parityPanel, /Recognized payment-exception journals/)
 assert.match(parityPanel, /They are recognized as one posting bundle and are not exceptions/)
-assert.match(parityPanel, /this journal is recognized and is not an unmatched posting/)
+assert.match(parityPanel, /Payment Exceptions clearing/)
+assert.match(parityPanel, /organization-level clearing cycle/)
+assert.match(
+  parityPanel,
+  /const clearingLifecycleSchemaPresent = baseline\?\.clearingLifecycles !== undefined/,
+)
+assert.match(
+  parityPanel,
+  /const visibleLegacyJournalOnlyCaptures = clearingLifecycleSchemaPresent\s*\? \[\]\s*: baseline\?\.journalOnlyCaptures \|\| \[\]/,
+)
+assert.doesNotMatch(
+  parityPanel,
+  /const visibleLegacyJournalOnlyCaptures = visibleClearingLifecycles\.length/,
+)
+const selectLegacyJournalOnlyCapturesBySchemaPresence = (baseline) => (
+  baseline.clearingLifecycles !== undefined ? [] : baseline.journalOnlyCaptures || []
+)
+const emptyClearingLifecyclePage = {
+  summary: { clearingLifecycleCount: 1 },
+  clearingLifecycles: [],
+  journalOnlyCaptures: [{ journalEntry: { evidenceId: 'legacy-row-must-not-reappear' } }],
+}
+assert.equal(emptyClearingLifecyclePage.summary.clearingLifecycleCount, 1)
+assert.equal(emptyClearingLifecyclePage.clearingLifecycles.length, 0)
+assert.equal(selectLegacyJournalOnlyCapturesBySchemaPresence(emptyClearingLifecyclePage).length, 0)
+assert.equal(selectLegacyJournalOnlyCapturesBySchemaPresence({
+  journalOnlyCaptures: emptyClearingLifecyclePage.journalOnlyCaptures,
+}).length, 1)
+assert.match(parityPanel, /Payment Exceptions credit fully offset by a later debit/)
+assert.match(parityPanel, /Provisional account offset · cached evidence/)
+assert.match(parityPanel, /label="Account offset"/)
+assert.match(parityPanel, /Verify full provider history or a known zero-balance boundary before treating the clearing cycle as conclusively settled/)
+assert.match(parityPanel, /cachedOffsetIsProvisional/)
+assert.match(parityPanel, /const displayedClearingStatusCounts = baseline\?\.summary\.clearingStatusCounts/)
+assert.match(parityPanel, /available organization-level evidence is insufficient for a conclusive allocation/)
+assert.doesNotMatch(parityPanel, /More than one organization-level journal allocation fits/)
+assert.match(
+  parityPanel,
+  /const evidenceStatus = cachedOffsetIsProvisional\s*\? CACHED_CLEARING_OFFSET_STATUS\s*: effectiveStatus/,
+)
+assert.match(parityPanel, /status === CACHED_CLEARING_OFFSET_STATUS\) return 'info'/)
+assert.doesNotMatch(parityPanel, /const evidenceStatus = effectiveStatus/)
+assert.match(parityPanel, /Offsets observed/)
+assert.match(parityPanel, /not clearing proof/)
+assert.match(parityPanel, /Sales Receipt evidence/)
+assert.match(parityPanel, /Sync the relevant later dates before treating this balance as missing or overdue/)
+assert.match(parityPanel, /Complete organization-level account evidence did not show a full offsetting debit within the expected window/)
+assert.match(parityPanel, /does not establish Toast-location attribution or create accounting notifications/)
+assert.match(parityPanel, /earlier credits appear only as opening-balance context/)
 
 console.log('PASS POS accounting parity normalization, matching, comparison, historical corpus, and read-only Postgres contracts')

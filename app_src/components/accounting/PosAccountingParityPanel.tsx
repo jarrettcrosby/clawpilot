@@ -244,6 +244,44 @@ type HistoricalJournalOnlyCapture = {
   journalBalance: { status: CheckStatus; deltaCents: number }
 }
 
+type ClearingLifecycleStatus =
+  | 'pending'
+  | 'settled'
+  | 'partially_settled'
+  | 'ambiguous'
+  | 'overdue_unresolved'
+
+type ClearingStatusCounts = {
+  pending: number
+  settled: number
+  partiallySettled: number
+  ambiguous: number
+  overdueUnresolved: number
+}
+
+type HistoricalClearingLifecycle = {
+  lifecycleId: string
+  status: ClearingLifecycleStatus
+  accountMatchBasis: 'configured_account_id' | 'legacy_account_name'
+  evidenceCoverage: 'complete' | 'cached_only'
+  currencyCode: string | null
+  paymentExceptionsAccountId: string | null
+  paymentExceptionsAccountName: string | null
+  captureBusinessDates: string[]
+  releaseBusinessDates?: string[]
+  releaseBusinessDate: string | null
+  capturedCents: number
+  releasedCents: number
+  appliedCents: number
+  outstandingCents: number
+  unappliedReleaseCents: number
+  captureJournals: EvidenceReference[]
+  releaseJournals?: EvidenceReference[]
+  releaseJournal: EvidenceReference | null
+  salesReceipts: EvidenceReference[]
+  reviewReason: string | null
+}
+
 type EvidenceGroup = {
   businessDate: string
   documentNumber: string | null
@@ -305,6 +343,8 @@ type ParityReport = {
       pairCount: number
       postingBundleCount?: number
       journalOnlyCaptureCount?: number
+      clearingLifecycleCount?: number
+      clearingStatusCounts?: ClearingStatusCounts
       exactMarkerPairs: number
       dateFallbackPairs: number
       unmatchedGroups: number
@@ -317,6 +357,7 @@ type ParityReport = {
     pairs: HistoricalPair[]
     postingBundles?: HistoricalPostingBundle[]
     journalOnlyCaptures?: HistoricalJournalOnlyCapture[]
+    clearingLifecycles?: HistoricalClearingLifecycle[]
     unmatchedGroups: EvidenceGroup[]
     ambiguousGroups: AmbiguousGroup[]
   }
@@ -349,6 +390,7 @@ type ParityReport = {
     pairPages: number
     postingBundlePages?: number
     journalOnlyCapturePages?: number
+    clearingLifecyclePages?: number
     unmatchedPages: number
     ambiguousPages: number
   }
@@ -446,6 +488,8 @@ type DrawerSelection =
 
 type ChipColor = 'default' | 'success' | 'warning' | 'error' | 'info'
 
+const CACHED_CLEARING_OFFSET_STATUS = 'cached_account_offset'
+
 const sectionSx = {
   border: '1px solid rgba(255,255,255,0.10)',
   borderRadius: '8px',
@@ -454,15 +498,82 @@ const sectionSx = {
 }
 
 function statusColor(status: string): ChipColor {
-  if (status === 'match' || status === 'matched') return 'success'
-  if (status === 'scheduled') return 'info'
-  if (status === 'variance' || status === 'missing_quickbooks' || status === 'unmatched') return 'error'
-  if (status === 'ambiguous' || status === 'insufficient_evidence') return 'warning'
+  if (status === CACHED_CLEARING_OFFSET_STATUS) return 'info'
+  if (status === 'match' || status === 'matched' || status === 'settled') return 'success'
+  if (status === 'scheduled' || status === 'pending') return 'info'
+  if (status === 'variance' || status === 'missing_quickbooks' || status === 'unmatched' || status === 'overdue_unresolved') return 'error'
+  if (status === 'ambiguous' || status === 'insufficient_evidence' || status === 'partially_settled') return 'warning'
   return 'default'
 }
 
 function statusLabel(status: string | null | undefined) {
+  if (status === CACHED_CLEARING_OFFSET_STATUS) return 'Provisional account offset · cached evidence'
   return String(status || 'unknown').replaceAll('_', ' ')
+}
+
+function effectiveClearingStatus(lifecycle: HistoricalClearingLifecycle): ClearingLifecycleStatus {
+  return lifecycle.status === 'overdue_unresolved' && lifecycle.evidenceCoverage === 'cached_only'
+    ? 'pending'
+    : lifecycle.status
+}
+
+function clearingStatusColor(lifecycle: HistoricalClearingLifecycle): ChipColor {
+  const status = effectiveClearingStatus(lifecycle)
+  if (status === 'settled') {
+    return lifecycle.evidenceCoverage === 'cached_only' ? 'info' : 'success'
+  }
+  if (status === 'pending') return 'info'
+  if (status === 'overdue_unresolved') return 'error'
+  return 'warning'
+}
+
+function clearingStatusLabel(lifecycle: HistoricalClearingLifecycle) {
+  const status = effectiveClearingStatus(lifecycle)
+  if (status === 'partially_settled') return 'Partially settled · review'
+  if (status === 'overdue_unresolved') return 'Overdue unresolved · review'
+  if (status === 'ambiguous') return 'Ambiguous · review'
+  if (status === 'settled') {
+    return lifecycle.evidenceCoverage === 'cached_only'
+      ? statusLabel(CACHED_CLEARING_OFFSET_STATUS)
+      : 'Settled'
+  }
+  return lifecycle.evidenceCoverage === 'cached_only' ? 'Pending · cached evidence' : 'Pending'
+}
+
+function clearingStatusMessage(lifecycle: HistoricalClearingLifecycle) {
+  if (lifecycle.status === 'overdue_unresolved' && lifecycle.evidenceCoverage === 'cached_only') {
+    return 'A later offsetting debit has not been observed in cached QuickBooks evidence. Sync the relevant later dates before treating this balance as missing or overdue.'
+  }
+  if (lifecycle.status === 'settled') {
+    if (lifecycle.evidenceCoverage === 'cached_only') {
+      return 'Cached QuickBooks evidence shows an offsetting Payment Exceptions debit. Verify full provider history or a known zero-balance boundary before treating the clearing cycle as conclusively settled. Any Sales Receipt below is fulfillment context, not clearing proof.'
+    }
+    return 'QuickBooks evidence shows the Payment Exceptions credit fully offset by a later debit. Any Sales Receipt below is fulfillment context, not clearing proof.'
+  }
+  if (lifecycle.status === 'partially_settled') {
+    return 'QuickBooks evidence offsets part, but not all, of the Payment Exceptions credit. Review the remaining account balance.'
+  }
+  if (lifecycle.status === 'ambiguous') {
+    return 'The available organization-level evidence is insufficient for a conclusive allocation, so ClawPilot has not guessed or assigned it to a Toast location.'
+  }
+  if (lifecycle.status === 'overdue_unresolved') {
+    return 'Complete organization-level account evidence did not show a full offsetting debit within the expected window. Review is required.'
+  }
+  return lifecycle.evidenceCoverage === 'cached_only'
+    ? 'A later offsetting debit has not been observed in cached QuickBooks evidence. Sync the relevant later dates before treating it as missing.'
+    : 'A later offsetting debit has not yet been observed in the complete organization-level account evidence for this cycle.'
+}
+
+function clearingStatusCounts(lifecycles: HistoricalClearingLifecycle[]): ClearingStatusCounts {
+  return lifecycles.reduce<ClearingStatusCounts>((counts, lifecycle) => {
+    const status = effectiveClearingStatus(lifecycle)
+    if (status === 'pending') counts.pending += 1
+    else if (status === 'settled') counts.settled += 1
+    else if (status === 'partially_settled') counts.partiallySettled += 1
+    else if (status === 'ambiguous') counts.ambiguous += 1
+    else counts.overdueUnresolved += 1
+    return counts
+  }, { pending: 0, settled: 0, partiallySettled: 0, ambiguous: 0, overdueUnresolved: 0 })
 }
 
 function evidenceLabel(evidence: EvidenceReference) {
@@ -620,12 +731,15 @@ function DetailMetric({ label, value }: { label: string; value: string }) {
   )
 }
 
-function EvidenceButton({ evidence, status, onOpen }: {
+function EvidenceButton({ evidence, status, contextLabel, showStatus = true, onOpen }: {
   evidence: EvidenceReference
   status?: string
+  contextLabel?: string
+  showStatus?: boolean
   onOpen: (evidence: EvidenceReference, status: string) => void
 }) {
-  const label = entityLabel(evidence.entityType)
+  const entity = entityLabel(evidence.entityType)
+  const label = contextLabel || entity
   const providerId = evidenceProviderId(evidence)
   return (
     <Tooltip title={`Open ${label.toLowerCase()} details`}>
@@ -645,13 +759,15 @@ function EvidenceButton({ evidence, status, onOpen }: {
             : <AccountBalanceRounded fontSize="small" color="action" />}
           <Box minWidth={0}>
             <Typography variant="caption" color="text.secondary" display="block">{label}</Typography>
-            <Typography variant="body2" noWrap>{evidenceLabel(evidence)}</Typography>
+            <Typography variant="body2" noWrap>
+              {contextLabel ? `${entity} · ` : ''}{evidenceLabel(evidence)}
+            </Typography>
             <Typography variant="caption" color="text.disabled" noWrap display="block">
-              {originLabel(evidence.postingOrigin)}{providerId ? ` · ID ${providerId}` : ''}{status ? ` · ${statusLabel(status)}` : ''}
+              {originLabel(evidence.postingOrigin)}{providerId ? ` · ID ${providerId}` : ''}{status && showStatus ? ` · ${statusLabel(status)}` : ''}
             </Typography>
           </Box>
           <Box display="flex" alignItems="center" gap={0.5}>
-            {status ? <Chip size="small" color={statusColor(status)} variant="outlined" label={statusLabel(status)} sx={{ display: { xs: 'none', sm: 'inline-flex' } }} /> : null}
+            {status && showStatus ? <Chip size="small" color={statusColor(status)} variant="outlined" label={statusLabel(status)} sx={{ display: { xs: 'none', sm: 'inline-flex' } }} /> : null}
             <ChevronRightRounded fontSize="small" color="action" />
           </Box>
         </Box>
@@ -1208,6 +1324,21 @@ export default function PosAccountingParityPanel() {
   }), [dateTimeSettings.locale])
 
   const formatDelta = (cents: number | null | undefined) => cents == null ? '—' : money.format(cents / 100)
+  const formatClearingAmount = (cents: number | null | undefined, currencyCode: string | null) => {
+    if (cents === null || cents === undefined) return '—'
+    const currency = String(currencyCode || '').trim().toUpperCase()
+    if (/^[A-Z]{3}$/.test(currency)) {
+      try {
+        return new Intl.NumberFormat(dateTimeSettings.locale, { style: 'currency', currency }).format(cents / 100)
+      } catch {
+        return `${currency} ${(cents / 100).toFixed(2)}`
+      }
+    }
+    return new Intl.NumberFormat(dateTimeSettings.locale, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(cents / 100)
+  }
   const openHistoricalEvidence = (evidence: EvidenceReference, status: string) => {
     const providerId = evidenceProviderId(evidence)
     setHistoricalDetail(null)
@@ -1278,7 +1409,15 @@ export default function PosAccountingParityPanel() {
   const baseline = report?.historicalBaseline
   const visiblePairs = baseline?.pairs || []
   const visiblePostingBundles = baseline?.postingBundles || []
-  const visibleJournalOnlyCaptures = baseline?.journalOnlyCaptures || []
+  const visibleClearingLifecycles = baseline?.clearingLifecycles || []
+  const clearingLifecycleSchemaPresent = baseline?.clearingLifecycles !== undefined
+  const visibleLegacyJournalOnlyCaptures = clearingLifecycleSchemaPresent
+    ? []
+    : baseline?.journalOnlyCaptures || []
+  const displayedClearingStatusCounts = baseline?.summary.clearingStatusCounts
+    || clearingStatusCounts(visibleClearingLifecycles)
+  const displayedClearingLifecycleCount = baseline?.summary.clearingLifecycleCount
+    ?? visibleClearingLifecycles.length
   const visibleUnmatched = baseline?.unmatchedGroups || []
   const visibleAmbiguous = baseline?.ambiguousGroups || []
   const dateRangeInvalid = Boolean(fromInput && toInput && fromInput > toInput)
@@ -1631,13 +1770,29 @@ export default function PosAccountingParityPanel() {
               <Metric label="Records" value={baseline.summary.cachedTransactions} />
               <Metric label="Paired dates" value={baseline.summary.pairCount} tone="#A8C7FA" />
               <Metric label="Posting bundles" value={baseline.summary.postingBundleCount || 0} tone="#70D6A7" />
-              <Metric label="Payment captures" value={baseline.summary.journalOnlyCaptureCount || 0} tone="#70D6A7" />
+              <Metric label="Clearing cycles" value={displayedClearingLifecycleCount} tone="#A8C7FA" />
               <Metric label="Exact marker pairs" value={baseline.summary.exactMarkerPairs} tone="#70D6A7" />
               <Metric label="Date fallback" value={baseline.summary.dateFallbackPairs} />
               <Metric label="Unmatched" value={baseline.summary.unmatchedEvidence} tone={baseline.summary.unmatchedEvidence ? '#F2B76D' : '#70D6A7'} />
               <Metric label="Ambiguous" value={baseline.summary.ambiguousEvidence} tone={baseline.summary.ambiguousEvidence ? '#FF8A80' : '#70D6A7'} />
               <Metric label="Receipt variances" value={baseline.summary.receiptArithmetic.variance} tone={baseline.summary.receiptArithmetic.variance ? '#FF8A80' : '#70D6A7'} />
             </Box>
+            {displayedClearingLifecycleCount > 0 ? (
+              <>
+                <Divider />
+                <Typography variant="caption" color="text.secondary" display="block" px={{ xs: 1.5, sm: 2 }} pt={1.5}>
+                  Payment Exceptions clearing
+                </Typography>
+                <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))', lg: 'repeat(6, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={1.5}>
+                  <Metric label="Cycles" value={displayedClearingLifecycleCount} />
+                  <Metric label="Offsets observed" value={displayedClearingStatusCounts.settled} tone="#A8C7FA" />
+                  <Metric label="Pending" value={displayedClearingStatusCounts.pending} tone="#A8C7FA" />
+                  <Metric label="Partially settled" value={displayedClearingStatusCounts.partiallySettled} tone={displayedClearingStatusCounts.partiallySettled ? '#F2B76D' : '#70D6A7'} />
+                  <Metric label="Ambiguous" value={displayedClearingStatusCounts.ambiguous} tone={displayedClearingStatusCounts.ambiguous ? '#F2B76D' : '#70D6A7'} />
+                  <Metric label="Overdue unresolved" value={displayedClearingStatusCounts.overdueUnresolved} tone={displayedClearingStatusCounts.overdueUnresolved ? '#FF8A80' : '#70D6A7'} />
+                </Box>
+              </>
+            ) : null}
             <Divider />
             <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5} px={{ xs: 1.5, sm: 2 }} py={1.5}>
               <Typography variant="body2" color="text.secondary">
@@ -1748,43 +1903,175 @@ export default function PosAccountingParityPanel() {
             </Box>
           ) : null}
 
-          {visibleJournalOnlyCaptures.length ? (
+          {visibleClearingLifecycles.length ? (
             <Box sx={sectionSx}>
               <SectionHeader
-                title="Recognized payment-exception journals"
-                detail={`${baseline.summary.journalOnlyCaptureCount || visibleJournalOnlyCaptures.length} journal-only payment capture${(baseline.summary.journalOnlyCaptureCount || visibleJournalOnlyCaptures.length) === 1 ? '' : 's'}`}
+                title="Payment Exceptions clearing"
+                detail={`${displayedClearingLifecycleCount} organization-level clearing cycle${displayedClearingLifecycleCount === 1 ? '' : 's'}`}
               />
               <Divider />
-              <Typography variant="body2" color="text.secondary" px={{ xs: 1.5, sm: 2 }} py={1.5}>
-                A payment-date exception correctly has only a Journal Entry. Its Sales Receipt remains tied to
-                the later fulfillment date, so this journal is recognized and is not an unmatched posting.
-              </Typography>
-              {visibleJournalOnlyCaptures.map((capture) => (
-                <Box
-                  key={`${capture.businessDate}-${capture.journalEntry.evidenceId}`}
-                  display="grid"
-                  gridTemplateColumns={{ xs: '1fr', sm: '130px minmax(0, 1fr) 170px' }}
-                  gap={1.25}
-                  px={{ xs: 1.5, sm: 2 }}
-                  py={1.5}
-                  alignItems="center"
-                  borderTop="1px solid rgba(255,255,255,0.06)"
-                >
-                  <Box>
-                    <Typography variant="body2" fontWeight={700}>{capture.businessDate}</Typography>
-                    <Typography variant="caption" color="success.main">Recognized payment capture</Typography>
+              <Box
+                component="aside"
+                aria-label="Payment Exceptions reconciliation scope"
+                mx={{ xs: 1.5, sm: 2 }}
+                my={1.5}
+                px={1.25}
+                py={1}
+                border="1px solid rgba(168,199,250,0.24)"
+                borderRadius="8px"
+                bgcolor="rgba(168,199,250,0.05)"
+              >
+                <Typography variant="body2" fontWeight={700}>
+                  Organization-level QuickBooks account reconciliation
+                </Typography>
+                <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
+                  This view compares credits and later debits in the organization&apos;s configured QuickBooks Payment Exceptions account.
+                  It does not establish Toast-location attribution or create accounting notifications. Sales Receipts are fulfillment context only.
+                  When a date filter begins mid-cycle, earlier credits appear only as opening-balance context.
+                </Typography>
+              </Box>
+              {visibleClearingLifecycles.map((lifecycle) => {
+                const effectiveStatus = effectiveClearingStatus(lifecycle)
+                const cachedOffsetIsProvisional = effectiveStatus === 'settled'
+                  && lifecycle.evidenceCoverage === 'cached_only'
+                const isReviewState = effectiveStatus === 'partially_settled'
+                  || effectiveStatus === 'ambiguous'
+                  || effectiveStatus === 'overdue_unresolved'
+                const evidenceStatus = cachedOffsetIsProvisional
+                  ? CACHED_CLEARING_OFFSET_STATUS
+                  : effectiveStatus
+                const safeReviewReason = lifecycle.status === 'overdue_unresolved'
+                  && lifecycle.evidenceCoverage === 'cached_only'
+                  ? null
+                  : lifecycle.reviewReason
+                const releaseBusinessDates = lifecycle.releaseBusinessDates?.length
+                  ? [...new Set(lifecycle.releaseBusinessDates)]
+                  : lifecycle.releaseBusinessDate
+                    ? [lifecycle.releaseBusinessDate]
+                    : []
+                const releaseJournals = lifecycle.releaseJournals?.length
+                  ? [...new Map(lifecycle.releaseJournals.map((evidence) => [evidence.evidenceId, evidence])).values()]
+                  : lifecycle.releaseJournal
+                    ? [lifecycle.releaseJournal]
+                    : []
+                return (
+                  <Box
+                    component="article"
+                    aria-label={`Payment Exceptions clearing cycle for ${lifecycle.paymentExceptionsAccountName || 'configured account'}`}
+                    key={lifecycle.lifecycleId}
+                    px={{ xs: 1.5, sm: 2 }}
+                    py={1.5}
+                    borderTop="1px solid rgba(255,255,255,0.06)"
+                  >
+                    <Box display="flex" alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" gap={1.5} flexDirection={{ xs: 'column', sm: 'row' }}>
+                      <Box minWidth={0}>
+                        <Typography variant="body2" fontWeight={700}>
+                          {lifecycle.paymentExceptionsAccountName || 'Payment Exceptions'}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          Capture credit {lifecycle.captureBusinessDates.length
+                            ? lifecycle.captureBusinessDates.join(', ')
+                            : 'date unavailable'}
+                          {' · '}Release debit {releaseBusinessDates.length ? releaseBusinessDates.join(', ') : 'not observed'}
+                        </Typography>
+                        {lifecycle.paymentExceptionsAccountId ? (
+                          <Typography variant="caption" color="text.disabled" display="block">
+                            QuickBooks account ID {lifecycle.paymentExceptionsAccountId}
+                          </Typography>
+                        ) : null}
+                      </Box>
+                      <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.75} flexWrap="wrap">
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          color={clearingStatusColor(lifecycle)}
+                          label={clearingStatusLabel(lifecycle)}
+                        />
+                        {lifecycle.evidenceCoverage === 'cached_only' ? (
+                          <Chip size="small" variant="outlined" color="info" label="Cached evidence only" />
+                        ) : null}
+                        {lifecycle.accountMatchBasis === 'legacy_account_name' ? (
+                          <Chip size="small" variant="outlined" color="warning" label="Legacy account-name match" />
+                        ) : null}
+                        {!/^[A-Z]{3}$/.test(lifecycle.currencyCode || '') ? (
+                          <Chip size="small" variant="outlined" color="warning" label="Currency not supplied" />
+                        ) : null}
+                      </Box>
+                    </Box>
+
+                    <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))' }} gap={1.25} py={1.25}>
+                      <DetailMetric label="Captured credit" value={formatClearingAmount(lifecycle.capturedCents, lifecycle.currencyCode)} />
+                      <DetailMetric label="Account offset" value={formatClearingAmount(lifecycle.appliedCents, lifecycle.currencyCode)} />
+                      <DetailMetric label="Outstanding" value={formatClearingAmount(lifecycle.outstandingCents, lifecycle.currencyCode)} />
+                      <DetailMetric label="Released debit" value={formatClearingAmount(lifecycle.releasedCents, lifecycle.currencyCode)} />
+                    </Box>
+
+                    <Alert severity={effectiveStatus === 'overdue_unresolved' ? 'error' : isReviewState ? 'warning' : effectiveStatus === 'settled' && !cachedOffsetIsProvisional ? 'success' : 'info'} variant="outlined">
+                      {clearingStatusMessage(lifecycle)}
+                      {safeReviewReason ? ` ${safeReviewReason}` : ''}
+                      {lifecycle.unappliedReleaseCents > 0
+                        ? ` Unapplied release: ${formatClearingAmount(lifecycle.unappliedReleaseCents, lifecycle.currencyCode)}.`
+                        : ''}
+                    </Alert>
+
+                    <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'repeat(3, minmax(0, 1fr))' }} gap={1.5} pt={1.5}>
+                      <Box minWidth={0}>
+                        <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
+                          Payment Exceptions credit journal evidence
+                        </Typography>
+                        {lifecycle.captureJournals.length ? (
+                          <Stack spacing={0.5}>
+                            {lifecycle.captureJournals.map((evidence) => (
+                              <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Payment Exceptions credit" showStatus={false} onOpen={openHistoricalEvidence} />
+                            ))}
+                          </Stack>
+                        ) : <Typography variant="body2" color="text.disabled">Not observed</Typography>}
+                      </Box>
+                      <Box minWidth={0}>
+                        <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
+                          Payment Exceptions debit journal evidence
+                        </Typography>
+                        {releaseJournals.length ? (
+                          <Stack spacing={0.5}>
+                            {releaseJournals.map((evidence) => (
+                              <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Payment Exceptions debit" showStatus={false} onOpen={openHistoricalEvidence} />
+                            ))}
+                          </Stack>
+                        ) : <Typography variant="body2" color="text.disabled">Not observed</Typography>}
+                      </Box>
+                      <Box minWidth={0}>
+                        <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
+                          Sales Receipt evidence · fulfillment context
+                        </Typography>
+                        {lifecycle.salesReceipts.length ? (
+                          <Stack spacing={0.5}>
+                            {lifecycle.salesReceipts.map((evidence) => (
+                              <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Fulfillment revenue evidence" showStatus={false} onOpen={openHistoricalEvidence} />
+                            ))}
+                          </Stack>
+                        ) : <Typography variant="body2" color="text.disabled">Not observed</Typography>}
+                      </Box>
+                    </Box>
                   </Box>
-                  <EvidenceButton
-                    evidence={capture.journalEntry}
-                    status={capture.journalBalance.status}
-                    onOpen={openHistoricalEvidence}
-                  />
-                  <Chip
-                    size="small"
-                    color={statusColor(capture.journalBalance.status)}
-                    variant="outlined"
-                    label={`Balance ${statusLabel(capture.journalBalance.status)} · ${formatDelta(capture.journalBalance.deltaCents)}`}
-                  />
+                )
+              })}
+            </Box>
+          ) : visibleLegacyJournalOnlyCaptures.length ? (
+            <Box sx={sectionSx}>
+              <SectionHeader
+                title="Payment Exceptions clearing"
+                detail={`${visibleLegacyJournalOnlyCaptures.length} payment journal${visibleLegacyJournalOnlyCaptures.length === 1 ? '' : 's'} awaiting lifecycle evaluation`}
+              />
+              <Divider />
+              <Alert severity="info" variant="outlined" sx={{ m: { xs: 1.5, sm: 2 } }}>
+                These cached journals contain Payment Exceptions activity, but this response does not include
+                cross-day clearing evidence. No settlement or related Sales Receipt conclusion is being made.
+                This is organization-level QuickBooks account evidence; it is not Toast-location attribution and does not trigger notifications.
+              </Alert>
+              {visibleLegacyJournalOnlyCaptures.map((capture) => (
+                <Box key={`${capture.businessDate}-${capture.journalEntry.evidenceId}`} px={{ xs: 1.5, sm: 2 }} py={1.25} borderTop="1px solid rgba(255,255,255,0.06)">
+                  <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>{capture.businessDate}</Typography>
+                  <EvidenceButton evidence={capture.journalEntry} status="pending" contextLabel="Payment Exceptions credit" showStatus={false} onOpen={openHistoricalEvidence} />
                 </Box>
               ))}
             </Box>
