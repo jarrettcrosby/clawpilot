@@ -44,6 +44,12 @@ const projection = read('app_src/lib/crm/boardProjection.ts')
 assert.match(projection, /normalizeCrmBoardCard/)
 assert.doesNotMatch(projection, /upsertTaskWithClient/)
 assert.match(projection, /card\.payload/)
+assert.match(projection, /canonicalJson\(left \|\| null\) === canonicalJson\(right \|\| null\)/)
+assert.match(projection, /crm_board_cards\.payload IS DISTINCT FROM EXCLUDED\.payload/)
+
+const taskPersistence = read('app_src/lib/persistence/tasks.ts')
+assert.match(taskPersistence, /payload IS DISTINCT FROM \$3::jsonb/)
+assert.match(taskPersistence, /SELECT 1 FROM crm_board_cards WHERE board_id = \$1::uuid AND card_id = \$2/)
 
 const migration = read('db/migrations/0036_crm_display_text_and_card_semantics.sql')
 assert.match(migration, /WHERE source = 'crm-projection'/)

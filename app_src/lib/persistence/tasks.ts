@@ -187,10 +187,17 @@ export async function replaceTasksInPostgres(tasks: Task[], scope: TaskStoreScop
       const result = await client.query(
         `UPDATE crm_board_cards
          SET payload = $3::jsonb, updated_at = now()
-         WHERE board_id = $1::uuid AND card_id = $2`,
+         WHERE board_id = $1::uuid AND card_id = $2
+           AND payload IS DISTINCT FROM $3::jsonb`,
         [scope.boardId, String(task.id), JSON.stringify(normalizeCrmBoardCard(task))],
       )
-      if (result.rowCount !== 1) throw new Error(`CRM board card was not found: ${task.id}`)
+      if (result.rowCount === 0) {
+        const existing = await client.query(
+          'SELECT 1 FROM crm_board_cards WHERE board_id = $1::uuid AND card_id = $2',
+          [scope.boardId, String(task.id)],
+        )
+        if (existing.rowCount !== 1) throw new Error(`CRM board card was not found: ${task.id}`)
+      }
     }
 
     if (ids.length > 0) {
