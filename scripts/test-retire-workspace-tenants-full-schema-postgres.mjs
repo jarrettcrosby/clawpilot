@@ -97,7 +97,9 @@ try {
       ))?.columns.map((column) => column.name),
     )
     for (const requiredReceiptColumn of [
-      'lock_catalog_digest', 'locked_relations', 'deleted_counts',
+      'railway_service_id', 'database_name', 'database_user',
+      'postgres_system_identifier', 'backup_evidence', 'lock_catalog_digest', 'locked_relations',
+      'deleted_counts',
     ]) {
       assert.ok(receiptColumns.has(requiredReceiptColumn))
     }

@@ -8,8 +8,12 @@ import {
   CONFIRMED_OPERATOR_EMAIL,
   PLAN_FORMAT,
   PRODUCTION_DATABASE_IDENTITY,
+  PRODUCTION_DATABASE_NAME,
+  PRODUCTION_DATABASE_USER,
+  PRODUCTION_POSTGRES_SYSTEM_IDENTIFIER,
   PRODUCTION_RAILWAY_ENVIRONMENT_ID,
   PRODUCTION_RAILWAY_PROJECT_ID,
+  PRODUCTION_RAILWAY_SERVICE_ID,
   RECEIPT_FORMAT,
   SCRIPT_VERSION,
   assertRuntimeEnvironment,
@@ -27,45 +31,77 @@ import {
 const exactTargets = APPROVED_TARGETS.flatMap((target) => [
   '--target', `${target.organizationId}|${target.referenceCode}|${target.name}`,
 ])
+const validatedBackupSha256 = 'd'.repeat(64)
+const validatedBackupBytes = '29360128'
 const common = [
   '--actor', CONFIRMED_OPERATOR_EMAIL,
   '--environment', 'production',
   '--railway-project-id', PRODUCTION_RAILWAY_PROJECT_ID,
   '--railway-environment-id', PRODUCTION_RAILWAY_ENVIRONMENT_ID,
+  '--railway-service-id', PRODUCTION_RAILWAY_SERVICE_ID,
+  '--validated-backup-sha256', validatedBackupSha256,
+  '--validated-backup-bytes', validatedBackupBytes,
   ...exactTargets,
 ]
 
-assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v2')
-assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v2')
-assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v2')
+assert.equal(SCRIPT_VERSION, 'workspace-tenant-retirement-v3')
+assert.equal(PLAN_FORMAT, 'clawpilot-workspace-tenant-retirement-plan-v3')
+assert.equal(RECEIPT_FORMAT, 'clawpilot-workspace-tenant-retirement-receipt-v3')
 assert.equal(PRODUCTION_DATABASE_IDENTITY, '0474a18c-649c-491b-bea1-7da006d21d81')
+assert.equal(PRODUCTION_DATABASE_NAME, 'railway')
+assert.equal(PRODUCTION_DATABASE_USER, 'postgres')
+assert.equal(PRODUCTION_POSTGRES_SYSTEM_IDENTIFIER, '7645434341173309484')
 assert.deepEqual(APPROVED_TARGETS.map((target) => ({
   organizationId: target.organizationId,
   referenceCode: target.referenceCode,
   name: target.name,
   organizationType: target.organizationType,
   parentId: target.parentId,
+  pipelineId: target.pipelineId,
+  crmOrganizationId: target.crmOrganizationId,
+  suiteCrmAccountId: target.suiteCrmAccountId,
+  crmContactId: target.crmContactId,
+  crmContactReferenceCode: target.crmContactReferenceCode,
+  suiteCrmContactId: target.suiteCrmContactId,
 })), [
   {
     organizationId: '33785418-9927-4e10-a492-d3a44b9b6f21',
     referenceCode: 'ga42g1438l4j2s',
     name: 'AG Alchemy, LLC',
-    organizationType: 'member',
+    organizationType: 'root',
     parentId: null,
+    pipelineId: 'd0d002ce-d073-4ff1-a5cd-0c8cdd28529d',
+    crmOrganizationId: '37b757cb-fc11-49e5-b668-5e97ce94fbab',
+    suiteCrmAccountId: '006d4b9e-b4db-5d5c-8440-6e6fbcbfb35a',
+    crmContactId: '371ba6cb-a322-4822-9f75-36abf2582c8e',
+    crmContactReferenceCode: 'gc3327424',
+    suiteCrmContactId: 'a03eecca-abe6-55eb-8cb7-366eac3892fa',
   },
   {
     organizationId: '3b9ceada-a4ff-4363-8e78-6069dee76328',
     referenceCode: 'gakrnoh15krp9n',
     name: 'French Florist',
-    organizationType: 'member',
+    organizationType: 'root',
     parentId: null,
+    pipelineId: '7d82a005-80dc-441e-95e8-3a23ac968ea0',
+    crmOrganizationId: '1a546db3-b584-4890-9d1f-0311a1cd1723',
+    suiteCrmAccountId: 'b8f39084-452b-5b2a-ace1-3851e27c3ab0',
+    crmContactId: '94d4db5a-c6bd-4c63-84ee-0344c1857c9a',
+    crmContactReferenceCode: 'gc3327424',
+    suiteCrmContactId: 'a03eecca-abe6-55eb-8cb7-366eac3892fa',
   },
   {
     organizationId: 'c8fcf491-cf8c-469a-b03c-0026a762752c',
     referenceCode: 'gac10cb46e3rpl',
     name: 'Test Pro Bakery Bites',
-    organizationType: 'member',
+    organizationType: 'root',
     parentId: null,
+    pipelineId: '8f43d061-057d-42a2-844b-85f89421854d',
+    crmOrganizationId: '85ecfa66-f07d-4745-8136-9b7abc1bfd9a',
+    suiteCrmAccountId: 'e4bfc539-0f56-5214-81da-03eff5b06664',
+    crmContactId: 'ab3939b1-5f86-47ea-81d4-11cdf09dd020',
+    crmContactReferenceCode: 'gc3327424',
+    suiteCrmContactId: 'a03eecca-abe6-55eb-8cb7-366eac3892fa',
   },
 ])
 
@@ -73,6 +109,10 @@ const defaultPlan = parseArguments([...common, '--output', '/tmp/retirement-plan
 assert.equal(defaultPlan.command, 'plan')
 assert.equal(defaultPlan.actor, CONFIRMED_OPERATOR_EMAIL)
 assert.equal(defaultPlan.targets.length, 3)
+assert.deepEqual(defaultPlan.backupEvidence, {
+  sha256: validatedBackupSha256,
+  bytes: Number(validatedBackupBytes),
+})
 
 const shuffledTargetValues = [...APPROVED_TARGETS].reverse().map((target) => (
   `${target.organizationId}|${target.referenceCode}|${target.name}`
@@ -105,10 +145,19 @@ const apply = parseArguments([
   '--confirm-digest', confirmation,
   '--receipt-output', '/tmp/retirement-receipt.json',
   '--acknowledge-suitecrm-retained', 'b'.repeat(64),
+  '--acknowledge-delete-triggers', 'c'.repeat(64),
 ])
 assert.equal(apply.command, 'apply')
 assert.equal(apply.confirmDigest, confirmation)
 assert.equal(apply.suiteCrmAcknowledgement, 'b'.repeat(64))
+assert.equal(apply.deleteTriggerAcknowledgement, 'c'.repeat(64))
+assert.throws(() => parseArguments([
+  'apply', ...common,
+  '--manifest', '/tmp/retirement-plan.json',
+  '--confirm-digest', confirmation,
+  '--receipt-output', '/tmp/retirement-receipt.json',
+  '--acknowledge-suitecrm-retained', 'bad',
+]), /acknowledge-suitecrm-retained must be a SHA-256/u)
 
 const verify = parseArguments([
   'verify', ...common,
@@ -122,6 +171,10 @@ assert.throws(() => parseArguments([
   '--confirm-digest', 'not-a-digest',
   '--receipt-output', '/tmp/receipt.json',
 ]), /SHA-256/u)
+assert.throws(() => parseArguments([
+  ...common.map((value) => value === validatedBackupBytes ? '0' : value),
+  '--output', '/tmp/no.json',
+]), /validated-backup-bytes must be a positive integer/u)
 assert.throws(() => parseArguments([
   ...common.map((value) => value === 'production' ? 'development' : value),
   '--output', '/tmp/no.json',
@@ -143,11 +196,18 @@ const endpointB = databaseEndpointFingerprint(
 assert.equal(endpointA, endpointARotated)
 assert.notEqual(endpointA, endpointB)
 assert.throws(() => databaseEndpointFingerprint('https://example.test/db'), /PostgreSQL/u)
+assert.throws(
+  () => databaseEndpointFingerprint(
+    'postgresql://operator:secret@database.example.test:5432/clawpilot?options=-csearch_path%3Devil',
+  ),
+  /must not override PostgreSQL startup options/u,
+)
 
 const runtime = {
   DATABASE_URL: 'postgresql://operator:secret@database.example.test:5432/clawpilot',
   RAILWAY_PROJECT_ID: PRODUCTION_RAILWAY_PROJECT_ID,
   RAILWAY_ENVIRONMENT_ID: PRODUCTION_RAILWAY_ENVIRONMENT_ID,
+  RAILWAY_SERVICE_ID: PRODUCTION_RAILWAY_SERVICE_ID,
   RAILWAY_ENVIRONMENT_NAME: 'production',
   CLAWPILOT_TENANT_RETIRE_DATABASE_ENDPOINT_SHA256: endpointA,
 }
@@ -241,8 +301,11 @@ for (const expected of [
   'workspace_tenant_retirement_scope',
   'pg_catalog.pg_constraint',
   'IN ACCESS EXCLUSIVE MODE',
+  "SET LOCAL search_path = pg_catalog, public",
+  "pg_advisory_xact_lock(hashtext('clawpilot-schema-migrations'))",
   'lockCatalogDigest',
   'unclassifiedOrganizationRoles',
+  'unexpectedSelectedRelations',
   'Committed retirement receipt digest is invalid',
   'DISABLE TRIGGER',
   'Post-delete relational absence verification failed',
@@ -264,6 +327,9 @@ assert.match(migration, /workspace_tenant_retirement_receipts/u)
 assert.match(migration, /BEFORE UPDATE OR DELETE/u)
 assert.match(migration, /locked_relations/u)
 assert.match(migration, /deleted_counts/u)
+assert.match(migration, /railway_service_id/u)
+assert.match(migration, /postgres_system_identifier/u)
+assert.match(migration, /backup_evidence/u)
 assert.match(migration, /retirement receipts are immutable/u)
 assert.doesNotMatch(migration, /REFERENCES\s+workspace_organizations/iu)
 
