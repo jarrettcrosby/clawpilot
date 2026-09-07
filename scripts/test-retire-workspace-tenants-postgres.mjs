@@ -351,6 +351,58 @@ async function installFixture(client) {
     `INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)`,
     ['0360_workspace_tenant_retirement_receipts.sql', receiptMigrationChecksum],
   )
+  const receiptBoundaryMigration = readFileSync(
+    new URL(
+      '../db/migrations/0362_workspace_tenant_retirement_receipt_boundary_evidence.sql',
+      import.meta.url,
+    ),
+    'utf8',
+  )
+  const receiptBoundaryMigrationChecksum = createHash('sha256')
+    .update(receiptBoundaryMigration)
+    .digest('hex')
+  await client.query('BEGIN')
+  try {
+    await client.query(
+      `INSERT INTO workspace_tenant_retirement_receipts (
+         plan_digest, receipt_digest, script_version, environment,
+         railway_project_id, railway_environment_id, database_identity,
+         database_endpoint_sha256, actor_email, target_organizations,
+         lock_catalog_digest, locked_relations, scope_digest, scope_counts,
+         retired_references, disabled_delete_triggers, retired_short_links,
+         suitecrm_records, external_system_disposition, deleted_counts, verification
+       ) VALUES (
+         $1, $2, 'legacy-test-receipt', 'production', $3::uuid, $4::uuid, $5::uuid,
+         $6, 'operator@example.test', '[{}]'::jsonb, $7, '["fixture"]'::jsonb,
+         $8, '{}'::jsonb, '{}'::text[], '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
+         '{}'::jsonb, '{}'::jsonb, '{}'::jsonb
+       )`,
+      [
+        '1'.repeat(64),
+        '2'.repeat(64),
+        PRODUCTION_RAILWAY_PROJECT_ID,
+        PRODUCTION_RAILWAY_ENVIRONMENT_ID,
+        PRODUCTION_DATABASE_IDENTITY,
+        '3'.repeat(64),
+        '4'.repeat(64),
+        '5'.repeat(64),
+      ],
+    )
+    await assert.rejects(
+      () => client.query(receiptBoundaryMigration),
+      /Cannot add tenant retirement boundary evidence after receipts exist/u,
+    )
+  } finally {
+    await client.query('ROLLBACK')
+  }
+  await client.query(receiptBoundaryMigration)
+  await client.query(
+    `INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)`,
+    [
+      '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql',
+      receiptBoundaryMigrationChecksum,
+    ],
+  )
   await client.query(
     `INSERT INTO app_settings (key, value)
      VALUES ('deployment.database.identity', jsonb_build_object('id', $1::text))`,
@@ -758,7 +810,27 @@ try {
   const outboxBlockedPlanPath = join(artifacts, 'outbox-blocked-plan.json')
   const invalidIdentityPlanPath = join(artifacts, 'invalid-identity-plan.json')
   const receiptPath = join(artifacts, 'receipt.json')
+  const missingMigrationPlanPath = join(artifacts, 'missing-migration-plan.json')
   const before = await pool.query('SELECT count(*)::integer AS count FROM workspace_organizations')
+  const removedBoundaryMigration = await pool.query(
+    `DELETE FROM schema_migrations
+     WHERE filename = '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql'
+     RETURNING checksum`,
+  )
+  assert.equal(removedBoundaryMigration.rows.length, 1)
+  await assert.rejects(
+    () => run([
+      ...commonFlags(), '--output', missingMigrationPlanPath,
+    ], environment, testRuntime),
+    /Migrations 0360_workspace_tenant_retirement_receipts\.sql and 0362_workspace_tenant_retirement_receipt_boundary_evidence\.sql are required/u,
+  )
+  await pool.query(
+    `INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)`,
+    [
+      '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql',
+      removedBoundaryMigration.rows[0].checksum,
+    ],
+  )
   await pool.query(
     'UPDATE workspace_organizations SET organization_type = $1 WHERE id = $2',
     ['member', APPROVED_TARGETS[0].organizationId],
@@ -1078,7 +1150,7 @@ try {
       '--manifest', planPath,
       '--confirm-digest', manifest.manifestDigest,
     ], environment, testRuntime),
-    /Migration 0360_workspace_tenant_retirement_receipts.sql is required/u,
+    /Migrations 0360_workspace_tenant_retirement_receipts\.sql and 0362_workspace_tenant_retirement_receipt_boundary_evidence\.sql are required/u,
   )
   await pool.query(
     `UPDATE workspace_tenant_retirement_receipts SET receipt_digest = $1 WHERE id = $2`,

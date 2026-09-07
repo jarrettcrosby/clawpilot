@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 
 import {
@@ -291,8 +292,15 @@ assert.deepEqual(
 )
 
 const source = fs.readFileSync(new URL('./retire-workspace-tenants.mjs', import.meta.url), 'utf8')
-const migration = fs.readFileSync(
+const receiptMigration = fs.readFileSync(
   new URL('../db/migrations/0360_workspace_tenant_retirement_receipts.sql', import.meta.url),
+  'utf8',
+)
+const boundaryMigration = fs.readFileSync(
+  new URL(
+    '../db/migrations/0362_workspace_tenant_retirement_receipt_boundary_evidence.sql',
+    import.meta.url,
+  ),
   'utf8',
 )
 for (const expected of [
@@ -303,6 +311,8 @@ for (const expected of [
   'IN ACCESS EXCLUSIVE MODE',
   "SET LOCAL search_path = pg_catalog, public",
   "pg_advisory_xact_lock(hashtext('clawpilot-schema-migrations'))",
+  '0360_workspace_tenant_retirement_receipts.sql',
+  '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql',
   'lockCatalogDigest',
   'unclassifiedOrganizationRoles',
   'unexpectedSelectedRelations',
@@ -323,14 +333,30 @@ for (const forbidden of [
 ]) {
   assert.equal(source.includes(forbidden), false, `Forbidden retirement behavior: ${forbidden}`)
 }
-assert.match(migration, /workspace_tenant_retirement_receipts/u)
-assert.match(migration, /BEFORE UPDATE OR DELETE/u)
-assert.match(migration, /locked_relations/u)
-assert.match(migration, /deleted_counts/u)
-assert.match(migration, /railway_service_id/u)
-assert.match(migration, /postgres_system_identifier/u)
-assert.match(migration, /backup_evidence/u)
-assert.match(migration, /retirement receipts are immutable/u)
-assert.doesNotMatch(migration, /REFERENCES\s+workspace_organizations/iu)
+assert.equal(
+  createHash('sha256').update(receiptMigration).digest('hex'),
+  '357c263b83cf7cee2003a9607ece1bc58698f06315e1c920cad5f32d4866d119',
+  'Already-deployed migration 0360 must remain byte-for-byte immutable',
+)
+assert.match(receiptMigration, /workspace_tenant_retirement_receipts/u)
+assert.match(receiptMigration, /BEFORE UPDATE OR DELETE/u)
+assert.match(receiptMigration, /locked_relations/u)
+assert.match(receiptMigration, /deleted_counts/u)
+assert.match(receiptMigration, /retirement receipts are immutable/u)
+assert.doesNotMatch(receiptMigration, /REFERENCES\s+workspace_organizations/iu)
+assert.doesNotMatch(receiptMigration, /railway_service_id/u)
+assert.match(boundaryMigration, /LOCK TABLE workspace_tenant_retirement_receipts/u)
+assert.match(boundaryMigration, /Cannot add tenant retirement boundary evidence after receipts exist/u)
+assert.match(boundaryMigration, /ADD COLUMN railway_service_id uuid NOT NULL/u)
+assert.match(boundaryMigration, /ADD COLUMN database_name text NOT NULL/u)
+assert.match(boundaryMigration, /ADD COLUMN database_user text NOT NULL/u)
+assert.match(boundaryMigration, /ADD COLUMN postgres_system_identifier text NOT NULL/u)
+assert.match(boundaryMigration, /ADD COLUMN backup_evidence jsonb NOT NULL/u)
+assert.doesNotMatch(boundaryMigration, /CREATE OR REPLACE FUNCTION/u)
+assert.doesNotMatch(boundaryMigration, /CREATE TRIGGER/u)
+assert.match(
+  source,
+  /Migrations 0360_workspace_tenant_retirement_receipts\.sql and .*0362_workspace_tenant_retirement_receipt_boundary_evidence\.sql are required/su,
+)
 
 process.stdout.write('tenant retirement unit/static safety tests passed\n')

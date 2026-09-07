@@ -655,16 +655,23 @@ async function databaseIdentity(client, expectedBoundary) {
 }
 
 async function assertReceiptMigration(client) {
-  const filename = '0360_workspace_tenant_retirement_receipts.sql'
-  const expectedChecksum = sha256(fs.readFileSync(
-    new URL(`../db/migrations/${filename}`, import.meta.url),
+  const baseFilename = '0360_workspace_tenant_retirement_receipts.sql'
+  const boundaryFilename =
+    '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql'
+  const baseChecksum = sha256(fs.readFileSync(
+    new URL(`../db/migrations/${baseFilename}`, import.meta.url),
+  ))
+  const boundaryChecksum = sha256(fs.readFileSync(
+    new URL(`../db/migrations/${boundaryFilename}`, import.meta.url),
   ))
   const result = await client.query(
-    `SELECT (
-       SELECT checksum = $2
-       FROM schema_migrations
-       WHERE filename = $1
-     ) IS TRUE AS migrated,
+    `SELECT NOT EXISTS (
+       SELECT 1
+       FROM (VALUES ($1::text, $2::text), ($3::text, $4::text))
+         expected(filename, checksum)
+       LEFT JOIN schema_migrations applied USING (filename)
+       WHERE applied.checksum IS DISTINCT FROM expected.checksum
+     ) AS migrated,
      to_regclass('public.workspace_tenant_retirement_receipts') IS NOT NULL AS present,
      NOT EXISTS (
        SELECT required.column_name
@@ -700,13 +707,16 @@ async function assertReceiptMigration(client) {
          AND regexp_replace(function_row.prosrc, '\\s+', ' ', 'g') =
            ' BEGIN RAISE EXCEPTION ''Workspace tenant retirement receipts are immutable''; END; '
      ) AS immutable`,
-    [filename, expectedChecksum],
+    [baseFilename, baseChecksum, boundaryFilename, boundaryChecksum],
   )
   if (result.rows[0]?.migrated !== true
     || result.rows[0]?.present !== true
     || result.rows[0]?.columns_present !== true
     || result.rows[0]?.immutable !== true) {
-    fail('Migration 0360_workspace_tenant_retirement_receipts.sql is required')
+    fail(
+      'Migrations 0360_workspace_tenant_retirement_receipts.sql and '
+      + '0362_workspace_tenant_retirement_receipt_boundary_evidence.sql are required',
+    )
   }
 }
 

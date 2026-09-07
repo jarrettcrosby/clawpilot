@@ -13,20 +13,9 @@ CREATE TABLE IF NOT EXISTS workspace_tenant_retirement_receipts (
   environment text NOT NULL CHECK (environment = 'production'),
   railway_project_id uuid NOT NULL,
   railway_environment_id uuid NOT NULL,
-  railway_service_id uuid NOT NULL,
   database_identity uuid NOT NULL,
-  database_name text NOT NULL CHECK (database_name = 'railway'),
-  database_user text NOT NULL CHECK (database_user = 'postgres'),
-  postgres_system_identifier text NOT NULL CHECK (
-    postgres_system_identifier ~ '^[0-9]{10,30}$'
-  ),
   database_endpoint_sha256 text NOT NULL CHECK (
     database_endpoint_sha256 ~ '^[a-f0-9]{64}$'
-  ),
-  backup_evidence jsonb NOT NULL CHECK (
-    jsonb_typeof(backup_evidence) = 'object'
-    AND backup_evidence->>'sha256' ~ '^[a-f0-9]{64}$'
-    AND (backup_evidence->>'bytes')::numeric > 0
   ),
   actor_email text NOT NULL CHECK (
     actor_email = lower(actor_email)
