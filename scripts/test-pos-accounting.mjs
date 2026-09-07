@@ -1847,12 +1847,14 @@ assert.ok(posAccountingPanel.includes('function toastProductDetailPath(restauran
 assert.ok(posAccountingPanel.includes('function toastProductImagePath(restaurantGuid: string, itemGuid: string)'))
 assert.ok(posAccountingPanel.includes("sourceImagePath: ''"))
 assert.ok(posAccountingPanel.includes('source?.hasImage === true'))
+assert.ok(posAccountingPanel.includes('label="Image available"'))
 assert.ok(posAccountingPanel.includes('void loadToastProductDetail({'))
 assert.ok(posAccountingPanel.includes("cache: 'no-store'"))
 assert.ok(posAccountingPanel.includes('item.hasImage === true'))
 assert.ok(posAccountingPanel.includes('Loading the latest Toast product details...'))
 assert.ok(posAccountingPanel.includes('Toast image unavailable'))
 assert.ok(posAccountingPanel.includes('You can still prepare this draft with the current values.'))
+assert.equal((posAccountingPanel.match(/<ToastProductThumbnail/g) || []).length, 1)
 assert.ok(posAccountingPanel.includes('This remains a Toast and ClawPilot reference image. It is not attached to the QuickBooks product draft.'))
 const quickBooksDraftPayload = posAccountingPanel.slice(
   posAccountingPanel.indexOf("operationKind: 'item.create'"),

@@ -1342,17 +1342,14 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               }}
             >
               <Box minWidth={0} display="flex" alignItems="center" gap={1}>
-                {exactToastProductSource && source?.hasImage === true ? (
-                  <ToastProductThumbnail
-                    imagePath={toastProductImagePath(locationGuid, mapping.sourceId)}
-                    productName={mapping.sourceName}
-                  />
-                ) : null}
                 <Box minWidth={0} flex={1}>
                   <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
                     <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
                     {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
                     {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
+                    {exactToastProductSource && source?.hasImage === true ? (
+                      <Chip size="small" variant="outlined" label="Image available" />
+                    ) : null}
                     {provenanceLabel ? <Chip
                       data-testid="pos-mapping-provenance"
                       size="small"
