@@ -62,8 +62,21 @@ function descriptionHash(value: unknown): string {
   return crypto.createHash('sha256').update(normalizeCrmDescription(value)).digest('hex')
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const source = value as Record<string, unknown>
+    return `{${Object.keys(source)
+      .filter((key) => source[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
 function sameCrmContext(left: Task['crm'], right: Task['crm']): boolean {
-  return JSON.stringify(left || null) === JSON.stringify(right || null)
+  return canonicalJson(left || null) === canonicalJson(right || null)
 }
 
 function taskIdFor(boardId: string, entity: CrmBoardRecord['entity_type'], entityId: string): string {
@@ -386,7 +399,18 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
              WHEN EXCLUDED.sync_status = 'conflict' THEN COALESCE(crm_board_cards.conflict_at, now())
              ELSE NULL
            END,
-           updated_at = now()`,
+           updated_at = now()
+         WHERE crm_board_cards.card_id IS DISTINCT FROM EXCLUDED.card_id
+            OR crm_board_cards.pipeline_id IS DISTINCT FROM EXCLUDED.pipeline_id
+            OR crm_board_cards.reference_code IS DISTINCT FROM EXCLUDED.reference_code
+            OR crm_board_cards.payload IS DISTINCT FROM EXCLUDED.payload
+            OR crm_board_cards.last_synced_description IS DISTINCT FROM EXCLUDED.last_synced_description
+            OR crm_board_cards.last_common_hash IS DISTINCT FROM EXCLUDED.last_common_hash
+            OR crm_board_cards.card_description_hash IS DISTINCT FROM EXCLUDED.card_description_hash
+            OR crm_board_cards.crm_description_hash IS DISTINCT FROM EXCLUDED.crm_description_hash
+            OR crm_board_cards.sync_status IS DISTINCT FROM EXCLUDED.sync_status
+            OR (EXCLUDED.sync_status = 'conflict' AND crm_board_cards.conflict_at IS NULL)
+            OR (EXCLUDED.sync_status <> 'conflict' AND crm_board_cards.conflict_at IS NOT NULL)`,
         [
           binding.board_id,
           card.task.id,
