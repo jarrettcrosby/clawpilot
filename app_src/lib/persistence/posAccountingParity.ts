@@ -1,4 +1,8 @@
 import { query } from '@/lib/persistence/postgres'
+import {
+  reconcilePosClearing,
+  type PosClearingReconciliationStatus,
+} from '@/lib/accounting/posClearingReconciliation'
 
 export type PosAccountingParityEntityType = 'SalesReceipt' | 'JournalEntry'
 export type PosAccountingPostingOrigin = 'shogo' | 'external' | 'clawpilot'
@@ -239,12 +243,63 @@ interface PosAccountingHistoricalEvidenceReference {
   postingOrigin: PosAccountingPostingOrigin | null
 }
 
+export type PosAccountingClearingLifecycleStatus = PosClearingReconciliationStatus
+
+export interface PosAccountingHistoricalClearingLifecycle {
+  lifecycleId: string
+  status: PosAccountingClearingLifecycleStatus
+  accountMatchBasis: 'configured_account_id' | 'legacy_account_name'
+  evidenceCoverage: 'complete' | 'cached_only'
+  currencyCode: string
+  paymentExceptionsAccountId: string
+  paymentExceptionsAccountName: string | null
+  captureBusinessDates: string[]
+  releaseBusinessDates: string[]
+  releaseBusinessDate: string | null
+  capturedCents: number
+  releasedCents: number
+  appliedCents: number
+  outstandingCents: number
+  unappliedReleaseCents: number
+  captureJournals: PosAccountingHistoricalEvidenceReference[]
+  releaseJournals: PosAccountingHistoricalEvidenceReference[]
+  releaseJournal: PosAccountingHistoricalEvidenceReference | null
+  salesReceipts: PosAccountingHistoricalEvidenceReference[]
+  reviewReason: string | null
+}
+
+export interface PosAccountingHistoricalBaselineOptions {
+  organizationId?: string
+  quickBooksCompanyId?: string
+  paymentExceptionAccounts?: ReadonlyArray<{
+    accountId: string
+    accountName?: string | null
+  }>
+  fromBusinessDate?: string
+  asOfBusinessDate?: string
+  overdueGraceDays?: number
+  openingBalanceQueryTruncated?: boolean
+  providerHistoryBoundaryProven?: boolean
+  evidenceCoverageRanges?: ReadonlyArray<{
+    fromBusinessDate: string
+    toBusinessDate: string
+  }>
+}
+
 export interface PosAccountingHistoricalBaseline {
   summary: {
     cachedTransactions: number
     pairCount: number
     postingBundleCount: number
     journalOnlyCaptureCount: number
+    clearingLifecycleCount: number
+    clearingStatusCounts: {
+      pending: number
+      settled: number
+      partiallySettled: number
+      ambiguous: number
+      overdueUnresolved: number
+    }
     exactMarkerPairs: number
     dateFallbackPairs: number
     unmatchedGroups: number
@@ -278,6 +333,7 @@ export interface PosAccountingHistoricalBaseline {
     journalEntry: PosAccountingHistoricalEvidenceReference
     journalBalance: PosAccountingJournalBalanceCheck
   }>
+  clearingLifecycles: PosAccountingHistoricalClearingLifecycle[]
   unmatchedGroups: Array<{
     businessDate: string
     documentNumber: string | null
@@ -398,6 +454,7 @@ export interface PosAccountingParityPostgresReport extends PosAccountingParityRe
     pairPages: number
     postingBundlePages: number
     journalOnlyCapturePages: number
+    clearingLifecyclePages: number
     unmatchedPages: number
     ambiguousPages: number
   }
@@ -1512,15 +1569,483 @@ function statusCounts(statuses: Array<'match' | 'variance' | 'insufficient_evide
   }
 }
 
-function isPaymentExceptionsJournal(journal: NormalizedQuickBooksJournalEntry): boolean {
-  return journal.postingOrigin !== null && journal.lineGroups.some((line) => {
-    const accountName = normalizedIdentity(line.accountName)
-    return Boolean(accountName && /\bpayment exceptions?\b/.test(accountName))
+const DEFAULT_PAYMENT_EXCEPTION_SETTLEMENT_GRACE_DAYS = 3
+const MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS = 1000
+const ACCOUNT_LEVEL_CLEARING_SCOPE = 'organization-account-level'
+
+function normalizedPaymentExceptionAccounts(
+  options: PosAccountingHistoricalBaselineOptions,
+): Map<string, string | null> {
+  const accounts = new Map<string, string | null>()
+  for (const account of options.paymentExceptionAccounts || []) {
+    const accountId = text(account.accountId, 200)
+    if (!accountId) continue
+    accounts.set(accountId, text(account.accountName, 300))
+  }
+  return accounts
+}
+
+function isLegacyPaymentExceptionsName(value: string | null): boolean {
+  const accountName = normalizedIdentity(value)
+  return Boolean(accountName && /\bpayment exceptions?\b/.test(accountName))
+}
+
+function paymentExceptionLineBasis(
+  line: PosAccountingJournalLineGroup,
+  configuredAccounts: ReadonlyMap<string, string | null>,
+): 'configured_account_id' | 'legacy_account_name' | null {
+  if (configuredAccounts.size > 0) {
+    return configuredAccounts.has(line.accountId) ? 'configured_account_id' : null
+  }
+  return isLegacyPaymentExceptionsName(line.accountName) ? 'legacy_account_name' : null
+}
+
+function mergeCoverageRanges(
+  ranges: PosAccountingHistoricalBaselineOptions['evidenceCoverageRanges'],
+): Array<{ fromBusinessDate: string; toBusinessDate: string }> {
+  const normalized = (ranges || []).map((range) => ({
+    fromBusinessDate: businessDate(range.fromBusinessDate),
+    toBusinessDate: businessDate(range.toBusinessDate),
+  })).filter((range): range is { fromBusinessDate: string; toBusinessDate: string } => Boolean(
+    range.fromBusinessDate
+      && range.toBusinessDate
+      && range.fromBusinessDate <= range.toBusinessDate,
+  )).sort((left, right) => left.fromBusinessDate.localeCompare(right.fromBusinessDate)
+    || left.toBusinessDate.localeCompare(right.toBusinessDate))
+
+  const merged: Array<{ fromBusinessDate: string; toBusinessDate: string }> = []
+  for (const range of normalized) {
+    const previous = merged.at(-1)
+    if (!previous) {
+      merged.push({ ...range })
+      continue
+    }
+    const previousNext = new Date(`${previous.toBusinessDate}T00:00:00.000Z`)
+    previousNext.setUTCDate(previousNext.getUTCDate() + 1)
+    if (range.fromBusinessDate <= previousNext.toISOString().slice(0, 10)) {
+      if (range.toBusinessDate > previous.toBusinessDate) {
+        previous.toBusinessDate = range.toBusinessDate
+      }
+      continue
+    }
+    merged.push({ ...range })
+  }
+  return merged
+}
+
+function evidenceRangeIsComplete(
+  fromBusinessDate: string,
+  toBusinessDate: string,
+  ranges: ReadonlyArray<{ fromBusinessDate: string; toBusinessDate: string }>,
+): boolean {
+  return ranges.some((range) => (
+    range.fromBusinessDate <= fromBusinessDate && range.toBusinessDate >= toBusinessDate
+  ))
+}
+
+function clearingStatusSummary(lifecycles: readonly PosAccountingHistoricalClearingLifecycle[]) {
+  return {
+    pending: lifecycles.filter((item) => item.status === 'pending').length,
+    settled: lifecycles.filter((item) => item.status === 'settled').length,
+    partiallySettled: lifecycles.filter((item) => item.status === 'partially_settled').length,
+    ambiguous: lifecycles.filter((item) => item.status === 'ambiguous').length,
+    overdueUnresolved: lifecycles.filter((item) => item.status === 'overdue_unresolved').length,
+  }
+}
+
+function buildPaymentExceptionClearingLifecycles(input: {
+  journals: readonly NormalizedQuickBooksJournalEntry[]
+  pairs: PosAccountingHistoricalBaseline['pairs']
+  postingBundles: PosAccountingHistoricalBaseline['postingBundles']
+  options: PosAccountingHistoricalBaselineOptions
+}): {
+  lifecycles: PosAccountingHistoricalClearingLifecycle[]
+  journalOnlyCaptureIds: Set<string>
+  recognizedReleaseJournalIds: Set<string>
+} {
+  const configuredAccounts = normalizedPaymentExceptionAccounts(input.options)
+  const coverageRanges = mergeCoverageRanges(input.options.evidenceCoverageRanges)
+  const evidenceDates = input.journals.map((journal) => journal.businessDate)
+  const coverageDates = coverageRanges.flatMap((range) => [range.toBusinessDate])
+  const requestedAsOf = businessDate(input.options.asOfBusinessDate)
+  const asOfBusinessDate = requestedAsOf || [...coverageDates, ...evidenceDates]
+    .filter((value): value is string => Boolean(value))
+    .sort().at(-1) || '1970-01-01'
+  const selectedRangeStart = businessDate(input.options.fromBusinessDate)
+  const overdueGraceDays = Number.isSafeInteger(input.options.overdueGraceDays)
+    && Number(input.options.overdueGraceDays) >= 0
+    ? Number(input.options.overdueGraceDays)
+    : DEFAULT_PAYMENT_EXCEPTION_SETTLEMENT_GRACE_DAYS
+  const organizationId = text(input.options.organizationId, 200) || 'historical-organization'
+  const quickBooksCompanyId = text(input.options.quickBooksCompanyId, 512)
+    || 'historical-quickbooks-company'
+
+  const receiptReferencesByJournalId = new Map<string, PosAccountingHistoricalEvidenceReference[]>()
+  for (const pair of input.pairs) {
+    if (pair.basis !== 'business_date_and_marker') continue
+    receiptReferencesByJournalId.set(pair.journalEntry.evidenceId, [pair.salesReceipt])
+  }
+  for (const bundle of input.postingBundles) {
+    for (const journal of bundle.journalEntries) {
+      receiptReferencesByJournalId.set(journal.evidenceId, bundle.salesReceipts)
+    }
+  }
+
+  type ClearingLeg = {
+    legId: string
+    journal: NormalizedQuickBooksJournalEntry
+    line: PosAccountingJournalLineGroup
+    accountMatchBasis: 'configured_account_id' | 'legacy_account_name'
+  }
+  const captures: ClearingLeg[] = []
+  const releases: ClearingLeg[] = []
+  const conflictedLegs: ClearingLeg[] = []
+  const journalOnlyCaptureIds = new Set<string>()
+
+  for (const journal of input.journals) {
+    if (journal.postingOrigin === null) continue
+    const matchingLines = journal.lineGroups.map((line) => ({
+      line,
+      accountMatchBasis: paymentExceptionLineBasis(line, configuredAccounts),
+    })).filter((entry): entry is {
+      line: PosAccountingJournalLineGroup
+      accountMatchBasis: 'configured_account_id' | 'legacy_account_name'
+    } => entry.accountMatchBasis !== null)
+    const accountIds = [...new Set(matchingLines.map((entry) => entry.line.accountId))]
+    for (const accountId of accountIds) {
+      const accountLines = matchingLines.filter((entry) => entry.line.accountId === accountId)
+      const hasDebit = accountLines.some((entry) => entry.line.side === 'debit')
+      const hasCredit = accountLines.some((entry) => entry.line.side === 'credit')
+      for (const entry of accountLines) {
+        const leg: ClearingLeg = {
+          legId: `${journal.evidenceId}:payment-exceptions:${entry.line.side}:${accountId}`,
+          journal,
+          line: entry.line,
+          accountMatchBasis: entry.accountMatchBasis,
+        }
+        if (hasDebit && hasCredit) conflictedLegs.push(leg)
+        else if (entry.line.side === 'credit') {
+          captures.push(leg)
+          journalOnlyCaptureIds.add(journal.evidenceId)
+        } else releases.push(leg)
+      }
+    }
+  }
+
+  const scopeFor = (leg: ClearingLeg) => ({
+    organizationId,
+    quickBooksCompanyId,
+    locationId: ACCOUNT_LEVEL_CLEARING_SCOPE,
+    currencyCode: (leg.journal.currencyCode || 'UNSPECIFIED').toUpperCase(),
+    clearingAccountId: leg.line.accountId,
   })
+  const reconciliation = reconcilePosClearing({
+    asOfBusinessDate,
+    overdueGraceDays,
+    captures: captures.map((capture) => ({
+      captureId: capture.legId,
+      scope: scopeFor(capture),
+      businessDate: capture.journal.businessDate,
+      amountCents: capture.line.amountCents,
+      evidence: [{
+        evidenceId: capture.legId,
+        entityType: 'JournalEntry',
+        providerTransactionId: capture.journal.providerTransactionId || undefined,
+        documentNumber: capture.journal.documentNumber || undefined,
+        lineId: `${capture.line.side}:${capture.line.accountId}`,
+      }],
+    })),
+    releases: releases.map((release) => ({
+      releaseId: release.legId,
+      scope: scopeFor(release),
+      businessDate: release.journal.businessDate,
+      amountCents: release.line.amountCents,
+      evidence: [{
+        evidenceId: release.legId,
+        entityType: 'JournalEntry',
+        providerTransactionId: release.journal.providerTransactionId || undefined,
+        documentNumber: release.journal.documentNumber || undefined,
+        lineId: `${release.line.side}:${release.line.accountId}`,
+      }, ...(receiptReferencesByJournalId.get(release.journal.evidenceId) || []).map((receipt) => ({
+        evidenceId: `${release.legId}:${receipt.evidenceId}`,
+        entityType: 'SalesReceipt' as const,
+        providerTransactionId: receipt.providerTransactionId || undefined,
+        documentNumber: receipt.documentNumber || undefined,
+      }))],
+    })),
+  })
+  const captureById = new Map(captures.map((capture) => [capture.legId, capture]))
+  const captureResultById = new Map(reconciliation.captures.map((capture) => [capture.captureId, capture]))
+  const releaseById = new Map(releases.map((release) => [release.legId, release]))
+  const releaseResultById = new Map(reconciliation.releases.map((release) => [release.releaseId, release]))
+  const lifecycles: PosAccountingHistoricalClearingLifecycle[] = []
+  const captureNodeId = (captureId: string) => `capture:${captureId}`
+  const releaseNodeId = (releaseId: string) => `release:${releaseId}`
+  const adjacency = new Map<string, Set<string>>()
+  const addNode = (nodeId: string) => {
+    if (!adjacency.has(nodeId)) adjacency.set(nodeId, new Set())
+  }
+  const connectNodes = (leftNodeId: string, rightNodeId: string) => {
+    addNode(leftNodeId)
+    addNode(rightNodeId)
+    adjacency.get(leftNodeId)!.add(rightNodeId)
+    adjacency.get(rightNodeId)!.add(leftNodeId)
+  }
+  for (const capture of reconciliation.captures) addNode(captureNodeId(capture.captureId))
+  for (const release of reconciliation.releases) addNode(releaseNodeId(release.releaseId))
+  for (const allocation of reconciliation.allocations) {
+    connectNodes(captureNodeId(allocation.captureId), releaseNodeId(allocation.releaseId))
+  }
+  for (const release of reconciliation.releases) {
+    for (const captureId of [
+      ...release.matchedCaptureIds,
+      ...release.ambiguousCandidateCaptureIds,
+    ]) {
+      connectNodes(captureNodeId(captureId), releaseNodeId(release.releaseId))
+    }
+  }
+
+  const connectedComponents: string[][] = []
+  const visitedNodes = new Set<string>()
+  for (const startingNodeId of [...adjacency.keys()].sort()) {
+    if (visitedNodes.has(startingNodeId)) continue
+    const component: string[] = []
+    const pendingNodes = [startingNodeId]
+    while (pendingNodes.length > 0) {
+      const nodeId = pendingNodes.pop()!
+      if (visitedNodes.has(nodeId)) continue
+      visitedNodes.add(nodeId)
+      component.push(nodeId)
+      pendingNodes.push(...[...(adjacency.get(nodeId) || [])].sort().reverse())
+    }
+    connectedComponents.push(component.sort())
+  }
+
+  const uniqueEvidenceReferences = (
+    references: PosAccountingHistoricalEvidenceReference[],
+  ): PosAccountingHistoricalEvidenceReference[] => [...new Map(
+    references.map((reference) => [reference.evidenceId, reference]),
+  ).values()].sort((left, right) => left.businessDate.localeCompare(right.businessDate)
+    || left.evidenceId.localeCompare(right.evidenceId))
+
+  for (const componentNodeIds of connectedComponents) {
+    const componentCaptureIds = componentNodeIds
+      .filter((nodeId) => nodeId.startsWith('capture:'))
+      .map((nodeId) => nodeId.slice('capture:'.length))
+    const componentReleaseIds = componentNodeIds
+      .filter((nodeId) => nodeId.startsWith('release:'))
+      .map((nodeId) => nodeId.slice('release:'.length))
+    const captureResults = componentCaptureIds.map((captureId) => captureResultById.get(captureId))
+      .filter((capture): capture is NonNullable<typeof capture> => Boolean(capture))
+    const releaseResults = componentReleaseIds.map((releaseId) => releaseResultById.get(releaseId))
+      .filter((release): release is NonNullable<typeof release> => Boolean(release))
+    const captureLegs = componentCaptureIds.map((captureId) => captureById.get(captureId))
+      .filter((capture): capture is ClearingLeg => Boolean(capture))
+      .sort((left, right) => left.journal.businessDate.localeCompare(right.journal.businessDate)
+        || left.legId.localeCompare(right.legId))
+    const releaseLegs = componentReleaseIds.map((releaseId) => releaseById.get(releaseId))
+      .filter((release): release is ClearingLeg => Boolean(release))
+      .sort((left, right) => left.journal.businessDate.localeCompare(right.journal.businessDate)
+        || left.legId.localeCompare(right.legId))
+    const representativeLeg = releaseLegs[0] || captureLegs[0]
+    const representativeResult = releaseResults[0] || captureResults[0]
+    if (!representativeLeg || !representativeResult) continue
+
+    const forwardCoverageComplete = captureLegs.length > 0 && captureLegs.every((capture) => (
+      evidenceRangeIsComplete(capture.journal.businessDate, asOfBusinessDate, coverageRanges)
+    ))
+    // A bounded date-filtered cache cannot prove that an older, uncached credit does not
+    // exist. Preserve the observed offset status, but keep its evidence provisional until
+    // a provider-history floor or explicit zero-balance boundary is recorded.
+    const lifecycleEvidenceComplete = forwardCoverageComplete
+      && input.options.providerHistoryBoundaryProven === true
+    const capturedCents = captureResults.reduce((total, capture) => total + capture.amountCents, 0)
+    const releasedCents = releaseResults.reduce((total, release) => total + release.amountCents, 0)
+    const appliedCents = captureResults.reduce(
+      (total, capture) => total + capture.allocatedCents,
+      0,
+    )
+    const outstandingCents = captureResults.reduce(
+      (total, capture) => total + capture.remainingCents,
+      0,
+    )
+    const unappliedReleaseCents = releaseResults.reduce(
+      (total, release) => total + release.remainingCents,
+      0,
+    )
+    const captureBusinessDates = [...new Set(
+      captureLegs.map((capture) => capture.journal.businessDate),
+    )].sort()
+    const releaseBusinessDates = [...new Set(
+      releaseLegs.map((release) => release.journal.businessDate),
+    )].sort()
+    const captureJournals = uniqueEvidenceReferences(
+      captureLegs.map((capture) => historicalEvidenceReference(capture.journal)),
+    )
+    const releaseJournals = uniqueEvidenceReferences(
+      releaseLegs.map((release) => historicalEvidenceReference(release.journal)),
+    )
+    const salesReceipts = uniqueEvidenceReferences(releaseLegs.flatMap((release) => (
+      receiptReferencesByJournalId.get(release.journal.evidenceId) || []
+    )))
+
+    let status: PosAccountingClearingLifecycleStatus
+    let reviewReason: string | null = null
+    if (captureResults.length === 0) {
+      status = 'ambiguous'
+      reviewReason = 'No uniquely matching earlier Payment Exceptions capture was found for this debit.'
+    } else if (
+      captureResults.some((capture) => capture.status === 'ambiguous')
+      || releaseResults.some((release) => release.status === 'ambiguous')
+    ) {
+      status = 'ambiguous'
+      reviewReason = 'More than one earlier capture combination can explain this clearing debit.'
+    } else if (releaseResults.length === 0) {
+      const captureStatus = captureResults[0].status
+      status = captureStatus === 'overdue_unresolved' && !lifecycleEvidenceComplete
+        ? 'pending'
+        : captureStatus
+      reviewReason = captureStatus === 'overdue_unresolved'
+        ? lifecycleEvidenceComplete
+          ? 'The refreshed evidence window passed the three-day clearing period without a release.'
+          : !forwardCoverageComplete
+            ? 'A later release has not yet been observed in the cached QuickBooks evidence window.'
+            : 'A provider-history boundary has not been verified, so this cached balance is not treated as overdue.'
+        : captureStatus === 'ambiguous'
+          ? 'The capture could not be assigned without guessing.'
+          : !forwardCoverageComplete
+            ? 'A later release has not yet been observed in the cached QuickBooks evidence window.'
+            : null
+    } else if (outstandingCents > 0 || unappliedReleaseCents > 0) {
+      status = 'partially_settled'
+      reviewReason = outstandingCents > 0
+        ? 'Only part of the captured Payment Exceptions balance has been released.'
+        : 'Part of the clearing debit could not be attributed to the matched captures.'
+    } else {
+      status = 'settled'
+    }
+
+    if (
+      input.options.openingBalanceQueryTruncated === true
+      || (selectedRangeStart !== null && input.options.providerHistoryBoundaryProven !== true)
+    ) {
+      status = 'ambiguous'
+      reviewReason = input.options.openingBalanceQueryTruncated === true
+        ? 'The bounded opening-balance query did not include all cached earlier Payment Exceptions journals, so this account offset cannot be treated as conclusive.'
+        : 'QuickBooks provider history before the selected range has not been proven complete, so this account offset cannot be treated as conclusive.'
+    }
+
+    lifecycles.push({
+      lifecycleId: `payment-exceptions:component:${componentNodeIds[0]}`,
+      status,
+      accountMatchBasis: [...captureLegs, ...releaseLegs].some(
+        (leg) => leg.accountMatchBasis === 'legacy_account_name',
+      ) ? 'legacy_account_name' : 'configured_account_id',
+      evidenceCoverage: lifecycleEvidenceComplete ? 'complete' : 'cached_only',
+      currencyCode: representativeResult.scope.currencyCode,
+      paymentExceptionsAccountId: representativeLeg.line.accountId,
+      paymentExceptionsAccountName: representativeLeg.line.accountName
+        || configuredAccounts.get(representativeLeg.line.accountId) || null,
+      captureBusinessDates,
+      releaseBusinessDates,
+      releaseBusinessDate: releaseBusinessDates.at(-1) || null,
+      capturedCents,
+      releasedCents,
+      appliedCents,
+      outstandingCents,
+      unappliedReleaseCents,
+      captureJournals,
+      releaseJournals,
+      releaseJournal: releaseJournals.at(-1) || null,
+      salesReceipts,
+      reviewReason,
+    })
+  }
+
+  const conflictedLegGroups = new Map<string, ClearingLeg[]>()
+  for (const leg of conflictedLegs) {
+    const key = `${leg.journal.evidenceId}\u0000${leg.line.accountId}`
+    conflictedLegGroups.set(key, [...(conflictedLegGroups.get(key) || []), leg])
+  }
+  for (const legs of conflictedLegGroups.values()) {
+    const journal = legs[0]?.journal
+    if (!journal) continue
+    const capturedCents = legs.filter((leg) => leg.line.side === 'credit')
+      .reduce((total, leg) => total + leg.line.amountCents, 0)
+    const releasedCents = legs.filter((leg) => leg.line.side === 'debit')
+      .reduce((total, leg) => total + leg.line.amountCents, 0)
+    lifecycles.push({
+      lifecycleId: `payment-exceptions:conflict:${journal.evidenceId}:${legs[0].line.accountId}`,
+      status: 'ambiguous',
+      accountMatchBasis: legs[0].accountMatchBasis,
+      evidenceCoverage: 'cached_only',
+      currencyCode: (journal.currencyCode || 'UNSPECIFIED').toUpperCase(),
+      paymentExceptionsAccountId: legs[0].line.accountId,
+      paymentExceptionsAccountName: legs[0].line.accountName
+        || configuredAccounts.get(legs[0].line.accountId) || null,
+      captureBusinessDates: [journal.businessDate],
+      releaseBusinessDates: [journal.businessDate],
+      releaseBusinessDate: journal.businessDate,
+      capturedCents,
+      releasedCents,
+      appliedCents: 0,
+      outstandingCents: capturedCents,
+      unappliedReleaseCents: releasedCents,
+      captureJournals: [historicalEvidenceReference(journal)],
+      releaseJournals: [historicalEvidenceReference(journal)],
+      releaseJournal: historicalEvidenceReference(journal),
+      salesReceipts: receiptReferencesByJournalId.get(journal.evidenceId) || [],
+      reviewReason: 'The same journal both debits and credits Payment Exceptions; automatic allocation was withheld.',
+    })
+  }
+
+  lifecycles.sort((left, right) => (
+    (right.releaseBusinessDate || right.captureBusinessDates.at(-1) || '')
+      .localeCompare(left.releaseBusinessDate || left.captureBusinessDates.at(-1) || '')
+      || left.lifecycleId.localeCompare(right.lifecycleId)
+  ))
+  const recognizedReleaseJournalIds = new Set(
+    reconciliation.releases
+      .filter((release) => release.allocatedCents > 0)
+      .map((release) => releaseById.get(release.releaseId)?.journal.evidenceId)
+      .filter((journalId): journalId is string => Boolean(journalId)),
+  )
+
+  return { lifecycles, journalOnlyCaptureIds, recognizedReleaseJournalIds }
+}
+
+function selectOpeningBalanceJournals(
+  journals: readonly NormalizedQuickBooksJournalEntry[],
+  options: PosAccountingHistoricalBaselineOptions,
+): NormalizedQuickBooksJournalEntry[] {
+  if (journals.length === 0) return []
+  if (
+    options.openingBalanceQueryTruncated === true
+    || (
+      businessDate(options.fromBusinessDate) !== null
+      && options.providerHistoryBoundaryProven !== true
+    )
+  ) return [...journals]
+  const openingLifecycles = buildPaymentExceptionClearingLifecycles({
+    journals,
+    pairs: [],
+    postingBundles: [],
+    options,
+  })
+  const retainedEvidenceIds = new Set<string>()
+  for (const lifecycle of openingLifecycles.lifecycles) {
+    if (lifecycle.status === 'settled' || lifecycle.captureJournals.length === 0) continue
+    for (const evidence of [...lifecycle.captureJournals, ...lifecycle.releaseJournals]) {
+      retainedEvidenceIds.add(evidence.evidenceId)
+    }
+  }
+  return journals.filter((journal) => retainedEvidenceIds.has(journal.evidenceId))
 }
 
 export function buildHistoricalPosAccountingBaseline(
   evidence: readonly NormalizedQuickBooksPosAccountingEvidence[],
+  options: PosAccountingHistoricalBaselineOptions = {},
+  openingBalanceJournals: readonly NormalizedQuickBooksJournalEntry[] = [],
 ): PosAccountingHistoricalBaseline {
   const receipts = evidence
     .filter((item): item is NormalizedQuickBooksSalesReceipt => item.entityType === 'SalesReceipt')
@@ -1530,6 +2055,10 @@ export function buildHistoricalPosAccountingBaseline(
     .filter((item): item is NormalizedQuickBooksJournalEntry => item.entityType === 'JournalEntry')
     .sort((left, right) => left.businessDate.localeCompare(right.businessDate)
       || left.evidenceId.localeCompare(right.evidenceId))
+  const clearingJournals = [...new Map(
+    [...openingBalanceJournals, ...journals].map((journal) => [journal.evidenceId, journal]),
+  ).values()].sort((left, right) => left.businessDate.localeCompare(right.businessDate)
+    || left.evidenceId.localeCompare(right.evidenceId))
   const receiptById = new Map(receipts.map((item) => [item.evidenceId, item]))
   const journalById = new Map(journals.map((item) => [item.evidenceId, item]))
   const remainingReceipts = new Set(receiptById.keys())
@@ -1603,15 +2132,24 @@ export function buildHistoricalPosAccountingBaseline(
     })
   }
 
+  const preliminaryClearing = buildPaymentExceptionClearingLifecycles({
+    journals: clearingJournals,
+    pairs,
+    postingBundles,
+    options,
+  })
   for (const journalId of [...remainingJournals]) {
     const journal = journalById.get(journalId)
-    if (!journal || !isPaymentExceptionsJournal(journal)) continue
+    if (!journal || !preliminaryClearing.journalOnlyCaptureIds.has(journal.evidenceId)) continue
     journalOnlyCaptures.push({
       basis: 'payment_exceptions_account',
       businessDate: journal.businessDate,
       journalEntry: historicalEvidenceReference(journal),
       journalBalance: compareJournalEntryBalance(journal),
     })
+    remainingJournals.delete(journalId)
+  }
+  for (const journalId of preliminaryClearing.recognizedReleaseJournalIds) {
     remainingJournals.delete(journalId)
   }
 
@@ -1662,6 +2200,27 @@ export function buildHistoricalPosAccountingBaseline(
     })
   }
 
+  const clearing = buildPaymentExceptionClearingLifecycles({
+    journals: clearingJournals,
+    pairs,
+    postingBundles,
+    options,
+  })
+  const fromBusinessDate = businessDate(options.fromBusinessDate)
+  const visibleClearingLifecycles = clearing.lifecycles.filter((lifecycle) => {
+    if (!fromBusinessDate) return true
+    const touchesSelectedRange = [
+      ...lifecycle.captureBusinessDates,
+      ...lifecycle.releaseBusinessDates,
+    ].some((date) => date >= fromBusinessDate)
+    const isUnresolvedOpeningBalance = lifecycle.status !== 'settled'
+      && [
+        ...lifecycle.captureBusinessDates,
+        ...lifecycle.releaseBusinessDates,
+      ].some((date) => date < fromBusinessDate)
+    return touchesSelectedRange || isUnresolvedOpeningBalance
+  })
+
   const unmatchedByGroup = new Map<string, NormalizedQuickBooksPosAccountingEvidence[]>()
   const unmatchedEvidence = [
     ...[...remainingReceipts].map((id) => receiptById.get(id)),
@@ -1698,6 +2257,8 @@ export function buildHistoricalPosAccountingBaseline(
       pairCount: pairs.length,
       postingBundleCount: postingBundles.length,
       journalOnlyCaptureCount: journalOnlyCaptures.length,
+      clearingLifecycleCount: visibleClearingLifecycles.length,
+      clearingStatusCounts: clearingStatusSummary(visibleClearingLifecycles),
       exactMarkerPairs: pairs
         .filter((pair) => pair.basis === 'business_date_and_marker').length,
       dateFallbackPairs: pairs.filter((pair) => pair.basis === 'business_date_only').length,
@@ -1711,6 +2272,7 @@ export function buildHistoricalPosAccountingBaseline(
     pairs,
     postingBundles,
     journalOnlyCaptures,
+    clearingLifecycles: visibleClearingLifecycles,
     unmatchedGroups,
     ambiguousGroups,
   }
@@ -1783,6 +2345,8 @@ export function buildPosAccountingParityReport(input: {
   drafts: readonly unknown[]
   transactions: readonly unknown[]
   fullHistoryTransactions?: readonly unknown[]
+  clearingOpeningBalanceTransactions?: readonly unknown[]
+  historicalBaselineOptions?: PosAccountingHistoricalBaselineOptions
   evidenceLastSyncedAt?: string | null
   draftsNewerThanEvidence?: number
 }): PosAccountingParityReport {
@@ -1804,6 +2368,24 @@ export function buildPosAccountingParityReport(input: {
     .filter((transaction) => classifyPosAccountingQuickBooksTransaction(transaction, linkedProviderIds) !== null)
     .map((transaction) => normalizeQuickBooksPosAccountingEvidence(transaction, linkedProviderIds))
     .filter((item): item is NormalizedQuickBooksPosAccountingEvidence => Boolean(item))
+  const configuredPaymentExceptionAccounts = normalizedPaymentExceptionAccounts(
+    input.historicalBaselineOptions || {},
+  )
+  const fromBusinessDate = businessDate(input.historicalBaselineOptions?.fromBusinessDate)
+  const clearingOpeningBalanceCandidates = (input.clearingOpeningBalanceTransactions || [])
+    .filter((transaction) => classifyPosAccountingQuickBooksTransaction(transaction, linkedProviderIds) !== null)
+    .map((transaction) => normalizeQuickBooksPosAccountingEvidence(transaction, linkedProviderIds))
+    .filter((item): item is NormalizedQuickBooksJournalEntry => (
+      item?.entityType === 'JournalEntry'
+      && (!fromBusinessDate || item.businessDate < fromBusinessDate)
+      && item.lineGroups.some((line) => (
+        paymentExceptionLineBasis(line, configuredPaymentExceptionAccounts) !== null
+      ))
+    ))
+  const clearingOpeningBalanceJournals = selectOpeningBalanceJournals(
+    clearingOpeningBalanceCandidates,
+    input.historicalBaselineOptions || {},
+  )
   const expected = drafts.flatMap((draft) => draft.documents)
   const matched = matchPosAccountingParityDocuments({ expected, actual: transactions })
   const rows = matched.matches.map((match) => {
@@ -1855,7 +2437,11 @@ export function buildPosAccountingParityReport(input: {
       evidenceMayBeStale: draftsNewerThanEvidence > 0,
     },
     preorderLifecycles: buildPreorderLifecycles(drafts),
-    historicalBaseline: buildHistoricalPosAccountingBaseline(fullHistoryTransactions),
+    historicalBaseline: buildHistoricalPosAccountingBaseline(
+      fullHistoryTransactions,
+      input.historicalBaselineOptions,
+      clearingOpeningBalanceJournals,
+    ),
     rows,
     unmatchedQuickBooks: matched.unmatchedQuickBooks,
     discardedEvidence: {
@@ -2002,7 +2588,14 @@ export async function readPosAccountingParityReportInPostgres(
   const historyPageSize = positiveInteger(input.historyPageSize, 20, 100, 'historyPageSize')
   const baseValues = [organizationId, fromBusinessDate, toBusinessDate]
 
-  const [countResult, dateResult, cacheResult, fullHistoryResult] = await Promise.all([
+  const [
+    countResult,
+    dateResult,
+    cacheResult,
+    fullHistoryResult,
+    paymentExceptionAccountsResult,
+    evidenceCoverageResult,
+  ] = await Promise.all([
     query<{ total_dates: string }>(
       `${EVIDENCE_DATES_CTE}
        SELECT count(*)::text AS total_dates FROM evidence_dates`,
@@ -2023,6 +2616,8 @@ export async function readPosAccountingParityReportInPostgres(
       last_pos_evidence_synced_at: string | null
       sync_status: string | null
       sync_completed_at: string | null
+      quickbooks_company_id: string | null
+      maton_connection_id: string | null
       sales_receipt_count: string
       journal_entry_count: string
       drafts_newer_than_evidence: string
@@ -2046,6 +2641,16 @@ export async function readPosAccountingParityReportInPostgres(
            FROM organization_quickbooks_connections connection
            WHERE connection.organization_id = $1::uuid
          ) AS last_pos_evidence_synced_at,
+         (
+           SELECT NULLIF(connection.company_profile ->> 'companyId', '')
+           FROM organization_quickbooks_connections connection
+           WHERE connection.organization_id = $1::uuid
+         ) AS quickbooks_company_id,
+         (
+           SELECT connection.maton_connection_id
+           FROM organization_quickbooks_connections connection
+           WHERE connection.organization_id = $1::uuid
+         ) AS maton_connection_id,
          (
            SELECT outbox.status FROM quickbooks_sync_outbox outbox
            WHERE outbox.organization_id = $1::uuid AND outbox.sync_kind = 'catalog'
@@ -2113,7 +2718,118 @@ export async function readPosAccountingParityReportInPostgres(
          transaction.quickbooks_transaction_id`,
       baseValues,
     ),
+    query<{
+      account_id: string
+      account_name: string | null
+    }>(
+      `SELECT DISTINCT ON (mapping.target_id)
+         mapping.target_id AS account_id, mapping.target_name AS account_name
+       FROM pos_accounting_catalog_mappings mapping
+       WHERE mapping.organization_id = $1::uuid
+         AND mapping.source_kind = 'payment_exception'
+         AND mapping.source_id = 'summary:payment_exceptions'
+         AND mapping.target_type = 'account'
+         AND mapping.active = true
+         AND mapping.effective_to IS NULL
+       ORDER BY mapping.target_id, mapping.effective_from DESC, mapping.mapping_revision DESC`,
+      [organizationId],
+    ),
+    query<{
+      from_business_date: string | null
+      to_business_date: string | null
+    }>(
+      `SELECT event.payload ->> 'fromBusinessDate' AS from_business_date,
+         event.payload ->> 'toBusinessDate' AS to_business_date
+       FROM audit_events event
+       WHERE event.organization_id = $1::uuid
+         AND event.event_type = 'quickbooks.pos_evidence.refreshed'
+         AND event.created_at >= COALESCE((
+           SELECT max(binding_event.created_at)
+           FROM audit_events binding_event
+           WHERE binding_event.organization_id = $1::uuid
+             AND binding_event.event_type = 'quickbooks.connection.bound'
+         ), '-infinity'::timestamptz)
+       ORDER BY event.created_at DESC
+       LIMIT 500`,
+      [organizationId],
+    ),
   ])
+
+  let clearingOpeningBalanceTransactions: unknown[] = []
+  let openingBalanceQueryTruncated = false
+  if (fromBusinessDate) {
+    const openingBalanceResult = await query<{
+      entity_type: string
+      quickbooks_transaction_id: string
+      document_number: string | null
+      transaction_date: string
+      currency_code: string | null
+      total_amount: string
+      memo: string | null
+      source_payload: unknown
+      synced_at: string
+      party_name: string | null
+      account_name: string | null
+      pos_accounting_origin: PosAccountingPostingOrigin
+    }>(
+      `SELECT transaction.entity_type, transaction.quickbooks_transaction_id,
+         transaction.document_number, transaction.transaction_date::text,
+         transaction.currency_code, transaction.total_amount::text,
+         transaction.memo, transaction.source_payload, transaction.synced_at::text,
+         transaction.party_name, transaction.account_name,
+         ${POS_ACCOUNTING_ORIGIN_SQL} AS pos_accounting_origin
+       FROM quickbooks_transactions transaction
+       WHERE transaction.organization_id = $1::uuid
+         AND transaction.entity_type = 'JournalEntry'
+         AND transaction.transaction_date IS NOT NULL
+         AND transaction.transaction_date < $2::date
+         AND ${POS_ACCOUNTING_TRANSACTION_SQL}
+         AND EXISTS (
+           SELECT 1
+           FROM jsonb_path_query(
+             COALESCE(transaction.source_payload, '{}'::jsonb),
+             'lax $.**.JournalEntryLineDetail'
+           ) AS candidate(journal_detail)
+           WHERE CASE
+             WHEN cardinality($3::text[]) > 0 THEN
+               COALESCE(
+                 candidate.journal_detail #>> '{AccountRef,value}',
+                 candidate.journal_detail #>> '{AccountRef,id}',
+                 ''
+               ) = ANY($3::text[])
+             ELSE lower(COALESCE(
+               candidate.journal_detail #>> '{AccountRef,name}',
+               ''
+             )) ~ '(^|[^a-z0-9])payment exceptions?([^a-z0-9]|$)'
+           END
+         )
+       ORDER BY transaction.transaction_date DESC, transaction.quickbooks_transaction_id
+       LIMIT $4::integer`,
+      [
+        organizationId,
+        fromBusinessDate,
+        paymentExceptionAccountsResult.rows.map((account) => account.account_id),
+        MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS + 1,
+      ],
+    )
+    const configuredAccounts = normalizedPaymentExceptionAccounts({
+      paymentExceptionAccounts: paymentExceptionAccountsResult.rows.map((account) => ({
+        accountId: account.account_id,
+        accountName: account.account_name,
+      })),
+    })
+    openingBalanceQueryTruncated = (
+      openingBalanceResult.rows.length > MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS
+    )
+    clearingOpeningBalanceTransactions = openingBalanceResult.rows
+      .slice(0, MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS)
+      .filter((row) => {
+      const journal = normalizeJournalEntryEvidence(row)
+      return journal?.lineGroups.some((line) => (
+        paymentExceptionLineBasis(line, configuredAccounts) !== null
+      )) === true
+      })
+  }
 
   const dates = dateResult.rows
     .map((row) => businessDate(row.business_date))
@@ -2231,6 +2947,25 @@ export async function readPosAccountingParityReportInPostgres(
     drafts,
     transactions,
     fullHistoryTransactions: fullHistoryResult.rows,
+    clearingOpeningBalanceTransactions,
+    historicalBaselineOptions: {
+      organizationId,
+      quickBooksCompanyId: cacheResult.rows[0]?.quickbooks_company_id
+        || cacheResult.rows[0]?.maton_connection_id
+        || undefined,
+      paymentExceptionAccounts: paymentExceptionAccountsResult.rows.map((account) => ({
+        accountId: account.account_id,
+        accountName: account.account_name,
+      })),
+      fromBusinessDate: fromBusinessDate || undefined,
+      asOfBusinessDate: toBusinessDate || undefined,
+      overdueGraceDays: DEFAULT_PAYMENT_EXCEPTION_SETTLEMENT_GRACE_DAYS,
+      openingBalanceQueryTruncated,
+      evidenceCoverageRanges: evidenceCoverageResult.rows.map((range) => ({
+        fromBusinessDate: range.from_business_date || '',
+        toBusinessDate: range.to_business_date || '',
+      })),
+    },
     evidenceLastSyncedAt: cacheResult.rows[0]?.last_pos_evidence_synced_at,
     draftsNewerThanEvidence: numberFromDatabase(
       cacheResult.rows[0]?.drafts_newer_than_evidence,
@@ -2250,6 +2985,9 @@ export async function readPosAccountingParityReportInPostgres(
     journalOnlyCapturePages: historicalBaseline.journalOnlyCaptures.length === 0
       ? 0
       : Math.ceil(historicalBaseline.journalOnlyCaptures.length / historyPageSize),
+    clearingLifecyclePages: historicalBaseline.clearingLifecycles.length === 0
+      ? 0
+      : Math.ceil(historicalBaseline.clearingLifecycles.length / historyPageSize),
     unmatchedPages: historicalBaseline.unmatchedGroups.length === 0
       ? 0
       : Math.ceil(historicalBaseline.unmatchedGroups.length / historyPageSize),
@@ -2262,6 +3000,7 @@ export async function readPosAccountingParityReportInPostgres(
     historicalPagination.pairPages,
     historicalPagination.postingBundlePages,
     historicalPagination.journalOnlyCapturePages,
+    historicalPagination.clearingLifecyclePages,
     historicalPagination.unmatchedPages,
     historicalPagination.ambiguousPages,
   )
@@ -2273,6 +3012,8 @@ export async function readPosAccountingParityReportInPostgres(
       postingBundles: historicalBaseline.postingBundles
         .slice(historicalOffset, historicalOffset + historyPageSize),
       journalOnlyCaptures: historicalBaseline.journalOnlyCaptures
+        .slice(historicalOffset, historicalOffset + historyPageSize),
+      clearingLifecycles: historicalBaseline.clearingLifecycles
         .slice(historicalOffset, historicalOffset + historyPageSize),
       unmatchedGroups: historicalBaseline.unmatchedGroups
         .slice(historicalOffset, historicalOffset + historyPageSize),
@@ -2305,6 +3046,32 @@ export async function readPosAccountingParityReportInPostgres(
   }
   if (report.discardedEvidence.drafts > 0 || report.discardedEvidence.quickBooksTransactions > 0) {
     warnings.push('Evidence with an invalid identifier, entity type, or business date was excluded.')
+  }
+  if (openingBalanceQueryTruncated) {
+    warnings.push(
+      `Opening-balance reconciliation is limited to the ${MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS} most recent cached earlier Payment Exceptions journals; every retained clearing cycle is marked ambiguous and unresolved opening balances may exist beyond the cap.`,
+    )
+  }
+  if (fromBusinessDate) {
+    warnings.push(
+      'QuickBooks provider history before the selected range has not been proven complete; selected-range Payment Exceptions cycles remain ambiguous until a verified history floor or zero-balance boundary is recorded.',
+    )
+  } else if (historicalBaseline.clearingLifecycles.length > 0) {
+    warnings.push(
+      'A QuickBooks provider-history floor or verified zero-balance boundary has not been recorded; observed Payment Exceptions offsets remain provisional cached evidence.',
+    )
+  }
+  if (historicalBaseline.clearingLifecycles.some(
+    (lifecycle) => lifecycle.accountMatchBasis === 'legacy_account_name',
+  )) {
+    warnings.push(
+      'Payment Exceptions history used the legacy account name because no active account mapping is configured; configure the account before treating it as final reconciliation evidence.',
+    )
+  }
+  if (historicalBaseline.clearingLifecycles.length > 0) {
+    warnings.push(
+      'Payment Exceptions clearing is reconstructed at the organization and QuickBooks account level. QuickBooks evidence does not provide trusted Toast location attribution; review multi-location results before relying on them.',
+    )
   }
 
   return {
