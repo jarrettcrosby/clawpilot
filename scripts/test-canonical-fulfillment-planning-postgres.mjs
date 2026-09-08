@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -4912,13 +4914,13 @@ async function main() {
     `clawpilot-canonical-plan-${process.pid}-${randomUUID().slice(0, 8)}`
   )
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_canonical_plan',
       '-e', 'POSTGRES_DB=clawpilot_canonical_plan',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command(
       'docker',
       ['port', container, '5432/tcp'],

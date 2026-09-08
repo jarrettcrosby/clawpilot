@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
 // Disposable PostgreSQL only. Never accepts an application database URL.
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
@@ -414,9 +416,9 @@ async function main() {
   const container = `clawpilot-tracking-url-schema-${process.pid}-${randomUUID().slice(0, 8)}`
   let pool
   try {
-    command('docker', ['run', '--rm', '-d', '--name', container,
+    command('docker', disposablePostgresDockerArgs(['run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=tracking_url_schema', '-e', 'POSTGRES_DB=tracking_url_schema',
-      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 180_000 })
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16']), { timeout: 180_000 })
     const port = Number(command('docker', ['port', container, '5432/tcp']).match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0)
     const url = `postgresql://postgres:tracking_url_schema@127.0.0.1:${port}/tracking_url_schema`

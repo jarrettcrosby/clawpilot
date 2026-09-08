@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -787,7 +789,7 @@ async function verifyDisposablePostgres() {
   ].join('-')
   let pool
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run',
       '--rm',
       '-d',
@@ -800,7 +802,7 @@ async function verifyDisposablePostgres() {
       '-p',
       '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command(
       'docker',
       ['port', container, '5432/tcp'],

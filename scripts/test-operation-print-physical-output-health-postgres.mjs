@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -146,13 +148,13 @@ async function verifyImage(image) {
   const password = `clawpilot_print_output_${majorVersion}`
   let pool
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', `POSTGRES_PASSWORD=${password}`,
       '-e', 'POSTGRES_DB=clawpilot_print_output',
       '-p', '127.0.0.1::5432',
       image,
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)

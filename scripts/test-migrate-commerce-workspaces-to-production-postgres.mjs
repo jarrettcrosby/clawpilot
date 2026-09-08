@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -1665,13 +1667,13 @@ async function run() {
       adminUrl = externalAdminUrl
       await waitForPostgres(adminUrl)
     } else {
-      command('docker', [
+      command('docker', disposablePostgresDockerArgs([
         'run', '--rm', '-d', '--name', container,
         '-e', 'POSTGRES_PASSWORD=commerce_migration',
         '-e', 'POSTGRES_DB=postgres',
         '-p', '127.0.0.1::5432',
         'pgvector/pgvector:pg16',
-      ], { timeout: 180_000 })
+      ]), { timeout: 180_000 })
       ownsContainer = true
       const portOutput = command('docker', ['port', container, '5432/tcp'])
       const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])

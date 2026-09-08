@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
@@ -470,13 +475,13 @@ async function runPostgresNotificationAcceptance() {
   const reservedOwnerEmail = 'reserved-owner@tenant.example'
   let pool
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_notifications',
       '-e', 'POSTGRES_DB=clawpilot_notifications',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const postgresPort = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
     assert.ok(postgresPort > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)
@@ -1847,7 +1852,11 @@ async function runPostgresNotificationAcceptance() {
     console.log('POS accounting notification disposable PostgreSQL acceptance passed')
   } finally {
     await pool?.end().catch(() => undefined)
-    spawnSync('docker', ['rm', '-f', container], { cwd: root, encoding: 'utf8', timeout: 30_000 })
+    spawnSync('docker', disposablePostgresDockerCleanupArgs(container), {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
   }
 }
 

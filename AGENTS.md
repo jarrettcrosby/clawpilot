@@ -34,6 +34,9 @@ Do not use Eigen Racing project assumptions, docs, ports, validation gates, or d
 - Do not use `npm run dev` for normal local validation. It omits the isolated data environment variables required by the dev runtime.
 - The supported local URL is `http://localhost:4002`.
 - For browser testing launched from a tool-managed shell, keep the startup shell alive for the duration of the test so the background app process is not cleaned up when the shell exits.
+- `./scripts/dev-start.sh` and the root `build`/`test` lifecycles run a local disk preflight before expensive or mutating work. It fails below 15 GiB free and warns below 25 GiB; use `CLAWPILOT_MIN_FREE_GIB` and `CLAWPILOT_WARN_FREE_GIB` only for reviewed local overrides.
+- Use `npm run storage:audit` for a read-only inventory. Its worktree, generated-artifact, npm-cache, and Docker allocation findings do not authorize deletion; never run broad prune or cache-cleaning commands automatically.
+- Disposable PostgreSQL acceptance containers must pass both launch and forced-cleanup Docker arguments through `scripts/lib/disposable-postgres-docker.mjs`. The guard uses version-aware tmpfs storage, `--rm`, and volume-aware forced removal so image-declared anonymous volumes cannot accumulate; change `CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE` only for a reviewed test requirement.
 
 ## Validation
 

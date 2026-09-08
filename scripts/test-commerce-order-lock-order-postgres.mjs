@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -289,9 +291,9 @@ let pool
 try {
   let url = externalDatabaseUrl
   if (!url) {
-    execFileSync('docker', ['run', '--rm', '-d', '--name', container,
+    execFileSync('docker', disposablePostgresDockerArgs(['run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=lock_order_test', '-e', 'POSTGRES_DB=lock_order_test',
-      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 180_000, stdio: 'pipe' })
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16']), { timeout: 180_000, stdio: 'pipe' })
     const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8' }).match(/:(\d+)\s*$/u)?.[1]
     assert.ok(port)
     url = `postgresql://postgres:lock_order_test@127.0.0.1:${port}/lock_order_test`
