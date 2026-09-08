@@ -47,7 +47,7 @@ conditions live in
 | Service | Resource ceiling | Recovery policy |
 | --- | --- | --- |
 | ClawPilot | 2 vCPU / 2 GB | One replica; validate `/api/health` and `/api/persistence/status` after infrastructure changes. |
-| Postgres | 2 vCPU / 4 GB | Keep PITR/WAL archiving and scheduled daily, weekly, and monthly volume backups. |
+| Postgres | 2 vCPU / 4 GB | PITR/external WAL archiving disabled under the 2026-09-07 cost-control decision; retain scheduled daily, weekly, and monthly volume backups. |
 | SuiteCRM | 2 vCPU / 2 GB | Supported by the production MariaDB service and persistent volume. |
 | MariaDB | 1 vCPU / 1 GB | Do not suspend independently while SuiteCRM is active. |
 | Fulfillment optimizer | Production ceiling set from measured load | Isolated production service; ClawPilot uses the exact private endpoint `http://fulfillment-optimizer.railway.internal:8080`. Missing service or invalid application configuration is capability drift and blocks parity sign-off. |
@@ -70,7 +70,11 @@ distinct retirement acceptance receipt succeed.
 ## Cost Controls
 
 - Railway workspace soft alert: **$25**.
-- Railway workspace hard limit: **$40**. Reaching it can stop workloads; treat the alert as an intervention threshold rather than a normal budget target.
+- Railway workspace intended hard limit: **$40**. The live 2026-09-07 review
+  observed **$100** instead; this is configuration drift, not an approved
+  restoration or change made by this PITR task. Reaching the live limit can stop
+  workloads; treat the alert as an intervention threshold rather than a normal
+  budget target.
 - Wait for CI is enabled to avoid deploying commits before GitHub Actions completes successfully.
 - Until DEV retirement is accepted, keep its application workers stopped,
   permit only bounded migration-source access, audit both development and
@@ -83,11 +87,21 @@ distinct retirement acceptance receipt succeed.
 ## Backup And Recovery Policy
 
 - **Development during cutover:** retain the frozen Railway source and its
-  scheduled recovery controls until migration postflight, archive verification,
-  and the DEV-retirement receipt are accepted. After retirement, retain only
-  the separately reviewed migration archive required by the cutover contract.
-- **Production:** retain both scheduled volume snapshots and PITR. Production
-  recovery data must not be removed by development-retirement cleanup.
+  daily, weekly, and monthly volume snapshots until migration postflight,
+  archive verification, and the DEV-retirement receipt are accepted. PITR and
+  external WAL archiving remain disabled. After retirement, retain only the
+  separately reviewed migration archive required by the cutover contract.
+- **Production:** PITR and external WAL archiving are disabled under the
+  operator-approved 2026-09-07 cost-control decision. Retain daily, weekly,
+  and monthly volume snapshots. Production snapshots must not be removed by
+  development-retirement cleanup.
+- **Recovery tradeoff:** recovery is limited to completed snapshots or validated
+  logical exports, not an arbitrary time between them. Writes since the latest
+  usable snapshot may be lost. A daily schedule does not guarantee an exact
+  24-hour recovery point if a backup is delayed or fails; keep the existing
+  completed-backup age gate of 30 hours.
+- Revisit production PITR and explicit recovery-point/recovery-time objectives
+  before the first customer is onboarded or recovery requirements change.
 - Before destructive data work, verify a recent provider backup and follow [Railway Postgres Backups](railway-postgres-backups.md).
 - Never treat an application checkpoint stored in Postgres as a replacement for provider-native recovery.
 
@@ -102,8 +116,10 @@ Run this review weekly and before onboarding a customer:
 4. Confirm Wait for CI remains enabled for production and no retired Railway
    development service, database, volume, backup schedule, or public domain is
    accruing cost.
-5. Confirm production Postgres PITR remains enabled and scheduled provider
-   backups are current.
+5. Confirm production Postgres and any retained development Postgres have no
+   `WAL_ARCHIVE_*` configuration, external WAL uploads, or remaining PITR bucket
+   charges. Confirm daily, weekly, and monthly provider snapshots remain enabled
+   and a completed backup is no more than 30 hours old for each retained volume.
 6. Inspect deployment churn, failed/restarted deployments, database archive
    errors, and unexpected public egress.
 7. Check Railway production `/api/health` and `/api/persistence/status`; require
@@ -125,6 +141,41 @@ Infrastructure changes require explicit approval. The weekly review reports reco
 
 Entries below are historical observations and approved actions. They do not
 recreate or authorize a current Railway development environment.
+
+### 2026-09-07 — Production PITR removed for cost control
+
+- The operator approved removing production PITR to reduce Railway usage.
+  This supersedes the earlier decision to retain production PITR; development
+  PITR remains disabled.
+- Before removal, Railway reported workspace usage of **$17.92** and a monthly
+  estimate of **$41.38**. The dedicated production `Postgres-PITR` bucket held
+  11,506,638,498 bytes across 70,490 objects. These are a point-in-time baseline,
+  not a measurement of expected savings; incurred charges are not reversed by
+  removing PITR.
+- The authenticated Railway dashboard showed Daily, Weekly, and Monthly
+  production snapshot schedules enabled, with a completed Daily snapshot five
+  hours old and a reported size of 1,001 MB before the change.
+- Removed all six production `WAL_ARCHIVE_*` variables and redeployed Postgres
+  once. Deployment `11102868-ce2b-4438-a00f-fd53e1d7ee97` reached `SUCCESS`.
+  Direct production SQL verification returned `archive_mode = off`,
+  `archive_command = (disabled)`, `archive_timeout = 0`, and
+  `pg_is_in_recovery() = false`.
+- Deleted the dedicated production `Postgres-PITR` bucket
+  (`9fd602c2-3bd2-4ea6-870b-0a1e189ccfd6`); the deletion was committed and the
+  production bucket inventory was empty afterward. Its archived recovery
+  history was removed and cannot be used for a future PITR restore. The
+  database volume and scheduled snapshots were retained.
+- Post-change verification on 2026-09-07 EDT (2026-09-08 UTC) confirmed both
+  environments' `/api/health` and `/api/persistence/status` returned HTTP 200.
+  A new-deployment query for `archive-push`/`pgbackrest` logs since
+  `2026-09-08T01:17:30Z`, with a 5,000-row limit, returned zero entries. This
+  bounded post-restart check does not establish a full-day traffic rate.
+- Retain daily, weekly, and monthly provider snapshots and the requirement for
+  a completed backup no more than 30 hours old. Recovering from a snapshot may
+  lose writes made after that snapshot; arbitrary-time recovery is unavailable.
+- Reassess production PITR at customer onboarding. This decision does not
+  authorize service suspension, DEV retirement, a spending-limit change, or
+  unrelated resource-ceiling changes.
 
 ### 2026-08-02 — Development PITR disabled
 
