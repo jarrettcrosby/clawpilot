@@ -49,6 +49,28 @@ The ChatGPT/Codex authorization path is distinct from the public OpenAI API-key 
 
 The Codex backend and OAuth client behavior must be regression-tested during OpenAI/Codex upgrades because they do not have the same compatibility guarantees as the public API-key Responses endpoint.
 
+### Career Desk model isolation
+
+Career Desk uses `CAREER_SITE_CODEX_MODEL`, defaulting to `gpt-5.6-terra` when
+unset or blank. It no longer inherits `OPENAI_CODEX_AGENT_MODEL`. The legacy
+global setting remains unchanged for other ClawPilot product agents; this is
+not a global model migration. If an operator previously used that global
+setting to select a different Career model, set the supported model explicitly
+in `CAREER_SITE_CODEX_MODEL` after checking the connected account's access.
+
+This deliberate boundary prevents an old global `gpt-5.4` pin from breaking
+Career Desk after its August 31, 2026 retirement for ChatGPT sign-in.
+[OpenAI's Codex model guidance](https://learn.chatgpt.com/docs/models) names
+`gpt-5.6-terra` as its replacement. The existing user credential, account ID,
+OAuth ownership, Codex Responses endpoint, prompts, strict output schema,
+tool selection, and request parameters are unchanged. No API-key fallback or
+billing-mode switch is introduced.
+
+Verify a model change with one bounded in-memory tailoring request using the
+existing credential and the unchanged transport. A connected status or model
+catalog entry alone does not prove successful generation. Do not persist a
+packet or queue an external career action during this compatibility check.
+
 ## Product Agent Mapping
 
 ClawPilot defines five product profiles: Projects, Pipeline, Docs, Calendar, and ClawPilot. Each profile contributes a distinct instruction and routing context, but all five use the initiating ClawPilot user's connected ChatGPT/Codex authorization. They are not separate Custom GPT objects in the user's ChatGPT sidebar.

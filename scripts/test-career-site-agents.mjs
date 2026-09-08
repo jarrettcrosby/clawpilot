@@ -504,6 +504,54 @@ assert.equal(execution.credential.accessToken, "private-test-token");
 assert.match(execution.instructions, /cannot submit an application/);
 assert.match(execution.instructions, /TEST SECURITY POLICY/);
 
+// Career selection is independent of the legacy global model. Exercise both
+// status and execution so a healthy label cannot conceal different routing.
+const previousCareerModel = process.env.CAREER_SITE_CODEX_MODEL;
+const previousGlobalModel = process.env.OPENAI_CODEX_AGENT_MODEL;
+try {
+  for (const [careerModel, globalModel, expected] of [
+    [undefined, undefined, "gpt-5.6-terra"],
+    [undefined, "gpt-5.4", "gpt-5.6-terra"],
+    ["", "gpt-5.5", "gpt-5.6-terra"],
+    ["   ", "gpt-5.4", "gpt-5.6-terra"],
+    [" gpt-5.6-terra ", "gpt-5.4", "gpt-5.6-terra"],
+    ["gpt-5.5", "gpt-5.4", "gpt-5.5"],
+  ]) {
+    if (careerModel === undefined) delete process.env.CAREER_SITE_CODEX_MODEL;
+    else process.env.CAREER_SITE_CODEX_MODEL = careerModel;
+    if (globalModel === undefined) delete process.env.OPENAI_CODEX_AGENT_MODEL;
+    else process.env.OPENAI_CODEX_AGENT_MODEL = globalModel;
+    const selected = await runtime.getCareerSiteAgentStatus(
+      "jarrett@suburbiasandwichco.com",
+    );
+    assert.equal(selected.model, expected);
+    const routed = await runtime.runCareerSiteAgent({
+      operatorId: "jarrett@suburbiasandwichco.com",
+      request: {
+        requestId: "e2f7c6dd-18cb-4fb1-a747-42f7f829b20d",
+        agentType: "tailor",
+        schemaName: "career_application_packet",
+        instructions: "Draft only.",
+        prompt: "{}",
+        outputSchema: { type: "object" },
+        webSearch: false,
+      },
+    });
+    const routedExecution = calls.findLast((call) => call.kind === "execution").input;
+    assert.equal(routed.model, expected);
+    assert.equal(routedExecution.model, expected);
+    assert.equal(routedExecution.webSearch, false);
+    assert.equal(routedExecution.outputSchema.name, "career_application_packet");
+    assert.equal(process.env.OPENAI_CODEX_AGENT_MODEL, globalModel);
+    assert.equal(process.env.CAREER_SITE_CODEX_MODEL, careerModel);
+  }
+} finally {
+  if (previousCareerModel === undefined) delete process.env.CAREER_SITE_CODEX_MODEL;
+  else process.env.CAREER_SITE_CODEX_MODEL = previousCareerModel;
+  if (previousGlobalModel === undefined) delete process.env.OPENAI_CODEX_AGENT_MODEL;
+  else process.env.OPENAI_CODEX_AGENT_MODEL = previousGlobalModel;
+}
+
 const disconnected = loadCareerAgents({
   auth: {
     async getChatGPTConnection() {
