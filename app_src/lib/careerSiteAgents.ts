@@ -4,7 +4,7 @@ import { runChatGPTCodexStructuredResponse } from '@/lib/agents/chatgptResponses
 import { AGENT_SECURITY_POLICY, serializePromptSection } from '@/lib/agents/promptSecurity'
 import type { CareerSiteAgentRequest } from '@/lib/careerSiteAgentContract'
 
-const DEFAULT_CODEX_MODEL = 'gpt-5.4'
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-terra'
 
 export type CareerSiteAgentStatus = {
   connected: boolean
@@ -28,7 +28,10 @@ export class CareerSiteAgentConnectionError extends Error {
 }
 
 function model(): string {
-  return String(process.env.OPENAI_CODEX_AGENT_MODEL || DEFAULT_CODEX_MODEL).trim()
+  // Career Desk has its own model setting. Do not inherit or rewrite the
+  // general ClawPilot model: legacy installations may still pin a model that
+  // has retired from ChatGPT subscription access.
+  return String(process.env.CAREER_SITE_CODEX_MODEL || DEFAULT_CODEX_MODEL).trim()
     || DEFAULT_CODEX_MODEL
 }
 
