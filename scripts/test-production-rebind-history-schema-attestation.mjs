@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -151,13 +156,13 @@ async function exerciseImage(image) {
   const container = `clawpilot-target-schema-attestation-${suffix}`
   const password = `target-schema-attestation-${suffix}`
   let pool
-  command('docker', [
+  command('docker', disposablePostgresDockerArgs([
     'run', '--detach', '--rm', '--name', container,
     '--env', `POSTGRES_PASSWORD=${password}`,
     '--env', 'POSTGRES_DB=clawpilot_target_schema_attestation',
     '--publish', '127.0.0.1::5432',
     image,
-  ])
+  ]))
   try {
     const portOutput = command('docker', ['port', container, '5432/tcp']).trim()
     const port = portOutput.slice(portOutput.lastIndexOf(':') + 1)
@@ -526,7 +531,7 @@ async function exerciseImage(image) {
     await attestProductionRebindHistorySchema(pool)
   } finally {
     if (pool) await pool.end().catch(() => undefined)
-    command('docker', ['rm', '--force', container], { stdio: 'ignore' })
+    command('docker', disposablePostgresDockerCleanupArgs(container), { stdio: 'ignore' })
   }
 }
 

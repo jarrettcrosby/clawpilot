@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -1694,13 +1696,13 @@ async function main() {
   )
   let containerStarted = false
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=checkout_audience_health',
       '-e', 'POSTGRES_DB=checkout_audience_health',
       '-p', '127.0.0.1::5432',
       disposablePostgresImage,
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     containerStarted = true
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])

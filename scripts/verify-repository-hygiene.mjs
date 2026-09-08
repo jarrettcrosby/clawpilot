@@ -59,6 +59,10 @@ const requiredPaths = [
   'docs/README.md',
   'db/README.md',
   'scripts/dev-start.sh',
+  'scripts/lib/disposable-postgres-docker.mjs',
+  'scripts/local-storage-guard.mjs',
+  'scripts/test-disposable-postgres-docker-guard.mjs',
+  'scripts/test-local-storage-guard.mjs',
   'scripts/regression-all.sh',
   'scripts/verify-predeploy.mjs',
   'scripts/verify-repository-hygiene.mjs',
@@ -81,7 +85,18 @@ for (const path of files) {
 }
 
 const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
-for (const script of ['verify:repo', 'verify:regression', 'verify:predeploy', 'test']) {
+for (const script of [
+  'storage:audit',
+  'storage:preflight',
+  'test:local-docker-storage-guard',
+  'test:local-storage-guard',
+  'prebuild',
+  'pretest',
+  'verify:repo',
+  'verify:regression',
+  'verify:predeploy',
+  'test',
+]) {
   if (!packageJson.scripts?.[script]) errors.push(`package.json is missing the ${script} script`)
 }
 

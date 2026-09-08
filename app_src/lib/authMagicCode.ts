@@ -2,6 +2,7 @@ import crypto from 'crypto'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { sendAuthMagicCodeEmail } from '@/lib/matonMail'
 import { getAppUser, normalizeUserEmail } from '@/lib/users'
+import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
 
 const RESEND_COOLDOWN_SECONDS = 60
 const MAX_ATTEMPTS = 5
@@ -194,7 +195,9 @@ export async function requestAuthMagicCode(
   } catch {
     return { status: 'not-authorized' }
   }
-  const user = await getAppUser(requestedEmail)
+  const accountEmail = await resolveLoginAccountEmail(requestedEmail)
+  if (!accountEmail) return { status: 'not-authorized' }
+  const user = await getAppUser(accountEmail)
   if (!user || user.status !== 'active') return { status: 'not-authorized' }
   return issueAuthMagicCode({ email: requestedEmail, purpose: 'sign_in' })
 }
@@ -275,7 +278,9 @@ export async function verifyAuthMagicCode(
   } catch {
     return { status: 'not-authorized' }
   }
-  const user = await getAppUser(requestedEmail)
+  const accountEmail = await resolveLoginAccountEmail(requestedEmail)
+  if (!accountEmail) return { status: 'not-authorized' }
+  const user = await getAppUser(accountEmail)
   if (!user || user.status === 'disabled') return { status: 'not-authorized' }
 
   const submittedCode = String(input.code || '').trim().slice(0, 128)
@@ -350,6 +355,7 @@ export async function verifyAuthMagicCode(
       const verified = result.rows[0]
       if (verified?.status !== 'verified') return verified
       if (verified.purpose === 'invitation') {
+        if (accountEmail !== requestedEmail) throw new Error(AUTHORIZATION_CHANGED)
         const invitedUser = await client.query(
           `
             SELECT email
@@ -486,7 +492,7 @@ export async function verifyAuthMagicCode(
               AND status = 'active'
             RETURNING email
           `,
-          [requestedEmail],
+          [accountEmail],
         )
         if (!signedIn.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
       }
@@ -501,7 +507,7 @@ export async function verifyAuthMagicCode(
   if (row.status === 'verified') {
     return {
       status: 'verified',
-      email: requestedEmail,
+      email: accountEmail,
       organizationId: (row as VerificationOutcome).organization_id || null,
     }
   }

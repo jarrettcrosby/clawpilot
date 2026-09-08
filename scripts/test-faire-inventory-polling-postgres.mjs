@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -808,13 +810,13 @@ const container = `clawpilot-faire-inventory-${randomUUID()}`
 let pool
 try {
   command('docker', ['info'], { timeout: 30_000 })
-  command('docker', [
+  command('docker', disposablePostgresDockerArgs([
     'run', '--rm', '-d', '--name', container,
     '-e', 'POSTGRES_PASSWORD=postgres',
     '-e', 'POSTGRES_DB=clawpilot_test',
     '-p', '127.0.0.1::5432',
     'pgvector/pgvector:pg16',
-  ], { timeout: 30_000 })
+  ]), { timeout: 30_000 })
   const portOutput = command(
     'docker',
     ['port', container, '5432/tcp'],

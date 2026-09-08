@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -92,7 +94,7 @@ async function verifyImage(image) {
   try {
     command(
       'docker',
-      [
+      disposablePostgresDockerArgs([
         'run',
         '--rm',
         '-d',
@@ -105,7 +107,7 @@ async function verifyImage(image) {
         '-p',
         '127.0.0.1::5432',
         image,
-      ],
+      ]),
       { timeout: 180_000 },
     )
     const portOutput = command('docker', ['port', container, '5432/tcp'])

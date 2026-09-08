@@ -64,6 +64,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Google Workspace integration](operations/google-workspace-integration.md)
 - [Infrastructure and cost control register](operations/infrastructure-and-cost-control-register.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
+- [Career Desk Maton LinkedIn source](operations/career-maton-linkedin.md)
 - [SuiteCRM Railway runbook](operations/suitecrm.md)
 - [Sales pipeline EPISCS migration](operations/sales-pipeline-episcs-migration.md)
 - [Printing, carrier billing, and GL Coding](operations/printing-carrier-billing-and-gl-coding.md)

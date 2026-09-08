@@ -36,6 +36,24 @@ testable without weakening Railway or Vercel session enforcement. Keep a
 tool-managed startup shell alive while browser testing so its child process is
 not cleaned up.
 
+Before local startup creates data, installs dependencies, or builds,
+`scripts/dev-start.sh` runs `npm run storage:preflight`; the root `prebuild` and
+`pretest` lifecycles enforce the same check. The local guard fails below 15 GiB
+free and warns below 25 GiB; reviewed overrides may use
+`CLAWPILOT_MIN_FREE_GIB` and `CLAWPILOT_WARN_FREE_GIB`. Hosted CI, Railway, and
+Vercel bypass this Mac-oriented check. `npm run storage:audit` reports likely
+worktree, generated-artifact, npm-cache, and Docker disk consumers without
+deleting anything. Audit output is evidence for a scoped review, not permission
+to prune worktrees or clean shared caches.
+
+Repository acceptance tests route disposable PostgreSQL 16 and 18 containers
+through `scripts/lib/disposable-postgres-docker.mjs`. The helper mounts each
+image's version-specific data path on a bounded 4 GiB tmpfs and enforces
+`--rm`; its cleanup helper also forces anonymous-volume removal when a test
+must remove a running container. Together these prevent interrupted or
+completed tests from leaving database volumes behind. A reviewed exceptional test may set
+`CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE`; routine runs should keep the default.
+
 A local runtime is optional test evidence only. It does not replace the hosted
 Railway development environment, must not claim `dev.aiapp.eigenracing.com`,
 and must not receive Railway data or provider credentials. The evaluated Mac

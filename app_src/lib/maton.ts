@@ -97,6 +97,7 @@ export function inferMatonGatewayApp(pathname: string): string | null {
   if (path === '/google-sheets' || path.startsWith('/google-sheets/')) return 'google-sheets'
   if (path === '/google-drive' || path.startsWith('/google-drive/')) return 'google-drive'
   if (path === '/quickbooks' || path.startsWith('/quickbooks/')) return 'quickbooks'
+  if (path === '/linkedin' || path.startsWith('/linkedin/')) return 'linkedin'
   return null
 }
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -71,13 +73,13 @@ if (!databaseUrl) {
   execFileSync('docker', ['info'], { stdio: 'ignore', timeout: 30_000 })
   const container = `clawpilot-shipping-independence-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    execFileSync('docker', [
+    execFileSync('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_shipping',
       '-e', 'POSTGRES_DB=clawpilot_shipping',
       '-p', '127.0.0.1::5432',
       disposablePostgresImage,
-    ], { stdio: 'ignore', timeout: 180_000 })
+    ]), { stdio: 'ignore', timeout: 180_000 })
     const portOutput = execFileSync('docker', ['port', container, '5432/tcp'], {
       encoding: 'utf8',
     })

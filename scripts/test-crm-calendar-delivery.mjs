@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -1495,9 +1497,9 @@ async function verifyMeetingEnqueuePostgresLock() {
   let pool
   const clients = []
   try {
-    execFileSync('docker', ['run', '--rm', '-d', '--name', container,
+    execFileSync('docker', disposablePostgresDockerArgs(['run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=calendar_lock_test', '-e', 'POSTGRES_DB=calendar_lock_test',
-      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16'], { timeout: 60_000, stdio: 'pipe' })
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16']), { timeout: 60_000, stdio: 'pipe' })
     const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8' }).match(/:(\d+)\s*$/u)?.[1]
     assert.ok(port)
     pool = new Pool({ connectionString: `postgresql://postgres:calendar_lock_test@127.0.0.1:${port}/calendar_lock_test`,

@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import {
@@ -2904,13 +2909,13 @@ async function run() {
   let sourceUrl
   let targetUrl
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=provider_rebind',
       '-e', 'POSTGRES_DB=postgres',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const port = Number(command('docker', ['port', container, '5432/tcp']).match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0)
     const adminUrl = `postgresql://postgres:provider_rebind@127.0.0.1:${port}/postgres`
@@ -2926,7 +2931,7 @@ async function run() {
     targetUrl = `postgresql://postgres:provider_rebind@127.0.0.1:${port}/${targetDatabase}`
     await runAcceptance(sourceUrl, targetUrl)
   } finally {
-    command('docker', ['rm', '-f', container], { timeout: 30_000 })
+    command('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 30_000 })
   }
 }
 

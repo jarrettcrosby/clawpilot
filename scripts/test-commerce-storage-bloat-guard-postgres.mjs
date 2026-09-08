@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -23,7 +28,7 @@ let disposableContainer = null
 function stopDisposableContainer() {
   if (!disposableContainer) return
   try {
-    command('docker', ['rm', '-f', disposableContainer], { timeout: 30_000 })
+    command('docker', disposablePostgresDockerCleanupArgs(disposableContainer), { timeout: 30_000 })
   } catch {}
   disposableContainer = null
 }
@@ -40,13 +45,14 @@ if (!databaseUrl) {
   // host port is omitted. Pick an explicit high loopback port instead. The
   // random suffix keeps parallel local/CI runs extremely unlikely to collide.
   const port = 55_000 + Number.parseInt(randomUUID().slice(0, 4), 16) % 9_000
-  command('docker', [
-    'create', '--name', disposableContainer,
+  command('docker', disposablePostgresDockerArgs([
+    'create',
+    '--rm', '--name', disposableContainer,
     '-e', 'POSTGRES_PASSWORD=commerce_guard',
     '-e', 'POSTGRES_DB=commerce_guard',
     '-p', `127.0.0.1:${port}:5432`,
     'pgvector/pgvector:pg16',
-  ], { timeout: 60_000 })
+  ]), { timeout: 60_000 })
   command('docker', ['start', disposableContainer], { timeout: 60_000 })
   databaseUrl = (
     `postgresql://postgres:commerce_guard@127.0.0.1:${port}/commerce_guard`

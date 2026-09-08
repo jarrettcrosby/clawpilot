@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -59,7 +64,7 @@ let container = `clawpilot-runtime-gate-${process.pid}-${randomUUID().slice(0, 8
 function cleanup() {
   if (!container) return
   try {
-    command('docker', ['rm', '-f', container], { timeout: 30_000 })
+    command('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 30_000 })
   } catch {}
   container = ''
 }
@@ -85,13 +90,14 @@ async function waitForPostgres(databaseUrl) {
 }
 
 command('docker', ['info'], { timeout: 30_000 })
-command('docker', [
-  'create', '--name', container,
+command('docker', disposablePostgresDockerArgs([
+  'create',
+  '--rm', '--name', container,
   '-e', 'POSTGRES_PASSWORD=runtime_gate_test',
   '-e', 'POSTGRES_DB=postgres',
   '-p', `127.0.0.1:${port}:5432`,
   'postgres:18-alpine',
-], { timeout: 60_000 })
+]), { timeout: 60_000 })
 command('docker', ['start', container], { timeout: 60_000 })
 
 const databaseUrl =
