@@ -1,3 +1,14 @@
+---
+id: cp-owner-login-domain-transition
+title: Owner Login Domain Transition
+summary: Preserve canonical owner identity after an email rename and deliver Career Desk sign-in codes through the isolated mail bridge.
+status: active
+kind: operating-contract
+area: access
+tags: [clawpilot, authentication, google, career-desk]
+app_visible: false
+---
+
 # Owner login after a Google Workspace domain rename
 
 ClawPilot uses `app_users.email` as its durable account key. Memberships, audit history, provider connections, browser sessions, and Career Desk service credentials refer to that key. Changing `APP_LOGIN_EMAIL` by itself can create a second owner; it is not an account migration.
@@ -8,14 +19,11 @@ Magic codes are sent to the address entered by the user and are digest-bound to 
 
 Google login requires the existing linked Google subject, original canonical user key, and enrollment email. An explicitly configured login alias can resolve to that original key after the same Google Workspace account is renamed. An unrelated Google account with the new email cannot use the old account's link. New Google identity enrollment remains exact-email only; changing to a different Google account requires a separate reviewed account-link procedure.
 
-## Observed production identity on September 7, 2026
+## Operator configuration
 
-- Original owner: `jarrett@suburbiasandwichco.com`, user reference `gu5591947`, contact reference `gc3327424`; four memberships and the existing Google link must be preserved.
-- `jarrett@bposupplychain.com` does not currently have a ClawPilot user row.
-- `jarrettcrosby@gmail.com` is a separate active member. Do not silently map it to the owner.
-- Career Desk service ownership, Gmail/Maton connections, encrypted state, and submission ownership still use the original owner key.
+Inspect the current owner, linked provider subject, memberships, and any existing account at the proposed new address before configuring an alias. Keep account-specific observations and identifiers in the approved operator runtime record, outside Git.
 
-Once the user's exact new login email is confirmed and this code is deployed, the scoped configuration change is `APP_LOGIN_EMAIL_ALIASES=jarrett@bposupplychain.com`. Do not change the original account, service principal, memberships, provider connection IDs, or encrypted-data ownership. Verify Google authentication using the renamed original Workspace account and magic-code authentication using the new address, then verify the same user references and memberships. No production configuration or user records were changed while preparing this implementation.
+After confirming the exact new login email, configure an exact alias such as `APP_LOGIN_EMAIL_ALIASES=operator@new-domain.example`. Preserve the original account, service principal, memberships, provider connection IDs, and encrypted-data ownership. Verify Google authentication using the renamed original Workspace account and magic-code authentication using the new address, then verify that the same user references and memberships remain. An independent account must remain separate.
 
 ## Career Desk sign-in mail bridge
 
@@ -27,6 +35,6 @@ The site should call the bridge once per issued code and fail the issuance on de
 
 ## Verification
 
-The auth suite passed, including real PostgreSQL invitation acceptance, owner-alias code issuance/consumption, unchanged membership rows, and rejection of an alias colliding with an independent account. This host's Docker metadata filesystem is read-only, so `CLAWPILOT_AUTH_TEST_POSTGRES_MODE=local npm run test:auth` used a newly initialized temporary local cluster; the cluster was stopped and removed after the test. The default CI mode continues to use disposable Docker PostgreSQL.
+Run `npm run test:auth` for magic-code and Google identity checks, including real PostgreSQL invitation acceptance, owner-alias code issuance/consumption, unchanged membership rows, and rejection of an alias colliding with an independent account. The default mode uses disposable Docker PostgreSQL. If Docker is unavailable and local PostgreSQL tools are installed, `CLAWPILOT_AUTH_TEST_POSTGRES_MODE=local npm run test:auth` initializes a temporary local cluster, then stops and removes only that cluster.
 
-Lint passed. Application-source TypeScript checking passed across 758 source roots with zero errors. The repository-wide standalone TypeScript command also includes existing test fixtures and reports their unrelated errors. The normal production build reached webpack but could not complete because the host filesystem returned `ENOSPC` while writing `.next`; a completed build and deployment verification remain required before release.
+Complete the normal lint, build, tests, documentation, and predeploy gates before release. After deployment, verify version, health, and signed-in identity continuity. Keep current validation results in the release record rather than this contract.
