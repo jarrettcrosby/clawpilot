@@ -284,6 +284,7 @@ assert.deepEqual(await verifiedResponse.json(), { ok: true })
 
 const originalEnv = {
   APP_LOGIN_EMAIL: process.env.APP_LOGIN_EMAIL,
+  APP_LOGIN_EMAIL_ALIASES: process.env.APP_LOGIN_EMAIL_ALIASES,
   APP_SESSION_SECRET: process.env.APP_SESSION_SECRET,
   MATON_GMAIL_CONNECTION_ID: process.env.MATON_GMAIL_CONNECTION_ID,
   MATON_AUTH_GMAIL_CONNECTION_ID: process.env.MATON_AUTH_GMAIL_CONNECTION_ID,
@@ -295,6 +296,7 @@ const originalEnv = {
 
 try {
   process.env.APP_LOGIN_EMAIL = 'operator@example.com'
+  delete process.env.APP_LOGIN_EMAIL_ALIASES
   process.env.APP_SESSION_SECRET = 'test-session-secret-with-at-least-32-characters'
   process.env.MATON_GMAIL_CONNECTION_ID = 'test-gmail-connection'
   process.env.CLAWPILOT_MAIL_FROM = 'stewards@eigenracing.com'
@@ -476,6 +478,7 @@ try {
   }
 
   const usersMock = {
+    configuredOwnerEmail() { return process.env.APP_LOGIN_EMAIL },
     normalizeUserEmail(value) {
       const email = String(value || '').trim().toLowerCase()
       if (!email.includes('@')) throw new Error('invalid email')
@@ -490,7 +493,18 @@ try {
     },
   }
 
+  const identityModule = loadTypeScriptModule('app_src/lib/authLoginIdentity.ts', {
+    '@/lib/users': usersMock,
+    '@/lib/persistence/postgres': {
+      async query(_sql, [email]) {
+        const user = await usersMock.getAppUser(email)
+        return { rows: user ? [{ email: user.email }] : [] }
+      },
+    },
+  })
+
   const authModule = loadTypeScriptModule('app_src/lib/authMagicCode.ts', {
+    '@/lib/authLoginIdentity': identityModule.exports,
     '@/lib/matonMail': mailMock,
     '@/lib/persistence/postgres': persistenceMock,
     '@/lib/users': usersMock,
@@ -578,6 +592,21 @@ try {
   now += 15 * 60_000 + 1
   const expired = await verifyAuthMagicCode({ email: 'operator@example.com', code: expiringCode })
   assert.equal(expired.status, 'expired')
+
+  process.env.APP_LOGIN_EMAIL_ALIASES = 'operator@renamed.example'
+  now += 61_000
+  assert.equal((await requestAuthMagicCode({ email: 'operator@renamed.example' })).status, 'sent')
+  assert.equal(delivered.at(-1).to, 'operator@renamed.example')
+  const aliasCode = delivered.at(-1).code
+  assert.equal(record.email, 'operator@renamed.example')
+  assert.equal((await verifyAuthMagicCode({ email: 'operator@example.com', code: aliasCode })).status, 'not-found')
+  const aliasVerified = await verifyAuthMagicCode({ email: 'operator@renamed.example', code: aliasCode })
+  assert.equal(aliasVerified.status, 'verified')
+  assert.equal(aliasVerified.email, 'operator@example.com', 'Alias verification returns the existing account key')
+  assert.equal((await verifyAuthMagicCode({ email: 'operator@renamed.example', code: aliasCode })).status, 'consumed')
+  process.env.APP_LOGIN_EMAIL_ALIASES = 'invited@example.com'
+  assert.equal((await requestAuthMagicCode({ email: 'invited@example.com' })).status, 'not-authorized', 'An existing independent account cannot become an owner alias')
+  delete process.env.APP_LOGIN_EMAIL_ALIASES
 
   now += 61_000
   const invited = await requestInvitationAuthMagicCode({
@@ -1115,6 +1144,16 @@ try {
   assert.match(invitationMessage, /Accept invitation/)
   assert.match(invitationMessage, /six-digit, one-time sign-in code/)
   assert.match(invitationMessage, /stewards@eigenracing\.com/)
+
+  const careerMail = loadFocusedMailHarness({ platformMailbox: 'platform@example.com', authMailbox: 'auth@example.com' })
+  assert.equal(await careerMail.mail.sendCareerDeskMagicCodeEmail({ to: 'owner@renamed.example', code: '246810' }), undefined)
+  const careerSend = careerMail.calls.filter((call) => call.pathname.endsWith('/messages/send'))
+  assert.equal(careerSend.length, 1)
+  const careerMessage = decodeBase64Url(JSON.parse(careerSend[0].init.body).raw)
+  assert.match(careerMessage, /Subject: Your Career Desk sign-in code/)
+  assert.match(careerMessage, /X-ClawPilot-Message-Purpose: auth-magic-code/)
+  assert.match(careerMessage, /This code expires in 15 minutes and can be used once/)
+  assert.match(careerMessage, /246810/)
 
   console.log('PASS test-auth-magic-code')
 } finally {

@@ -190,7 +190,7 @@
     "test:suitecrm-interactions": "node scripts/test-suitecrm-interaction-ingestion.mjs",
     "test:suitecrm-calls": "node scripts/test-suitecrm-call-ingestion.mjs",
     "crm:merge-contacts": "node scripts/merge-crm-contacts.mjs",
-    "test:auth": "node scripts/test-auth-magic-code.mjs && node scripts/test-auth-self-delivery.mjs && node scripts/test-google-sso.mjs && npm run test:invitation-acceptance-postgres",
+    "test:auth": "node scripts/test-auth-magic-code.mjs && node scripts/test-auth-self-delivery.mjs && node scripts/test-google-sso.mjs && node scripts/test-career-auth-identity.mjs && npm run test:invitation-acceptance-postgres",
     "test:invitation-acceptance-postgres": "node scripts/test-invitation-acceptance-postgres.mjs",
     "test:auth-sessions": "node scripts/test-browser-session-security.mjs",
     "test:audit": "node scripts/test-audit-activity.mjs",
