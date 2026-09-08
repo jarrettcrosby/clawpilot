@@ -683,6 +683,27 @@ assert.equal(gmailSources.careerGmailMessageIsRelevant(shortInterviewFollowup), 
 assert.equal(gmailSources.careerGmailMessageRelevance({ ...shortInterviewFollowup, sentThreadMatched: true }).reason, 'sent-thread')
 assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...shortInterviewFollowup, subject: 'Re: Thursday', sentThreadMatched: true }), false,
   'arbitrary personal conversations must not become job mail merely because the user replied')
+for (const senderEmail of ['alex@employer.example', 'alex@press.example', 'alex@podcast.example', 'alex@school.example']) {
+  const genericInterviewFollowup = {
+    ...shortInterviewFollowup,
+    senderEmail,
+    subject: 'Re: Interview',
+  }
+  assert.equal(gmailSources.careerGmailMessageRelevance(genericInterviewFollowup).sentThreadEligible, false,
+    'a generic interview subject must provide employment evidence before a Sent-thread lookup')
+  assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...genericInterviewFollowup, sentThreadMatched: true }), false,
+    'a Sent label alone cannot identify a generic interview as an employment conversation')
+}
+assert.equal(gmailSources.careerGmailMessageRelevance({
+  ...shortInterviewFollowup,
+  subject: 'Re: Interview',
+  sentThreadMatched: true,
+}).reason, 'sent-thread', 'a recruiter sender supplies independent employment evidence for a generic interview reply')
+assert.equal(gmailSources.careerGmailMessageRelevance({
+  ...shortInterviewFollowup,
+  senderEmail: 'alex@employer.example',
+  sentThreadMatched: true,
+}).reason, 'sent-thread', 'an explicit phone-screen subject remains eligible with exact Sent-thread evidence')
 assert.equal(gmailSources.careerGmailMessageRelevance(linkedInNotification).reason, 'linkedin-message-notification')
 assert.equal(gmailSources.careerGmailMessageIsRelevant({
   ...linkedInNotification,

@@ -69,6 +69,7 @@ type CareerGmailMessageSignals = {
 
 const DIRECT_RECRUITING_PATTERN = /\b(?:recruiter|recruiting|talent acquisition|talent partner|hiring manager|headhunter|executive search|sourcer|sourcing (?:for|a candidate))\b/i
 const INTERVIEW_PATTERN = /\b(?:interview|phone screen|screening call|candidate interview|meet (?:the|our) hiring (?:manager|team)|technical screen|panel interview)\b/i
+const EMPLOYMENT_INTERVIEW_SUBJECT_PATTERN = /\b(?:phone screen|technical screen|(?:job|employment) interview|meet (?:the|our) hiring (?:manager|team))\b/i
 const ASSESSMENT_PATTERN = /\b(?:candidate assessment|skills? assessment|technical assessment|take-home (?:exercise|assessment)|case study|background check|reference check)\b/i
 const APPLICATION_STATUS_PATTERN = /\b(?:your application|application (?:for|to|status|update)|thank you for appl(?:y|ying)|we (?:have )?received your application|candidate (?:portal|profile|application)|next steps? (?:for|in) (?:your )?application|application is (?:under review|being reviewed)|moved to (?:the )?(?:next stage|hiring manager review))\b/i
 const CANDIDATE_APPLICATION_PATTERN = /\b(?:thank you for appl(?:y|ying)|we (?:have )?received your application|your application (?:for|to|has|is|status)|application is (?:under review|being reviewed)|application has (?:been )?(?:received|submitted|moved|advanced))\b/i
@@ -391,7 +392,17 @@ export function careerGmailMessageRelevance(
   const sentThreadEligible = (
     !bulkDistribution
     && !MARKETING_SUBJECT_PATTERN.test(subject)
-    && (roleEvidence || (interview && INTERVIEW_PATTERN.test(subject)))
+    && (
+      roleEvidence
+      || (
+        interview
+        && INTERVIEW_PATTERN.test(subject)
+        // A Sent label proves participation, not that a generic interview is
+        // about employment. Terse replies need an explicit screening subject
+        // or independent recruiting/employment evidence before this lookup.
+        && (EMPLOYMENT_INTERVIEW_SUBJECT_PATTERN.test(subject) || independentEmploymentProvenance)
+      )
+    )
     && (
       EXPLICIT_JOB_CONTEXT_PATTERN.test(searchable)
       || employmentContext
