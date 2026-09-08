@@ -338,9 +338,9 @@ async function verifySender(profile: MailProfile, sender: string) {
   }
 }
 
-function authMagicCodeContent(to: string, code: string) {
+function authMagicCodeContent(to: string, code: string, product: 'ClawPilot' | 'Career Desk' = 'ClawPilot') {
   const text = [
-    'ClawPilot sign-in',
+    `${product} sign-in`,
     '',
     `Your sign-in code is: ${code}`,
     '',
@@ -354,14 +354,14 @@ function authMagicCodeContent(to: string, code: string) {
     '<html><body style="margin:0;padding:24px;background:#0f0f13;color:#e4e1ec;font-family:Arial,sans-serif">',
     '<div style="max-width:520px;margin:0 auto;padding:24px;background:#1a1a23;border:1px solid #343741;border-radius:8px">',
     `<img src="${escapeHtml(logoUrl)}" width="48" height="48" alt="" style="display:block;margin:0 0 16px">`,
-    '<h1 style="margin:0 0 20px;font-size:24px">ClawPilot sign-in</h1>',
+    `<h1 style="margin:0 0 20px;font-size:24px">${product} sign-in</h1>`,
     '<p style="margin:0 0 12px">Use this code to sign in:</p>',
     `<p style="margin:0 0 20px;font-size:32px;font-weight:700;letter-spacing:8px;color:#a8c7fa">${code}</p>`,
     '<p style="margin:0 0 8px">This code expires in 15 minutes and can be used once.</p>',
     '<p style="margin:0;color:#a9adb8">If you did not request this code, ignore this email.</p>',
     '</div></body></html>',
   ].join('')
-  return { to, subject: 'Your ClawPilot sign-in code', text, html, messagePurpose: 'auth-magic-code' as const }
+  return { to, subject: `Your ${product} sign-in code`, text, html, messagePurpose: 'auth-magic-code' as const }
 }
 
 export async function sendAuthMagicCodeEmail(
@@ -370,6 +370,14 @@ export async function sendAuthMagicCodeEmail(
   const to = assertEmail(input.to)
   const code = assertCode(input.code)
   return sendMessage(authMagicCodeContent(to, code), await authMailProfileForRecipient(to))
+}
+
+export async function sendCareerDeskMagicCodeEmail(
+  input: SendAuthMagicCodeEmailInput,
+): Promise<void> {
+  const to = assertEmail(input.to)
+  const code = assertCode(input.code)
+  await sendMessage(authMagicCodeContent(to, code, 'Career Desk'), await authMailProfileForRecipient(to))
 }
 
 export async function sendInvitationEmail(input: SendInvitationEmailInput): Promise<{ messageId: string | null }> {

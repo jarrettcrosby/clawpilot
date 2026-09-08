@@ -5,9 +5,11 @@ import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.m
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import crypto, { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createServer } from 'node:net'
+import { tmpdir } from 'node:os'
 import { createRequire } from 'node:module'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import vm from 'node:vm'
 
 const root = process.cwd()
@@ -291,6 +293,7 @@ async function verifyAcceptance(databaseUrl) {
     withTransaction: withRuntimeTransaction,
   }
   const usersMock = {
+    configuredOwnerEmail() { return 'owner@original.example' },
     normalizeUserEmail(value) {
       const email = String(value || '').trim().toLowerCase()
       if (!email.includes('@')) throw new Error('invalid email')
@@ -304,7 +307,12 @@ async function verifyAcceptance(databaseUrl) {
       return result.rows[0] || null
     },
   }
+  const loginIdentity = loadTypeScriptModule('app_src/lib/authLoginIdentity.ts', {
+    '@/lib/users': usersMock,
+    '@/lib/persistence/postgres': persistenceMock,
+  })
   const auth = loadTypeScriptModule('app_src/lib/authMagicCode.ts', {
+    '@/lib/authLoginIdentity': loginIdentity,
     '@/lib/matonMail': {
       async sendAuthMagicCodeEmail({ to, code }) {
         deliveredCodes.set(to, code)
@@ -583,6 +591,34 @@ async function verifyAcceptance(databaseUrl) {
   assert.equal(missingPrimaryState.invitation.accepted_at, null)
   assert.equal(missingPrimaryState.code, null)
 
+  const previousAliases = process.env.APP_LOGIN_EMAIL_ALIASES
+  process.env.APP_LOGIN_EMAIL_ALIASES = 'owner@renamed.example'
+  try {
+    await runtimePool.query("INSERT INTO app_users (email, role, status) VALUES ('owner@original.example', 'owner', 'active')")
+    await runtimePool.query(`INSERT INTO app_user_organization_memberships (user_email, organization_id, role, status, is_default)
+      VALUES ('owner@original.example', $1::uuid, 'owner', 'active', true),
+             ('owner@original.example', $2::uuid, 'owner', 'active', false)`, [organizations.primary, organizations.additional])
+    const membershipQuery = "SELECT * FROM app_user_organization_memberships WHERE user_email = 'owner@original.example' ORDER BY organization_id"
+    const before = (await runtimePool.query(membershipQuery)).rows
+    assert.equal((await auth.requestAuthMagicCode({ email: 'owner@renamed.example' })).status, 'sent')
+    const code = deliveredCodes.get('owner@renamed.example')
+    assert.match(code, /^\d{6}$/)
+    assert.equal((await auth.verifyAuthMagicCode({ email: 'owner@original.example', code })).status, 'not-found')
+    const verified = await auth.verifyAuthMagicCode({ email: 'owner@renamed.example', code })
+    assert.equal(verified.status, 'verified')
+    assert.equal(verified.email, 'owner@original.example')
+    assert.equal((await auth.verifyAuthMagicCode({ email: 'owner@renamed.example', code })).status, 'consumed')
+    assert.deepEqual((await runtimePool.query(membershipQuery)).rows, before)
+    assert.equal((await runtimePool.query("SELECT email FROM app_users WHERE email = 'owner@renamed.example'")).rowCount, 0)
+    await runtimePool.query("INSERT INTO app_users (email, role, status) VALUES ('owner@renamed.example', 'member', 'active')")
+    assert.equal((await auth.requestAuthMagicCode({ email: 'owner@renamed.example' })).status, 'not-authorized')
+    assert.equal((await auth.verifyAuthMagicCode({ email: 'owner@renamed.example', code })).status, 'not-authorized')
+    assert.deepEqual((await runtimePool.query(membershipQuery)).rows, before)
+  } finally {
+    if (previousAliases === undefined) delete process.env.APP_LOGIN_EMAIL_ALIASES
+    else process.env.APP_LOGIN_EMAIL_ALIASES = previousAliases
+  }
+
   await runtimePool.end()
   runtimePool = null
 }
@@ -590,6 +626,28 @@ async function verifyAcceptance(databaseUrl) {
 async function main() {
   process.env.APP_SESSION_SECRET =
     'invitation-acceptance-postgres-secret-32-characters'
+  if (process.env.CLAWPILOT_AUTH_TEST_POSTGRES_MODE === 'local') {
+    const directory = mkdtempSync(join(tmpdir(), 'clawpilot-auth-pg-'))
+    const data = join(directory, 'data')
+    const listener = createServer()
+    await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
+    const port = listener.address().port
+    await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()))
+    let started = false
+    try {
+      command('initdb', ['-D', data, '-U', 'postgres', '-A', 'trust', '--no-locale'], { timeout: 30_000 })
+      command('pg_ctl', ['-D', data, '-l', join(directory, 'postgres.log'), '-o', `-h 127.0.0.1 -p ${port} -k ${directory}`, '-w', 'start'], { timeout: 30_000 })
+      started = true
+      await verifyAcceptance(`postgresql://postgres@127.0.0.1:${port}/postgres`)
+      console.log('Invitation exact-set disposable local-PostgreSQL acceptance passed')
+    } finally {
+      if (runtimePool) await runtimePool.end().catch(() => {})
+      runtimePool = null
+      if (started) command('pg_ctl', ['-D', data, '-m', 'fast', '-w', 'stop'], { timeout: 30_000 })
+      rmSync(directory, { recursive: true, force: true })
+    }
+    return
+  }
   command('docker', ['info'], { timeout: 30_000 })
   const container = (
     `clawpilot-invitation-acceptance-${process.pid}-${randomUUID().slice(0, 8)}`

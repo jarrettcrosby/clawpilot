@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
 import {
   GoogleSsoError,
   googleSsoClientConfiguration,
@@ -478,6 +479,10 @@ export async function linkGoogleIdentity(input: {
 export async function resolveLinkedGoogleIdentity(
   identity: VerifiedGoogleIdentity,
 ): Promise<AppUser> {
+  const accountEmail = await resolveLoginAccountEmail(identity.email)
+  if (!accountEmail) {
+    throw new GoogleSsoError('GOOGLE_SSO_IDENTITY_CONFLICT', 'This Google account belongs to a different ClawPilot user', 409)
+  }
   const result = await query<{
     user_email: string
     user_status: string
@@ -504,7 +509,7 @@ export async function resolveLinkedGoogleIdentity(
        AND identity.user_email = $2
        AND identity.verified_email = $2
      LIMIT 1`,
-    [identity.subject, identity.email],
+    [identity.subject, accountEmail],
   )
   const linked = result.rows[0]
   if (!linked) {

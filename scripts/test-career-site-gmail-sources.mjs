@@ -662,6 +662,66 @@ assert.equal(
   false,
   'a known-platform job alert is discovery spam, not a real conversation',
 )
+const linkedInNotification = {
+  ...baseMessageSignals,
+  senderEmail: 'messages-noreply@linkedin.com',
+  subject: 'A recruiter sent you a message',
+  snippet: 'I reviewed your background for our Vice President, Supply Chain opening.',
+  bodyText: 'Would you be open to a quick call about this role? Schedule a call with me. Recommended jobs in your area.',
+  sourceUrls: ['https://www.linkedin.com/comm/messaging/thread/abc123'],
+  labelIds: ['CATEGORY_SOCIAL'],
+  listUnsubscribe: '<https://www.linkedin.com/comm/settings>',
+  autoSubmitted: 'auto-generated',
+}
+const shortInterviewFollowup = {
+  ...baseMessageSignals,
+  senderEmail: 'recruiter@employer.com', subject: 'Re: Phone Screen',
+  snippet: 'Thursday works for me.', bodyText: 'See you then.',
+}
+assert.equal(gmailSources.careerGmailMessageRelevance(shortInterviewFollowup).sentThreadEligible, true)
+assert.equal(gmailSources.careerGmailMessageIsRelevant(shortInterviewFollowup), false, 'a terse reply alone is not proof')
+assert.equal(gmailSources.careerGmailMessageRelevance({ ...shortInterviewFollowup, sentThreadMatched: true }).reason, 'sent-thread')
+assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...shortInterviewFollowup, subject: 'Re: Thursday', sentThreadMatched: true }), false,
+  'arbitrary personal conversations must not become job mail merely because the user replied')
+for (const senderEmail of ['alex@employer.example', 'alex@press.example', 'alex@podcast.example', 'alex@school.example']) {
+  const genericInterviewFollowup = {
+    ...shortInterviewFollowup,
+    senderEmail,
+    subject: 'Re: Interview',
+  }
+  assert.equal(gmailSources.careerGmailMessageRelevance(genericInterviewFollowup).sentThreadEligible, false,
+    'a generic interview subject must provide employment evidence before a Sent-thread lookup')
+  assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...genericInterviewFollowup, sentThreadMatched: true }), false,
+    'a Sent label alone cannot identify a generic interview as an employment conversation')
+}
+assert.equal(gmailSources.careerGmailMessageRelevance({
+  ...shortInterviewFollowup,
+  subject: 'Re: Interview',
+  sentThreadMatched: true,
+}).reason, 'sent-thread', 'a recruiter sender supplies independent employment evidence for a generic interview reply')
+assert.equal(gmailSources.careerGmailMessageRelevance({
+  ...shortInterviewFollowup,
+  senderEmail: 'alex@employer.example',
+  sentThreadMatched: true,
+}).reason, 'sent-thread', 'an explicit phone-screen subject remains eligible with exact Sent-thread evidence')
+assert.equal(gmailSources.careerGmailMessageRelevance(linkedInNotification).reason, 'linkedin-message-notification')
+assert.equal(gmailSources.careerGmailMessageIsRelevant({
+  ...linkedInNotification,
+  snippet: 'Interview for Director of Operations',
+  bodyText: 'Please share your availability for an interview with the hiring team.',
+}), true, 'specific interview message notifications survive the social wrapper')
+for (const changes of [
+  { subject: 'Job alert: Vice President of Supply Chain' },
+  { subject: 'A recruiter viewed your profile' },
+  { subject: 'Weekly message digest' },
+  { sourceUrls: [] },
+  { sourceUrls: ['https://linkedin.com.evil.test/messaging/thread/abc123'] },
+  { senderEmail: 'notifications@other-board.com' },
+  { snippet: 'You have a new message', bodyText: 'Open LinkedIn to view your message.' },
+  { snippet: 'Director of Admissions invites you', bodyText: 'Would you be open to an admissions interview for our MBA program?' },
+  { labelIds: ['SPAM'] },
+]) assert.equal(gmailSources.careerGmailMessageIsRelevant({ ...linkedInNotification, ...changes }), false,
+  `LinkedIn notification must fail closed: ${JSON.stringify(changes)}`)
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
