@@ -34,6 +34,26 @@ receipt, a separate reviewed change may narrow the active audit to production.
 
 Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
 
+### PITR Cost-Control Policy — 2026-09-07
+
+Production PITR and external WAL archiving were disabled on 2026-09-07 EDT
+under the operator-approved cost-control decision; development PITR remains
+disabled. Production SQL verification showed `archive_mode = off`,
+`archive_command = (disabled)`, and `archive_timeout = 0`. The dedicated
+production PITR bucket was deleted, removing its archived recovery history.
+Deployment, snapshot, and application-health evidence is recorded in the
+[Infrastructure and Cost Control Register](infrastructure-and-cost-control-register.md).
+Daily, weekly, monthly, and required manual volume snapshots remain in scope;
+this decision does not retire the frozen development migration source or any
+scheduled snapshot policy.
+
+Recovery is limited to completed volume snapshots or validated logical exports.
+Writes since the latest usable snapshot may be lost, and an arbitrary recovery
+time between snapshots cannot be selected. Keep the 30-hour completed-backup
+age gate: a daily schedule alone does not establish that a recent restore point
+exists. Revisit production PITR and recovery-point/recovery-time objectives
+before customer onboarding.
+
 Current Railway references, checked on 2026-07-18 EDT:
 
 - [Volume backups](https://docs.railway.com/volumes/backups)
@@ -85,7 +105,10 @@ The authenticated Railway dashboard was inspected without staging a restore or c
 | `development` | `2026-07-15 17:48 EDT` | `2026-07-18 18:05 EDT` | enabled |
 | `production` | `2026-07-14 16:33 EDT` | `2026-07-18 18:07 EDT` | enabled |
 
-Railway reports that a PITR restore creates a new Postgres service and leaves the source running. PITR is independent of the daily, weekly, monthly, and manual volume backups, so both controls remain enabled.
+At that historical inspection, both PITR and the independent daily, weekly,
+monthly, and manual volume backups were enabled. Development PITR was disabled
+on 2026-08-02 and production PITR was disabled on 2026-09-07 EDT, superseding
+this historical state. The scheduled snapshot policy remains required.
 
 ## Repeatable Audit
 
@@ -193,6 +216,10 @@ restore target during the current migration. Validation returned:
 | Audit events | 1,808 |
 | Unvalidated foreign keys | 0 |
 
-The temporary restore database was dropped after validation. This proves the ignored logical artifact can be read and restored independently; it does not replace a provider-native volume or PITR drill during a planned maintenance window.
+The temporary restore database was dropped after validation. This proves the
+ignored logical artifact can be read and restored independently; it does not
+replace a provider-native volume restore drill during a planned maintenance
+window. If production PITR is re-enabled later, verify it with a separate
+PITR restore drill.
 
 Use [ClawPilot environments and deployment](clawpilot-environments.md) for release sequencing and [Shared short links](../modules/short-links.md) for public link routing. Backup evidence must remain focused on recovery controls.
