@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -1052,12 +1054,12 @@ async function main() {
   ).trim()
   const container = `clawpilot-shopify-reversal-${randomUUID()}`
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=postgres',
       '-e', 'POSTGRES_DB=clawpilot_shopify_reversal_test',
       '-p', '127.0.0.1::5432', postgresImage,
-    ])
+    ]))
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = portOutput.match(/:(\d+)$/u)?.[1]
     assert.ok(port, `Unable to parse disposable PostgreSQL port: ${portOutput}`)

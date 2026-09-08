@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -908,14 +910,14 @@ try {
     databaseUrl = suppliedUrl
   } else {
     containerName = `clawpilot-tenant-retirement-${process.pid}-${randomUUID().slice(0, 8)}`
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '--detach',
       '--name', containerName,
       '--env', 'POSTGRES_PASSWORD=tenant_retirement_test',
       '--env', 'POSTGRES_DB=railway',
       '--publish', '127.0.0.1::5432',
       'postgres:16-alpine',
-    ])
+    ]))
     const binding = command('docker', ['port', containerName, '5432/tcp'])
     const port = /:(\d+)$/u.exec(binding)?.[1]
     assert.ok(port, `Could not parse disposable PostgreSQL port: ${binding}`)

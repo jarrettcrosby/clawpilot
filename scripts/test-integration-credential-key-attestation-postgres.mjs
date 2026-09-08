@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import {
@@ -55,7 +60,7 @@ let disposableContainer = null
 function stopDisposableContainer() {
   if (!disposableContainer) return
   try {
-    command('docker', ['rm', '-f', disposableContainer], { timeout: 30_000 })
+    command('docker', disposablePostgresDockerCleanupArgs(disposableContainer), { timeout: 30_000 })
   } catch {}
   disposableContainer = null
 }
@@ -276,13 +281,14 @@ disposableContainer = (
   `clawpilot-key-attestation-${process.pid}-${randomUUID().slice(0, 8)}`
 )
 command('docker', ['info'], { timeout: 30_000 })
-command('docker', [
-  'create', '--name', disposableContainer,
+command('docker', disposablePostgresDockerArgs([
+  'create',
+  '--rm', '--name', disposableContainer,
   '-e', 'POSTGRES_PASSWORD=attestation_test',
   '-e', 'POSTGRES_DB=postgres',
   '-p', `127.0.0.1:${port}:5432`,
   'postgres:16-alpine',
-], { timeout: 60_000 })
+]), { timeout: 60_000 })
 command('docker', ['start', disposableContainer], { timeout: 60_000 })
 const baseUrl = (
   `postgresql://postgres:attestation_test@127.0.0.1:${port}/postgres`

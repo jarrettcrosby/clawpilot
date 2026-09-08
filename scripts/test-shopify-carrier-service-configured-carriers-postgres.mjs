@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -2072,13 +2077,13 @@ async function main() {
   }`
   let pool = null
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_carriers',
       '-e', 'POSTGRES_DB=clawpilot_carriers',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const postgresPort = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
     assert.ok(
@@ -3033,7 +3038,7 @@ async function main() {
     }
   } finally {
     if (pool) await pool.end().catch(() => undefined)
-    spawnSync('docker', ['rm', '-f', container], {
+    spawnSync('docker', disposablePostgresDockerCleanupArgs(container), {
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,

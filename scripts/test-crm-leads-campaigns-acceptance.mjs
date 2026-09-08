@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
@@ -990,13 +992,13 @@ async function main() {
   let logs = ''
   const runtimeDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpilot-crm-acceptance-'))
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_acceptance',
       '-e', 'POSTGRES_DB=clawpilot_acceptance',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const postgresPort = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
     assert.ok(postgresPort > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)

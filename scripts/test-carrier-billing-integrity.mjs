@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
 import assert from 'node:assert/strict'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
@@ -1871,13 +1873,13 @@ async function main() {
 
   const container = `clawpilot-carrier-integrity-${process.pid}-${randomUUID().slice(0, 8)}`
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
       '-e', 'POSTGRES_PASSWORD=clawpilot_carrier_integrity',
       '-e', 'POSTGRES_DB=clawpilot_carrier_integrity',
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
-    ], { timeout: 180_000 })
+    ]), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
     assert.ok(port > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)

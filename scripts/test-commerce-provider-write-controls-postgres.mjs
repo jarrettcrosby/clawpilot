@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -479,13 +481,13 @@ async function seed(pool) {
 
 let pool = null
 try {
-  command('docker', [
+  command('docker', disposablePostgresDockerArgs([
     'run', '--rm', '-d', '--name', containerName,
     '-e', 'POSTGRES_PASSWORD=postgres',
     '-e', 'POSTGRES_DB=clawpilot',
     '-p', '127.0.0.1::5432',
     'pgvector/pgvector:pg16',
-  ])
+  ]))
   const published = command('docker', ['port', containerName, '5432/tcp'])
   const port = published.match(/:(\d+)$/u)?.[1]
   assert.ok(port, `Could not resolve disposable PostgreSQL port: ${published}`)

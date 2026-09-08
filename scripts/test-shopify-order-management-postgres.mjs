@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -4364,13 +4366,13 @@ async function main() {
     const container =
       `clawpilot-shopify-order-management-${phase}-${randomUUID()}`
     try {
-      command('docker', [
+      command('docker', disposablePostgresDockerArgs([
         'run', '--detach', '--rm', '--name', container,
         '-e', 'POSTGRES_PASSWORD=postgres',
         '-e', 'POSTGRES_DB=clawpilot_order_management_test',
         '-p', '127.0.0.1::5432',
         'pgvector/pgvector:pg18',
-      ])
+      ]))
       const portOutput = command('docker', ['port', container, '5432/tcp'])
       const port = portOutput.trim().split(':').at(-1)
       const databaseUrl =

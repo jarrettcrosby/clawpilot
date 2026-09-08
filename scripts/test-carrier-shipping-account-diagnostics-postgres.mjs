@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
+
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -2195,13 +2200,13 @@ async function main() {
   let pool = null
 
   try {
-    command('docker', [
+    command('docker', disposablePostgresDockerArgs([
       'run', '--detach', '--rm', '--name', containerName,
       '-e', 'POSTGRES_PASSWORD=postgres',
       '-e', 'POSTGRES_DB=clawpilot_test',
       '-p', `${port}:5432`,
       'pgvector/pgvector:pg16',
-    ])
+    ]))
     pool = new Pool({ connectionString: databaseUrl, max: 2 })
     await waitForPostgres(pool)
     const upgradeClient = await pool.connect()
@@ -2272,7 +2277,7 @@ async function main() {
     )
   } finally {
     if (pool) await pool.end().catch(() => {})
-    spawnSync('docker', ['rm', '--force', containerName], {
+    spawnSync('docker', disposablePostgresDockerCleanupArgs(containerName), {
       cwd: root,
       encoding: 'utf8',
       stdio: 'ignore',
