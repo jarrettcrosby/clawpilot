@@ -18,8 +18,7 @@ Railway Postgres is the durable store for ClawPilot-owned state. Use two indepen
 1. Railway volume backups as the primary provider-native restore mechanism.
 2. A logical `pg_dump` export before risky migrations or major production promotions.
 
-Every retained Railway Postgres volume instance covered by the active cutover
-must have:
+Every retained Railway Postgres volume instance must have:
 
 - `DAILY` backups, retained by Railway for 6 days.
 - `WEEKLY` backups, retained by Railway for 1 month.
@@ -27,12 +26,32 @@ must have:
 - At least one completed provider backup no more than 30 hours old.
 - A manual provider backup immediately before destructive or high-risk database work.
 
-During the current transition this policy covers both `development`, which is
-the frozen selective-migration source, and `production`, which is the target.
-After migration postflight, archive verification, and an accepted DEV-retirement
-receipt, a separate reviewed change may narrow the active audit to production.
+This policy covers both active, isolated environments: `development` and
+`production`. The selective migration and Mac-hosted replacement were
+abandoned. Narrowing the audit to production requires a separately approved
+development-retirement decision and verified recovery/data disposition.
 
 Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
+
+### PITR Cost-Control Policy — 2026-09-07
+
+Production PITR and external WAL archiving were disabled on 2026-09-07 EDT
+under the operator-approved cost-control decision; development PITR remains
+disabled. Production SQL verification showed `archive_mode = off`,
+`archive_command = (disabled)`, and `archive_timeout = 0`. The dedicated
+production PITR bucket was deleted, removing its archived recovery history.
+Deployment, snapshot, and application-health evidence is recorded in the
+[Infrastructure and Cost Control Register](infrastructure-and-cost-control-register.md).
+Daily, weekly, monthly, and required manual volume snapshots remain in scope;
+this decision does not retire the development environment or any
+scheduled snapshot policy.
+
+Recovery is limited to completed volume snapshots or validated logical exports.
+Writes since the latest usable snapshot may be lost, and an arbitrary recovery
+time between snapshots cannot be selected. Keep the 30-hour completed-backup
+age gate: a daily schedule alone does not establish that a recent restore point
+exists. Revisit production PITR and recovery-point/recovery-time objectives
+before customer onboarding.
 
 Current Railway references, checked on 2026-07-18 EDT:
 
@@ -41,14 +60,13 @@ Current Railway references, checked on 2026-07-18 EDT:
 - [Manage volume backups with the public API](https://docs.railway.com/integrations/api/manage-volumes)
 - [Point-in-time recovery](https://docs.railway.com/volumes/point-in-time-recovery)
 
-## Transitional Development Evidence
+## Retained Development Evidence
 
-The provider evidence below was captured earlier, but the hosted Railway
-`development` environment has not yet completed retirement. It remains a
-frozen migration source, backup target, and billable resource until selective
-migration postflight, archive verification, and the distinct retirement
-acceptance receipt succeed. Do not relabel it historical or remove it from the
-default audit before those gates pass.
+The provider evidence below was captured earlier and is historical, not proof
+of current backup freshness. Railway `development` is an active, retained
+environment, backup target, and billable resource. Check both environments
+with the repeatable audit; do not remove development from the default audit
+because an earlier plan proposed retiring it.
 
 ## Historical Provider Evidence
 
@@ -85,17 +103,20 @@ The authenticated Railway dashboard was inspected without staging a restore or c
 | `development` | `2026-07-15 17:48 EDT` | `2026-07-18 18:05 EDT` | enabled |
 | `production` | `2026-07-14 16:33 EDT` | `2026-07-18 18:07 EDT` | enabled |
 
-Railway reports that a PITR restore creates a new Postgres service and leaves the source running. PITR is independent of the daily, weekly, monthly, and manual volume backups, so both controls remain enabled.
+At that historical inspection, both PITR and the independent daily, weekly,
+monthly, and manual volume backups were enabled. Development PITR was disabled
+on 2026-08-02 and production PITR was disabled on 2026-09-07 EDT, superseding
+this historical state. The scheduled snapshot policy remains required.
 
 ## Repeatable Audit
 
-`scripts/railway-backup-audit.mjs` is read-only. During the transition it
+`scripts/railway-backup-audit.mjs` is read-only. It
 defaults to both `development` and `production` and exits nonzero unless each
 named environment has `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider
 backup no more than 30 hours old. The explicit `--environment` option is
 available for narrower diagnostics or an isolated restore target, but a
-single-environment invocation does not satisfy the cutover backup gate while
-DEV remains the migration source.
+single-environment invocation does not satisfy the backup gate while both
+hosted environments remain active.
 
 Use an account or workspace API token supplied through the environment. Do not commit or print the token.
 
@@ -152,10 +173,8 @@ Manual Railway volume backups were created and confirmed in the authenticated Ra
 | `development` | `2026-07-14 14:30 UTC` | 225 MB | manual backup |
 
 Daily, weekly, and monthly schedules were then enabled and their persisted
-checked state was verified in both environments. During the transition the
-current policy continues to audit both; after accepted DEV retirement, the
-production policy remains active and this development evidence becomes
-historical.
+checked state was verified in both environments. This is historical evidence;
+current policy continues to audit both retained hosted environments.
 
 ## Restore Drill
 
@@ -178,7 +197,7 @@ The `2026-07-18` pre-hygiene production dump was restored on `2026-07-18` into
 a uniquely named temporary database on the development Postgres service.
 Neither active database was changed. This is proof that the artifact was
 restorable; it does not make the retained development environment a disposable
-restore target during the current migration. Validation returned:
+restore target for unrelated work. Validation returned:
 
 | Check | Result |
 |---|---:|
@@ -193,6 +212,10 @@ restore target during the current migration. Validation returned:
 | Audit events | 1,808 |
 | Unvalidated foreign keys | 0 |
 
-The temporary restore database was dropped after validation. This proves the ignored logical artifact can be read and restored independently; it does not replace a provider-native volume or PITR drill during a planned maintenance window.
+The temporary restore database was dropped after validation. This proves the
+ignored logical artifact can be read and restored independently; it does not
+replace a provider-native volume restore drill during a planned maintenance
+window. If production PITR is re-enabled later, verify it with a separate
+PITR restore drill.
 
 Use [ClawPilot environments and deployment](clawpilot-environments.md) for release sequencing and [Shared short links](../modules/short-links.md) for public link routing. Backup evidence must remain focused on recovery controls.
