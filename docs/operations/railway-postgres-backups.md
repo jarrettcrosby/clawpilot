@@ -18,8 +18,7 @@ Railway Postgres is the durable store for ClawPilot-owned state. Use two indepen
 1. Railway volume backups as the primary provider-native restore mechanism.
 2. A logical `pg_dump` export before risky migrations or major production promotions.
 
-Every retained Railway Postgres volume instance covered by the active cutover
-must have:
+Every retained Railway Postgres volume instance must have:
 
 - `DAILY` backups, retained by Railway for 6 days.
 - `WEEKLY` backups, retained by Railway for 1 month.
@@ -27,10 +26,10 @@ must have:
 - At least one completed provider backup no more than 30 hours old.
 - A manual provider backup immediately before destructive or high-risk database work.
 
-During the current transition this policy covers both `development`, which is
-the frozen selective-migration source, and `production`, which is the target.
-After migration postflight, archive verification, and an accepted DEV-retirement
-receipt, a separate reviewed change may narrow the active audit to production.
+This policy covers both active, isolated environments: `development` and
+`production`. The selective migration and Mac-hosted replacement were
+abandoned. Narrowing the audit to production requires a separately approved
+development-retirement decision and verified recovery/data disposition.
 
 Provider backups are incremental, Copy-on-Write volume snapshots and are billed as volume storage. Railway limits a manual backup to 50% of the volume's total capacity.
 
@@ -44,7 +43,7 @@ production PITR bucket was deleted, removing its archived recovery history.
 Deployment, snapshot, and application-health evidence is recorded in the
 [Infrastructure and Cost Control Register](infrastructure-and-cost-control-register.md).
 Daily, weekly, monthly, and required manual volume snapshots remain in scope;
-this decision does not retire the frozen development migration source or any
+this decision does not retire the development environment or any
 scheduled snapshot policy.
 
 Recovery is limited to completed volume snapshots or validated logical exports.
@@ -61,14 +60,13 @@ Current Railway references, checked on 2026-07-18 EDT:
 - [Manage volume backups with the public API](https://docs.railway.com/integrations/api/manage-volumes)
 - [Point-in-time recovery](https://docs.railway.com/volumes/point-in-time-recovery)
 
-## Transitional Development Evidence
+## Retained Development Evidence
 
-The provider evidence below was captured earlier, but the hosted Railway
-`development` environment has not yet completed retirement. It remains a
-frozen migration source, backup target, and billable resource until selective
-migration postflight, archive verification, and the distinct retirement
-acceptance receipt succeed. Do not relabel it historical or remove it from the
-default audit before those gates pass.
+The provider evidence below was captured earlier and is historical, not proof
+of current backup freshness. Railway `development` is an active, retained
+environment, backup target, and billable resource. Check both environments
+with the repeatable audit; do not remove development from the default audit
+because an earlier plan proposed retiring it.
 
 ## Historical Provider Evidence
 
@@ -112,13 +110,13 @@ this historical state. The scheduled snapshot policy remains required.
 
 ## Repeatable Audit
 
-`scripts/railway-backup-audit.mjs` is read-only. During the transition it
+`scripts/railway-backup-audit.mjs` is read-only. It
 defaults to both `development` and `production` and exits nonzero unless each
 named environment has `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider
 backup no more than 30 hours old. The explicit `--environment` option is
 available for narrower diagnostics or an isolated restore target, but a
-single-environment invocation does not satisfy the cutover backup gate while
-DEV remains the migration source.
+single-environment invocation does not satisfy the backup gate while both
+hosted environments remain active.
 
 Use an account or workspace API token supplied through the environment. Do not commit or print the token.
 
@@ -175,10 +173,8 @@ Manual Railway volume backups were created and confirmed in the authenticated Ra
 | `development` | `2026-07-14 14:30 UTC` | 225 MB | manual backup |
 
 Daily, weekly, and monthly schedules were then enabled and their persisted
-checked state was verified in both environments. During the transition the
-current policy continues to audit both; after accepted DEV retirement, the
-production policy remains active and this development evidence becomes
-historical.
+checked state was verified in both environments. This is historical evidence;
+current policy continues to audit both retained hosted environments.
 
 ## Restore Drill
 
@@ -201,7 +197,7 @@ The `2026-07-18` pre-hygiene production dump was restored on `2026-07-18` into
 a uniquely named temporary database on the development Postgres service.
 Neither active database was changed. This is proof that the artifact was
 restorable; it does not make the retained development environment a disposable
-restore target during the current migration. Validation returned:
+restore target for unrelated work. Validation returned:
 
 | Check | Result |
 |---|---:|
