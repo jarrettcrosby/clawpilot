@@ -756,4 +756,47 @@ assert.throws(
   /Duplicate evidenceId/,
 )
 
+{
+  const deposit = {
+    releaseId: 'explicit-receipt-deposit',
+    businessDate: '2026-07-25',
+    amountCents: 4454,
+    scope: BASE_SCOPE,
+    source: 'sales_receipt_deposit',
+    depositAccountId: BASE_SCOPE.clearingAccountId,
+    evidence: evidence('receipt-deposit', 'SalesReceipt', '260725POS'),
+  }
+  const input = { captures: [capture({ captureId: 'prior-capture', amountCents: 4454 })], releases: [deposit] }
+  const result = reconcile(input)
+  assert.equal(result.allocations.length, 1)
+  assert.equal(result.partitions[0].allocatedCents, 4454)
+  assert.equal(result.releases[0].receiptBacked, true)
+  for (const field of ['organizationId', 'quickBooksCompanyId', 'locationId', 'currencyCode', 'clearingAccountId']) {
+    const scope = { ...BASE_SCOPE, [field]: field === 'currencyCode' ? 'EUR' : `other-${field}` }
+    const scoped = { ...deposit, scope, depositAccountId: scope.clearingAccountId }
+    assert.equal(reconcile({ ...input, releases: [scoped] }).allocations.length, 0, field)
+  }
+  for (const invalid of [
+    { depositAccountId: 'wrong-account' },
+    { depositAccountId: undefined },
+    { scope: { ...BASE_SCOPE, currencyCode: 'UNSPECIFIED' } },
+    { evidence: evidence('not-a-receipt', 'JournalEntry', '260725POS') },
+    { evidence: [{ evidenceId: 'no-provider-id', entityType: 'SalesReceipt' }] },
+    { evidence: [...deposit.evidence, ...evidence('extra-context', 'JournalEntry', '260725POS')] },
+  ]) {
+    assert.throws(() => reconcile({ ...input, releases: [{ ...deposit, ...invalid }] }), /exact SalesReceipt deposit-account evidence/)
+  }
+  assert.throws(() => reconcile({ ...input, releases: [{ ...deposit, source: undefined }] }), /clearing debit JournalEntry/)
+  assert.throws(() => reconcile({ ...input, releases: [deposit, {
+    ...deposit, releaseId: 'duplicate-receipt-deposit',
+    evidence: [{ ...deposit.evidence[0], evidenceId: 'another-evidence-id-same-receipt' }],
+  }] }), /Duplicate SalesReceipt deposit/)
+  for (const amountCents of [-1, 0, 1.2, Number.NaN]) {
+    assert.throws(() => reconcile({ ...input, releases: [{ ...deposit, amountCents }] }), /positive integer/)
+  }
+  assert.equal(reconcile({
+    ...input, releases: [{ ...deposit, businessDate: '2026-07-22' }],
+  }).allocations.length, 0, 'A receipt cannot offset a later capture')
+}
+
 console.log('POS clearing reconciliation tests passed')
