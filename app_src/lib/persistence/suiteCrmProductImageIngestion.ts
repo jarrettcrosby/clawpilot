@@ -86,6 +86,7 @@ type FenceRow = QueryResultRow & {
   fence_revision: string | number
   pipeline_id: string | null
   product_id: string | null
+  accepted_timestamp_precision: 'minute' | 'exact'
 }
 
 type EvidenceRow = QueryResultRow & {
@@ -332,6 +333,7 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
   suiteCrmId: string
   suiteCrmGlobalId: string | null
   suiteCrmModifiedAt: string
+  suiteCrmModifiedAtPrecision?: 'minute' | 'exact'
   productName: string
   media: null | {
     mediaId: string
@@ -346,6 +348,10 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
   const suiteCrmId = safeSuiteCrmId(input.suiteCrmId)
   const globalId = safeGlobalId(input.suiteCrmGlobalId)
   const modifiedAt = safeTimestamp(input.suiteCrmModifiedAt, 'modified timestamp')
+  const modifiedAtPrecision = input.suiteCrmModifiedAtPrecision ?? 'exact'
+  if (modifiedAtPrecision !== 'minute' && modifiedAtPrecision !== 'exact') {
+    fail('SUITECRM_PRODUCT_IMAGE_TIMESTAMP_INVALID', 'Invalid image revision precision')
+  }
   const observedAt = safeTimestamp(input.observedAt || new Date(), 'observation timestamp')
   if (
     Date.parse(modifiedAt) > Date.parse(observedAt) + MAX_SUITECRM_CLOCK_SKEW_MS
@@ -455,7 +461,11 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
          accepted_observation_id::text,
          fence_revision::text,
          pipeline_id::text,
-         product_id::text
+         product_id::text,
+         (SELECT observation.suitecrm_modified_at_precision
+          FROM crm_suitecrm_product_image_observations observation
+          WHERE observation.id = accepted_observation_id
+            AND observation.organization_id = $1::uuid) AS accepted_timestamp_precision
        FROM crm_suitecrm_product_image_snapshot_fences
        WHERE organization_id = $1::uuid AND suitecrm_id = $2
        LIMIT 1
@@ -488,10 +498,36 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
             409,
           )
         }
-        return replayEvidence(
-          client,
-          input.organizationId,
-          fence.accepted_observation_id,
+        if (!(fence.accepted_timestamp_precision === 'minute'
+          && modifiedAtPrecision === 'exact')) {
+          return replayEvidence(
+            client,
+            input.organizationId,
+            fence.accepted_observation_id,
+          )
+        }
+        // Append an immutable precision attestation even at exact second zero.
+        // The old observation and the accepted content hash stay unchanged.
+      }
+      if (
+        fence.accepted_timestamp_precision === 'minute'
+        && Math.floor(incomingAt / 60_000) === Math.floor(acceptedAt / 60_000)
+        && fence.accepted_snapshot_sha256 !== snapshotHash({
+          suiteCrmId,
+          globalId,
+          modifiedAt: new Date(acceptedAt).toISOString(),
+          media: image,
+          mediaId,
+          originalName,
+        })
+      ) {
+        // A legacy minute does not prove which same-minute revision came last.
+        // Refinement is safe only for identical evidence, never to clear a
+        // conflict by pretending a truncated timestamp is an exact timestamp.
+        fail(
+          'SUITECRM_PRODUCT_IMAGE_SNAPSHOT_CONFLICT',
+          'SuiteCRM Product image minute-precision timestamp identifies conflicting evidence',
+          409,
         )
       }
       if (
@@ -558,11 +594,12 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
          local_primary_content_sha256,
          observed_by,
          observed_at,
-         provider_write_count
+         provider_write_count,
+         suitecrm_modified_at_precision
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6::timestamptz, $7, $8,
          $9::uuid, $10, $11, $12, $13, $14, $15, $16, $17,
-         $18::uuid, $19, $20, $21, $22, $23::timestamptz, 0
+         $18::uuid, $19, $20, $21, $22, $23::timestamptz, 0, $24
        )
        RETURNING id::text, global_id`,
       [
@@ -589,6 +626,7 @@ export async function ingestSuiteCrmProductImageSnapshotInPostgres(input: {
         currentPrimary?.content_sha256 || null,
         actorEmail,
         observedAt,
+        modifiedAtPrecision,
       ],
     )
     const savedObservation = observation.rows[0]

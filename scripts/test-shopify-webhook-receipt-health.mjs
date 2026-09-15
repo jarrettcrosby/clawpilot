@@ -146,6 +146,7 @@ async function createFixture(client) {
       state text NOT NULL,
       attempts integer NOT NULL DEFAULT 0,
       max_attempts integer NOT NULL DEFAULT 12,
+      last_error_code text,
       received_at timestamptz NOT NULL,
       lease_expires_at timestamptz
     );
@@ -249,15 +250,18 @@ async function seedFixture(client) {
     state,
     receivedAt,
     leaseExpiresAt = null,
+    lastErrorCode = null,
+    attempts = 0,
   ) => client.query(
     `INSERT INTO operations_commerce_webhook_receipts (
        id, organization_id, integration_account_id, provider,
-       credential_version, topic, state, received_at, lease_expires_at
+       credential_version, topic, state, received_at, lease_expires_at,
+       last_error_code, attempts
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, 'shopify', $4, $5, $6,
        clock_timestamp() + $7::interval,
        CASE WHEN $8::text IS NULL THEN NULL
-            ELSE clock_timestamp() + $8::interval END
+            ELSE clock_timestamp() + $8::interval END, $9, $10
      )`,
     [
       randomUUID(),
@@ -268,6 +272,8 @@ async function seedFixture(client) {
       state,
       receivedAt,
       leaseExpiresAt,
+      lastErrorCode,
+      attempts,
     ],
   )
 
@@ -299,6 +305,15 @@ async function seedFixture(client) {
   await insertReceipt(accountIds[2], 1, 'products/delete', 'held', '-2 minutes')
   await insertReceipt(accountIds[3], 4, 'products/update', 'queued', '-2 days')
   await insertReceipt(accountIds[3], 4, 'products/update', 'dead_letter', '-2 days')
+  for (const [accountId, topic] of [
+    [accountIds[0], 'products/update'],
+    [accountIds[0], 'inventory_levels/update'],
+    [accountIds[1], 'products/update'],
+    [accountIds[2], 'products/update'],
+  ]) {
+    await insertReceipt(accountId, accountId === accountIds[0] ? 2 : 1,
+      topic, 'failed', '-30 days', null, 'SOURCE_CUTOVER_RETIRED')
+  }
   await client.query(
     `INSERT INTO operations_commerce_webhook_receipts (
        id, organization_id, integration_account_id, provider,
@@ -396,6 +411,7 @@ async function verify(databaseUrl) {
         failed: 1,
         deadLetter: 1,
         heldProductDeletes: 1,
+        retiredCutover: 4,
       },
     )
     assert.match(oldestActionableAt, /^\d{4}-\d{2}-\d{2}T/u)
@@ -405,6 +421,8 @@ async function verify(databaseUrl) {
       ),
     ))
     assert.equal(accountHealth.length, 3)
+    assert.deepEqual(accountHealth.map((row) => row.retiredCutover), [2, 1, 1],
+      'Retired counts must remain visible even for a paused store')
     assert.deepEqual(
       accountHealth.map((row) => ({
         integrationAccountId: row.integrationAccountId,
@@ -437,6 +455,33 @@ async function verify(databaseUrl) {
       'Health classification must not mutate webhook evidence',
     )
 
+    // Only exact, never-attempted failed retirements are informational. A
+    // similar code, attempted failure, or active/dead-letter lifecycle remains
+    // actionable; this is not a generic old-error suppression rule.
+    for (const [state, attempts, code] of [
+      ['failed', 1, 'SOURCE_CUTOVER_RETIRED'],
+      ['failed', 0, 'SOURCE_CUTOVER_RETIRED_OTHER'],
+      ['queued', 0, 'SOURCE_CUTOVER_RETIRED'],
+      ['dead_letter', 0, 'SOURCE_CUTOVER_RETIRED'],
+    ]) {
+      await client.query(`
+        INSERT INTO operations_commerce_webhook_receipts (
+          id, organization_id, integration_account_id, provider,
+          credential_version, topic, state, attempts, last_error_code, received_at
+        ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'shopify', 2,
+          'products/update', $4, $5, $6, clock_timestamp() - interval '30 days')`,
+      [randomUUID(), fixture.organizationId, fixture.actionableAccountId,
+        state, attempts, code])
+    }
+    const withNarrowCases = await snapshotReceipts(client)
+    const narrowHealth = await health.readShopifyWebhookReceiptHealthFromPostgres()
+    assert.equal(narrowHealth.retiredCutover, 4)
+    assert.equal(narrowHealth.actionable, 10)
+    assert.equal(narrowHealth.failed, 3)
+    assert.equal(narrowHealth.deadLetter, 2)
+    assert.equal(narrowHealth.staleQueued, 3)
+    assert.equal(await snapshotReceipts(client), withNarrowCases)
+
     const route = read('app_src/app/api/health/route.ts')
     for (const fragment of [
       'readShopifyWebhookReceiptHealthFromPostgres',
@@ -452,6 +497,8 @@ async function verify(databaseUrl) {
       'webhookReceiptHealth.actionable > 0',
       'Current Shopify webhook receipts need attention',
       'Ordinary held inventory/catalog history and prior generations remain',
+      'webhookReceiptHealth.retiredCutover > 0',
+      'explicitly retired during source cutover remain in the',
     ]) {
       assert.ok(settings.includes(fragment), `Settings UI missing ${fragment}`)
     }

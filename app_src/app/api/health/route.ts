@@ -3155,6 +3155,7 @@ export async function GET(request: NextRequest) {
       failed: 0,
       deadLetter: 0,
       heldProductDeletes: 0,
+      retiredCutover: 0,
       oldestActionableAt: null,
     }
     let faireInventoryPollWorker: Record<string, unknown> = {

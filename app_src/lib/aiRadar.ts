@@ -5,10 +5,10 @@ import { isIP } from 'node:net'
 import type { IncomingMessage } from 'node:http'
 import type { LookupFunction } from 'node:net'
 import { XMLParser } from 'fast-xml-parser'
+import { MAX_RADAR_FEED_ITEMS, readBoundedRadarFeed } from '@/lib/aiRadarFeed'
 import { query } from '@/lib/persistence/postgres'
 
-const MAX_FEED_BYTES = 4 * 1024 * 1024
-const MAX_ITEMS_PER_SOURCE = 30
+const MAX_ITEMS_PER_SOURCE = MAX_RADAR_FEED_ITEMS
 const RETENTION_DAYS = 365
 const MAX_REDIRECTS = 3
 
@@ -181,23 +181,6 @@ async function fetchFeedResponse(source: RadarSource): Promise<IncomingMessage> 
   throw new Error(`${source.name} exceeded the redirect limit`)
 }
 
-async function readBoundedFeed(response: IncomingMessage, sourceName: string): Promise<string> {
-  const declaredLength = Number(responseHeader(response, 'content-length') || 0)
-  if (declaredLength > MAX_FEED_BYTES) throw new Error(`${sourceName} feed exceeds ${MAX_FEED_BYTES} bytes`)
-  const chunks: Buffer[] = []
-  let bytes = 0
-  for await (const value of response) {
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
-    bytes += chunk.byteLength
-    if (bytes > MAX_FEED_BYTES) {
-      response.destroy()
-      throw new Error(`${sourceName} feed exceeds ${MAX_FEED_BYTES} bytes`)
-    }
-    chunks.push(chunk)
-  }
-  return Buffer.concat(chunks).toString('utf8')
-}
-
 function asArray<T>(value: T | T[] | null | undefined): T[] {
   if (value === undefined || value === null) return []
   return Array.isArray(value) ? value : [value]
@@ -307,7 +290,7 @@ async function fetchFeed(source: RadarSource) {
     response.resume()
     throw new Error(`${source.name} returned HTTP ${response.statusCode || 0}`)
   }
-  const xml = await readBoundedFeed(response, source.name)
+  const xml = await readBoundedRadarFeed(response, source.name)
   const root = parser.parse(xml) as Record<string, unknown>
   const rssChannel = root.rss && typeof root.rss === 'object'
     ? (root.rss as Record<string, unknown>).channel as Record<string, unknown> | undefined

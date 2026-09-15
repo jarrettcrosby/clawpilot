@@ -430,6 +430,7 @@ function accountState(
             failed: 0,
             deadLetter: 0,
             heldProductDeletes: 0,
+            retiredCutover: 0,
             oldestActionableAt: null,
           }
         : null,
