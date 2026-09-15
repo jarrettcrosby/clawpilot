@@ -29,6 +29,7 @@ import {
   useState,
 } from 'react'
 import type { ProductSalesChannelState } from '@/lib/crm/types'
+import ProductImageImportRecoveryPanel from '@/components/crm/ProductImageImportRecoveryPanel'
 
 type ProductImageAsset = {
   id: string
@@ -1242,6 +1243,9 @@ export default function ProductImagePanel({
 
   return (
     <Stack spacing={1.5} data-testid="crm-product-image-panel">
+      {canManage && state?.imageImportAvailable && (
+        <ProductImageImportRecoveryPanel key={productId} productId={productId} />
+      )}
       <Stack
         direction={{ xs: 'column', sm: 'row' }}
         gap={1}
