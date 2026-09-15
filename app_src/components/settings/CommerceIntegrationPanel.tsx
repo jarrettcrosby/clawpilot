@@ -154,6 +154,7 @@ type CommerceAccount = {
       failed: number
       deadLetter: number
       heldProductDeletes: number
+      retiredCutover: number
       oldestActionableAt: string | null
     } | null
   }
@@ -3270,6 +3271,18 @@ export default function CommerceIntegrationPanel({
                               Ordinary held inventory/catalog history and prior generations remain
                               informational evidence below.
                             </Typography>
+                          </Alert>
+                        ) : null}
+
+                      {account.provider === 'shopify'
+                        && webhookReceiptHealth
+                        && webhookReceiptHealth.retiredCutover > 0 ? (
+                          <Alert severity="info">
+                            {webhookReceiptHealth.retiredCutover} webhook receipt{
+                              webhookReceiptHealth.retiredCutover === 1 ? '' : 's'
+                            } explicitly retired during source cutover remain in the
+                            audit history. These were never attempted and require no
+                            replay; they are excluded from current failure counts.
                           </Alert>
                         ) : null}
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import {
+  disposablePostgresDockerArgs,
+  disposablePostgresDockerCleanupArgs,
+} from './lib/disposable-postgres-docker.mjs'
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -303,6 +306,7 @@ function imageInput(tenant, product, values) {
     suiteCrmId: values.suiteCrmId || product.suiteCrmId,
     suiteCrmGlobalId: values.globalId || product.referenceCode,
     suiteCrmModifiedAt: values.modifiedAt,
+    suiteCrmModifiedAtPrecision: values.precision || 'exact',
     productName: `SuiteCRM image ${values.name || 'remote'}`,
     media: values.absent ? null : {
       mediaId: values.mediaId || randomUUID(),
@@ -1157,6 +1161,112 @@ async function verify(pool) {
     provenance_writes: 0,
   })
 
+  const precisionProduct = await addProduct(pool, tenant, 'precision',
+    randomUUID())
+  const legacyInput = imageInput(tenant, precisionProduct, {
+    modifiedAt: '2026-08-02T12:00:00Z', precision: 'minute',
+    mimeType: 'image/png', bytes: ONE_PIXEL_PNG,
+  })
+  const legacy = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(legacyInput)
+  const legacyFence = async () => (await pool.query(
+    `SELECT accepted_observation_id::text, accepted_snapshot_sha256,
+       accepted_suitecrm_modified_at, fence_revision::text
+     FROM crm_suitecrm_product_image_snapshot_fences
+     WHERE organization_id = $1::uuid AND suitecrm_id = $2`,
+    [tenant.organizationId, precisionProduct.suiteCrmId],
+  )).rows[0]
+  const beforeConflict = await legacyFence()
+  await assert.rejects(ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(
+    imageInput(tenant, precisionProduct, {
+      modifiedAt: '2026-08-02T12:00:15Z',
+      mimeType: 'image/webp', bytes: FOUR_BY_FIVE_WEBP,
+    }),
+  ), (error) => error?.code === 'SUITECRM_PRODUCT_IMAGE_SNAPSHOT_CONFLICT')
+  assert.deepEqual(await legacyFence(), beforeConflict,
+    'Precise seconds must not clear conflicting legacy minute evidence')
+
+  const refined = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres({
+    ...legacyInput,
+    suiteCrmModifiedAt: '2026-08-02T12:00:15Z',
+    suiteCrmModifiedAtPrecision: 'exact',
+    observedAt: '2026-08-02T12:00:30Z',
+  })
+  assert.notEqual(refined.observationId, legacy.observationId)
+  const precisionEvidence = await pool.query(
+    `SELECT suitecrm_modified_at_precision, suitecrm_modified_at,
+       content_sha256
+     FROM crm_suitecrm_product_image_observations
+     WHERE id = ANY($1::uuid[]) ORDER BY observation_revision`,
+    [[legacy.observationId, refined.observationId]],
+  )
+  assert.deepEqual(precisionEvidence.rows.map((row) => row.suitecrm_modified_at_precision),
+    ['minute', 'exact'])
+  assert.equal(precisionEvidence.rows[0].suitecrm_modified_at.toISOString(),
+    '2026-08-02T12:00:00.000Z', 'Legacy observation is never rewritten')
+  assert.equal(precisionEvidence.rows[1].suitecrm_modified_at.toISOString(),
+    '2026-08-02T12:00:15.000Z')
+  assert.equal(precisionEvidence.rows[0].content_sha256, precisionEvidence.rows[1].content_sha256)
+  await assert.rejects(pool.query(
+    `UPDATE crm_suitecrm_product_image_observations
+     SET suitecrm_modified_at_precision = 'exact' WHERE id = $1::uuid`,
+    [legacy.observationId],
+  ), /immutable/u)
+
+  const exactChange = imageInput(tenant, precisionProduct, {
+    modifiedAt: '2026-08-02T12:00:30Z',
+    mimeType: 'image/webp', bytes: FOUR_BY_FIVE_WEBP,
+  })
+  const exactChanged = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(exactChange)
+  assert.equal(exactChanged.resolution, 'imported_primary')
+  assert.equal((await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(exactChange)).replayed,
+    true)
+  const exactFence = await legacyFence()
+  await assert.rejects(ingestion.ingestSuiteCrmProductImageSnapshotInPostgres({
+    ...exactChange, media: null,
+  }), (error) => error?.code === 'SUITECRM_PRODUCT_IMAGE_SNAPSHOT_CONFLICT')
+  assert.deepEqual(await legacyFence(), exactFence)
+
+  const exactZero = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres({
+    ...legacyInput,
+    suiteCrmModifiedAt: '2026-08-02T12:01:00Z',
+    suiteCrmModifiedAtPrecision: 'exact', observedAt: '2026-08-02T12:01:00Z',
+  })
+  const afterZero = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres({
+    ...exactChange, suiteCrmModifiedAt: '2026-08-02T12:01:15Z',
+    observedAt: '2026-08-02T12:01:15Z',
+  })
+  assert.notEqual(afterZero.observationId, exactZero.observationId,
+    'An explicitly exact second-zero revision must not be mistaken for legacy minute precision')
+  assert.equal((await legacyFence()).accepted_suitecrm_modified_at.toISOString(),
+    '2026-08-02T12:01:15.000Z')
+
+  const legacyZeroProduct = await addProduct(pool, tenant, 'legacy-zero', randomUUID())
+  const legacyZeroInput = imageInput(tenant, legacyZeroProduct, {
+    modifiedAt: '2026-08-02T13:00:00Z', precision: 'minute',
+    mimeType: 'image/png', bytes: ONE_PIXEL_PNG,
+  })
+  const legacyZero = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(legacyZeroInput)
+  const zeroAttestation = { ...legacyZeroInput, suiteCrmModifiedAtPrecision: 'exact' }
+  const attestedZero = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(zeroAttestation)
+  assert.notEqual(attestedZero.observationId, legacyZero.observationId)
+  const zeroEvidence = await pool.query(
+    `SELECT suitecrm_modified_at_precision, snapshot_sha256
+     FROM crm_suitecrm_product_image_observations
+     WHERE id = ANY($1::uuid[]) ORDER BY observation_revision`,
+    [[legacyZero.observationId, attestedZero.observationId]],
+  )
+  assert.deepEqual(zeroEvidence.rows.map((row) => row.suitecrm_modified_at_precision),
+    ['minute', 'exact'])
+  assert.equal(zeroEvidence.rows[0].snapshot_sha256, zeroEvidence.rows[1].snapshot_sha256)
+  assert.equal((await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(zeroAttestation))
+    .replayed, true)
+  const changedAfterAttestation = await ingestion.ingestSuiteCrmProductImageSnapshotInPostgres(
+    imageInput(tenant, legacyZeroProduct, {
+      modifiedAt: '2026-08-02T13:00:15Z', mimeType: 'image/webp', bytes: FOUR_BY_FIVE_WEBP,
+    }),
+  )
+  assert.equal(changedAfterAttestation.resolution, 'imported_primary')
+
   const lockOrderProduct = await addProduct(
     pool,
     tenant,
@@ -1198,7 +1308,7 @@ async function main() {
   } finally {
     if (runtimePool) await runtimePool.end().catch(() => {})
     runtimePool = null
-    spawnSync('docker', ['stop', '-t', '1', container], {
+    spawnSync('docker', disposablePostgresDockerCleanupArgs(container), {
       cwd: root,
       encoding: 'utf8',
       timeout: 20_000,

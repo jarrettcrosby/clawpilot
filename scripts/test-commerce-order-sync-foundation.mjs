@@ -1422,6 +1422,8 @@ let shopifyAdapterReadAllOrders = true
 let shopifyAdapterFailureStage = null
 let shopifyAdapterNativeNodes = []
 let faireAdapterOrder = null
+let faireAdapterPage = null
+let faireAdapterNormalizedTimes = null
 let faireAdapterFailureStage = null
 const normalizedAdapterOrder = (provider, source) => ({
   provider,
@@ -1503,7 +1505,7 @@ const adapterHistoryRuntime = loadTypeScript(
         }
         return faireAdapterOrder
       },
-      listFaireOrders: async () => ({
+      listFaireOrders: async () => faireAdapterPage ?? ({
         orders: [faireAdapterOrder], has_more: false, next_cursor: null,
       }),
       probeFaireBrandProfile: async () => {
@@ -1516,7 +1518,10 @@ const adapterHistoryRuntime = loadTypeScript(
     '@/lib/integrations/faireCommerceNormalizer': {
       normalizeFaireCommerce: (value) => ({
         orders: value.orders.orders.map(
-          (source) => normalizedAdapterOrder('faire', source),
+          (source) => ({
+            ...normalizedAdapterOrder('faire', source),
+            ...faireAdapterNormalizedTimes,
+          }),
         ),
         rejections: [],
       }),
@@ -2136,19 +2141,104 @@ const faireTrackingOrder = (trackingNumber, revision, status = 'SHIPPED') => ({
     tracking_number: trackingNumber,
   }],
 })
-const readFaireAdapter = async (source) => {
+const readFaireAdapter = async (source, overrides = {}) => {
   adapterProvider = 'faire'
   faireAdapterOrder = source
+  faireAdapterPage = overrides.page ?? null
+  faireAdapterNormalizedTimes = overrides.normalizedTimes ?? null
   return adapterHistoryRuntime.readCommerceOrderHistoryPage({
     organizationId: '00000000-0000-4000-8000-000000000001',
     accountGlobalId: 'gia0000001',
     expectedCredentialGeneration: 1,
-    requestedFrom: null,
-    requestedThrough: '2026-08-13T00:02:00.000Z',
+    requestedFrom: overrides.requestedFrom ?? null,
+    requestedThrough: overrides.requestedThrough ?? '2026-08-13T00:02:00.000Z',
     providerCursor: null,
     observedAt: '2026-08-13T00:03:00.000Z',
-    mode: 'historical_backfill',
+    mode: overrides.mode ?? 'historical_backfill',
   })
+}
+const faireFixedWindow = {
+  requestedFrom: '2026-08-12T00:00:00.000Z',
+  requestedThrough: '2026-08-13T00:02:00.000Z',
+}
+const faireWindowOrder = (id, createdAt, updatedAt = '2026-08-13T00:01:00.000Z') => ({
+  ...faireOrder, id, created_at: createdAt, updated_at: updatedAt,
+})
+const faireWindowRows = [
+  faireWindowOrder('old-recently-updated', '2026-08-11T23:59:59.999Z'),
+  faireWindowOrder('at-floor', faireFixedWindow.requestedFrom),
+  faireWindowOrder('inside', '2026-08-12T12:00:00.000Z'),
+  faireWindowOrder('at-ceiling', faireFixedWindow.requestedThrough,
+    faireFixedWindow.requestedThrough),
+  faireWindowOrder('after-ceiling', '2026-08-13T00:02:00.001Z',
+    '2026-08-13T00:02:00.001Z'),
+]
+const mixedFaireWindowPage = await readFaireAdapter(faireOrder, {
+  ...faireFixedWindow,
+  page: { orders: faireWindowRows, has_more: true, next_cursor: 'faire-window-next' },
+})
+assert.deepEqual(
+  Array.from(mixedFaireWindowPage.observations, (order) => order.externalOrderId),
+  ['at-floor', 'inside', 'at-ceiling'],
+  'Faire history must admit created-at window rows, not all recently updated rows',
+)
+assert.equal(mixedFaireWindowPage.providerRowsSeen, 5)
+assert.equal(mixedFaireWindowPage.nextProviderCursor, 'faire-window-next')
+assert.equal(mixedFaireWindowPage.providerReads, 2)
+assert.equal(mixedFaireWindowPage.providerWrites, 0)
+const emptyFaireWindowPage = await readFaireAdapter(faireOrder, {
+  ...faireFixedWindow,
+  page: {
+    orders: [faireWindowRows[0], faireWindowRows[4]],
+    has_more: true, next_cursor: 'faire-filtered-next',
+  },
+})
+assert.equal(emptyFaireWindowPage.observations.length, 0)
+assert.equal(emptyFaireWindowPage.providerRowsSeen, 2)
+assert.equal(emptyFaireWindowPage.nextProviderCursor, 'faire-filtered-next',
+  'A filtered empty page is not the end of provider history')
+const unboundedFaireWindowPage = await readFaireAdapter(faireOrder, {
+  page: { orders: [faireWindowRows[0], faireWindowRows[4]], has_more: false },
+})
+assert.deepEqual(
+  Array.from(unboundedFaireWindowPage.observations, (order) => order.externalOrderId),
+  ['old-recently-updated'],
+  'Full history retains old orders while respecting the sealed upper boundary',
+)
+for (const timestamp of [undefined, null, '', 'not-a-time']) {
+  await assert.rejects(
+    () => readFaireAdapter({ ...faireOrder, created_at: timestamp }, faireFixedWindow),
+    (error) => error.code === 'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+    'Missing/invalid source creation timestamps must not be filtered away',
+  )
+  await assert.rejects(
+    () => readFaireAdapter(faireOrder, {
+      ...faireFixedWindow, normalizedTimes: { providerCreatedAt: timestamp },
+    }),
+    (error) => error.code === 'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+    'Missing/invalid normalized creation timestamps must fail closed',
+  )
+}
+const polledFaireWindowPage = await readFaireAdapter(faireOrder, {
+  ...faireFixedWindow,
+  mode: 'continuous_poll',
+  page: { orders: [faireWindowRows[0], faireWindowRows[4]], has_more: false },
+})
+assert.deepEqual(
+  Array.from(polledFaireWindowPage.observations, (order) => order.externalOrderId),
+  ['old-recently-updated'],
+  'Continuous polls still use updated-at, retaining updates to old orders',
+)
+assert.equal(polledFaireWindowPage.providerRowsSeen, 2)
+for (const updatedAt of [null, 'not-a-time', '2026-08-11T23:59:59.999Z']) {
+  await assert.rejects(
+    () => readFaireAdapter(faireOrder, {
+      ...faireFixedWindow, mode: 'continuous_poll',
+      normalizedTimes: { providerUpdatedAt: updatedAt },
+    }),
+    (error) => error.code === 'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+    'Continuous polls must still reject missing/invalid or before-floor update facts',
+  )
 }
 const faireAdapterOne = await readFaireAdapter(
   faireTrackingOrder('FAIRE-TRACK-ONE', '2026-08-13T00:00:00.000Z'),

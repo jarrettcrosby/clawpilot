@@ -2134,7 +2134,24 @@ async function readFaireHistoryPage(
   const fromTime = requestedFrom ? new Date(requestedFrom).getTime() : null
   const throughTime = new Date(requestedThrough).getTime()
   const windowOrders = normalized.orders.filter((order) => {
-    if (input.mode !== 'continuous_poll') return true
+    if (input.mode !== 'continuous_poll') {
+      const createdAt = order.providerCreatedAt
+        ? new Date(order.providerCreatedAt).getTime()
+        : Number.NaN
+      if (!Number.isFinite(createdAt)) {
+        historyError(
+          'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+          'Faire returned an order without the creation-time fact required by the fixed window',
+          502,
+        )
+      }
+      // Faire only offers updated_at_min. That response can include older
+      // orders updated recently, or orders created after our sealed window.
+      // Historical admission is creation-based; retain the provider cursor
+      // and row count below even when every row on this page is out of range.
+      return (fromTime === null || createdAt >= fromTime)
+        && createdAt <= throughTime
+    }
     if (!order.providerUpdatedAt || fromTime === null) {
       historyError(
         'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
@@ -2143,7 +2160,7 @@ async function readFaireHistoryPage(
       )
     }
     const updatedAt = new Date(order.providerUpdatedAt).getTime()
-    if (updatedAt < fromTime) {
+    if (!Number.isFinite(updatedAt) || updatedAt < fromTime) {
       historyError(
         'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
         'Faire returned an order before the requested updated-at boundary',

@@ -13,6 +13,7 @@ type ShopifyWebhookReceiptHealthRow = {
   failed: string | number
   dead_letter: string | number
   held_product_deletes: string | number
+  retired_cutover: string | number
   oldest_actionable_at: TimestampValue | null
 }
 
@@ -26,6 +27,7 @@ export type ShopifyWebhookReceiptHealth = {
   failed: number
   deadLetter: number
   heldProductDeletes: number
+  retiredCutover: number
   oldestActionableAt: string | null
 }
 
@@ -91,6 +93,12 @@ WITH current_shopify_accounts AS (
     account.account_global_id,
     receipt.received_at,
     CASE
+      -- Explicit, never-attempted migration retirements remain immutable
+      -- evidence, not current provider failures or replay candidates.
+      WHEN receipt.state = 'failed'
+       AND receipt.attempts = 0
+       AND receipt.last_error_code = 'SOURCE_CUTOVER_RETIRED'
+        THEN 'retired_cutover'
       WHEN NOT account.store_sync_running THEN 'informational'
       WHEN receipt.state = 'queued'
        AND receipt.received_at <= clock_timestamp() - interval '2 minutes'
@@ -179,6 +187,9 @@ SELECT
   count(receipt.classification) FILTER (
     WHERE receipt.classification = 'held_product_delete'
   )::text AS held_product_deletes,
+  count(receipt.classification) FILTER (
+    WHERE receipt.classification = 'retired_cutover'
+  )::text AS retired_cutover,
   min(receipt.received_at) FILTER (
     WHERE receipt.classification IN (${actionableSql})
   ) AS oldest_actionable_at
@@ -211,6 +222,9 @@ SELECT
   count(receipt.classification) FILTER (
     WHERE receipt.classification = 'held_product_delete'
   )::text AS held_product_deletes,
+  count(receipt.classification) FILTER (
+    WHERE receipt.classification = 'retired_cutover'
+  )::text AS retired_cutover,
   min(receipt.received_at) FILTER (
     WHERE receipt.classification IN (${actionableSql})
   ) AS oldest_actionable_at
@@ -248,6 +262,7 @@ function accountHealth(
     failed: count(row.failed),
     deadLetter: count(row.dead_letter),
     heldProductDeletes: count(row.held_product_deletes),
+    retiredCutover: count(row.retired_cutover),
     oldestActionableAt: iso(row.oldest_actionable_at),
   }
 }
@@ -270,6 +285,7 @@ export async function readShopifyWebhookReceiptHealthFromPostgres(): Promise<
     failed: count(row.failed),
     deadLetter: count(row.dead_letter),
     heldProductDeletes: count(row.held_product_deletes),
+    retiredCutover: count(row.retired_cutover),
     oldestActionableAt: iso(row.oldest_actionable_at),
   }
 }

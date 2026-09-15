@@ -140,6 +140,20 @@ environment policy is defined above, not by superseded migration plans.
 
 ### 2026-09-14 — Release parity, retained development, and measured cost
 
+#### Later daily-backup repair
+
+After the operator approved the reliability pass, development's `DAILY`
+six-day schedule was restored alongside its existing `WEEKLY` 27-day schedule.
+No monthly schedule, PITR, production backup policy, resource limit, billing
+limit, or environment topology was changed. The current $25 spending email
+alert was independently confirmed; the $100 hard limit was left unchanged.
+A new pre-change snapshot completed at `2026-09-15T00:32:02.501Z`; the scoped
+daily/weekly freshness check passed. Development monthly coverage remains an
+explicit retention-policy gap, not a passing result for the stricter default
+backup audit. See [backup repair evidence](railway-postgres-backups.md#daily-coverage-repair--2026-09-14-edt).
+
+#### Initial release and cost audit
+
 - The operator requested completion of open development work, release parity,
   worktree cleanup, and a fresh cost assessment. This did not authorize another
   organization migration, hosted-development deletion, or public Mac hosting.
