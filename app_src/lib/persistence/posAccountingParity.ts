@@ -147,6 +147,9 @@ interface NormalizedQuickBooksBase extends PosAccountingIdentity {
 
 export interface NormalizedQuickBooksSalesReceipt extends NormalizedQuickBooksBase {
   entityType: 'SalesReceipt'
+  depositToAccountId: string | null
+  depositAmountCents: number | null
+  discountCents: number
   subtotalCents: number | null
   subtotalSource: 'explicit' | 'line_sum' | null
   totalCents: number | null
@@ -265,6 +268,8 @@ export interface PosAccountingHistoricalClearingLifecycle {
   releaseJournals: PosAccountingHistoricalEvidenceReference[]
   releaseJournal: PosAccountingHistoricalEvidenceReference | null
   salesReceipts: PosAccountingHistoricalEvidenceReference[]
+  receiptDeposits?: PosAccountingHistoricalEvidenceReference[]
+  zeroNetJournals?: PosAccountingHistoricalEvidenceReference[]
   reviewReason: string | null
 }
 
@@ -725,6 +730,7 @@ export function normalizeSalesReceiptEvidence(
   linkedProviderIds: ReadonlySet<string> = new Set<string>(),
 ): NormalizedQuickBooksSalesReceipt | null {
   const row = asRecord(input)
+  if (row.entity_type && row.entity_type !== 'SalesReceipt') return null
   const payload = transactionPayload(row, 'SalesReceipt')
   const providerTransactionId = firstText([
     row.quickbooks_transaction_id,
@@ -740,12 +746,19 @@ export function normalizeSalesReceiptEvidence(
   let unidentifiedLineCount = 0
   let unsupportedLineCount = 0
   let explicitSubtotalCents: number | null = null
+  let lineDiscountCents = 0
 
   for (const line of flattenedLines) {
     const detailType = text(line.DetailType, 100)?.replace(/[^a-z]/gi, '').toLowerCase()
     if (detailType === 'subtotallinedetail' || Object.hasOwn(line, 'SubTotalLineDetail')) {
       const subtotal = moneyToCents(line.Amount)
       if (subtotal !== null) explicitSubtotalCents = (explicitSubtotalCents || 0) + subtotal
+      continue
+    }
+    if (detailType === 'discountlinedetail' && Object.hasOwn(line, 'DiscountLineDetail')) {
+      const discount = moneyToCents(line.Amount)
+      if (discount === null || discount < 0) unsupportedLineCount += 1
+      else lineDiscountCents += discount
       continue
     }
     const detail = asRecord(line.SalesItemLineDetail)
@@ -771,6 +784,12 @@ export function normalizeSalesReceiptEvidence(
   }
 
   const taxDetail = asRecord(payload.TxnTaxDetail)
+  const explicitDiscount = moneyToCents(payload.DiscountAmt)
+  if (explicitDiscount !== null && (explicitDiscount < 0
+    || (lineDiscountCents > 0 && explicitDiscount !== lineDiscountCents))) {
+    unsupportedLineCount += 1
+  }
+  const discountCents = lineDiscountCents || Math.max(0, explicitDiscount || 0)
   const lineGroups = sortReceiptGroups(groups.values())
   const subtotalCents = explicitSubtotalCents ?? (
     lineGroups.length > 0 && unidentifiedLineCount === 0 && unsupportedLineCount === 0
@@ -806,6 +825,9 @@ export function normalizeSalesReceiptEvidence(
       row.currencyCode,
     ], 20),
     syncedAt: timestamp(row.synced_at ?? row.syncedAt),
+    depositToAccountId: firstText([asRecord(payload.DepositToAccountRef).value], 200),
+    depositAmountCents: salesReceiptDepositAmount(payload, flattenedLines, row.currency_code ?? row.currencyCode),
+    discountCents,
     subtotalCents,
     subtotalSource: explicitSubtotalCents !== null
       ? 'explicit'
@@ -817,6 +839,61 @@ export function normalizeSalesReceiptEvidence(
     unidentifiedLineCount,
     unsupportedLineCount,
   }
+}
+
+// Intuit defines DepositToAccountRef as the asset account receiving the payment.
+// Require explicit provider evidence; never infer its default account or use a
+// display name, subtotal, or cached header fallback as the deposit amount.
+// https://static.developer.intuit.com/sdkdocs/qbv3doc/ippphpdevkitv3/entities/files/IPPSalesReceipt.html
+function salesReceiptDepositAmount(
+  payload: UnknownRecord,
+  lines: UnknownRecord[],
+  cachedCurrency: unknown,
+): number | null {
+  const exactCents = (value: unknown): number | null => {
+    const source = String(value ?? '').trim()
+    if (!/^\d+(?:\.\d{1,2}0*)?$/.test(source)) return null
+    const cents = moneyToCents(source)
+    return cents !== null && Number.isSafeInteger(cents) ? cents : null
+  }
+  const accountId = text(asRecord(payload.DepositToAccountRef).value, 200)
+  const currency = text(asRecord(payload.CurrencyRef).value, 20)?.toUpperCase()
+  const cachedCode = text(cachedCurrency, 20)?.toUpperCase()
+  const total = exactCents(payload.TotalAmt)
+  const tax = exactCents(asRecord(payload.TxnTaxDetail).TotalTax)
+  const state = text(payload.TxnStatus ?? payload.status ?? payload.Status, 80)?.toLowerCase()
+  if (!accountId || !currency || !/^[A-Z]{3}$/.test(currency)
+    || (cachedCode && cachedCode !== currency) || total === null || total <= 0 || tax === null
+    || (state && !['paid', 'closed', 'completed'].includes(state))
+    || payload.Void === true || payload.Deleted === true || payload.Refund === true
+    || payload.GlobalTaxCalculation === 'TaxInclusive'
+    || Object.hasOwn(payload, 'CashBack') || Object.hasOwn(payload, 'CashBackInfo')) return null
+  let itemTotal = 0
+  let discounts = 0
+  let itemCount = 0
+  const subtotals: number[] = []
+  for (const line of lines) {
+    const amount = exactCents(line.Amount)
+    if (amount === null) return null
+    if (line.DetailType === 'SalesItemLineDetail') {
+      const detail = asRecord(line.SalesItemLineDetail)
+      if (!text(asRecord(detail.ItemRef).value, 200)
+        || (detail.Qty !== undefined && (!Number.isFinite(Number(detail.Qty)) || Number(detail.Qty) < 0))) return null
+      itemCount += 1
+      itemTotal += amount
+    } else if (line.DetailType === 'DiscountLineDetail' && Object.hasOwn(line, 'DiscountLineDetail')) {
+      discounts += amount
+    } else if (line.DetailType === 'SubTotalLineDetail') subtotals.push(amount)
+    else if (amount !== 0) return null
+  }
+  const headerDiscount = payload.DiscountAmt === undefined ? null : exactCents(payload.DiscountAmt)
+  if ((payload.DiscountAmt !== undefined && headerDiscount === null)
+    || (headerDiscount !== null && discounts > 0 && discounts !== headerDiscount)) return null
+  discounts = discounts || headerDiscount || 0
+  if (itemCount === 0 || discounts > itemTotal || subtotals.some((amount) => amount !== itemTotal)
+    || !Number.isSafeInteger(itemTotal) || !Number.isSafeInteger(discounts)
+    || itemTotal - discounts + tax !== total) return null
+  return total
 }
 
 export function normalizeJournalEntryEvidence(
@@ -1523,7 +1600,7 @@ export function compareSalesReceiptInternalArithmetic(
       deltaCents: null,
     }
   }
-  const deltaCents = totalCents - subtotalCents - taxCents
+  const deltaCents = totalCents - subtotalCents + (receipt.discountCents || 0) - taxCents
   return {
     status: deltaCents === 0 ? 'match' : 'variance',
     subtotalCents,
@@ -1570,7 +1647,7 @@ function statusCounts(statuses: Array<'match' | 'variance' | 'insufficient_evide
 }
 
 const DEFAULT_PAYMENT_EXCEPTION_SETTLEMENT_GRACE_DAYS = 3
-const MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS = 1000
+const MAX_PAYMENT_EXCEPTION_OPENING_EVIDENCE = 1000
 const ACCOUNT_LEVEL_CLEARING_SCOPE = 'organization-account-level'
 
 function normalizedPaymentExceptionAccounts(
@@ -1655,6 +1732,7 @@ function clearingStatusSummary(lifecycles: readonly PosAccountingHistoricalClear
 
 function buildPaymentExceptionClearingLifecycles(input: {
   journals: readonly NormalizedQuickBooksJournalEntry[]
+  receipts?: readonly NormalizedQuickBooksSalesReceipt[]
   pairs: PosAccountingHistoricalBaseline['pairs']
   postingBundles: PosAccountingHistoricalBaseline['postingBundles']
   options: PosAccountingHistoricalBaselineOptions
@@ -1665,7 +1743,7 @@ function buildPaymentExceptionClearingLifecycles(input: {
 } {
   const configuredAccounts = normalizedPaymentExceptionAccounts(input.options)
   const coverageRanges = mergeCoverageRanges(input.options.evidenceCoverageRanges)
-  const evidenceDates = input.journals.map((journal) => journal.businessDate)
+  const evidenceDates = [...input.journals, ...(input.receipts || [])].map((item) => item.businessDate)
   const coverageDates = coverageRanges.flatMap((range) => [range.toBusinessDate])
   const requestedAsOf = businessDate(input.options.asOfBusinessDate)
   const asOfBusinessDate = requestedAsOf || [...coverageDates, ...evidenceDates]
@@ -1690,17 +1768,41 @@ function buildPaymentExceptionClearingLifecycles(input: {
       receiptReferencesByJournalId.set(journal.evidenceId, bundle.salesReceipts)
     }
   }
+  // Opening context is not included in the visible posting-pair list. Retain
+  // exact-date/document references there as context only, never as cash proof.
+  for (const journal of input.journals) {
+    if (!selectedRangeStart || journal.businessDate >= selectedRangeStart
+      || !journal.documentNumber || receiptReferencesByJournalId.has(journal.evidenceId)) continue
+    const related = (input.receipts || []).filter((receipt) => (
+      receipt.businessDate === journal.businessDate
+      && receipt.documentNumber === journal.documentNumber
+      && receipt.currencyCode === journal.currencyCode
+      && receipt.depositAmountCents !== null && receipt.depositToAccountId !== null
+      && configuredAccounts.has(receipt.depositToAccountId)
+    ))
+    if (related.length) receiptReferencesByJournalId.set(
+      journal.evidenceId, related.map(historicalEvidenceReference),
+    )
+  }
 
   type ClearingLeg = {
     legId: string
-    journal: NormalizedQuickBooksJournalEntry
+    document: NormalizedQuickBooksPosAccountingEvidence
     line: PosAccountingJournalLineGroup
     accountMatchBasis: 'configured_account_id' | 'legacy_account_name'
   }
   const captures: ClearingLeg[] = []
   const releases: ClearingLeg[] = []
   const conflictedLegs: ClearingLeg[] = []
+  const zeroNetLegs: ClearingLeg[] = []
   const journalOnlyCaptureIds = new Set<string>()
+  const eligibleReceiptDeposit = (receipt: NormalizedQuickBooksSalesReceipt) => (
+    Boolean(receipt.postingOrigin && receipt.depositToAccountId
+      && configuredAccounts.has(receipt.depositToAccountId))
+    && receipt.depositAmountCents !== null && receipt.depositAmountCents !== undefined
+    && Number.isSafeInteger(receipt.depositAmountCents) && receipt.depositAmountCents > 0
+    && /^[A-Z]{3}$/.test(receipt.currencyCode?.toUpperCase() || '')
+  )
 
   for (const journal of input.journals) {
     if (journal.postingOrigin === null) continue
@@ -1716,14 +1818,28 @@ function buildPaymentExceptionClearingLifecycles(input: {
       const accountLines = matchingLines.filter((entry) => entry.line.accountId === accountId)
       const hasDebit = accountLines.some((entry) => entry.line.side === 'debit')
       const hasCredit = accountLines.some((entry) => entry.line.side === 'credit')
+      const netCents = accountLines.reduce((total, entry) => total
+        + (entry.line.side === 'debit' ? entry.line.amountCents : -entry.line.amountCents), 0)
+      // The complete journal has no movement on this account. Preserve it as
+      // context without inventing a release from just one of its two sides.
+      const provenZeroNet = hasDebit && hasCredit && netCents === 0
+        && compareJournalEntryBalance(journal).status === 'match'
+        && journal.unidentifiedLineCount === 0 && journal.unsupportedLineCount === 0
+        && (input.receipts || []).some((receipt) => eligibleReceiptDeposit(receipt)
+          && receipt.depositToAccountId === accountId
+          && receipt.currencyCode === journal.currencyCode
+          && (receiptReferencesByJournalId.get(journal.evidenceId) || []).some((reference) => (
+            reference.evidenceId === receipt.evidenceId
+          )))
       for (const entry of accountLines) {
         const leg: ClearingLeg = {
           legId: `${journal.evidenceId}:payment-exceptions:${entry.line.side}:${accountId}`,
-          journal,
+          document: journal,
           line: entry.line,
           accountMatchBasis: entry.accountMatchBasis,
         }
-        if (hasDebit && hasCredit) conflictedLegs.push(leg)
+        if (provenZeroNet) zeroNetLegs.push(leg)
+        else if (hasDebit && hasCredit) conflictedLegs.push(leg)
         else if (entry.line.side === 'credit') {
           captures.push(leg)
           journalOnlyCaptureIds.add(journal.evidenceId)
@@ -1732,11 +1848,31 @@ function buildPaymentExceptionClearingLifecycles(input: {
     }
   }
 
+  const receiptIds = new Set<string>()
+  for (const receipt of input.receipts || []) {
+    if (receiptIds.has(receipt.evidenceId)) throw new Error('Duplicate SalesReceipt clearing evidence')
+    receiptIds.add(receipt.evidenceId)
+    // An exact active account mapping is required for receipt cash movements.
+    // Legacy account-name discovery is insufficient authority for a deposit.
+    if (!eligibleReceiptDeposit(receipt)) continue
+    const accountId = receipt.depositToAccountId!
+    releases.push({
+      legId: `${receipt.evidenceId}:clearing-deposit:${receipt.depositToAccountId}`,
+      document: receipt,
+      line: {
+        side: 'debit', accountId,
+        accountName: configuredAccounts.get(accountId) || receipt.accountName,
+        amountCents: receipt.depositAmountCents!,
+      },
+      accountMatchBasis: 'configured_account_id',
+    })
+  }
+
   const scopeFor = (leg: ClearingLeg) => ({
     organizationId,
     quickBooksCompanyId,
     locationId: ACCOUNT_LEVEL_CLEARING_SCOPE,
-    currencyCode: (leg.journal.currencyCode || 'UNSPECIFIED').toUpperCase(),
+    currencyCode: (leg.document.currencyCode || 'UNSPECIFIED').toUpperCase(),
     clearingAccountId: leg.line.accountId,
   })
   const reconciliation = reconcilePosClearing({
@@ -1745,28 +1881,32 @@ function buildPaymentExceptionClearingLifecycles(input: {
     captures: captures.map((capture) => ({
       captureId: capture.legId,
       scope: scopeFor(capture),
-      businessDate: capture.journal.businessDate,
+      businessDate: capture.document.businessDate,
       amountCents: capture.line.amountCents,
       evidence: [{
         evidenceId: capture.legId,
         entityType: 'JournalEntry',
-        providerTransactionId: capture.journal.providerTransactionId || undefined,
-        documentNumber: capture.journal.documentNumber || undefined,
+        providerTransactionId: capture.document.providerTransactionId || undefined,
+        documentNumber: capture.document.documentNumber || undefined,
         lineId: `${capture.line.side}:${capture.line.accountId}`,
       }],
     })),
     releases: releases.map((release) => ({
       releaseId: release.legId,
       scope: scopeFor(release),
-      businessDate: release.journal.businessDate,
+      businessDate: release.document.businessDate,
       amountCents: release.line.amountCents,
+      ...(release.document.entityType === 'SalesReceipt' ? {
+        source: 'sales_receipt_deposit' as const,
+        depositAccountId: release.line.accountId,
+      } : {}),
       evidence: [{
         evidenceId: release.legId,
-        entityType: 'JournalEntry',
-        providerTransactionId: release.journal.providerTransactionId || undefined,
-        documentNumber: release.journal.documentNumber || undefined,
+        entityType: release.document.entityType,
+        providerTransactionId: release.document.providerTransactionId || undefined,
+        documentNumber: release.document.documentNumber || undefined,
         lineId: `${release.line.side}:${release.line.accountId}`,
-      }, ...(receiptReferencesByJournalId.get(release.journal.evidenceId) || []).map((receipt) => ({
+      }, ...(receiptReferencesByJournalId.get(release.document.evidenceId) || []).map((receipt) => ({
         evidenceId: `${release.legId}:${receipt.evidenceId}`,
         entityType: 'SalesReceipt' as const,
         providerTransactionId: receipt.providerTransactionId || undefined,
@@ -1841,18 +1981,18 @@ function buildPaymentExceptionClearingLifecycles(input: {
       .filter((release): release is NonNullable<typeof release> => Boolean(release))
     const captureLegs = componentCaptureIds.map((captureId) => captureById.get(captureId))
       .filter((capture): capture is ClearingLeg => Boolean(capture))
-      .sort((left, right) => left.journal.businessDate.localeCompare(right.journal.businessDate)
+      .sort((left, right) => left.document.businessDate.localeCompare(right.document.businessDate)
         || left.legId.localeCompare(right.legId))
     const releaseLegs = componentReleaseIds.map((releaseId) => releaseById.get(releaseId))
       .filter((release): release is ClearingLeg => Boolean(release))
-      .sort((left, right) => left.journal.businessDate.localeCompare(right.journal.businessDate)
+      .sort((left, right) => left.document.businessDate.localeCompare(right.document.businessDate)
         || left.legId.localeCompare(right.legId))
     const representativeLeg = releaseLegs[0] || captureLegs[0]
     const representativeResult = releaseResults[0] || captureResults[0]
     if (!representativeLeg || !representativeResult) continue
 
     const forwardCoverageComplete = captureLegs.length > 0 && captureLegs.every((capture) => (
-      evidenceRangeIsComplete(capture.journal.businessDate, asOfBusinessDate, coverageRanges)
+      evidenceRangeIsComplete(capture.document.businessDate, asOfBusinessDate, coverageRanges)
     ))
     // A bounded date-filtered cache cannot prove that an older, uncached credit does not
     // exist. Preserve the observed offset status, but keep its evidence provisional until
@@ -1874,20 +2014,31 @@ function buildPaymentExceptionClearingLifecycles(input: {
       0,
     )
     const captureBusinessDates = [...new Set(
-      captureLegs.map((capture) => capture.journal.businessDate),
+      captureLegs.map((capture) => capture.document.businessDate),
     )].sort()
     const releaseBusinessDates = [...new Set(
-      releaseLegs.map((release) => release.journal.businessDate),
+      releaseLegs.map((release) => release.document.businessDate),
     )].sort()
     const captureJournals = uniqueEvidenceReferences(
-      captureLegs.map((capture) => historicalEvidenceReference(capture.journal)),
+      captureLegs.map((capture) => historicalEvidenceReference(capture.document)),
     )
     const releaseJournals = uniqueEvidenceReferences(
-      releaseLegs.map((release) => historicalEvidenceReference(release.journal)),
+      releaseLegs.filter((release) => release.document.entityType === 'JournalEntry')
+        .map((release) => historicalEvidenceReference(release.document)),
     )
-    const salesReceipts = uniqueEvidenceReferences(releaseLegs.flatMap((release) => (
-      receiptReferencesByJournalId.get(release.journal.evidenceId) || []
-    )))
+    const receiptDeposits = uniqueEvidenceReferences(releaseLegs
+      .filter((release) => release.document.entityType === 'SalesReceipt')
+      .map((release) => historicalEvidenceReference(release.document)))
+    const salesReceipts = uniqueEvidenceReferences([...receiptDeposits, ...releaseLegs.flatMap((release) => (
+      receiptReferencesByJournalId.get(release.document.evidenceId) || []
+    ))])
+    const zeroNetJournals = uniqueEvidenceReferences(zeroNetLegs.filter((leg) => (
+      leg.line.accountId === representativeLeg.line.accountId
+      && leg.document.currencyCode === representativeLeg.document.currencyCode
+      && (receiptReferencesByJournalId.get(leg.document.evidenceId) || []).some((receipt) => (
+        receiptDeposits.some((deposit) => deposit.evidenceId === receipt.evidenceId)
+      ))
+    )).map((leg) => historicalEvidenceReference(leg.document)))
 
     let status: PosAccountingClearingLifecycleStatus
     let reviewReason: string | null = null
@@ -1958,17 +2109,19 @@ function buildPaymentExceptionClearingLifecycles(input: {
       releaseJournals,
       releaseJournal: releaseJournals.at(-1) || null,
       salesReceipts,
+      receiptDeposits,
+      zeroNetJournals,
       reviewReason,
     })
   }
 
   const conflictedLegGroups = new Map<string, ClearingLeg[]>()
   for (const leg of conflictedLegs) {
-    const key = `${leg.journal.evidenceId}\u0000${leg.line.accountId}`
+    const key = `${leg.document.evidenceId}\u0000${leg.line.accountId}`
     conflictedLegGroups.set(key, [...(conflictedLegGroups.get(key) || []), leg])
   }
   for (const legs of conflictedLegGroups.values()) {
-    const journal = legs[0]?.journal
+    const journal = legs[0]?.document
     if (!journal) continue
     const capturedCents = legs.filter((leg) => leg.line.side === 'credit')
       .reduce((total, leg) => total + leg.line.amountCents, 0)
@@ -2007,7 +2160,9 @@ function buildPaymentExceptionClearingLifecycles(input: {
   const recognizedReleaseJournalIds = new Set(
     reconciliation.releases
       .filter((release) => release.allocatedCents > 0)
-      .map((release) => releaseById.get(release.releaseId)?.journal.evidenceId)
+      .map((release) => releaseById.get(release.releaseId)?.document)
+      .filter((document) => document?.entityType === 'JournalEntry')
+      .map((document) => document?.evidenceId)
       .filter((journalId): journalId is string => Boolean(journalId)),
   )
 
@@ -2046,6 +2201,7 @@ export function buildHistoricalPosAccountingBaseline(
   evidence: readonly NormalizedQuickBooksPosAccountingEvidence[],
   options: PosAccountingHistoricalBaselineOptions = {},
   openingBalanceJournals: readonly NormalizedQuickBooksJournalEntry[] = [],
+  openingBalanceReceipts: readonly NormalizedQuickBooksSalesReceipt[] = [],
 ): PosAccountingHistoricalBaseline {
   const receipts = evidence
     .filter((item): item is NormalizedQuickBooksSalesReceipt => item.entityType === 'SalesReceipt')
@@ -2059,6 +2215,7 @@ export function buildHistoricalPosAccountingBaseline(
     [...openingBalanceJournals, ...journals].map((journal) => [journal.evidenceId, journal]),
   ).values()].sort((left, right) => left.businessDate.localeCompare(right.businessDate)
     || left.evidenceId.localeCompare(right.evidenceId))
+  const clearingReceipts = [...openingBalanceReceipts, ...receipts]
   const receiptById = new Map(receipts.map((item) => [item.evidenceId, item]))
   const journalById = new Map(journals.map((item) => [item.evidenceId, item]))
   const remainingReceipts = new Set(receiptById.keys())
@@ -2134,6 +2291,7 @@ export function buildHistoricalPosAccountingBaseline(
 
   const preliminaryClearing = buildPaymentExceptionClearingLifecycles({
     journals: clearingJournals,
+    receipts: clearingReceipts,
     pairs,
     postingBundles,
     options,
@@ -2202,6 +2360,7 @@ export function buildHistoricalPosAccountingBaseline(
 
   const clearing = buildPaymentExceptionClearingLifecycles({
     journals: clearingJournals,
+    receipts: clearingReceipts,
     pairs,
     postingBundles,
     options,
@@ -2213,7 +2372,8 @@ export function buildHistoricalPosAccountingBaseline(
       ...lifecycle.captureBusinessDates,
       ...lifecycle.releaseBusinessDates,
     ].some((date) => date >= fromBusinessDate)
-    const isUnresolvedOpeningBalance = lifecycle.status !== 'settled'
+    const isUnresolvedOpeningBalance = (options.openingBalanceQueryTruncated === true
+      || lifecycle.outstandingCents > 0 || lifecycle.unappliedReleaseCents > 0)
       && [
         ...lifecycle.captureBusinessDates,
         ...lifecycle.releaseBusinessDates,
@@ -2375,17 +2535,22 @@ export function buildPosAccountingParityReport(input: {
   const clearingOpeningBalanceCandidates = (input.clearingOpeningBalanceTransactions || [])
     .filter((transaction) => classifyPosAccountingQuickBooksTransaction(transaction, linkedProviderIds) !== null)
     .map((transaction) => normalizeQuickBooksPosAccountingEvidence(transaction, linkedProviderIds))
-    .filter((item): item is NormalizedQuickBooksJournalEntry => (
-      item?.entityType === 'JournalEntry'
-      && (!fromBusinessDate || item.businessDate < fromBusinessDate)
-      && item.lineGroups.some((line) => (
-        paymentExceptionLineBasis(line, configuredPaymentExceptionAccounts) !== null
-      ))
-    ))
-  const clearingOpeningBalanceJournals = selectOpeningBalanceJournals(
-    clearingOpeningBalanceCandidates,
-    input.historicalBaselineOptions || {},
+    .filter((item): item is NormalizedQuickBooksPosAccountingEvidence => Boolean(item
+      && (!fromBusinessDate || item.businessDate < fromBusinessDate)))
+  const clearingOpeningBalanceReceipts = clearingOpeningBalanceCandidates.filter(
+    (item): item is NormalizedQuickBooksSalesReceipt => item.entityType === 'SalesReceipt'
+      && item.depositToAccountId !== null && configuredPaymentExceptionAccounts.has(item.depositToAccountId)
+      && item.depositAmountCents !== null,
   )
+  const openingJournalCandidates = clearingOpeningBalanceCandidates.filter(
+    (item): item is NormalizedQuickBooksJournalEntry => item.entityType === 'JournalEntry'
+      && item.lineGroups.some((line) => paymentExceptionLineBasis(line, configuredPaymentExceptionAccounts) !== null),
+  )
+  // Keep both sides of bounded opening account evidence together. Pruning old
+  // journals without considering their receipt deposits creates false balances.
+  const clearingOpeningBalanceJournals = clearingOpeningBalanceReceipts.length
+    ? openingJournalCandidates
+    : selectOpeningBalanceJournals(openingJournalCandidates, input.historicalBaselineOptions || {})
   const expected = drafts.flatMap((draft) => draft.documents)
   const matched = matchPosAccountingParityDocuments({ expected, actual: transactions })
   const rows = matched.matches.map((match) => {
@@ -2441,6 +2606,7 @@ export function buildPosAccountingParityReport(input: {
       fullHistoryTransactions,
       input.historicalBaselineOptions,
       clearingOpeningBalanceJournals,
+      clearingOpeningBalanceReceipts,
     ),
     rows,
     unmatchedQuickBooks: matched.unmatchedQuickBooks,
@@ -2780,11 +2946,11 @@ export async function readPosAccountingParityReportInPostgres(
          ${POS_ACCOUNTING_ORIGIN_SQL} AS pos_accounting_origin
        FROM quickbooks_transactions transaction
        WHERE transaction.organization_id = $1::uuid
-         AND transaction.entity_type = 'JournalEntry'
+         AND transaction.entity_type IN ('JournalEntry', 'SalesReceipt')
          AND transaction.transaction_date IS NOT NULL
          AND transaction.transaction_date < $2::date
          AND ${POS_ACCOUNTING_TRANSACTION_SQL}
-         AND EXISTS (
+         AND ((transaction.entity_type = 'JournalEntry' AND EXISTS (
            SELECT 1
            FROM jsonb_path_query(
              COALESCE(transaction.source_payload, '{}'::jsonb),
@@ -2802,14 +2968,23 @@ export async function readPosAccountingParityReportInPostgres(
                ''
              )) ~ '(^|[^a-z0-9])payment exceptions?([^a-z0-9]|$)'
            END
-         )
-       ORDER BY transaction.transaction_date DESC, transaction.quickbooks_transaction_id
+         )) OR (
+           transaction.entity_type = 'SalesReceipt'
+           AND cardinality($3::text[]) > 0
+           AND COALESCE(
+             transaction.source_payload #>> '{SalesReceipt,DepositToAccountRef,value}',
+             transaction.source_payload #>> '{QueryResponse,SalesReceipt,0,DepositToAccountRef,value}',
+             transaction.source_payload #>> '{DepositToAccountRef,value}'
+           ) = ANY($3::text[])
+         ))
+       ORDER BY transaction.transaction_date DESC, transaction.entity_type,
+         transaction.quickbooks_transaction_id
        LIMIT $4::integer`,
       [
         organizationId,
         fromBusinessDate,
         paymentExceptionAccountsResult.rows.map((account) => account.account_id),
-        MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS + 1,
+        MAX_PAYMENT_EXCEPTION_OPENING_EVIDENCE + 1,
       ],
     )
     const configuredAccounts = normalizedPaymentExceptionAccounts({
@@ -2819,15 +2994,19 @@ export async function readPosAccountingParityReportInPostgres(
       })),
     })
     openingBalanceQueryTruncated = (
-      openingBalanceResult.rows.length > MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS
+      openingBalanceResult.rows.length > MAX_PAYMENT_EXCEPTION_OPENING_EVIDENCE
     )
     clearingOpeningBalanceTransactions = openingBalanceResult.rows
-      .slice(0, MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS)
+      .slice(0, MAX_PAYMENT_EXCEPTION_OPENING_EVIDENCE)
       .filter((row) => {
-      const journal = normalizeJournalEntryEvidence(row)
-      return journal?.lineGroups.some((line) => (
-        paymentExceptionLineBasis(line, configuredAccounts) !== null
-      )) === true
+        const document = normalizeQuickBooksPosAccountingEvidence(row)
+        if (document?.entityType === 'SalesReceipt') {
+          return document.depositAmountCents !== null && document.depositToAccountId !== null
+            && configuredAccounts.has(document.depositToAccountId)
+        }
+        return document?.lineGroups.some((line) => (
+          paymentExceptionLineBasis(line, configuredAccounts) !== null
+        )) === true
       })
   }
 
@@ -3049,7 +3228,7 @@ export async function readPosAccountingParityReportInPostgres(
   }
   if (openingBalanceQueryTruncated) {
     warnings.push(
-      `Opening-balance reconciliation is limited to the ${MAX_PAYMENT_EXCEPTION_OPENING_JOURNALS} most recent cached earlier Payment Exceptions journals; every retained clearing cycle is marked ambiguous and unresolved opening balances may exist beyond the cap.`,
+      `Opening-balance reconciliation is limited to the ${MAX_PAYMENT_EXCEPTION_OPENING_EVIDENCE} most recent cached earlier Payment Exceptions journals and explicit receipt deposits; every retained clearing cycle is marked ambiguous and unresolved opening balances may exist beyond the cap.`,
     )
   }
   if (fromBusinessDate) {

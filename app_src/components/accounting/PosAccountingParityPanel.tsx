@@ -99,6 +99,8 @@ type EvidenceBase = EvidenceReference & {
 
 type SalesReceiptEvidence = EvidenceBase & {
   entityType: 'SalesReceipt'
+  discountCents?: number
+  depositToAccountId?: string | null
   subtotalCents: number | null
   subtotalSource: 'explicit' | 'line_sum' | null
   totalCents: number | null
@@ -279,6 +281,8 @@ type HistoricalClearingLifecycle = {
   releaseJournals?: EvidenceReference[]
   releaseJournal: EvidenceReference | null
   salesReceipts: EvidenceReference[]
+  receiptDeposits?: EvidenceReference[]
+  zeroNetJournals?: EvidenceReference[]
   reviewReason: string | null
 }
 
@@ -541,14 +545,20 @@ function clearingStatusLabel(lifecycle: HistoricalClearingLifecycle) {
 }
 
 function clearingStatusMessage(lifecycle: HistoricalClearingLifecycle) {
+  const offsetEvidence = lifecycle.receiptDeposits?.length
+    ? 'an explicit Sales Receipt deposit to the same mapped clearing account'
+    : 'an offsetting Payment Exceptions debit'
+  const receiptCaveat = lifecycle.receiptDeposits?.length
+    ? ' Zero-net journals are context only and are not counted again.'
+    : ' Any Sales Receipt below is fulfillment context, not clearing proof.'
   if (lifecycle.status === 'overdue_unresolved' && lifecycle.evidenceCoverage === 'cached_only') {
     return 'A later offsetting debit has not been observed in cached QuickBooks evidence. Sync the relevant later dates before treating this balance as missing or overdue.'
   }
   if (lifecycle.status === 'settled') {
     if (lifecycle.evidenceCoverage === 'cached_only') {
-      return 'Cached QuickBooks evidence shows an offsetting Payment Exceptions debit. Verify full provider history or a known zero-balance boundary before treating the clearing cycle as conclusively settled. Any Sales Receipt below is fulfillment context, not clearing proof.'
+      return `Cached QuickBooks evidence shows ${offsetEvidence}. Verify full provider history or a known zero-balance boundary before treating the clearing cycle as conclusively settled.${receiptCaveat}`
     }
-    return 'QuickBooks evidence shows the Payment Exceptions credit fully offset by a later debit. Any Sales Receipt below is fulfillment context, not clearing proof.'
+    return `QuickBooks evidence shows the Payment Exceptions credit fully offset by a later debit, including ${offsetEvidence}.${receiptCaveat}`
   }
   if (lifecycle.status === 'partially_settled') {
     return 'QuickBooks evidence offsets part, but not all, of the Payment Exceptions credit. Review the remaining account balance.'
@@ -1122,6 +1132,7 @@ function QuickBooksEvidenceDetails({ evidence, integrity, contextStatus, formatC
         <>
           <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))' }} gap={2} py={2}>
             <DetailMetric label="Subtotal" value={formatCents(evidence.subtotalCents)} />
+            {evidence.discountCents ? <DetailMetric label="Discount" value={formatCents(evidence.discountCents)} /> : null}
             <DetailMetric label="Tax" value={formatCents(evidence.taxCents)} />
             <DetailMetric label="Total" value={formatCents(evidence.totalCents)} />
           </Box>
@@ -1954,6 +1965,11 @@ export default function PosAccountingParityPanel() {
                   : lifecycle.releaseJournal
                     ? [lifecycle.releaseJournal]
                     : []
+                const receiptDeposits = lifecycle.receiptDeposits || []
+                const contextReceipts = lifecycle.salesReceipts.filter((receipt) => (
+                  !receiptDeposits.some((deposit) => deposit.evidenceId === receipt.evidenceId)
+                ))
+                const zeroNetJournals = lifecycle.zeroNetJournals || []
                 return (
                   <Box
                     component="article"
@@ -2029,24 +2045,30 @@ export default function PosAccountingParityPanel() {
                       </Box>
                       <Box minWidth={0}>
                         <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
-                          Payment Exceptions debit journal evidence
+                          Clearing account debit evidence
                         </Typography>
-                        {releaseJournals.length ? (
+                        {releaseJournals.length || receiptDeposits.length ? (
                           <Stack spacing={0.5}>
                             {releaseJournals.map((evidence) => (
                               <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Payment Exceptions debit" showStatus={false} onOpen={openHistoricalEvidence} />
+                            ))}
+                            {receiptDeposits.map((evidence) => (
+                              <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Explicit Sales Receipt deposit to clearing account" showStatus={false} onOpen={openHistoricalEvidence} />
                             ))}
                           </Stack>
                         ) : <Typography variant="body2" color="text.disabled">Not observed</Typography>}
                       </Box>
                       <Box minWidth={0}>
                         <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
-                          Sales Receipt evidence · fulfillment context
+                          Related evidence · not additional account movement
                         </Typography>
-                        {lifecycle.salesReceipts.length ? (
+                        {contextReceipts.length || zeroNetJournals.length ? (
                           <Stack spacing={0.5}>
-                            {lifecycle.salesReceipts.map((evidence) => (
+                            {contextReceipts.map((evidence) => (
                               <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Fulfillment revenue evidence" showStatus={false} onOpen={openHistoricalEvidence} />
+                            ))}
+                            {zeroNetJournals.map((evidence) => (
+                              <EvidenceButton key={evidence.evidenceId} evidence={evidence} status={evidenceStatus} contextLabel="Same-account journal · net zero" showStatus={false} onOpen={openHistoricalEvidence} />
                             ))}
                           </Stack>
                         ) : <Typography variant="body2" color="text.disabled">Not observed</Typography>}

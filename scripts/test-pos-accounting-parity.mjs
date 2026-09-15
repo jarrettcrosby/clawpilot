@@ -942,6 +942,196 @@ assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].appliedCents, 13
 assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].outstandingCents, 0)
 assert.equal(julyCrossDayClearingBaseline.clearingLifecycles[0].salesReceipts.length, 1)
 
+// Actual provider shape: the July 25 journal both credits and debits the same
+// clearing account. The receipt's explicit deposit, not that zero-net journal,
+// offsets the July 23 and 24 captures. No provider-history attestation is added.
+const receiptDepositAccount = '1150040001'
+const realShapeOptions = {
+  organizationId: ORGANIZATION_ID,
+  quickBooksCompanyId: 'qbo-company-test',
+  paymentExceptionAccounts: [{ accountId: receiptDepositAccount, accountName: 'Clearing Account' }],
+  asOfBusinessDate: '2026-07-25',
+  evidenceCoverageRanges: [{ fromBusinessDate: '2026-07-23', toBusinessDate: '2026-07-25' }],
+}
+const realShapeJournalTransactions = [
+  ...[['1537', '2026-07-23', '260723POS', '44.54'], ['1538', '2026-07-24', '260724POS', '95.26']]
+    .map(([id, date, documentNumber, amount]) =>
+      paymentExceptionsJournalTransaction({ id, date, documentNumber, amount, side: 'credit',
+        accountId: receiptDepositAccount, accountName: 'Clearing Account' }),
+    ),
+  journalTransaction({
+    id: '1539', date: '2026-07-25', documentNumber: '260725POS',
+    lines: ['Credit', 'Debit'].map((side, index) => ({
+      Id: String(index), Amount: '139.80', DetailType: 'JournalEntryLineDetail',
+      Description: side === 'Credit' ? 'POS Clearing' : 'Payment Exceptions',
+      JournalEntryLineDetail: { PostingType: side, AccountRef: { value: receiptDepositAccount, name: 'Clearing Account' } },
+    })),
+  }),
+]
+const realShapeJournals = realShapeJournalTransactions.map(row => pure.normalizeJournalEntryEvidence(row))
+function depositReceiptRaw() {
+  const row = receiptTransaction({ id: '1547', date: '2026-07-25', documentNumber: '260725POS',
+    total: '139.80', tax: '9.55', lines: singleItemReceiptLines('130.25') })
+  row.source_payload.DepositToAccountRef = { value: receiptDepositAccount, name: 'Clearing Account' }
+  return row
+}
+const realShapeReceipt = pure.normalizeSalesReceiptEvidence(depositReceiptRaw())
+assert.equal(realShapeReceipt.depositToAccountId, receiptDepositAccount)
+assert.equal(realShapeReceipt.depositAmountCents, 13980)
+const realShapeBaseline = pure.buildHistoricalPosAccountingBaseline(
+  [...realShapeJournals, realShapeReceipt], realShapeOptions,
+)
+assert.equal(realShapeBaseline.clearingLifecycles.length, 1)
+const realShapeCycle = realShapeBaseline.clearingLifecycles[0]
+assert.equal(realShapeCycle.capturedCents, 13980)
+assert.equal(realShapeCycle.releasedCents, 13980)
+assert.equal(realShapeCycle.appliedCents, 13980)
+assert.equal(realShapeCycle.outstandingCents, 0)
+assert.equal(realShapeCycle.status, 'settled')
+assert.equal(realShapeCycle.evidenceCoverage, 'cached_only')
+assert.deepEqual([...realShapeCycle.receiptDeposits].map(r => r.providerTransactionId), ['1547'])
+assert.deepEqual([...realShapeCycle.zeroNetJournals].map(r => r.providerTransactionId), ['1539'])
+assert.equal(realShapeCycle.releaseJournals.length, 0)
+assert.equal(realShapeBaseline.summary.unmatchedEvidence, 0)
+const selectedRealShape = pure.buildHistoricalPosAccountingBaseline(
+  [...realShapeJournals, realShapeReceipt], { ...realShapeOptions, fromBusinessDate: '2026-07-23' },
+).clearingLifecycles[0]
+assert.equal(selectedRealShape.status, 'ambiguous')
+assert.equal(selectedRealShape.appliedCents, 13980)
+assert.match(selectedRealShape.reviewReason, /history before the selected range/)
+
+// Opening evidence must include earlier explicit receipt deposits as well as
+// their capture journals. Otherwise date filtering fabricates unpaid captures.
+const priorCaptureRaw = paymentExceptionsJournalTransaction({
+  id: 'prior-capture', date: '2026-07-20', documentNumber: '260720POS', amount: '100.00',
+  side: 'credit', accountId: receiptDepositAccount, accountName: 'Clearing Account',
+})
+const priorDepositRaw = receiptTransaction({
+  id: 'prior-deposit', date: '2026-07-21', documentNumber: '260721POS',
+  total: '100.00', tax: '0.00', lines: singleItemReceiptLines('100.00'),
+})
+priorDepositRaw.source_payload.DepositToAccountRef = { value: receiptDepositAccount }
+const priorZeroNetRaw = journalTransaction({
+  id: 'prior-zero-net', date: '2026-07-21', documentNumber: '260721POS',
+  lines: ['Credit', 'Debit'].map((side, index) => ({
+    Id: String(index), Amount: '100.00', DetailType: 'JournalEntryLineDetail',
+    JournalEntryLineDetail: { PostingType: side, AccountRef: { value: receiptDepositAccount, name: 'Clearing Account' } },
+  })),
+})
+const selectedWithOpeningInput = {
+  drafts: [], transactions: [...realShapeJournalTransactions, depositReceiptRaw()],
+  clearingOpeningBalanceTransactions: [priorCaptureRaw, priorDepositRaw, priorZeroNetRaw],
+  historicalBaselineOptions: { ...realShapeOptions, fromBusinessDate: '2026-07-23' },
+}
+const openingDepositReport = pure.buildPosAccountingParityReport(selectedWithOpeningInput)
+assert.equal(openingDepositReport.historicalBaseline.clearingLifecycles.length, 1)
+const openingDepositCycle = openingDepositReport.historicalBaseline.clearingLifecycles[0]
+assert.equal(openingDepositCycle.capturedCents, 13980)
+assert.equal(openingDepositCycle.releasedCents, 13980)
+assert.equal(openingDepositCycle.appliedCents, 13980)
+assert.equal(openingDepositCycle.outstandingCents, 0)
+assert.equal(openingDepositCycle.status, 'ambiguous')
+assert.equal(openingDepositCycle.evidenceCoverage, 'cached_only')
+assert.deepEqual([...openingDepositCycle.captureJournals].map(r => r.providerTransactionId), ['1537', '1538'])
+assert.deepEqual([...openingDepositCycle.receiptDeposits].map(r => r.providerTransactionId), ['1547'])
+assert.deepEqual([...openingDepositCycle.zeroNetJournals].map(r => r.providerTransactionId), ['1539'])
+for (const wrap of [payload => ({ SalesReceipt: payload }), payload => ({ QueryResponse: { SalesReceipt: [payload] } })]) {
+  const wrappedOpening = pure.buildPosAccountingParityReport({
+    ...selectedWithOpeningInput,
+    clearingOpeningBalanceTransactions: [priorCaptureRaw, priorZeroNetRaw,
+      { ...priorDepositRaw, source_payload: wrap(priorDepositRaw.source_payload) },
+    ],
+  }).historicalBaseline.clearingLifecycles
+  assert.equal(wrappedOpening.length, 1)
+  assert.equal(wrappedOpening[0].capturedCents, 13980)
+  assert.equal(wrappedOpening[0].appliedCents, 13980)
+  assert.equal(wrappedOpening[0].outstandingCents, 0)
+}
+const allOpeningCycles = pure.buildHistoricalPosAccountingBaseline(
+  [...realShapeJournals, realShapeReceipt], selectedWithOpeningInput.historicalBaselineOptions,
+  [priorCaptureRaw, priorZeroNetRaw].map(row => pure.normalizeJournalEntryEvidence(row)),
+  [pure.normalizeSalesReceiptEvidence(priorDepositRaw)],
+).clearingLifecycles
+assert.equal(allOpeningCycles.length, 1, 'fully offset earlier cycles are context, not selected unresolved work')
+const remainingOpeningReport = pure.buildPosAccountingParityReport({
+  ...selectedWithOpeningInput,
+  clearingOpeningBalanceTransactions: [...selectedWithOpeningInput.clearingOpeningBalanceTransactions,
+    paymentExceptionsJournalTransaction({
+      id: 'prior-unpaid', date: '2026-07-22', documentNumber: '260722POS', amount: '5.00',
+      side: 'credit', accountId: receiptDepositAccount, accountName: 'Clearing Account',
+    }),
+  ],
+})
+assert.ok(remainingOpeningReport.historicalBaseline.clearingLifecycles.some(cycle => (
+  cycle.captureJournals.some(journal => journal.providerTransactionId === 'prior-unpaid')
+  && cycle.outstandingCents > 0 && cycle.status === 'ambiguous'
+)), 'unresolved earlier captures remain visible; no fabricated zero opening balance')
+
+for (const [name, mutate] of [
+  ['missing deposit ID', row => { delete row.source_payload.DepositToAccountRef.value }],
+  ['missing total with cached header present', row => { delete row.source_payload.TotalAmt }],
+  ['invalid total', row => { row.source_payload.TotalAmt = 'bad' }],
+  ['fractional cent total', row => { row.source_payload.TotalAmt = '139.801' }],
+  ['zero total', row => { row.source_payload.TotalAmt = '0' }],
+  ['negative total', row => { row.source_payload.TotalAmt = '-139.80' }],
+  ['missing currency', row => { delete row.source_payload.CurrencyRef }],
+  ['currency conflicts with cache', row => { row.currency_code = 'EUR' }],
+  ['camelCase currency conflicts with cache', row => { delete row.currency_code; row.currencyCode = 'EUR' }],
+  ['tax inclusive unsupported', row => { row.source_payload.GlobalTaxCalculation = 'TaxInclusive' }],
+  ['refund state', row => { row.source_payload.TxnStatus = 'Refunded' }],
+  ['void receipt', row => { row.source_payload.Void = true }],
+  ['cashback unsupported', row => { row.source_payload.CashBack = { Amount: '10' } }],
+  ['negative item', row => { row.source_payload.Line[0].Amount = '-130.25' }],
+  ['missing tax', row => { delete row.source_payload.TxnTaxDetail }],
+  ['tax total mismatch', row => { row.source_payload.TxnTaxDetail.TotalTax = '10.00' }],
+]) {
+  const row = depositReceiptRaw()
+  mutate(row)
+  const normalized = pure.normalizeSalesReceiptEvidence(row)
+  assert.equal(normalized.depositAmountCents, null, name)
+  const baseline = pure.buildHistoricalPosAccountingBaseline([...realShapeJournals, normalized], realShapeOptions)
+  assert.equal(baseline.clearingLifecycles.reduce((sum, cycle) => sum + cycle.appliedCents, 0), 0, name)
+  assert.ok(baseline.clearingLifecycles.some(cycle => cycle.status === 'ambiguous'), name)
+}
+for (const variant of ['other account', 'other currency', 'unmapped account']) {
+  const row = depositReceiptRaw()
+  const options = { ...realShapeOptions }
+  if (variant === 'other account') row.source_payload.DepositToAccountRef.value = 'not-the-clearing-account'
+  if (variant === 'other currency') {
+    row.source_payload.CurrencyRef.value = 'EUR'; row.currency_code = 'EUR'
+  }
+  if (variant === 'unmapped account') options.paymentExceptionAccounts = []
+  const baseline = pure.buildHistoricalPosAccountingBaseline([
+    ...realShapeJournals, pure.normalizeSalesReceiptEvidence(row),
+  ], options)
+  assert.equal(baseline.clearingLifecycles.reduce((sum, cycle) => sum + cycle.appliedCents, 0), 0, variant)
+}
+assert.equal(pure.normalizeSalesReceiptEvidence({ ...depositReceiptRaw(), entity_type: 'RefundReceipt' }), null)
+assert.throws(() => pure.buildHistoricalPosAccountingBaseline([
+  ...realShapeJournals, realShapeReceipt, { ...realShapeReceipt },
+], realShapeOptions), /Duplicate SalesReceipt clearing evidence/)
+
+// Deposit amount is the explicit provider total, including tax/discount. It
+// must never become the item subtotal or a fallback calculated payment.
+for (const useHeaderDiscount of [false, true]) {
+  const row = depositReceiptRaw()
+  row.source_payload.Line = singleItemReceiptLines('100.00')
+  if (useHeaderDiscount) row.source_payload.DiscountAmt = '10.00'
+  else row.source_payload.Line.push({ Amount: '10.00', DetailType: 'DiscountLineDetail', DiscountLineDetail: { PercentBased: false } })
+  row.source_payload.TxnTaxDetail.TotalTax = '6.35'
+  row.source_payload.TotalAmt = '96.35'
+  const normalized = pure.normalizeSalesReceiptEvidence(row)
+  assert.equal(normalized.depositAmountCents, 9635)
+  assert.equal(normalized.discountCents, 1000)
+  assert.equal(pure.compareSalesReceiptInternalArithmetic(normalized).status, 'match')
+  delete row.source_payload.TotalAmt
+  assert.equal(pure.normalizeSalesReceiptEvidence(row).depositAmountCents, null)
+}
+const conflictingDiscount = depositReceiptRaw()
+conflictingDiscount.source_payload.DiscountAmt = '5.00'
+conflictingDiscount.source_payload.Line.push({ Amount: '10.00', DetailType: 'DiscountLineDetail', DiscountLineDetail: {} })
+assert.equal(pure.normalizeSalesReceiptEvidence(conflictingDiscount).depositAmountCents, null)
+
 const julyDateFilteredTransactions = [
   paymentExceptionsJournalTransaction({
     id: '260724-date-filtered-capture',
@@ -1842,6 +2032,11 @@ assert.match(openingBalanceQuery.source, /transaction\.transaction_date < \$2::d
 assert.match(openingBalanceQuery.source, /jsonb_path_query/)
 assert.match(openingBalanceQuery.source, /JournalEntryLineDetail/)
 assert.match(openingBalanceQuery.source, /AccountRef,value/)
+assert.match(openingBalanceQuery.source, /transaction\.entity_type = 'SalesReceipt'/)
+assert.match(openingBalanceQuery.source, /DepositToAccountRef,value/)
+assert.match(openingBalanceQuery.source, /SalesReceipt,DepositToAccountRef,value/)
+assert.match(openingBalanceQuery.source, /QueryResponse,SalesReceipt,0,DepositToAccountRef,value/)
+assert.match(openingBalanceQuery.source, /transaction\.organization_id = \$1::uuid/)
 assert.match(openingBalanceQuery.source, /cardinality\(\$3::text\[\]\)/)
 assert.match(openingBalanceQuery.source, /LIMIT \$4::integer/)
 assert.doesNotMatch(openingBalanceQuery.source, /transaction\.transaction_date <= \$3::date/)
@@ -2066,7 +2261,9 @@ assert.match(parityPanel, /status === CACHED_CLEARING_OFFSET_STATUS\) return 'in
 assert.doesNotMatch(parityPanel, /const evidenceStatus = effectiveStatus/)
 assert.match(parityPanel, /Offsets observed/)
 assert.match(parityPanel, /not clearing proof/)
-assert.match(parityPanel, /Sales Receipt evidence/)
+assert.match(parityPanel, /Explicit Sales Receipt deposit to clearing account/)
+assert.match(parityPanel, /Same-account journal · net zero/)
+assert.match(parityPanel, /Related evidence · not additional account movement/)
 assert.match(parityPanel, /Sync the relevant later dates before treating this balance as missing or overdue/)
 assert.match(parityPanel, /Complete organization-level account evidence did not show a full offsetting debit within the expected window/)
 assert.match(parityPanel, /does not establish Toast-location attribution or create accounting notifications/)
