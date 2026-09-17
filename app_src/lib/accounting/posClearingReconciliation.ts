@@ -36,6 +36,9 @@ export interface PosClearingRelease {
   readonly businessDate: string;
   readonly amountCents: number;
   readonly evidence: readonly PosClearingEvidenceReference[];
+  /** Receipt deposits are account movements, not a receipt-total match. */
+  readonly source?: 'journal_debit' | 'sales_receipt_deposit';
+  readonly depositAccountId?: string;
 }
 
 export interface PosClearingReconciliationInput {
@@ -399,6 +402,7 @@ export function reconcilePosClearing(
   const seenCaptureIds = new Set<string>();
   const seenReleaseIds = new Set<string>();
   const seenEvidenceIds = new Set<string>();
+  const seenReceiptDeposits = new Set<string>();
 
   const captures: NormalizedCapture[] = input.captures.map((capture, index) => {
     const captureId = assertNonEmpty(capture.captureId, `captures[${index}].captureId`);
@@ -462,7 +466,24 @@ export function reconcilePosClearing(
       `releases[${index}].evidence`,
       seenEvidenceIds,
     );
-    if (!sourceEvidence.some((reference) => reference.entityType === 'JournalEntry')) {
+    if (release.source === 'sales_receipt_deposit') {
+      if (
+        release.depositAccountId !== scope.clearingAccountId ||
+        !/^[A-Z]{3}$/.test(scope.currencyCode) ||
+        sourceEvidence.length !== 1 ||
+        sourceEvidence[0].entityType !== 'SalesReceipt' ||
+        !sourceEvidence[0].providerTransactionId
+      ) {
+        throw new Error(`releases[${index}] requires exact SalesReceipt deposit-account evidence`);
+      }
+      const receiptKey = JSON.stringify([
+        scope.organizationId, scope.quickBooksCompanyId, sourceEvidence[0].providerTransactionId,
+      ]);
+      if (seenReceiptDeposits.has(receiptKey)) throw new Error('Duplicate SalesReceipt deposit');
+      seenReceiptDeposits.add(receiptKey);
+    } else if (release.source && release.source !== 'journal_debit') {
+      throw new Error(`releases[${index}] has an unsupported source`);
+    } else if (!sourceEvidence.some((reference) => reference.entityType === 'JournalEntry')) {
       throw new Error(
         `releases[${index}].evidence must include the clearing debit JournalEntry`,
       );

@@ -74,6 +74,11 @@ export type SuiteCrmProductImageMediaSnapshot = {
   bytes: Uint8Array
 }
 
+export type SuiteCrmProductImageSnapshot = {
+  modifiedAt: string
+  media: SuiteCrmProductImageMediaSnapshot | null
+}
+
 export type SuiteCrmProductImageListPage = {
   products: SuiteCrmProductImageProductSnapshot[]
   totalPages: number
@@ -88,7 +93,7 @@ export type SuiteCrmProductImageReadClient = {
     pageSize?: number
   }): Promise<SuiteCrmProductImageListPage>
   readProductImage(suiteCrmId: string, expectedModifiedAt: string): Promise<
-    SuiteCrmProductImageMediaSnapshot | null
+    SuiteCrmProductImageSnapshot
   >
 }
 
@@ -782,7 +787,7 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
     suiteCrmId: string,
     expectedModifiedAt: string,
   ): Promise<
-    SuiteCrmProductImageMediaSnapshot | null
+    SuiteCrmProductImageSnapshot
   > {
     const id = safeSuiteCrmId(suiteCrmId)
     const expectedRevision = parsedDate(
@@ -845,7 +850,9 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
       throw new Error('SuiteCRM Product image changed during the read')
     }
     const rawMedia = imageAttributes[SUITECRM_NATIVE_PRODUCT_IMAGE_FIELD]
-    if (rawMedia === null || rawMedia === undefined || rawMedia === '') return null
+    if (rawMedia === null || rawMedia === undefined || rawMedia === '') {
+      return { modifiedAt: currentRevision, media: null }
+    }
     if (!rawMedia || typeof rawMedia !== 'object' || Array.isArray(rawMedia)) {
       throw new Error('SuiteCRM returned invalid Product image metadata')
     }
@@ -930,12 +937,15 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
       throw new Error('SuiteCRM Product image content length does not match metadata')
     }
     return {
-      mediaId,
-      originalName,
-      mimeType,
-      byteLength,
-      contentSha256: createHash('sha256').update(bytes).digest('hex'),
-      bytes,
+      modifiedAt: currentRevision,
+      media: {
+        mediaId,
+        originalName,
+        mimeType,
+        byteLength,
+        contentSha256: createHash('sha256').update(bytes).digest('hex'),
+        bytes,
+      },
     }
   }
 }

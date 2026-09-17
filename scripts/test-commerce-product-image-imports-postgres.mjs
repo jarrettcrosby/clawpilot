@@ -3236,22 +3236,57 @@ async function verifyImports(pool) {
     .reconcileCommerceProductImageSetInPostgres(deadInput)
   assert.equal(ordinaryDeadReplay.active[0].jobId, deadReceipt.jobId)
   assert.equal(ordinaryDeadReplay.active[0].jobState, 'dead')
+  const retryCommand = {
+    organizationId: gamma.organizationId, productId: deadProduct.id,
+    jobId: deadReceipt.jobId, actorEmail: gamma.actorEmail,
+    reason: 'Provider endpoint recovered; operator approved one retry',
+    expectedJobGeneration: 1, expectedErrorCode: 'PROVIDER_IMAGE_READ_FAILED',
+    confirmInboundOnly: true, idempotencyKey: randomUUID(),
+  }
+  const deadRead = await imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: gamma.organizationId, productId: deadProduct.id, actorEmail: gamma.actorEmail,
+  })
+  assert.equal(deadRead.jobs.length, 1)
+  assert.equal(deadRead.jobs[0].retryEligible, true)
+  assert.equal(deadRead.jobs[0].jobId, deadReceipt.jobId)
+  assert.doesNotMatch(JSON.stringify(deadRead), /credential|locator|image_identity|source_hash|https:/)
+  await assertImportCode(imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: gamma.organizationId, productId: deadProduct.id, actorEmail: beta.actorEmail,
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_FORBIDDEN')
+  await assertImportCode(imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: beta.organizationId, productId: deadProduct.id, actorEmail: beta.actorEmail,
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_PRODUCT_NOT_FOUND')
   await assertImportCode(
     imageImports.retryDeadCommerceProductImageImportJobInPostgres({
-      organizationId: gamma.organizationId,
-      jobId: deadReceipt.jobId,
+      ...retryCommand,
       actorEmail: beta.actorEmail,
       reason: 'Cross-tenant retry must fail',
     }),
     'COMMERCE_PRODUCT_IMAGE_RETRY_FORBIDDEN',
   )
-  const deadSuccessor = await imageImports
-    .retryDeadCommerceProductImageImportJobInPostgres({
-      organizationId: gamma.organizationId,
-      jobId: deadReceipt.jobId,
-      actorEmail: gamma.actorEmail,
-      reason: 'Provider endpoint recovered; operator approved one retry',
-    })
+  for (const change of [{ expectedJobGeneration: 2 }, { expectedErrorCode: 'WRONG_FAILURE' }]) {
+    await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+      ...retryCommand, ...change,
+    }), 'COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE')
+  }
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...retryCommand, productId: randomUUID(),
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_PRODUCT_NOT_FOUND')
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...retryCommand, productId: switchThirdProduct.id,
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE')
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...retryCommand, confirmInboundOnly: false,
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_COMMAND_INVALID')
+  const [deadSuccessor, repeatedRetry] = await Promise.all([
+    imageImports.retryDeadCommerceProductImageImportJobInPostgres(retryCommand),
+    imageImports.retryDeadCommerceProductImageImportJobInPostgres(retryCommand),
+  ])
+  assert.equal(deadSuccessor.jobId, repeatedRetry.jobId)
+  assert.equal([deadSuccessor, repeatedRetry].filter((result) => result.replayed).length, 1)
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...retryCommand, reason: 'A changed request cannot reuse this key',
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_IDEMPOTENCY_CONFLICT')
   assert.equal(deadSuccessor.jobGeneration, 2)
   assert.equal(deadSuccessor.state, 'queued')
   assert.equal(deadSuccessor.productId, deadProduct.id)
@@ -3414,6 +3449,15 @@ async function verifyImports(pool) {
     [gamma.organizationId, expiredProduct.id],
   )
   assert.equal(retainedAfterCredentialRotation.rows[0].count, 1)
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...retryCommand, idempotencyKey: randomUUID(),
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE')
+  const staleRetryCount = await pool.query(
+    `SELECT count(*)::integer AS count FROM operations_commerce_product_image_import_jobs
+     WHERE organization_id = $1::uuid AND observation_id = $2::uuid`,
+    [gamma.organizationId, deadReceipt.observationId],
+  )
+  assert.equal(staleRetryCount.rows[0].count, 2)
 
   const alphaGlobal = await recordObservation(alpha, {
       externalProductId: 'gid://shopify/Product/100',
@@ -3824,6 +3868,80 @@ async function verifyImports(pool) {
   assert.ok(evidence.rows[0].provenance >= 7)
   assert.ok(evidence.rows[0].imported_assets >= 6)
   assert.equal(evidence.rows[0].provider_write_columns, 0)
+
+  // A reviewed retry does not reset the lineage budget after it fails again.
+  const cappedProduct = await addProduct(pool, beta, {
+    key: 'operator-retry-cap', name: 'Retry cap product',
+    externalProductId: 'gid://shopify/Product/1990',
+    variants: ['gid://shopify/ProductVariant/1991'],
+  })
+  const cappedInput = imageSetInput(beta, {
+    externalProductId: 'gid://shopify/Product/1990', providerImageId: 'retry-cap-image',
+    locatorSha256: sha256('retry-cap-locator'), sourceHash: sha256('retry-cap-source'), maxAttempts: 1,
+    credentialGeneration: 2,
+  })
+  const cappedSet = await imageImports.reconcileCommerceProductImageSetInPostgres(cappedInput)
+  let cappedClaim = await claimOne(beta.organizationId, 'retry-cap-worker')
+  const failCapped = (claim) => imageImports.failCommerceProductImageImportJobInPostgres({
+    organizationId: beta.organizationId, jobId: claim.jobId,
+    leaseToken: claim.leaseToken, workerId: 'retry-cap-worker',
+    errorCode: 'PROVIDER_IMAGE_READ_FAILED', retryable: false, retryAfterSeconds: 0,
+  })
+  await failCapped(cappedClaim)
+  const cappedCommand = { ...retryCommand, organizationId: beta.organizationId,
+    actorEmail: beta.actorEmail, productId: cappedProduct.id,
+    jobId: cappedSet.active[0].jobId, idempotencyKey: randomUUID() }
+  await pool.query(`UPDATE operations_commerce_store_sync_controls
+    SET desired_state = 'paused', explicit_choice = true, revision = revision + 1
+    WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+  [beta.organizationId, beta.accountId])
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres(cappedCommand),
+    'COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE')
+  const pausedRead = await imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: beta.organizationId, productId: cappedProduct.id, actorEmail: beta.actorEmail,
+  })
+  assert.equal(pausedRead.jobs.length, 0)
+  const pausedCount = await pool.query(`SELECT count(*)::integer AS count
+    FROM operations_commerce_product_image_import_jobs
+    WHERE organization_id = $1::uuid AND observation_id = $2::uuid`,
+  [beta.organizationId, cappedSet.active[0].observationId])
+  assert.equal(pausedCount.rows[0].count, 1)
+  await pool.query(`UPDATE operations_commerce_store_sync_controls
+    SET desired_state = 'running', revision = revision + 1
+    WHERE organization_id = $1::uuid AND integration_account_id = $2::uuid`,
+  [beta.organizationId, beta.accountId])
+  const cappedRetry = await imageImports.retryDeadCommerceProductImageImportJobInPostgres(cappedCommand)
+  cappedClaim = await claimOne(beta.organizationId, 'retry-cap-worker')
+  assert.equal(cappedClaim.maxAttempts, 1)
+  await failCapped(cappedClaim)
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...cappedCommand, jobId: cappedRetry.jobId, expectedJobGeneration: 2, idempotencyKey: randomUUID(),
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_LIMIT_REACHED')
+  const cappedRead = await imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: beta.organizationId, actorEmail: beta.actorEmail, productId: cappedProduct.id,
+  })
+  assert.equal(cappedRead.jobs[0].retryEligible, false)
+  assert.equal(cappedRead.jobs[0].jobId, cappedRetry.jobId)
+  const cappedCount = await pool.query(`SELECT count(*)::integer AS count
+    FROM operations_commerce_product_image_import_jobs
+    WHERE organization_id = $1::uuid AND observation_id = $2::uuid`,
+  [beta.organizationId, cappedSet.active[0].observationId])
+  assert.equal(cappedCount.rows[0].count, 2)
+  // An old command remains replayable after completion/failure without new jobs.
+  assert.equal((await imageImports.retryDeadCommerceProductImageImportJobInPostgres(cappedCommand)).replayed, true)
+  const newerEvidence = imageSetInput(beta, {
+    externalProductId: 'gid://shopify/Product/1990', providerImageId: 'retry-cap-image',
+    locatorSha256: sha256('retry-cap-new-locator'), sourceHash: sha256('retry-cap-new-source'), maxAttempts: 1,
+    credentialGeneration: 2,
+  })
+  await imageImports.reconcileCommerceProductImageSetInPostgres(newerEvidence)
+  await assertImportCode(imageImports.retryDeadCommerceProductImageImportJobInPostgres({
+    ...cappedCommand, jobId: cappedRetry.jobId, expectedJobGeneration: 2, idempotencyKey: randomUUID(),
+  }), 'COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE')
+  const staleRead = await imageImports.listDeadCommerceProductImageImportRecoveriesInPostgres({
+    organizationId: beta.organizationId, actorEmail: beta.actorEmail, productId: cappedProduct.id,
+  })
+  assert.equal(staleRead.jobs.length, 0)
 }
 
 async function main() {

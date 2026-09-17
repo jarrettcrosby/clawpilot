@@ -5,6 +5,7 @@ import {
 import {
   findSuiteCrmProductImageTargetInPostgres,
   ingestSuiteCrmProductImageSnapshotInPostgres,
+  SuiteCrmProductImageIngestionError,
   writeSuiteCrmProductImageIngestionHeartbeatInPostgres,
 } from '@/lib/persistence/suiteCrmProductImageIngestion'
 import { getPostgresPool } from '@/lib/persistence/postgres'
@@ -59,6 +60,7 @@ export type SuiteCrmProductImageIngestionCounts = {
   noImage: number
   identityConflicts: number
   mediaIntegrityConflicts: number
+  snapshotConflicts: number
   staleIgnored: number
   deletedProductsIgnored: number
   unmatchedProducts: number
@@ -298,6 +300,7 @@ function emptyCounts(input: { enabled: boolean; ready: boolean }): SuiteCrmProdu
     noImage: 0,
     identityConflicts: 0,
     mediaIntegrityConflicts: 0,
+    snapshotConflicts: 0,
     staleIgnored: 0,
     deletedProductsIgnored: 0,
     unmatchedProducts: 0,
@@ -476,6 +479,7 @@ export async function processSuiteCrmProductImageIngestion(): Promise<
           ))
         ) return restartAndReturn('membership_changed')
 
+        let pageConflict: SuiteCrmProductImageIngestionError | null = null
         for (const product of page.products) {
           if (product.deleted) {
             counts.deletedProductsIgnored += 1
@@ -491,19 +495,33 @@ export async function processSuiteCrmProductImageIngestion(): Promise<
             continue
           }
           counts.productsMatched += 1
-          const media = await reader.readProductImage(
+          const snapshot = await reader.readProductImage(
             product.id,
             product.modifiedAt,
           )
-          const result = await ingestSuiteCrmProductImageSnapshotInPostgres({
-            organizationId: target.organizationId,
-            suiteCrmId: product.id,
-            suiteCrmGlobalId: product.globalId,
-            suiteCrmModifiedAt: product.modifiedAt,
-            productName: product.name,
-            media,
-            actorEmail: target.actorEmail,
-          })
+          if (Date.parse(snapshot.modifiedAt) > Date.parse(state.pollStartedAt)) {
+            return restartAndReturn('membership_changed')
+          }
+          let result
+          try {
+            result = await ingestSuiteCrmProductImageSnapshotInPostgres({
+              organizationId: target.organizationId,
+              suiteCrmId: product.id,
+              suiteCrmGlobalId: product.globalId,
+              suiteCrmModifiedAt: snapshot.modifiedAt,
+              suiteCrmModifiedAtPrecision: 'exact',
+              productName: product.name,
+              media: snapshot.media,
+              actorEmail: target.actorEmail,
+            })
+          } catch (error) {
+            if (!(error instanceof SuiteCrmProductImageIngestionError)
+              || error.code !== 'SUITECRM_PRODUCT_IMAGE_SNAPSHOT_CONFLICT') throw error
+            counts.snapshotConflicts += 1
+            pageConflict ||= error
+            await refreshProgressHeartbeat()
+            continue
+          }
           if (result.resolution === 'imported_primary') counts.importedPrimary += 1
           else if (result.resolution === 'imported_secondary') {
             counts.importedSecondary += 1
@@ -516,6 +534,13 @@ export async function processSuiteCrmProductImageIngestion(): Promise<
             counts.mediaIntegrityConflicts += 1
           } else counts.staleIgnored += 1
           await refreshProgressHeartbeat()
+        }
+        // Process independent products, but retain this page and its watermark
+        // until every conflict is resolved. Successful items replay idempotently
+        // on retry; a conflict cannot disappear behind an advanced cursor.
+        if (pageConflict) {
+          counts.pending = true
+          throw pageConflict
         }
       }
 

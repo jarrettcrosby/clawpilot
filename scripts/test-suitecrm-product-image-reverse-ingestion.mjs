@@ -241,6 +241,7 @@ let graphModifiedAt = '2026-08-02T12:00:00Z'
 let contentUrlOverride = null
 let omitTotalRecords = false
 let emptyCollection = false
+let imageAbsent = false
 
 function jsonResponse(value, status = 200, headers = {}) {
   return new Response(JSON.stringify(value), {
@@ -318,7 +319,7 @@ const fetchImpl = async (input, init = {}) => {
           module: 'products',
           attributes: {
             date_modified: graphModifiedAt,
-            clawpilot_image_c: {
+            clawpilot_image_c: imageAbsent ? null : {
               id: MEDIA_ID,
               module: 'media-objects',
               attributes: {
@@ -464,10 +465,12 @@ await assert.rejects(
   }),
   /outside the requested snapshot/u,
 )
-const media = await reader.readProductImage(
+const snapshot = await reader.readProductImage(
   PRODUCT_ID,
   '2026-08-02T12:00:00Z',
 )
+const media = snapshot.media
+assert.equal(snapshot.modifiedAt, '2026-08-02T12:00:00.000Z')
 assert.equal(media.mediaId, MEDIA_ID)
 assert.equal(media.contentSha256, IMAGE_SHA256)
 assert.deepEqual(Buffer.from(media.bytes), Buffer.from(ONE_PIXEL_PNG))
@@ -477,8 +480,14 @@ const minutePrecisionMedia = await reader.readProductImage(
   PRODUCT_ID,
   '2026-08-02T12:00:00Z',
 )
-assert.equal(minutePrecisionMedia.mediaId, MEDIA_ID)
-assert.equal(minutePrecisionMedia.contentSha256, IMAGE_SHA256)
+assert.equal(minutePrecisionMedia.media.mediaId, MEDIA_ID)
+assert.equal(minutePrecisionMedia.media.contentSha256, IMAGE_SHA256)
+assert.equal(minutePrecisionMedia.modifiedAt, '2026-08-02T12:00:15.000Z')
+imageAbsent = true
+const absentSnapshot = await reader.readProductImage(PRODUCT_ID, '2026-08-02T12:00:00Z')
+assert.equal(absentSnapshot.modifiedAt, '2026-08-02T12:00:15.000Z')
+assert.equal(absentSnapshot.media, null)
+imageAbsent = false
 
 graphModifiedAt = '2026-08-02 12:01:00'
 await assert.rejects(
@@ -491,8 +500,8 @@ const currentMediaPathImage = await reader.readProductImage(
   PRODUCT_ID,
   '2026-08-02T12:00:00Z',
 )
-assert.equal(currentMediaPathImage.mediaId, MEDIA_ID)
-assert.equal(currentMediaPathImage.contentSha256, IMAGE_SHA256)
+assert.equal(currentMediaPathImage.media.mediaId, MEDIA_ID)
+assert.equal(currentMediaPathImage.media.contentSha256, IMAGE_SHA256)
 
 contentUrlOverride = `/api/private-image-media-objects/${MEDIA_ID}/extra`
 await assert.rejects(
@@ -579,7 +588,7 @@ const postPaths = calls
   .map((call) => call.url.pathname)
 assert.equal(postPaths.filter((path) => path === '/Api/access_token').length, 1)
 assert.equal(postPaths.filter((path) => path === '/login').length, 1)
-assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 5)
+assert.equal(postPaths.filter((path) => path === '/api/graphql').length, 6)
 assert.equal(postPaths.every((path) => [
   '/Api/access_token', '/login', '/api/graphql',
 ].includes(path)), true)
@@ -686,7 +695,14 @@ function suiteProduct(index, modifiedAt = '2026-08-02T12:00:00.000Z') {
   }
 }
 
-function loadWorkerHarness({ listImpl, lockAvailable = true }) {
+class TestImageIngestionError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
+  }
+}
+
+function loadWorkerHarness({ listImpl, imageImpl, ingestImpl, lockAvailable = true }) {
   let cursorValue = null
   const sqlCalls = []
   const listCalls = []
@@ -739,7 +755,9 @@ function loadWorkerHarness({ listImpl, lockAvailable = true }) {
             },
             async readProductImage(id, expectedModifiedAt) {
               imageReads.push({ id, expectedModifiedAt })
-              return null
+              return imageImpl
+                ? imageImpl(id, expectedModifiedAt)
+                : { modifiedAt: expectedModifiedAt, media: null }
             },
           }
         },
@@ -750,6 +768,7 @@ function loadWorkerHarness({ listImpl, lockAvailable = true }) {
         },
       },
       '@/lib/persistence/suiteCrmProductImageIngestion': {
+        SuiteCrmProductImageIngestionError: TestImageIngestionError,
         async findSuiteCrmProductImageTargetInPostgres() {
           return {
             organizationId: '33333333-3333-4333-8333-333333333333',
@@ -758,7 +777,7 @@ function loadWorkerHarness({ listImpl, lockAvailable = true }) {
         },
         async ingestSuiteCrmProductImageSnapshotInPostgres(input) {
           ingestions.push(input)
-          return { resolution: 'no_image' }
+          return ingestImpl ? ingestImpl(input) : { resolution: 'no_image' }
         },
         async writeSuiteCrmProductImageIngestionHeartbeatInPostgres(input) {
           heartbeats.push(input)
@@ -830,6 +849,59 @@ assert.equal(
   true,
 )
 assert.deepEqual(baselineHarness.releaseErrors, [undefined])
+
+const exactRevisionHarness = loadWorkerHarness({
+  listImpl: () => ({ products: [baselineProduct], totalPages: 1, totalRecords: 1 }),
+  imageImpl: () => ({ modifiedAt: '2026-08-02T12:00:42.000Z', media: null }),
+})
+await exactRevisionHarness.process()
+assert.equal(exactRevisionHarness.ingestions[0].suiteCrmModifiedAt,
+  '2026-08-02T12:00:42.000Z')
+assert.equal(exactRevisionHarness.ingestions[0].suiteCrmModifiedAtPrecision, 'exact')
+assert.equal(exactRevisionHarness.ingestions[0].media, null,
+  'Image removals carry the exact revision too')
+
+const conflictProducts = [suiteProduct(10), suiteProduct(11)]
+let conflictPending = true
+const conflictHarness = loadWorkerHarness({
+  listImpl: () => ({ products: conflictProducts, totalPages: 1, totalRecords: 2 }),
+  ingestImpl(input) {
+    if (conflictPending && input.suiteCrmId === conflictProducts[0].id) {
+      throw new TestImageIngestionError('SUITECRM_PRODUCT_IMAGE_SNAPSHOT_CONFLICT',
+        'SuiteCRM Product image timestamp identifies conflicting evidence')
+    }
+    return { resolution: 'no_image' }
+  },
+})
+const conflictFirst = await conflictHarness.process()
+assert.equal(conflictFirst.snapshotConflicts, 1)
+assert.equal(conflictFirst.noImage, 1, 'A conflict must not starve the next product')
+assert.equal(conflictFirst.errors, 1)
+assert.equal(conflictFirst.pending, true)
+assert.equal(conflictHarness.cursor().state.page, 1)
+assert.equal(conflictHarness.cursor().baselineComplete, false)
+assert.equal(conflictHarness.cursor().lastPolledAt, null)
+assert.equal(conflictHarness.heartbeats.at(-1).phase, 'degraded')
+assert.match(conflictHarness.cursor().lastError, /conflicting evidence/u)
+const failedPageWatermark = conflictHarness.cursor().state.pollStartedAt
+await conflictHarness.process()
+assert.equal(conflictHarness.cursor().state.pollStartedAt, failedPageWatermark)
+assert.equal(conflictHarness.heartbeats.at(-1).phase, 'degraded')
+assert.equal(conflictHarness.ingestions.length, 4)
+conflictPending = false
+const recoveredPage = await conflictHarness.process()
+assert.equal(recoveredPage.errors, 0)
+assert.equal(conflictHarness.cursor().baselineComplete, true)
+assert.equal(conflictHarness.cursor().state, null)
+assert.equal(conflictHarness.cursor().lastPolledAt, failedPageWatermark)
+
+const unexpectedFailure = loadWorkerHarness({
+  listImpl: () => ({ products: conflictProducts, totalPages: 1, totalRecords: 2 }),
+  ingestImpl() { throw new Error('Database unavailable') },
+})
+assert.equal((await unexpectedFailure.process()).errors, 1)
+assert.equal(unexpectedFailure.ingestions.length, 1,
+  'Only immutable snapshot conflicts may be isolated; infrastructure errors stop the pass')
 
 const boundedProducts = Array.from({ length: 200 }, (_, index) => (
   suiteProduct(index + 1)

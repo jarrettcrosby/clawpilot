@@ -2795,17 +2795,128 @@ export async function resolveWaitingCommerceProductImageImportJobsInPostgres(inp
   })
 }
 
+async function authorizeProductImageRecovery(
+  client: PoolClient,
+  organizationId: string,
+  productId: string,
+  actorEmail: string,
+) {
+  const authority = await client.query<{ authorized: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM app_users app_user
+       JOIN app_user_organization_memberships membership
+         ON membership.user_email = app_user.email
+        AND membership.organization_id = $1::uuid
+        AND membership.status = 'active'
+        AND membership.role IN ('owner', 'admin')
+       WHERE app_user.email = $2 AND app_user.status = 'active'
+     ) AS authorized`,
+    [organizationId, actorEmail],
+  )
+  if (!authority.rows[0]?.authorized) {
+    fail('COMMERCE_PRODUCT_IMAGE_RETRY_FORBIDDEN',
+      'Active organization owner or admin authority is required', 403)
+  }
+  const product = await client.query(
+    `SELECT product.id FROM crm_products product
+     JOIN pipeline_spaces pipeline ON pipeline.id = product.pipeline_id
+       AND pipeline.workspace_organization_id = $1::uuid
+     WHERE product.id = $2::uuid`,
+    [organizationId, productId],
+  )
+  if (!product.rows.length) {
+    fail('COMMERCE_PRODUCT_IMAGE_RETRY_PRODUCT_NOT_FOUND',
+      'Product was not found in the active organization', 404)
+  }
+}
+
+async function imageOperatorRetryUsed(
+  client: PoolClient,
+  organizationId: string,
+  observationId: string,
+) {
+  const result = await client.query<{ used: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM audit_events
+       WHERE organization_id = $1::uuid
+         AND event_type = 'operations.commerce_product_image_import.successor_created'
+         AND payload->>'reason' = 'operator_retry'
+         AND payload->>'observationId' = $2
+     ) AS used`,
+    [organizationId, observationId],
+  )
+  return result.rows[0]?.used === true
+}
+
+/** Inbound recovery only: never exposes source URLs, credentials or payloads. */
+export async function listDeadCommerceProductImageImportRecoveriesInPostgres(input: {
+  organizationId: string
+  productId: string
+  actorEmail: string
+}) {
+  return withTransaction(async (client) => {
+    await authorizeProductImageRecovery(client, input.organizationId,
+      input.productId, input.actorEmail)
+    const result = await client.query<JobRow & { account_global_id: string }>(
+      `SELECT job.*, account.global_id AS account_global_id
+       FROM operations_commerce_product_image_import_jobs job
+       JOIN operations_integration_accounts account
+         ON account.organization_id = job.organization_id
+        AND account.id = job.integration_account_id
+       WHERE job.organization_id = $1::uuid AND job.product_id = $2::uuid
+         AND job.state = 'dead'
+         AND operations_commerce_product_image_job_fences_are_current(
+           job.organization_id, job.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM operations_commerce_product_image_import_jobs later
+           WHERE later.organization_id = job.organization_id
+             AND later.observation_id = job.observation_id
+             AND later.job_generation > job.job_generation)
+       ORDER BY job.updated_at DESC, job.id LIMIT 26`,
+      [input.organizationId, input.productId],
+    )
+    const jobs = []
+    for (const job of result.rows.slice(0, 25)) {
+      if (!await observationIsLatestActiveEvidence(client, input.organizationId,
+        job.observation_id) || !await accountCredentialIsCurrent(client, job)) continue
+      const errorCode = /^[A-Z0-9_]{1,128}$/.test(job.last_error_code || '')
+        ? job.last_error_code : null
+      jobs.push({
+        jobId: job.id,
+        jobGlobalId: job.global_id,
+        provider: job.provider,
+        accountGlobalId: job.account_global_id,
+        jobGeneration: Number(job.job_generation),
+        errorCode,
+        attemptCount: Number(job.attempt_count),
+        maxAttempts: Number(job.max_attempts),
+        updatedAt: job.updated_at,
+        retryEligible: Boolean(errorCode)
+          && !await imageOperatorRetryUsed(client, input.organizationId, job.observation_id),
+      })
+    }
+    return { jobs, hasMore: result.rows.length > 25, providerWrites: 0 as const }
+  })
+}
+
 export async function retryDeadCommerceProductImageImportJobInPostgres(input: {
   organizationId: string
+  productId: string
   jobId: string
   actorEmail: string
   reason: string
+  expectedJobGeneration: number
+  expectedErrorCode: string
+  idempotencyKey: string
+  confirmInboundOnly: boolean
 }): Promise<{
   jobId: string
   jobGlobalId: string
   jobGeneration: number
   state: CommerceProductImageImportJobState
   productId: string | null
+  replayed: boolean
+  providerWrites: 0
 }> {
   const organizationId = requiredTrimmed(
     input.organizationId,
@@ -2813,31 +2924,59 @@ export async function retryDeadCommerceProductImageImportJobInPostgres(input: {
     64,
   )
   const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
+  const productId = requiredTrimmed(input.productId, 'Product ID', 64)
   const actorEmail = requiredTrimmed(input.actorEmail, 'Actor email', 255)
   const reason = requiredTrimmed(input.reason, 'Retry reason', 500)
+  const expectedErrorCode = requiredTrimmed(input.expectedErrorCode, 'Expected error code', 128)
+  if (input.confirmInboundOnly !== true || reason.length < 10
+    || !Number.isSafeInteger(input.expectedJobGeneration) || input.expectedJobGeneration < 1
+    || !/^[A-Z0-9_]{1,128}$/.test(expectedErrorCode)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.idempotencyKey)) {
+    fail('COMMERCE_PRODUCT_IMAGE_RETRY_COMMAND_INVALID',
+      'Review the current failure, confirm inbound-only recovery and supply a reason and UUID retry key')
+  }
+  const eventKey = `commerce-product-image-retry:${organizationId}:${input.idempotencyKey.toLowerCase()}`
+  const requestHash = createHash('sha256').update(JSON.stringify({
+    organizationId, productId, jobId, actorEmail, reason,
+    expectedJobGeneration: input.expectedJobGeneration, expectedErrorCode,
+  })).digest('hex')
+  function response(job: JobRow, replayed: boolean) {
+    return { jobId: job.id, jobGlobalId: job.global_id,
+      jobGeneration: positiveInteger(job.job_generation, 'job generation'),
+      state: job.state, productId: job.product_id, replayed, providerWrites: 0 as const }
+  }
   return withTransaction(async (client) => {
-    const authority = await client.query<{ authorized: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1
-         FROM app_users app_user
-         JOIN app_user_organization_memberships membership
-           ON membership.user_email = app_user.email
-          AND membership.organization_id = $1::uuid
-          AND membership.status = 'active'
-          AND membership.role IN ('owner', 'admin')
-         WHERE app_user.email = $2
-           AND app_user.status = 'active'
-       ) AS authorized`,
-      [organizationId, actorEmail],
+    await authorizeProductImageRecovery(client, organizationId, productId, actorEmail)
+    await acquireTransactionAdvisoryLock(client, eventKey)
+    const recorded = await client.query<{ payload: { requestHash: string; successorJobId: string } }>(
+      `SELECT payload FROM audit_events WHERE organization_id = $1::uuid AND event_key = $2`,
+      [organizationId, eventKey],
     )
-    if (!authority.rows[0]?.authorized) {
-      fail(
-        'COMMERCE_PRODUCT_IMAGE_RETRY_FORBIDDEN',
-        'Owner or admin authority is required to retry dead image work',
-        403,
-      )
+    if (recorded.rows[0]) {
+      if (recorded.rows[0].payload.requestHash !== requestHash) {
+        fail('COMMERCE_PRODUCT_IMAGE_RETRY_IDEMPOTENCY_CONFLICT',
+          'This retry key was already used for a different reviewed command', 409)
+      }
+      return response(await selectJob(client, organizationId,
+        recorded.rows[0].payload.successorJobId, false), true)
+    }
+    const selectedJob = await selectJob(client, organizationId, jobId, false)
+    await acquireTransactionAdvisoryLock(client,
+      `commerce-product-image-retry-lineage:${organizationId}:${selectedJob.observation_id}`)
+    if (!await lockCommerceProductImageProviderReadAuthority(client, selectedJob)) {
+      fail('COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE',
+        'Store sync authority changed; reload the current product before retrying', 409)
     }
     const priorJob = await selectJob(client, organizationId, jobId, true)
+    if (priorJob.product_id !== productId
+      || Number(priorJob.job_generation) !== input.expectedJobGeneration
+      || priorJob.last_error_code !== expectedErrorCode
+      || !await jobFencesAreCurrent(client, organizationId, jobId)
+      || !await accountCredentialIsCurrent(client, priorJob)
+      || !await observationIsLatestActiveEvidence(client, organizationId, priorJob.observation_id)) {
+      fail('COMMERCE_PRODUCT_IMAGE_RETRY_FENCE_STALE',
+        'Product mapping or failed image evidence changed; reload before retrying', 409)
+    }
     if (priorJob.state !== 'dead') {
       fail(
         'COMMERCE_PRODUCT_IMAGE_RETRY_STATE_INVALID',
@@ -2845,22 +2984,25 @@ export async function retryDeadCommerceProductImageImportJobInPostgres(input: {
         409,
       )
     }
+    if (await imageOperatorRetryUsed(client, organizationId, priorJob.observation_id)) {
+      fail('COMMERCE_PRODUCT_IMAGE_RETRY_LIMIT_REACHED',
+        'This source observation already used its reviewed retry; investigate the failure before new source evidence is imported', 409)
+    }
     const successor = await createCommerceProductImageSuccessorJob(client, {
       priorJob,
       actorEmail,
       auditReason: 'operator_retry',
       operatorReason: reason,
     })
-    return {
-      jobId: successor.id,
-      jobGlobalId: successor.global_id,
-      jobGeneration: positiveInteger(
-        successor.job_generation,
-        'job generation',
-      ),
-      state: successor.state,
-      productId: successor.product_id,
-    }
+    await recordAuditEvent({ actor: actorEmail, organizationId, eventKey,
+      eventType: 'operations.commerce_product_image_import.retry_requested',
+      aggregateType: 'operations_commerce_product_image_import_job',
+      aggregateId: successor.global_id,
+      payload: { requestHash, priorJobId: priorJob.id, successorJobId: successor.id,
+        productId, reason, expectedJobGeneration: input.expectedJobGeneration,
+        expectedErrorCode, providerWrites: 0 },
+    }, client)
+    return response(successor, false)
   })
 }
 

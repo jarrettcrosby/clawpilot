@@ -110,6 +110,39 @@ this historical state. The scheduled snapshot policy remains required.
 
 ## Repeatable Audit
 
+### Daily Coverage Repair — 2026-09-14 EDT
+
+The operator approved restoring daily development coverage and asked about its
+cost. At `2026-09-15T00:33:41Z`, a fresh provider API read verified:
+
+- Development schedules: `DAILY` (six days, `45 2 * * *` UTC) plus the existing
+  `WEEKLY` schedule (27 days). Production schedules were not changed.
+- A new provider snapshot, `pre-reliability-20260914`, completed at
+  `2026-09-15T00:32:02.501Z`, ID `17d5944b-02bd-4c7d-939c-d99e90a0530e`.
+  Railway reported 26 MB exclusive and 6,253 MB referenced immediately after
+  creation. Exclusive size can grow as live data changes.
+- The scoped development check with `--required-schedules DAILY,WEEKLY`
+  passed the 30-hour freshness gate. **The stricter default policy still
+  reports development's missing monthly schedule.** This pass did not add
+  longer retention or change the default audit requirements.
+- The manual pre-change snapshot has no automatic expiry. Review its removal
+  after successful daily snapshots and the reliability release; do not delete
+  recovery points automatically or before the replacement is verified.
+
+Railway's current backup documentation confirms incremental Copy-on-Write
+billing for data exclusive to snapshots, at the volume storage rate of
+$0.15 per GB-month. Six hypothetical additional snapshots retaining 1 GB each
+would therefore average about $0.90/month, not six full database charges.
+This is an illustration, not a forecast: changed blocks and retention determine
+actual usage. Existing development snapshots had about 4.8 GB exclusive before
+the new manual snapshot (roughly $0.72/month at that moment's allocation).
+
+The existing CLI account authentication successfully performed the scoped API
+schedule update and backup creation in this pass; the older authorization
+limitation above is historical. Tokens were used in memory and not recorded.
+
+### Audit Command
+
 `scripts/railway-backup-audit.mjs` is read-only. It
 defaults to both `development` and `production` and exits nonzero unless each
 named environment has `DAILY` + `WEEKLY` + `MONTHLY` schedules and a provider
