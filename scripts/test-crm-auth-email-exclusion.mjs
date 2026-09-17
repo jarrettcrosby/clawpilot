@@ -36,6 +36,8 @@ function loadModule(path, mocks) {
 // All addresses and codes below are synthetic test data; no live mailbox calls.
 const template = 'ClawPilot sign-in\n\nYour sign-in code is: 123456\n\nThis code expires in 15 minutes and can be used once.\nIf you did not request this code, ignore this email.'
 const htmlTemplate = '<html><body><img src="https://example.test/logo.png"><h1>ClawPilot sign-in</h1><p>Use this code to sign in:</p><p>123456</p><p>This code expires in 15 minutes and can be used once.</p><p>If you did not request this code, ignore this email.</p></body></html>'
+const careerTemplate = template.replace('ClawPilot sign-in', 'Career Desk sign-in')
+const careerHtmlTemplate = htmlTemplate.replace('ClawPilot sign-in', 'Career Desk sign-in')
 const purpose = { name: 'X-ClawPilot-Message-Purpose', value: 'auth-magic-code' }
 
 function message(id, { from = 'ClawPilot Stewards <stewards@eigenracing.com>', subject = 'Your ClawPilot sign-in code', body = template, mimeType = 'text/plain', headers = [] } = {}) {
@@ -53,6 +55,10 @@ function message(id, { from = 'ClawPilot Stewards <stewards@eigenracing.com>', s
   }
 }
 
+function careerMessage(id, overrides = {}) {
+  return message(id, { subject: 'Your Career Desk sign-in code', body: careerTemplate, ...overrides })
+}
+
 const excluded = [
   message('legacy-stewards'),
   message('legacy-html', { body: htmlTemplate, mimeType: 'text/html' }),
@@ -65,6 +71,13 @@ const excluded = [
   message('marked-cross-environment', { from: 'CROSS-ENV@EXAMPLE.TEST', headers: [purpose] }),
   // Even explicit CRM markers or a matching sender must not turn auth into CRM activity.
   message('marked-with-reference', { headers: [purpose], body: `${template}\nhttps://example.test/s/gc1234567` }),
+  careerMessage('career-legacy'),
+  careerMessage('career-legacy-html', { body: careerHtmlTemplate, mimeType: 'text/html' }),
+  careerMessage('career-marked-auth', { from: 'auth@example.test', headers: [purpose] }),
+  careerMessage('career-marked-platform', { from: 'platform@example.test', headers: [purpose] }),
+  careerMessage('career-marked-additional', { from: 'legacy-auth@example.test', headers: [purpose] }),
+  careerMessage('career-marked-with-reference', { headers: [purpose], body: `${careerTemplate}\nhttps://example.test/s/gc1234567` }),
+  { ...careerMessage('career-sent', { headers: [purpose] }), labelIds: ['SENT'] },
 ]
 const retained = [
   message('customer-discussion', { from: 'customer@example.test', subject: 'Our sign-in code problem', body: 'Please help with the sign-in code for our shipping portal.' }),
@@ -90,6 +103,18 @@ const retained = [
   message('display-name-not-from', { from: '"stewards@eigenracing.com" <customer@example.test>' }),
   message('multiple-from-addresses', { from: 'stewards@eigenracing.com, customer@example.test' }),
   message('lookalike-sender', { from: 'stewards@eigenracing.com.example.test' }),
+  careerMessage('career-reply', { subject: 'Re: Your Career Desk sign-in code' }),
+  careerMessage('career-forward', { subject: 'Fwd: Your Career Desk sign-in code' }),
+  careerMessage('career-unknown-sender', { from: 'customer@example.test', headers: [purpose] }),
+  careerMessage('career-lookalike-sender', { from: 'stewards@eigenracing.com.example.test' }),
+  careerMessage('career-quoted', { body: `Can you help with this?\n\n${careerTemplate}` }),
+  careerMessage('career-discussion', { body: 'Please help me with the sign-in code issue.' }),
+  careerMessage('career-wrong-purpose', { headers: [{ ...purpose, value: 'customer-email' }] }),
+  careerMessage('career-conflicting-purpose', { headers: [purpose, { ...purpose, value: 'customer-email' }] }),
+  careerMessage('career-mismatched-template', { body: template }),
+  message('clawpilot-mismatched-template', { body: careerTemplate }),
+  careerMessage('career-duplicate-subject', { headers: [{ name: 'Subject', value: 'Customer discussion' }] }),
+  careerMessage('career-duplicate-from', { headers: [{ name: 'From', value: 'customer@example.test' }] }),
   message('nested-purpose', { body: 'Customer discussion' }),
 ]
 retained.at(-1).payload.parts = [{ mimeType: 'message/rfc822', headers: [purpose] }]
@@ -107,6 +132,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': loadModule('app_src/lib/crm/emailAddressHeaders.ts', {}),
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
+  '@/lib/auditWriter': { recordAuditEvent: async () => assert.fail('Normal polling must not request recovery') },
   '@/lib/tenancy': { resolvePipelineSpaceAccess: async () => ({ id: pipelineId, ownerEmail }) },
   '@/lib/maton': {
     async matonFetch(path, init, scope) {
@@ -136,6 +162,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes('FROM pipeline_spaces')) return { rows: [{ id: pipelineId, is_default: true }] }
+      if (sql.includes('FROM organization_communication_bindings')) return { rows: [] }
       if (sql.includes('INSERT INTO crm_inbound_messages')) {
         assert.ok(retained.some((entry) => entry.id === values[2]), 'Auth email must be excluded before raw CRM persistence')
         storedMessageIds.push(values[2])
@@ -143,8 +170,9 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
       }
       if (sql.includes('FROM crm_contacts')) {
         matchedSenders.push(values[1])
-        return { rows: [{ reference_code: 'gc1234567' }] }
+        return { rows: [{ pipeline_id: pipelineId, reference_code: 'gc1234567', email: values[1][0] }] }
       }
+      if (sql.includes('FROM crm_interactions')) return { rows: [] }
       if (sql.includes('FROM crm_inbound_message_links')) return { rows: [] }
       if (sql.includes('UPDATE crm_inbound_messages SET')) return { rows: [], rowCount: 1 }
       if (sql.includes('INSERT INTO crm_inbound_message_links')) {
@@ -176,21 +204,24 @@ assert.equal(ingestion.isClawPilotAuthEmail(message('invalid-list', { from: 'dis
 testEnv.CLAWPILOT_AUTH_MAIL_ADDITIONAL_SENDERS = additionalSenders
 // The general parser is reused by Career Desk: leave its message semantics alone.
 assert.equal(ingestion.parseGmailMessage(excluded[0]).bodyText, template)
+assert.equal(ingestion.parseGmailMessage(careerMessage('parsed-career')).bodyText, careerTemplate)
 
 const counts = await ingestion.processInboundGmailIngestion()
 assert.equal(counts.errors, 0)
 assert.equal(counts.authMessagesSkipped, excluded.length)
 assert.equal(counts.messagesFetched, excluded.length + retained.length)
 assert.equal(counts.messagesStored, retained.length)
-assert.equal(counts.interactions, retained.length)
-assert.equal(counts.links, retained.length)
+// Malformed/multiple From headers remain retained evidence but must not auto-route.
+const routable = retained.filter((entry) => ingestion.parseGmailMessage(entry).emailAddressHeaders.from?.length === 1)
+assert.equal(counts.interactions, routable.length)
+assert.equal(counts.links, routable.length)
 assert.equal(counts.mailboxesPolled, 1)
 assert.equal(counts.pendingMailboxes, 0)
 assert.equal(counts.markerReferences, 0, 'Auth markers must never enter target resolution')
 assert.deepEqual(storedMessageIds, retained.map((entry) => entry.id))
-assert.equal(matchedSenders.length, retained.length)
-assert.equal(stagedInteractions.length, retained.length)
-assert.equal(linkedIds.length, retained.length)
+assert.equal(matchedSenders.length, routable.length)
+assert.equal(stagedInteractions.length, routable.length)
+assert.equal(linkedIds.length, routable.length)
 assert.equal(providerCalls.filter((path) => path.includes('pageToken=page-2')).length, 1)
 assert.equal(cursorWrites.at(-1)[3], null, 'Skipped auth messages must not prevent the cursor completing')
 assert.equal(cursorWrites.at(-1)[5], null)
@@ -218,7 +249,9 @@ const mail = loadModule('app_src/lib/matonMail.ts', {
 })
 await mail.sendAuthMagicCodeEmail({ to: 'recipient@example.test', code: '123456' })
 await mail.sendAuthMagicCodeEmail({ to: 'auth@example.test', code: '123456' })
-assert.deepEqual(deliveries.map((delivery) => delivery.profile), ['auth', 'platform'])
+await mail.sendCareerDeskMagicCodeEmail({ to: 'recipient@example.test', code: '123456' })
+await mail.sendCareerDeskMagicCodeEmail({ to: 'auth@example.test', code: '123456' })
+assert.deepEqual(deliveries.map((delivery) => delivery.profile), ['auth', 'platform', 'auth', 'platform'])
 for (const [index, delivery] of deliveries.entries()) {
   const topHeaders = delivery.raw.split('\r\n\r\n')[0]
   assert.match(topHeaders, /^X-ClawPilot-Message-Purpose: auth-magic-code$/m)
@@ -241,4 +274,4 @@ await mail.sendInvitationEmail({
 })
 assert.doesNotMatch(deliveries.at(-1).raw.split('\r\n\r\n')[0], /X-ClawPilot-Message-Purpose|Auto-Submitted/)
 
-console.log('CRM auth-email exclusion: producer headers, precise legacy detection, pre-storage skip and unchanged customer ingestion passed')
+console.log('CRM auth-email exclusion: ClawPilot/Career Desk producer headers, precise legacy detection, pre-storage skip and unchanged customer ingestion passed')
