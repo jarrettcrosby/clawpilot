@@ -15,6 +15,7 @@ import {
 import {
   buildQuickBooksProviderPayload,
   quickBooksProviderEntity,
+  type QuickBooksItemUpdateDraft,
   type QuickBooksWriteDraftPayload,
   type QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
@@ -207,6 +208,44 @@ export async function createQuickBooksEntity(input: {
     entityType: entity.responseKey,
     entityId: id,
     syncToken: providerRecord.SyncToken === undefined ? null : String(providerRecord.SyncToken),
+  }
+}
+
+export async function updateQuickBooksItem(input: {
+  ownerEmail: string
+  connectionId: string
+  payload: QuickBooksItemUpdateDraft
+  providerRequestId: string
+}) {
+  let current: Record<string, unknown>
+  try {
+    const response = await requestResponse(
+      `/quickbooks/v3/company/:realmId/item/${encodeURIComponent(input.payload.itemId)}?minorversion=${MINOR_VERSION}`,
+      input.ownerEmail,
+      input.connectionId,
+    )
+    const data = await responseJson(response)
+    const record = data.Item
+    if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('QuickBooks item missing')
+    current = record as Record<string, unknown>
+  } catch {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ITEM_READ_FAILED', 'QuickBooks product could not be verified before editing')
+  }
+  if (String(current.Id || '') !== input.payload.itemId
+    || current.Active === false
+    || String(current.Type || '') !== input.payload.itemType) {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ITEM_STALE', 'QuickBooks product identity or type changed; prepare a new edit draft')
+  }
+  if (String(current.SyncToken ?? '') !== input.payload.expectedSyncToken) {
+    throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ITEM_STALE', 'QuickBooks product changed; prepare a new edit draft')
+  }
+  try {
+    return await createQuickBooksEntity({ ...input, operationKind: 'item.update' })
+  } catch (error) {
+    if (error instanceof QuickBooksProviderWriteError && error.code === 'QUICKBOOKS_5010') {
+      throw new QuickBooksProviderWriteError('QUICKBOOKS_WRITE_ITEM_STALE', 'QuickBooks product changed; prepare a new edit draft')
+    }
+    throw error
   }
 }
 

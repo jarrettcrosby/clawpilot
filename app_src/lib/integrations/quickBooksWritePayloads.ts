@@ -1,9 +1,10 @@
 import crypto from 'crypto'
 import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
+import { validateQuickBooksTaxClassification } from '@/lib/integrations/quickBooksTaxClassificationValidation'
 import { query } from '@/lib/persistence/postgres'
 
 export const QUICKBOOKS_WRITE_OPERATIONS = [
-  'customer.create', 'item.create', 'invoice.create',
+  'customer.create', 'item.create', 'item.update', 'invoice.create',
   'sales_receipt.create', 'journal_entry.create',
 ] as const
 
@@ -49,6 +50,8 @@ export type QuickBooksItemDraft = {
   parentCategoryId: string | null
   parentCategoryName: string | null
   taxable: boolean
+  taxClassificationId: string | null
+  taxClassificationName: string | null
   trackQuantity: boolean
   quantityOnHand: number | null
   inventoryStartDate: string | null
@@ -58,6 +61,20 @@ export type QuickBooksItemDraft = {
   sourceName: string | null
   sourceRestaurantGuid: string | null
   mappingScope: QuickBooksItemMappingScope | null
+}
+
+export type QuickBooksItemUpdateDraft = {
+  itemId: string
+  expectedSyncToken: string
+  itemType: 'Service' | 'NonInventory' | 'Inventory'
+  name: string
+  sku: string | null
+  description: string | null
+  unitPrice: number
+  purchaseCost: number
+  taxable: boolean
+  taxClassificationId: string | null
+  taxClassificationName: string | null
 }
 
 type QuickBooksItemSourceContext = Pick<
@@ -122,6 +139,7 @@ export type QuickBooksJournalEntryDraft = {
 export type QuickBooksWriteDraftPayload =
   | QuickBooksCustomerDraft
   | QuickBooksItemDraft
+  | QuickBooksItemUpdateDraft
   | QuickBooksInvoiceDraft
   | QuickBooksSalesReceiptDraft
   | QuickBooksJournalEntryDraft
@@ -200,10 +218,35 @@ function dateValue(value: unknown, label: string, required = false): string | nu
   return date
 }
 
+async function taxClassificationValue(
+  organizationId: string,
+  rawId: unknown,
+  itemType: 'Service' | 'NonInventory' | 'Inventory',
+) {
+  const classificationId = cleanText(rawId, 'Sales tax category', 200)
+  if (!classificationId) return null
+  let selected: { id: string; name: string } | null
+  try {
+    selected = await validateQuickBooksTaxClassification({ organizationId, classificationId, itemType })
+  } catch {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_UNAVAILABLE',
+      'QuickBooks sales tax categories could not be verified; try again before saving the draft',
+    )
+  }
+  if (!selected) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+      'Select an applicable QuickBooks sales tax category for this product type',
+    )
+  }
+  return selected
+}
+
 function operationValue(value: unknown): QuickBooksWriteOperationKind {
   const operation = String(value || '') as QuickBooksWriteOperationKind
-  if (!(['customer.create', 'item.create', 'invoice.create'] as const).includes(
-    operation as 'customer.create' | 'item.create' | 'invoice.create',
+  if (!(['customer.create', 'item.create', 'item.update', 'invoice.create'] as const).includes(
+    operation as 'customer.create' | 'item.create' | 'item.update' | 'invoice.create',
   )) {
     throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_OPERATION_INVALID', 'The accounting operation is not supported')
   }
@@ -438,6 +481,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     ? optionalNumberValue(raw.reorderPoint, 'Reorder point', { min: 0, max: 1_000_000_000 })
     : null
   const sourceContext = await validateItemSourceContext(organizationId, raw)
+  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, itemType)
   return {
     name: cleanText(raw.name, 'Product or service name', 100, true)!,
     itemType,
@@ -462,12 +506,75 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     parentCategoryId,
     parentCategoryName: parentCategory?.fully_qualified_name || null,
     taxable: raw.taxable === true,
+    taxClassificationId: taxClassification?.id || null,
+    taxClassificationName: taxClassification?.name || null,
     trackQuantity: itemType === 'Inventory',
     quantityOnHand,
     inventoryStartDate,
     reorderPoint,
     ...sourceContext,
   }
+}
+
+async function validateItemUpdateDraft(organizationId: string, raw: Record<string, unknown>): Promise<QuickBooksItemUpdateDraft> {
+  const itemId = cleanText(raw.itemId, 'QuickBooks product ID', 200, true)!
+  const expectedSyncToken = cleanText(raw.expectedSyncToken, 'QuickBooks product version', 100, true)!
+  if (!/^\d+$/.test(expectedSyncToken)) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_VERSION_INVALID', 'Refresh the QuickBooks product before editing it')
+  }
+  const result = await query<{
+    item_type: string
+    name: string
+    sku: string | null
+    description: string | null
+    unit_price: string
+    purchase_cost: string
+    taxable: boolean
+    sync_token: string | null
+    tax_classification_id: string | null
+  }>(
+    `SELECT item_type, name, sku, description, unit_price::text, purchase_cost::text, taxable,
+       source_payload->>'SyncToken' AS sync_token,
+       source_payload #>> '{TaxClassificationRef,value}' AS tax_classification_id
+     FROM quickbooks_items
+     WHERE organization_id = $1::uuid AND quickbooks_item_id = $2
+       AND active = true AND item_type IN ('Service', 'NonInventory', 'Inventory')
+     LIMIT 1`,
+    [organizationId, itemId],
+  )
+  const item = result.rows[0]
+  if (!item) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_NOT_FOUND', 'Select an active QuickBooks product or service in this organization')
+  }
+  if (!item.sync_token || item.sync_token !== expectedSyncToken) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_STALE', 'This QuickBooks product changed. Refresh it before preparing an edit')
+  }
+  if (typeof raw.taxable !== 'boolean') {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_TAXABLE_INVALID', 'Choose whether this product is taxable')
+  }
+  const draft: QuickBooksItemUpdateDraft = {
+    itemId,
+    expectedSyncToken,
+    itemType: item.item_type as QuickBooksItemUpdateDraft['itemType'],
+    name: cleanText(raw.name, 'Product or service name', 100, true)!,
+    sku: cleanText(raw.sku, 'SKU', 100),
+    description: cleanText(raw.description, 'Sales description', 4_000),
+    unitPrice: numberValue(raw.unitPrice, 'Sales price', { min: 0, max: 1_000_000_000, required: true }),
+    purchaseCost: numberValue(raw.purchaseCost, 'Purchase cost', { min: 0, max: 1_000_000_000, required: true }),
+    taxable: raw.taxable,
+    taxClassificationId: null,
+    taxClassificationName: null,
+  }
+  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, draft.itemType)
+  draft.taxClassificationId = taxClassification?.id || null
+  draft.taxClassificationName = taxClassification?.name || null
+  if (draft.name === item.name && draft.sku === item.sku && draft.description === item.description
+    && draft.unitPrice === Number(item.unit_price) && draft.purchaseCost === Number(item.purchase_cost)
+    && draft.taxable === item.taxable
+    && (!draft.taxClassificationId || draft.taxClassificationId === item.tax_classification_id)) {
+    throw new QuickBooksWriteValidationError('QUICKBOOKS_WRITE_ITEM_UNCHANGED', 'Change at least one product field before creating an edit draft')
+  }
+  return draft
 }
 
 async function validateInvoiceDraft(organizationId: string, raw: Record<string, unknown>): Promise<QuickBooksInvoiceDraft> {
@@ -541,6 +648,8 @@ export async function validateQuickBooksWriteDraft(input: {
     ? await validateCustomerDraft(input.organizationId, raw)
     : operationKind === 'item.create'
       ? await validateItemDraft(input.organizationId, raw)
+      : operationKind === 'item.update'
+        ? await validateItemUpdateDraft(input.organizationId, raw)
       : await validateInvoiceDraft(input.organizationId, raw)
   const serialized = JSON.stringify(payload)
   return {
@@ -600,11 +709,27 @@ export function buildQuickBooksProviderPayload(
       SubItem: item.parentCategoryId ? true : null,
       ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
       Taxable: item.taxable,
+      TaxClassificationRef: item.taxClassificationId ? { value: item.taxClassificationId } : null,
       TrackQtyOnHand: item.itemType === 'Inventory' ? item.trackQuantity : null,
       QtyOnHand: item.quantityOnHand,
       InvStartDate: item.inventoryStartDate,
       ReorderPoint: item.reorderPoint,
     })
+  }
+  if (operationKind === 'item.update') {
+    const item = payload as QuickBooksItemUpdateDraft
+    return {
+      Id: item.itemId,
+      SyncToken: item.expectedSyncToken,
+      sparse: true,
+      Name: item.name,
+      Sku: item.sku,
+      Description: item.description,
+      UnitPrice: item.unitPrice,
+      PurchaseCost: item.purchaseCost,
+      Taxable: item.taxable,
+      ...(item.taxClassificationId ? { TaxClassificationRef: { value: item.taxClassificationId } } : {}),
+    }
   }
   if (operationKind === 'sales_receipt.create') {
     const receipt = payload as QuickBooksSalesReceiptDraft
@@ -670,6 +795,7 @@ export function buildQuickBooksProviderPayload(
 export function quickBooksProviderEntity(operationKind: QuickBooksWriteOperationKind) {
   if (operationKind === 'customer.create') return { path: 'customer', responseKey: 'Customer' }
   if (operationKind === 'item.create') return { path: 'item', responseKey: 'Item' }
+  if (operationKind === 'item.update') return { path: 'item', responseKey: 'Item' }
   if (operationKind === 'sales_receipt.create') return { path: 'salesreceipt', responseKey: 'SalesReceipt' }
   if (operationKind === 'journal_entry.create') return { path: 'journalentry', responseKey: 'JournalEntry' }
   return { path: 'invoice', responseKey: 'Invoice' }

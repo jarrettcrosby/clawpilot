@@ -29,6 +29,8 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import { buildAccountingDraftReviewUrl } from '@/lib/accountingDraftNavigation'
+import QuickBooksTaxClassificationPicker from '@/components/accounting/QuickBooksTaxClassificationPicker'
+import type { QuickBooksTaxClassification } from '@/lib/integrations/quickBooksTaxClassifications'
 
 type DataRecord = Record<string, unknown>
 type MoneyFormatter = (amount: number, compact?: boolean) => string
@@ -95,6 +97,8 @@ type ProductDraft = {
   expenseAccountId: string
   parentCategoryId: string
   taxable: boolean
+  taxClassificationId: string
+  taxClassificationName: string
 }
 
 type PreparedProductDraft = {
@@ -284,7 +288,8 @@ function mappingDraftsForScope(workspace: DataRecord, selectedScope: MappingScop
 }
 
 function mappingIsUsable(mapping: MappingDraft) {
-  return mapping.active
+  return Boolean(mapping.scope)
+    && mapping.active
     && Boolean(mapping.targetId)
     && (!mapping.validationStatus || ['valid', 'unvalidated'].includes(mapping.validationStatus))
 }
@@ -454,7 +459,6 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const draftHistory = rows(workspace?.draftHistory)
   const latestCommand = record(workspace?.latestCommand)
   const sourceCatalog = rows(workspace?.sourceCatalog)
-  const missingMappings = rows(readiness.missingMappings)
   const commandStatus = text(latestCommand.status)
   const commandActive = ['queued', 'running'].includes(commandStatus)
   const hasAccountingDraft = Boolean(currentDraft.id)
@@ -540,7 +544,12 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     return () => window.clearTimeout(timer)
   }, [focusAction, loading, mappingDrafts, workspace])
 
-  const mappedCount = mappingDrafts.filter(mappingIsUsable).length
+  const mappedCount = workspace ? mappingDraftsForScope(workspace, scope).filter(mappingIsUsable).length : 0
+  const acceptableSuggestions = visibleMappings.filter((mapping) => (
+    mapping.suggested
+    && !dirtyMappingKeys.has(mappingDraftKey(mapping.sourceKind, mapping.sourceId))
+    && (targetOptions[mapping.targetType] || []).some((target) => target.id === mapping.targetId)
+  ))
   const locationGuid = text(locationRecord.restaurantGuid)
 
   function updateProfile(field: string, value: unknown) {
@@ -584,6 +593,22 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         : entry
     )))
     setDirtyMappingKeys((current) => new Set(current).add(key))
+    setMappingError(null)
+  }
+
+  function acceptVisibleSuggestions() {
+    const accepted = new Map(acceptableSuggestions.map((mapping) => [
+      mappingDraftKey(mapping.sourceKind, mapping.sourceId),
+      (targetOptions[mapping.targetType] || []).find((target) => target.id === mapping.targetId)!,
+    ]))
+    if (!accepted.size) return
+    setMappingDrafts((current) => current.map((entry) => {
+      const target = accepted.get(mappingDraftKey(entry.sourceKind, entry.sourceId))
+      return target
+        ? { ...entry, targetName: target.name, active: true, suggested: false, suggestionConfidence: '' }
+        : entry
+    }))
+    setDirtyMappingKeys((current) => new Set([...current, ...accepted.keys()]))
     setMappingError(null)
   }
 
@@ -684,6 +709,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       expenseAccountId: '',
       parentCategoryId: '',
       taxable: suggestion.taxable !== false,
+      taxClassificationId: '',
+      taxClassificationName: '',
     })
     setPreparedProductDraft(null)
     setPreparedProductDraftDialogOpen(false)
@@ -731,6 +758,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             expenseAccountId: productDraft.expenseAccountId,
             parentCategoryId: productDraft.parentCategoryId,
             taxable: productDraft.taxable,
+            taxClassificationId: productDraft.taxClassificationId,
+            taxClassificationName: productDraft.taxClassificationName,
             sourceKind: productDraft.sourceKind,
             sourceId: productDraft.sourceId,
             sourceRestaurantGuid: productDraft.sourceRestaurantGuid,
@@ -1249,15 +1278,16 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             <Box display="flex" alignItems="center" gap={0.75}>
               <Inventory2Rounded sx={{ color: '#A8C7FA' }} />
               <Typography fontWeight={700}>Catalog mappings</Typography>
-              <Chip size="small" variant="outlined" color={missingMappings.length ? 'warning' : 'success'} label={`${number(mappedCount)}/${number(sourceCatalog.length)} mapped`} />
+              <Chip size="small" variant="outlined" color={mappedCount < sourceCatalog.length ? 'warning' : 'success'} label={`${number(mappedCount)}/${number(sourceCatalog.length)} saved mappings`} />
             </Box>
             <Typography variant="caption" color="text.secondary">
               {scope === 'organization_default'
                 ? 'Organization-default Toast sources to stable QuickBooks targets'
                 : 'Location overrides with inherited organization defaults clearly labeled'}
+              {' Suggestions shown in the target field are previews until accepted and saved.'}
             </Typography>
           </Box>
-          <Box display="flex" gap={1}>
+          <Box display="flex" flexWrap="wrap" gap={1}>
             <TextField
               value={search}
               onChange={(event) => setSearch(event.target.value)}
@@ -1266,6 +1296,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               sx={{ ...controlSx, width: { xs: '100%', sm: 260 } }}
               InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
             />
+            {acceptableSuggestions.length ? (
+              <Button variant="outlined" size="small" onClick={acceptVisibleSuggestions} disabled={!canEdit || savingMappings} sx={{ whiteSpace: 'nowrap' }}>
+                Accept {number(acceptableSuggestions.length)} {acceptableSuggestions.length === 1 ? 'suggestion' : 'suggestions'}
+              </Button>
+            ) : null}
             <Button variant="outlined" size="small" startIcon={savingMappings ? <CircularProgress size={16} /> : <SaveRounded />} onClick={saveMappings} disabled={!canEdit || savingMappings || dirtyMappingKeys.size === 0}>
               Save
             </Button>
@@ -1311,7 +1346,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               || {
                 id: mapping.targetId,
                 name: mapping.targetName || mapping.targetId,
-                detail: mapping.validationStatus ? mapping.validationStatus.replaceAll('_', ' ') : 'Saved target',
+                detail: mapping.validationStatus ? mapping.validationStatus.replaceAll('_', ' ') : mapping.suggested && !mapping.scope ? 'Suggested target · not saved' : 'Saved target',
                 classification: '',
                 accountType: '',
                 itemType: '',
@@ -1345,7 +1380,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 <Box minWidth={0} flex={1}>
                   <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
                     <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
-                    {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested" /> : null}
+                    {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested · not saved" /> : null}
                     {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
                     {exactToastProductSource && source?.hasImage === true ? (
                       <Chip size="small" variant="outlined" label="Image available" />
@@ -1536,7 +1571,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               ) : null}
               <TextField label="Product name" value={productDraft.name} onChange={(event) => updateProductDraft({ name: event.target.value })} required sx={controlSx} />
               <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={1.25}>
-                <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'] })} sx={controlSx}>
+                <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'], taxClassificationId: '', taxClassificationName: '' })} sx={controlSx}>
                   <MenuItem value="NonInventory">Non-inventory</MenuItem>
                   <MenuItem value="Service">Service</MenuItem>
                 </TextField>
@@ -1585,6 +1620,22 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               />
               <TextField label="Description" value={productDraft.description} onChange={(event) => updateProductDraft({ description: event.target.value })} multiline minRows={2} sx={controlSx} />
               <FormControlLabel control={<Switch checked={productDraft.taxable} onChange={(event) => updateProductDraft({ taxable: event.target.checked })} />} label="Taxable" />
+              <QuickBooksTaxClassificationPicker
+                key={productDraft.itemType}
+                itemType={productDraft.itemType}
+                value={productDraft.taxClassificationId ? { id: productDraft.taxClassificationId, name: productDraft.taxClassificationName } : null}
+                onChange={(choice) => updateProductDraft({ taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '' })}
+                loadPage={async (parentId) => {
+                  const parameters = new URLSearchParams({ itemType: productDraft.itemType })
+                  if (parentId) parameters.set('parentId', parentId)
+                  const response = await fetch(`/api/accounting/quickbooks/tax-classifications?${parameters}`, { cache: 'no-store' })
+                  const payload = await response.json() as { ok?: boolean; error?: string; categories?: QuickBooksTaxClassification[] }
+                  if (!response.ok || !payload.ok || !Array.isArray(payload.categories)) {
+                    throw new Error(payload.error || 'QuickBooks sales tax categories are unavailable')
+                  }
+                  return payload.categories
+                }}
+              />
             </Stack>
           ) : null}
         </DialogContent>

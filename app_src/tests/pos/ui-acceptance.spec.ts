@@ -820,6 +820,87 @@ test('POS accounting saves only one exact changed mapping from a catalog larger 
   expect(clearedMappings[0]).toMatchObject({ targetId, targetName, active: false })
 })
 
+test('POS accounting accepts only visible catalog-backed suggestions before saving them', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  await mockPos(page)
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+
+  const validSourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
+  const staleSourceId = '24351ea1-ad68-4f2c-85e6-da00661bab4e'
+  const target = { id: '35', name: 'Saratoga Sparkling 12 oz' }
+  let savedMapping: Record<string, unknown> | null = null
+  const submittedBodies: Array<Record<string, unknown>> = []
+  await page.route((url) => url.pathname === '/api/pos/accounting', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      submittedBodies.push(body)
+      const submitted = (body.mappings as Array<Record<string, unknown>>)[0]
+      savedMapping = { ...submitted, scope: body.scope, mappingRevision: 1, validationStatus: 'valid' }
+      await route.fulfill({ json: { ok: true, mappings: [savedMapping], changedCount: 1 } })
+      return
+    }
+    await route.fulfill({ json: {
+      ok: true,
+      capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+      accounting: {
+        organizationId: posSnapshot.organizationId,
+        location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+        profile: {
+          scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+          breakoutDimensions: [], trackSalesTax: true, memoMode: 'standard', customMemo: null,
+          customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+          autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+          batchHoldPolicy: 'hold', emailNotificationsEnabled: false,
+        },
+        quickBooks: { configured: true, bound: true, companyName: 'Acceptance Books', status: 'active', catalog: {} },
+        sourceCatalog: [
+          { sourceKind: 'sales_item', sourceId: validSourceId, sourceName: 'Sparkling Water',
+            suggestedTarget: { id: target.id, name: target.name, confidence: 'exact' } },
+          { sourceKind: 'sales_item', sourceId: staleSourceId, sourceName: 'Stale Soda',
+            suggestedTarget: { id: 'retired-36', name: 'Retired Soda', confidence: 'exact' } },
+        ],
+        mappings: savedMapping ? [savedMapping] : [],
+        targets: {
+          accounts: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [], locations: [],
+          items: [{ id: target.id, name: target.name, fullyQualifiedName: target.name, itemType: 'NonInventory' }],
+        },
+        preview: { readiness: { missingMappings: [] }, salesReceipt: {}, journal: {}, evidence: {} },
+        draft: null, draftHistory: [], latestCommand: null,
+      },
+    } })
+  })
+
+  await page.goto('/#pos')
+  if (new URL(page.url()).pathname === '/login') {
+    throw new Error('Target requires authentication; set UI_AUTH_PASSWORD and UI_OPERATOR_SECRET together')
+  }
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  const closeGuide = page.getByRole('button', { name: 'Close POS guide' })
+  if (await closeGuide.isVisible()) await closeGuide.click()
+  await activatePos(page)
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+
+  await expect(page.getByText('0/2 saved mappings')).toBeVisible()
+  await expect(page.getByText('Suggested · not saved')).toHaveCount(2)
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: 'Accept 1 suggestion' }).click()
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled()
+  await expect(page.getByText('0/2 saved mappings')).toBeVisible()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+
+  await expect.poll(() => submittedBodies.length).toBe(1)
+  expect(submittedBodies[0]).toMatchObject({ action: 'save-mappings', scope: 'organization_default' })
+  expect(submittedBodies[0].mappings).toEqual([{
+    sourceKind: 'sales_item', sourceId: validSourceId, sourceName: 'Sparkling Water',
+    targetType: 'item', targetId: target.id, targetName: target.name, active: true,
+  }])
+  await expect(page.getByText('1/2 saved mappings')).toBeVisible()
+  await expect(page.getByText('Suggested · not saved')).toHaveCount(1)
+})
+
 test('POS accounting keeps organization defaults and location overrides visibly separated', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 })
   await authenticateIfConfigured(page)

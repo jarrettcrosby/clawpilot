@@ -2,6 +2,7 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
 import type {
   QuickBooksItemDraft,
+  QuickBooksItemUpdateDraft,
   QuickBooksWriteDraftPayload,
   QuickBooksWriteOperationKind,
 } from '@/lib/integrations/quickBooksWritePayloads'
@@ -176,6 +177,9 @@ function requestSummary(operationKind: QuickBooksWriteOperationKind, payload: Qu
       debitAmount: record.debitAmount,
       creditAmount: record.creditAmount,
     }
+  }
+  if (operationKind === 'item.update') {
+    return { name: record.name, itemId: record.itemId }
   }
   return { name: record.displayName || record.name }
 }
@@ -463,6 +467,9 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
       if (current.status !== 'failed' && current.status !== 'dead') {
         throw new QuickBooksWriteRequestError('QUICKBOOKS_WRITE_STATE_CONFLICT', 'Only a failed accounting change can be retried', 409)
       }
+      if (current.operation_kind === 'item.update' && current.last_error_code === 'QUICKBOOKS_WRITE_ITEM_STALE') {
+        throw new QuickBooksWriteRequestError('QUICKBOOKS_WRITE_ITEM_STALE', 'This product changed in QuickBooks. Prepare a new edit draft', 409)
+      }
       nextStatus = 'approved'
     } else {
       if (!['draft', 'pending_approval', 'approved', 'failed', 'dead'].includes(current.status)) {
@@ -472,6 +479,20 @@ export async function transitionQuickBooksWriteRequestInPostgres(input: {
     }
 
     if (input.action === 'approve' || input.action === 'retry') {
+      if (current.operation_kind === 'item.update') {
+        const update = current.request_payload as QuickBooksItemUpdateDraft
+        const item = await client.query<{ sync_token: string | null }>(
+          `SELECT source_payload->>'SyncToken' AS sync_token
+           FROM quickbooks_items
+           WHERE organization_id = $1::uuid AND quickbooks_item_id = $2
+             AND active = true AND item_type = $3
+           LIMIT 1`,
+          [input.organizationId, update.itemId, update.itemType],
+        )
+        if (!item.rows[0]?.sync_token || item.rows[0].sync_token !== update.expectedSyncToken) {
+          throw new QuickBooksWriteRequestError('QUICKBOOKS_WRITE_ITEM_STALE', 'This QuickBooks product changed. Refresh it and prepare a new edit draft', 409)
+        }
+      }
       await reservePosAccountingItemMappingForWrite(client, {
         organizationId: input.organizationId,
         requestId: current.id,
@@ -772,7 +793,7 @@ async function reservePosAccountingItemMappingForWrite(
 
 async function cacheCreatedQuickBooksItem(
   client: Parameters<Parameters<typeof withTransaction>[0]>[0],
-  input: { job: QuickBooksWriteJob; providerEntityId: string },
+  input: { job: QuickBooksWriteJob; providerEntityId: string; providerSyncToken: string | null },
 ) {
   if (input.job.operationKind !== 'item.create') return
   const item = normalizeQuickBooksItemDraftForStoredCompatibility(
@@ -825,6 +846,7 @@ async function cacheCreatedQuickBooksItem(
       item.taxable,
       JSON.stringify({
         Id: input.providerEntityId,
+        SyncToken: input.providerSyncToken,
         Name: item.name,
         FullyQualifiedName: fullyQualifiedName,
         Type: item.itemType,
@@ -841,11 +863,66 @@ async function cacheCreatedQuickBooksItem(
         PrefVendorRef: item.preferredVendorId ? { value: item.preferredVendorId } : null,
         ParentRef: item.parentCategoryId ? { value: item.parentCategoryId } : null,
         Taxable: item.taxable,
+        TaxClassificationRef: item.taxClassificationId ? { value: item.taxClassificationId } : null,
         InvStartDate: item.inventoryStartDate,
         ReorderPoint: item.reorderPoint,
       }),
     ],
   )
+}
+
+export async function cacheUpdatedQuickBooksItemInPostgres(input: {
+  organizationId: string
+  payload: QuickBooksItemUpdateDraft
+  providerSyncToken: string | null
+}) {
+  if (!input.providerSyncToken) return false
+  const existing = await query<{ fully_qualified_name: string }>(
+    `SELECT fully_qualified_name
+     FROM quickbooks_items
+     WHERE organization_id = $1::uuid AND quickbooks_item_id = $2
+       AND source_payload->>'SyncToken' = $3
+     LIMIT 1`,
+    [input.organizationId, input.payload.itemId, input.payload.expectedSyncToken],
+  )
+  if (!existing.rows[0]) return false
+  const currentQualifiedName = existing.rows[0].fully_qualified_name
+  const categoryDelimiter = currentQualifiedName.lastIndexOf(':')
+  const fullyQualifiedName = categoryDelimiter >= 0
+    ? `${currentQualifiedName.slice(0, categoryDelimiter + 1)}${input.payload.name}`
+    : input.payload.name
+  const sourcePatch: Record<string, unknown> = {
+    Id: input.payload.itemId,
+    SyncToken: input.providerSyncToken,
+    Name: input.payload.name,
+    FullyQualifiedName: fullyQualifiedName,
+    Sku: input.payload.sku,
+    Description: input.payload.description,
+    UnitPrice: input.payload.unitPrice,
+    PurchaseCost: input.payload.purchaseCost,
+    Taxable: input.payload.taxable,
+  }
+  if (input.payload.taxClassificationId) {
+    sourcePatch.TaxClassificationRef = {
+      value: input.payload.taxClassificationId,
+      name: input.payload.taxClassificationName,
+    }
+  }
+  const updated = await query(
+    `UPDATE quickbooks_items SET
+       name = $4, fully_qualified_name = $5, sku = $6, description = $7,
+       unit_price = $8, purchase_cost = $9, taxable = $10,
+       source_payload = source_payload || $11::jsonb, synced_at = now()
+     WHERE organization_id = $1::uuid AND quickbooks_item_id = $2
+       AND source_payload->>'SyncToken' = $3`,
+    [
+      input.organizationId, input.payload.itemId, input.payload.expectedSyncToken,
+      input.payload.name, fullyQualifiedName, input.payload.sku, input.payload.description,
+      input.payload.unitPrice, input.payload.purchaseCost, input.payload.taxable,
+      JSON.stringify(sourcePatch),
+    ],
+  )
+  return updated.rowCount === 1
 }
 
 async function createPosAccountingItemMappingIfAbsent(
@@ -1008,6 +1085,7 @@ export async function completeQuickBooksWriteJobInPostgres(input: {
     await cacheCreatedQuickBooksItem(client, {
       job: input.job,
       providerEntityId: input.providerEntityId,
+      providerSyncToken: input.providerSyncToken,
     })
     const resultPayload = {
       entityType: input.providerEntityType,
@@ -1073,6 +1151,7 @@ export async function failQuickBooksWriteJobInPostgres(input: {
   error: unknown
 }) {
   const dead = input.job.attemptCount >= input.job.maxAttempts
+    || (input.job.operationKind === 'item.update' && input.errorCode === 'QUICKBOOKS_WRITE_ITEM_STALE')
   const message = safeError(input.error)
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(client, `quickbooks-binding:${input.job.organizationId}`)

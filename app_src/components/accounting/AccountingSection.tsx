@@ -36,6 +36,7 @@ import { accountingExplorerViewParameter, consumeAccountingDraftTarget } from '@
 import { formatUserDateTime } from '@/lib/userDateTime'
 import PosAccountingParityPanel from './PosAccountingParityPanel'
 import QuickBooksActionsPanel from './QuickBooksActionsPanel'
+import QuickBooksProductEditDialog, { type EditableQuickBooksProduct } from './QuickBooksProductEditDialog'
 
 type View = 'overview' | 'actions' | 'pos-parity' | 'reports' | 'invoices' | 'receipts' | 'transactions' | 'products' | 'accounts' | 'customers' | 'vendors' | 'attachments'
 type Range = '30d' | '90d' | 'ytd' | '12m' | 'all'
@@ -713,6 +714,7 @@ export default function AccountingSection() {
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<{ view: View; row: ExplorerRow } | null>(null)
+  const [editingProduct, setEditingProduct] = useState<EditableQuickBooksProduct | null>(null)
   const [invoiceDetail, setInvoiceDetail] = useState<InvoiceDetail | null>(null)
   const [invoiceLoading, setInvoiceLoading] = useState(false)
   const [invoiceError, setInvoiceError] = useState<string | null>(null)
@@ -898,6 +900,22 @@ export default function AccountingSection() {
     } finally {
       setRefreshing(false)
     }
+  }
+
+  function openProductEdit(row: ExplorerRow) {
+    setEditingProduct({
+      id: row.id,
+      syncToken: textValue(row, 'syncToken', ''),
+      name: textValue(row, 'name', ''),
+      sku: textValue(row, 'sku', ''),
+      description: textValue(row, 'description', ''),
+      unitPrice: Number(value(row, 'unitPrice') || 0),
+      purchaseCost: Number(value(row, 'purchaseCost') || 0),
+      taxable: value(row, 'taxable') === true,
+      itemType: textValue(row, 'itemType', '') as EditableQuickBooksProduct['itemType'],
+      taxClassificationId: textValue(row, 'taxClassificationId', ''),
+      taxClassificationName: textValue(row, 'taxClassificationName', ''),
+    })
   }
 
   const columns = useMemo<Column[]>(() => {
@@ -1265,6 +1283,12 @@ export default function AccountingSection() {
                       <Box sx={{ '& .MuiTypography-root': { whiteSpace: 'normal' } }}>{column.render(selected.row)}</Box>
                     </Box>
                   ))}
+                  {selected.view === 'products' ? (
+                    <Box>
+                      <Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Sales tax category</Typography>
+                      <Typography variant="body2">{textValue(selected.row, 'taxClassificationName', textValue(selected.row, 'taxClassificationId'))}</Typography>
+                    </Box>
+                  ) : null}
                   {selected.view !== 'accounts' && selected.view !== 'products' && selected.view !== 'customers' && selected.view !== 'vendors' ? (
                     <>
                       <Box><Typography variant="caption" color="text.disabled" display="block" mb={0.5}>Due date</Typography><Typography variant="body2">{dateOnly(value(selected.row, 'dueDate'))}</Typography></Box>
@@ -1291,9 +1315,40 @@ export default function AccountingSection() {
                 </Stack>
               )}
             </Box>
+            {selected.view === 'products' && capabilities?.canPrepare && value(selected.row, 'active') === true && textValue(selected.row, 'itemType', '') !== 'Category' ? (
+              <>
+                <Divider />
+                <Box px={2.5} py={1.5}>
+                  <Button
+                    variant="outlined"
+                    fullWidth
+                    onClick={() => openProductEdit(selected.row)}
+                    disabled={!textValue(selected.row, 'syncToken', '')}
+                  >
+                    Edit product · prepare for review
+                  </Button>
+                  {!textValue(selected.row, 'syncToken', '') ? (
+                    <Typography variant="caption" color="text.secondary" display="block" mt={0.75}>
+                      Refresh QuickBooks to load the product version before editing.
+                    </Typography>
+                  ) : null}
+                </Box>
+              </>
+            ) : null}
           </Box>
         ) : null}
       </Drawer>
+      <QuickBooksProductEditDialog
+        product={editingProduct}
+        onClose={() => setEditingProduct(null)}
+        onPrepared={(requestId) => {
+          setEditingProduct(null)
+          setSelected(null)
+          setInitialActionRequestId(requestId)
+          setView('actions')
+          setNotice('Product edit draft prepared. Review and submit it before approval and posting.')
+        }}
+      />
     </Box>
   )
 }

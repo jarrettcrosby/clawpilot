@@ -33,10 +33,12 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import VerifiedOutlined from '@mui/icons-material/VerifiedOutlined'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import QuickBooksTaxClassificationPicker from '@/components/accounting/QuickBooksTaxClassificationPicker'
 import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
+import type { QuickBooksTaxClassification } from '@/lib/integrations/quickBooksTaxClassifications'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
-type OperationKind = 'customer.create' | 'item.create' | 'invoice.create'
+type OperationKind = 'customer.create' | 'item.create' | 'item.update' | 'invoice.create'
 type RequestStatus = 'draft' | 'pending_approval' | 'approved' | 'processing' | 'succeeded' | 'failed' | 'dead' | 'cancelled'
 type Capabilities = { canView: boolean; canManage: boolean; canPrepare: boolean; canApprove: boolean }
 
@@ -104,6 +106,7 @@ type ItemFormValue = {
   purchaseInformationEnabled: boolean; purchaseDescription: string; purchaseCost: string
   incomeAccountId: string; expenseAccountId: string; assetAccountId: string
   preferredVendorId: string; parentCategoryId: string; taxable: boolean
+  taxClassificationId: string; taxClassificationName: string
   quantityOnHand: string; inventoryStartDate: string; reorderPoint: string
 }
 type InvoiceFormValue = {
@@ -113,6 +116,7 @@ type InvoiceFormValue = {
 const operationLabels: Record<OperationKind, string> = {
   'customer.create': 'New customer',
   'item.create': 'New product or service',
+  'item.update': 'Edit product or service',
   'invoice.create': 'New invoice',
 }
 
@@ -164,7 +168,7 @@ function newLine(): InvoiceLine {
 function requestTitle(request: WriteRequest) {
   const payload = request.requestPayload
   if (request.operationKind === 'customer.create') return String(payload.displayName || 'Customer')
-  if (request.operationKind === 'item.create') return String(payload.name || 'Product or service')
+  if (request.operationKind === 'item.create' || request.operationKind === 'item.update') return String(payload.name || 'Product or service')
   return String(payload.customerName || 'Invoice')
 }
 
@@ -190,6 +194,8 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
   const payload = request.operationKind === 'item.create'
     ? normalizeQuickBooksItemDraftForStoredCompatibility(request.requestPayload)
     : request.requestPayload
+  const isItemUpdate = request.operationKind === 'item.update'
+  const isItemWrite = request.operationKind === 'item.create' || isItemUpdate
   const mappingResult = dataRecord(request.resultPayload.posAccountingMapping)
   const lines = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : []
   return (
@@ -199,23 +205,26 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
         <Chip size="small" variant="outlined" label={operationLabels[request.operationKind]} />
       </Box>
       <DetailField label="Record" value={requestTitle(request)} />
+      {isItemUpdate ? <DetailField label="QuickBooks item ID" value={payload.itemId} /> : null}
+      {isItemUpdate ? <DetailField label="Expected QuickBooks version" value={payload.expectedSyncToken} /> : null}
       <DetailField label="Company" value={payload.companyName} />
       <DetailField label="Email" value={payload.email || payload.billingEmail} />
       <DetailField label="Phone" value={payload.phone} />
       <DetailField label="Type" value={payload.itemType} />
       <DetailField label="SKU" value={payload.sku} />
       <DetailField label="Category" value={payload.parentCategoryName} />
-      <DetailField label="Sales price" value={payload.itemType ? money(Number(payload.unitPrice || 0)) : null} />
+      <DetailField label="Sales price" value={isItemWrite ? money(Number(payload.unitPrice || 0)) : null} />
       <DetailField label="Income account" value={payload.incomeAccountName} />
       <DetailField label="Purchase description" value={payload.purchaseDescription} />
-      <DetailField label="Purchase cost" value={payload.purchaseInformationEnabled ? money(Number(payload.purchaseCost || 0)) : null} />
+      <DetailField label="Purchase cost" value={isItemUpdate || payload.purchaseInformationEnabled ? money(Number(payload.purchaseCost || 0)) : null} />
       <DetailField label="Expense or COGS account" value={payload.expenseAccountName} />
       <DetailField label="Preferred vendor" value={payload.preferredVendorName} />
       <DetailField label="Inventory asset account" value={payload.assetAccountName} />
       <DetailField label="Initial quantity on hand" value={payload.quantityOnHand} />
       <DetailField label="Inventory as-of date" value={payload.inventoryStartDate} />
       <DetailField label="Reorder point" value={payload.reorderPoint} />
-      <DetailField label="Taxable" value={payload.itemType ? (payload.taxable ? 'Yes' : 'No') : null} />
+      <DetailField label="Taxable" value={isItemWrite ? (payload.taxable ? 'Yes' : 'No') : null} />
+      <DetailField label="Sales tax category" value={payload.taxClassificationName || payload.taxClassificationId} />
       <DetailField label="Toast source" value={payload.sourceName} />
       <DetailField label="Toast location" value={payload.sourceRestaurantGuid} />
       <DetailField label="Mapping scope" value={payload.mappingScope === 'location_override' ? 'Location override' : payload.mappingScope === 'organization_default' ? 'Organization default' : null} />
@@ -290,7 +299,7 @@ export default function QuickBooksActionsPanel({
     name: '', itemType: 'Service', sku: '', description: '', unitPrice: '', purchaseCost: '',
     purchaseInformationEnabled: false, purchaseDescription: '',
     incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-    parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+    parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
   })
   const [invoice, setInvoice] = useState({
     customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '',
@@ -350,7 +359,7 @@ export default function QuickBooksActionsPanel({
         name: '', itemType: 'Service', sku: '', description: '', unitPrice: '',
         purchaseInformationEnabled: false, purchaseDescription: '', purchaseCost: '',
         incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-        parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+        parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
       })
     } else {
       setInvoice({ customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '' })
@@ -444,6 +453,17 @@ export default function QuickBooksActionsPanel({
   const invoiceTotal = invoiceLines.reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.unitPrice || 0), 0)
   const productPostingOnly = workspace?.connection.postingOperations.length === 1
     && workspace.connection.postingOperations[0] === 'item.create'
+
+  async function loadTaxClassificationPage(itemType: ItemFormValue['itemType'], parentId: string | null): Promise<QuickBooksTaxClassification[]> {
+    const parameters = new URLSearchParams({ itemType })
+    if (parentId) parameters.set('parentId', parentId)
+    const response = await fetch(`/api/accounting/quickbooks/tax-classifications?${parameters}`, { cache: 'no-store' })
+    const payload = await response.json() as { ok?: boolean; error?: string; categories?: QuickBooksTaxClassification[] }
+    if (!response.ok || !payload.ok || !Array.isArray(payload.categories)) {
+      throw new Error(payload.error || 'QuickBooks sales tax categories are unavailable')
+    }
+    return payload.categories
+  }
 
   if (loading && !workspace) return <Box display="grid" sx={{ placeItems: 'center' }} minHeight={320}><CircularProgress /></Box>
 
@@ -553,6 +573,7 @@ export default function QuickBooksActionsPanel({
                 assetAccounts={inventoryAssetAccounts}
                 categories={workspace?.referenceData.categories || []}
                 vendors={workspace?.referenceData.vendors || []}
+                loadTaxClassificationPage={(parentId) => loadTaxClassificationPage(item.itemType, parentId)}
               /> : null}
               {formKind === 'invoice.create' && workspace ? (
                 <InvoiceForm
@@ -633,7 +654,7 @@ function CustomerForm({ value, onChange }: { value: CustomerFormValue; onChange:
   )
 }
 
-function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccounts, categories, vendors }: {
+function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccounts, categories, vendors, loadTaxClassificationPage }: {
   value: ItemFormValue
   onChange: (value: ItemFormValue) => void
   incomeAccounts: ReferenceData['accounts']
@@ -641,6 +662,7 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
   assetAccounts: ReferenceData['accounts']
   categories: ReferenceData['categories']
   vendors: ReferenceData['vendors']
+  loadTaxClassificationPage: (parentId: string | null) => Promise<QuickBooksTaxClassification[]>
 }) {
   const field = (key: Exclude<keyof ItemFormValue, 'taxable' | 'purchaseInformationEnabled'>) => (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...value, [key]: event.target.value })
   const isInventory = value.itemType === 'Inventory'
@@ -661,6 +683,8 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
           quantityOnHand: itemType === 'Inventory' ? value.quantityOnHand : '0',
           inventoryStartDate: itemType === 'Inventory' ? (value.inventoryStartDate || today()) : '',
           reorderPoint: itemType === 'Inventory' ? value.reorderPoint : '',
+          taxClassificationId: '',
+          taxClassificationName: '',
         })
       }} sx={fieldSx}>
         <MenuItem value="Service">Service</MenuItem>
@@ -677,6 +701,13 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
       <TextField type="number" label="Sales price or rate" value={value.unitPrice} onChange={field('unitPrice')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} />
       <TextField select required label="Income account" value={value.incomeAccountId} onChange={field('incomeAccountId')} sx={fieldSx}>{incomeAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}</TextField>
       <FormControlLabel control={<Checkbox checked={value.taxable} onChange={(event) => onChange({ ...value, taxable: event.target.checked })} />} label="Taxable" />
+      <QuickBooksTaxClassificationPicker
+        key={value.itemType}
+        itemType={value.itemType as 'Service' | 'NonInventory' | 'Inventory'}
+        value={value.taxClassificationId ? { id: value.taxClassificationId, name: value.taxClassificationName } : null}
+        onChange={(choice) => onChange({ ...value, taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '' })}
+        loadPage={loadTaxClassificationPage}
+      />
       {!isInventory ? <FormControlLabel
         control={<Checkbox checked={value.purchaseInformationEnabled} onChange={(event) => onChange({
           ...value,
