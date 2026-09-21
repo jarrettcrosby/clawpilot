@@ -16,9 +16,6 @@ export type QuickBooksTaxClassification = {
 
 const SUPPORTED_ITEM_TYPES = new Set(['Inventory', 'NonInventory', 'Service'])
 const DEFAULT_MINOR_VERSION = '75'
-// Intuit documents level-one categories and their level-two children.
-const DEFAULT_MAX_DEPTH = 2
-const DEFAULT_MAX_RECORDS = 20_000
 
 function objectValue(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -68,53 +65,40 @@ export function parseQuickBooksTaxClassificationPage(payload: unknown): QuickBoo
 
 export function quickBooksTaxClassificationPath(input: {
   parentId?: string
+  allLevels?: boolean
   minorVersion?: string
 } = {}): string {
+  if (input.allLevels && input.parentId) throw new Error('QuickBooks tax classification query is ambiguous')
   const search = new URLSearchParams()
   if (input.parentId) search.set('parentId', input.parentId)
-  else search.set('level', '1')
+  else if (!input.allLevels) search.set('level', '1')
   search.set('minorversion', input.minorVersion || DEFAULT_MINOR_VERSION)
   return `/quickbooks/v3/company/:realmId/taxclassification?${search.toString()}`
 }
 
-/**
- * Read the company-specific category tree using the existing bound QuickBooks
- * connection's request function. The caller owns auth, pacing, and retries.
- */
-export async function readQuickBooksTaxClassifications(
-  request: (pathname: string) => Promise<unknown>,
-  options: { minorVersion?: string; maxDepth?: number; maxRecords?: number } = {},
-): Promise<QuickBooksTaxClassification[]> {
-  const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH
-  const maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS
-  if (!Number.isInteger(maxDepth) || maxDepth < 1 || !Number.isInteger(maxRecords) || maxRecords < 1) {
-    throw new Error('QuickBooks tax classification read limits are invalid')
+/** Resolve a provider row through its exact ParentRef chain to a level-one root. */
+export function resolveQuickBooksTaxClassificationChain(
+  categories: QuickBooksTaxClassification[],
+  selectedId: string,
+): QuickBooksTaxClassification[] | null {
+  const byId = new Map<string, QuickBooksTaxClassification>()
+  for (const category of categories) {
+    if (byId.has(category.id)) return null
+    byId.set(category.id, category)
   }
-  const result: QuickBooksTaxClassification[] = []
+  const chain: QuickBooksTaxClassification[] = []
   const seen = new Set<string>()
-  const pending: Array<{ parent: QuickBooksTaxClassification | null; depth: number }> = [{ parent: null, depth: 1 }]
-  while (pending.length) {
-    const { parent, depth } = pending.shift()!
-    const page = parseQuickBooksTaxClassificationPage(await request(quickBooksTaxClassificationPath({
-      parentId: parent?.id,
-      minorVersion: options.minorVersion,
-    })))
-    for (const row of page) {
-      if (seen.has(row.id)) continue
-      if (result.length >= maxRecords) throw new Error('QuickBooks tax classification catalog exceeded the supported size')
-      if (parent && row.parentId && row.parentId !== parent.id) {
-        throw new Error('QuickBooks tax classification parent is inconsistent')
-      }
-      if (row.level !== depth) throw new Error('QuickBooks tax classification level is inconsistent')
-      const classification = parent && !row.parentId
-        ? { ...row, parentId: parent.id, parentName: parent.name }
-        : row
-      seen.add(classification.id)
-      result.push(classification)
-      if (depth < maxDepth) pending.push({ parent: classification, depth: depth + 1 })
-    }
+  let current = byId.get(selectedId)
+  while (current && chain.length < 20) {
+    if (seen.has(current.id)) return null
+    seen.add(current.id)
+    chain.push(current)
+    if (!current.parentId) return current.level === 1 ? chain.reverse() : null
+    const parent = byId.get(current.parentId)
+    if (!parent || current.level !== parent.level + 1) return null
+    current = parent
   }
-  return result
+  return null
 }
 
 export function taxClassificationAppliesToItem(

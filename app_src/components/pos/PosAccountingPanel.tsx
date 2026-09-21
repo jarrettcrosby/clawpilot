@@ -99,6 +99,7 @@ type ProductDraft = {
   taxable: boolean
   taxClassificationId: string
   taxClassificationName: string
+  taxClassificationParentId: string
 }
 
 type PreparedProductDraft = {
@@ -711,6 +712,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       taxable: suggestion.taxable !== false,
       taxClassificationId: '',
       taxClassificationName: '',
+      taxClassificationParentId: '',
     })
     setPreparedProductDraft(null)
     setPreparedProductDraftDialogOpen(false)
@@ -760,6 +762,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             taxable: productDraft.taxable,
             taxClassificationId: productDraft.taxClassificationId,
             taxClassificationName: productDraft.taxClassificationName,
+            taxClassificationParentId: productDraft.taxClassificationParentId,
             sourceKind: productDraft.sourceKind,
             sourceId: productDraft.sourceId,
             sourceRestaurantGuid: productDraft.sourceRestaurantGuid,
@@ -1571,7 +1574,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               ) : null}
               <TextField label="Product name" value={productDraft.name} onChange={(event) => updateProductDraft({ name: event.target.value })} required sx={controlSx} />
               <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={1.25}>
-                <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'], taxClassificationId: '', taxClassificationName: '' })} sx={controlSx}>
+                <TextField select label="Product type" value={productDraft.itemType} onChange={(event) => updateProductDraft({ itemType: event.target.value as ProductDraft['itemType'], taxClassificationId: '', taxClassificationName: '', taxClassificationParentId: '' })} sx={controlSx}>
                   <MenuItem value="NonInventory">Non-inventory</MenuItem>
                   <MenuItem value="Service">Service</MenuItem>
                 </TextField>
@@ -1623,8 +1626,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               <QuickBooksTaxClassificationPicker
                 key={productDraft.itemType}
                 itemType={productDraft.itemType}
-                value={productDraft.taxClassificationId ? { id: productDraft.taxClassificationId, name: productDraft.taxClassificationName } : null}
-                onChange={(choice) => updateProductDraft({ taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '' })}
+                value={productDraft.taxClassificationId ? { id: productDraft.taxClassificationId, name: productDraft.taxClassificationName, parentId: productDraft.taxClassificationParentId || null } : null}
+                onChange={(choice) => updateProductDraft({ taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '', taxClassificationParentId: choice?.parentId || '' })}
                 loadPage={async (parentId) => {
                   const parameters = new URLSearchParams({ itemType: productDraft.itemType })
                   if (parentId) parameters.set('parentId', parentId)

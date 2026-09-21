@@ -106,7 +106,7 @@ type ItemFormValue = {
   purchaseInformationEnabled: boolean; purchaseDescription: string; purchaseCost: string
   incomeAccountId: string; expenseAccountId: string; assetAccountId: string
   preferredVendorId: string; parentCategoryId: string; taxable: boolean
-  taxClassificationId: string; taxClassificationName: string
+  taxClassificationId: string; taxClassificationName: string; taxClassificationParentId: string
   quantityOnHand: string; inventoryStartDate: string; reorderPoint: string
 }
 type InvoiceFormValue = {
@@ -299,7 +299,7 @@ export default function QuickBooksActionsPanel({
     name: '', itemType: 'Service', sku: '', description: '', unitPrice: '', purchaseCost: '',
     purchaseInformationEnabled: false, purchaseDescription: '',
     incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-    parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+    parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', taxClassificationParentId: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
   })
   const [invoice, setInvoice] = useState({
     customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '',
@@ -359,7 +359,7 @@ export default function QuickBooksActionsPanel({
         name: '', itemType: 'Service', sku: '', description: '', unitPrice: '',
         purchaseInformationEnabled: false, purchaseDescription: '', purchaseCost: '',
         incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-        parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+        parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', taxClassificationParentId: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
       })
     } else {
       setInvoice({ customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '' })
@@ -685,6 +685,7 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
           reorderPoint: itemType === 'Inventory' ? value.reorderPoint : '',
           taxClassificationId: '',
           taxClassificationName: '',
+          taxClassificationParentId: '',
         })
       }} sx={fieldSx}>
         <MenuItem value="Service">Service</MenuItem>
@@ -704,8 +705,8 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
       <QuickBooksTaxClassificationPicker
         key={value.itemType}
         itemType={value.itemType as 'Service' | 'NonInventory' | 'Inventory'}
-        value={value.taxClassificationId ? { id: value.taxClassificationId, name: value.taxClassificationName } : null}
-        onChange={(choice) => onChange({ ...value, taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '' })}
+        value={value.taxClassificationId ? { id: value.taxClassificationId, name: value.taxClassificationName, parentId: value.taxClassificationParentId || null } : null}
+        onChange={(choice) => onChange({ ...value, taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '', taxClassificationParentId: choice?.parentId || '' })}
         loadPage={loadTaxClassificationPage}
       />
       {!isInventory ? <FormControlLabel

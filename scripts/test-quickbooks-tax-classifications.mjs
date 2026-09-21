@@ -18,7 +18,7 @@ vm.runInNewContext(compiled, { module, exports: module.exports, URLSearchParams,
 const {
   parseQuickBooksTaxClassificationPage,
   quickBooksTaxClassificationPath,
-  readQuickBooksTaxClassifications,
+  resolveQuickBooksTaxClassificationChain,
   taxClassificationAppliesToItem,
 } = module.exports
 
@@ -41,39 +41,50 @@ const retailChildren = {
     }],
   },
 }
+const catalog = parseQuickBooksTaxClassificationPage({ QueryResponse: { TaxClassification: [
+  ...rootPage.QueryResponse.TaxClassification,
+  ...retailChildren.QueryResponse.TaxClassification,
+] } })
 
 assert.equal(parseQuickBooksTaxClassificationPage(rootPage).length, 2)
 assert.equal(parseQuickBooksTaxClassificationPage({ QueryResponse: {} }).length, 0)
 assert.throws(() => parseQuickBooksTaxClassificationPage({ QueryResponse: { TaxClassification: {} } }), /response is invalid/)
 assert.throws(() => parseQuickBooksTaxClassificationPage({ QueryResponse: { TaxClassification: [{ Name: 'Missing ID', Level: '1' }] } }), /record is invalid/)
 assert.equal(quickBooksTaxClassificationPath(), '/quickbooks/v3/company/:realmId/taxclassification?level=1&minorversion=75')
+assert.equal(quickBooksTaxClassificationPath({ allLevels: true }), '/quickbooks/v3/company/:realmId/taxclassification?minorversion=75')
+assert.throws(() => quickBooksTaxClassificationPath({ allLevels: true, parentId: 'V1-00120000' }), /ambiguous/)
 assert.equal(
   quickBooksTaxClassificationPath({ parentId: 'A&B', minorVersion: '75' }),
   '/quickbooks/v3/company/:realmId/taxclassification?parentId=A%26B&minorversion=75',
 )
 
-const requested = []
-const catalog = await readQuickBooksTaxClassifications(async (path) => {
-  requested.push(path)
-  if (path.includes('level=1')) return rootPage
-  if (path.includes('parentId=V1-00120000')) return retailChildren
-  return { QueryResponse: {} }
-})
 assert.equal(catalog.length, 3)
-assert.equal(requested.length, 3, 'only the two documented levels are read')
 assert.equal(catalog[2].parentId, 'V1-00120000')
 assert.equal(taxClassificationAppliesToItem(catalog[2], 'NonInventory'), true)
 assert.equal(taxClassificationAppliesToItem(catalog[2], 'Service'), false)
 assert.equal(taxClassificationAppliesToItem(catalog[1], 'Service'), true)
-await assert.rejects(
-  () => readQuickBooksTaxClassifications(async () => rootPage, { maxRecords: 1 }),
-  /exceeded the supported size/,
+const fullCatalog = parseQuickBooksTaxClassificationPage({ QueryResponse: { TaxClassification: [
+  ...rootPage.QueryResponse.TaxClassification,
+  ...retailChildren.QueryResponse.TaxClassification,
+  { Id: 'EUC-FOOD', Name: 'Food', Level: '3', ParentRef: { value: 'EUC-09040101-V1-00120000' }, ApplicableTo: ['NonInventory'] },
+  { Id: 'EUC-READY', Name: 'Ready to eat', Level: '4', ParentRef: { value: 'EUC-FOOD' }, ApplicableTo: ['NonInventory'] },
+] } })
+assert.deepEqual(
+  JSON.parse(JSON.stringify(resolveQuickBooksTaxClassificationChain(fullCatalog, 'EUC-READY')?.map((row) => row.id))),
+  ['V1-00120000', 'EUC-09040101-V1-00120000', 'EUC-FOOD', 'EUC-READY'],
 )
-await assert.rejects(
-  () => readQuickBooksTaxClassifications(async (path) => path.includes('level=1')
-    ? rootPage
-    : { QueryResponse: { TaxClassification: [{ ...retailChildren.QueryResponse.TaxClassification[0], ParentRef: { value: 'wrong' } }] } }),
-  /parent is inconsistent/,
-)
+assert.equal(resolveQuickBooksTaxClassificationChain(fullCatalog, 'missing'), null)
+assert.equal(resolveQuickBooksTaxClassificationChain([
+  ...fullCatalog.slice(0, -1), { ...fullCatalog.at(-1), parentId: 'missing-parent' },
+], 'EUC-READY'), null, 'an orphan ParentRef is rejected')
+assert.equal(resolveQuickBooksTaxClassificationChain([
+  ...fullCatalog.slice(0, -1), { ...fullCatalog.at(-1), parentId: 'V1-00200000' },
+], 'EUC-READY'), null, 'a forged parent with an inconsistent level is rejected')
+assert.equal(resolveQuickBooksTaxClassificationChain([
+  { ...fullCatalog[0], parentId: 'EUC-READY' }, ...fullCatalog.slice(1),
+], 'EUC-READY'), null, 'a cycle is rejected')
+assert.equal(resolveQuickBooksTaxClassificationChain([
+  ...fullCatalog, fullCatalog[0],
+], 'EUC-READY'), null, 'duplicate provider IDs are rejected')
 
 console.log('QuickBooks tax classification helper tests passed')

@@ -3,6 +3,7 @@ import { accountingCapabilities, activeAccountingOrganizationId } from '@/lib/ac
 import {
   parseQuickBooksTaxClassificationPage,
   quickBooksTaxClassificationPath,
+  resolveQuickBooksTaxClassificationChain,
   taxClassificationAppliesToItem,
 } from '@/lib/integrations/quickBooksTaxClassifications'
 import { matonFetch } from '@/lib/maton'
@@ -15,7 +16,7 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-const MAX_CATEGORIES_PER_PAGE = 5_000
+const MAX_CATALOG_RECORDS = 5_000
 const PARENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/
 const ITEM_TYPES = new Set(['Inventory', 'NonInventory', 'Service'])
 type ItemType = 'Inventory' | 'NonInventory' | 'Service'
@@ -24,12 +25,11 @@ function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, { status, headers: { 'Cache-Control': 'no-store' } })
 }
 
-async function requestProviderPage(input: {
+async function requestProviderCatalog(input: {
   ownerEmail: string
   connectionId: string
-  parentId?: string
 }) {
-  const response = await matonFetch(quickBooksTaxClassificationPath({ parentId: input.parentId }), { method: 'GET' }, {
+  const response = await matonFetch(quickBooksTaxClassificationPath({ allLevels: true }), { method: 'GET' }, {
     ownerEmail: input.ownerEmail,
     app: 'quickbooks',
     boundConnectionId: input.connectionId,
@@ -50,8 +50,8 @@ async function requestProviderPage(input: {
     throw new Error('QuickBooks tax classifications are temporarily unavailable')
   }
   const categories = parseQuickBooksTaxClassificationPage(payload)
-  if (categories.length > MAX_CATEGORIES_PER_PAGE) {
-    throw new Error('QuickBooks tax classification page exceeded the supported size')
+  if (categories.length > MAX_CATALOG_RECORDS) {
+    throw new Error('QuickBooks tax classification catalog exceeded the supported size')
   }
   return categories
 }
@@ -89,21 +89,24 @@ export async function GET(req: NextRequest) {
       return json({ ok: false, error: 'Connect QuickBooks before choosing sales tax categories', code: 'QUICKBOOKS_NOT_CONNECTED' }, 409)
     }
     const provider = { ownerEmail: binding.credential_owner_email, connectionId: binding.maton_connection_id }
+    const catalog = await requestProviderCatalog(provider)
     if (parentId) {
-      const parents = await requestProviderPage(provider)
-      const parent = parents.find((category) => category.id === parentId)
-      if (!parent || (parent.applicableTo.length && !taxClassificationAppliesToItem(parent, itemType))) {
+      const chain = resolveQuickBooksTaxClassificationChain(catalog, parentId)
+      if (!chain || chain.some((category) => category.applicableTo.length
+        && !taxClassificationAppliesToItem(category, itemType))) {
         return json({ ok: false, error: 'Selected sales tax category is unavailable', code: 'QUICKBOOKS_TAX_CLASSIFICATION_PARENT_INVALID' }, 400)
       }
+      const parent = chain[chain.length - 1]
+      const categories = catalog.filter((category) => category.parentId === parent.id
+        && category.level === parent.level + 1)
+      return json({ ok: true, categories })
     }
-    const page = await requestProviderPage({ ...provider, parentId: parentId || undefined })
-    if (parentId && page.some((category) => category.parentId !== parentId)) {
-      throw new Error('QuickBooks tax classification hierarchy was inconsistent')
-    }
-    // Return every child so the picker can distinguish "no children" from
-    // "children exist, but none apply to this item type" before selecting a leaf.
-    const categories = parentId ? page : page.filter((category) => category.applicableTo.length === 0
+    // Return every direct child so the picker can distinguish "no children"
+    // from "children exist, but none apply to this item type" before selecting a leaf.
+    const categories = catalog.filter((category) => category.level === 1 && !category.parentId
+      && (category.applicableTo.length === 0
       || taxClassificationAppliesToItem(category, itemType))
+    )
     return json({ ok: true, categories })
   } catch (error) {
     if (error instanceof Error && error.message === 'Unauthorized') {

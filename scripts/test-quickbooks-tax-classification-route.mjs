@@ -43,16 +43,25 @@ const route = load('../app_src/app/api/accounting/quickbooks/tax-classifications
   '@/lib/maton': {
     async matonFetch(path, init, context) {
       calls.push({ path, init, context })
-      const payload = path.includes('parentId=')
-        ? { QueryResponse: { TaxClassification: [{
+      const payload = { QueryResponse: { TaxClassification: [{
+          Id: 'V1-00120000', Name: 'Retail', Level: '1', ApplicableTo: ['Inventory', 'NonInventory'],
+        }, {
+          Id: 'V1-OTHER', Name: 'Other', Level: '1', ApplicableTo: ['Service'],
+        }, {
           Id: 'EUC-FOOD-V1-00120000', Name: 'Food & beverages', Level: '2',
           ParentRef: { value: 'V1-00120000', name: 'Retail' }, ApplicableTo: ['NonInventory'],
         }, {
           Id: 'EUC-SERVICE-V1-00120000', Name: 'Retail service', Level: '2',
           ParentRef: { value: 'V1-00120000', name: 'Retail' }, ApplicableTo: ['Service'],
-        }] } }
-        : { QueryResponse: { TaxClassification: [{
-          Id: 'V1-00120000', Name: 'Retail', Level: '1', ApplicableTo: ['Inventory', 'NonInventory'],
+        }, {
+          Id: 'EUC-MEAL', Name: 'Meal', Level: '3',
+          ParentRef: { value: 'EUC-FOOD-V1-00120000' }, ApplicableTo: ['NonInventory'],
+        }, {
+          Id: 'EUC-PREPARED', Name: 'Prepared meal', Level: '4',
+          ParentRef: { value: 'EUC-MEAL' }, ApplicableTo: ['NonInventory'],
+        }, {
+          Id: 'EUC-UNRELATED', Name: 'Unrelated', Level: '2',
+          ParentRef: { value: 'V1-OTHER' }, ApplicableTo: ['Service'],
         }] } }
       return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } })
     },
@@ -76,12 +85,25 @@ assert.equal(result.payload.categories.length, 1)
 assert.equal(calls.length, 1)
 assert.equal(calls[0].init.method, 'GET')
 assert.equal(calls[0].context.boundConnectionId, 'bound-connection')
+assert.match(calls[0].path, /taxclassification\?minorversion=75$/)
 
 result = await route.GET(request('?itemType=NonInventory&parentId=V1-00120000'))
 assert.equal(result.status, 200)
 assert.equal(result.payload.categories[0].name, 'Food & beverages')
 assert.equal(result.payload.categories.length, 2, 'inapplicable children remain visible to leaf detection')
-assert.equal(calls.length, 3, 'child lookup validates the parent against the bound company')
+assert.equal(calls.length, 2, 'each branch reads the bound company catalog once')
+
+result = await route.GET(request('?itemType=NonInventory&parentId=EUC-FOOD-V1-00120000'))
+assert.equal(result.status, 200)
+assert.deepEqual(Array.from(result.payload.categories, (row) => row.id), ['EUC-MEAL'])
+result = await route.GET(request('?itemType=NonInventory&parentId=EUC-MEAL'))
+assert.equal(result.status, 200)
+assert.deepEqual(Array.from(result.payload.categories, (row) => row.id), ['EUC-PREPARED'])
+result = await route.GET(request('?itemType=NonInventory&parentId=EUC-PREPARED'))
+assert.equal(result.status, 200)
+assert.equal(result.payload.categories.length, 0, 'a level-four leaf has no direct children')
+result = await route.GET(request('?itemType=NonInventory&parentId=forged-parent'))
+assert.equal(result.status, 400, 'a parent outside the bound company catalog is rejected')
 
 const beforeInvalid = calls.length
 result = await route.GET(request('?itemType=Bad&parentId=V1-00120000'))

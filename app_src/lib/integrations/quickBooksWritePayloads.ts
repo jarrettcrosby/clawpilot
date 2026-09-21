@@ -52,6 +52,7 @@ export type QuickBooksItemDraft = {
   taxable: boolean
   taxClassificationId: string | null
   taxClassificationName: string | null
+  taxClassificationParentId: string | null
   trackQuantity: boolean
   quantityOnHand: number | null
   inventoryStartDate: string | null
@@ -75,6 +76,7 @@ export type QuickBooksItemUpdateDraft = {
   taxable: boolean
   taxClassificationId: string | null
   taxClassificationName: string | null
+  taxClassificationParentId: string | null
 }
 
 type QuickBooksItemSourceContext = Pick<
@@ -221,13 +223,27 @@ function dateValue(value: unknown, label: string, required = false): string | nu
 async function taxClassificationValue(
   organizationId: string,
   rawId: unknown,
+  rawParentId: unknown,
   itemType: 'Service' | 'NonInventory' | 'Inventory',
 ) {
   const classificationId = cleanText(rawId, 'Sales tax category', 200)
   if (!classificationId) return null
-  let selected: { id: string; name: string } | null
+  if (rawParentId === undefined) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+      'Select a QuickBooks sales tax category again before saving the draft',
+    )
+  }
+  const parentId = cleanText(rawParentId, 'Sales tax category parent', 200)
+  if (parentId && !/^[A-Za-z0-9_-]{1,200}$/.test(parentId)) {
+    throw new QuickBooksWriteValidationError(
+      'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+      'Select an applicable QuickBooks sales tax category for this product type',
+    )
+  }
+  let selected: { id: string; name: string; parentId: string | null } | null
   try {
-    selected = await validateQuickBooksTaxClassification({ organizationId, classificationId, itemType })
+    selected = await validateQuickBooksTaxClassification({ organizationId, classificationId, parentId, itemType })
   } catch {
     throw new QuickBooksWriteValidationError(
       'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_UNAVAILABLE',
@@ -481,7 +497,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     ? optionalNumberValue(raw.reorderPoint, 'Reorder point', { min: 0, max: 1_000_000_000 })
     : null
   const sourceContext = await validateItemSourceContext(organizationId, raw)
-  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, itemType)
+  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, raw.taxClassificationParentId, itemType)
   return {
     name: cleanText(raw.name, 'Product or service name', 100, true)!,
     itemType,
@@ -508,6 +524,7 @@ async function validateItemDraft(organizationId: string, raw: Record<string, unk
     taxable: raw.taxable === true,
     taxClassificationId: taxClassification?.id || null,
     taxClassificationName: taxClassification?.name || null,
+    taxClassificationParentId: taxClassification?.parentId || null,
     trackQuantity: itemType === 'Inventory',
     quantityOnHand,
     inventoryStartDate,
@@ -564,10 +581,12 @@ async function validateItemUpdateDraft(organizationId: string, raw: Record<strin
     taxable: raw.taxable,
     taxClassificationId: null,
     taxClassificationName: null,
+    taxClassificationParentId: null,
   }
-  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, draft.itemType)
+  const taxClassification = await taxClassificationValue(organizationId, raw.taxClassificationId, raw.taxClassificationParentId, draft.itemType)
   draft.taxClassificationId = taxClassification?.id || null
   draft.taxClassificationName = taxClassification?.name || null
+  draft.taxClassificationParentId = taxClassification?.parentId || null
   if (draft.name === item.name && draft.sku === item.sku && draft.description === item.description
     && draft.unitPrice === Number(item.unit_price) && draft.purchaseCost === Number(item.purchase_cost)
     && draft.taxable === item.taxable

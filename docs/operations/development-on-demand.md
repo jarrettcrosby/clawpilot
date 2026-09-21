@@ -120,9 +120,10 @@ Before suspension, accounting release
 Railway development deployment `a9899b2b-2107-4fc7-b000-806639dea580`, version,
 health, and persistence checks. It was not promoted to production in this
 infrastructure change. The live production read-only QuickBooks taxonomy
-probe returned 31 root categories and 2,106 children under one root; this
-identified a validation-performance follow-up before product-edit release
-acceptance. Development's stored QuickBooks binding did not match its current
+probe returned 31 root categories and a 2,106-row, four-level catalog even
+when requesting one parent's children. This identified a hierarchy-validation
+follow-up before product-edit release acceptance. Development's stored
+QuickBooks binding did not match its current
 credential/connection owner, so live dev provider acceptance remains pending.
 
 An additional manual development Postgres backup was requested but Railway

@@ -45,6 +45,7 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
   const [taxable, setTaxable] = useState(false)
   const [taxClassificationId, setTaxClassificationId] = useState('')
   const [taxClassificationName, setTaxClassificationName] = useState('')
+  const [taxClassificationParentId, setTaxClassificationParentId] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -59,6 +60,7 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
     setTaxable(product.taxable)
     setTaxClassificationId(product.taxClassificationId)
     setTaxClassificationName(product.taxClassificationName)
+    setTaxClassificationParentId('')
     setError(null)
   }, [product])
 
@@ -82,7 +84,8 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
             unitPrice,
             purchaseCost,
             taxable,
-            ...(taxClassificationId && taxClassificationId !== product.taxClassificationId ? { taxClassificationId } : {}),
+            ...(taxClassificationId && taxClassificationId !== product.taxClassificationId
+              ? { taxClassificationId, taxClassificationParentId } : {}),
           },
         }),
       })
@@ -126,10 +129,11 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
             <QuickBooksTaxClassificationPicker
               key={product.id}
               itemType={product.itemType}
-              value={taxClassificationId ? { id: taxClassificationId, name: taxClassificationName || taxClassificationId } : null}
+              value={taxClassificationId ? { id: taxClassificationId, name: taxClassificationName || taxClassificationId, parentId: taxClassificationParentId || null } : null}
               onChange={(choice) => {
                 setTaxClassificationId(choice?.id || '')
                 setTaxClassificationName(choice?.name || '')
+                setTaxClassificationParentId(choice?.parentId || '')
               }}
               loadPage={async (parentId): Promise<QuickBooksTaxClassification[]> => {
                 const parameters = new URLSearchParams({ itemType: product.itemType })

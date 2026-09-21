@@ -543,9 +543,13 @@ const taxValidationModule = loadTypeScriptModule('app_src/lib/integrations/quick
   '@/lib/maton': {
     matonFetch: async (path, init, options) => {
       taxValidationReads.push({ path, init, options })
-      return quickBooksJsonResponse({ QueryResponse: { TaxClassification: path.includes('parentId=tax-root')
-        ? [{ Id: 'tax-food', Name: 'Prepared food', Level: 2, ParentRef: { value: 'tax-root' }, ApplicableTo: ['Service'] }]
-        : [{ Id: 'tax-root', Name: 'Food & beverages', Level: 1 }] } })
+      return quickBooksJsonResponse({ QueryResponse: { TaxClassification: [
+        { Id: 'tax-root', Name: 'Food & beverages', Level: 1, ApplicableTo: ['Service'] },
+        { Id: 'tax-other', Name: 'Other', Level: 1 },
+        { Id: 'tax-food', Name: 'Meals', Level: 2, ParentRef: { value: 'tax-root' }, ApplicableTo: ['Service'] },
+        { Id: 'tax-meals', Name: 'Prepared food', Level: 3, ParentRef: { value: 'tax-food' }, ApplicableTo: ['Service'] },
+        { Id: 'tax-prepared', Name: 'Ready to eat', Level: 4, ParentRef: { value: 'tax-meals' }, ApplicableTo: ['Service'] },
+      ] } })
     },
   },
   '@/lib/persistence/postgres': {
@@ -554,26 +558,48 @@ const taxValidationModule = loadTypeScriptModule('app_src/lib/integrations/quick
   },
 })
 assert.deepEqual(JSON.parse(JSON.stringify(await taxValidationModule.validateQuickBooksTaxClassification({
-  organizationId: writeOrganizationId, classificationId: 'tax-food', itemType: 'Service',
-}))), { id: 'tax-food', name: 'Food & beverages:Prepared food' })
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Service',
+}))), { id: 'tax-prepared', name: 'Food & beverages:Meals:Prepared food:Ready to eat', parentId: 'tax-meals' })
 assert.equal(taxValidationReads[0].options.boundConnectionId, 'binding-1')
+assert.equal(taxValidationReads.length, 1, 'validation reads the bound company catalog once')
+assert.match(taxValidationReads[0].path, /taxclassification\?minorversion=75$/)
+taxValidationReads.length = 0
 assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
-  organizationId: writeOrganizationId, classificationId: 'tax-root', itemType: 'Service',
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-other', itemType: 'Service',
+}), null, 'a child with a mismatched ParentRef must be rejected')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-forged', itemType: 'Service',
+}), null, 'an unknown parent must be rejected')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: null, itemType: 'Service',
+}), null, 'a child without its parent must not be accepted as a root')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-root', parentId: null, itemType: 'Service',
 }), null, 'a non-leaf tax classification must not be selected')
+assert.equal(taxValidationReads.length, 1)
 assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
-  organizationId: writeOrganizationId, classificationId: 'tax-food', itemType: 'Inventory',
+  organizationId: writeOrganizationId, classificationId: 'tax-food', parentId: 'tax-root', itemType: 'Service',
+}), null, 'a level-two category with descendants must not be selected')
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Inventory',
 }), null, 'an inapplicable tax classification must not be selected')
 await assert.rejects(
   taxValidationModule.validateQuickBooksTaxClassification({
-    organizationId: '33333333-3333-4333-8333-333333333333', classificationId: 'tax-food', itemType: 'Service',
+    organizationId: '33333333-3333-4333-8333-333333333333', classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Service',
   }), /Active QuickBooks connection unavailable/,
 )
 const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksWritePayloads.ts', {
   '@/lib/integrations/quickBooksItemCompatibility': itemCompatibilityModule,
   '@/lib/integrations/quickBooksTaxClassificationValidation': {
-    validateQuickBooksTaxClassification: async ({ classificationId, itemType }) => (
-      classificationId === 'tax-food' && itemType === 'Service'
-        ? { id: 'tax-food', name: 'Food & beverages:Prepared food' }
+    validateQuickBooksTaxClassification: async ({ classificationId, parentId, itemType }) => (
+      classificationId === 'tax-prepared' && parentId === 'tax-meals' && itemType === 'Service'
+        ? { id: 'tax-prepared', name: 'Food & beverages:Meals:Prepared food:Ready to eat', parentId: 'tax-meals' }
         : null
     ),
   },
@@ -680,14 +706,31 @@ assert.equal(providerItem.SubItem, true)
 assert.equal(providerItem.ParentRef.value, 'category-1')
 const taxedItemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
   organizationId: writeOrganizationId, operationKind: 'item.create',
-  payload: { ...itemDraft.payload, taxClassificationId: 'tax-food' },
+  payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-meals' },
 })
-assert.equal(taxedItemDraft.payload.taxClassificationName, 'Food & beverages:Prepared food')
-assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.create', taxedItemDraft.payload).TaxClassificationRef.value, 'tax-food')
+assert.equal(taxedItemDraft.payload.taxClassificationName, 'Food & beverages:Meals:Prepared food:Ready to eat')
+assert.equal(taxedItemDraft.payload.taxClassificationParentId, 'tax-meals')
+assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.create', taxedItemDraft.payload).TaxClassificationRef.value, 'tax-prepared')
 await assert.rejects(
   writePayloadModule.validateQuickBooksWriteDraft({
     organizationId: writeOrganizationId, operationKind: 'item.create',
-    payload: { ...itemDraft.payload, taxClassificationId: 'tax-unknown' },
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: undefined },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+  'a selected tax classification requires explicit parent context',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId, operationKind: 'item.create',
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-other' },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+  'a forged tax classification parent is rejected',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId, operationKind: 'item.create',
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-unknown', taxClassificationParentId: 'tax-meals' },
   }),
   (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
 )
@@ -700,11 +743,14 @@ const itemUpdate = await writePayloadModule.validateQuickBooksWriteDraft({
   },
 })
 assert.equal(itemUpdate.payload.itemType, 'Service')
+assert.equal(itemUpdate.payload.taxClassificationId, null, 'a price-only edit does not require reselecting the current tax category')
+assert.equal(Object.hasOwn(writePayloadModule.buildQuickBooksProviderPayload('item.update', itemUpdate.payload), 'TaxClassificationRef'), false,
+  'an unchanged tax category is omitted from the sparse QuickBooks update')
 const taxedItemUpdate = await writePayloadModule.validateQuickBooksWriteDraft({
   organizationId: writeOrganizationId, operationKind: 'item.update',
-  payload: { ...itemUpdate.payload, taxClassificationId: 'tax-food' },
+  payload: { ...itemUpdate.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-meals' },
 })
-assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.update', taxedItemUpdate.payload).TaxClassificationRef.value, 'tax-food')
+assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.update', taxedItemUpdate.payload).TaxClassificationRef.value, 'tax-prepared')
 assert.deepEqual(JSON.parse(JSON.stringify(writePayloadModule.buildQuickBooksProviderPayload('item.update', itemUpdate.payload))), {
   Id: 'item-10', SyncToken: '7', sparse: true, Name: 'Consulting revised', Sku: 'CONSULT',
   Description: 'Old description', UnitPrice: 150, PurchaseCost: 25, Taxable: false,
