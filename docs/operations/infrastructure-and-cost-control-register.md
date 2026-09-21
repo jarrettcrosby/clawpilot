@@ -11,6 +11,12 @@ app_visible: true
 
 # ClawPilot Infrastructure and Cost Control Register
 
+> Current development runtime policy, approved September 21, 2026:
+> [Development on demand](development-on-demand.md). Development services,
+> configuration, volumes, and backups are retained, but deployments are stopped
+> and development autodeploy is disabled between test sessions. This supersedes
+> the continuously running development assumptions in the earlier entries below.
+
 ## Purpose
 
 This is the durable operating record for ClawPilot infrastructure, cost controls, and approved configuration changes. Read it before changing Railway topology, service limits, networking, deployment triggers, backups, or spending controls. Verify every time-sensitive value against Railway before acting; this document records the intended baseline, not a substitute for live evidence.
