@@ -2,12 +2,10 @@
   "name": "clawpilot-architecture-model",
   "version": "0.1.0",
   "private": true,
-  "description": "Local-only LikeC4 model for ClawPilot architecture reviews",
+  "description": "Build-time LikeC4 tooling for the private ClawPilot architecture viewer",
   "scripts": {
     "validate": "likec4 validate .",
-    "build": "likec4 build . --output ./dist --base ./ --use-hash-history",
-    "preview": "likec4 preview . --output ./dist --listen 127.0.0.1",
-    "dev": "likec4 serve . --listen 127.0.0.1"
+    "build": "node ../../scripts/build-architecture-viewer.mjs"
   },
   "devDependencies": {
     "likec4": "1.59.4"

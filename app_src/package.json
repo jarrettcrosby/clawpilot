@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "node ../scripts/build-architecture-viewer.mjs",
     "build": "next build --webpack",
     "build:vercel": "node ../scripts/vercel-build.mjs",
     "start": "next start",

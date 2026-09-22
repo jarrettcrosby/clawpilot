@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { currentLoginEmail } from '@/lib/authLoginIdentity'
 import { clearBrowserSessionCookies } from '@/lib/authSessions'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
-import { confirmLoginEmailChange, LoginEmailChangeError, requestLoginEmailChange } from '@/lib/loginEmailChange'
+import { confirmLoginEmailChange, loginEmailChangeEnabled, LoginEmailChangeError, LOGIN_EMAIL_CHANGE_UNAVAILABLE, requestLoginEmailChange } from '@/lib/loginEmailChange'
 import { requireRequestSession } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -11,7 +11,9 @@ const json = (body: object, status = 200) => NextResponse.json(body, { status, h
 export async function GET(req: NextRequest) {
   try {
     const session = await requireRequestSession(req)
-    return json({ ok: true, loginEmail: await currentLoginEmail(session.effectiveUser) })
+    const changeEnabled = loginEmailChangeEnabled()
+    return json({ ok: true, loginEmail: await currentLoginEmail(session.effectiveUser), changeEnabled,
+      changeUnavailableReason: changeEnabled ? null : LOGIN_EMAIL_CHANGE_UNAVAILABLE })
   } catch { return json({ ok: false, error: 'Sign in to view your login email.' }, 401) }
 }
 

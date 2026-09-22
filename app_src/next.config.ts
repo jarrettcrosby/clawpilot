@@ -7,6 +7,8 @@ const nextConfig: NextConfig = {
   typescript: { tsconfigPath: 'tsconfig.build.json' },
   outputFileTracingRoot: path.resolve(process.cwd(), '..'),
   outputFileTracingIncludes: {
+    '/api/settings/architecture': ['./server-assets/architecture/manifest.json'],
+    '/api/settings/architecture/viewer': ['./server-assets/architecture/viewer.html', './server-assets/architecture/manifest.json'],
     '/api/docs': [
       '../docs/**/*.md',
       '../README.md',

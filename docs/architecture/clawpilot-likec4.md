@@ -1,7 +1,7 @@
 ---
 id: cp-architecture-likec4
 title: ClawPilot Architecture Model
-summary: Local-only LikeC4 views of current production, suspended development, provider data flows, and pending BPO domains.
+summary: Private platform-owner LikeC4 views of production, suspended development, provider data flows, verified BPO app hosts, and the staged short-link bridge.
 status: active
 kind: architecture
 area: architecture
@@ -13,15 +13,23 @@ app_visible: false
 
 The [LikeC4 model](../../tools/architecture/model.c4) is a hand-reviewed map,
 not an automated inventory or deployment manifest. Its static viewer is built
-locally from the separate [tool package](../../tools/architecture/README.md).
-Generated `dist/` files and dependencies are ignored; no architecture service
-or public site is deployed.
+from the separate [tool package](../../tools/architecture/README.md) during the
+application build. Settings → Architecture loads the real LikeC4 views on
+demand, only for the configured platform owner outside impersonation; ordinary
+organization owners/admins do not receive the global topology. Both metadata
+and HTML are independently authenticated, private/no-store responses. The
+single-file artifact stays outside `public` and `_next/static`, runs in a
+sandboxed iframe with network connections blocked, and needs no separate
+service or AI runtime. Generated artifacts and tool dependencies remain ignored.
 
 The model has four views: system context; production runtime and durable data;
 commerce, POS, CRM, and accounting connections; and current domain/environment
-state. The domain view labels the additional BPO Railway hostnames as registered
-but awaiting DNS/TLS acceptance, the BPO website short-link route as planned,
-and Railway development as suspended. A diagram edge is a documented
+state. The September 21, 2026 domain view reflects verified DNS/TLS for both
+BPO app hostnames and a real production magic-code login without an Eigen
+redirect. The BPO website short-link bridge is staged and protected, not yet
+promoted to its public domain; production end-to-end acceptance and activation
+remain open. Google browser sign-in requires separate acceptance. Railway
+development is retained but suspended, not a live login path. A diagram edge is a documented
 integration boundary, not proof that every provider action is currently enabled.
 
 Sources for the relationships and authority boundaries:

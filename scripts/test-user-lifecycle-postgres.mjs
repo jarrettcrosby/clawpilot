@@ -14,7 +14,7 @@ const owner = 'owner@example.test'
 const member = 'member@example.test'
 const orgA = '11111111-1111-4111-8111-111111111111'
 const orgB = '22222222-2222-4222-8222-222222222222'
-const runtime = { env: { ...process.env, APP_LOGIN_EMAIL: owner, APP_LOGIN_EMAIL_ALIASES: 'owner-alias@example.test', APP_SESSION_SECRET: 'test-session-secret-of-at-least-32-characters' } }
+const runtime = { env: { ...process.env, APP_LOGIN_EMAIL: owner, APP_LOGIN_EMAIL_ALIASES: 'owner-alias@example.test', APP_SESSION_SECRET: 'test-session-secret-of-at-least-32-characters', CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED: '1' } }
 const command = (args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 180_000 })
 const read = (path) => readFileSync(path, 'utf8')
 function load(path, mocks) {
@@ -22,6 +22,53 @@ function load(path, mocks) {
   const module = { exports: {} }
   vm.runInNewContext(output, { module, exports: module.exports, process: runtime, Buffer, Date, URL, console, require: (id) => mocks[id] || require(id) }, { filename: path })
   return module.exports
+}
+
+async function verifyMigrationWriterFence(pool) {
+  const migration = read('db/migrations/0370_verified_login_email.sql')
+  const seedPosition = migration.indexOf('INSERT INTO app_google_subject_owners (')
+  assert.ok(seedPosition > 0)
+  const migrator = await pool.connect()
+  const writer = await pool.connect()
+  const waitForBlock = async (waitingPid, blockingPid) => {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const result = await pool.query('SELECT $2::int = ANY(pg_blocking_pids($1::int)) AS blocked', [waitingPid, blockingPid])
+      if (result.rows[0].blocked) return
+      await new Promise((done) => setTimeout(done, 25))
+    }
+    assert.fail('Expected migration/writer lock contention was not observed')
+  }
+  const insertIdentity = (client, subject, email) => client.query("INSERT INTO app_user_external_identities(provider, provider_subject, user_email, verified_email, linked_organization_id, linked_by) VALUES ('google', $1, $2, $2, $3, $2)", [subject, email, orgA])
+  try {
+    await writer.query('BEGIN')
+    await writer.query("SET LOCAL statement_timeout = '10s'")
+    await writer.query('SELECT email FROM app_users WHERE email = $1 FOR SHARE', [member])
+    await insertIdentity(writer, 'old-subject', member)
+    await migrator.query('BEGIN')
+    await migrator.query("SET LOCAL statement_timeout = '10s'")
+    const prepare = migrator.query(migration.slice(0, seedPosition)).then(() => null, (error) => error)
+    await waitForBlock(migrator.processID, writer.processID)
+    await writer.query('COMMIT')
+    assert.equal(await prepare, null, 'Migration waits for an in-flight old-version identity write before taking its snapshot')
+
+    await writer.query('BEGIN')
+    await writer.query("SET LOCAL statement_timeout = '10s'")
+    await writer.query('SELECT email FROM app_users WHERE email = $1 FOR SHARE', [owner])
+    const lateInsert = insertIdentity(writer, 'rollout-subject', owner).then(() => null, (error) => error)
+    await waitForBlock(writer.processID, migrator.processID)
+    await migrator.query(migration.slice(seedPosition))
+    await migrator.query('COMMIT')
+    assert.equal(await lateInsert, null, 'A writer arriving before seed/trigger installation resumes only after migration commit')
+    assert.equal((await writer.query("SELECT user_email FROM app_google_subject_owners WHERE provider_subject = 'rollout-subject'")).rows[0].user_email, owner, 'The blocked old-version insert is covered by the newly installed ownership trigger')
+    await writer.query('ROLLBACK') // Test-only identity and ownership insert; keep the durable-history fixture unchanged.
+    assert.equal((await pool.query("SELECT user_email FROM app_google_subject_owners WHERE provider_subject = 'old-subject'")).rows[0].user_email, member, 'Backfill includes the old-version write committed before the migration lock was granted')
+    console.log('PASS: migration 0370 fences old identity writers across ownership backfill and trigger installation')
+  } finally {
+    await migrator.query('ROLLBACK').catch(() => undefined)
+    await writer.query('ROLLBACK').catch(() => undefined)
+    migrator.release()
+    writer.release()
+  }
 }
 
 const container = `clawpilot-user-lifecycle-${process.pid}-${randomUUID().slice(0, 8)}`
@@ -48,14 +95,15 @@ try {
   await pool.query("INSERT INTO workspace_organizations(id, name) VALUES ($1, 'Org A'), ($2, 'Org B')", [orgA, orgB])
   await pool.query("INSERT INTO app_users(email, role) VALUES ($1, 'owner'), ($2, 'member'), ('other@example.test', 'member')", [owner, member])
   await pool.query("INSERT INTO app_user_organization_memberships(user_email, organization_id, role) VALUES ($1, $3, 'owner'), ($2, $3, 'member'), ($2, $4, 'member')", [owner, member, orgA, orgB])
-  await pool.query("INSERT INTO app_user_external_identities(provider, provider_subject, user_email, verified_email, linked_organization_id, linked_by) VALUES ('google', 'old-subject', $1, $1, $2, $1)", [member, orgA])
-  await pool.query(read('db/migrations/0370_verified_login_email.sql'))
+  await verifyMigrationWriterFence(pool)
   assert.equal((await pool.query("SELECT user_email FROM app_google_subject_owners WHERE provider_subject = 'old-subject'")).rows[0].user_email, member, 'Migration backfills immutable ownership for existing Google links')
   await pool.query('INSERT INTO app_sessions(authenticated_user_email, effective_user_email, active_workspace_organization_id) VALUES ($1, $1, $2), ($1, $1, $3)', [member, orgA, orgB])
   const audit = []
+  let transactionCount = 0
   const persistence = {
     query: (sql, values) => pool.query(sql, values),
     withTransaction: async (callback) => {
+      transactionCount += 1
       const client = await pool.connect()
       try { await client.query('BEGIN'); const result = await callback(client); await client.query('COMMIT'); return result }
       catch (error) { await client.query('ROLLBACK'); throw error }
@@ -94,6 +142,36 @@ try {
     '@/lib/matonMail': { sendLoginEmailChangeCode: async (mail) => { if (failMail) throw new Error('delivery failed'); sent.push(mail) }, sendLoginEmailChangedNotice: async (mail) => notices.push(mail) },
   })
   const session = { authenticatedUser: member, effectiveUser: member, lastAuthenticatedAt: new Date().toISOString(), activeWorkspaceOrganizationId: orgA }
+  const api = load('app_src/app/api/auth/login-email/route.ts', { ...mocks,
+    'next/server': { NextResponse: { json: (body, { status }) => ({ body, status }) } },
+    '@/lib/authLoginIdentity': identity, '@/lib/authSessions': { clearBrowserSessionCookies: () => assert.fail('Disabled confirmation must not clear a session') },
+    '@/lib/browserSameOrigin': { isBrowserSameOriginRequest: () => true }, '@/lib/loginEmailChange': changes,
+    '@/lib/requestUser': { requireRequestSession: async () => session },
+  })
+  const apiRequest = { headers: new Headers({ 'content-type': 'application/json' }), nextUrl: { origin: 'https://app.example.test' }, text: async () => JSON.stringify({ email: 'new@example.test', code: '123456' }) }
+  const beforeGateTransactions = transactionCount
+  for (const flag of [undefined, '0', 'true']) {
+    if (flag === undefined) delete runtime.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED
+    else runtime.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED = flag
+    assert.equal(changes.loginEmailChangeEnabled(), false)
+    const state = await api.GET(apiRequest)
+    assert.equal(state.body.loginEmail, member, 'Reading the current login address still works while changes are disabled')
+    assert.equal(state.body.changeEnabled, false)
+    assert.match(state.body.changeUnavailableReason, /temporarily unavailable/)
+    for (const operation of [api.POST, api.PATCH]) {
+      const result = await operation(apiRequest)
+      assert.equal(result.status, 503)
+      assert.match(result.body.error, /temporarily unavailable/)
+    }
+    await assert.rejects(changes.requestLoginEmailChange(session, 'new@example.test'), (error) => error.status === 503)
+    await assert.rejects(changes.confirmLoginEmailChange(session, { email: 'new@example.test', code: '123456' }), (error) => error.status === 503)
+  }
+  assert.equal(transactionCount, beforeGateTransactions, 'Disabled API and direct request/confirm perform no state-writing transaction')
+  assert.equal(sent.length, 0, 'Disabled request sends no verification email')
+  assert.equal(notices.length, 0, 'Disabled confirmation sends no notice')
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM app_login_email_changes')).rows[0].n, 0)
+  runtime.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED = '1'
+  assert.equal((await api.GET(apiRequest)).body.changeEnabled, true)
   const resetCooldown = () => pool.query("UPDATE app_login_email_changes SET requested_at = now() - interval '61 seconds', request_window_started = now() - interval '2 hours' WHERE user_email = $1", [member])
   await assert.rejects(changes.requestLoginEmailChange({ ...session, impersonating: true }, 'new@example.test'), /yourself/)
   await assert.rejects(changes.requestLoginEmailChange({ ...session, lastAuthenticatedAt: '2000-01-01' }, 'new@example.test'), /sign out/)
@@ -117,6 +195,17 @@ try {
   await resetCooldown()
   await changes.requestLoginEmailChange(session, 'new@example.test')
   await pool.query('INSERT INTO auth_magic_codes(email) VALUES ($1), ($2)', [member, 'new@example.test'])
+  const beforeDisabledConfirm = transactionCount
+  const mailCount = sent.length
+  const pendingBefore = (await pool.query('SELECT * FROM app_login_email_changes WHERE user_email = $1', [member])).rows[0]
+  runtime.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED = '0'
+  await assert.rejects(changes.confirmLoginEmailChange(session, { email: 'new@example.test', code: sent.at(-1).code }), (error) => error.status === 503)
+  assert.equal(transactionCount, beforeDisabledConfirm, 'Turning the gate off blocks an already-issued valid code before any transaction')
+  assert.deepEqual((await pool.query('SELECT * FROM app_login_email_changes WHERE user_email = $1', [member])).rows[0], pendingBefore)
+  assert.equal(sent.length, mailCount)
+  assert.equal(notices.length, 0)
+  assert.equal(await identity.currentLoginEmail(member), member)
+  runtime.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED = '1'
   await changes.confirmLoginEmailChange(session, { email: 'new@example.test', code: sent.at(-1).code })
   assert.equal(await identity.currentLoginEmail(member), 'new@example.test')
   assert.equal(await identity.resolveLoginAccountEmail('new@example.test'), member)
@@ -172,7 +261,7 @@ try {
   assert.equal((await google.resolveLinkedGoogleIdentity({ subject: 'third-subject', email: 'third@example.test' })).email, member)
   assert.ok(audit.some((event) => event.eventType === 'user.trashed'))
   assert.ok(audit.some((event) => event.eventType === 'auth.login_email.changed'))
-  console.log('PASS: user Trash/Restore isolation, access states, sessions; login verification, rate limits, collisions, identity preservation, old login revocation')
+  console.log('PASS: user Trash/Restore isolation, access states, sessions; default-off login-change gate, API/no-write/no-mail checks, verification, rate limits, collisions, identity preservation, old login revocation')
 } finally {
   await pool?.end()
   if (started) command(disposablePostgresDockerCleanupArgs(container))

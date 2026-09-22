@@ -37,12 +37,14 @@ import type {
   DashboardWorkspaceSnapshot as WorkspaceSnapshot,
 } from '@/lib/dashboardBootstrapTypes'
 import { readWorkspaceBootstrap } from '@/lib/workspaceClient'
+import type { ModuleCapabilities } from '@/lib/moduleAccess'
 
 type Filter = { priority: string[]; status: string[]; labels: string[] }
 type Props = {
   onNavigate: (section: string) => void
   onNavigateWithFilter?: (section: string, filter?: Filter) => void
   initialWorkspaceId?: string | null
+  moduleCapabilities: ModuleCapabilities
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -87,8 +89,8 @@ function isCrmCard(task: Task): boolean {
     || candidate.entityType === 'crm-contact'
 }
 
-function taskRequestUrl(boardId?: string | null): string {
-  const params = new URLSearchParams({ includeCrmCards: 'true' })
+function taskRequestUrl(boardId?: string | null, includeCrmCards = false): string {
+  const params = new URLSearchParams({ includeCrmCards: String(includeCrmCards) })
   if (boardId) params.set('boardId', boardId)
   return `/api/tasks?${params.toString()}`
 }
@@ -124,13 +126,17 @@ function MetricValue({ available, loading, value }: { available: boolean; loadin
   return <Typography variant="h5" fontWeight={700} color="text.primary" lineHeight={1}>{available ? value : '—'}</Typography>
 }
 
-export default function DashboardSection({ onNavigate, onNavigateWithFilter, initialWorkspaceId }: Props) {
+export default function DashboardSection({ onNavigate, onNavigateWithFilter, initialWorkspaceId, moduleCapabilities }: Props) {
   const { timeZone } = useUserDateTime()
+  const canProjects = moduleCapabilities.projects
+  const canDocs = moduleCapabilities.docs
+  const canPipeline = moduleCapabilities.pipeline
+  const canAgents = moduleCapabilities.agents
   const initialBootstrap = initialWorkspaceId ? readWorkspaceBootstrap(initialWorkspaceId) : null
-  const [tasks, setTasks] = useState<Task[]>(() => initialBootstrap?.tasks || [])
-  const [docs, setDocs] = useState<DocMeta[]>(() => initialBootstrap?.docs || [])
+  const [tasks, setTasks] = useState<Task[]>(() => canProjects ? initialBootstrap?.tasks || [] : [])
+  const [docs, setDocs] = useState<DocMeta[]>(() => canDocs ? initialBootstrap?.docs || [] : [])
   const [pipelineSnapshot, setPipelineSnapshot] = useState<PipelineSnapshot | null>(
-    () => initialBootstrap?.pipelineSnapshot || null,
+    () => canPipeline ? initialBootstrap?.pipelineSnapshot || null : null,
   )
   const [workspace, setWorkspace] = useState<WorkspaceSnapshot | null>(() => initialBootstrap?.workspace || null)
   const [user, setUser] = useState<UserSummary | null>(() => initialBootstrap?.user || null)
@@ -154,7 +160,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
 
     async function load() {
       const independentResultsPromise = Promise.allSettled([
-        fetchJson('/api/docs', controller.signal),
+        canDocs ? fetchJson('/api/docs', controller.signal) : Promise.resolve(null),
         fetchJson('/api/users', controller.signal),
       ])
       let nextWorkspace: WorkspaceSnapshot | null = null
@@ -173,8 +179,8 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       const pipelineId = nextWorkspace?.selectedPipelineId
       const [scopedResults, independentResults] = await Promise.all([
         Promise.allSettled([
-          fetchJson(taskRequestUrl(boardId), controller.signal),
-          fetchJson(pipelineRequestUrl(boardId, pipelineId), controller.signal),
+          canProjects ? fetchJson(taskRequestUrl(boardId, canPipeline), controller.signal) : Promise.resolve(null),
+          canPipeline ? fetchJson(pipelineRequestUrl(canProjects ? boardId : null, pipelineId), controller.signal) : Promise.resolve(null),
         ]),
         independentResultsPromise,
       ])
@@ -217,17 +223,17 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       clearTimeout(timeout)
       controller.abort()
     }
-  }, [])
+  }, [canDocs, canProjects, canPipeline])
 
   useEffect(() => {
-    if (loading) return
+    if (loading || !canProjects) return
     let active = true
     let controller: AbortController | null = null
 
     async function refreshLiveData() {
       controller?.abort()
       controller = new AbortController()
-      const results = await Promise.allSettled([fetchJson(taskRequestUrl(selectedBoardId), controller.signal)])
+      const results = await Promise.allSettled([fetchJson(taskRequestUrl(selectedBoardId, canPipeline), controller.signal)])
       if (!active) return
       const [tasksResult] = results
       if (tasksResult.status === 'fulfilled' && Array.isArray(tasksResult.value)) {
@@ -244,7 +250,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       clearInterval(interval)
       controller?.abort()
     }
-  }, [loading, selectedBoardId])
+  }, [loading, selectedBoardId, canProjects, canPipeline])
 
   const boardCards = useMemo(() => tasks.filter((task) => !task.archived), [tasks])
   const operationalTasks = useMemo(() => boardCards.filter((task) => !isCrmCard(task)), [boardCards])
@@ -313,25 +319,29 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
     { label: 'Open tasks', value: activeTasks.length, available: availability.tasks, loading: taskLoading, Icon: RadioButtonUncheckedRounded, color: '#CFC6EA', action: () => navigateToProjects({ priority: [], status: ACTIVE_STATUS_ORDER, labels: [] }) },
     { label: 'Completed', value: done.length, available: availability.tasks, loading: taskLoading, Icon: CheckCircleRounded, color: '#66BB6A', action: () => navigateToProjects({ priority: [], status: ['done'], labels: [] }) },
     { label: 'Agent attention', value: agentAttention.length, available: availability.tasks, loading: taskLoading, Icon: SmartToyRounded, color: '#4FD1B8', action: () => onNavigate('agents') },
-  ]
+  ].filter((metric) => canProjects && (metric.label !== 'Agent attention' || canAgents))
 
   function navigateToProjects(filter: Filter) {
+    if (!canProjects) return
     if (onNavigateWithFilter) onNavigateWithFilter('projects', filter)
     else onNavigate('projects')
   }
 
   function openTask(taskId: string) {
+    if (!canProjects) return
     queueProjectTaskOpen(taskId)
     onNavigate('projects')
     window.dispatchEvent(new CustomEvent('open-task', { detail: { id: taskId } }))
   }
 
   function openAgentChat(taskId: string, agentId?: string) {
+    if (!canAgents) return
     queueAgentTaskOpen(taskId, agentId || '')
     onNavigate('agents')
   }
 
   function openDoc(doc: DocMeta) {
+    if (!canDocs) return
     const oldURL = window.location.href
     const url = new URL(window.location.href)
     url.searchParams.set('doc', doc.slug || doc.id)
@@ -341,7 +351,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
   }
 
   async function updateDashboardSelection(kind: 'board' | 'pipeline', id: string) {
-    if (!id || selectionPending) return
+    if (!id || selectionPending || (kind === 'board' ? !canProjects : !canPipeline)) return
     setSelectionPending(kind)
     try {
       const response = await fetch('/api/workspaces', {
@@ -361,7 +371,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       if (kind === 'board') {
         setTasks([])
         setAvailability((current) => ({ ...current, tasks: false }))
-        const taskValue = await fetchJson(taskRequestUrl(value.selectedBoardId))
+        const taskValue = await fetchJson(taskRequestUrl(value.selectedBoardId, canPipeline))
         if (!Array.isArray(taskValue)) throw new Error('Project board returned an invalid response')
         setTasks(taskValue as Task[])
         setAvailability((current) => ({ ...current, tasks: true }))
@@ -369,7 +379,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       } else {
         setPipelineSnapshot(null)
         setAvailability((current) => ({ ...current, pipeline: false }))
-        const pipelineValue = await fetchJson(pipelineRequestUrl(value.selectedBoardId, value.selectedPipelineId))
+        const pipelineValue = await fetchJson(pipelineRequestUrl(canProjects ? value.selectedBoardId : null, value.selectedPipelineId))
         if (!isPipelineSnapshot(pipelineValue)) throw new Error('Pipeline returned an invalid response')
         setPipelineSnapshot(pipelineValue)
         setAvailability((current) => ({ ...current, pipeline: true }))
@@ -400,7 +410,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         </Box>
       ) : workspace ? (
         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' }, gap: 1.5, mb: 3 }}>
-          <TextField
+          {canProjects && <TextField
             select
             size="small"
             label="Dashboard board"
@@ -409,8 +419,8 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
             onChange={(event) => { void updateDashboardSelection('board', event.target.value) }}
           >
             {workspace.boards.map((board) => <MenuItem key={board.id} value={board.id}>{board.name}</MenuItem>)}
-          </TextField>
-          <TextField
+          </TextField>}
+          {canPipeline && <TextField
             select
             size="small"
             label="Dashboard pipeline"
@@ -419,7 +429,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
             onChange={(event) => { void updateDashboardSelection('pipeline', event.target.value) }}
           >
             {workspace.pipelines.map((pipeline) => <MenuItem key={pipeline.id} value={pipeline.id}>{pipeline.name}</MenuItem>)}
-          </TextField>
+          </TextField>}
         </Box>
       ) : null}
 
@@ -429,7 +439,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         </Box>
       )}
 
-      <Box
+      {metrics.length > 0 && <Box
         aria-label="Workspace pulse"
         sx={{
           display: 'grid',
@@ -448,9 +458,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
             </Box>
           </ButtonBase>
         ))}
-      </Box>
+      </Box>}
 
-      <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: { xs: 1.75, sm: 2.25 }, mb: 3 }}>
+      {canProjects && canAgents && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: { xs: 1.75, sm: 2.25 }, mb: 3 }}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1.5} mb={1}>
           <Typography variant="subtitle2" fontWeight={700} color="text.primary">Current Agent Activity</Typography>
           {taskLoading ? <Skeleton variant="rounded" width={92} height={24} /> : (
@@ -479,9 +489,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         ) : (
           <Typography variant="body2" color="text.secondary">No agent is currently reporting task activity.</Typography>
         )}
-      </Box>
+      </Box>}
 
-      <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, px: { xs: 1.75, sm: 2.25 }, py: 1, mb: 3 }}>
+      {canProjects && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, px: { xs: 1.75, sm: 2.25 }, py: 1, mb: 3 }}>
         <Typography variant="subtitle2" fontWeight={700} color="text.primary" py={1.25}>Next Actions</Typography>
         {taskLoading ? (
           <Stack spacing={1.25} pb={1.5}><Skeleton height={28} /><Skeleton height={28} /><Skeleton height={28} /></Stack>
@@ -504,16 +514,16 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
                 </Box>
                 <Stack direction="row" spacing={0.75} flexShrink={0}>
                   <Button size="small" variant="text" onClick={() => openTask(task.id)}>Open task</Button>
-                  {task.assignedAgent && <Button size="small" variant="outlined" onClick={() => openAgentChat(task.id, task.assignedAgent)}>Open thread</Button>}
+                  {canAgents && task.assignedAgent && <Button size="small" variant="outlined" onClick={() => openAgentChat(task.id, task.assignedAgent)}>Open thread</Button>}
                 </Stack>
               </Stack>
             </Box>
           </Box>
         ))}
-      </Box>
+      </Box>}
 
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'repeat(2, minmax(0, 1fr))', lg: 'repeat(3, minmax(0, 1fr))' }, gap: 2.5 }}>
-        <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canProjects && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5} gap={1}>
             <Stack direction="row" alignItems="center" spacing={1} minWidth={0}>
               <ViewKanbanRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />
@@ -546,9 +556,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
               </Box>
             </ButtonBase>
           ))}
-        </Box>
+        </Box>}
 
-        <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canPipeline && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5} gap={1}>
             <Stack direction="row" alignItems="center" spacing={1} minWidth={0}>
               <AccountBalanceRounded sx={{ fontSize: 19, color: '#4FD1B8' }} />
@@ -576,9 +586,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
               </Box>
             ))}
           </Box>
-        </Box>
+        </Box>}
 
-        <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canDocs && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
             <Stack direction="row" alignItems="center" spacing={1}>
               <DescriptionRounded sx={{ fontSize: 19, color: '#CFC6EA' }} />
@@ -610,8 +620,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
               ))}
             </>
           )}
-        </Box>
+        </Box>}
       </Box>
+      {!canProjects && !canDocs && !canPipeline && <Typography color="text.secondary">Your account is active. Select an available module from the menu, or ask your administrator to enable access for this organization.</Typography>}
     </Box>
   )
 }

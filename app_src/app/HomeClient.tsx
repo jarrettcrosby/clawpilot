@@ -20,15 +20,17 @@ import ShippingSection, {
   type ShippingView,
 } from '@/components/shipping/ShippingSection'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
-import SessionGuard from '@/components/auth/SessionGuard'
+import SessionGuard, { SESSION_REFRESH_EVENT } from '@/components/auth/SessionGuard'
 import ImpersonationBanner from '@/components/auth/ImpersonationBanner'
-import { Box } from '@mui/material'
+import { Alert, Box, Button, CircularProgress } from '@mui/material'
 import type { BoardFilter } from '@/components/projects/FilterBar'
 import { emptyFilter } from '@/components/projects/FilterBar'
 import { WORKSPACE_CHANGED_EVENT, type WorkspaceChangedDetail } from '@/lib/workspaceClient'
 import { accountingSectionFromNavigationUrl } from '@/lib/accountingDraftNavigation'
+import type { AppModuleId, ModuleCapabilities } from '@/lib/moduleAccess'
 
 const SECTIONS = ['dashboard', 'docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping', 'links', 'agents', 'versions']
+const LOCAL_MODULE_CAPABILITIES = Object.fromEntries(SECTIONS.map((section) => [section, true])) as ModuleCapabilities
 const OPERATIONS_TARGETS: Record<string, OperationsView> = {
   operations: 'orders',
   'operations/picking': 'picking',
@@ -106,6 +108,24 @@ export default function HomeClient({
   const [boardFilter, setBoardFilter] = useState<BoardFilter>(emptyFilter())
   const [workspaceRevision, setWorkspaceRevision] = useState(0)
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null)
+  const [moduleCapabilities, setModuleCapabilities] = useState<ModuleCapabilities | null>(sessionGuardEnabled ? null : LOCAL_MODULE_CAPABILITIES)
+  const [accessUnavailable, setAccessUnavailable] = useState(false)
+  const reportAccessUnavailable = useCallback(() => setAccessUnavailable(true), [])
+  const allowedModuleIds = SECTIONS.filter((section) => moduleCapabilities?.[section as AppModuleId] === true || section === 'dashboard')
+  const receiveSession = useCallback((payload: unknown) => {
+    const session = payload && typeof payload === 'object' ? payload as { ok?: boolean; moduleCapabilities?: unknown; activeWorkspace?: { organizationId?: string } } : null
+    if (activeWorkspaceId && session?.activeWorkspace?.organizationId !== activeWorkspaceId) return
+    const candidate = session?.moduleCapabilities
+    if (session?.ok !== true || !candidate || typeof candidate !== 'object'
+      || !SECTIONS.every((key) => typeof (candidate as Record<string, unknown>)[key] === 'boolean')) {
+      setModuleCapabilities(null)
+      setAccessUnavailable(true)
+      return
+    }
+    const next = Object.fromEntries(SECTIONS.map((key) => [key, (candidate as Record<string, boolean>)[key] === true])) as ModuleCapabilities
+    setModuleCapabilities((current) => JSON.stringify(current) === JSON.stringify(next) ? current : next)
+    setAccessUnavailable(false)
+  }, [activeWorkspaceId])
 
   const toggleDesktopNav = useCallback(() => {
     try {
@@ -165,8 +185,10 @@ export default function HomeClient({
   // Navigate and push to browser history
   const navigate = useCallback((section: string) => {
     setMobileNavOpen(false)
+    const root = section.split('/')[0] as AppModuleId
+    if (root !== 'dashboard' && (!moduleCapabilities?.[root] || (root === 'links' && !shortLinksEnabled))) return
     window.location.hash = section
-  }, [])
+  }, [moduleCapabilities, shortLinksEnabled])
 
   useEffect(() => {
     if (!shortLinksEnabled && activeSection === 'links') navigate('dashboard')
@@ -178,11 +200,13 @@ export default function HomeClient({
       setMobileNavOpen(false)
       setBoardFilter(emptyFilter())
       setActiveWorkspaceId(detail?.organizationId || null)
+      setModuleCapabilities(sessionGuardEnabled ? null : LOCAL_MODULE_CAPABILITIES)
+      setAccessUnavailable(false)
       setWorkspaceRevision((revision) => revision + 1)
     }
     window.addEventListener(WORKSPACE_CHANGED_EVENT, onWorkspaceChanged)
     return () => window.removeEventListener(WORKSPACE_CHANGED_EVENT, onWorkspaceChanged)
-  }, [])
+  }, [sessionGuardEnabled])
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -207,7 +231,7 @@ export default function HomeClient({
     return () => window.removeEventListener('keydown', onKey)
   }, [navigate])
 
-  const section = activeSection
+  const section = moduleCapabilities?.[activeSection as AppModuleId] === true ? activeSection : ''
 
   return (
     <Box
@@ -233,6 +257,7 @@ export default function HomeClient({
         onMobileOpen={() => setMobileNavOpen(true)}
         onMobileClose={() => setMobileNavOpen(false)}
         showLinks={shortLinksEnabled}
+        allowedModuleIds={allowedModuleIds}
       />
       <Box
         data-testid="app-content"
@@ -242,7 +267,7 @@ export default function HomeClient({
         overflow="hidden"
         minWidth={0}
       >
-        <SessionGuard enabled={sessionGuardEnabled} />
+        <SessionGuard key={`session-${workspaceRevision}`} enabled={sessionGuardEnabled} onSession={receiveSession} onUnavailable={reportAccessUnavailable} />
         <AppHeader
           activeSection={section}
           workspaceRevision={workspaceRevision}
@@ -253,7 +278,7 @@ export default function HomeClient({
         />
         <ImpersonationBanner />
         <Box
-          key={`workspace-${workspaceRevision}`}
+          key={`workspace-${workspaceRevision}-${JSON.stringify(moduleCapabilities)}`}
           sx={{
             flex: 1,
             overflow: ['docs', 'projects', 'pipeline', 'crm', 'accounting', 'pos', 'operations', 'shipping'].includes(section) ? 'hidden' : 'auto',
@@ -262,12 +287,17 @@ export default function HomeClient({
               : { xs: 'calc(var(--mobile-navigation-height) + env(safe-area-inset-bottom) + 16px)', md: 2 },
           }}
         >
+          {!moduleCapabilities ? accessUnavailable
+            ? <Alert severity="warning" sx={{ m: 3 }} action={<Button onClick={() => { setAccessUnavailable(false); window.dispatchEvent(new Event(SESSION_REFRESH_EVENT)) }}>Retry</Button>}>Workspace access could not be verified. Your account has not been signed out.</Alert>
+            : <Box sx={{ p: 3, display: 'flex', alignItems: 'center', gap: 2 }} role="status"><CircularProgress size={20} />Checking workspace access…</Box>
+            : !section ? <Alert severity="info" sx={{ m: 3 }}>You do not have access to this module in the current organization. Select an available module or ask your administrator.</Alert> : null}
           {section === 'dashboard' && (
             <Box sx={{ height: '100%', overflow: 'auto' }}>
               <DashboardSection
                 onNavigate={navigate}
                 onNavigateWithFilter={navigateWithFilter}
                 initialWorkspaceId={activeWorkspaceId}
+                moduleCapabilities={moduleCapabilities!}
               />
             </Box>
           )}

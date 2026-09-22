@@ -24,6 +24,12 @@ export class AppUserNotFoundError extends Error {
 }
 
 export type AppUserPermissions = {
+  viewDocs?: boolean
+  viewProjects?: boolean
+  viewCrm?: boolean
+  viewLinks?: boolean
+  viewAgents?: boolean
+  viewVersions?: boolean
   accessDemo: boolean
   inviteUsers: boolean
   manageUserAccess: boolean
@@ -51,6 +57,12 @@ export type AppUserPermissions = {
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
+  viewDocs: true,
+  viewProjects: true,
+  viewCrm: true,
+  viewLinks: true,
+  viewAgents: true,
+  viewVersions: true,
   accessDemo: false,
   inviteUsers: false,
   manageUserAccess: false,
@@ -78,6 +90,12 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
+  viewDocs: true,
+  viewProjects: true,
+  viewCrm: true,
+  viewLinks: true,
+  viewAgents: true,
+  viewVersions: true,
   accessDemo: true,
   inviteUsers: true,
   manageUserAccess: true,
@@ -331,6 +349,12 @@ export function isRootAppOwner(user: Pick<AppUser, 'email' | 'role'>): boolean {
 function normalizePermissions(value: unknown): AppUserPermissions {
   const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
+    viewDocs: input.viewDocs !== false,
+    viewProjects: input.viewProjects !== false,
+    viewCrm: input.viewCrm !== false,
+    viewLinks: input.viewLinks !== false,
+    viewAgents: input.viewAgents !== false,
+    viewVersions: input.viewVersions !== false,
     accessDemo: input.accessDemo === true,
     inviteUsers: input.inviteUsers === true,
     manageUserAccess: input.manageUserAccess === true,
@@ -398,6 +422,14 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     permissions.approveAccounting = false
     permissions.viewOrganizationAudit = false
     permissions.viewSystemAudit = false
+  }
+  // Viewing is necessary but never sufficient for a write/action permission.
+  if (!permissions.viewProjects) permissions.createBoards = false
+  if (!permissions.viewCrm) permissions.createPipelines = false
+  if (!permissions.viewLinks) permissions.manageLinks = false
+  if (!permissions.viewVersions) {
+    permissions.viewFullReleaseHistory = false
+    permissions.manageBackups = false
   }
   return permissions
 }

@@ -2,6 +2,7 @@ import type { NextRequest } from 'next/server'
 import { resolveRequestSession, type BrowserSession } from '@/lib/authSessions'
 import { OWNER_PERMISSIONS, requireActiveAppUser, type AppUser } from '@/lib/users'
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import { requireRequestModuleAccess } from '@/lib/moduleAuthorization'
 
 function localDevelopmentUser(): AppUser | null {
   const hosted = Boolean(
@@ -54,10 +55,10 @@ export async function sessionEmail(req: NextRequest): Promise<string | null> {
 export async function requireRequestUser(req: NextRequest): Promise<AppUser> {
   const session = await requestSession(req)
   if (session?.effectiveUser) {
-    return requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId)
+    return requireRequestModuleAccess(req, await requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId))
   }
   const localUser = localDevelopmentUser()
-  if (localUser) return localUser
+  if (localUser) return requireRequestModuleAccess(req, localUser)
   throw new Error('Unauthorized')
 }
 

@@ -40,16 +40,16 @@ model {
     description 'Current production app and canonical provider callback origin.'
   }
   bpoAppHost = system 'aiapp.bposupplychain.com' {
-    description 'Additional production domain registered in Railway; DNS and TLS validation pending at 2026-09-21 review.'
+    description 'Additional production app host. DNS, TLS, and real magic-code login to the same account verified on 2026-09-21; no Eigen redirect. Google browser sign-in needs separate acceptance.'
   }
   eigenDevHost = system 'dev.aiapp.eigenracing.com' {
     description 'Existing development domain; app suspended.'
   }
   bpoDevHost = system 'dev.aiapp.bposupplychain.com' {
-    description 'Additional development domain registered in Railway; DNS/TLS pending and app suspended.'
+    description 'Additional development domain with verified DNS and TLS as of 2026-09-21; app remains intentionally suspended, so this is not a live login path.'
   }
   bpoWebsite = system 'BPO Supply Chain website' {
-    description 'Existing bposupplychain.com Vercel website; proposed /s/{slug} resolver route is not active until released and verified.'
+    description 'Existing bposupplychain.com Vercel website. Source-only /s/{slug} bridge deployment is staged and protected; not promoted to the public domain. BPO link creation remains disabled pending production end-to-end acceptance.'
   }
 
   googleSheets = system 'Google Sheets / Drive' {
@@ -76,7 +76,7 @@ model {
 
   operator -> eigenAppHost 'uses production app'
   eigenAppHost -> production.app 'routes HTTPS'
-  bpoAppHost -> production.app 'additional HTTPS route after DNS/TLS activation'
+  bpoAppHost -> production.app 'verified additional HTTPS login route; no redirect'
   production.app -> production.postgres 'reads and writes organization-scoped state'
   production.app -> production.optimizer 'private optimization request'
   production.app -> production.suitecrm 'CRM projection and reconciliation'
@@ -90,9 +90,9 @@ model {
   production.app -> faire 'commerce provider reads and scoped writes'
   production.app -> toast 'read-only POS ingestion'
 
-  bpoWebsite -> production.app 'planned server-side short-link resolver; not active yet'
+  bpoWebsite -> production.app 'staged server-side short-link resolver; public activation pending'
   eigenDevHost -> development 'retained domain; runtime suspended'
-  bpoDevHost -> development 'registered domain; DNS pending and runtime suspended'
+  bpoDevHost -> development 'DNS/TLS verified; runtime suspended'
 }
 
 views {
@@ -113,6 +113,7 @@ views {
     title 'Production runtime and durable data'
     include operator
     include eigenAppHost
+    include bpoAppHost
     include production.*
     include googleSheets
     include maton
@@ -133,7 +134,7 @@ views {
 
   view domainsAndEnvironments {
     title 'App domains and environment state — 2026-09-21'
-    description 'Registration does not prove DNS, TLS, or login acceptance. Development is retained but suspended.'
+    description 'Both production app hosts work without redirects. BPO short-link bridge is staged, not public. Development DNS/TLS is retained while its runtime is suspended.'
     include eigenAppHost
     include bpoAppHost
     include production.app

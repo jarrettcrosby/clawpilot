@@ -11,6 +11,16 @@ export class LoginEmailChangeError extends Error {
   constructor(message: string, public status = 400) { super(message) }
 }
 
+export const LOGIN_EMAIL_CHANGE_UNAVAILABLE = 'Login email changes are temporarily unavailable while the authentication rollout is being verified. Your current sign-in address still works.'
+
+export function loginEmailChangeEnabled() {
+  return process.env.CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED === '1'
+}
+
+function assertLoginEmailChangeEnabled() {
+  if (!loginEmailChangeEnabled()) throw new LoginEmailChangeError(LOGIN_EMAIL_CHANGE_UNAVAILABLE, 503)
+}
+
 export function assertLoginEmailChangeSession(session: BrowserSession) {
   if (session.legacy || session.impersonating || session.authenticatedUser !== session.effectiveUser) {
     throw new LoginEmailChangeError('Sign in as yourself before changing your login email.', 403)
@@ -43,6 +53,7 @@ async function availableAddress(client: PoolClient, user: string, email: string)
 }
 
 export async function requestLoginEmailChange(session: BrowserSession, value: unknown) {
+  assertLoginEmailChangeEnabled()
   assertLoginEmailChangeSession(session)
   const email = normalizeUserEmail(value)
   const user = session.authenticatedUser
@@ -75,6 +86,7 @@ export async function requestLoginEmailChange(session: BrowserSession, value: un
 }
 
 export async function confirmLoginEmailChange(session: BrowserSession, input: { email: unknown; code: unknown }) {
+  assertLoginEmailChangeEnabled()
   assertLoginEmailChangeSession(session)
   const user = session.authenticatedUser
   const email = normalizeUserEmail(input.email)

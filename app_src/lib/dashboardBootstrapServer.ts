@@ -9,10 +9,17 @@ import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { readCrmSummaryFromPostgres } from '@/lib/persistence/crm'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
 import type { AppUser } from '@/lib/users'
+import { moduleCapabilitiesForUser } from '@/lib/moduleAuthorization'
+import { resolveCrmBoardBinding } from '@/lib/crm/boardProjection'
+import { resolvePipelineSpaceAccess } from '@/lib/tenancy'
 
-async function readTasks(boardId: string | null) {
+async function readTasks(actor: AppUser, boardId: string | null, includeCrmCards: boolean) {
   if (!boardId || !isPostgresTaskStoreEnabled()) throw new Error('Task prefetch is unavailable')
-  const tasks = await readTasksFromPostgres({ boardId, includeCrmCards: true })
+  // Sharing a project board never implies access to its linked CRM pipeline.
+  // Resolve that resource ACL before reading any projected CRM card payloads.
+  const binding = includeCrmCards ? await resolveCrmBoardBinding(boardId) : null
+  if (binding) await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
+  const tasks = await readTasksFromPostgres({ boardId, includeCrmCards: Boolean(binding) })
   return tasks.filter((task) => !task.archived)
 }
 
@@ -44,6 +51,7 @@ async function readPipeline(
 
 export async function buildDashboardBootstrap(actor: AppUser): Promise<DashboardBootstrapPayload> {
   if (!actor.organizationId) throw new Error('Active workspace is not available')
+  const capabilities = moduleCapabilitiesForUser(actor)
   const workspace = await readDashboardWorkspace(actor, {
     preferDefaults: true,
     ensureDefaults: false,
@@ -53,9 +61,9 @@ export async function buildDashboardBootstrap(actor: AppUser): Promise<Dashboard
     (pipeline) => pipeline.id === workspace.selectedPipelineId,
   )?.name || null
   const [tasksResult, docsResult, pipelineResult] = await Promise.allSettled([
-    readTasks(workspace.selectedBoardId),
-    readDocs(actor),
-    readPipeline(workspace.selectedPipelineId, pipelineName),
+    capabilities.projects ? readTasks(actor, workspace.selectedBoardId, capabilities.crm) : Promise.resolve([]),
+    capabilities.docs ? readDocs(actor) : Promise.resolve([]),
+    capabilities.crm ? readPipeline(workspace.selectedPipelineId, pipelineName) : Promise.resolve(null),
   ])
   const unavailable: DashboardBootstrapPayload['unavailable'] = []
   if (tasksResult.status === 'rejected') unavailable.push('tasks')
@@ -72,9 +80,9 @@ export async function buildDashboardBootstrap(actor: AppUser): Promise<Dashboard
     pipelineSnapshot: pipelineResult.status === 'fulfilled' ? pipelineResult.value : null,
     user: { displayName: actor.displayName, email: actor.email },
     availability: {
-      tasks: tasksResult.status === 'fulfilled',
-      docs: docsResult.status === 'fulfilled',
-      pipeline: pipelineResult.status === 'fulfilled',
+      tasks: capabilities.projects && tasksResult.status === 'fulfilled',
+      docs: capabilities.docs && docsResult.status === 'fulfilled',
+      pipeline: capabilities.crm && pipelineResult.status === 'fulfilled',
     },
     unavailable,
   }

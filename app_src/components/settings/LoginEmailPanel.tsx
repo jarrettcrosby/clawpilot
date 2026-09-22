@@ -7,6 +7,8 @@ import { Alert, Box, Button, Stack, TextField, Typography } from '@mui/material'
 export default function LoginEmailPanel({ identityEmail }: { identityEmail: string }) {
   const router = useRouter()
   const [loginEmail, setLoginEmail] = useState('')
+  const [changeEnabled, setChangeEnabled] = useState(false)
+  const [unavailableReason, setUnavailableReason] = useState('')
   const [newEmail, setNewEmail] = useState('')
   const [pendingEmail, setPendingEmail] = useState('')
   const [code, setCode] = useState('')
@@ -14,15 +16,21 @@ export default function LoginEmailPanel({ identityEmail }: { identityEmail: stri
   const [error, setError] = useState('')
   useEffect(() => {
     const controller = new AbortController()
+    setChangeEnabled(false)
+    setUnavailableReason('')
     fetch('/api/auth/login-email', { signal: controller.signal }).then(async (response) => {
       const data = await response.json()
       if (!response.ok || !data.ok) throw new Error(data.error || 'Unable to load login email')
+      if (controller.signal.aborted) return
       setLoginEmail(data.loginEmail)
+      setChangeEnabled(data.changeEnabled === true)
+      setUnavailableReason(data.changeEnabled === true ? '' : data.changeUnavailableReason || 'Login email changes are temporarily unavailable. Your current sign-in address still works.')
     }).catch((failure) => { if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : 'Unable to load login email') })
     return () => controller.abort()
   }, [identityEmail])
 
   async function submit(confirm: boolean) {
+    if (!changeEnabled) return
     setBusy(true)
     setError('')
     try {
@@ -49,14 +57,15 @@ export default function LoginEmailPanel({ identityEmail }: { identityEmail: stri
       This changes how you sign in, not your historical identity, organization memberships, CRM contact emails, or email sender settings.
       Verify the new inbox first. You will be signed out of all devices and must relink Google sign-in afterward. The old email will stop working for sign-in.
     </Typography>
+    {unavailableReason ? <Alert severity="info" sx={{ mb: 1 }}>{unavailableReason}</Alert> : null}
     {error ? <Alert severity="error" sx={{ mb: 1 }}>{error}</Alert> : null}
     {pendingEmail ? <Alert severity="info" sx={{ mb: 1 }}>Enter the six-digit code sent to {pendingEmail}. No change has been made yet.</Alert> : null}
     <Stack spacing={1.5}>
-      <TextField label="New login email" type="email" size="small" value={newEmail} disabled={busy} onChange={(event) => { setNewEmail(event.target.value); setPendingEmail(''); setCode('') }} />
-      <Button type="button" variant="outlined" disabled={busy || !loginEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail) || newEmail.trim().toLowerCase() === loginEmail} onClick={() => { void submit(false) }}>Send verification code</Button>
+      <TextField label="New login email" type="email" size="small" value={newEmail} disabled={busy || !changeEnabled} onChange={(event) => { setNewEmail(event.target.value); setPendingEmail(''); setCode('') }} />
+      <Button type="button" variant="outlined" disabled={busy || !changeEnabled || !loginEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail) || newEmail.trim().toLowerCase() === loginEmail} onClick={() => { void submit(false) }}>Send verification code</Button>
       {pendingEmail ? <>
-        <TextField label="Login email verification code" size="small" value={code} disabled={busy} onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))} inputProps={{ inputMode: 'numeric', autoComplete: 'one-time-code', maxLength: 6 }} />
-        <Button type="button" variant="contained" disabled={busy || code.length !== 6} onClick={() => { void submit(true) }}>Verify and change login email</Button>
+        <TextField label="Login email verification code" size="small" value={code} disabled={busy || !changeEnabled} onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))} inputProps={{ inputMode: 'numeric', autoComplete: 'one-time-code', maxLength: 6 }} />
+        <Button type="button" variant="contained" disabled={busy || !changeEnabled || code.length !== 6} onClick={() => { void submit(true) }}>Verify and change login email</Button>
       </> : null}
     </Stack>
   </Box>

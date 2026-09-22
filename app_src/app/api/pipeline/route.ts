@@ -17,6 +17,7 @@ import {
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres } from '@/lib/persistence/tasks'
 import { isPostgresPipelineStoreEnabled } from '@/lib/persistence/pipeline'
 import { requireRequestUser } from '@/lib/requestUser'
+import { moduleCapabilitiesForUser } from '@/lib/moduleAuthorization'
 import {
   BOARD_SELECTION_COOKIE,
   PIPELINE_SELECTION_COOKIE,
@@ -111,14 +112,16 @@ export async function GET(req: NextRequest) {
   let workItems: ReturnType<typeof pipelineWorkItemsFromTasks> = []
   try {
     let boardId: string | undefined
+    let canReadProjects = true
     let selectedPipeline: PipelineSpace | null = null
     if (isPostgresPipelineStoreEnabled()) {
       const actor = await requireRequestUser(req)
+      canReadProjects = moduleCapabilitiesForUser(actor).projects
       const explicitBoardId = req.nextUrl.searchParams.get('boardId') || undefined
       const explicitPipelineId = req.nextUrl.searchParams.get('pipelineId') || undefined
       const selectedBoardId = explicitBoardId || req.cookies.get(BOARD_SELECTION_COOKIE)?.value || undefined
       const selectedPipelineId = explicitPipelineId || req.cookies.get(PIPELINE_SELECTION_COOKIE)?.value || undefined
-      const board = explicitBoardId
+      const board = !canReadProjects ? null : explicitBoardId
         ? await resolveProjectBoardAccess({ actorEmail: actor, boardId: explicitBoardId })
         : await resolveProjectBoardAccess({ actorEmail: actor, boardId: selectedBoardId })
           .catch(() => resolveProjectBoardAccess({ actorEmail: actor }))
@@ -126,9 +129,9 @@ export async function GET(req: NextRequest) {
         ? await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: explicitPipelineId })
         : await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: selectedPipelineId })
           .catch(() => resolvePipelineSpaceAccess({ actorEmail: actor }))
-      boardId = board.id
+      boardId = board?.id
     }
-    workItems = pipelineWorkItemsFromTasks(await readTasks(boardId))
+    workItems = canReadProjects ? pipelineWorkItemsFromTasks(await readTasks(boardId)) : []
 
     if (isPostgresPipelineStoreEnabled()) {
       try {

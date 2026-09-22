@@ -1,3 +1,10 @@
+-- The migration runner holds one transaction for this file. Take the existing
+-- user/identity lock order before any DDL, then keep identity writers blocked
+-- from the ownership snapshot through installation of the insert trigger.
+-- SHARE ROW EXCLUSIVE still permits ordinary reads and the old link path's
+-- user FOR SHARE/FK checks; it conflicts with identity INSERT's ROW EXCLUSIVE.
+LOCK TABLE app_users, app_user_external_identities IN SHARE ROW EXCLUSIVE MODE;
+
 CREATE TABLE app_user_login_addresses (
   user_email text PRIMARY KEY REFERENCES app_users(email),
   login_email text NOT NULL UNIQUE CHECK (login_email = lower(btrim(login_email)) AND length(login_email) BETWEEN 3 AND 254),

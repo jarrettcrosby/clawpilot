@@ -10,6 +10,7 @@ import {
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { requireRequestUser } from '@/lib/requestUser'
 import { BOARD_SELECTION_COOKIE, PIPELINE_SELECTION_COOKIE } from '@/lib/tenancy'
+import { ModuleAccessError } from '@/lib/moduleAuthorization'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -17,7 +18,7 @@ export const runtime = 'nodejs'
 
 function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : 'Document request failed'
-  const status = message === 'Unauthorized' ? 401 : 500
+  const status = error instanceof ModuleAccessError ? error.status : message === 'Unauthorized' ? 401 : 500
   return NextResponse.json({ ok: false, error: message }, { status })
 }
 

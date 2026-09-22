@@ -161,6 +161,7 @@ type NavigationProps = {
   onMobileOpen: () => void
   onMobileClose: () => void
   showLinks?: boolean
+  allowedModuleIds?: readonly string[]
 }
 
 type NavigationListProps = {
@@ -169,15 +170,17 @@ type NavigationListProps = {
   onSelect: (section: string) => void
   surface: 'desktop' | 'mobile'
   showLinks: boolean
+  allowedModuleIds: readonly string[]
 }
 
-function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks }: NavigationListProps) {
-  const items = showLinks ? NAV_ITEMS : NAV_ITEMS.filter((item) => item.id !== 'links')
+function NavigationList({ activeSection, collapsed = false, onSelect, surface, showLinks, allowedModuleIds }: NavigationListProps) {
+  const items = NAV_ITEMS.filter((item) => allowedModuleIds.includes(item.id) && (showLinks || item.id !== 'links'))
   const activeRoot = activeSection.split('/')[0]
   const [flyout, setFlyout] = useState<{
     anchor: HTMLElement
     item: NavigationItem
   } | null>(null)
+  const visibleFlyout = items.some((item) => item.id === flyout?.item.id) ? flyout : null
 
   const selectFlyoutItem = (section: string) => {
     setFlyout(null)
@@ -302,16 +305,16 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
         ))}
       </List>
       <Menu
-        anchorEl={flyout?.anchor || null}
-        open={Boolean(flyout)}
+        anchorEl={visibleFlyout?.anchor || null}
+        open={Boolean(visibleFlyout)}
         onClose={() => setFlyout(null)}
         anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
         transformOrigin={{ vertical: 'top', horizontal: 'left' }}
         MenuListProps={{
-          'aria-label': `${flyout?.item.label || 'Module'} submodules`,
+          'aria-label': `${visibleFlyout?.item.label || 'Module'} submodules`,
         }}
       >
-        {(flyout?.item.children || []).map((child) => (
+        {(visibleFlyout?.item.children || []).map((child) => (
           <MenuItem
             key={child.id}
             selected={activeSection === child.id}
@@ -336,6 +339,7 @@ export default function Navigation({
   onMobileOpen,
   onMobileClose,
   showLinks = true,
+  allowedModuleIds = ['dashboard'],
 }: NavigationProps) {
   const desktopWidth = collapsed ? 76 : 220
 
@@ -402,6 +406,7 @@ export default function Navigation({
             onSelect={onNavigate}
             surface="desktop"
             showLinks={showLinks}
+            allowedModuleIds={allowedModuleIds}
           />
         </Box>
       </Drawer>
@@ -459,6 +464,7 @@ export default function Navigation({
             onSelect={navigateFromMobile}
             surface="mobile"
             showLinks={showLinks}
+            allowedModuleIds={allowedModuleIds}
           />
         </Box>
       </Drawer>
@@ -491,7 +497,7 @@ export default function Navigation({
           },
         }}
       >
-        {MOBILE_DIRECT_ITEMS.map((item) => (
+        {MOBILE_DIRECT_ITEMS.filter((item) => allowedModuleIds.includes(item.id)).map((item) => (
           <BottomNavigationAction
             key={item.id}
             data-testid={`nav-bottom-${item.id}`}
