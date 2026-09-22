@@ -1464,19 +1464,27 @@ async function exerciseHistoricalReceiptMigration(databaseUrl) {
       { id: terminalId, status: 'failed', rate_source: 'production' },
       { id: processingId, status: 'processing', rate_source: 'sandbox' },
     ])
-    await assert.rejects(
-      pool.query(
-        `UPDATE operations_shopify_checkout_rate_receipts
-         SET rate_source = 'sandbox'
-         WHERE id = $1::uuid`,
-        [terminalId],
-      ),
-      /checkout rate receipts are immutable/u,
-    )
+    // pool.query releases SQL errors as broken clients and removes them from
+    // totalCount before their sockets close. Keep this expected rejection's
+    // healthy client tracked until the awaited pool teardown below.
+    const immutableProbe = await pool.connect()
+    try {
+      await assert.rejects(
+        immutableProbe.query(
+          `UPDATE operations_shopify_checkout_rate_receipts
+           SET rate_source = 'sandbox'
+           WHERE id = $1::uuid`,
+          [terminalId],
+        ),
+        /checkout rate receipts are immutable/u,
+      )
+    } finally {
+      immutableProbe.release()
+    }
   } finally {
     await endPoolAfterClientsClose(pool).catch(() => undefined)
     await adminPool.query(
-      `DROP DATABASE IF EXISTS ${historyDatabaseName} WITH (FORCE)`,
+      `DROP DATABASE IF EXISTS ${historyDatabaseName}`,
     ).catch(() => undefined)
     await adminPool.end().catch(() => undefined)
   }
