@@ -29,12 +29,34 @@ test('hosted CI, Railway, and Vercel bypass without reading local disk', () => {
   const code = runStorageGuard({
     argv: ['--preflight'],
     environment: { CI: '1' },
+    platform: 'linux',
     repositoryRoot: root,
     write: (message) => output.push(message),
     readSpace: () => assert.fail('hosted guard read local disk'),
   })
   assert.equal(code, 0)
   assert.match(output.join(''), /LOCAL_STORAGE_PREFLIGHT_SKIPPED hosted=CI/)
+})
+
+test('local Mac preflight cannot be bypassed by inherited hosted variables', () => {
+  for (const environment of [
+    { CI: 'true' },
+    { RAILWAY_ENVIRONMENT_ID: 'inherited-from-railway-run' },
+    { VERCEL_ENV: 'preview' },
+  ]) {
+    const output = []
+    assert.equal(runStorageGuard({
+      argv: ['--preflight'],
+      environment,
+      platform: 'darwin',
+      repositoryRoot: root,
+      write: (message) => output.push(message),
+      writeError: (message) => output.push(message),
+      readSpace: () => ({ availableBytes: 14 * GIB, totalBytes: 100 * GIB }),
+    }), 1)
+    assert.match(output.join(''), /LOCAL_STORAGE_PREFLIGHT_FAILED/)
+    assert.doesNotMatch(output.join(''), /SKIPPED/)
+  }
 })
 
 test('thresholds implement configurable fail, warning, and pass bands', () => {

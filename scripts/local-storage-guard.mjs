@@ -256,6 +256,7 @@ function printAudit(root, space, thresholds, write) {
 export function runStorageGuard({
   argv = process.argv.slice(2),
   environment = process.env,
+  platform = process.platform,
   repositoryRoot = process.cwd(),
   write = (message) => process.stdout.write(message),
   writeError = (message) => process.stderr.write(message),
@@ -271,7 +272,9 @@ export function runStorageGuard({
     return 0
   }
   const mode = argv.includes('--preflight') ? 'PREFLIGHT' : 'AUDIT'
-  const hosted = detectHostedEnvironment(environment)
+  // Railway CLI and test runners can inject hosted identity variables into a
+  // local Mac process. Those variables must not bypass the Mac disk safeguard.
+  const hosted = platform === 'darwin' ? null : detectHostedEnvironment(environment)
   if (hosted) {
     write(`LOCAL_STORAGE_${mode}_SKIPPED hosted=${hosted} policy=local-only\n`)
     return 0
