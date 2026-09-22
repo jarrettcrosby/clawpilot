@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import vm from "node:vm";
+import { isPublicBpoShortlinkResolvePath } from "../app_src/lib/bpoShortlinkPublicPath.mjs";
 
 const root = process.cwd();
 const requireFromApp = createRequire(
@@ -84,6 +85,9 @@ function loadProxy() {
         }
         if (specifier === "@/lib/demoMode") {
           return { demoMutationIsRestricted: () => false };
+        }
+        if (specifier === "@/lib/bpoShortlinkPublicPath.mjs") {
+          return { isPublicBpoShortlinkResolvePath };
         }
         throw new Error(`Unexpected proxy test import: ${specifier}`);
       },
@@ -420,6 +424,25 @@ try {
     1,
     "Only the exact Career agent service route is public",
   );
+
+  const bpoResolvePath = "/api/shortlinks/bpo/resolve/abc123";
+  const bpoGet = await proxyRuntime.proxy(proxyRequest(bpoResolvePath));
+  const bpoHead = await proxyRuntime.proxy({
+    ...proxyRequest(bpoResolvePath),
+    method: "HEAD",
+  });
+  assert.equal(bpoGet.kind, "next");
+  assert.equal(bpoHead.kind, "next");
+  assert.equal(proxyRuntime.sessionCalls(), 1, "Only the BPO resolver handler authenticates public GET and HEAD requests");
+
+  const bpoPost = await proxyRuntime.proxy({
+    ...proxyRequest(bpoResolvePath),
+    method: "POST",
+  });
+  const bpoSibling = await proxyRuntime.proxy(proxyRequest(`${bpoResolvePath}/extra`));
+  assert.equal(bpoPost.status, 401);
+  assert.equal(bpoSibling.status, 401);
+  assert.equal(proxyRuntime.sessionCalls(), 3, "BPO resolver methods and sibling paths must not bypass browser sessions");
 } finally {
   if (previousAuthRequired === undefined) delete process.env.APP_AUTH_REQUIRED;
   else process.env.APP_AUTH_REQUIRED = previousAuthRequired;
