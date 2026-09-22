@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { ModuleAccessError } from '@/lib/moduleAuthorization'
 import {
   readShortLinkDomainPreferences,
   resolveShortLinkActor,
@@ -11,6 +12,9 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 function errorResponse(error: unknown) {
+  if (error instanceof ModuleAccessError) {
+    return NextResponse.json({ ok: false, error: error.message, code: error.code, module: error.module }, { status: error.status })
+  }
   if (error instanceof ShortLinkRequestError) {
     return NextResponse.json({ ok: false, error: error.message }, { status: error.status })
   }
