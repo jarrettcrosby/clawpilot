@@ -881,7 +881,10 @@ async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
       assert.equal(await field.isDisabled(), true, 'Converted lead fields must not remain editable')
     }
     for (const label of ['Organization', 'Owner']) {
-      assert.equal(await editorDrawer.getByRole('combobox', { name: label, exact: true }).isDisabled(), true)
+      // MUI Select's accessible name includes both its label and selected value.
+      const field = editorDrawer.getByRole('combobox', { name: new RegExp(`^${label}(?:\\s|$)`) })
+      assert.equal(await field.count(), 1, `Converted lead must show one ${label} selector`)
+      assert.equal(await field.isDisabled(), true, `Converted lead ${label} selector must be disabled`)
     }
     assert.equal(await editorDrawer.getByRole('checkbox', { name: 'Do not email', exact: true }).isDisabled(), true)
     assert.equal(await editorDrawer.getByRole('button', { name: 'Save', exact: true }).count(), 0, 'Converted lead cannot be saved again')

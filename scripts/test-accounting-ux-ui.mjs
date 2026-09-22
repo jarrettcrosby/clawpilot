@@ -134,6 +134,9 @@ try {
   await drawer.getByRole('combobox', { name: 'Income account' }).click()
   await page.getByRole('option', { name: 'Product income', exact: true }).click()
   await drawer.getByRole('button', { name: 'Choose sales tax category' }).click()
+  // The product-category select already exists while the async tax roots load.
+  // Wait for both controls before choosing the tax-category select.
+  await expect(drawer.getByRole('combobox', { name: 'Category', exact: true })).toHaveCount(2)
   await drawer.getByRole('combobox', { name: 'Category', exact: true }).last().click()
   await page.getByRole('option', { name: 'Food', exact: true }).click()
   holdTaxLeaf = true
