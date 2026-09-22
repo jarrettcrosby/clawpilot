@@ -4,6 +4,7 @@ import {
   CommerceOrderRevisionEvidenceKeyConfigError,
   resolveCommerceOrderRevisionEvidenceKeyConfig,
 } from '../app_src/lib/integrations/commerceOrderRevisionEvidenceKeyConfig.mjs'
+import { additionalPublicOrigins } from '../app_src/lib/publicOriginRouting.mjs'
 
 const sourcePattern = /^[a-z][a-z0-9-]{1,39}$/
 const ownerDomainPattern = /^[a-z0-9.-]+$/
@@ -30,6 +31,26 @@ function validateShortLinkOrigin() {
     fail('SHORTLINK_PUBLIC_ORIGIN must be a valid HTTPS origin')
   }
   return origin
+}
+
+function validateBpoShortLinkDomain() {
+  const ready = String(process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY || '0').trim()
+  if (ready !== '0' && ready !== '1') fail('SHORTLINK_BPO_PUBLIC_ROUTE_READY must be 0 or 1')
+  if (ready === '0') return 'disabled'
+  const secret = String(process.env.SHORTLINK_BPO_RESOLVER_SECRET || '')
+  if (secret.length < 32) fail('SHORTLINK_BPO_RESOLVER_SECRET must contain at least 32 characters when the BPO route is ready')
+  let ids
+  try {
+    ids = JSON.parse(String(process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON || ''))
+  } catch {
+    fail('SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON must be a JSON array of exact workspace UUIDs')
+  }
+  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 20
+    || ids.some((id) => typeof id !== 'string' || !uuidPattern.test(id))
+    || new Set(ids.map((id) => id.toLowerCase())).size !== ids.length) {
+    fail('SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON must contain 1-20 unique workspace UUIDs')
+  }
+  return 'ready'
 }
 
 function validateServiceClients() {
@@ -416,6 +437,13 @@ function validateRevisionEvidenceConfiguration() {
 }
 
 const origin = validateShortLinkOrigin()
+const bpoShortLinkDomain = validateBpoShortLinkDomain()
+let additionalBrowserOrigins
+try {
+  additionalBrowserOrigins = additionalPublicOrigins(process.env.CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON)
+} catch (error) {
+  fail(error instanceof Error ? error.message : 'Additional public origins are invalid')
+}
 const clients = validateServiceClients()
 const authMail = validateAuthMailConfiguration()
 const careerSiteSubmissions = validateCareerSiteSubmissionsConfiguration()
@@ -425,4 +453,4 @@ const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
 const printAgentRelease = validatePrintAgentReleaseConfiguration()
 const revisionEvidence = validateRevisionEvidenceConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} authMail=${authMail} careerSiteSubmissions=${careerSiteSubmissions} careerSiteAgents=${careerSiteAgents} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} bpoShortLinkDomain=${bpoShortLinkDomain} additionalBrowserOrigins=${additionalBrowserOrigins.length} clients=${clients} authMail=${authMail} careerSiteSubmissions=${careerSiteSubmissions} careerSiteAgents=${careerSiteAgents} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)

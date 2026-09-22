@@ -159,7 +159,7 @@ const DEFAULT_SOURCES = [...BASE_PIPELINE_WORKFLOW.source]
 const DEFAULT_LOSS_REASONS = [...BASE_PIPELINE_WORKFLOW.loss_reason]
 
 const PRIORITY_COLORS: Record<string, string> = {
-  'A+': '#66BB6A', A: '#A8C7FA', B: '#CFC6EA', C: '#FDD663', D: '#EF5350',
+  'A+': '#66BB6A', A: 'var(--mui-palette-primary-main)', B: 'var(--mui-palette-secondary-main)', C: '#FDD663', D: '#EF5350',
 }
 
 const PRIORITY_SORT_WEIGHT: Record<string, number> = {
@@ -345,7 +345,7 @@ function DealCard({ deal, onClick, onMoveStage }: { deal: Deal; onClick: () => v
         if (e.shiftKey && e.key === 'ArrowRight') { e.preventDefault(); onMoveStage(deal, 1) }
         if (e.key === 'Enter') { e.preventDefault(); onClick() }
       }}
-      sx={{ backgroundColor: '#1A1A23', borderRadius: 2, p: 2, border: '1px solid rgba(255,255,255,0.06)', cursor: 'pointer', '&:hover': { borderColor: 'rgba(168,199,250,0.25)' }, '&:focus-visible': { outline: '2px solid rgba(168,199,250,0.55)', outlineOffset: 2 }, mb: 1.25 }}
+      sx={{ backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2, p: 2, border: '1px solid rgba(var(--cp-neutral-rgb),0.06)', cursor: 'pointer', '&:hover': { borderColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.25)' }, '&:focus-visible': { outline: '2px solid rgba(var(--mui-palette-primary-mainChannel) / 0.55)', outlineOffset: 2 }, mb: 1.25 }}
     >
       <Stack direction="row" alignItems="flex-start" justifyContent="space-between" mb={0.75}>
         <Box sx={{ flex: 1, minWidth: 0, mr: 1 }}>
@@ -452,8 +452,8 @@ function DealDrawer({
   const selectableOwners = owners.filter((owner) => owner.active)
 
   return (
-    <Drawer anchor="right" open={!!deal} onClose={onClose} PaperProps={{ sx: { width: touchLandscape ? { xs: '96vw', sm: 600 } : { xs: '100vw', sm: 520 }, maxWidth: '100vw', height: '100dvh', backgroundColor: '#0F0F13', borderLeft: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' } }}>
-      <Box sx={{ px: 3, py: 2, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+    <Drawer anchor="right" open={!!deal} onClose={onClose} PaperProps={{ sx: { width: touchLandscape ? { xs: '96vw', sm: 600 } : { xs: '100vw', sm: 520 }, maxWidth: '100vw', height: '100dvh', backgroundColor: 'var(--mui-palette-background-default)', borderLeft: '1px solid rgba(var(--cp-neutral-rgb),0.08)', display: 'flex', flexDirection: 'column' } }}>
+      <Box sx={{ px: 3, py: 2, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
         <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
           <Box>
             <Typography variant="h6" fontWeight={700}>{form.org || 'Unknown Organization'}</Typography>
@@ -583,7 +583,7 @@ function DealDrawer({
           </TextField>
         </Stack>
 
-        <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
+        <Divider sx={{ my: 2, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
         <Stack direction="row" justifyContent="space-between" alignItems="center" mb={1}>
           <Typography variant="subtitle2">Associated Contacts</Typography>
@@ -591,7 +591,7 @@ function DealDrawer({
             <Chip
               size="small"
               label={`${associatedContacts.filter(c => c.phone || c.email).length}/${associatedContacts.length} actionable`}
-              sx={{ height: 22, fontSize: '0.68rem', backgroundColor: 'rgba(168,199,250,0.12)', color: '#A8C7FA' }}
+              sx={{ height: 22, fontSize: '0.68rem', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)', color: 'var(--mui-palette-primary-main)' }}
             />
           )}
         </Stack>
@@ -640,11 +640,11 @@ function DealDrawer({
               const isPrimary = idx === 0
 
               return (
-                <Box key={contact.id} sx={{ p: 1.25, borderRadius: 2, border: isPrimary ? '1px solid rgba(168,199,250,0.45)' : '1px solid rgba(255,255,255,0.08)', backgroundColor: isPrimary ? 'rgba(168,199,250,0.08)' : 'rgba(255,255,255,0.02)' }}>
+                <Box key={contact.id} sx={{ p: 1.25, borderRadius: 2, border: isPrimary ? '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.45)' : '1px solid rgba(var(--cp-neutral-rgb),0.08)', backgroundColor: isPrimary ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' : 'rgba(var(--cp-neutral-rgb),0.02)' }}>
                   <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
                     <Typography variant="body2" fontWeight={600}>{contact.name}</Typography>
                     <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
-                      {isPrimary && <Chip size="small" label="Primary" sx={{ height: 20, fontSize: '0.62rem', backgroundColor: 'rgba(168,199,250,0.18)', color: '#A8C7FA' }} />}
+                      {isPrimary && <Chip size="small" label="Primary" sx={{ height: 20, fontSize: '0.62rem', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.18)', color: 'var(--mui-palette-primary-main)' }} />}
                       <Chip
                         size="small"
                         label={actionable ? 'Actionable' : 'Needs method'}
@@ -719,7 +719,7 @@ function DealDrawer({
           }}>Save opportunity</Button>
         </Stack> : null}
 
-        <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
+        <Divider sx={{ my: 2, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
         {!readOnly ? <><Typography variant="subtitle2" mb={1}>Add comment</Typography>
         <TextField multiline minRows={3} fullWidth value={comment} onChange={e => setComment(e.target.value)} placeholder="Write a comment..." />
@@ -740,7 +740,7 @@ function DealDrawer({
 
         {form.notes && (
           <>
-            <Divider sx={{ my: 2, borderColor: 'rgba(255,255,255,0.08)' }} />
+            <Divider sx={{ my: 2, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
             <Typography variant="caption" color="text.disabled">Current Notes</Typography>
             <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', mt: 1, color: 'text.secondary' }}>{form.notes}</Typography>
           </>
@@ -1187,7 +1187,7 @@ export default function PipelineSection() {
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <Box sx={{ px: compactLandscapeBoard ? 1 : { xs: 2, md: 3 }, py: compactLandscapeBoard ? 0.75 : 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+      <Box sx={{ px: compactLandscapeBoard ? 1 : { xs: 2, md: 3 }, py: compactLandscapeBoard ? 0.75 : 2, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)', flexShrink: 0 }}>
         <Stack
           direction="row"
           spacing={compactLandscapeBoard ? 1.5 : 3}
@@ -1208,7 +1208,7 @@ export default function PipelineSection() {
               <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmtSnapshotCurrency(pipelineReporting.snapshot?.activePipelineValue ?? null)}</Typography></Box>
               <Box>
                 <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
-                <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmtSnapshotCurrency(pipelineReporting.snapshot?.weightedPipelineValue ?? null)}</Typography>
+                <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="var(--mui-palette-primary-main)">{fmtSnapshotCurrency(pipelineReporting.snapshot?.weightedPipelineValue ?? null)}</Typography>
                 {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
               </Box>
               <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineReporting.snapshot?.activeOpportunities ?? '—'}</Typography></Box>
@@ -1218,7 +1218,7 @@ export default function PipelineSection() {
           ) : null}
 
           <Stack spacing={0.45} sx={{ minWidth: compactLandscapeBoard ? 170 : { xs: '100%', sm: 260 }, maxWidth: compactLandscapeBoard ? 220 : { xs: '100%', md: 460 } }}>
-            <Typography variant="caption" sx={{ color: '#A8C7FA', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
+            <Typography variant="caption" sx={{ color: 'var(--mui-palette-primary-main)', fontWeight: 700 }}>{pipelineSyncEnabled ? 'Pipeline sync' : 'Pipeline storage'}</Typography>
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
               <Typography variant="caption" color="text.disabled">Sync status</Typography>
               <Chip
@@ -1232,9 +1232,9 @@ export default function PipelineSection() {
                     : syncSurface.state === 'error'
                       ? 'rgba(239,83,80,0.18)'
                       : syncSurface.state === 'syncing'
-                        ? 'rgba(168,199,250,0.18)'
-                        : 'rgba(255,255,255,0.08)',
-                  color: syncSurface.state === 'ok' ? '#66BB6A' : syncSurface.state === 'error' ? '#EF5350' : syncSurface.state === 'syncing' ? '#A8C7FA' : 'text.secondary',
+                        ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.18)'
+                        : 'rgba(var(--cp-neutral-rgb),0.08)',
+                  color: syncSurface.state === 'ok' ? '#66BB6A' : syncSurface.state === 'error' ? '#EF5350' : syncSurface.state === 'syncing' ? 'var(--mui-palette-primary-main)' : 'text.secondary',
                 }}
               />
             </Stack>
@@ -1305,8 +1305,8 @@ export default function PipelineSection() {
                   sx={{
                     minWidth: 38,
                     minHeight: 38,
-                    border: '1px solid rgba(168,199,250,0.45)',
-                    color: '#A8C7FA',
+                    border: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.45)',
+                    color: 'var(--mui-palette-primary-main)',
                     borderRadius: 1,
                   }}
                 >
@@ -1321,7 +1321,7 @@ export default function PipelineSection() {
                 sx={{
                   minWidth: 38,
                   minHeight: 38,
-                  border: '1px solid rgba(255,255,255,0.18)',
+                  border: '1px solid rgba(var(--cp-neutral-rgb),0.18)',
                   color: 'text.secondary',
                   borderRadius: 1,
                 }}
@@ -1423,10 +1423,10 @@ export default function PipelineSection() {
                 sx={{
                   minHeight: 38,
                   mb: 1,
-                  borderBottom: '1px solid rgba(255,255,255,0.06)',
+                  borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
                   '& .MuiTab-root': { minHeight: 38, textTransform: 'none', fontSize: '0.76rem', color: 'text.secondary' },
-                  '& .Mui-selected': { color: '#A8C7FA' },
-                  '& .MuiTabs-indicator': { backgroundColor: '#A8C7FA' },
+                  '& .Mui-selected': { color: 'var(--mui-palette-primary-main)' },
+                  '& .MuiTabs-indicator': { backgroundColor: 'var(--mui-palette-primary-main)' },
                 }}
               >
                 {stageOptions.map(stage => (
@@ -1451,7 +1451,7 @@ export default function PipelineSection() {
                   <Box key={stage} sx={{ minWidth: 220, maxWidth: 240, flexShrink: 0 }}>
                     <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.25} px={0.5}>
                       <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem' }}>{stage}</Typography>
-                      <Chip size="small" label={stageDeals.length} sx={{ height: 18, fontSize: '0.62rem', borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.06)' }} />
+                      <Chip size="small" label={stageDeals.length} sx={{ height: 18, fontSize: '0.62rem', borderRadius: 1, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
                     </Stack>
                     {stageDeals.map(deal => <DealCard key={deal.id} deal={deal} onClick={() => setSelectedDeal(deal)} onMoveStage={moveDealStage} />)}
                   </Box>
@@ -1466,7 +1466,7 @@ export default function PipelineSection() {
                 No opportunities match this filter.
               </Typography>
             ) : filtered.map(deal => (
-              <Box key={deal.id} onClick={() => setSelectedDeal(deal)} sx={{ display: 'flex', alignItems: 'center', gap: 2, px: 2, py: 1.5, minHeight: 48, borderBottom: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer' }}>
+              <Box key={deal.id} onClick={() => setSelectedDeal(deal)} sx={{ display: 'flex', alignItems: 'center', gap: 2, px: 2, py: 1.5, minHeight: 48, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.05)', cursor: 'pointer' }}>
                 <Box sx={{ flex: 1, minWidth: 0 }}>
                   <Typography variant="body2" fontWeight={600}>{deal.org || 'Unknown Organization'}</Typography>
                   <Typography variant="caption" color="text.disabled">{deal.name || '—'}</Typography>
@@ -1485,7 +1485,7 @@ export default function PipelineSection() {
         fullScreen={singleStageBoard}
         fullWidth
         maxWidth="sm"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: singleStageBoard ? 0 : 1 } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: singleStageBoard ? 0 : 1 } }}
       >
         <DialogTitle sx={{ fontWeight: 700, pr: 7 }}>
           How your pipeline works
@@ -1539,7 +1539,7 @@ export default function PipelineSection() {
         fullScreen={compactLandscapeBoard}
         fullWidth
         maxWidth="xs"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
       >
         <DialogTitle sx={{ fontWeight: 700 }}>
           {pipelineProvisioningStatus === 'ready'
@@ -1575,7 +1575,7 @@ export default function PipelineSection() {
         fullScreen={compactLandscapeBoard}
         fullWidth
         maxWidth="sm"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: compactLandscapeBoard ? 0 : 1 } }}
       >
         <DialogTitle sx={{ fontWeight: 700 }}>New opportunity</DialogTitle>
         <DialogContent>
@@ -1612,7 +1612,7 @@ export default function PipelineSection() {
               {newOrganizationOpen ? 'Cancel new organization' : 'Add organization'}
             </Button>
             {newOrganizationOpen ? (
-              <Box sx={{ border: '1px solid rgba(255,255,255,0.1)', borderRadius: 1, p: 1.5 }}>
+              <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.1)', borderRadius: 1, p: 1.5 }}>
                 <Stack spacing={1.5}>
                   <Typography variant="subtitle2">New CRM organization</Typography>
                   <TextField required label="Organization name" value={newOrganization.name} onChange={(event) => setNewOrganization((current) => ({ ...current, name: event.target.value }))} />

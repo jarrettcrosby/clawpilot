@@ -33,10 +33,12 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SendRounded from '@mui/icons-material/SendRounded'
 import VerifiedOutlined from '@mui/icons-material/VerifiedOutlined'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
+import QuickBooksTaxClassificationPicker from '@/components/accounting/QuickBooksTaxClassificationPicker'
 import { normalizeQuickBooksItemDraftForStoredCompatibility } from '@/lib/integrations/quickBooksItemCompatibility'
+import type { QuickBooksTaxClassification } from '@/lib/integrations/quickBooksTaxClassifications'
 import { formatUserDateTime } from '@/lib/userDateTime'
 
-type OperationKind = 'customer.create' | 'item.create' | 'invoice.create'
+type OperationKind = 'customer.create' | 'item.create' | 'item.update' | 'invoice.create'
 type RequestStatus = 'draft' | 'pending_approval' | 'approved' | 'processing' | 'succeeded' | 'failed' | 'dead' | 'cancelled'
 type Capabilities = { canView: boolean; canManage: boolean; canPrepare: boolean; canApprove: boolean }
 
@@ -104,6 +106,7 @@ type ItemFormValue = {
   purchaseInformationEnabled: boolean; purchaseDescription: string; purchaseCost: string
   incomeAccountId: string; expenseAccountId: string; assetAccountId: string
   preferredVendorId: string; parentCategoryId: string; taxable: boolean
+  taxClassificationId: string; taxClassificationName: string; taxClassificationParentId: string
   quantityOnHand: string; inventoryStartDate: string; reorderPoint: string
 }
 type InvoiceFormValue = {
@@ -113,6 +116,7 @@ type InvoiceFormValue = {
 const operationLabels: Record<OperationKind, string> = {
   'customer.create': 'New customer',
   'item.create': 'New product or service',
+  'item.update': 'Edit product or service',
   'invoice.create': 'New invoice',
 }
 
@@ -141,7 +145,7 @@ const statusColors: Record<RequestStatus, 'default' | 'info' | 'warning' | 'succ
 const drawerSx = {
   width: { xs: '100%', sm: 520 },
   maxWidth: '100vw',
-  bgcolor: '#171821',
+  bgcolor: 'background.paper',
   backgroundImage: 'none',
 }
 
@@ -164,7 +168,7 @@ function newLine(): InvoiceLine {
 function requestTitle(request: WriteRequest) {
   const payload = request.requestPayload
   if (request.operationKind === 'customer.create') return String(payload.displayName || 'Customer')
-  if (request.operationKind === 'item.create') return String(payload.name || 'Product or service')
+  if (request.operationKind === 'item.create' || request.operationKind === 'item.update') return String(payload.name || 'Product or service')
   return String(payload.customerName || 'Invoice')
 }
 
@@ -190,6 +194,8 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
   const payload = request.operationKind === 'item.create'
     ? normalizeQuickBooksItemDraftForStoredCompatibility(request.requestPayload)
     : request.requestPayload
+  const isItemUpdate = request.operationKind === 'item.update'
+  const isItemWrite = request.operationKind === 'item.create' || isItemUpdate
   const mappingResult = dataRecord(request.resultPayload.posAccountingMapping)
   const lines = Array.isArray(payload.lines) ? payload.lines as Array<Record<string, unknown>> : []
   return (
@@ -199,23 +205,26 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
         <Chip size="small" variant="outlined" label={operationLabels[request.operationKind]} />
       </Box>
       <DetailField label="Record" value={requestTitle(request)} />
+      {isItemUpdate ? <DetailField label="QuickBooks item ID" value={payload.itemId} /> : null}
+      {isItemUpdate ? <DetailField label="Expected QuickBooks version" value={payload.expectedSyncToken} /> : null}
       <DetailField label="Company" value={payload.companyName} />
       <DetailField label="Email" value={payload.email || payload.billingEmail} />
       <DetailField label="Phone" value={payload.phone} />
       <DetailField label="Type" value={payload.itemType} />
       <DetailField label="SKU" value={payload.sku} />
       <DetailField label="Category" value={payload.parentCategoryName} />
-      <DetailField label="Sales price" value={payload.itemType ? money(Number(payload.unitPrice || 0)) : null} />
+      <DetailField label="Sales price" value={isItemWrite ? money(Number(payload.unitPrice || 0)) : null} />
       <DetailField label="Income account" value={payload.incomeAccountName} />
       <DetailField label="Purchase description" value={payload.purchaseDescription} />
-      <DetailField label="Purchase cost" value={payload.purchaseInformationEnabled ? money(Number(payload.purchaseCost || 0)) : null} />
+      <DetailField label="Purchase cost" value={isItemUpdate || payload.purchaseInformationEnabled ? money(Number(payload.purchaseCost || 0)) : null} />
       <DetailField label="Expense or COGS account" value={payload.expenseAccountName} />
       <DetailField label="Preferred vendor" value={payload.preferredVendorName} />
       <DetailField label="Inventory asset account" value={payload.assetAccountName} />
       <DetailField label="Initial quantity on hand" value={payload.quantityOnHand} />
       <DetailField label="Inventory as-of date" value={payload.inventoryStartDate} />
       <DetailField label="Reorder point" value={payload.reorderPoint} />
-      <DetailField label="Taxable" value={payload.itemType ? (payload.taxable ? 'Yes' : 'No') : null} />
+      <DetailField label="Taxable" value={isItemWrite ? (payload.taxable ? 'Yes' : 'No') : null} />
+      <DetailField label="Sales tax category" value={payload.taxClassificationName || payload.taxClassificationId} />
       <DetailField label="Toast source" value={payload.sourceName} />
       <DetailField label="Toast location" value={payload.sourceRestaurantGuid} />
       <DetailField label="Mapping scope" value={payload.mappingScope === 'location_override' ? 'Location override' : payload.mappingScope === 'organization_default' ? 'Organization default' : null} />
@@ -238,7 +247,7 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
               </Box>
             ))}
           </Stack>
-          <Box display="flex" justifyContent="space-between" mt={1.5} pt={1.5} borderTop="1px solid rgba(255,255,255,0.1)">
+          <Box display="flex" justifyContent="space-between" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
             <Typography fontWeight={700}>Total</Typography>
             <Typography fontWeight={700}>{money(Number(payload.totalAmount || 0))}</Typography>
           </Box>
@@ -290,7 +299,7 @@ export default function QuickBooksActionsPanel({
     name: '', itemType: 'Service', sku: '', description: '', unitPrice: '', purchaseCost: '',
     purchaseInformationEnabled: false, purchaseDescription: '',
     incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-    parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+    parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', taxClassificationParentId: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
   })
   const [invoice, setInvoice] = useState({
     customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '',
@@ -350,7 +359,7 @@ export default function QuickBooksActionsPanel({
         name: '', itemType: 'Service', sku: '', description: '', unitPrice: '',
         purchaseInformationEnabled: false, purchaseDescription: '', purchaseCost: '',
         incomeAccountId: '', expenseAccountId: '', assetAccountId: '', preferredVendorId: '',
-        parentCategoryId: '', taxable: false, quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
+        parentCategoryId: '', taxable: false, taxClassificationId: '', taxClassificationName: '', taxClassificationParentId: '', quantityOnHand: '0', inventoryStartDate: today(), reorderPoint: '',
       })
     } else {
       setInvoice({ customerId: '', transactionDate: today(), dueDate: '', billingEmail: '', customerMemo: '' })
@@ -359,7 +368,7 @@ export default function QuickBooksActionsPanel({
   }
 
   async function saveDraft() {
-    if (!formKind) return
+    if (!formKind || busy) return
     setBusy(true)
     setError(null)
     setNotice(null)
@@ -445,11 +454,22 @@ export default function QuickBooksActionsPanel({
   const productPostingOnly = workspace?.connection.postingOperations.length === 1
     && workspace.connection.postingOperations[0] === 'item.create'
 
+  async function loadTaxClassificationPage(itemType: ItemFormValue['itemType'], parentId: string | null): Promise<QuickBooksTaxClassification[]> {
+    const parameters = new URLSearchParams({ itemType })
+    if (parentId) parameters.set('parentId', parentId)
+    const response = await fetch(`/api/accounting/quickbooks/tax-classifications?${parameters}`, { cache: 'no-store' })
+    const payload = await response.json() as { ok?: boolean; error?: string; categories?: QuickBooksTaxClassification[] }
+    if (!response.ok || !payload.ok || !Array.isArray(payload.categories)) {
+      throw new Error(payload.error || 'QuickBooks sales tax categories are unavailable')
+    }
+    return payload.categories
+  }
+
   if (loading && !workspace) return <Box display="grid" sx={{ placeItems: 'center' }} minHeight={320}><CircularProgress /></Box>
 
   return (
     <Stack spacing={2.25}>
-      {error ? <Alert severity="error" onClose={() => setError(null)}>{error}</Alert> : null}
+      {error ? <Alert severity="error" onClose={() => setError(null)} action={!workspace ? <Button color="inherit" onClick={() => { void load() }} disabled={loading}>Retry</Button> : undefined}>{error}</Alert> : null}
       {notice ? <Alert severity="success" onClose={() => setNotice(null)}>{notice}</Alert> : null}
 
       {workspace ? (
@@ -493,17 +513,17 @@ export default function QuickBooksActionsPanel({
             </Alert>
           ) : null}
 
-          <Box sx={{ border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px', overflow: 'hidden', bgcolor: '#15151D' }}>
+          <Box sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', overflow: 'hidden', bgcolor: 'background.paper' }}>
             <TableContainer sx={{ display: { xs: 'none', md: 'block' } }}>
               <Table size="small" aria-label="QuickBooks accounting actions">
                 <TableHead>
                   <TableRow>
-                    {['Change', 'Record', 'Prepared by', 'Created', 'Status', 'Actions'].map((label) => <TableCell key={label} sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700 }}>{label}</TableCell>)}
+                    {['Change', 'Record', 'Prepared by', 'Created', 'Status', 'Actions'].map((label) => <TableCell key={label} sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700 }}>{label}</TableCell>)}
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {workspace.requests.map((request) => (
-                    <TableRow key={request.id} hover onClick={() => setSelected(request)} sx={{ cursor: 'pointer', '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+                    <TableRow key={request.id} hover onClick={() => setSelected(request)} sx={{ cursor: 'pointer', '& td': { borderColor: 'divider' } }}>
                       <TableCell>{operationLabels[request.operationKind]}</TableCell>
                       <TableCell><Typography variant="body2" fontWeight={650}>{requestTitle(request)}</Typography>{requestAmount(request) !== null ? <Typography variant="caption" color="text.secondary">{money(requestAmount(request)!)}</Typography> : null}</TableCell>
                       <TableCell>{request.requestedByName || request.requestedBy}</TableCell>
@@ -518,7 +538,7 @@ export default function QuickBooksActionsPanel({
 
             <Box sx={{ display: { xs: 'block', md: 'none' } }}>
               {workspace.requests.map((request) => (
-                <Box key={request.id} borderBottom="1px solid rgba(255,255,255,0.07)" p={1.75}>
+                <Box key={request.id} borderBottom={1} borderColor="divider" p={1.75}>
                   <Box component="button" type="button" onClick={() => setSelected(request)} sx={{ width: '100%', border: 0, bgcolor: 'transparent', color: 'inherit', p: 0, textAlign: 'left' }}>
                     <Box display="flex" justifyContent="space-between" gap={1.5}>
                       <Box minWidth={0}><Typography fontWeight={650}>{requestTitle(request)}</Typography><Typography variant="caption" color="text.secondary">{operationLabels[request.operationKind]}</Typography></Box>
@@ -537,13 +557,15 @@ export default function QuickBooksActionsPanel({
 
       <Drawer anchor="right" open={Boolean(formKind)} onClose={() => { if (!busy) setFormKind(null) }} PaperProps={{ sx: drawerSx }}>
         {formKind ? (
-          <Box height="100%" display="flex" flexDirection="column">
+          <Box component="form" onSubmit={(event) => { event.preventDefault(); void saveDraft() }} height="100%" display="flex" flexDirection="column">
             <Box px={2.5} py={2} display="flex" alignItems="center" justifyContent="space-between">
               <Box><Typography variant="h6" fontWeight={700}>{operationLabels[formKind]}</Typography><Typography variant="caption" color="text.secondary">Save as an immutable review draft</Typography></Box>
               <IconButton aria-label="Close accounting draft" onClick={() => setFormKind(null)} disabled={busy}><CloseRounded /></IconButton>
             </Box>
             <Divider />
             <Box flex={1} overflow="auto" p={2.5}>
+              <Alert severity="info" sx={{ mb: 2 }}>Creating a draft does not change QuickBooks. Review and submit it for approval before it can be posted.</Alert>
+              <Box component="fieldset" disabled={busy} inert={busy} sx={{ border: 0, p: 0, m: 0, minWidth: 0 }}>
               {formKind === 'customer.create' ? <CustomerForm value={customer} onChange={setCustomer} /> : null}
               {formKind === 'item.create' ? <ItemForm
                 value={item}
@@ -553,6 +575,7 @@ export default function QuickBooksActionsPanel({
                 assetAccounts={inventoryAssetAccounts}
                 categories={workspace?.referenceData.categories || []}
                 vendors={workspace?.referenceData.vendors || []}
+                loadTaxClassificationPage={(parentId) => loadTaxClassificationPage(item.itemType, parentId)}
               /> : null}
               {formKind === 'invoice.create' && workspace ? (
                 <InvoiceForm
@@ -566,11 +589,15 @@ export default function QuickBooksActionsPanel({
                   money={money}
                 />
               ) : null}
+              </Box>
             </Box>
             <Divider />
-            <Box p={2} display="flex" justifyContent="flex-end" gap={1}>
-              <Button onClick={() => setFormKind(null)} disabled={busy}>Cancel</Button>
-              <Button variant="contained" startIcon={busy ? <CircularProgress size={16} /> : <AddRounded />} onClick={() => { void saveDraft() }} disabled={busy}>Create draft</Button>
+            <Box p={2} display="flex" flexDirection="column" gap={1}>
+              {error ? <Alert severity="error">{error}</Alert> : null}
+              <Box display="flex" justifyContent="flex-end" gap={1}>
+                <Button onClick={() => setFormKind(null)} disabled={busy}>Cancel</Button>
+                <Button type="submit" variant="contained" startIcon={busy ? <CircularProgress size={16} /> : <AddRounded />} disabled={busy}>{busy ? 'Preparing draft…' : 'Create draft'}</Button>
+              </Box>
             </Box>
           </Box>
         ) : null}
@@ -633,7 +660,7 @@ function CustomerForm({ value, onChange }: { value: CustomerFormValue; onChange:
   )
 }
 
-function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccounts, categories, vendors }: {
+function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccounts, categories, vendors, loadTaxClassificationPage }: {
   value: ItemFormValue
   onChange: (value: ItemFormValue) => void
   incomeAccounts: ReferenceData['accounts']
@@ -641,6 +668,7 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
   assetAccounts: ReferenceData['accounts']
   categories: ReferenceData['categories']
   vendors: ReferenceData['vendors']
+  loadTaxClassificationPage: (parentId: string | null) => Promise<QuickBooksTaxClassification[]>
 }) {
   const field = (key: Exclude<keyof ItemFormValue, 'taxable' | 'purchaseInformationEnabled'>) => (event: React.ChangeEvent<HTMLInputElement>) => onChange({ ...value, [key]: event.target.value })
   const isInventory = value.itemType === 'Inventory'
@@ -661,6 +689,9 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
           quantityOnHand: itemType === 'Inventory' ? value.quantityOnHand : '0',
           inventoryStartDate: itemType === 'Inventory' ? (value.inventoryStartDate || today()) : '',
           reorderPoint: itemType === 'Inventory' ? value.reorderPoint : '',
+          taxClassificationId: '',
+          taxClassificationName: '',
+          taxClassificationParentId: '',
         })
       }} sx={fieldSx}>
         <MenuItem value="Service">Service</MenuItem>
@@ -677,6 +708,13 @@ function ItemForm({ value, onChange, incomeAccounts, expenseAccounts, assetAccou
       <TextField type="number" label="Sales price or rate" value={value.unitPrice} onChange={field('unitPrice')} inputProps={{ min: 0, step: '0.01' }} sx={fieldSx} />
       <TextField select required label="Income account" value={value.incomeAccountId} onChange={field('incomeAccountId')} sx={fieldSx}>{incomeAccounts.map((account) => <MenuItem key={account.id} value={account.id}>{account.name}</MenuItem>)}</TextField>
       <FormControlLabel control={<Checkbox checked={value.taxable} onChange={(event) => onChange({ ...value, taxable: event.target.checked })} />} label="Taxable" />
+      <QuickBooksTaxClassificationPicker
+        key={value.itemType}
+        itemType={value.itemType as 'Service' | 'NonInventory' | 'Inventory'}
+        value={value.taxClassificationId ? { id: value.taxClassificationId, name: value.taxClassificationName, parentId: value.taxClassificationParentId || null } : null}
+        onChange={(choice) => onChange({ ...value, taxClassificationId: choice?.id || '', taxClassificationName: choice?.name || '', taxClassificationParentId: choice?.parentId || '' })}
+        loadPage={loadTaxClassificationPage}
+      />
       {!isInventory ? <FormControlLabel
         control={<Checkbox checked={value.purchaseInformationEnabled} onChange={(event) => onChange({
           ...value,
@@ -739,7 +777,7 @@ function InvoiceForm({ value, onChange, lines, onLinesChange, customers, items, 
       <TextField label="Customer memo" multiline minRows={2} value={value.customerMemo} onChange={field('customerMemo')} sx={fieldSx} />
       <Box display="flex" alignItems="center" justifyContent="space-between"><Typography fontWeight={700}>Line items</Typography><Button size="small" startIcon={<AddRounded />} onClick={() => onLinesChange([...lines, newLine()])}>Add line</Button></Box>
       {lines.map((line, index) => (
-        <Box key={line.key} sx={{ borderTop: index ? '1px solid rgba(255,255,255,0.08)' : 0, pt: index ? 2 : 0 }}>
+        <Box key={line.key} sx={{ borderTop: index ? 1 : 0, borderColor: 'divider', pt: index ? 2 : 0 }}>
           <Box display="flex" alignItems="center" gap={1}>
             <TextField select required fullWidth label={`Item ${index + 1}`} value={line.itemId} onChange={(event) => {
               const selected = items.find((item) => item.id === event.target.value)
@@ -755,7 +793,7 @@ function InvoiceForm({ value, onChange, lines, onLinesChange, customers, items, 
           </Box>
         </Box>
       ))}
-      <Box display="flex" justifyContent="space-between" borderTop="1px solid rgba(255,255,255,0.1)" pt={2}><Typography variant="h6" fontWeight={700}>Total</Typography><Typography variant="h6" fontWeight={700}>{money(total)}</Typography></Box>
+      <Box display="flex" justifyContent="space-between" borderTop={1} borderColor="divider" pt={2}><Typography variant="h6" fontWeight={700}>Total</Typography><Typography variant="h6" fontWeight={700}>{money(total)}</Typography></Box>
     </Stack>
   )
 }

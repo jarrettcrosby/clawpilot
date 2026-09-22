@@ -345,6 +345,7 @@ try {
         return { rows: [{ retry_after_seconds: seconds }], rowCount: 1 }
       }
 
+      if (sql.includes('FROM app_user_login_addresses')) return { rows: [], rowCount: 0 }
       if (sql.includes('WITH candidate AS')) {
         if (!record || record.email !== values[0]) return { rows: [], rowCount: 0 }
         let status
@@ -496,7 +497,8 @@ try {
   const identityModule = loadTypeScriptModule('app_src/lib/authLoginIdentity.ts', {
     '@/lib/users': usersMock,
     '@/lib/persistence/postgres': {
-      async query(_sql, [email]) {
+      async query(sql, [email]) {
+        if (sql.includes('FROM app_user_login_addresses')) return { rows: [] }
         const user = await usersMock.getAppUser(email)
         return { rows: user ? [{ email: user.email }] : [] }
       },

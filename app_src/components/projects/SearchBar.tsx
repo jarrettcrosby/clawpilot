@@ -34,15 +34,15 @@ export default function SearchBar({ query, onSearch, archiveMode, onToggleArchiv
         sx={{
           flex: 1,
           '& .MuiOutlinedInput-root': {
-            backgroundColor: '#1A1A23',
+            backgroundColor: 'var(--mui-palette-background-paper)',
             borderRadius: 2,
             fontSize: 14,
             minHeight: 40,
-            '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
-            '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.18)' },
-            '&.Mui-focused fieldset': { borderColor: '#A8C7FA' },
+            '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' },
+            '&:hover fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.18)' },
+            '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' },
           },
-          '& input': { color: '#E4E1EC', py: 1 },
+          '& input': { color: 'var(--mui-palette-text-primary)', py: 1 },
         }}
       />
       <Tooltip title={archiveMode ? 'Back to board' : 'View archived cards'}>
@@ -51,12 +51,12 @@ export default function SearchBar({ query, onSearch, archiveMode, onToggleArchiv
           onClick={onToggleArchive}
           sx={{
             width: 40, height: 40,
-            backgroundColor: archiveMode ? 'rgba(168,199,250,0.15)' : '#1A1A23',
+            backgroundColor: archiveMode ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.15)' : 'var(--mui-palette-background-paper)',
             border: '1px solid',
-            borderColor: archiveMode ? '#A8C7FA' : 'rgba(255,255,255,0.08)',
+            borderColor: archiveMode ? 'var(--mui-palette-primary-main)' : 'rgba(var(--cp-neutral-rgb),0.08)',
             borderRadius: 2,
-            color: archiveMode ? '#A8C7FA' : 'text.disabled',
-            '&:hover': { backgroundColor: 'rgba(168,199,250,0.1)' },
+            color: archiveMode ? 'var(--mui-palette-primary-main)' : 'text.disabled',
+            '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)' },
           }}
         >
           {archiveMode ? <VisibilityRounded sx={{ fontSize: 18 }} /> : <VisibilityOffRounded sx={{ fontSize: 18 }} />}

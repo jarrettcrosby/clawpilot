@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { ModuleAccessError } from '@/lib/moduleAuthorization'
 import {
   createShortLink,
   deleteShortLink,
   listShortLinks,
+  readShortLinkDefaultDomain,
+  readShortLinkDomainPreferences,
   resolveShortLinkActor,
   ShortLinkRequestError,
   updateShortLink,
@@ -13,6 +16,9 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 function errorResponse(error: unknown) {
+  if (error instanceof ModuleAccessError) {
+    return NextResponse.json({ ok: false, error: error.message, code: error.code, module: error.module }, { status: error.status })
+  }
   if (error instanceof ShortLinkRequestError) {
     return NextResponse.json({ ok: false, error: error.message }, { status: error.status })
   }
@@ -34,15 +40,19 @@ export async function GET(req: NextRequest) {
   try {
     const actor = await resolveShortLinkActor(req)
     const params = new URL(req.url).searchParams
-    const links = await listShortLinks(actor, {
-      query: params.get('q'),
-      tag: params.get('tag'),
-      status: params.get('status'),
-      sourceApp: params.get('source'),
-    })
+    const [links, domainPreferences] = await Promise.all([
+      listShortLinks(actor, {
+        query: params.get('q'),
+        tag: params.get('tag'),
+        status: params.get('status'),
+        sourceApp: params.get('source'),
+      }),
+      readShortLinkDomainPreferences(actor),
+    ])
     return NextResponse.json({
       ok: true,
       links,
+      ...domainPreferences,
       currentOwnerEmail: actor.ownerEmail,
       canManageOrganization: actor.manageOrganization,
     })
@@ -54,7 +64,12 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const actor = await resolveShortLinkActor(req)
-    const link = await createShortLink(actor, await requestBody(req))
+    const body = await requestBody(req)
+    const input = !actor.service && body && typeof body === 'object' && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'publicDomain')
+      ? { ...body, publicDomain: await readShortLinkDefaultDomain(actor) }
+      : body
+    const link = await createShortLink(actor, input)
     return NextResponse.json({ ok: true, link }, { status: 201 })
   } catch (error) {
     return errorResponse(error)

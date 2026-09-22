@@ -11,6 +11,7 @@ import DialogContent from '@mui/material/DialogContent'
 import DialogTitle from '@mui/material/DialogTitle'
 import IconButton from '@mui/material/IconButton'
 import InputAdornment from '@mui/material/InputAdornment'
+import MenuItem from '@mui/material/MenuItem'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import useMediaQuery from '@mui/material/useMediaQuery'
@@ -18,7 +19,7 @@ import { useTheme } from '@mui/material/styles'
 import AddLinkRounded from '@mui/icons-material/AddLinkRounded'
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
-import type { ShortLinkRecord, ShortLinkWriteInput } from './types'
+import type { ShortLinkDomainChoice, ShortLinkRecord, ShortLinkWriteInput } from './types'
 
 type FormValues = {
   destinationUrl: string
@@ -28,11 +29,15 @@ type FormValues = {
   tags: string
   durationHours: string
   maxClicks: string
+  publicDomain: 'eigenracing' | 'bpo'
 }
 
 type Props = {
   open: boolean
   record: ShortLinkRecord | null
+  availableDomains: ShortLinkDomainChoice[]
+  defaultPublicDomain: FormValues['publicDomain']
+  domainLocked?: boolean
   busy: boolean
   onClose: () => void
   onSubmit: (input: ShortLinkWriteInput) => Promise<void>
@@ -46,12 +51,13 @@ const EMPTY_FORM: FormValues = {
   tags: '',
   durationHours: '24',
   maxClicks: '',
+  publicDomain: 'eigenracing',
 }
 
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -62,8 +68,8 @@ function durationFrom(record: ShortLinkRecord): string {
   return String(Math.max(1, Math.ceil(milliseconds / (60 * 60 * 1000))))
 }
 
-function valuesFrom(record: ShortLinkRecord | null): FormValues {
-  if (!record) return EMPTY_FORM
+function valuesFrom(record: ShortLinkRecord | null, defaultPublicDomain: FormValues['publicDomain']): FormValues {
+  if (!record) return { ...EMPTY_FORM, publicDomain: defaultPublicDomain }
   return {
     destinationUrl: record.destinationUrl,
     title: record.title,
@@ -72,6 +78,7 @@ function valuesFrom(record: ShortLinkRecord | null): FormValues {
     tags: record.tags.join(', '),
     durationHours: durationFrom(record),
     maxClicks: record.maxClicks == null ? '' : String(record.maxClicks),
+    publicDomain: record.publicDomain || 'eigenracing',
   }
 }
 
@@ -98,9 +105,8 @@ function validatedDestination(value: string): string {
   } catch {
     throw new Error('Destination must be a valid URL')
   }
-  const localDevelopmentUrl = url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)
-  if (url.protocol !== 'https:' && !localDevelopmentUrl) {
-    throw new Error('Destination must use HTTPS')
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error('Destination must use HTTPS without an embedded username or password')
   }
   return url.toString()
 }
@@ -109,7 +115,7 @@ function sameTags(left: string[], right: string[]) {
   return left.length === right.length && left.every((tag, index) => tag === right[index])
 }
 
-export default function ShortLinkFormDialog({ open, record, busy, onClose, onSubmit }: Props) {
+export default function ShortLinkFormDialog({ open, record, availableDomains, defaultPublicDomain, domainLocked = false, busy, onClose, onSubmit }: Props) {
   const theme = useTheme()
   const narrowScreen = useMediaQuery(theme.breakpoints.down('sm'))
   const shortViewport = useMediaQuery('(max-height: 500px)')
@@ -120,11 +126,11 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
 
   useEffect(() => {
     if (!open) return
-    const nextValues = valuesFrom(record)
+    const nextValues = valuesFrom(record, defaultPublicDomain)
     setValues(nextValues)
     setInitialValues(nextValues)
     setError('')
-  }, [open, record])
+  }, [open, record, defaultPublicDomain])
 
   const dirty = useMemo(
     () => Object.keys(values).some((key) => values[key as keyof FormValues] !== initialValues[key as keyof FormValues]),
@@ -137,6 +143,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (busy) return
     setError('')
     try {
       const destinationUrl = validatedDestination(values.destinationUrl)
@@ -155,7 +162,10 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
       }
 
       if (!record) {
-        await onSubmit({ destinationUrl, title, slug, slugLength: slug ? undefined : slugLength || 7, tags, durationHours, maxClicks })
+        await onSubmit({
+          destinationUrl, title, slug, slugLength: slug ? undefined : slugLength || 7, tags,
+          durationHours, maxClicks, publicDomain: values.publicDomain,
+        })
         return
       }
 
@@ -188,8 +198,9 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
       PaperProps={{
         sx: {
           borderRadius: fullScreen ? 0 : '8px',
-          backgroundColor: '#1A1A23',
-          border: { sm: '1px solid rgba(255,255,255,0.09)' },
+          backgroundColor: 'background.paper',
+          border: { sm: 1 },
+          borderColor: 'divider',
         },
       }}
     >
@@ -209,9 +220,27 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
           </IconButton>
         </DialogTitle>
 
-        <DialogContent dividers sx={{ px: { xs: 2, sm: 3 }, py: 2.5, borderColor: 'rgba(255,255,255,0.07)' }}>
-          {error ? <Alert severity="error" sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+        {error ? <Alert severity="error" sx={{ mx: { xs: 2, sm: 3 }, mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+        <DialogContent dividers sx={{ px: { xs: 2, sm: 3 }, py: 2.5, borderColor: 'divider' }}>
           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 2 }}>
+            <TextField
+              select
+              size="small"
+              label="Short URL domain"
+              value={values.publicDomain}
+              onChange={(event) => update('publicDomain', event.target.value as FormValues['publicDomain'])}
+              disabled={busy || Boolean(record) || domainLocked}
+              sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
+              helperText={record
+                ? 'The short URL domain cannot be changed after creation.'
+                : domainLocked ? 'Your organization administrator controls the short-link domain.' : 'This choice applies only to this link; change your saved default above.'}
+            >
+              {(record && !availableDomains.some((domain) => domain.key === values.publicDomain)
+                ? [{ key: values.publicDomain, label: values.publicDomain === 'bpo' ? 'bposupplychain.com' : 'eigenracing.com' }, ...availableDomains]
+                : availableDomains).map((domain) => (
+                <MenuItem key={domain.key} value={domain.key}>{domain.label}</MenuItem>
+              ))}
+            </TextField>
             <TextField
               autoFocus
               size="small"
@@ -231,6 +260,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
               onChange={(event) => update('destinationUrl', event.target.value)}
               disabled={busy}
               inputProps={{ maxLength: 2048 }}
+              helperText="Use a complete HTTPS address, without a username or password in the URL."
               sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
             />
             <TextField
@@ -241,6 +271,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
               disabled={busy}
               inputProps={{ maxLength: 64, autoCapitalize: 'none', spellCheck: false }}
               InputProps={{ startAdornment: <InputAdornment position="start">/</InputAdornment> }}
+              helperText={record ? 'Changing the slug changes the public URL.' : 'Leave blank to generate a short URL automatically.'}
               sx={fieldSx}
             />
             {!record && !values.slug.trim() ? (
@@ -274,6 +305,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
               disabled={busy}
               inputProps={{ min: 1, step: 1, inputMode: 'numeric' }}
               InputProps={{ endAdornment: <InputAdornment position="end">hours</InputAdornment> }}
+              helperText={record ? 'Leave unchanged to keep the current expiry. Change to restart the duration, or clear for no expiry.' : 'Starts when created. Clear this field for no expiry.'}
               sx={fieldSx}
             />
             <TextField
@@ -284,6 +316,7 @@ export default function ShortLinkFormDialog({ open, record, busy, onClose, onSub
               onChange={(event) => update('maxClicks', event.target.value)}
               disabled={busy}
               inputProps={{ min: 1, step: 1, inputMode: 'numeric' }}
+              helperText="Total lifetime clicks allowed. Leave blank for unlimited clicks."
               sx={fieldSx}
             />
           </Box>

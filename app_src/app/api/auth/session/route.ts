@@ -7,6 +7,7 @@ import {
 import { getAppUser, isRootAppOwner } from '@/lib/users'
 import { operationsCapabilities } from '@/lib/operations/authorization'
 import { listWorkspaceMemberships, requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import { moduleCapabilitiesForUser } from '@/lib/moduleAuthorization'
 
 export async function GET(req: NextRequest) {
   try {
@@ -33,6 +34,7 @@ export async function GET(req: NextRequest) {
       user: effectiveUser.email,
       role: effectiveUser.role,
       status: effectiveUser.status,
+      moduleCapabilities: moduleCapabilitiesForUser(effectiveUser),
       exp: Math.floor(expiration / 1000),
       authenticatedUser: {
         email: authenticatedUser.email,

@@ -182,7 +182,7 @@ const fieldSx = {
   minWidth: 0,
   '& .MuiInputBase-root': {
     borderRadius: '8px',
-    backgroundColor: '#15151D',
+    backgroundColor: 'background.paper',
   },
 }
 
@@ -1191,7 +1191,7 @@ export default function PrinterConfigurationPanel() {
         value={view}
         onChange={(_event, next: View) => setView(next)}
         variant={mobile ? 'fullWidth' : 'standard'}
-        sx={{ mt: 1.5, borderBottom: '1px solid rgba(255,255,255,0.1)' }}
+        sx={{ mt: 1.5, borderBottom: '1px solid', borderColor: 'divider' }}
       >
         <Tab value="jobs" label={`Jobs${jobs ? ` (${jobs.jobs.length})` : ''}`} />
         <Tab value="printers" label={`Printers${printers ? ` (${printers.printers.length})` : ''}`} />
@@ -1243,7 +1243,7 @@ export default function PrinterConfigurationPanel() {
                       </Typography>
                     )}
                     {job.reprintOfJobGlobalId && (
-                      <Typography variant="caption" color="#A8C7FA" display="block" sx={{ mt: 0.35 }}>
+                      <Typography variant="caption" color="primary.main" display="block" sx={{ mt: 0.35 }}>
                         Reprint of {job.reprintOfJobGlobalId}: {job.reprintReason}
                       </Typography>
                     )}
@@ -1435,7 +1435,7 @@ export default function PrinterConfigurationPanel() {
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                       {printer.warehouseName} · {label(printer.stationType)} · {label(printer.connectionMode)}
                     </Typography>
-                    <Typography variant="caption" color="#A8C7FA">
+                    <Typography variant="caption" color="primary.main">
                       {printer.globalId} · {printer.code}
                     </Typography>
                     <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
@@ -1490,9 +1490,10 @@ export default function PrinterConfigurationPanel() {
             component="section"
             sx={{
               p: { xs: 2, md: 2.5 },
-              border: '1px solid rgba(255,255,255,0.12)',
+              border: '1px solid',
+              borderColor: 'divider',
               borderRadius: '10px',
-              backgroundColor: 'rgba(255,255,255,0.025)',
+              backgroundColor: 'background.paper',
             }}
           >
             <Stack
@@ -1647,7 +1648,7 @@ export default function PrinterConfigurationPanel() {
                       {agent.warehouseName} · Last seen{' '}
                       {agent.lastSeenAt ? timestamp(agent.lastSeenAt) : 'Agent never connected'}
                     </Typography>
-                    <Typography variant="caption" color="#A8C7FA">{agent.globalId}</Typography>
+                    <Typography variant="caption" color="primary.main">{agent.globalId}</Typography>
                     <Stack direction="row" gap={0.75} flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
                       {agent.supportedFormats.map((item) => (
                         <Chip
@@ -2692,7 +2693,8 @@ export default function PrinterConfigurationPanel() {
                   mt: 1,
                   mb: 1,
                   p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.15)',
+                  border: '1px solid',
+                  borderColor: 'divider',
                   borderRadius: '6px',
                   overflowWrap: 'anywhere',
                   whiteSpace: 'pre-wrap',
@@ -2761,7 +2763,8 @@ export default function PrinterConfigurationPanel() {
                     mt: 1,
                     mb: 1,
                     p: 1.5,
-                    border: '1px solid rgba(255,255,255,0.15)',
+                    border: '1px solid',
+                    borderColor: 'divider',
                     borderRadius: '6px',
                     overflowWrap: 'anywhere',
                     whiteSpace: 'pre-wrap',

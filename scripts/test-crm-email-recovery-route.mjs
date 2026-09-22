@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import vm from 'node:vm'
+import * as publicOriginRouting from '../app_src/lib/publicOriginRouting.mjs'
 
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
@@ -17,7 +18,7 @@ const digest = 'a'.repeat(64)
 const command = { pipelineId, connectionId, messageIds: ['19abcdef01234567'] }
 class SafeEmailIngestionError extends Error {}
 
-function load(code, mocks = {}) {
+function load(code, mocks = {}, environment = {}) {
   const module = { exports: {} }
   const output = ts.transpileModule(code, { compilerOptions: {
     module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
@@ -25,6 +26,7 @@ function load(code, mocks = {}) {
   vm.runInNewContext(output, {
     module, exports: module.exports, Error, Uint8Array, TextDecoder, URL,
     Object, String, Number, JSON, RegExp, Set,
+    process: { env: environment },
     require: name => { assert.ok(name in mocks, `Unexpected dependency: ${name}`); return mocks[name] },
   })
   return module.exports
@@ -40,7 +42,9 @@ function harness(options = {}) {
   const pipeline = { id: pipelineId, ownerEmail: email, workspaceOrganizationId: organizationId, ...options.pipeline }
   const route = load(source, {
     'next/server': { NextResponse: { json: (body, init) => ({ body, ...init }) } },
-    '@/lib/browserSameOrigin': load(sameOriginSource),
+    '@/lib/browserSameOrigin': load(sameOriginSource, {
+      './publicOriginRouting.mjs': publicOriginRouting,
+    }, { CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON: options.additionalOrigins }),
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.test' },
     '@/lib/persistence/config': { isPostgresStorageEnabled: () => options.postgres !== false },
     '@/lib/requestUser': {
@@ -127,6 +131,40 @@ test('origin validation uses real helper and rejects missing, foreign and cross-
   ]) {
     const app = harness(), result = await app.request(command, headers)
     assert.equal(result.status, 403)
+    assert.equal(app.authCalls.length, 0)
+    assert.equal(app.calls.length, 0)
+  }
+})
+
+test('real origin helpers allow only configured additional origins without bypassing cross-site protection', async () => {
+  const additionalOrigins = JSON.stringify(['https://aiapp.bposupplychain.com'])
+  const allowed = harness({ additionalOrigins })
+  assert.equal((await allowed.request(command, { origin: 'https://aiapp.bposupplychain.com' })).status, 200)
+  assert.equal(allowed.calls.length, 1)
+
+  for (const [options, headers] of [
+    [{}, { origin: 'https://aiapp.bposupplychain.com' }],
+    [{ additionalOrigins }, { origin: 'https://aiapp.bposupplychain.com.attacker.test' }],
+    [{ additionalOrigins }, { origin: 'http://aiapp.bposupplychain.com' }],
+    [{ additionalOrigins }, { origin: 'https://aiapp.bposupplychain.com', 'sec-fetch-site': 'cross-site' }],
+  ]) {
+    const app = harness(options)
+    assert.equal((await app.request(command, headers)).status, 403)
+    assert.equal(app.authCalls.length, 0)
+    assert.equal(app.calls.length, 0)
+  }
+})
+
+test('invalid additional-origin configuration fails closed before authentication or recovery', async () => {
+  for (const additionalOrigins of [
+    '{', JSON.stringify(['http://aiapp.bposupplychain.com']),
+    JSON.stringify(['https://aiapp.bposupplychain.com/path']),
+    JSON.stringify(['https://aiapp.bposupplychain.com', 'https://aiapp.bposupplychain.com']),
+  ]) {
+    const app = harness({ additionalOrigins })
+    const result = await app.request()
+    assert.equal(result.status, 500)
+    assert.equal(result.body.error, 'Email recovery is unavailable')
     assert.equal(app.authCalls.length, 0)
     assert.equal(app.calls.length, 0)
   }

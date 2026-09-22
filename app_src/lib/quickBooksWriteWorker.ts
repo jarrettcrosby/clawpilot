@@ -1,8 +1,11 @@
 import {
   createQuickBooksEntity,
+  updateQuickBooksItem,
   QuickBooksProviderWriteError,
 } from '@/lib/integrations/quickBooksClient'
+import type { QuickBooksItemUpdateDraft } from '@/lib/integrations/quickBooksWritePayloads'
 import {
+  cacheUpdatedQuickBooksItemInPostgres,
   claimQuickBooksWriteJobsInPostgres,
   completeQuickBooksWriteJobInPostgres,
   failQuickBooksWriteJobInPostgres,
@@ -31,17 +34,25 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
   let failed = 0
   let dead = 0
   let catalogSyncWarnings = 0
+  let itemCacheWarnings = 0
   let accountingNotificationWarnings = 0
   for (const job of jobs) {
     try {
       const readiness = await validateQuickBooksWriteJobBeforeProviderInPostgres(job)
-      const provider = await createQuickBooksEntity({
-        ownerEmail: job.ownerEmail,
-        connectionId: job.connectionId,
-        operationKind: job.operationKind,
-        payload: job.requestPayload,
-        providerRequestId: job.providerRequestId,
-      })
+      const provider = job.operationKind === 'item.update'
+        ? await updateQuickBooksItem({
+            ownerEmail: job.ownerEmail,
+            connectionId: job.connectionId,
+            payload: job.requestPayload as QuickBooksItemUpdateDraft,
+            providerRequestId: job.providerRequestId,
+          })
+        : await createQuickBooksEntity({
+            ownerEmail: job.ownerEmail,
+            connectionId: job.connectionId,
+            operationKind: job.operationKind,
+            payload: job.requestPayload,
+            providerRequestId: job.providerRequestId,
+          })
       const completion = await completeQuickBooksWriteJobInPostgres({
         job,
         providerEntityType: provider.entityType,
@@ -50,6 +61,20 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
         posAccountingSource: readiness.posAccountingSource,
       })
       succeeded += 1
+      if (job.operationKind === 'item.update') {
+        try {
+          const cached = await cacheUpdatedQuickBooksItemInPostgres({
+            organizationId: job.organizationId,
+            payload: job.requestPayload as QuickBooksItemUpdateDraft,
+            providerSyncToken: provider.syncToken,
+          })
+          if (!cached) itemCacheWarnings += 1
+        } catch {
+          // The provider write is already recorded as successful. The queued
+          // full catalog read repairs the cache without replaying the update.
+          itemCacheWarnings += 1
+        }
+      }
       const mapping = completion.posAccountingMapping
       if (job.operationKind === 'item.create' && mapping?.active) {
         try {
@@ -103,6 +128,7 @@ export async function processQuickBooksWriteOutbox(input: { limit?: number; work
     failed,
     dead,
     catalogSyncWarnings,
+    itemCacheWarnings,
     accountingNotificationWarnings,
   }
 }

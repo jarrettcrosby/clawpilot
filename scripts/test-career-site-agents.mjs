@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import vm from "node:vm";
+import { isPublicBpoShortlinkResolvePath } from "../app_src/lib/bpoShortlinkPublicPath.mjs";
 
 const root = process.cwd();
 const requireFromApp = createRequire(
@@ -44,10 +45,38 @@ function testNextResponse() {
   };
 }
 
-function loadProxy() {
+function loadPermissionModule(path, mocks = {}) {
+  const module = { exports: {} };
+  vm.runInNewContext(transpile(path), {
+    exports: module.exports,
+    module,
+    process,
+    console,
+    require: (specifier) => Object.hasOwn(mocks, specifier)
+      ? mocks[specifier]
+      : requireFromApp(specifier),
+  }, { filename: path });
+  return module.exports;
+}
+
+const noPermissionIo = () => { throw new Error("Unexpected permission database I/O"); };
+const permissionUsers = loadPermissionModule("app_src/lib/users.ts", {
+  "@/lib/persistence/postgres": { query: noPermissionIo, withTransaction: noPermissionIo },
+  "@/lib/auditWriter": {},
+  "@/lib/crm/suiteCrmClient": {},
+  "@/lib/demoMode": {},
+});
+const moduleAuthorization = loadPermissionModule("app_src/lib/moduleAuthorization.ts", {
+  "server-only": {},
+  "@/lib/users": permissionUsers,
+  "@/lib/moduleAccess": loadPermissionModule("app_src/lib/moduleAccess.ts"),
+});
+
+function loadProxy({ session = null, actor = null, membershipError = false } = {}) {
   const path = "app_src/proxy.ts";
   const module = { exports: {} };
   let sessionCalls = 0;
+  let membershipCalls = 0;
   vm.runInNewContext(
     transpile(path),
     {
@@ -74,7 +103,7 @@ function loadProxy() {
             },
             resolveRequestSession: async () => {
               sessionCalls += 1;
-              return null;
+              return session;
             },
             setBrowserSessionCookie: () => {},
           };
@@ -85,20 +114,32 @@ function loadProxy() {
         if (specifier === "@/lib/demoMode") {
           return { demoMutationIsRestricted: () => false };
         }
+        if (specifier === "@/lib/bpoShortlinkPublicPath.mjs") {
+          return { isPublicBpoShortlinkResolvePath };
+        }
+        if (specifier === "@/lib/moduleAuthorization") return moduleAuthorization;
+        if (specifier === "@/lib/workspaceMemberships") {
+          return {
+            requireWorkspaceAppUser: async (email, organizationId) => {
+              membershipCalls += 1;
+              assert.equal(email, session?.effectiveUser);
+              assert.equal(organizationId, session?.activeWorkspaceOrganizationId);
+              if (membershipError || !actor) throw new Error("Membership unavailable");
+              return actor;
+            },
+          };
+        }
         throw new Error(`Unexpected proxy test import: ${specifier}`);
       },
     },
     { filename: path },
   );
-  return { proxy: module.exports.proxy, sessionCalls: () => sessionCalls };
+  return { proxy: module.exports.proxy, sessionCalls: () => sessionCalls, membershipCalls: () => membershipCalls };
 }
 
 function proxyRequest(pathname) {
   return {
-    headers: {
-      get: (name) =>
-        String(name).toLowerCase() === "host" ? "aiapp.eigenracing.com" : null,
-    },
+    headers: new Headers({ host: "aiapp.eigenracing.com" }),
     method: "GET",
     nextUrl: { pathname, port: "", search: "" },
     url: `https://aiapp.eigenracing.com${pathname}`,
@@ -420,6 +461,63 @@ try {
     1,
     "Only the exact Career agent service route is public",
   );
+
+  const bpoResolvePath = "/api/shortlinks/bpo/resolve/abc123";
+  const bpoGet = await proxyRuntime.proxy(proxyRequest(bpoResolvePath));
+  const bpoHead = await proxyRuntime.proxy({
+    ...proxyRequest(bpoResolvePath),
+    method: "HEAD",
+  });
+  assert.equal(bpoGet.kind, "next");
+  assert.equal(bpoHead.kind, "next");
+  assert.equal(proxyRuntime.sessionCalls(), 1, "Only the BPO resolver handler authenticates public GET and HEAD requests");
+
+  const bpoPost = await proxyRuntime.proxy({
+    ...proxyRequest(bpoResolvePath),
+    method: "POST",
+  });
+  const bpoSibling = await proxyRuntime.proxy(proxyRequest(`${bpoResolvePath}/extra`));
+  assert.equal(bpoPost.status, 401);
+  assert.equal(bpoSibling.status, 401);
+  assert.equal(proxyRuntime.sessionCalls(), 3, "BPO resolver methods and sibling paths must not bypass browser sessions");
+
+  const session = {
+    id: "permission-test-session",
+    authenticatedUser: "member@example.test",
+    effectiveUser: "member@example.test",
+    activeWorkspaceOrganizationId: "organization-test",
+    legacy: false,
+  };
+  const actor = {
+    email: session.effectiveUser,
+    role: "owner",
+    status: "active",
+    permissions: permissionUsers.OWNER_PERMISSIONS,
+    organizationId: session.activeWorkspaceOrganizationId,
+    organizationRole: "member",
+    organizationPermissions: { viewAgents: false, viewProjects: false },
+  };
+  const deniedRuntime = loadProxy({ session, actor });
+  const deniedAgents = await deniedRuntime.proxy(proxyRequest("/api/agents"));
+  assert.equal(deniedAgents.status, 403, "Workspace denial must override unrelated global owner authority");
+  assert.equal(deniedAgents.body.code, "MODULE_VIEW_REQUIRED");
+  assert.equal(deniedAgents.body.module, "agents");
+  assert.equal(deniedRuntime.membershipCalls(), 1);
+  const permittedService = await deniedRuntime.proxy(proxyRequest("/api/career-site/agents"));
+  assert.equal(permittedService.kind, "next", "Career service keeps its independent bearer authorization");
+  assert.equal(deniedRuntime.membershipCalls(), 1, "Career service must not acquire browser membership");
+  assert.equal(deniedRuntime.sessionCalls(), 1, "Career service must not acquire a browser session");
+
+  const agentsOnlyRuntime = loadProxy({ session, actor: {
+    ...actor,
+    organizationPermissions: { viewAgents: true, viewProjects: false },
+  } });
+  assert.equal((await agentsOnlyRuntime.proxy(proxyRequest("/api/agents"))).kind, "next");
+  const deniedThreads = await agentsOnlyRuntime.proxy(proxyRequest("/api/agents/threads"));
+  assert.equal(deniedThreads.status, 403);
+  assert.equal(deniedThreads.body.module, "projects", "Task-backed browser Agents data requires Projects access");
+  const unavailableRuntime = loadProxy({ session, actor, membershipError: true });
+  assert.equal((await unavailableRuntime.proxy(proxyRequest("/api/agents"))).status, 503);
 } finally {
   if (previousAuthRequired === undefined) delete process.env.APP_AUTH_REQUIRED;
   else process.env.APP_AUTH_REQUIRED = previousAuthRequired;

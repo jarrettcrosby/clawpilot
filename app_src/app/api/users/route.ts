@@ -17,6 +17,7 @@ import {
   effectiveAuthorizationRole,
   listAppUsers,
   setAppUserStatus,
+  setAppUserTrashed,
   updateAppUserAccess,
   updateAppUserCrmEmployee,
   updateAppUserProfile,
@@ -38,7 +39,7 @@ export async function GET(req: NextRequest) {
       : null
     if (!currentOrganization) throw new Error('Active workspace is not available')
     await ensureDefaultResourcesForUser(requestActor)
-    const { actor, users } = await listAppUsers(requestActor)
+    const { actor, users } = await listAppUsers(requestActor, req.nextUrl.searchParams.get('view') === 'trash' ? 'trash' : 'active')
     const workspaceOrganizations = await listWorkspaceOrganizationHierarchy(requestActor)
     const organizationRole = effectiveAuthorizationRole(actor)
     return NextResponse.json({
@@ -88,6 +89,11 @@ export async function PATCH(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const body = await req.json()
+    if (body?.action === 'trash-user' || body?.action === 'restore-user') {
+      const user = await setAppUserTrashed({ actorEmail: actor, email: body.email,
+        organizationId: body.organizationId, trashed: body.action === 'trash-user' })
+      return NextResponse.json({ ok: true, user })
+    }
     if (body?.action === 'organizations-add') {
       const result = await addAppUserOrganizationMemberships({
         actorEmail: actor,

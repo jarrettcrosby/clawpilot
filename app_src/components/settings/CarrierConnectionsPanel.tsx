@@ -135,7 +135,7 @@ const PROVIDERS: ProviderOption[] = [
 const WIZARD_STEPS = ['Carrier', 'Connection', 'Services', 'Done']
 const POSTAL_CODE_PATTERN = /^(?:\d{5}(?:-\d{4})?|[A-Za-z]\d[A-Za-z][ -]?\d[A-Za-z]\d)$/
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 type DirectForm = {

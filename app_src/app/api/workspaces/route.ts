@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { readDashboardWorkspace } from '@/lib/dashboardWorkspace'
 import { requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
+import { ModuleAccessError, requireModuleAccess } from '@/lib/moduleAuthorization'
 import {
   PipelineProvisioningRequestError,
   queuePipelineProvisioning,
@@ -55,14 +56,14 @@ async function workspacePayload(
 
 function errorResponse(error: unknown) {
   const message = error instanceof Error ? error.message : 'Workspace request failed'
-  const status = error instanceof PipelineProvisioningRequestError
+  const status = error instanceof PipelineProvisioningRequestError || error instanceof ModuleAccessError
     ? error.status
     : message === 'Unauthorized'
       ? 401
       : /denied|view-only|Only the/i.test(message)
         ? 403
         : 400
-  return NextResponse.json({ ok: false, error: message }, { status })
+  return NextResponse.json({ ok: false, error: message, ...(error instanceof ModuleAccessError ? { code: error.code, module: error.module } : {}) }, { status })
 }
 
 export async function GET(req: NextRequest) {
@@ -88,6 +89,8 @@ export async function POST(req: NextRequest) {
     const actor = await requireRequestUser(req)
     const body = await req.json()
     const action = String(body?.action || '')
+    if (['create-board', 'select-board', 'share-board', 'remove-board-share'].includes(action)) requireModuleAccess(actor, 'projects')
+    if (['create-pipeline', 'select-pipeline', 'provision-pipeline', 'share-pipeline', 'remove-pipeline-share'].includes(action)) requireModuleAccess(actor, 'crm')
     let selectedBoardId: string | undefined
     let selectedPipelineId: string | undefined
     let actionResult: Record<string, unknown> | undefined

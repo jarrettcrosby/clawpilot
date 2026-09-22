@@ -24,6 +24,12 @@ export class AppUserNotFoundError extends Error {
 }
 
 export type AppUserPermissions = {
+  viewDocs?: boolean
+  viewProjects?: boolean
+  viewCrm?: boolean
+  viewLinks?: boolean
+  viewAgents?: boolean
+  viewVersions?: boolean
   accessDemo: boolean
   inviteUsers: boolean
   manageUserAccess: boolean
@@ -51,6 +57,12 @@ export type AppUserPermissions = {
 }
 
 export const MEMBER_PERMISSIONS: AppUserPermissions = {
+  viewDocs: true,
+  viewProjects: true,
+  viewCrm: true,
+  viewLinks: true,
+  viewAgents: true,
+  viewVersions: true,
   accessDemo: false,
   inviteUsers: false,
   manageUserAccess: false,
@@ -78,6 +90,12 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
 }
 
 export const OWNER_PERMISSIONS: AppUserPermissions = {
+  viewDocs: true,
+  viewProjects: true,
+  viewCrm: true,
+  viewLinks: true,
+  viewAgents: true,
+  viewVersions: true,
   accessDemo: true,
   inviteUsers: true,
   manageUserAccess: true,
@@ -106,6 +124,7 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
 
 export type AppUser = {
   email: string
+  trashedAt?: string | null
   referenceCode: string | null
   contactReferenceCode: string
   crmUserEnabled: boolean
@@ -330,6 +349,12 @@ export function isRootAppOwner(user: Pick<AppUser, 'email' | 'role'>): boolean {
 function normalizePermissions(value: unknown): AppUserPermissions {
   const input = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
+    viewDocs: input.viewDocs !== false,
+    viewProjects: input.viewProjects !== false,
+    viewCrm: input.viewCrm !== false,
+    viewLinks: input.viewLinks !== false,
+    viewAgents: input.viewAgents !== false,
+    viewVersions: input.viewVersions !== false,
     accessDemo: input.accessDemo === true,
     inviteUsers: input.inviteUsers === true,
     manageUserAccess: input.manageUserAccess === true,
@@ -397,6 +422,14 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     permissions.approveAccounting = false
     permissions.viewOrganizationAudit = false
     permissions.viewSystemAudit = false
+  }
+  // Viewing is necessary but never sufficient for a write/action permission.
+  if (!permissions.viewProjects) permissions.createBoards = false
+  if (!permissions.viewCrm) permissions.createPipelines = false
+  if (!permissions.viewLinks) permissions.manageLinks = false
+  if (!permissions.viewVersions) {
+    permissions.viewFullReleaseHistory = false
+    permissions.manageBackups = false
   }
   return permissions
 }
@@ -536,6 +569,7 @@ type ScopedAppUserRow = AppUserRow & {
   membership_role: AppUserRole
   membership_permissions: unknown
   membership_status: AppUserStatus
+  membership_trashed_at?: string | null
 }
 
 function toScopedAppUser(row: ScopedAppUserRow): AppUser {
@@ -546,6 +580,7 @@ function toScopedAppUser(row: ScopedAppUserRow): AppUser {
     role,
     permissions,
     status: row.membership_status,
+    trashedAt: row.membership_trashed_at || null,
     organizationId: row.membership_organization_id,
     organizationName: row.membership_organization_name,
     organizationRole: role,
@@ -573,7 +608,8 @@ async function getScopedAppUser(email: string, organizationId: string): Promise<
        organization.name AS membership_organization_name,
        membership.role AS membership_role,
        membership.permissions AS membership_permissions,
-       membership.status AS membership_status
+       membership.status AS membership_status,
+       membership.trashed_at::text AS membership_trashed_at
      FROM app_users app_user
      JOIN app_user_organization_memberships membership ON membership.user_email = app_user.email
      JOIN workspace_organizations organization ON organization.id = membership.organization_id
@@ -635,7 +671,7 @@ export async function resolveAppUserActor(value: AppUser | unknown): Promise<App
   return requireActiveAppUser(value)
 }
 
-export async function listAppUsers(actorEmailValue: AppUser | unknown): Promise<{ actor: AppUser; users: AppUser[] }> {
+export async function listAppUsers(actorEmailValue: AppUser | unknown, view: 'active' | 'trash' = 'active'): Promise<{ actor: AppUser; users: AppUser[] }> {
   const actor = await resolveAppUserActor(actorEmailValue)
   const actorView = actor.organizationRole
     ? {
@@ -644,6 +680,7 @@ export async function listAppUsers(actorEmailValue: AppUser | unknown): Promise<
         permissions: actor.organizationPermissions || actor.permissions,
       }
     : actor
+  if (view === 'trash' && !canManageUserAccess(actor)) throw new AppUserAuthorizationError('Manage access permission is required to view Trash')
   if (!canInviteUsers(actor) && !canManageUserAccess(actor)) return { actor: actorView, users: [actorView] }
   if (!actor.organizationId) return { actor: actorView, users: [actorView] }
   const result = await query<AppUserRow>(
@@ -660,15 +697,17 @@ export async function listAppUsers(actorEmailValue: AppUser | unknown): Promise<
         organization.name AS membership_organization_name,
         membership.role AS membership_role,
         membership.permissions AS membership_permissions,
-        membership.status AS membership_status
+        membership.status AS membership_status,
+        membership.trashed_at::text AS membership_trashed_at
       FROM app_user_organization_memberships membership
       JOIN app_users app_user ON app_user.email = membership.user_email
       JOIN workspace_organizations organization ON organization.id = membership.organization_id
       JOIN managed ON managed.id = membership.organization_id
+      WHERE (membership.trashed_at IS NOT NULL) = $2::boolean
       ORDER BY CASE membership.role WHEN 'owner' THEN 0 ELSE 1 END,
         membership.created_at ASC, app_user.email ASC
     `,
-    [actor.organizationId],
+    [actor.organizationId, view === 'trash'],
   )
   return {
     actor: actorView,
@@ -740,14 +779,16 @@ export async function inviteAppUser(input: {
         permissions: unknown
         status: AppUserStatus
         is_default: boolean
+        trashed_at: string | null
       }>(
-        `SELECT role, permissions, status, is_default
+        `SELECT role, permissions, status, is_default, trashed_at
          FROM app_user_organization_memberships
          WHERE user_email = $1 AND organization_id = $2::uuid
          FOR UPDATE`,
         [email, organizationId],
       )
       if (existingMembership.rows[0]) {
+        if (existingMembership.rows[0].trashed_at) throw new AppUserAuthorizationError('Restore this user from Trash before inviting them again')
         existingMemberships.set(organizationId, existingMembership.rows[0])
       }
     }
@@ -973,6 +1014,69 @@ export async function restoreInvitedUserAssignments(input: {
   })
 }
 
+export async function setAppUserTrashed(input: {
+  actorEmail: unknown
+  email: unknown
+  organizationId?: unknown
+  trashed: boolean
+}): Promise<AppUser> {
+  const actor = await resolveAppUserActor(input.actorEmail)
+  if (!canManageUserAccess(actor)) throw new AppUserAuthorizationError('You do not have permission to manage users')
+  const email = normalizeUserEmail(input.email)
+  if (email === actor.email) throw new AppUserAuthorizationError('You cannot remove your own account')
+  const organizationId = String(input.organizationId || actor.organizationId || '').trim()
+  await requireOrganizationInActorScope(actor, organizationId)
+  await withTransaction(async (client) => {
+    await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [email])
+    const locked = await client.query<{
+      role: AppUserRole; status: AppUserStatus; trashed_at: string | null; pre_trash_status: AppUserStatus | null
+    }>(`SELECT role, status, trashed_at, pre_trash_status
+        FROM app_user_organization_memberships
+        WHERE user_email = $1 AND organization_id = $2::uuid FOR UPDATE`, [email, organizationId])
+    const target = locked.rows[0]
+    if (!target) throw new AppUserNotFoundError()
+    if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be removed')
+    if (effectiveAuthorizationRole(actor) !== 'owner' && target.role !== 'member') {
+      throw new AppUserAuthorizationError('Only the owner can manage administrators')
+    }
+    if (Boolean(target.trashed_at) === input.trashed) return
+    const status = input.trashed ? 'disabled' : target.pre_trash_status
+    if (!status) throw new Error('The previous access state is unavailable')
+    await client.query(`UPDATE app_user_organization_memberships
+      SET status = $3, trashed_at = CASE WHEN $4 THEN now() ELSE NULL END,
+          trashed_by = CASE WHEN $4 THEN $5 ELSE NULL END,
+          pre_trash_status = CASE WHEN $4 THEN status ELSE NULL END,
+          updated_by = $5, updated_at = now()
+      WHERE user_email = $1 AND organization_id = $2::uuid`, [email, organizationId, status, input.trashed, actor.email])
+    if (input.trashed) {
+      await client.query(`UPDATE app_sessions SET revoked_at = COALESCE(revoked_at, now()), revoked_reason = 'workspace_user_trashed'
+        WHERE effective_user_email = $1 AND active_workspace_organization_id = $2::uuid AND revoked_at IS NULL`, [email, organizationId])
+      await client.query(`UPDATE app_user_invitations SET revoked_at = now()
+        WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL
+          AND (workspace_organization_id = $2::uuid OR $2::uuid = ANY(workspace_organization_ids))`, [email, organizationId])
+      // Demo access is derived from active real-workspace grants, not a lasting independent grant.
+      const demo = await client.query<{ allowed: boolean }>(`SELECT EXISTS (
+        SELECT 1 FROM app_user_organization_memberships m JOIN workspace_organizations o ON o.id = m.organization_id
+        WHERE m.user_email = $1 AND m.status = 'active' AND o.is_demo = false
+          AND (m.role = 'owner' OR COALESCE((m.permissions->>'accessDemo')::boolean, false))) AS allowed`, [email])
+      if (!demo.rows[0]?.allowed) {
+        await client.query('DELETE FROM app_sessions WHERE effective_user_email = $1 AND active_workspace_organization_id = $2::uuid', [email, DEMO_WORKSPACE_ID])
+        await client.query('DELETE FROM app_user_organization_memberships WHERE user_email = $1 AND organization_id = $2::uuid', [email, DEMO_WORKSPACE_ID])
+      }
+    }
+    await client.query(`UPDATE app_users u SET status = CASE
+        WHEN EXISTS (SELECT 1 FROM app_user_organization_memberships m WHERE m.user_email = u.email AND m.status = 'active') THEN 'active'
+        WHEN EXISTS (SELECT 1 FROM app_user_organization_memberships m WHERE m.user_email = u.email AND m.status = 'invited') THEN 'invited'
+        ELSE 'disabled' END, updated_at = now() WHERE email = $1`, [email])
+    await recordAuditEvent({ actor: actor.email, eventType: input.trashed ? 'user.trashed' : 'user.restored',
+      aggregateType: 'app_user', aggregateId: email, subject: email, organizationId,
+      payload: { organizationId, previousStatus: target.status, status } }, client)
+  })
+  const updated = await getScopedAppUser(email, organizationId)
+  if (!updated) throw new AppUserNotFoundError()
+  return updated
+}
+
 export async function setAppUserStatus(input: {
   actorEmail: unknown
   email: unknown
@@ -989,6 +1093,7 @@ export async function setAppUserStatus(input: {
   await requireOrganizationInActorScope(actor, organizationId)
   const target = await getScopedAppUser(email, organizationId)
   if (!target) throw new AppUserNotFoundError()
+  if (target.trashedAt) throw new AppUserAuthorizationError('Restore this user from Trash before changing access')
   if (target.role === 'owner') throw new AppUserAuthorizationError('The owner account cannot be changed')
   if (effectiveAuthorizationRole(actor) !== 'owner' && target.role !== 'member') {
     throw new AppUserAuthorizationError('Only the owner can manage administrators')
@@ -1006,6 +1111,7 @@ export async function setAppUserStatus(input: {
        WHERE user_email = $1
          AND organization_id = $2::uuid
          AND role <> 'owner'
+         AND trashed_at IS NULL
        RETURNING user_email`,
       [email, organizationId, input.status, actor.email],
     )

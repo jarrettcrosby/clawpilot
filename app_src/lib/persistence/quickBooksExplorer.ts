@@ -483,9 +483,13 @@ export async function readQuickBooksExplorerListInPostgres(input: {
         id: string; name: string; fully_qualified_name: string; item_type: string; sku: string | null
         description: string | null; unit_price: string; purchase_cost: string
         quantity_on_hand: string | null; track_quantity: boolean; active: boolean; taxable: boolean
+        sync_token: string | null; tax_classification_id: string | null; tax_classification_name: string | null
       }>(
         `SELECT quickbooks_item_id AS id, name, fully_qualified_name, item_type, sku, description,
-           unit_price::text, purchase_cost::text, quantity_on_hand::text, track_quantity, active, taxable
+           unit_price::text, purchase_cost::text, quantity_on_hand::text, track_quantity, active, taxable,
+           source_payload->>'SyncToken' AS sync_token,
+           source_payload #>> '{TaxClassificationRef,value}' AS tax_classification_id,
+           source_payload #>> '{TaxClassificationRef,name}' AS tax_classification_name
          FROM quickbooks_items
          WHERE organization_id = $1::uuid
            AND (name ILIKE $2 OR fully_qualified_name ILIKE $2 OR sku ILIKE $2 OR item_type ILIKE $2)
@@ -511,6 +515,9 @@ export async function readQuickBooksExplorerListInPostgres(input: {
         trackQuantity: row.track_quantity,
         active: row.active,
         taxable: row.taxable,
+        syncToken: row.sync_token,
+        taxClassificationId: row.tax_classification_id,
+        taxClassificationName: row.tax_classification_name,
       })),
     }
   }

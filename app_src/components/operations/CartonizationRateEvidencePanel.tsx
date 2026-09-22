@@ -442,9 +442,9 @@ export default function CartonizationRateEvidencePanel({
       variant="outlined"
       sx={{
         p: { xs: 1.5, md: 2 },
-        borderColor: 'rgba(255, 183, 77, 0.4)',
+        borderColor: 'warning.main',
         background:
-          'linear-gradient(135deg, rgba(255,183,77,0.08), rgba(21,21,29,0.94) 42%)',
+          'linear-gradient(135deg, color-mix(in srgb, var(--mui-palette-warning-main) 8%, transparent), var(--mui-palette-background-paper) 42%)',
       }}
     >
       <Stack spacing={2}>
@@ -584,7 +584,8 @@ export default function CartonizationRateEvidencePanel({
                 sx={{
                   p: 1.5,
                   borderRadius: 1,
-                  border: '1px dashed rgba(255,183,77,0.55)',
+                  border: '1px dashed',
+                  borderColor: 'warning.main',
                 }}
               >
                 <Typography fontWeight={800}>

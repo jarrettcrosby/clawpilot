@@ -11,6 +11,12 @@ app_visible: true
 
 # ClawPilot Infrastructure and Cost Control Register
 
+> Current development runtime policy, approved September 21, 2026:
+> [Development on demand](development-on-demand.md). Development services,
+> configuration, volumes, and backups are retained, but deployments are stopped
+> and development autodeploy is disabled between test sessions. This supersedes
+> the continuously running development assumptions in the earlier entries below.
+
 ## Purpose
 
 This is the durable operating record for ClawPilot infrastructure, cost controls, and approved configuration changes. Read it before changing Railway topology, service limits, networking, deployment triggers, backups, or spending controls. Verify every time-sensitive value against Railway before acting; this document records the intended baseline, not a substitute for live evidence.
@@ -40,6 +46,27 @@ and evidence keys require a separately reviewed data migration rather than
 blind rotation. Re-audit without printing values. The detailed order and stop
 conditions live in
 [ClawPilot Environments and Deployment](clawpilot-environments.md).
+
+### Legacy Vercel containment — September 22, 2026
+
+The ClawPilot application project `prj_OYGgLt8zrpNTpl5sgQ6LQZtfgaDm` had no Git
+connection and only the `clawpilot-nu.vercel.app` alias, but its obsolete runtime
+was publicly reachable. For the reviewed application release, Vercel
+Authentication was changed from `all_except_custom_domains` to `all`, covering
+existing and future deployments, and the project was paused. The project API
+confirmed `paused=true`; the public alias returned HTTP 503 after pausing.
+The two sampled historical production/preview deployment URLs returned
+authentication redirects after all-deployment protection was enabled.
+
+No deployment, variable, credential, database, or service was deleted. This is
+reversible access containment, **not credential retirement**; trusted Vercel
+team access to protected historical artifacts still requires care. Keep the
+login-email-change release gate off until its separate retirement checks pass.
+Rollback is project unpause followed, only if intended, by restoring the former
+protection scope. Neither action should happen implicitly during a source push.
+Both Railway application domains remained healthy, and the existing Eigen
+short-link canary still redirected to Railway after protection. The BPO website
+project and its staged short-link bridge were not changed by this containment.
 
 | Platform | Responsibility | Intended boundary |
 | --- | --- | --- |
@@ -81,6 +108,30 @@ webhooks, and recovery needs, quantify savings, and obtain operator approval.
   Preserve each environment's reviewed integration permissions.
 - Do not infer monthly savings from a short metrics window. Compare current and previous billing-period line items and separate CPU, memory, egress, volume, and backup charges.
 - Review deployment churn because repeated builds and replacements can create avoidable usage even when runtime utilization is low.
+
+## Local Host Resource Safety
+
+Local Docker pressure is separate from Railway resource usage. Before heavy
+local work, run `npm run storage:audit`; it reports allocation without deleting
+anything. The supported startup and root build/test lifecycles fail below
+15 GiB free and warn below 25 GiB. Mac checks remain active even with inherited
+`CI`, Railway, or Vercel environment variables.
+
+Every guarded disposable PostgreSQL launch on macOS, including individual
+test scripts, checks disk headroom and acquires a shared one-test-at-a-time
+lease across worktrees. Test containers use version-aware temporary storage
+and automatic removal, with a default 4 GiB tmpfs, 5 GiB RAM ceiling, no
+additional container swap, 2 CPUs, 256 processes, and three 10 MB rotated log
+files. These are ceilings, not preallocated RAM. Lower test profiles can be
+reviewed through `CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE`,
+`CLAWPILOT_TEST_POSTGRES_MEMORY`, and `CLAWPILOT_TEST_POSTGRES_CPUS`.
+
+Normal exit, SIGINT, and SIGTERM cleanup verifies the exact container's
+ownership labels before removal. SIGKILL, an interrupted lease write, or an
+unreachable Docker daemon can require manual inspection; a stale lease with
+a retained container fails closed. Do not delete foreign containers, volumes,
+or worktrees to unblock it. These safeguards do not control unrelated
+applications, older checkouts, or the Docker VM's separate disk capacity.
 
 ## Backup And Recovery Policy
 
@@ -137,6 +188,44 @@ Infrastructure changes require explicit approval. The weekly review reports reco
 
 Entries below are historical observations and approved actions. Current
 environment policy is defined above, not by superseded migration plans.
+
+### 2026-09-21 — Local Docker disk-pressure follow-up
+
+The operator paused further Railway work to address local disk/memory safety.
+The live Mac had about 20.04 GiB free (96% used). Docker was responsive; its
+only running container, the Career Desk LinkedIn browser, was healthy and was
+left untouched. Current memory pressure reported 47% free; this does not prove
+the cause of an earlier failure or rule out a previous memory spike.
+
+The read-only inventory found 129 unattached PostgreSQL volumes, reported by
+Docker as 18.68 GB, created September 5–12. Catalog-name inspection identified
+115 cleanup candidates (13.32 GiB allocated) matching ClawPilot test fixtures.
+The other 14 were excluded, including two databases named `railway`. Database
+names establish likely test provenance, not permission to discard recovery
+data. Scoped deletion approval was requested; no old volumes were deleted in
+this follow-up. Generated artifacts across seven worktrees totaled 3.56 GiB;
+they were not removed.
+
+The existing tmpfs/automatic-removal fix was present in the active checkout.
+Follow-up local source changes close targeted-test disk-preflight bypasses,
+serialize Mac test database launches, bound test-container resources/logs,
+and add owner-checked interruption cleanup. They do not change Railway,
+Docker Desktop's global settings, or the running Career Desk service. These
+source changes require the normal reviewed release before being described as
+published in the production application.
+
+Bounded live PostgreSQL 16 checks returned `SELECT 1`, confirmed the resource
+ceilings and zero persistent-volume mounts, rejected a simultaneous second
+guarded test, and verified SIGTERM removed the owned container. All 129
+pre-existing volumes remained unchanged after both smoke tests. No full
+application build, bulk acceptance run, global Docker restart, or deployment
+was needed for these local-only checks.
+
+The focused guard suite passed its 89-launch/12-cleanup call-site inventory
+plus mocked ownership, signal, stale-lease, and cross-process race checks;
+all nine storage-guard unit tests and the document catalog passed. The CRM
+email-routing PostgreSQL acceptance test also passed all 12 checks with its
+existing 512 MiB/1 CPU budget preserved and a 256 MiB tmpfs test profile.
 
 ### 2026-09-14 — Release parity, retained development, and measured cost
 

@@ -31,8 +31,8 @@ function formatDate(iso: string, settings: UserDateTimeSettings) {
 }
 
 const CATEGORY_COLORS: Record<string, string> = {
-  clawpilot: '#CFC6EA', epi: '#66BB6A', suburbia: '#FDD663',
-  p9ine: '#29B6F6', personal: '#A8C7FA', ops: '#FF8A65',
+  clawpilot: 'var(--mui-palette-secondary-main)', epi: '#66BB6A', suburbia: '#FDD663',
+  p9ine: '#29B6F6', personal: 'var(--mui-palette-primary-main)', ops: '#FF8A65',
   tech: '#5C6BC0', marketing: '#EC407A',
 }
 
@@ -58,7 +58,7 @@ export default function DeletedCardsView({ query }: Props) {
 
   if (loading) return (
     <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', pt: 8 }}>
-      <CircularProgress size={28} sx={{ color: '#A8C7FA' }} />
+      <CircularProgress size={28} sx={{ color: 'var(--mui-palette-primary-main)' }} />
     </Box>
   )
 
@@ -82,9 +82,9 @@ export default function DeletedCardsView({ query }: Props) {
                 key={task.id}
                 disablePadding
                 sx={{
-                  backgroundColor: '#1A1A23',
+                  backgroundColor: 'var(--mui-palette-background-paper)',
                   borderRadius: 2,
-                  border: '1px solid rgba(255,255,255,0.06)',
+                  border: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
                   px: 2, py: 1.5,
                   display: 'flex',
                   alignItems: 'center',
@@ -105,8 +105,8 @@ export default function DeletedCardsView({ query }: Props) {
                           size="small"
                           sx={{
                             height: 20, fontSize: 11,
-                            backgroundColor: `${CATEGORY_COLORS[task.category] || '#A8C7FA'}22`,
-                            color: CATEGORY_COLORS[task.category] || '#A8C7FA',
+                            backgroundColor: `color-mix(in srgb, ${CATEGORY_COLORS[task.category] || 'var(--mui-palette-primary-main)'} 13%, transparent)`,
+                            color: CATEGORY_COLORS[task.category] || 'var(--mui-palette-primary-main)',
                             fontWeight: 600,
                           }}
                         />

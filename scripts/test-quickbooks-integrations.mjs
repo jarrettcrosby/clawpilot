@@ -514,7 +514,7 @@ const writePayloads = read('app_src/lib/integrations/quickBooksWritePayloads.ts'
 for (const fragment of [
   'validateQuickBooksWriteDraft',
   'buildQuickBooksProviderPayload',
-  "'customer.create', 'item.create', 'invoice.create'",
+  "'customer.create', 'item.create', 'item.update', 'invoice.create'",
   "itemType !== 'Service' && itemType !== 'NonInventory' && itemType !== 'Inventory'",
   'QUICKBOOKS_WRITE_ASSET_ACCOUNT_REQUIRED',
   'PrefVendorRef',
@@ -532,11 +532,77 @@ const writeOrganizationId = '11111111-1111-4111-8111-111111111111'
 const toastRestaurantGuid = '22222222-2222-4222-8222-222222222222'
 const toastSourceId = '14351ea1-ad68-4f2c-85e6-da00661bab4e'
 let sourceMappingExists = false
+let writeItemSyncToken = '7'
 const itemCompatibilityModule = loadTypeScriptModule(
   'app_src/lib/integrations/quickBooksItemCompatibility.ts',
 )
+const taxTreeModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksTaxClassifications.ts')
+const taxValidationReads = []
+const taxValidationModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksTaxClassificationValidation.ts', {
+  '@/lib/integrations/quickBooksTaxClassifications': taxTreeModule,
+  '@/lib/maton': {
+    matonFetch: async (path, init, options) => {
+      taxValidationReads.push({ path, init, options })
+      return quickBooksJsonResponse({ QueryResponse: { TaxClassification: [
+        { Id: 'tax-root', Name: 'Food & beverages', Level: 1, ApplicableTo: ['Service'] },
+        { Id: 'tax-other', Name: 'Other', Level: 1 },
+        { Id: 'tax-food', Name: 'Meals', Level: 2, ParentRef: { value: 'tax-root' }, ApplicableTo: ['Service'] },
+        { Id: 'tax-meals', Name: 'Prepared food', Level: 3, ParentRef: { value: 'tax-food' }, ApplicableTo: ['Service'] },
+        { Id: 'tax-prepared', Name: 'Ready to eat', Level: 4, ParentRef: { value: 'tax-meals' }, ApplicableTo: ['Service'] },
+      ] } })
+    },
+  },
+  '@/lib/persistence/postgres': {
+    query: async (_sql, params) => ({ rows: params[0] === writeOrganizationId
+      ? [{ credential_owner_email: 'owner@example.com', maton_connection_id: 'binding-1' }] : [] }),
+  },
+})
+assert.deepEqual(JSON.parse(JSON.stringify(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Service',
+}))), { id: 'tax-prepared', name: 'Food & beverages:Meals:Prepared food:Ready to eat', parentId: 'tax-meals' })
+assert.equal(taxValidationReads[0].options.boundConnectionId, 'binding-1')
+assert.equal(taxValidationReads.length, 1, 'validation reads the bound company catalog once')
+assert.match(taxValidationReads[0].path, /taxclassification\?minorversion=75$/)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-other', itemType: 'Service',
+}), null, 'a child with a mismatched ParentRef must be rejected')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-forged', itemType: 'Service',
+}), null, 'an unknown parent must be rejected')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: null, itemType: 'Service',
+}), null, 'a child without its parent must not be accepted as a root')
+assert.equal(taxValidationReads.length, 1)
+taxValidationReads.length = 0
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-root', parentId: null, itemType: 'Service',
+}), null, 'a non-leaf tax classification must not be selected')
+assert.equal(taxValidationReads.length, 1)
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-food', parentId: 'tax-root', itemType: 'Service',
+}), null, 'a level-two category with descendants must not be selected')
+assert.equal(await taxValidationModule.validateQuickBooksTaxClassification({
+  organizationId: writeOrganizationId, classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Inventory',
+}), null, 'an inapplicable tax classification must not be selected')
+await assert.rejects(
+  taxValidationModule.validateQuickBooksTaxClassification({
+    organizationId: '33333333-3333-4333-8333-333333333333', classificationId: 'tax-prepared', parentId: 'tax-meals', itemType: 'Service',
+  }), /Active QuickBooks connection unavailable/,
+)
 const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickBooksWritePayloads.ts', {
   '@/lib/integrations/quickBooksItemCompatibility': itemCompatibilityModule,
+  '@/lib/integrations/quickBooksTaxClassificationValidation': {
+    validateQuickBooksTaxClassification: async ({ classificationId, parentId, itemType }) => (
+      classificationId === 'tax-prepared' && parentId === 'tax-meals' && itemType === 'Service'
+        ? { id: 'tax-prepared', name: 'Food & beverages:Meals:Prepared food:Ready to eat', parentId: 'tax-meals' }
+        : null
+    ),
+  },
   '@/lib/persistence/postgres': {
     query: async (sql, params = []) => {
       const source = String(sql)
@@ -576,6 +642,12 @@ const writePayloadModule = loadTypeScriptModule('app_src/lib/integrations/quickB
         return { rows: params[1] === 'customer-1' ? [{ display_name: 'Acme Buyer', email: 'buyer@example.com' }] : [] }
       }
       if (source.includes('FROM quickbooks_items')) {
+        if (source.includes("source_payload->>'SyncToken'")) {
+          return { rows: params[0] === writeOrganizationId && params[1] === 'item-10' ? [{
+            item_type: 'Service', name: 'Consulting', sku: 'CONSULT', description: 'Old description',
+            unit_price: '125', purchase_cost: '25', taxable: false, sync_token: writeItemSyncToken,
+          }] : [] }
+        }
         if (source.includes("lower(item_type) = 'category'")) {
           return { rows: params[0] === writeOrganizationId && params[1] === 'category-1' ? [{
             quickbooks_item_id: 'category-1',
@@ -632,6 +704,118 @@ const providerItem = writePayloadModule.buildQuickBooksProviderPayload('item.cre
 assert.equal(providerItem.Type, 'Service')
 assert.equal(providerItem.SubItem, true)
 assert.equal(providerItem.ParentRef.value, 'category-1')
+const taxedItemDraft = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId, operationKind: 'item.create',
+  payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-meals' },
+})
+assert.equal(taxedItemDraft.payload.taxClassificationName, 'Food & beverages:Meals:Prepared food:Ready to eat')
+assert.equal(taxedItemDraft.payload.taxClassificationParentId, 'tax-meals')
+assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.create', taxedItemDraft.payload).TaxClassificationRef.value, 'tax-prepared')
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId, operationKind: 'item.create',
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: undefined },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+  'a selected tax classification requires explicit parent context',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId, operationKind: 'item.create',
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-other' },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+  'a forged tax classification parent is rejected',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId, operationKind: 'item.create',
+    payload: { ...itemDraft.payload, taxClassificationId: 'tax-unknown', taxClassificationParentId: 'tax-meals' },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_TAX_CLASSIFICATION_INVALID',
+)
+const itemUpdate = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId,
+  operationKind: 'item.update',
+  payload: {
+    itemId: 'item-10', expectedSyncToken: '7', name: 'Consulting revised', sku: 'CONSULT',
+    description: 'Old description', unitPrice: 150, purchaseCost: 25, taxable: false,
+  },
+})
+assert.equal(itemUpdate.payload.itemType, 'Service')
+assert.equal(itemUpdate.payload.taxClassificationId, null, 'a price-only edit does not require reselecting the current tax category')
+assert.equal(Object.hasOwn(writePayloadModule.buildQuickBooksProviderPayload('item.update', itemUpdate.payload), 'TaxClassificationRef'), false,
+  'an unchanged tax category is omitted from the sparse QuickBooks update')
+const taxedItemUpdate = await writePayloadModule.validateQuickBooksWriteDraft({
+  organizationId: writeOrganizationId, operationKind: 'item.update',
+  payload: { ...itemUpdate.payload, taxClassificationId: 'tax-prepared', taxClassificationParentId: 'tax-meals' },
+})
+assert.equal(writePayloadModule.buildQuickBooksProviderPayload('item.update', taxedItemUpdate.payload).TaxClassificationRef.value, 'tax-prepared')
+assert.deepEqual(JSON.parse(JSON.stringify(writePayloadModule.buildQuickBooksProviderPayload('item.update', itemUpdate.payload))), {
+  Id: 'item-10', SyncToken: '7', sparse: true, Name: 'Consulting revised', Sku: 'CONSULT',
+  Description: 'Old description', UnitPrice: 150, PurchaseCost: 25, Taxable: false,
+})
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: writeOrganizationId,
+    operationKind: 'item.update',
+    payload: { ...itemUpdate.payload, expectedSyncToken: '6' },
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_ITEM_STALE',
+)
+await assert.rejects(
+  writePayloadModule.validateQuickBooksWriteDraft({
+    organizationId: '33333333-3333-4333-8333-333333333333',
+    operationKind: 'item.update',
+    payload: itemUpdate.payload,
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_ITEM_NOT_FOUND',
+)
+let providerItemSyncToken = '7'
+let providerUpdateConflict = false
+const providerItemUpdateCalls = []
+const itemUpdateClient = loadTypeScriptModule('app_src/lib/integrations/quickBooksClient.ts', {
+  '@/lib/maton': {
+    matonFetch: async (path, init) => {
+      providerItemUpdateCalls.push({ path, init })
+      if (!init || init.method !== 'POST') {
+        return quickBooksJsonResponse({ Item: { Id: 'item-10', Type: 'Service', Active: true, SyncToken: providerItemSyncToken } })
+      }
+      if (providerUpdateConflict) {
+        return quickBooksJsonResponse({ Fault: { Error: [{ code: '5010', Message: 'Stale Object Error' }] } }, 400)
+      }
+      return quickBooksJsonResponse({ Item: { Id: 'item-10', SyncToken: '8' } })
+    },
+  },
+  '@/lib/integrations/quickBooksCatalog.mjs': quickBooksCatalogClientMocks,
+  '@/lib/integrations/quickBooksWritePayloads': writePayloadModule,
+})
+const updatedItem = await itemUpdateClient.updateQuickBooksItem({
+  ownerEmail: 'owner@example.com', connectionId: 'connection-1',
+  payload: itemUpdate.payload, providerRequestId: 'product-update-1',
+})
+assert.equal(updatedItem.entityId, 'item-10')
+assert.equal(updatedItem.syncToken, '8')
+assert.equal(JSON.parse(providerItemUpdateCalls[1].init.body).SyncToken, '7')
+assert.equal(JSON.parse(providerItemUpdateCalls[1].init.body).sparse, true)
+providerItemSyncToken = '8'
+await assert.rejects(
+  itemUpdateClient.updateQuickBooksItem({
+    ownerEmail: 'owner@example.com', connectionId: 'connection-1',
+    payload: itemUpdate.payload, providerRequestId: 'product-update-2',
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_ITEM_STALE',
+)
+assert.equal(providerItemUpdateCalls.filter((call) => call.init?.method === 'POST').length, 1)
+providerItemSyncToken = '7'
+providerUpdateConflict = true
+await assert.rejects(
+  itemUpdateClient.updateQuickBooksItem({
+    ownerEmail: 'owner@example.com', connectionId: 'connection-1',
+    payload: itemUpdate.payload, providerRequestId: 'product-update-3',
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_ITEM_STALE',
+)
 const legacyItemPayload = {
   name: 'Legacy consulting', itemType: 'Service', sku: null,
   description: 'Approved before item field expansion', unitPrice: 125, purchaseCost: 25,
@@ -1528,6 +1712,8 @@ let existingWriteMapping = {
   mapping_revision: 4,
 }
 let currentReviewedConnectionId = 'connection-reviewed'
+let writePolicyOperations = ['item.create']
+let cachedItemUpdateSql = null
 const recentWriteRequestId = '33333333-3333-4333-8333-333333333333'
 const targetedWriteRequestId = '77777777-7777-4777-8777-777777777777'
 const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/quickBooksWrites.ts', {
@@ -1535,7 +1721,7 @@ const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/qui
   '@/lib/integrations/quickBooksItemCompatibility': itemCompatibilityModule,
   '@/lib/auditWriter': { recordAuditEvent: async (event) => { writeAuditEvents.push(event) } },
   '@/lib/quickBooksWritePolicy': {
-    configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['item.create'] }),
+    configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: writePolicyOperations }),
   },
   '@/lib/persistence/postgres': {
     acquireTransactionAdvisoryLock: async (client, key) => client.query(
@@ -1544,6 +1730,14 @@ const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/qui
     ),
     query: async (sql, params = []) => {
       const source = String(sql)
+      if (source.includes('SELECT fully_qualified_name') && source.includes('FROM quickbooks_items')) {
+        return { rows: params[0] === writeOrganizationId && params[1] === 'item-10' && params[2] === '7'
+          ? [{ fully_qualified_name: 'Services:Consulting' }] : [], rowCount: 1 }
+      }
+      if (source.includes('UPDATE quickbooks_items SET') && source.includes('source_payload = source_payload ||')) {
+        cachedItemUpdateSql = { source, params }
+        return { rowCount: 1 }
+      }
       if (source.includes('FROM toast_menu_catalog_items')) {
         return writeSourceReadinessScenario === 'current'
           ? {
@@ -1576,6 +1770,10 @@ const writePersistenceModule = loadTypeScriptModule('app_src/lib/persistence/qui
         writeSqlCalls.push({ source, params })
         if (source.includes('SELECT maton_connection_id') && source.includes('FOR SHARE')) {
           return { rows: [{ maton_connection_id: currentReviewedConnectionId }], rowCount: 1 }
+        }
+        if (source.includes("source_payload->>'SyncToken' AS sync_token")) {
+          return { rows: params[0] === organizationId && params[1] === 'item-10'
+            ? [{ sync_token: writeItemSyncToken }] : [], rowCount: 1 }
         }
         if (source.includes('FOR UPDATE OF request') && source.includes('request.id = $2::uuid')) {
           return transitionWriteRow
@@ -1672,6 +1870,15 @@ const crossTenantWriteWorkspace = await writePersistenceModule.readQuickBooksWri
 assert.equal(crossTenantWriteWorkspace.requests.some((request) => request.id === targetedWriteRequestId), false)
 writeReadScenario = 'off'
 
+assert.equal(await writePersistenceModule.cacheUpdatedQuickBooksItemInPostgres({
+  organizationId: writeOrganizationId, payload: itemUpdate.payload, providerSyncToken: '8',
+}), true)
+assert.equal(cachedItemUpdateSql.params[4], 'Services:Consulting revised')
+assert.equal(cachedItemUpdateSql.params[2], '7')
+assert.equal(JSON.parse(cachedItemUpdateSql.params[10]).SyncToken, '8')
+assert.equal(JSON.parse(cachedItemUpdateSql.params[10]).IncomeAccountRef, undefined)
+assert.ok(cachedItemUpdateSql.source.includes('source_payload = source_payload ||'), 'Item update cache must preserve untouched provider fields')
+
 await writePersistenceModule.createQuickBooksWriteRequestInPostgres({
   organizationId,
   operationKind: 'customer.create',
@@ -1754,6 +1961,28 @@ const reservationLock = writeSqlCalls.find((call) => (
   call.source.includes('pg_advisory_xact_lock') && call.params[0] === `quickbooks-binding:${organizationId}`
 ))
 assert.ok(reservationLock, 'Mapped item approval must reserve its source under the QuickBooks binding lock')
+transitionWriteRow = writeRequestRow({
+  operation_kind: 'item.update',
+  status: 'pending_approval',
+  request_payload: itemUpdate.payload,
+  request_fingerprint: itemUpdate.requestFingerprint,
+})
+writePolicyOperations = ['item.create', 'item.update']
+writeItemSyncToken = '8'
+await assert.rejects(
+  writePersistenceModule.transitionQuickBooksWriteRequestInPostgres({
+    organizationId, requestId: transitionWriteRow.id, action: 'approve',
+    actorEmail, confirmFingerprint: itemUpdate.requestFingerprint,
+  }),
+  (error) => error.code === 'QUICKBOOKS_WRITE_ITEM_STALE',
+  'Approval must fail closed when the cached QuickBooks item version changed',
+)
+writeItemSyncToken = '7'
+const approvedItemUpdate = await writePersistenceModule.transitionQuickBooksWriteRequestInPostgres({
+  organizationId, requestId: transitionWriteRow.id, action: 'approve',
+  actorEmail, confirmFingerprint: itemUpdate.requestFingerprint,
+})
+assert.equal(approvedItemUpdate.status, 'approved')
 transitionWriteRow = null
 
 const writeJob = {
@@ -1777,6 +2006,11 @@ await writePersistenceModule.completeQuickBooksWriteJobInPostgres({
   providerSyncToken: '0',
 })
 await writePersistenceModule.failQuickBooksWriteJobInPostgres({ job: writeJob, errorCode: 'TEMPORARY', error: 'retry' })
+const staleItemUpdateDead = await writePersistenceModule.failQuickBooksWriteJobInPostgres({
+  job: { ...writeJob, operationKind: 'item.update', requestPayload: itemUpdate.payload },
+  errorCode: 'QUICKBOOKS_WRITE_ITEM_STALE', error: 'stale item',
+})
+assert.equal(staleItemUpdateDead, true)
 const completeWriteCall = writeSqlCalls.find((call) => call.source.includes("status = 'succeeded'"))
 const failWriteCall = writeSqlCalls.find((call) => (
   call.source.includes('status = $3') && call.source.includes('last_error_code = $4')
@@ -2931,6 +3165,51 @@ const retryResult = await retryWorkerModule.processQuickBooksWriteOutbox({ worke
 assert.equal(retryResult.failed, 1)
 assert.equal(retryResult.dead, 0)
 assert.equal(failedJobs, 1)
+
+let workerUpdateCalls = 0
+let workerCreateCalls = 0
+const itemUpdateWorkerModule = loadTypeScriptModule('app_src/lib/quickBooksWriteWorker.ts', {
+  '@/lib/integrations/quickBooksClient': {
+    QuickBooksProviderWriteError: class extends Error {},
+    createQuickBooksEntity: async () => { workerCreateCalls += 1; return {} },
+    updateQuickBooksItem: async (input) => {
+      workerUpdateCalls += 1
+      assert.equal(input.payload.itemId, 'item-10')
+      return { entityType: 'Item', entityId: 'item-10', syncToken: '8' }
+    },
+  },
+  '@/lib/persistence/quickBooksWrites': {
+    QuickBooksWriteRequestError: class extends Error {},
+    cacheUpdatedQuickBooksItemInPostgres: async (input) => {
+      assert.equal(input.payload.itemId, 'item-10')
+      assert.equal(input.providerSyncToken, '8')
+      return true
+    },
+    claimQuickBooksWriteJobsInPostgres: async () => [{
+      id: 'write-update-1', organizationId: writeOrganizationId,
+      ownerEmail: 'owner@example.com', connectionId: 'connection-1',
+      operationKind: 'item.update', requestPayload: itemUpdate.payload,
+      providerRequestId: 'cp-update-1', requestFingerprint: itemUpdate.requestFingerprint,
+      attemptCount: 1, maxAttempts: 5, lockToken: '33333333-3333-4333-8333-333333333333', writeMode: 'sandbox',
+    }],
+    completeQuickBooksWriteJobInPostgres: async () => ({ posAccountingMapping: null }),
+    failQuickBooksWriteJobInPostgres: async () => false,
+    validateQuickBooksWriteJobBeforeProviderInPostgres: async () => ({ posAccountingSource: null }),
+  },
+  '@/lib/persistence/quickBooksIntegrations': { queueQuickBooksCatalogSyncInPostgres: async () => undefined },
+  '@/lib/persistence/posAccountingNotifications': {
+    reconcileOpenPosAccountingIssuesForMappedItemInPostgres: async () => null,
+    reconcilePosAccountingIssueForQuickBooksRequestInPostgres: async () => null,
+  },
+  '@/lib/quickBooksWritePolicy': {
+    configuredQuickBooksWritePolicy: () => ({ enabled: true, mode: 'sandbox', allowedOperations: ['item.update'] }),
+  },
+})
+const itemUpdateWorkerResult = await itemUpdateWorkerModule.processQuickBooksWriteOutbox({ workerId: 'test-worker' })
+assert.equal(itemUpdateWorkerResult.succeeded, 1)
+assert.equal(itemUpdateWorkerResult.itemCacheWarnings, 0)
+assert.equal(workerUpdateCalls, 1)
+assert.equal(workerCreateCalls, 0)
 
 let staleSourceProviderCalls = 0
 let staleSourceFailureCode = null

@@ -5,6 +5,7 @@
     "buildCommand": "npm --prefix app_src install && npm run build",
     "watchPatterns": [
       "/app_src/**",
+      "/tools/architecture/**",
       "/scripts/**",
       "/db/**",
       "/docs/**",

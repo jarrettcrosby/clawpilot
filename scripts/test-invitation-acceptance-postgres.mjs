@@ -133,6 +133,8 @@ async function createSchema(pool) {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
 
+    CREATE TABLE app_user_login_addresses (user_email text PRIMARY KEY REFERENCES app_users(email), login_email text UNIQUE);
+
     CREATE TABLE workspace_organizations (
       id uuid PRIMARY KEY,
       name text NOT NULL,
@@ -341,8 +343,8 @@ async function verifyAcceptance(databaseUrl) {
       async retireUnusedWorkspaceOrganization() {},
     },
     '@/lib/persistence/postgres': persistenceMock,
-    '@/lib/publicUrl': {
-      appPublicUrl() {
+    '@/lib/organizationWebPreferences': {
+      organizationAppPublicUrl() {
         return 'https://clawpilot.test'
       },
     },

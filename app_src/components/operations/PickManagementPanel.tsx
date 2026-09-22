@@ -343,9 +343,10 @@ export default function PickManagementPanel({
                   data-testid={`pick-assignment-${assignment.orderGlobalId}`}
                   sx={{
                     p: 2,
-                    border: '1px solid rgba(255,255,255,0.1)',
+                    border: '1px solid',
+                    borderColor: 'divider',
                     borderRadius: 2,
-                    backgroundColor: 'rgba(255,255,255,0.025)',
+                    backgroundColor: 'background.paper',
                   }}
                 >
                   <Stack
@@ -375,7 +376,7 @@ export default function PickManagementPanel({
                           <Chip size="small" color="warning" label="Manager exception open" />
                         )}
                       </Stack>
-                      <Typography variant="caption" color="#A8C7FA">
+                      <Typography variant="caption" color="primary.main">
                         {assignment.orderGlobalId} · {assignment.warehouseName}
                       </Typography>
                       {assignment.assignmentState === 'mixed' && (
@@ -521,7 +522,7 @@ export default function PickManagementPanel({
                         >
                           {history.orderNumber}
                         </Button>
-                        <Typography variant="caption" color="#A8C7FA" display="block">
+                        <Typography variant="caption" color="primary.main" display="block">
                           {history.orderGlobalId}
                         </Typography>
                       </TableCell>

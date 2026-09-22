@@ -6,7 +6,7 @@ import {
   retireUnusedWorkspaceOrganization,
 } from '@/lib/organizations'
 import { query, withTransaction } from '@/lib/persistence/postgres'
-import { appPublicUrl } from '@/lib/publicUrl'
+import { organizationAppPublicUrl } from '@/lib/organizationWebPreferences'
 import {
   getAppUser,
   inviteAppUser,
@@ -336,7 +336,7 @@ export async function createUserInvitation(input: {
     const token = crypto.randomBytes(32).toString('base64url')
     const digest = tokenDigest(token)
     const fromAddress = mailFromAddress()
-    const publicUrl = appPublicUrl()
+    const publicUrl = await organizationAppPublicUrl(assignment.organization.id)
     invitation = await claimInvitation({
       email: user.email,
       actorEmail: actor.email,

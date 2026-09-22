@@ -495,6 +495,7 @@ export async function verifyAuthMagicCode(
           [accountEmail],
         )
         if (!signedIn.rows[0]) throw new Error(AUTHORIZATION_CHANGED)
+        if (await resolveLoginAccountEmail(requestedEmail, client) !== accountEmail) throw new Error(AUTHORIZATION_CHANGED)
       }
       return { ...verified, organization_id: null } satisfies VerificationOutcome
     })

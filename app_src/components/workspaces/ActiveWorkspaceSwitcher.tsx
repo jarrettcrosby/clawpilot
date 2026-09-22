@@ -259,8 +259,8 @@ export default function ActiveWorkspaceSwitcher() {
             maxWidth: { xs: 48, sm: 230 },
             minHeight: 38,
             px: { xs: 1, sm: 1.25 },
-            color: '#A8C7FA',
-            border: '1px solid rgba(168,199,250,0.24)',
+            color: 'var(--mui-palette-primary-main)',
+            border: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.24)',
             borderRadius: 1.5,
             justifyContent: 'flex-start',
             textTransform: 'none',
@@ -294,8 +294,8 @@ export default function ActiveWorkspaceSwitcher() {
             mt: 0.5,
             minWidth: 280,
             maxWidth: 'calc(100vw - 24px)',
-            backgroundColor: '#1A1A23',
-            border: '1px solid rgba(255,255,255,0.08)',
+            backgroundColor: 'var(--mui-palette-background-paper)',
+            border: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
           },
         }}
       >
@@ -337,7 +337,7 @@ export default function ActiveWorkspaceSwitcher() {
             sx={{ py: 1.1 }}
           >
             <ListItemIcon sx={{ minWidth: 34 }}>
-              <AddBusinessRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />
+              <AddBusinessRounded sx={{ fontSize: 19, color: 'var(--mui-palette-primary-main)' }} />
             </ListItemIcon>
             <ListItemText primary="Add business" primaryTypographyProps={{ variant: 'body2' }} />
           </MenuItem>
@@ -351,7 +351,7 @@ export default function ActiveWorkspaceSwitcher() {
             <ListItemIcon sx={{ minWidth: 34 }}>
               {demoOpening
                 ? <CircularProgress size={17} />
-                : <ScienceRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />}
+                : <ScienceRounded sx={{ fontSize: 19, color: 'var(--mui-palette-primary-main)' }} />}
             </ListItemIcon>
             <ListItemText
               primary="Open demo account"

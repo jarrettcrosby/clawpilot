@@ -470,7 +470,7 @@ const COMMERCE_PROVIDER_OPTIONS: readonly {
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 

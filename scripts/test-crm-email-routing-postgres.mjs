@@ -429,10 +429,16 @@ let pool
 try {
   execFileSync('docker', disposablePostgresDockerArgs([
     'run', '--rm', '-d', '--name', container, '--pull', 'never',
-    '--memory', '512m', '--memory-swap', '512m', '--cpus', '1',
     '-e', 'POSTGRES_PASSWORD=email_routing_test', '-e', 'POSTGRES_DB=email_routing_test',
     '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
-  ]), { timeout: 60_000, stdio: 'pipe' })
+  ], {
+    environment: {
+      ...process.env,
+      CLAWPILOT_TEST_POSTGRES_MEMORY: '512m',
+      CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: '256m',
+      CLAWPILOT_TEST_POSTGRES_CPUS: '1',
+    },
+  }), { timeout: 60_000, stdio: 'pipe' })
   started = true
   const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8', timeout: 10_000 })
     .match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]

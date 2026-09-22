@@ -43,11 +43,19 @@ import SecurityRounded from '@mui/icons-material/SecurityRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import ArchitectureRounded from '@mui/icons-material/ArchitectureRounded'
+import ArchitecturePanel from './ArchitecturePanel'
+import AppearancePreference from '@/components/AppearancePreference'
+import LoginEmailPanel from './LoginEmailPanel'
+import { SESSION_REFRESH_EVENT } from '@/components/auth/SessionGuard'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
+import { MODULE_PERMISSION_GROUPS, modulePermissionDependencies } from '@/lib/moduleAccess'
+import type { AppUserPermissions } from '@/lib/users'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
 import MeasurementPreferencesPanel from './MeasurementPreferencesPanel'
 import OrganizationBrandingPanel from './OrganizationBrandingPanel'
+import OrganizationWebPreferencesPanel from './OrganizationWebPreferencesPanel'
 import SessionSecurityPanel from './SessionSecurityPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
@@ -59,35 +67,11 @@ type ShareAccessRole = Exclude<ResourceAccessRole, 'owner'>
 type ResourceKind = 'board' | 'pipeline'
 type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
 
-type UserPermissions = {
-  accessDemo: boolean
-  inviteUsers: boolean
-  manageUserAccess: boolean
-  createBoards: boolean
-  createPipelines: boolean
-  viewOperations: boolean
-  manageOperations: boolean
-  executeWarehouse: boolean
-  viewShipping: boolean
-  createShipments: boolean
-  purchaseLivePostage: boolean
-  manageCarrierRateNetworks: boolean
-  grantCarrierRateAccess: boolean
-  viewCarrierCost: boolean
-  reconcileCarrierBilling: boolean
-  approveCarrierSettlement: boolean
-  viewFullReleaseHistory: boolean
-  manageBackups: boolean
-  manageLinks: boolean
-  viewAccounting: boolean
-  prepareAccounting: boolean
-  approveAccounting: boolean
-  viewOrganizationAudit: boolean
-  viewSystemAudit: boolean
-}
+type UserPermissions = AppUserPermissions
 
 type AppUser = {
   email: string
+  trashedAt?: string | null
   referenceCode: string | null
   contactReferenceCode: string
   crmUserEnabled: boolean
@@ -122,6 +106,13 @@ type UsersPayload = ApiPayload & {
   canManageUserAccess?: boolean
   users?: AppUser[]
   workspaceOrganizations?: WorkspaceOrganization[]
+}
+
+type AuthSessionPayload = ApiPayload & {
+  authenticatedUser?: { email: string }
+  effectiveUser?: { email: string }
+  impersonation?: { active: boolean }
+  isRootAdmin?: boolean
 }
 
 type WorkspaceOrganization = {
@@ -243,6 +234,12 @@ const PERMISSIONS: Array<{
   description?: string
   adminOnly?: boolean
 }> = [
+  { key: 'viewDocs', label: 'View docs' },
+  { key: 'viewProjects', label: 'View projects' },
+  { key: 'viewCrm', label: 'View pipeline and CRM' },
+  { key: 'viewLinks', label: 'View links' },
+  { key: 'viewAgents', label: 'View agents' },
+  { key: 'viewVersions', label: 'View versions' },
   { key: 'accessDemo', label: 'Open demo account' },
   { key: 'inviteUsers', label: 'Invite users', adminOnly: true },
   { key: 'manageUserAccess', label: 'Manage access', adminOnly: true },
@@ -312,9 +309,20 @@ const PERMISSIONS: Array<{
   { key: 'viewSystemAudit', label: 'View global system activity', adminOnly: true },
 ]
 
+const PERMISSIONS_BY_KEY = new Map(PERMISSIONS.map((permission) => [permission.key, permission]))
+const LEGACY_VISIBLE_VIEW_KEYS = new Set<PermissionKey>([
+  'viewDocs', 'viewProjects', 'viewCrm', 'viewLinks', 'viewAgents', 'viewVersions',
+])
+
+function permissionEnabled(permissions: UserPermissions, key: PermissionKey) {
+  return LEGACY_VISIBLE_VIEW_KEYS.has(key)
+    ? permissions[key] !== false
+    : permissions[key] === true
+}
+
 function permissionsForRolePreset(role: EditableRole, current: UserPermissions): UserPermissions {
   const enabled = role === 'admin'
-  return {
+  const preset: UserPermissions = {
     ...current,
     inviteUsers: enabled,
     manageUserAccess: enabled,
@@ -338,33 +346,19 @@ function permissionsForRolePreset(role: EditableRole, current: UserPermissions):
     viewOrganizationAudit: enabled,
     viewSystemAudit: enabled,
   }
-}
-
-function permissionsWithDependencies(
-  current: UserPermissions,
-  key: PermissionKey,
-  enabled: boolean,
-): UserPermissions {
-  const next = { ...current, [key]: enabled }
-  if (key === 'executeWarehouse' && enabled) next.viewOperations = true
-  if (key === 'viewOperations' && !enabled) next.executeWarehouse = false
-  if (key === 'createShipments' && enabled) next.viewShipping = true
-  if (key === 'purchaseLivePostage' && enabled) {
-    next.viewShipping = true
-    next.createShipments = true
-  }
-  if (key === 'createShipments' && !enabled) next.purchaseLivePostage = false
-  if (key === 'viewShipping' && !enabled) {
-    next.createShipments = false
-    next.purchaseLivePostage = false
-  }
-  return next
+  return PERMISSIONS.reduce(
+    (permissions, { key }) => permissionEnabled(preset, key)
+      ? modulePermissionDependencies(permissions, key, true)
+      : permissions,
+    preset,
+  )
 }
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1,
+  borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: 'rgba(255,255,255,0.025)',
+  backgroundColor: 'background.paper',
 }
 
 const compactButtonSx = {
@@ -377,7 +371,7 @@ const compactButtonSx = {
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -460,7 +454,10 @@ export default function UserAccessDialog({
   const shortViewport = useMediaQuery('(max-height: 500px)')
   const fullScreen = narrowScreen || shortViewport
   const [activeTab, setActiveTab] = useState(0)
+  const [architectureAuthorized, setArchitectureAuthorized] = useState<boolean | null>(null)
   const [usersPayload, setUsersPayload] = useState<UsersPayload | null>(null)
+  const [usersView, setUsersView] = useState<'active' | 'trash'>('active')
+  const [trashedUsers, setTrashedUsers] = useState<AppUser[]>([])
   const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
   const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
   const [inviteEmail, setInviteEmail] = useState('')
@@ -487,9 +484,10 @@ export default function UserAccessDialog({
 
   const displayedUsers = useMemo(() => {
     if (!currentUser) return []
+    if (usersView === 'trash') return trashedUsers
     if (!usersPayload?.isAdmin) return [currentUser]
     return usersPayload.users || [currentUser]
-  }, [currentUser, usersPayload])
+  }, [currentUser, usersPayload, usersView, trashedUsers])
 
   const eligibleShareEmails = useMemo(() => {
     return (usersPayload?.users || [])
@@ -540,7 +538,10 @@ export default function UserAccessDialog({
 
     let active = true
     setActiveTab(initialTab)
+    setArchitectureAuthorized(null)
     setUsersPayload(null)
+    setUsersView('active')
+    setTrashedUsers([])
     setWorkspacesPayload(null)
     setProfile(EMPTY_PROFILE)
     setInviteEmail('')
@@ -561,7 +562,8 @@ export default function UserAccessDialog({
     Promise.allSettled([
       requestJson<UsersPayload>('/api/users'),
       requestJson<WorkspacesPayload>('/api/workspaces'),
-    ]).then(([usersResult, workspacesResult]) => {
+      requestJson<AuthSessionPayload>('/api/auth/session', { cache: 'no-store' }),
+    ]).then(([usersResult, workspacesResult, sessionResult]) => {
       if (!active) return
       const loadErrors: string[] = []
 
@@ -583,6 +585,14 @@ export default function UserAccessDialog({
       } else {
         loadErrors.push(messageFrom(workspacesResult.reason, 'Unable to load workspaces'))
       }
+
+      const session = sessionResult.status === 'fulfilled' ? sessionResult.value : null
+      const canViewArchitecture = session?.isRootAdmin === true
+        && session.impersonation?.active === false
+        && Boolean(session.authenticatedUser?.email)
+        && session.authenticatedUser?.email === session.effectiveUser?.email
+      setArchitectureAuthorized(canViewArchitecture)
+      if (!canViewArchitecture && initialTab === 5) setActiveTab(0)
 
       setError(Array.from(new Set(loadErrors)).join(' '))
       setLoading(false)
@@ -749,6 +759,37 @@ export default function UserAccessDialog({
     return currentUser.role === 'admin' && user.role === 'member' && user.email !== currentUser.email
   }
 
+  async function changeUsersView(view: 'active' | 'trash') {
+    if (busy) return
+    startAction('users-view')
+    try {
+      const result = await requestJson<UsersPayload>(`/api/users${view === 'trash' ? '?view=trash' : ''}`)
+      if (view === 'trash') setTrashedUsers(result.users || [])
+      else setUsersPayload(result)
+      setUsersView(view)
+    } catch (loadError) {
+      setError(messageFrom(loadError, 'Unable to load users'))
+    } finally { finishAction() }
+  }
+
+  async function changeUserTrash(user: AppUser, trashed: boolean) {
+    if (busy || !canManageUser(user)) return
+    if (trashed && !window.confirm(`Move ${user.email} to Trash in ${user.organizationName}? Their access to this organization stops now. Other organizations and historical records are preserved.`)) return
+    startAction(`trash:${user.email}`)
+    try {
+      await requestJson<UserMutationPayload>('/api/users', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: trashed ? 'trash-user' : 'restore-user', email: user.email, organizationId: user.organizationId }) })
+      const [active, trash] = await Promise.all([
+        requestJson<UsersPayload>('/api/users'), requestJson<UsersPayload>('/api/users?view=trash'),
+      ])
+      setUsersPayload(active)
+      setTrashedUsers(trash.users || [])
+      setNotice(trashed ? 'User moved to organization Trash. Historical records were preserved.' : 'User restored to their previous access state. Invited users need a new invitation.')
+    } catch (updateError) {
+      setError(messageFrom(updateError, 'Unable to update Trash'))
+    } finally { finishAction() }
+  }
+
   async function updateStatus(user: AppUser) {
     if (busy || !canManageUser(user)) return
     const status: UserStatus = user.status === 'disabled' ? 'active' : 'disabled'
@@ -786,6 +827,7 @@ export default function UserAccessDialog({
       })
       if (!result.user) throw new Error('User response was incomplete')
       upsertUser(result.user)
+      window.dispatchEvent(new Event(SESSION_REFRESH_EVENT))
       setNotice(`Access updated for ${result.user.displayName || result.user.email}.`)
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update access'))
@@ -1045,9 +1087,10 @@ export default function UserAccessDialog({
           width: '100%',
           height: fullScreen ? '100%' : 'min(780px, calc(100vh - 48px))',
           maxHeight: fullScreen ? '100%' : 'calc(100vh - 48px)',
-          backgroundColor: '#1A1A23',
+          backgroundColor: 'background.paper',
           backgroundImage: 'none',
-          border: '1px solid rgba(255,255,255,0.09)',
+          border: 1,
+          borderColor: 'divider',
           borderRadius: fullScreen ? 0 : '8px',
           overflow: 'hidden',
         },
@@ -1091,7 +1134,7 @@ export default function UserAccessDialog({
             minHeight: 42,
             p: '3px',
             borderRadius: '8px',
-            backgroundColor: '#232330',
+            backgroundColor: 'background.default',
             '& .MuiTabs-indicator': { display: 'none' },
             '& .MuiTab-root': {
               minHeight: 36,
@@ -1106,7 +1149,7 @@ export default function UserAccessDialog({
             },
             '& .MuiTab-root.Mui-selected': {
               color: 'text.primary',
-              backgroundColor: 'rgba(168,199,250,0.12)',
+              backgroundColor: 'action.selected',
             },
           }}
         >
@@ -1115,10 +1158,11 @@ export default function UserAccessDialog({
           <Tab icon={<ShareRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Sharing" id="settings-tab-2" aria-controls="settings-panel-2" />
           <Tab icon={<IntegrationInstructionsRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Integrations" id="settings-tab-3" aria-controls="settings-panel-3" />
           <Tab icon={<SecurityRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Security" id="settings-tab-4" aria-controls="settings-panel-4" />
+          {architectureAuthorized ? <Tab icon={<ArchitectureRounded sx={{ fontSize: 18 }} />} iconPosition="start" label="Architecture" id="settings-tab-5" aria-controls="settings-panel-5" /> : null}
         </Tabs>
       </Box>
 
-      <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+      <Divider />
 
       <DialogContent sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 2, sm: 2.5 }, pb: { xs: 'calc(env(safe-area-inset-bottom) + 20px)', sm: 2.5 } }}>
         {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
@@ -1142,7 +1186,7 @@ export default function UserAccessDialog({
             {currentUser ? (
               <>
                 <Stack direction="row" spacing={1.5} alignItems="center" mb={2.5}>
-                  <Avatar sx={{ width: 44, height: 44, bgcolor: 'rgba(168,199,250,0.16)', color: 'primary.main', fontWeight: 700 }}>
+                  <Avatar sx={{ width: 44, height: 44, bgcolor: 'action.selected', color: 'primary.main', fontWeight: 700 }}>
                     {initials(currentUser)}
                   </Avatar>
                   <Box minWidth={0}>
@@ -1210,7 +1254,7 @@ export default function UserAccessDialog({
                   </TextField>
                   <TextField
                     size="small"
-                    label="Email"
+                    label="Historical account identity"
                     value={currentUser.email}
                     disabled
                     sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
@@ -1249,13 +1293,16 @@ export default function UserAccessDialog({
                     Save profile
                   </Button>
                 </Box>
+                <Box sx={{ mt: 3 }}><AppearancePreference /></Box>
                 <MeasurementPreferencesPanel
                   organizationName={
                     usersPayload?.currentOrganization?.name
                     || currentUser.organizationName
                   }
                 />
+                <LoginEmailPanel identityEmail={currentUser.email} />
                 <OrganizationBrandingPanel />
+                <OrganizationWebPreferencesPanel />
               </>
             ) : (
               <Typography color="text.secondary">Profile unavailable.</Typography>
@@ -1452,9 +1499,19 @@ export default function UserAccessDialog({
               </Box>
             ) : null}
 
+            {usersPayload?.canManageUserAccess ? <Stack direction="row" spacing={1} mb={2}>
+              <Button variant={usersView === 'active' ? 'contained' : 'outlined'} disabled={busy} onClick={() => { void changeUsersView('active') }}>Users</Button>
+              <Button variant={usersView === 'trash' ? 'contained' : 'outlined'} disabled={busy} onClick={() => { void changeUsersView('trash') }}>Trashed users</Button>
+            </Stack> : null}
             <Stack spacing={1.5}>
               {displayedUsers.map((user) => {
                 const manageable = canManageUser(user)
+                if (user.trashedAt) return <Box key={`${user.email}:${user.organizationId}`} sx={{ ...panelSx, p: 2 }}>
+                  <Typography fontWeight={700}>{user.displayName || user.email}</Typography>
+                  <Typography variant="body2">{user.email} · {user.organizationName}</Typography>
+                  <Typography variant="caption" color="text.secondary">Removed from this organization. Historical records and other organization memberships are preserved.</Typography>
+                  {manageable ? <Button disabled={busy} startIcon={<RestoreRounded />} onClick={() => { void changeUserTrash(user, false) }}>Restore user</Button> : null}
+                </Box>
                 const userOrganizations = inviteOrganizationOptions.filter((organization) => (
                   displayedUsers.some((candidate) => (
                     candidate.email === user.email && candidate.organizationId === organization.id
@@ -1485,7 +1542,7 @@ export default function UserAccessDialog({
                   <Box key={`${user.email}:${user.organizationId || 'identity'}`} sx={panelSx}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1.5, alignItems: 'start', p: { xs: 1.5, sm: 2 } }}>
                       <Stack direction="row" spacing={1.25} alignItems="center" minWidth={0}>
-                        <Avatar sx={{ width: 38, height: 38, bgcolor: '#2D3442', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>
+                        <Avatar sx={{ width: 38, height: 38, bgcolor: 'action.selected', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>
                           {initials(user)}
                         </Avatar>
                         <Box minWidth={0}>
@@ -1527,6 +1584,10 @@ export default function UserAccessDialog({
                       </Stack>
 
                       {manageable ? (
+                        <Stack direction="row">
+                        <Tooltip title="Move to organization Trash">
+                          <span><IconButton aria-label={`Move ${user.email} to Trash`} disabled={busy} onClick={() => { void changeUserTrash(user, true) }}><DeleteOutlineRounded fontSize="small" /></IconButton></span>
+                        </Tooltip>
                         <Tooltip title={user.status === 'disabled' ? 'Restore access' : 'Disable access'}>
                           <span>
                             <IconButton
@@ -1542,10 +1603,11 @@ export default function UserAccessDialog({
                             </IconButton>
                           </span>
                         </Tooltip>
+                        </Stack>
                       ) : userPending ? <CircularProgress size={18} /> : null}
                     </Box>
 
-                    <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                    <Divider />
 
                     <Box sx={{ p: { xs: 1.5, sm: 2 }, pt: { xs: 1.25, sm: 1.5 } }}>
                       {crmMappingManageable ? (
@@ -1671,50 +1733,73 @@ export default function UserAccessDialog({
                         {permissionGuidance}
                       </Typography>
 
-                      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, columnGap: 2, rowGap: 0 }}>
-                        {PERMISSIONS.map((permission) => {
-                          const permissionEditable = manageable && (!permission.adminOnly || user.role === 'admin')
-                          return (
-                            <Tooltip
-                              key={permission.key}
-                              title={permission.description || ''}
-                              placement="top"
-                              arrow
-                              describeChild={Boolean(permission.description)}
-                            >
-                              <FormControlLabel
-                                label={permission.label}
-                                labelPlacement="start"
-                                control={(
-                                  <Switch
-                                    size="small"
-                                    checked={Boolean(user.permissions[permission.key])}
-                                    onChange={(event) => {
-                                      void updateAccess(
-                                        user,
-                                        user.role as EditableRole,
-                                        permissionsWithDependencies(
-                                          user.permissions,
-                                          permission.key,
-                                          event.target.checked,
-                                        ),
-                                      )
-                                    }}
-                                    disabled={busy || !permissionEditable}
-                                    inputProps={{ 'aria-label': `${permission.label} for ${user.email}` }}
-                                  />
-                                )}
-                                sx={{
-                                  m: 0,
-                                  minHeight: 38,
-                                  justifyContent: 'space-between',
-                                  gap: 1,
-                                  '& .MuiFormControlLabel-label': { fontSize: '0.82rem', color: 'text.secondary' },
-                                }}
-                              />
-                            </Tooltip>
-                          )
-                        })}
+                      <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mb: 1.25 }}>
+                        Changes save immediately. Turning off a module&apos;s View setting also turns off its dependent actions.
+                      </Typography>
+
+                      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(2, minmax(0, 1fr))' }, gap: 1.25 }}>
+                        {MODULE_PERMISSION_GROUPS.map((group) => (
+                          <Box
+                            component="section"
+                            key={group.id}
+                            aria-label={`${group.title} permissions for ${user.email}`}
+                            sx={{ ...panelSx, p: 1.25, minWidth: 0 }}
+                          >
+                            <Typography variant="subtitle2" color="text.primary" fontWeight={700}>{group.title}</Typography>
+                            {group.description ? (
+                              <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.25, mb: 0.5 }}>
+                                {group.description}
+                              </Typography>
+                            ) : null}
+                            <Box sx={{ display: 'grid', gap: 0.125, mt: 0.5 }}>
+                              {group.permissionKeys.map((key) => {
+                                const permission = PERMISSIONS_BY_KEY.get(key)
+                                if (!permission) return null
+                                const permissionEditable = manageable && (!permission.adminOnly || user.role === 'admin')
+                                return (
+                                  <Tooltip
+                                    key={key}
+                                    title={permission.description || ''}
+                                    placement="top"
+                                    arrow
+                                    describeChild={Boolean(permission.description)}
+                                  >
+                                    <FormControlLabel
+                                      label={permission.label}
+                                      labelPlacement="start"
+                                      control={(
+                                        <Switch
+                                          size="small"
+                                          checked={permissionEnabled(user.permissions, key)}
+                                          onChange={(event) => {
+                                            void updateAccess(
+                                              user,
+                                              user.role as EditableRole,
+                                              modulePermissionDependencies(
+                                                user.permissions,
+                                                key,
+                                                event.target.checked,
+                                              ),
+                                            )
+                                          }}
+                                          disabled={busy || !permissionEditable}
+                                          slotProps={{ input: { 'aria-label': `${permission.label} in ${group.title} for ${user.email}` } }}
+                                        />
+                                      )}
+                                      sx={{
+                                        m: 0,
+                                        minHeight: 38,
+                                        justifyContent: 'space-between',
+                                        gap: 1,
+                                        '& .MuiFormControlLabel-label': { fontSize: '0.82rem', color: 'text.secondary' },
+                                      }}
+                                    />
+                                  </Tooltip>
+                                )
+                              })}
+                            </Box>
+                          </Box>
+                        ))}
                       </Box>
                     </Box>
                   </Box>
@@ -1722,7 +1807,7 @@ export default function UserAccessDialog({
               })}
 
               {displayedUsers.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">Account unavailable.</Typography>
+                <Typography variant="body2" color="text.secondary">{usersView === 'trash' ? 'No trashed users.' : 'Account unavailable.'}</Typography>
               ) : null}
             </Stack>
           </Box>
@@ -1905,7 +1990,7 @@ export default function UserAccessDialog({
 
                           {owned ? (
                             <>
-                              <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                              <Divider />
                               <Box sx={{ p: { xs: 1.5, sm: 2 } }}>
                                 <Typography variant="caption" color="text.disabled" fontWeight={700}>Share</Typography>
                                 <Box
@@ -1956,7 +2041,7 @@ export default function UserAccessDialog({
                           ) : null}
 
                           {owned ? <>
-                            <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                            <Divider />
 
                             <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5 }}>
                             {resource.members.length > 0 ? resource.members.map((member, index) => (
@@ -1973,7 +2058,8 @@ export default function UserAccessDialog({
                                   alignItems: 'center',
                                   gap: 1,
                                   py: 1.25,
-                                  borderTop: index === 0 ? 0 : '1px solid rgba(255,255,255,0.06)',
+                                  borderTop: index === 0 ? 0 : 1,
+                                  borderColor: 'divider',
                                 }}
                               >
                                 <Box minWidth={0} sx={{ gridArea: 'identity' }}>
@@ -2065,6 +2151,11 @@ export default function UserAccessDialog({
           />
         ) : null}
         {!loading && activeTab === 4 ? <SessionSecurityPanel /> : null}
+        {!loading && activeTab === 5 && architectureAuthorized ? (
+          <Box role="tabpanel" id="settings-panel-5" aria-labelledby="settings-tab-5">
+            <ArchitecturePanel />
+          </Box>
+        ) : null}
       </DialogContent>
 
       <Dialog
@@ -2077,9 +2168,10 @@ export default function UserAccessDialog({
         maxWidth="xs"
         PaperProps={{
           sx: {
-            backgroundColor: '#1A1A23',
+            backgroundColor: 'background.paper',
             backgroundImage: 'none',
-            border: '1px solid rgba(255,255,255,0.09)',
+            border: 1,
+            borderColor: 'divider',
             borderRadius: fullScreen ? 0 : '8px',
           },
         }}

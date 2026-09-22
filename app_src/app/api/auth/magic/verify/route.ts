@@ -74,6 +74,7 @@ export async function POST(req: NextRequest) {
       authMethod: 'magic_code',
       headers: req.headers,
       organizationId: actor.organizationId,
+      verifiedLoginEmail: email,
     })
     const response = json({ ok: true })
     setBrowserSessionCookie(response, issued)

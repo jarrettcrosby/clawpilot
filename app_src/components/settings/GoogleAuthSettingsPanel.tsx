@@ -245,7 +245,7 @@ export default function GoogleAuthSettingsPanel() {
       {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mt: 1.5, borderRadius: '8px' }}>{notice}</Alert> : null}
 
       {policy ? (
-        <Box sx={{ mt: 1.5, p: 1.5, border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px' }}>
+        <Box sx={{ mt: 1.5, p: 1.5, border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: '8px' }}>
           <Typography variant="body2" color="text.primary" fontWeight={700}>Your ClawPilot account</Typography>
           <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.5 }}>
             Google linking belongs only to this user. Once linked, this exact user can sign in and switch among every direct active organization membership. It does not enable Google for any other user.

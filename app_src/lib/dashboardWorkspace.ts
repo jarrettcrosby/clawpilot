@@ -5,6 +5,7 @@ import {
   readWorkspacePreferences,
 } from '@/lib/tenancy'
 import type { AppUser } from '@/lib/users'
+import { moduleCapabilitiesForUser } from '@/lib/moduleAuthorization'
 
 type DashboardWorkspaceOptions = {
   requestedBoardId?: string
@@ -18,9 +19,10 @@ export async function readDashboardWorkspace(
   actor: AppUser,
   options: DashboardWorkspaceOptions = {},
 ): Promise<DashboardWorkspaceSnapshot> {
+  const capabilities = moduleCapabilitiesForUser(actor)
   const [boards, pipelines, preferences] = await Promise.all([
-    listProjectBoards(actor, { ensureDefaults: options.ensureDefaults !== false }),
-    listPipelineSpaces(actor, { ensureDefaults: options.ensureDefaults !== false }),
+    capabilities.projects ? listProjectBoards(actor, { ensureDefaults: options.ensureDefaults !== false }) : Promise.resolve([]),
+    capabilities.crm ? listPipelineSpaces(actor, { ensureDefaults: options.ensureDefaults !== false }) : Promise.resolve([]),
     readWorkspacePreferences(actor),
   ])
   const defaultBoard = boards.find((board) => board.id === preferences.defaultBoardId)

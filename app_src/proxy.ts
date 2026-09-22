@@ -13,6 +13,9 @@ import {
 } from '@/lib/authSessions'
 import { resolveAgentDispatchWorker } from '@/lib/workerAuth'
 import { demoMutationIsRestricted } from '@/lib/demoMode'
+import { isPublicBpoShortlinkResolvePath } from '@/lib/bpoShortlinkPublicPath.mjs'
+import { ModuleAccessError, requiredModulesForApiPath, requireModuleAccess } from '@/lib/moduleAuthorization'
+import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
 const HOSTED_RUNTIME = Boolean(
   process.env.RAILWAY_ENVIRONMENT_NAME
@@ -40,7 +43,7 @@ function missingDevIsolationEnv(req: NextRequest) {
   return required.filter((key) => !process.env[key])
 }
 
-function isPublicApi(pathname: string) {
+function isPublicApi(pathname: string, method: string) {
   const normalizedPath = pathname.endsWith('/') && pathname.length > 1 ? pathname.slice(0, -1) : pathname
 
   return (
@@ -84,6 +87,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/operations/print-agent/jobs'
     || normalizedPath === '/api/operations/print-agent/pair'
     || normalizedPath === '/api/shortlinks'
+    || isPublicBpoShortlinkResolvePath(normalizedPath, method)
     || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')
   )
@@ -169,7 +173,7 @@ export async function proxy(req: NextRequest) {
   }
 
   if (!AUTH_REQUIRED) return NextResponse.next()
-  if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
+  if (pathname.startsWith('/api/') && isPublicApi(pathname, req.method)) return NextResponse.next()
   if (isPublicAppleAppLink(pathname)) return NextResponse.next()
   if (pathname.startsWith('/s/')) return NextResponse.next()
 
@@ -215,6 +219,20 @@ export async function proxy(req: NextRequest) {
         { ok: false, error: 'Exit user view before changing account access, integrations, or security settings.' },
         { status: 403 },
       )
+    }
+    const requiredModules = requiredModulesForApiPath(pathname)
+    if (requiredModules.length) {
+      try {
+        const actor = await requireWorkspaceAppUser(session.effectiveUser, session.activeWorkspaceOrganizationId)
+        for (const moduleId of requiredModules) requireModuleAccess(actor, moduleId)
+      } catch (error) {
+        const denied = error instanceof ModuleAccessError
+        return NextResponse.json({
+          ok: false,
+          error: denied ? error.message : 'Access validation unavailable',
+          ...(denied ? { code: error.code, module: error.module } : {}),
+        }, { status: denied ? 403 : 503, headers: { 'Cache-Control': 'no-store' } })
+      }
     }
     const requestHeaders = new Headers(req.headers)
     requestHeaders.delete(AUTH_CONTEXT_HEADER)

@@ -31,7 +31,8 @@ assert.match(
 
 const dashboard = read('app_src/components/dashboard/DashboardSection.tsx')
 assert.ok(dashboard.includes('/api/workspaces?dashboard=true'), 'dashboard must request its per-user workspace defaults')
-assert.match(dashboard, /new URLSearchParams\(\{ includeCrmCards: ['"]true['"] \}\)/, 'dashboard task requests must include CRM cards')
+assert.match(dashboard, /new URLSearchParams\(\{ includeCrmCards: String\(includeCrmCards\) \}\)/, 'dashboard task requests include CRM cards only with CRM view access')
+assert.match(dashboard, /taskRequestUrl\(boardId, canPipeline\)/, 'dashboard must use current CRM capability for task enrichment')
 assert.match(dashboard, /params\.set\(['"]boardId['"], boardId\)/, 'dashboard task requests must include an explicit boardId')
 assert.match(dashboard, /params\.set\(['"]pipelineId['"], pipelineId\)/, 'dashboard pipeline requests must include an explicit pipelineId')
 assert.match(dashboard, /return `\/api\/tasks\?\$\{params\.toString\(\)\}`/, 'dashboard must request tasks with its scoped query')
@@ -40,7 +41,7 @@ assert.match(dashboard, /setDefault\s*:\s*true/, 'dashboard workspace selections
 assert.match(dashboard, /['"]select-board['"]/, 'dashboard must persist board selection')
 assert.match(dashboard, /['"]select-pipeline['"]/, 'dashboard must persist pipeline selection')
 assert.match(dashboard, /import Skeleton from ['"]@mui\/material\/Skeleton['"]/, 'dashboard must use the stable Skeleton loading shell')
-assert.match(dashboard, /if\s*\(loading\)/, 'dashboard must retain an explicit loading shell')
+assert.match(dashboard, /if\s*\(loading \|\| !canProjects\)/, 'dashboard must wait for loading and Projects access before live refresh')
 assert.match(dashboard, /<Skeleton\b/, 'dashboard loading shell must render Skeleton content')
 assert.doesNotMatch(dashboard, /CircularProgress/, 'dashboard loading must not collapse to a spinner')
 assert.doesNotMatch(dashboard, /(?:window\.)?location\.reload\s*\(/, 'dashboard selection must update without a full-page reload')

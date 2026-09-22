@@ -469,15 +469,17 @@ command below while the environment remains in adoption mode.
   registered callback has been independently verified and the cutover
   acceptance evidence has been retained with the same rebind plan digest.
 
-Before planning or applying a rebind, require the v5 target-schema attestation.
-It must prove one exact ledger row for 0349 and 0353 through 0359; fingerprint
+Before planning or applying a rebind, require the v6 target-schema attestation.
+It must prove one exact ledger row for 0349, 0353 through 0359, and 0370 through
+0371; fingerprint
 the image-import job relation, its enabled write trigger, and
 `guard_operations_commerce_product_image_import_job()`; and fingerprint the
 0358 authority relation, trigger, and current-authority function. It must also
 fingerprint the fulfillment-export relation including the 0359 recovery-budget
-column, constraint, and index. Generate and enroll the PostgreSQL-major-specific
+column, constraint, and index, plus the 0370 login-address guard and the 0370/0371
+foreign-key guards on users and organizations. Generate and enroll the PostgreSQL-major-specific
 digest only from the complete production migration runner on disposable
-PostgreSQL 16 and 18. Do not reuse a v2/v3/v4 digest or proceed when any ledger,
+PostgreSQL 16 and 18. Do not reuse a v2/v3/v4/v5 digest or proceed when any ledger,
 relation, column, constraint, index, trigger, or function fingerprint differs.
 
 Create and review one commerce plan at a time. Supported Shopify choices are

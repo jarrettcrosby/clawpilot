@@ -15,6 +15,7 @@ import { shouldFallbackToFileOnDatabaseError } from '@/lib/persistence/config'
 import { isPostgresTaskStoreEnabled, readTasksFromPostgres, replaceTasksInPostgres } from '@/lib/persistence/tasks'
 import type { AgentDispatchEnqueueInput } from '@/lib/persistence/agentDispatch'
 import { requireRequestUser } from '@/lib/requestUser'
+import { moduleCapabilitiesForUser, requireModuleAccess } from '@/lib/moduleAuthorization'
 import { resolveAgentDispatchWorker, type AgentDispatchWorkerContext } from '@/lib/workerAuth'
 import {
   BOARD_SELECTION_COOKIE,
@@ -482,12 +483,13 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
     const includeArchived = searchParams.get('includeArchived') === 'true'
-    const includeCrmCards = searchParams.get('includeCrmCards') === 'true'
+    const actor = await requireRequestUser(req)
+    const canReadCrm = moduleCapabilitiesForUser(actor).crm
+    const includeCrmCards = canReadCrm && searchParams.get('includeCrmCards') === 'true'
     const board = await resolveTaskBoard(req)
-    if (board) {
+    if (board && canReadCrm) {
       const binding = await resolveCrmBoardBinding(board.id)
       if (binding) {
-        const actor = await requireRequestUser(req)
         await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
       }
       await reconcileCrmBoardProjection({ boardId: board.id })
@@ -747,6 +749,11 @@ export async function PATCH(req: NextRequest) {
     const binding = await resolveCrmBoardBinding(board.id)
     if (binding) {
       const actor = workerContext?.actor || await requireRequestUser(req)
+      if (!workerContext) {
+        try { requireModuleAccess(actor, 'crm') } catch {
+          return NextResponse.json({ error: 'CRM view access is required to update CRM board cards', code: 'MODULE_VIEW_REQUIRED', module: 'crm' }, { status: 403 })
+        }
+      }
       const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
       requireResourceEditor(pipeline)
     }

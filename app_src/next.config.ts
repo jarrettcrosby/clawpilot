@@ -2,8 +2,13 @@ import type { NextConfig } from "next";
 import path from "path";
 
 const nextConfig: NextConfig = {
+  // Next's CLI type checker includes test fixtures that its older worker skipped.
+  // Keep strict application checks separate from independently executed test suites.
+  typescript: { tsconfigPath: 'tsconfig.build.json' },
   outputFileTracingRoot: path.resolve(process.cwd(), '..'),
   outputFileTracingIncludes: {
+    '/api/settings/architecture': ['./server-assets/architecture/manifest.json'],
+    '/api/settings/architecture/viewer': ['./server-assets/architecture/viewer.html', './server-assets/architecture/manifest.json'],
     '/api/docs': [
       '../docs/**/*.md',
       '../README.md',

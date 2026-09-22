@@ -94,7 +94,7 @@ const TYPE_COLORS: Record<string, string> = {
   succeeded: '#66BB6A',
   created: '#66BB6A',
   queued: '#FFA726',
-  moved: '#A8C7FA',
+  moved: 'var(--mui-palette-primary-main)',
   comment: '#FFA726',
   updated: '#78909C',
 }
@@ -143,7 +143,7 @@ function displayType(type: string) {
 }
 
 function TypeIcon({ event }: { event: ActivityEvent }) {
-  const color = TYPE_COLORS[event.type] || 'rgba(255,255,255,0.45)'
+  const color = TYPE_COLORS[event.type] || 'rgba(var(--cp-neutral-rgb),0.45)'
   const sx = { fontSize: 16, color }
   if (event.module === 'auth') return <LoginRounded sx={sx} />
   if (event.type === 'failed') return <ErrorOutlineRounded sx={sx} />
@@ -159,10 +159,10 @@ function ActorBadge({ event }: { event: ActivityEvent }) {
   const initials = name === 'system'
     ? 'SY'
     : name.split(/\s+|@/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || 'CP'
-  const color = event.actor === 'system' ? '#78909C' : '#A8C7FA'
+  const color = event.actor === 'system' ? '#78909C' : 'var(--mui-palette-primary-main)'
   return (
     <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
-      <Box sx={{ width: 22, height: 22, borderRadius: '50%', backgroundColor: `${color}22`, border: `1px solid ${color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+      <Box sx={{ width: 22, height: 22, borderRadius: '50%', backgroundColor: `color-mix(in srgb, ${color} 13%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 27%, transparent)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
         <Typography sx={{ color, fontWeight: 700, fontSize: '0.58rem', lineHeight: 1 }}>{initials}</Typography>
       </Box>
       <Typography variant="caption" sx={{ color, fontWeight: 600, fontSize: '0.72rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</Typography>
@@ -378,15 +378,15 @@ export default function ActivityLogPage({ onClose }: Props) {
   }
 
   const selectSx = {
-    fontSize: '0.78rem', backgroundColor: '#1A1A23', borderRadius: 1, color: 'text.primary', height: 34,
-    '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.1)' },
+    fontSize: '0.78rem', backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 1, color: 'text.primary', height: 34,
+    '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(var(--cp-neutral-rgb),0.1)' },
     '& .MuiSelect-select': { py: 0.6, px: 1.25 },
-    '& .MuiSvgIcon-root': { color: 'rgba(255,255,255,0.4)' },
+    '& .MuiSvgIcon-root': { color: 'rgba(var(--cp-neutral-rgb),0.4)' },
   }
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <Box sx={{ px: { xs: 2, sm: 3 }, pt: 2.5, pb: 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+      <Box sx={{ px: { xs: 2, sm: 3 }, pt: 2.5, pb: 2, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)', flexShrink: 0 }}>
         <Stack direction="row" alignItems="flex-start" justifyContent="space-between" mb={1.5}>
           <Box>
             <Typography variant="h6" fontWeight={700}>Activity</Typography>
@@ -397,7 +397,7 @@ export default function ActivityLogPage({ onClose }: Props) {
           <Stack direction="row" spacing={0.5}>
             {unreadCount > 0 && (
               <Tooltip title="Mark all read">
-                <IconButton size="small" onClick={markAllRead} sx={{ color: '#A8C7FA' }}><DoneAllRounded sx={{ fontSize: 18 }} /></IconButton>
+                <IconButton size="small" onClick={markAllRead} sx={{ color: 'var(--mui-palette-primary-main)' }}><DoneAllRounded sx={{ fontSize: 18 }} /></IconButton>
               </Tooltip>
             )}
             {onClose && <IconButton size="small" onClick={onClose} aria-label="Close activity"><CloseRounded sx={{ fontSize: 18 }} /></IconButton>}
@@ -409,7 +409,7 @@ export default function ActivityLogPage({ onClose }: Props) {
           exclusive
           value={scope || ''}
           onChange={(_, value: ActivityScope | null) => value && changeScope(value)}
-          sx={{ mb: 1.5, maxWidth: '100%', overflowX: 'auto', '& .MuiToggleButton-root': { minHeight: 34, px: 1.5, color: 'text.disabled', textTransform: 'none', whiteSpace: 'nowrap', borderColor: 'rgba(255,255,255,0.1)', '&.Mui-selected': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.1)' } } }}
+          sx={{ mb: 1.5, maxWidth: '100%', overflowX: 'auto', '& .MuiToggleButton-root': { minHeight: 34, px: 1.5, color: 'text.disabled', textTransform: 'none', whiteSpace: 'nowrap', borderColor: 'rgba(var(--cp-neutral-rgb),0.1)', '&.Mui-selected': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)' } } }}
         >
           <ToggleButton value="self">My activity</ToggleButton>
           {capabilities?.canViewOrganization && <ToggleButton value="organization">Organization</ToggleButton>}
@@ -423,7 +423,7 @@ export default function ActivityLogPage({ onClose }: Props) {
               size="small"
               label={MODULE_LABELS[module] || displayType(module)}
               onClick={() => setModuleFilter(module)}
-              sx={{ height: 26, fontSize: '0.72rem', borderRadius: 1, flexShrink: 0, cursor: 'pointer', backgroundColor: moduleFilter === module ? 'rgba(168,199,250,0.15)' : 'rgba(255,255,255,0.05)', color: moduleFilter === module ? '#A8C7FA' : 'text.disabled', border: moduleFilter === module ? '1px solid rgba(168,199,250,0.3)' : '1px solid transparent' }}
+              sx={{ height: 26, fontSize: '0.72rem', borderRadius: 1, flexShrink: 0, cursor: 'pointer', backgroundColor: moduleFilter === module ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.15)' : 'rgba(var(--cp-neutral-rgb),0.05)', color: moduleFilter === module ? 'var(--mui-palette-primary-main)' : 'text.disabled', border: moduleFilter === module ? '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.3)' : '1px solid transparent' }}
             />
           ))}
         </Stack>
@@ -435,9 +435,9 @@ export default function ActivityLogPage({ onClose }: Props) {
             value={search}
             onChange={(event) => setSearch(event.target.value)}
             InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded sx={{ fontSize: 16, color: 'text.disabled' }} /></InputAdornment> }}
-            sx={{ flex: 1, minWidth: { xs: '100%', sm: 160 }, '& .MuiOutlinedInput-root': { borderRadius: 1, backgroundColor: '#1A1A23', fontSize: '0.78rem', height: 34, '& fieldset': { borderColor: 'rgba(255,255,255,0.1)' } } }}
+            sx={{ flex: 1, minWidth: { xs: '100%', sm: 160 }, '& .MuiOutlinedInput-root': { borderRadius: 1, backgroundColor: 'var(--mui-palette-background-paper)', fontSize: '0.78rem', height: 34, '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.1)' } } }}
           />
-          <ToggleButtonGroup size="small" value={readFilter} exclusive onChange={(_, value) => value && setReadFilter(value)} sx={{ '& .MuiToggleButton-root': { height: 34, borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', fontSize: '0.7rem', px: 1.1, textTransform: 'none', '&.Mui-selected': { backgroundColor: 'rgba(168,199,250,0.1)', color: '#A8C7FA' } } }}>
+          <ToggleButtonGroup size="small" value={readFilter} exclusive onChange={(_, value) => value && setReadFilter(value)} sx={{ '& .MuiToggleButton-root': { height: 34, borderColor: 'rgba(var(--cp-neutral-rgb),0.1)', color: 'text.disabled', fontSize: '0.7rem', px: 1.1, textTransform: 'none', '&.Mui-selected': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)', color: 'var(--mui-palette-primary-main)' } } }}>
             <ToggleButton value="all">All</ToggleButton>
             <ToggleButton value="unread">Unread</ToggleButton>
             <ToggleButton value="read">Read</ToggleButton>
@@ -461,19 +461,19 @@ export default function ActivityLogPage({ onClose }: Props) {
         )}
         {!loading && !error && Object.entries(grouped).map(([day, dayEvents]) => (
           <Box key={day}>
-            <Box sx={{ px: { xs: 2, sm: 3 }, py: 1, backgroundColor: 'rgba(255,255,255,0.015)', borderBottom: '1px solid rgba(255,255,255,0.04)', position: 'sticky', top: 0, backdropFilter: 'blur(8px)', zIndex: 1 }}>
+            <Box sx={{ px: { xs: 2, sm: 3 }, py: 1, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.015)', borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.04)', position: 'sticky', top: 0, backdropFilter: 'blur(8px)', zIndex: 1 }}>
               <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.6rem', letterSpacing: 1.5 }}>{day}</Typography>
             </Box>
             {dayEvents.map((event) => {
               const isRead = readIds.has(event.id)
               const isExpanded = expanded.has(event.id)
-              const color = TYPE_COLORS[event.type] || '#A8C7FA'
+              const color = TYPE_COLORS[event.type] || 'var(--mui-palette-primary-main)'
               const crmMetadata = crmRecordMetadata(event)
               return (
-                <Box key={event.id} sx={{ borderBottom: '1px solid rgba(255,255,255,0.04)', backgroundColor: isRead ? 'transparent' : 'rgba(168,199,250,0.025)' }}>
+                <Box key={event.id} sx={{ borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.04)', backgroundColor: isRead ? 'transparent' : 'rgba(var(--mui-palette-primary-mainChannel) / 0.025)' }}>
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.25, px: { xs: 2, sm: 3 }, py: 1.5 }}>
-                    <Box sx={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: isRead ? 'transparent' : '#A8C7FA', flexShrink: 0 }} />
-                    <Box sx={{ width: 30, height: 30, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><TypeIcon event={event} /></Box>
+                    <Box sx={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: isRead ? 'transparent' : 'var(--mui-palette-primary-main)', flexShrink: 0 }} />
+                    <Box sx={{ width: 30, height: 30, borderRadius: '50%', backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><TypeIcon event={event} /></Box>
                     <Box onClick={() => void navigate(event)} sx={{ flex: 1, minWidth: 0, cursor: event.target ? 'pointer' : 'default' }}>
                       <Stack direction="row" spacing={1} alignItems="center" mb={0.35} flexWrap="wrap">
                         <ActorBadge event={event} />
@@ -481,7 +481,7 @@ export default function ActivityLogPage({ onClose }: Props) {
                       </Stack>
                       <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
                         <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.68rem' }}>{formatTimestamp(event.timestamp, dateTimeSettings)}</Typography>
-                        <Chip size="small" label={displayType(event.type)} sx={{ height: 17, fontSize: '0.6rem', borderRadius: 0.75, backgroundColor: `${color}18`, color }} />
+                        <Chip size="small" label={displayType(event.type)} sx={{ height: 17, fontSize: '0.6rem', borderRadius: 0.75, backgroundColor: `color-mix(in srgb, ${color} 9%, transparent)`, color }} />
                         {crmMetadata?.recordType && (
                           <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.68rem' }}>
                             <Box component="span" sx={{ color: 'text.disabled' }}>Record type:</Box> {crmMetadata.recordType}
@@ -493,7 +493,7 @@ export default function ActivityLogPage({ onClose }: Props) {
                             <Box component="span" sx={{ fontFamily: 'monospace' }}>{crmMetadata.referenceCode}</Box>
                           </Typography>
                         )}
-                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(255,255,255,0.35)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: { xs: 150, sm: 260 } }}>{event.target?.label || event.eventType}</Typography>
+                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(var(--cp-neutral-rgb),0.35)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: { xs: 150, sm: 260 } }}>{event.target?.label || event.eventType}</Typography>
                       </Stack>
                     </Box>
                     {event.target && (

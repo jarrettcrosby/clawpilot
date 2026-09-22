@@ -37,6 +37,8 @@ Do not use Eigen Racing project assumptions, docs, ports, validation gates, or d
 - `./scripts/dev-start.sh` and the root `build`/`test` lifecycles run a local disk preflight before expensive or mutating work. It fails below 15 GiB free and warns below 25 GiB; use `CLAWPILOT_MIN_FREE_GIB` and `CLAWPILOT_WARN_FREE_GIB` only for reviewed local overrides.
 - Use `npm run storage:audit` for a read-only inventory. Its worktree, generated-artifact, npm-cache, and Docker allocation findings do not authorize deletion; never run broad prune or cache-cleaning commands automatically.
 - Disposable PostgreSQL acceptance containers must pass both launch and forced-cleanup Docker arguments through `scripts/lib/disposable-postgres-docker.mjs`. The guard uses version-aware tmpfs storage, `--rm`, and volume-aware forced removal so image-declared anonymous volumes cannot accumulate; change `CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE` only for a reviewed test requirement.
+- On macOS the Docker helper also checks disk headroom for targeted tests and serializes guarded test databases across worktrees. Do not bypass a busy or incomplete lease; inspect its exact owner/container first. Inherited `CI` or Railway/Vercel variables do not bypass Mac disk checks.
+- Guarded PostgreSQL tests default to 4 GiB tmpfs within a 5 GiB memory ceiling, no additional container swap, 2 CPUs, 256 processes, and rotating logs. `CLAWPILOT_TEST_POSTGRES_MEMORY` and `CLAWPILOT_TEST_POSTGRES_CPUS` may lower these ceilings only for a reviewed test profile. Owner-checked cleanup handles normal exit, SIGINT, and SIGTERM; SIGKILL or a Docker outage may leave a lease/container requiring inspection. Never remove unidentified volumes to clear a lease.
 
 ## Validation
 

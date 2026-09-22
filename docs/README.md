@@ -1,7 +1,7 @@
 ---
 id: cp-vault-map
 title: ClawPilot Vault Map
-summary: Human entry point for the canonical repository vault and its current contracts, maps, operations, and history.
+summary: Human entry point for the canonical docs-only vault and its current contracts, maps, operations, and history.
 status: active
 kind: vault-map
 area: knowledge
@@ -11,7 +11,7 @@ app_visible: false
 
 # ClawPilot Vault Map
 
-Open the repository root, not the `docs/` folder, as the Obsidian vault. Start with the [canonical knowledge index](index.md). Portable vault settings are committed; window layout, hotkeys, themes, and community plugins remain local.
+Open this `docs/` folder as the Obsidian vault; the containing ClawPilot repository remains the canonical source. Start with the concise [Home](Home.md) or the [application knowledge index](index.md). Keeping the vault at `docs/` avoids indexing dependency packages, generated artifacts, and their README files. Portable vault settings are committed; window layout, hotkeys, themes, and community plugins remain local.
 
 ## Maps Of Content
 
@@ -59,9 +59,13 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Demo account](operations/public-demo-environment.md)
 - [Agent security and integration isolation](operations/agent-security-and-isolation.md)
 - [Knowledge vault organization](operations/knowledge-vault-organization.md)
+- [Legacy vault reconciliation](operations/legacy-vault-reconciliation.md) (vault-only registration and index audit; review before any migration)
 - [ChatGPT agent authorization](operations/chatgpt-agent-auth.md)
 - [Repository patch runner](operations/repository-patch-runner.md)
 - [Google Workspace integration](operations/google-workspace-integration.md)
+- [Owner login aliases and domain transition](auth-login-domain-transition.md) (current, vault-only operator contract)
+- [BPO public domains](operations/bpo-public-domains.md) (additive app hosts and branded short-link rollout)
+- [Local LikeC4 architecture views](architecture/clawpilot-likec4.md) (hand-maintained, local-only diagrams)
 - [Infrastructure and cost control register](operations/infrastructure-and-cost-control-register.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [Career Desk Maton LinkedIn source](operations/career-maton-linkedin.md)
@@ -83,6 +87,14 @@ These documents define the accepted authority boundary and staged activation des
 - [Distributed operations runbook](operations/distributed-operations-runbook.md)
 - [Native distributed operations authority and adapter boundaries](decisions/0006-native-distributed-operations-authority.md)
 
+### Vault-Only Integration And Development References
+
+These references are available in the repository vault, not in the in-app Docs catalog. Their development procedures do not authorize provider or production changes.
+
+- [Shopify native order activity](shopify-native-order-activity.md) (current read-only order-history reference)
+- [WMS development simulation](modules/wms-development-simulation.md) (current local/disposable-database simulation; hosted-development invocation retired)
+- [Shopify reversal test fixture](operations/shopify-reversal-test-fixture.md) (retained development-only fixture; its Railway development identity is retired)
+
 ### Authority
 
 The active module contracts above are the current product and architecture surface. Operator runbooks contain provider procedures but do not redefine product behavior. Deleted file-backed and OpenClaw designs remain available in Git history and must not be treated as current requirements.
@@ -99,9 +111,20 @@ Use this order to understand progress without reconstructing it from dated workl
 6. Use the in-app Versions surface for durable environment-specific releases and checkpoints.
 7. Use GitHub pull requests and Git history for implementation-level evidence.
 
+For a manual operator review, start with observed evidence and the current Versions record. List risks or blockers separately, choose one scoped next action, then record any lasting decision or update the owning active contract. Do not treat a historical runbook or a local vault index as proof of a current deployment.
+
 ## Historical Archive
 
 Retain historical Markdown only when the event itself has continuing operational value. The [stable-build integrity incident](incidents/2026-03-20-stable-build-integrity-outage.md) remains searchable because it explains a release-safety control. Provider backup evidence remains in the Railway backup runbook. Superseded plans, reviews, requirements matrices, and setup handoffs are removed after their useful conclusions are incorporated into active contracts; Git history preserves their original wording.
+
+### Retained Cutover And Compatibility Evidence
+
+These vault-only notes explain earlier environment or migration work. They are not instructions to reactivate a retired environment or resume an abandoned migration without a new decision and verified prerequisites.
+
+- [Commerce workspace production migration](operations/commerce-workspace-production-migration.md) (historical DEV-to-PROD cutover plan; migration not currently authorized)
+- [Express Parcel development warehouse normalization](operations/express-parcel-development-warehouse-normalization.md) (historical one-time procedure for the retired Railway development database)
+- [System operating model](architecture/system-operating-model.md) (superseded compatibility pointer)
+- [Development contract](operations/development-contract.md) (superseded compatibility pointer)
 
 ## App Search Flow
 

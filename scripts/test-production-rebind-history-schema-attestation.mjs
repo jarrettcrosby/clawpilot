@@ -20,6 +20,7 @@ import {
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
+  productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -30,6 +31,21 @@ const requestedImage = process.env.CLAWPILOT_TEST_POSTGRES_IMAGE?.trim()
 const images = requestedImage
   ? [requestedImage]
   : ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18']
+
+const PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'e8e3ce7233e3c33e22064e4833f93dffff7ea6d585fdb55bfe69f602cf2665d2',
+  18: '048935a6dca7fbe7c79850f7a326cda075eb2aa1720865f6dccdb9534be66bfe',
+})
+const NEW_REFERENCE_CONSTRAINTS = new Map([
+  ['app_user_login_addresses_user_email_fkey', 'public.app_users'],
+  ['app_login_email_changes_user_email_fkey', 'public.app_users'],
+  ['app_user_google_login_bindings_user_email_fkey', 'public.app_users'],
+  ['app_user_google_login_bindings_linked_by_fkey', 'public.app_users'],
+  ['app_google_subject_owners_user_email_fkey', 'public.app_users'],
+  ['workspace_organization_web_preferences_updated_by_fkey', 'public.app_users'],
+  ['app_user_google_login_bindings_linked_organization_id_fkey', 'public.workspace_organizations'],
+  ['workspace_organization_web_preferences_organization_id_fkey', 'public.workspace_organizations'],
+])
 
 for (const image of images) {
   assert.match(
@@ -172,7 +188,8 @@ async function exerciseImage(image) {
     await waitForPostgres(databaseUrl)
 
     // Use the production migration runner against a blank database. This is
-    // intentionally not a hand-built fixture: the real 0349 and 0353-0357
+    // intentionally not a hand-built fixture: the real 0349, 0353-0359,
+    // 0370, and 0371
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -201,6 +218,46 @@ async function exerciseImage(image) {
     assert.ok(applied.rows.every((row) => row.has_applied_at === true))
 
     const baseline = await inspectProductionRebindHistorySchema(pool)
+    for (const [constraint, relation] of NEW_REFERENCE_CONSTRAINTS) {
+      const triggers = baseline.catalog.triggers.filter((trigger) => (
+        trigger.constraint === constraint && trigger.relation === relation
+      ))
+      assert.equal(triggers.length, 2, `${constraint} has both referenced-table guards`)
+      assert.deepEqual(
+        triggers.map(({ typeMask }) => typeMask).sort((left, right) => left - right),
+        [9, 17],
+        `${constraint} guards both referenced-table DELETE and UPDATE`,
+      )
+      assert.ok(triggers.every((trigger) => trigger.internal && trigger.enabled === 'O'))
+    }
+    const loginAddressGuard = baseline.catalog.triggers.filter((trigger) => (
+      trigger.relation === 'public.app_users'
+      && trigger.name === 'app_users_guard_login_address'
+    ))
+    assert.equal(loginAddressGuard.length, 1)
+    assert.equal(loginAddressGuard[0].internal, false)
+    assert.equal(loginAddressGuard[0].enabled, 'O')
+    assert.equal(loginAddressGuard[0].function, 'public.guard_clawpilot_login_address()')
+    const addedTriggers = baseline.catalog.triggers.filter((trigger) => (
+      NEW_REFERENCE_CONSTRAINTS.has(trigger.constraint)
+      || trigger.name === 'app_users_guard_login_address'
+    ))
+    assert.equal(addedTriggers.length, 17, 'only the eight new FK pairs and login guard are new')
+    const addedFunctions = baseline.catalog.functions.filter((fn) => (
+      fn.schema === 'public' && fn.name === 'guard_clawpilot_login_address'
+    ))
+    assert.equal(addedFunctions.length, 1)
+    assert.equal(addedFunctions[0].result, 'trigger')
+    const projectedPriorCatalog = {
+      ...baseline.catalog,
+      triggers: baseline.catalog.triggers.filter((trigger) => !addedTriggers.includes(trigger)),
+      functions: baseline.catalog.functions.filter((fn) => !addedFunctions.includes(fn)),
+    }
+    assert.equal(
+      productionRebindHistorySchemaDigest(projectedPriorCatalog),
+      PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
+      'the reviewed 0370/0371 trigger and function additions alone explain the digest change',
+    )
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
     assert.equal(

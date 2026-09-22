@@ -93,7 +93,7 @@ export default function IntegrationSettingsPanel({
         sx={{
           minHeight: 42,
           mb: 3,
-          borderBottom: '1px solid rgba(255,255,255,0.08)',
+          borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
           '& .MuiTab-root': { minHeight: 42, px: 1.5 },
         }}
       >

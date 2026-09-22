@@ -71,8 +71,8 @@ const EMOJI_ICONS: Record<string, { icon: React.ElementType; color: string }> = 
   '🟡': { icon: RadioButtonCheckedRounded, color: '#FFA726' },
   '🟢': { icon: RadioButtonCheckedRounded, color: '#66BB6A' },
   '⭐': { icon: StarRounded, color: '#FDD663' },
-  '→': { icon: ArrowForwardRounded, color: '#A8C7FA' },
-  '➡️': { icon: ArrowForwardRounded, color: '#A8C7FA' },
+  '→': { icon: ArrowForwardRounded, color: 'var(--mui-palette-primary-main)' },
+  '➡️': { icon: ArrowForwardRounded, color: 'var(--mui-palette-primary-main)' },
 }
 
 function renderTextWithIcons(text: string): ReactNode[] {
@@ -123,27 +123,27 @@ function applyIcons(children: ReactNode): ReactNode {
 
 export default function DocViewer({ doc, loading }: Props) {
   if (!doc && !loading) return (
-    <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0F0F13', gap: 2 }}>
-      <InsertDriveFileRounded sx={{ fontSize: 56, color: 'rgba(255,255,255,0.1)' }} />
+    <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--mui-palette-background-default)', gap: 2 }}>
+      <InsertDriveFileRounded sx={{ fontSize: 56, color: 'rgba(var(--cp-neutral-rgb),0.1)' }} />
       <Typography variant="h6" color="text.secondary" fontWeight={500}>Select a document</Typography>
       <Typography variant="body2" color="text.disabled">Your document workspace is ready</Typography>
     </Box>
   )
 
   if (loading) return (
-    <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0F0F13' }}>
-      <CircularProgress size={32} sx={{ color: '#A8C7FA' }} />
+    <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: 'var(--mui-palette-background-default)' }}>
+      <CircularProgress size={32} sx={{ color: 'var(--mui-palette-primary-main)' }} />
     </Box>
   )
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', backgroundColor: '#0F0F13', overflow: 'hidden' }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', backgroundColor: 'var(--mui-palette-background-default)', overflow: 'hidden' }}>
 
-      <Box sx={{
+      <Box data-testid="docs-reader-header" sx={{
         px: { xs: 2, sm: 3, md: 5 }, pt: { xs: 2.5, md: 4 }, pb: 3,
-        backgroundColor: 'rgba(15,15,19,0.96)',
+        backgroundColor: 'background.paper',
         backdropFilter: 'blur(12px)',
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
         flexShrink: 0,
         '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
           px: 1.5,
@@ -152,7 +152,7 @@ export default function DocViewer({ doc, loading }: Props) {
         },
       }}>
         <Typography variant="overline" sx={{
-          color: '#A8C7FA', fontSize: '0.65rem', letterSpacing: 2, fontWeight: 600,
+          color: 'var(--mui-palette-primary-main)', fontSize: '0.65rem', letterSpacing: 2, fontWeight: 600,
           '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': { display: 'none' },
         }}>
           {doc!.category.toUpperCase()}
@@ -184,15 +184,15 @@ export default function DocViewer({ doc, loading }: Props) {
           <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.75rem' }}>{doc!.date}</Typography>
           {doc!.status && (
             <Chip label={doc!.status} size="small" variant="outlined"
-              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
+              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
           )}
           {doc!.source && (
             <Chip label={doc!.source === 'repository' ? 'ClawPilot knowledge' : doc!.source} size="small" variant="outlined"
-              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
+              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
           )}
           {doc!.tags.map(tag => (
             <Chip key={tag} label={tag} size="small" variant="outlined"
-              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(255,255,255,0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
+              sx={{ height: 22, fontSize: '0.7rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.12)', color: 'text.secondary', borderRadius: 1.5 }} />
           ))}
         </Box>
       </Box>
@@ -212,23 +212,23 @@ export default function DocViewer({ doc, loading }: Props) {
               h1: ({ children }) => <Typography variant="h4" fontWeight={700} sx={{ mt: 4, mb: 2, color: 'text.primary', lineHeight: 1.3 }}>{children}</Typography>,
               h2: ({ children }) => <Typography variant="h5" fontWeight={600} sx={{ mt: 3.5, mb: 1.5, color: 'text.primary' }}>{children}</Typography>,
               h3: ({ children }) => <Typography variant="h6" fontWeight={600} sx={{ mt: 3, mb: 1, color: 'text.primary' }}>{children}</Typography>,
-              p: ({ children }) => <Typography variant="body1" sx={{ mb: 2, color: 'rgba(228,225,236,0.85)', lineHeight: 1.85 }}>{applyIcons(children as ReactNode)}</Typography>,
+              p: ({ children }) => <Typography variant="body1" sx={{ mb: 2, color: 'text.primary', lineHeight: 1.85 }}>{applyIcons(children as ReactNode)}</Typography>,
               ul: ({ children }) => <Box component="ul" sx={{ mb: 2, pl: 3, '& li': { mb: 0.75 } }}>{children}</Box>,
               ol: ({ children }) => <Box component="ol" sx={{ mb: 2, pl: 3, '& li': { mb: 0.75 } }}>{children}</Box>,
-              li: ({ children }) => <Typography component="li" variant="body1" sx={{ color: 'rgba(228,225,236,0.85)', lineHeight: 1.75 }}>{applyIcons(children as ReactNode)}</Typography>,
+              li: ({ children }) => <Typography component="li" variant="body1" sx={{ color: 'text.primary', lineHeight: 1.75 }}>{applyIcons(children as ReactNode)}</Typography>,
               strong: ({ children }) => <Box component="strong" sx={{ color: 'text.primary', fontWeight: 700 }}>{children}</Box>,
               blockquote: ({ children }) => (
-                <Box component="blockquote" sx={{ borderLeft: '3px solid #A8C7FA', pl: 2.5, ml: 0, my: 2.5, color: 'text.secondary', fontStyle: 'italic' }}>
+                <Box component="blockquote" sx={{ borderLeft: '3px solid var(--mui-palette-primary-main)', pl: 2.5, ml: 0, my: 2.5, color: 'text.secondary', fontStyle: 'italic' }}>
                   {children}
                 </Box>
               ),
               code: ({ children }) => {
                 const isBlock = String(children).includes('\n')
                 return isBlock
-                  ? <Box component="pre" sx={{ backgroundColor: '#1A1A2E', borderRadius: 2, p: 2.5, mb: 2.5, overflow: 'auto', border: '1px solid rgba(255,255,255,0.08)' }}>
-                      <Box component="code" sx={{ fontFamily: 'monospace', fontSize: '0.85rem', color: '#A8C7FA', display: 'block' }}>{children}</Box>
+                  ? <Box component="pre" sx={{ backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, p: 2.5, mb: 2.5, overflow: 'auto', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
+                      <Box component="code" sx={{ fontFamily: 'monospace', fontSize: '0.85rem', color: 'var(--mui-palette-primary-main)', display: 'block' }}>{children}</Box>
                     </Box>
-                  : <Box component="code" sx={{ backgroundColor: '#1E2030', borderRadius: 1, px: 0.75, py: 0.25, fontFamily: 'monospace', fontSize: '0.85rem', color: '#CFC6EA' }}>{children}</Box>
+                  : <Box component="code" sx={{ backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 1, px: 0.75, py: 0.25, fontFamily: 'monospace', fontSize: '0.85rem', color: 'var(--mui-palette-secondary-main)' }}>{children}</Box>
               },
               text: ({ children }) => <>{renderTextWithIcons(String(children))}</>,
               table: ({ children }) => (
@@ -236,10 +236,10 @@ export default function DocViewer({ doc, loading }: Props) {
                   <Box component="table" sx={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>{children}</Box>
                 </Box>
               ),
-              thead: ({ children }) => <Box component="thead" sx={{ '& th': { borderBottom: '2px solid rgba(255,255,255,0.1)', pb: 1, pr: 3, textAlign: 'left', color: 'text.secondary', fontWeight: 600, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em' } }}>{children}</Box>,
-              td: ({ children }) => <Box component="td" sx={{ py: 1.5, pr: 3, borderBottom: '1px solid rgba(255,255,255,0.05)', color: 'rgba(228,225,236,0.75)', verticalAlign: 'top' }}>{applyIcons(children as ReactNode)}</Box>,
-              hr: () => <Divider sx={{ my: 3.5, borderColor: 'rgba(255,255,255,0.07)' }} />,
-              a: ({ href, children }) => <Box component="a" href={repositoryLink(doc!, href)} sx={{ color: '#A8C7FA', textDecoration: 'none', borderBottom: '1px solid rgba(168,199,250,0.3)', '&:hover': { borderBottomColor: '#A8C7FA' } }}>{children}</Box>,
+              thead: ({ children }) => <Box component="thead" sx={{ '& th': { borderBottom: '2px solid rgba(var(--cp-neutral-rgb),0.1)', pb: 1, pr: 3, textAlign: 'left', color: 'text.secondary', fontWeight: 600, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em' } }}>{children}</Box>,
+              td: ({ children }) => <Box component="td" sx={{ py: 1.5, pr: 3, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.05)', color: 'text.secondary', verticalAlign: 'top' }}>{applyIcons(children as ReactNode)}</Box>,
+              hr: () => <Divider sx={{ my: 3.5, borderColor: 'rgba(var(--cp-neutral-rgb),0.07)' }} />,
+              a: ({ href, children }) => <Box component="a" href={repositoryLink(doc!, href)} sx={{ color: 'var(--mui-palette-primary-main)', textDecoration: 'none', borderBottom: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.3)', '&:hover': { borderBottomColor: 'var(--mui-palette-primary-main)' } }}>{children}</Box>,
             }}
           >
             {stripLeadingMarkdownTitle(doc!.content, doc!.title).trimStart()}

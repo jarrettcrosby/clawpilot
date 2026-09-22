@@ -1080,7 +1080,7 @@ const controlSx = {
   '& .MuiInputBase-root': {
     minHeight: 40,
     borderRadius: '8px',
-    backgroundColor: '#15151D',
+    backgroundColor: 'background.paper',
   },
 }
 
@@ -1496,7 +1496,8 @@ function ShadowPreparationStageCard({
       sx={{
         minWidth: 0,
         p: 1.5,
-        border: '1px solid rgba(255,255,255,0.12)',
+        border: '1px solid',
+        borderColor: 'divider',
         borderRadius: '8px',
       }}
     >
@@ -1534,7 +1535,7 @@ function ShadowPreparationStageCard({
             sx={{
               minWidth: 0,
               p: 1.25,
-              backgroundColor: 'rgba(255,255,255,0.035)',
+              backgroundColor: 'action.hover',
               borderRadius: '6px',
             }}
           >
@@ -1685,7 +1686,8 @@ function ShadowFulfillmentPreparationPanel({
         sx={{
           minWidth: 0,
           p: 1.5,
-          border: '1px solid rgba(255,255,255,0.12)',
+          border: '1px solid',
+          borderColor: 'divider',
           borderRadius: '8px',
         }}
       >
@@ -1745,7 +1747,8 @@ function ShadowFulfillmentPreparationPanel({
                 display: 'grid',
                 gridTemplateColumns: 'minmax(0, 1fr) auto',
                 gap: 1,
-                border: '1px solid rgba(255,255,255,0.12)',
+                border: '1px solid',
+                borderColor: 'divider',
                 borderRadius: '6px',
               }}
             >
@@ -1788,7 +1791,8 @@ function ShadowFulfillmentPreparationPanel({
               minWidth: 0,
               p: 1,
               textAlign: 'center',
-              border: '1px solid rgba(255,255,255,0.12)',
+              border: '1px solid',
+              borderColor: 'divider',
               borderRadius: '6px',
             }}
           >
@@ -2188,9 +2192,10 @@ function OrderDetailDrawer({
         sx: {
           width: mobile ? '100%' : 'min(540px, 46vw)',
           maxWidth: '100vw',
-          backgroundColor: '#17171F',
+          backgroundColor: 'background.paper',
           backgroundImage: 'none',
-          borderLeft: '1px solid rgba(255,255,255,0.1)',
+          borderLeft: '1px solid',
+          borderColor: 'divider',
         },
       }}
     >
@@ -2239,7 +2244,7 @@ function OrderDetailDrawer({
             )}
             <DetailSection title="Overview">
               <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 1.5 }}>
-                <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{order.customerName}</Typography><Typography variant="caption" color="#A8C7FA">{order.customerGlobalId}</Typography></Box>
+                <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{order.customerName}</Typography><Typography variant="caption" color="primary.main">{order.customerGlobalId}</Typography></Box>
                 <Box>
                   <Typography variant="caption" color="text.secondary">Warehouse</Typography>
                   <Typography>{order.warehouseName || 'Unassigned'}</Typography>
@@ -2312,7 +2317,7 @@ function OrderDetailDrawer({
               <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2, rowGap: 0.5 }}>
                 {metric('Expected cost', money(order.expectedCostMinor, order.currency))}
                 {metric('Expected revenue', money(order.expectedRevenueMinor, order.currency))}
-                {metric('Expected margin', money(order.expectedMarginMinor, order.currency), Number(order.expectedMarginMinor || 0) >= 0 ? '#81C784' : '#EF9A9A')}
+                {metric('Expected margin', money(order.expectedMarginMinor, order.currency), Number(order.expectedMarginMinor || 0) >= 0 ? 'success.main' : 'error.main')}
               </Box>
             </DetailSection>
 
@@ -2695,7 +2700,8 @@ function OrderDetailDrawer({
                         key={item.globalId}
                         sx={{
                           p: 1.5,
-                          border: '1px solid rgba(255,255,255,0.12)',
+                          border: '1px solid',
+                          borderColor: 'divider',
                           borderRadius: '8px',
                         }}
                       >
@@ -3026,9 +3032,10 @@ function OrderDetailDrawer({
                           key={item.globalId}
                           sx={{
                             p: 1.5,
-                            border: packageLabel
-                              ? '1px solid rgba(129,199,132,0.35)'
-                              : '1px solid rgba(255,255,255,0.12)',
+                            border: '1px solid',
+                            borderColor: packageLabel
+                              ? 'success.main'
+                              : 'divider',
                             borderRadius: '8px',
                           }}
                         >
@@ -3091,7 +3098,7 @@ function OrderDetailDrawer({
                 ) : (
                   <>
                     {activeLabel ? (
-                      <Box sx={{ p: 1.5, border: '1px solid rgba(129,199,132,0.35)', borderRadius: '8px' }}>
+                      <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'success.main', borderRadius: '8px' }}>
                         <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
                           <Box sx={{ minWidth: 0 }}>
                             <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', rowGap: 0.75 }}>
@@ -3877,9 +3884,10 @@ function ExceptionDetailDrawer({
         sx: {
           width: mobile ? '100%' : 'min(520px, 44vw)',
           maxWidth: '100vw',
-          backgroundColor: '#17171F',
+          backgroundColor: 'background.paper',
           backgroundImage: 'none',
-          borderLeft: '1px solid rgba(255,255,255,0.1)',
+          borderLeft: '1px solid',
+          borderColor: 'divider',
         },
       }}
     >
@@ -3907,7 +3915,7 @@ function ExceptionDetailDrawer({
             <DetailSection title="Context">
               <Stack spacing={1.25}>
                 <Box><Typography variant="caption" color="text.secondary">Type</Typography><Typography>{displayStatus(exception.exceptionType)}</Typography></Box>
-                <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{exception.customerName || 'Not linked'}</Typography>{exception.customerGlobalId && <Typography variant="caption" color="#A8C7FA">{exception.customerGlobalId}</Typography>}</Box>
+                <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{exception.customerName || 'Not linked'}</Typography>{exception.customerGlobalId && <Typography variant="caption" color="primary.main">{exception.customerGlobalId}</Typography>}</Box>
                 <Box><Typography variant="caption" color="text.secondary">Assigned to</Typography><Typography>{exception.assignedTo || 'Unassigned'}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Opened</Typography><Typography>{formatUserDateTime(exception.createdAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown' })}</Typography></Box>
               </Stack>
@@ -3927,7 +3935,7 @@ function ExceptionDetailDrawer({
             </DetailSection>
             <DetailSection title="Evidence">
               {evidenceText ? (
-                <Box component="pre" sx={{ m: 0, p: 1.5, borderRadius: '6px', backgroundColor: '#111118', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '0.78rem', color: 'text.secondary' }}>{evidenceText}</Box>
+                <Box component="pre" sx={{ m: 0, p: 1.5, borderRadius: '6px', backgroundColor: 'action.hover', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: '0.78rem', color: 'text.secondary' }}>{evidenceText}</Box>
               ) : <Typography color="text.secondary">No supporting evidence has been recorded.</Typography>}
             </DetailSection>
             {canManage && (
@@ -8618,6 +8626,13 @@ export default function OperationsSection({
     || orderDate !== 'all'
     || orderSort !== 'order_date_desc',
   )
+  const orderMatchingFiltersActive = Boolean(
+    search
+    || status
+    || orderProvider
+    || orderTracking !== 'all'
+    || orderDate !== 'all',
+  )
   const orderPageStart = orderPage && orderPage.total > 0
     ? orderPage.offset + 1
     : 0
@@ -8634,6 +8649,16 @@ export default function OperationsSection({
     updateOrderPageSnapshot('')
     setOrderPageNumber(1)
     setOrderPageInput('1')
+  }
+
+  const clearOrderFilters = () => {
+    setSearch('')
+    setStatus('')
+    setOrderSort('order_date_desc')
+    setOrderProvider('')
+    setOrderTracking('all')
+    setOrderDate('all')
+    resetOrderPaging()
   }
 
   const goToOrderPage = () => {
@@ -8901,7 +8926,7 @@ export default function OperationsSection({
         overscrollBehaviorY: 'contain',
       }}
     >
-      <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, pb: 1.5, borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0 }}>
+      <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, pb: 1.5, borderBottom: '1px solid', borderColor: 'divider', flexShrink: 0 }}>
         <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1.5}>
           <Box>
             <Stack direction="row" spacing={1} alignItems="center">
@@ -8979,7 +9004,8 @@ export default function OperationsSection({
                 justifyContent="space-between"
                 gap={1}
                 sx={{
-                  border: '1px solid rgba(255,255,255,0.09)',
+                  border: '1px solid',
+                  borderColor: 'divider',
                   borderRadius: 1.5,
                   px: 1.5,
                   py: 1.25,
@@ -9155,9 +9181,9 @@ export default function OperationsSection({
         {mainWorkspaceView && summary && (
           <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: { xs: 2, sm: 3.5 }, rowGap: 0.25, mt: 2 }}>
             {metric('Open orders', summary.openOrders)}
-            {metric('Exceptions', summary.exceptions, summary.exceptions ? '#EF9A9A' : 'text.primary')}
-            {metric('Due soon', summary.dueSoon, summary.dueSoon ? '#FFB74D' : 'text.primary')}
-            {metric('ClawPilot shipped today', summary.shippedToday, '#81C784')}
+            {metric('Exceptions', summary.exceptions, summary.exceptions ? 'error.main' : 'text.primary')}
+            {metric('Due soon', summary.dueSoon, summary.dueSoon ? 'warning.main' : 'text.primary')}
+            {metric('ClawPilot shipped today', summary.shippedToday, 'success.main')}
             {metric('Available units', summary.availableUnits)}
             {metric('Reserved units', summary.reservedUnits)}
             {metric('Unbilled', money(summary.unbilledMinor))}
@@ -9220,15 +9246,15 @@ export default function OperationsSection({
                 width: { xs: 36, sm: 40 },
                 minWidth: { xs: 36, sm: 40 },
                 borderRadius: 0,
-                color: '#A8C7FA',
-                backgroundColor: '#111118',
-                '&:hover': { backgroundColor: '#1B1B24' },
+                color: 'primary.main',
+                backgroundColor: 'background.paper',
+                '&:hover': { backgroundColor: 'action.hover' },
                 '&.Mui-disabled': {
                   opacity: 0.32,
                   color: 'text.disabled',
                 },
                 '&.Mui-focusVisible': {
-                  outline: '2px solid #A8C7FA',
+                  outline: '2px solid var(--mui-palette-primary-main)',
                   outlineOffset: -2,
                 },
               },
@@ -9360,15 +9386,7 @@ export default function OperationsSection({
                 {orderFiltersActive && (
                   <Button
                     size="small"
-                    onClick={() => {
-                      setSearch('')
-                      setStatus('')
-                      setOrderSort('order_date_desc')
-                      setOrderProvider('')
-                      setOrderTracking('all')
-                      setOrderDate('all')
-                      resetOrderPaging()
-                    }}
+                    onClick={clearOrderFilters}
                   >
                     Clear filters
                   </Button>
@@ -9550,7 +9568,25 @@ export default function OperationsSection({
             {view === 'orders'
               ? <Inventory2Rounded sx={{ fontSize: 36, color: 'text.disabled' }} />
               : <WarningAmberRounded sx={{ fontSize: 36, color: 'text.disabled' }} />}
-            <Typography sx={{ mt: 1 }} fontWeight={600}>No matching {view}</Typography>
+            <Typography sx={{ mt: 1 }} fontWeight={600}>
+              {view === 'orders'
+                ? orderMatchingFiltersActive
+                  ? 'No orders match these filters'
+                  : 'No orders yet'
+                : 'No matching exceptions'}
+            </Typography>
+            {view === 'orders' && (
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                {orderMatchingFiltersActive
+                  ? 'Adjust or clear the filters to review a different set of orders.'
+                  : 'Connected sales-channel orders and native one-off shipments will appear here.'}
+              </Typography>
+            )}
+            {view === 'orders' && orderMatchingFiltersActive && (
+              <Button size="small" onClick={clearOrderFilters} sx={{ mt: 1.5 }}>
+                Clear filters
+              </Button>
+            )}
           </Box>
         ) : view === 'exceptions' && mobile ? (
           <Stack divider={<Divider flexItem />}>
@@ -9563,7 +9599,7 @@ export default function OperationsSection({
                 sx={{
                   appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
                   px: 2, py: 1.75, width: '100%', cursor: 'pointer',
-                  '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                  '&:active': { backgroundColor: 'action.selected' },
                 }}
               >
                 <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
@@ -9575,7 +9611,7 @@ export default function OperationsSection({
                 </Stack>
                 <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                   <Box sx={{ minWidth: 0 }}>
-                    <Typography variant="caption" color="#A8C7FA">{exception.globalId}</Typography>
+                    <Typography variant="caption" color="primary.main">{exception.globalId}</Typography>
                     <Typography variant="caption" color="text.secondary" display="block" noWrap>{exception.orderNumber ? `Order ${exception.orderNumber}` : 'No order linked'}</Typography>
                   </Box>
                   <Chip size="small" label={displayStatus(exception.status)} color={exceptionStatusColor(exception.status)} />
@@ -9595,7 +9631,7 @@ export default function OperationsSection({
                 {workspace?.exceptions.map((exception) => (
                   <TableRow key={exception.globalId} hover onClick={() => chooseException(exception)} sx={{ cursor: 'pointer' }}>
                     <TableCell><Chip size="small" label={displayStatus(exception.severity)} color={severityColor(exception.severity)} /></TableCell>
-                    <TableCell><Typography fontWeight={600}>{exception.title}</Typography><Typography variant="caption" color="#A8C7FA">{exception.globalId} · {displayStatus(exception.exceptionType)}</Typography></TableCell>
+                    <TableCell><Typography fontWeight={600}>{exception.title}</Typography><Typography variant="caption" color="primary.main">{exception.globalId} · {displayStatus(exception.exceptionType)}</Typography></TableCell>
                     <TableCell>{exception.orderNumber || '—'}</TableCell>
                     <TableCell><Typography>{exception.customerName || '—'}</Typography>{exception.customerGlobalId && <Typography variant="caption" color="text.secondary">{exception.customerGlobalId}</Typography>}</TableCell>
                     <TableCell><Chip size="small" label={displayStatus(exception.status)} color={exceptionStatusColor(exception.status)} /></TableCell>
@@ -9621,7 +9657,7 @@ export default function OperationsSection({
                     sx={{
                       appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
                       px: 2, py: 1.75, width: '100%', cursor: 'pointer',
-                      '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                      '&:active': { backgroundColor: 'action.selected' },
                     }}
                   >
                     <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
@@ -9635,7 +9671,7 @@ export default function OperationsSection({
                     </Stack>
                     <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                       <Box sx={{ minWidth: 0 }}>
-                        <Typography variant="caption" color="#A8C7FA">
+                        <Typography variant="caption" color="primary.main">
                           {displayStatus(order.provider)} · {importedOrderWarehouseName(order)}
                         </Typography>
                         <Typography variant="caption" color="text.secondary" display="block" noWrap>
@@ -9675,7 +9711,7 @@ export default function OperationsSection({
                   sx={{
                     appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
                     px: 2, py: 1.75, width: '100%', cursor: 'pointer',
-                    '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                    '&:active': { backgroundColor: 'action.selected' },
                   }}
                 >
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
@@ -9687,7 +9723,7 @@ export default function OperationsSection({
                   </Stack>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                     <Box sx={{ minWidth: 0 }}>
-                      <Typography variant="caption" color="#A8C7FA">
+                      <Typography variant="caption" color="primary.main">
                         {displayStatus(order.sourceProvider)} · {order.warehouseName || 'Unassigned'}
                       </Typography>
                       <Typography variant="caption" color="text.secondary" display="block" noWrap>
@@ -9800,7 +9836,7 @@ export default function OperationsSection({
                       >
                         <TableCell>
                           <Typography fontWeight={600}>{order.orderNumber}</Typography>
-                          <Typography variant="caption" color="#A8C7FA">
+                          <Typography variant="caption" color="primary.main">
                             {displayStatus(order.provider)} · {order.candidateGlobalId}
                           </Typography>
                         </TableCell>
@@ -9897,7 +9933,7 @@ export default function OperationsSection({
                     >
                       <TableCell>
                         <Typography fontWeight={600}>{order.orderNumber}</Typography>
-                        <Typography variant="caption" color="#A8C7FA">
+                        <Typography variant="caption" color="primary.main">
                           {displayStatus(order.sourceProvider)} · {order.globalId}
                         </Typography>
                       </TableCell>
@@ -10222,7 +10258,7 @@ export default function OperationsSection({
                           {displayStatus(account.provider)} · {displayStatus(account.environment)}
                         </Typography>
                       </Box>
-                      <Typography variant="caption" color="#A8C7FA">
+                      <Typography variant="caption" color="primary.main">
                         {account.accountGlobalId}
                       </Typography>
                     </Stack>
@@ -10319,7 +10355,7 @@ export default function OperationsSection({
                 >
                   <Stack spacing={0.75}>
                     <Typography variant="body2">
-                      Preparation: <Box component="span" color="#A8C7FA">
+                      Preparation: <Box component="span" color="primary.main">
                         {commerceActivePreparation.preparationGlobalId}
                       </Box>
                     </Typography>
@@ -11831,7 +11867,10 @@ export default function OperationsSection({
                           key={offer.globalId}
                           sx={{
                             p: 1,
-                            border: `1px solid ${oneOffGroupPurchaseOfferGlobalId === offer.globalId ? '#A8C7FA' : 'rgba(255,255,255,0.12)'}`,
+                            border: '1px solid',
+                            borderColor: oneOffGroupPurchaseOfferGlobalId === offer.globalId
+                              ? 'primary.main'
+                              : 'divider',
                             borderRadius: 2,
                           }}
                         >

@@ -10,6 +10,7 @@ export type QuickBooksWritePolicy = {
 const supportedOperations = new Set<QuickBooksWriteOperationKind>([
   'customer.create',
   'item.create',
+  'item.update',
   'invoice.create',
   'sales_receipt.create',
   'journal_entry.create',

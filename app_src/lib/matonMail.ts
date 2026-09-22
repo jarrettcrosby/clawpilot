@@ -380,6 +380,27 @@ export async function sendCareerDeskMagicCodeEmail(
   await sendMessage(authMagicCodeContent(to, code, 'Career Desk'), await authMailProfileForRecipient(to))
 }
 
+export async function sendLoginEmailChangeCode(input: { to: string; code: string }) {
+  const to = assertEmail(input.to)
+  const code = assertCode(input.code)
+  return sendMessage({
+    to, subject: 'Verify your ClawPilot login email change',
+    text: `Your login email verification code is: ${code}\r\n\r\nEnter this in ClawPilot to change your login email. It expires in 15 minutes. If you did not request this change, ignore this email.`,
+    html: `<p>Your ClawPilot login email verification code is <strong>${code}</strong>.</p><p>Enter this in ClawPilot to change your login email. It expires in 15 minutes. If you did not request this change, ignore this email.</p>`,
+    messagePurpose: 'auth-magic-code',
+  }, await authMailProfileForRecipient(to))
+}
+
+export async function sendLoginEmailChangedNotice(input: { to: string; newEmail: string }) {
+  const to = assertEmail(input.to)
+  const newEmail = assertEmail(input.newEmail)
+  return sendMessage({ to, subject: 'Your ClawPilot login email changed',
+    text: `Your ClawPilot login email was changed to ${newEmail}. Existing sessions and the previous Google sign-in link were revoked. If you did not make this change, contact your ClawPilot administrator immediately.`,
+    html: `<p>Your ClawPilot login email was changed to ${escapeHtml(newEmail)}.</p><p>Existing sessions and the previous Google sign-in link were revoked. If you did not make this change, contact your ClawPilot administrator immediately.</p>`,
+    messagePurpose: 'auth-magic-code',
+  }, await authMailProfileForRecipient(to))
+}
+
 export async function sendInvitationEmail(input: SendInvitationEmailInput): Promise<{ messageId: string | null }> {
   const to = assertEmail(input.to)
   const inviterName = String(input.inviterName || 'A ClawPilot administrator').trim().slice(0, 100)

@@ -31,16 +31,17 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import ShortLinkFormDialog from './ShortLinkFormDialog'
-import type { ShortLinkRecord, ShortLinkWriteInput } from './types'
+import type { ShortLinkDomainChoice, ShortLinkRecord, ShortLinkWriteInput } from './types'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import { WORKSPACE_CHANGED_EVENT } from '@/lib/workspaceClient'
 
 type StatusKey = 'active' | 'disabled' | 'expired' | 'exhausted'
 
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#191921',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -50,7 +51,7 @@ const iconButtonSx = {
   flex: '0 0 40px',
   color: 'text.secondary',
   borderRadius: '8px',
-  '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' },
+  '&:hover': { color: 'primary.main', backgroundColor: 'action.hover' },
 }
 
 function payloadRecords(payload: unknown): ShortLinkRecord[] {
@@ -81,10 +82,10 @@ function effectiveStatus(record: ShortLinkRecord): StatusKey {
 }
 
 function statusPresentation(status: StatusKey) {
-  if (status === 'active') return { label: 'Active', color: '#66BB6A', background: 'rgba(102,187,106,0.11)' }
-  if (status === 'disabled') return { label: 'Disabled', color: '#B9B3C0', background: 'rgba(185,179,192,0.10)' }
-  if (status === 'expired') return { label: 'Expired', color: '#FFA726', background: 'rgba(255,167,38,0.11)' }
-  return { label: 'Limit reached', color: '#FFB4AB', background: 'rgba(255,180,171,0.11)' }
+  if (status === 'active') return { label: 'Active', color: 'success.main', background: 'action.hover' }
+  if (status === 'disabled') return { label: 'Disabled', color: 'text.secondary', background: 'action.hover' }
+  if (status === 'expired') return { label: 'Expired', color: 'warning.main', background: 'action.hover' }
+  return { label: 'Limit reached', color: 'error.main', background: 'action.hover' }
 }
 
 function formatRelativeDate(value: string | null): string {
@@ -139,6 +140,18 @@ async function copyText(value: string) {
 }
 
 export default function ShortLinksSection() {
+  const [workspaceEpoch, setWorkspaceEpoch] = useState(0)
+  useEffect(() => {
+    const reset = () => setWorkspaceEpoch((current) => current + 1)
+    window.addEventListener(WORKSPACE_CHANGED_EVENT, reset)
+    return () => window.removeEventListener(WORKSPACE_CHANGED_EVENT, reset)
+  }, [])
+  // Drafts, selection, records, and in-flight responses must not follow the user
+  // into another workspace, even when the surrounding shell stays mounted.
+  return <WorkspaceShortLinks key={workspaceEpoch} />
+}
+
+function WorkspaceShortLinks() {
   const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [records, setRecords] = useState<ShortLinkRecord[]>([])
@@ -156,6 +169,17 @@ export default function ShortLinksSection() {
   const [mutation, setMutation] = useState<string | null>(null)
   const [currentOwnerEmail, setCurrentOwnerEmail] = useState('')
   const [canManageOrganization, setCanManageOrganization] = useState(false)
+  const [availableDomains, setAvailableDomains] = useState<ShortLinkDomainChoice[]>([
+    { key: 'eigenracing', label: 'eigenracing.com' },
+  ])
+  const [domainPreference, setDomainPreference] = useState<{ saved: ShortLinkDomainChoice['key'] | 'organization'; selected: ShortLinkDomainChoice['key'] | 'organization' }>({
+    saved: 'organization', selected: 'organization',
+  })
+  const [effectiveDefaultDomain, setEffectiveDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [organizationDefaultDomain, setOrganizationDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [canOverrideDefault, setCanOverrideDefault] = useState(true)
+  const [formDefaultDomain, setFormDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [savingPreference, setSavingPreference] = useState(false)
   const requestSequence = useRef(0)
 
   useEffect(() => {
@@ -192,6 +216,22 @@ export default function ShortLinksSection() {
           const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
           setCurrentOwnerEmail(String(data.currentOwnerEmail || '').toLowerCase())
           setCanManageOrganization(data.canManageOrganization === true)
+          const domains = Array.isArray(data.availableDomains) ? data.availableDomains as ShortLinkDomainChoice[] : []
+          setAvailableDomains(domains.some((domain) => domain.key === 'eigenracing' || domain.key === 'bpo')
+            ? domains.filter((domain) => domain.key === 'eigenracing' || domain.key === 'bpo')
+            : [{ key: 'eigenracing', label: 'eigenracing.com' }])
+          const defaultDomain = data.defaultDomain === 'bpo' && domains.some((domain) => domain.key === 'bpo')
+            ? 'bpo' : 'eigenracing'
+          const overrideAllowed = data.canOverrideDefault !== false
+          const saved = overrideAllowed && (data.userDefaultDomain === 'bpo' || data.userDefaultDomain === 'eigenracing') ? data.userDefaultDomain : 'organization'
+          setEffectiveDefaultDomain(defaultDomain)
+          setOrganizationDefaultDomain(data.organizationDefaultDomain === 'bpo' ? 'bpo' : 'eigenracing')
+          setCanOverrideDefault(overrideAllowed)
+          setDomainPreference((current) => ({
+            saved,
+            selected: !overrideAllowed || current.selected === current.saved || (current.selected !== 'organization' && !domains.some((domain) => domain.key === current.selected))
+              ? saved : current.selected,
+          }))
         }
       })
       .catch((loadError: unknown) => {
@@ -218,12 +258,38 @@ export default function ShortLinksSection() {
 
   function openCreate() {
     setEditing(null)
+    setFormDefaultDomain(effectiveDefaultDomain)
     setFormOpen(true)
   }
 
   function openEdit(record: ShortLinkRecord) {
     setEditing(record)
     setFormOpen(true)
+  }
+
+  async function saveDefaultDomain() {
+    const selected = domainPreference.selected
+    setSavingPreference(true)
+    setError('')
+    try {
+      const response = await fetch('/api/shortlinks/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ defaultDomain: selected === 'organization' ? null : selected }),
+      })
+      const payload = await responsePayload(response)
+      if (!response.ok || payload.ok === false) throw new Error(errorMessage(payload, 'Unable to save default domain'))
+      const saved = payload.userDefaultDomain === 'bpo' || payload.userDefaultDomain === 'eigenracing' ? payload.userDefaultDomain : 'organization'
+      setEffectiveDefaultDomain(payload.defaultDomain === 'bpo' ? 'bpo' : 'eigenracing')
+      requestSequence.current += 1
+      setDomainPreference({ saved, selected: saved })
+      setRefreshKey((current) => current + 1)
+      setNotice('Default short-link domain saved for this workspace')
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save default domain')
+    } finally {
+      setSavingPreference(false)
+    }
   }
 
   async function saveLink(input: ShortLinkWriteInput) {
@@ -273,7 +339,7 @@ export default function ShortLinksSection() {
   }
 
   async function deleteLink() {
-    if (!deleting) return
+    if (!deleting || mutation) return
     const record = deleting
     const key = `delete:${record.id}`
     setMutation(key)
@@ -320,9 +386,39 @@ export default function ShortLinksSection() {
           variant="contained"
           startIcon={<AddLinkRounded />}
           onClick={openCreate}
+          disabled={loading || savingPreference}
           sx={{ minHeight: 40, borderRadius: '8px', px: 2, flexShrink: 0 }}
         >
           New link
+        </Button>
+      </Box>
+
+      <Box display="flex" alignItems="flex-start" flexWrap="wrap" gap={1.5} mb={2.5}>
+        <TextField
+          select
+          size="small"
+          label="Default short-link domain"
+          value={domainPreference.selected}
+          onChange={(event) => setDomainPreference((current) => ({ ...current, selected: event.target.value as ShortLinkDomainChoice['key'] | 'organization' }))}
+          disabled={loading || savingPreference || !canOverrideDefault}
+          helperText={!canOverrideDefault ? 'Your organization administrator controls the domain for new links.'
+            : domainPreference.selected !== 'organization' && !availableDomains.some((domain) => domain.key === domainPreference.selected)
+              ? `Your saved domain is temporarily unavailable. New links currently use ${availableDomains.find((domain) => domain.key === effectiveDefaultDomain)?.label || effectiveDefaultDomain}; your preference is preserved.`
+              : 'Inherit the organization default, or choose your own. Each new link can use another enabled domain.'}
+          sx={{ ...fieldSx, flex: '1 1 280px', maxWidth: 520 }}
+        >
+          <MenuItem value="organization">Organization default ({availableDomains.find((domain) => domain.key === organizationDefaultDomain)?.label || organizationDefaultDomain})</MenuItem>
+          {domainPreference.selected !== 'organization' && !availableDomains.some((domain) => domain.key === domainPreference.selected)
+            ? <MenuItem value={domainPreference.selected} disabled>{domainPreference.selected === 'bpo' ? 'bposupplychain.com' : 'eigenracing.com'} — temporarily unavailable</MenuItem> : null}
+          {availableDomains.map((domain) => <MenuItem key={domain.key} value={domain.key}>{domain.label}</MenuItem>)}
+        </TextField>
+        <Button
+          variant="outlined"
+          onClick={() => void saveDefaultDomain()}
+          disabled={loading || savingPreference || !canOverrideDefault || domainPreference.selected === domainPreference.saved}
+          sx={{ minHeight: 40, borderRadius: '8px' }}
+        >
+          {savingPreference ? 'Saving default…' : 'Save default'}
         </Button>
       </Box>
 
@@ -382,11 +478,11 @@ export default function ShortLinksSection() {
         </Tooltip>
       </Box>
 
-      {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+      {error && !deleting ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
 
       <Box
         data-testid="short-links-list"
-        sx={{ borderTop: { lg: '1px solid rgba(255,255,255,0.09)' } }}
+        sx={{ borderTop: { lg: 1 }, borderColor: 'divider' }}
       >
         <Box
           sx={{
@@ -413,7 +509,7 @@ export default function ShortLinksSection() {
         {!loading && records.length === 0 ? (
           <Box display="grid" sx={{ minHeight: 280, placeItems: 'center', textAlign: 'center', px: 2 }}>
             <Box>
-              <LinkOffRounded sx={{ fontSize: 42, color: 'rgba(255,255,255,0.16)', mb: 1 }} />
+              <LinkOffRounded sx={{ fontSize: 42, color: 'text.disabled', mb: 1 }} />
               <Typography variant="subtitle1" color="text.primary" fontWeight={700}>No short links found</Typography>
               <Typography variant="body2" color="text.secondary" mt={0.5}>Adjust the current filters or create a link.</Typography>
             </Box>
@@ -443,15 +539,16 @@ export default function ShortLinksSection() {
                 px: { xs: 1.5, lg: 1.5 },
                 py: { xs: 1.75, lg: 1.5 },
                 mb: { xs: 1.25, lg: 0 },
-                border: { xs: '1px solid rgba(255,255,255,0.09)', lg: 'none' },
-                borderTop: { lg: '1px solid rgba(255,255,255,0.07)' },
+                border: { xs: 1, lg: 0 },
+                borderTop: { lg: 1 },
+                borderColor: 'divider',
                 borderRadius: { xs: '8px', lg: 0 },
-                backgroundColor: { xs: 'rgba(255,255,255,0.025)', lg: 'transparent' },
+                backgroundColor: { xs: 'background.paper', lg: 'transparent' },
               }}
             >
               <Box minWidth={0}>
                 <Box display="flex" alignItems="center" gap={1} minWidth={0}>
-                  <Typography variant="body2" fontWeight={700} color="#A8C7FA" noWrap title={record.shortUrl}>
+                  <Typography variant="body2" fontWeight={700} color="primary.main" noWrap title={record.shortUrl}>
                     {record.shortUrl}
                   </Typography>
                   <Tooltip title="Copy short URL">
@@ -477,7 +574,7 @@ export default function ShortLinksSection() {
                         label={recordTag}
                         size="small"
                         onClick={() => setTag(recordTag)}
-                        sx={{ minHeight: 22, height: 22, borderRadius: '6px', fontSize: '0.68rem', backgroundColor: 'rgba(168,199,250,0.08)', color: 'text.secondary' }}
+                        sx={{ minHeight: 22, height: 22, borderRadius: '6px', fontSize: '0.68rem', backgroundColor: 'action.hover', color: 'text.secondary' }}
                       />
                     ))}
                     {record.tags.length > 3 ? <Chip label={`+${record.tags.length - 3}`} size="small" sx={{ minHeight: 22, height: 22, borderRadius: '6px', fontSize: '0.68rem' }} /> : null}
@@ -514,13 +611,13 @@ export default function ShortLinksSection() {
                     variant="determinate"
                     value={recordUsage.percent}
                     aria-label={`${recordUsage.label} click usage`}
-                    sx={{ mt: 0.75, height: 3, borderRadius: '3px', backgroundColor: 'rgba(255,255,255,0.08)', '& .MuiLinearProgress-bar': { backgroundColor: recordUsage.percent >= 100 ? '#FFB4AB' : '#A8C7FA' } }}
+                    sx={{ mt: 0.75, height: 3, borderRadius: '3px', backgroundColor: 'action.hover', '& .MuiLinearProgress-bar': { backgroundColor: recordUsage.percent >= 100 ? 'error.main' : 'primary.main' } }}
                   />
                 ) : null}
               </Box>
 
               <Box>
-                <Typography variant="body2" color={recordStatus === 'expired' ? '#FFA726' : 'text.primary'}>
+                <Typography variant="body2" color={recordStatus === 'expired' ? 'warning.main' : 'text.primary'}>
                   {formatRelativeDate(record.expiresAt)}
                 </Typography>
               </Box>
@@ -555,9 +652,9 @@ export default function ShortLinksSection() {
                 <Tooltip title="Delete short link">
                   <IconButton
                     aria-label={`Delete ${record.title || record.slug}`}
-                    onClick={() => setDeleting(record)}
+                    onClick={() => { setError(''); setDeleting(record) }}
                     disabled={recordBusy || !canMutate}
-                    sx={{ ...iconButtonSx, '&:hover': { color: '#FFB4AB', backgroundColor: 'rgba(255,180,171,0.08)' } }}
+                    sx={{ ...iconButtonSx, '&:hover': { color: 'error.main', backgroundColor: 'action.hover' } }}
                   >
                     <DeleteOutlineRounded sx={{ fontSize: 20 }} />
                   </IconButton>
@@ -571,6 +668,9 @@ export default function ShortLinksSection() {
       <ShortLinkFormDialog
         open={formOpen}
         record={editing}
+        availableDomains={availableDomains}
+        defaultPublicDomain={formDefaultDomain}
+        domainLocked={!canOverrideDefault}
         busy={mutation?.startsWith('POST:') === true || mutation?.startsWith('PATCH:') === true}
         onClose={() => { if (!mutation) setFormOpen(false) }}
         onSubmit={saveLink}
@@ -581,15 +681,17 @@ export default function ShortLinksSection() {
         onClose={() => { if (!mutation) setDeleting(null) }}
         fullScreen={shortLandscape}
         aria-labelledby="delete-short-link-title"
-        PaperProps={{ sx: { width: shortLandscape ? '100%' : 'min(92vw, 440px)', borderRadius: shortLandscape ? 0 : '8px', border: '1px solid rgba(255,255,255,0.09)', backgroundColor: '#1A1A23' } }}
+        PaperProps={{ sx: { width: shortLandscape ? '100%' : 'min(92vw, 440px)', borderRadius: shortLandscape ? 0 : '8px', border: 1, borderColor: 'divider', backgroundColor: 'background.paper' } }}
       >
         <DialogTitle id="delete-short-link-title" sx={{ fontSize: '1.05rem', fontWeight: 700 }}>Delete short link?</DialogTitle>
+        {error && <Alert severity="error" sx={{ mx: 3, mb: 2 }}>{error}</Alert>}
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
             {deleting?.shortUrl}
           </Typography>
+          <Typography variant="body2" sx={{ mt: 1.5 }}>Existing copies of this URL will stop working. You can disable the link instead if you may need it later.</Typography>
         </DialogContent>
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+        <Divider />
         <DialogActions sx={{ px: 2.5, py: 2 }}>
           <Button onClick={() => setDeleting(null)} disabled={Boolean(mutation)} sx={{ minHeight: 38, borderRadius: '8px' }}>Cancel</Button>
           <Button

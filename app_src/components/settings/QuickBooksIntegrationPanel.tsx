@@ -153,7 +153,7 @@ const EMPTY_STATE: IntegrationState = {
 }
 
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 const buttonSx = {
@@ -576,7 +576,7 @@ export default function QuickBooksIntegrationPanel() {
               key={location.restaurantGuid}
               disableGutters
               elevation={0}
-              sx={{ backgroundColor: 'transparent', borderTop: '1px solid rgba(255,255,255,0.1)', '&:before': { display: 'none' } }}
+              sx={{ backgroundColor: 'transparent', borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.1)', '&:before': { display: 'none' } }}
             >
               <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                 <Box minWidth={0} flex={1}>

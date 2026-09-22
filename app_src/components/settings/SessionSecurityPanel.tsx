@@ -55,7 +55,7 @@ type SupportPayload = {
 }
 
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -175,7 +175,7 @@ export default function SessionSecurityPanel() {
       {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 2, borderRadius: '8px' }}>{notice}</Alert> : null}
 
       <GoogleAuthSettingsPanel />
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="section">
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.25}>
@@ -196,7 +196,7 @@ export default function SessionSecurityPanel() {
           </Button>
         </Box>
 
-        <Box sx={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+        <Box sx={{ borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
           {sessions.map((session) => (
             <Box
               key={session.id}
@@ -206,7 +206,7 @@ export default function SessionSecurityPanel() {
                 gap: 1.5,
                 alignItems: 'center',
                 py: 1.5,
-                borderBottom: '1px solid rgba(255,255,255,0.08)',
+                borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
               }}
             >
               <Box minWidth={0}>
@@ -258,7 +258,7 @@ export default function SessionSecurityPanel() {
 
       {support?.isRootAdmin ? (
         <>
-          <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+          <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
           <Box component="section">
             <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25}>
               <PersonSearchRounded sx={{ fontSize: 20, color: 'text.secondary' }} />

@@ -360,7 +360,7 @@ const PROVIDERS: Array<{ value: CarrierProvider; label: string }> = [
 ]
 
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 const buttonSx = {
@@ -2172,7 +2172,7 @@ export default function CarrierIntegrationPanel({
               border: '1px solid',
               borderColor: 'divider',
               borderRadius: '8px',
-              backgroundColor: 'rgba(255,255,255,0.02)',
+              backgroundColor: 'rgba(var(--cp-neutral-rgb),0.02)',
             }}
           >
             <Typography variant="caption" color="text.disabled">Read-only sender</Typography>
@@ -2457,7 +2457,7 @@ export default function CarrierIntegrationPanel({
                     border: '1px solid',
                     borderColor: 'divider',
                     borderRadius: '8px',
-                    backgroundColor: 'rgba(255,255,255,0.02)',
+                    backgroundColor: 'rgba(var(--cp-neutral-rgb),0.02)',
                   }}
                 >
                   <Typography variant="body2" fontWeight={700}>{selectedRate.serviceName}</Typography>

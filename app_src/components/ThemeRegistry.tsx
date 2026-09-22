@@ -53,8 +53,8 @@ export default function ThemeRegistry({ children }: ThemeRegistryProps) {
 
   return (
     <CacheProvider value={cache}>
-      <ThemeProvider theme={theme}>
-        <CssBaseline />
+      <ThemeProvider theme={theme} defaultMode="system" modeStorageKey="clawpilot-color-mode" disableTransitionOnChange>
+        <CssBaseline enableColorScheme />
         {children}
       </ThemeProvider>
     </CacheProvider>

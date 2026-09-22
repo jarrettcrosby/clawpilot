@@ -116,9 +116,9 @@ type PosPayload = {
 }
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1, borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: '#15151D',
+  backgroundColor: 'background.paper',
 }
 
 const controlSx = {
@@ -126,7 +126,7 @@ const controlSx = {
   '& .MuiInputBase-root': {
     height: 40,
     borderRadius: '8px',
-    backgroundColor: '#15151D',
+    backgroundColor: 'background.paper',
   },
   '& input': { minWidth: 0 },
 }
@@ -767,7 +767,7 @@ function queueDraft(draft: DataRecord, index: number): PostingQueueDraft {
   }
 }
 
-function Metric({ label, value, detail, color = '#F3F4F6' }: {
+function Metric({ label, value, detail, color = 'text.primary' }: {
   label: string
   value: string
   detail: string
@@ -813,7 +813,7 @@ function DailyTrend({ rows, money, dateLabel }: {
           <Typography variant="caption" color="text.secondary">Net sales by business date</Typography>
         </Box>
         <Box display="flex" alignItems="center" gap={0.75} flexShrink={0}>
-          <Box width={8} height={8} borderRadius="2px" bgcolor="#70D6A7" />
+          <Box width={8} height={8} borderRadius="2px" bgcolor="success.main" />
           <Typography variant="caption" color="text.secondary">Net sales</Typography>
         </Box>
       </Box>
@@ -844,7 +844,7 @@ function DailyTrend({ rows, money, dateLabel }: {
                           minHeight: 3,
                           height: `${Math.max(2, (netSales / maximum) * 100)}%`,
                           borderRadius: '3px 3px 0 0',
-                          bgcolor: '#70D6A7',
+                          bgcolor: 'success.main',
                           opacity: netSales ? 1 : 0.32,
                         }}
                       />
@@ -1116,11 +1116,11 @@ export default function PosSection() {
     ? postingQueue.filter((entry) => ['Hold', 'Failed'].includes(entry.status))
     : postingQueue
   const draftMetrics = [
-    { label: 'Hold', value: postingQueue.filter((entry) => entry.status === 'Hold').length, color: '#F2B76D' },
-    { label: 'Ready', value: postingQueue.filter((entry) => entry.status === 'Ready').length, color: '#A8C7FA' },
-    { label: 'Posting', value: postingQueue.filter((entry) => entry.status === 'Posting').length, color: '#CFC6EA' },
-    { label: 'Posted', value: postingQueue.filter((entry) => entry.status === 'Posted').length, color: '#70D6A7' },
-    { label: 'Failed', value: postingQueue.filter((entry) => entry.status === 'Failed').length, color: '#FF8A80' },
+    { label: 'Hold', value: postingQueue.filter((entry) => entry.status === 'Hold').length, color: 'warning.main' },
+    { label: 'Ready', value: postingQueue.filter((entry) => entry.status === 'Ready').length, color: 'primary.main' },
+    { label: 'Posting', value: postingQueue.filter((entry) => entry.status === 'Posting').length, color: 'secondary.main' },
+    { label: 'Posted', value: postingQueue.filter((entry) => entry.status === 'Posted').length, color: 'success.main' },
+    { label: 'Failed', value: postingQueue.filter((entry) => entry.status === 'Failed').length, color: 'error.main' },
   ]
   const reconciledDrafts = accountingDrafts.filter((draft) => (
     isSourceReady(textValue(draft, ['reconciliationStatus']))
@@ -1229,7 +1229,7 @@ export default function PosSection() {
   }
 
   return (
-    <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="#0F0F13">
+    <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="background.default">
       <Box
         sx={{
           px: { xs: 1.5, sm: 2, md: 3 },
@@ -1245,7 +1245,7 @@ export default function PosSection() {
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={1.5} mb={1.25}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={1} minWidth={0}>
-              <PointOfSaleRounded sx={{ color: '#A8C7FA', fontSize: 23, flexShrink: 0 }} />
+              <PointOfSaleRounded sx={{ color: 'primary.main', fontSize: 23, flexShrink: 0 }} />
               <Typography variant="h5" fontWeight={700} noWrap>POS</Typography>
               <Chip size="small" variant="outlined" label="Toast" sx={{ display: { xs: 'none', sm: 'inline-flex' } }} />
               {capabilities && !capabilities.canManage ? <Chip size="small" variant="outlined" label="Read only" /> : null}
@@ -1259,7 +1259,7 @@ export default function PosSection() {
               <IconButton
                 aria-label="Open POS guide"
                 onClick={() => setGuideOpen(true)}
-                sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', width: 40, height: 40 }}
+                sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', width: 40, height: 40 }}
               >
                 <HelpOutlineRounded fontSize="small" />
               </IconButton>
@@ -1270,7 +1270,7 @@ export default function PosSection() {
                   aria-label="Refresh POS data"
                   onClick={() => setRevision((value) => value + 1)}
                   disabled={loading}
-                  sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', width: 40, height: 40 }}
+                  sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', width: 40, height: 40 }}
                 >
                   {loading ? <CircularProgress size={18} /> : <RefreshRounded fontSize="small" />}
                 </IconButton>
@@ -1335,7 +1335,7 @@ export default function PosSection() {
         sx={{
           px: { xs: 1, md: 2 },
           minHeight: 44,
-          borderBottom: '1px solid rgba(255,255,255,0.08)',
+          borderBottom: 1, borderColor: 'divider',
           flexShrink: 0,
           '& .MuiTab-root': { minHeight: 44, textTransform: 'none', letterSpacing: 0, minWidth: 92 },
         }}
@@ -1360,12 +1360,12 @@ export default function PosSection() {
           ) : snapshot && view === 'overview' ? (
             <Stack spacing={2}>
               <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))', xl: 'repeat(6, minmax(0, 1fr))' }} gap={1.25}>
-                <Metric label="Net sales" value={money(netSales, true)} detail={`Gross ${money(grossSales, true)}`} color="#70D6A7" />
-                <Metric label="Orders" value={number(ordersCount)} detail={`${number(guestCount)} guests`} color="#A8C7FA" />
+                <Metric label="Net sales" value={money(netSales, true)} detail={`Gross ${money(grossSales, true)}`} color="success.main" />
+                <Metric label="Orders" value={number(ordersCount)} detail={`${number(guestCount)} guests`} color="primary.main" />
                 <Metric label="Average check" value={money(averageCheck)} detail="Per order" />
                 <Metric label="Guests" value={number(guestCount)} detail={ordersCount ? `${number(guestCount / ordersCount, 1)} per order` : 'No orders'} />
-                <Metric label="Discounts" value={money(discounts, true)} detail="Applied discounts" color="#F2B76D" />
-                <Metric label="Refunds" value={money(refunds, true)} detail="Returned sales" color={refunds ? '#FF8A80' : '#70D6A7'} />
+                <Metric label="Discounts" value={money(discounts, true)} detail="Applied discounts" color="warning.main" />
+                <Metric label="Refunds" value={money(refunds, true)} detail="Returned sales" color={refunds ? 'error.main' : 'success.main'} />
               </Box>
 
               <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1.55fr) minmax(280px, 0.45fr)' }} gap={2}>
@@ -1414,7 +1414,7 @@ export default function PosSection() {
                     <TableHead>
                       <TableRow>
                         {['Order', 'Business date', 'Location', 'Status', 'Checks', 'Total'].map((label, index) => (
-                          <TableCell key={label} align={index >= 4 ? 'right' : 'left'} sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{label}</TableCell>
+                          <TableCell key={label} align={index >= 4 ? 'right' : 'left'} sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{label}</TableCell>
                         ))}
                       </TableRow>
                     </TableHead>
@@ -1433,7 +1433,7 @@ export default function PosSection() {
                             role={id ? 'button' : undefined}
                             onClick={() => openOrder(order)}
                             onKeyDown={(event) => { if (id && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openOrder(order) } }}
-                            sx={{ cursor: id ? 'pointer' : 'default', '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}
+                            sx={{ cursor: id ? 'pointer' : 'default', '& td': { borderColor: 'divider' } }}
                           >
                             <TableCell>
                               <Box display="flex" alignItems="center" gap={0.65} flexWrap="wrap">
@@ -1473,8 +1473,8 @@ export default function PosSection() {
                         sx={{
                           width: '100%', minHeight: 78, px: 1.5, py: 1.25, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto',
                           gap: 1.25, textAlign: 'left', color: 'inherit', font: 'inherit', border: 0,
-                          borderBottom: '1px solid rgba(255,255,255,0.065)', bgcolor: 'transparent', cursor: id ? 'pointer' : 'default',
-                          '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' }, '&:disabled': { color: 'inherit' },
+                          borderBottom: 1, borderColor: 'divider', bgcolor: 'transparent', cursor: id ? 'pointer' : 'default',
+                          '&:hover': { bgcolor: 'action.hover' }, '&:disabled': { color: 'inherit' },
                         }}
                       >
                         <Box minWidth={0}>
@@ -1504,7 +1504,7 @@ export default function PosSection() {
                   </Box>
                 ) : null}
 
-                <Box sx={{ minHeight: 52, px: 1, py: 0.75, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: { xs: 0.5, sm: 1.25 }, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                <Box sx={{ minHeight: 52, px: 1, py: 0.75, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: { xs: 0.5, sm: 1.25 }, borderTop: 1, borderColor: 'divider' }}>
                   <TextField
                     select
                     label="Rows"
@@ -1560,7 +1560,7 @@ export default function PosSection() {
 
               <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: 'minmax(0, 1fr) minmax(280px, 0.42fr)' }} gap={2}>
                 <Box sx={{ ...panelSx, overflow: 'hidden' }}>
-                  <Box px={{ xs: 1.5, sm: 2 }} py={1.5} borderBottom="1px solid rgba(255,255,255,0.08)" display="flex" alignItems="center" justifyContent="space-between" gap={1}>
+                  <Box px={{ xs: 1.5, sm: 2 }} py={1.5} borderBottom={1} borderColor="divider" display="flex" alignItems="center" justifyContent="space-between" gap={1}>
                     <Box>
                       <Typography fontWeight={700}>Posting dates in range</Typography>
                       <Typography variant="caption" color="text.secondary">Select a row to load its exact location and business date</Typography>
@@ -1590,13 +1590,13 @@ export default function PosSection() {
                         sx={{
                           px: { xs: 1.5, sm: 2 },
                           py: 1.5,
-                          borderBottom: '1px solid rgba(255,255,255,0.065)',
-                          bgcolor: selected ? 'rgba(168,199,250,0.08)' : 'transparent',
-                          boxShadow: selected ? 'inset 3px 0 #A8C7FA' : 'none',
+                          borderBottom: 1, borderColor: 'divider',
+                          bgcolor: selected ? 'action.selected' : 'transparent',
+                          boxShadow: selected ? 'inset 3px 0 var(--mui-palette-primary-main)' : 'none',
                           cursor: 'pointer',
                           outline: 'none',
                           transition: 'background-color 120ms ease',
-                          '&:hover, &:focus-visible': { bgcolor: 'rgba(255,255,255,0.045)' },
+                          '&:hover, &:focus-visible': { bgcolor: 'action.hover' },
                         }}
                       >
                         <Box
@@ -1625,7 +1625,7 @@ export default function PosSection() {
                           <Box
                             mt={1.15}
                             pt={1.15}
-                            borderTop="1px solid rgba(255,255,255,0.055)"
+                            borderTop={1} borderColor="divider"
                             display="flex"
                             flexDirection={{ xs: 'column', sm: 'row' }}
                             alignItems={{ xs: 'stretch', sm: 'center' }}
@@ -1732,15 +1732,15 @@ export default function PosSection() {
             width: { xs: '100vw', sm: 560 },
             maxWidth: '100vw',
             height: '100dvh',
-            bgcolor: '#0F0F13',
-            borderLeft: '1px solid rgba(255,255,255,0.08)',
+            bgcolor: 'background.default',
+            borderLeft: 1, borderColor: 'divider',
             display: 'flex',
             flexDirection: 'column',
           },
         }}
       >
-        <Box sx={{ minHeight: { xs: 'calc(env(safe-area-inset-top) + 62px)', sm: 62 }, pt: { xs: 'env(safe-area-inset-top)', sm: 0 }, px: 2, display: 'flex', alignItems: 'center', gap: 1.25, borderBottom: '1px solid rgba(255,255,255,0.08)', flexShrink: 0 }}>
-          <PointOfSaleRounded sx={{ color: '#A8C7FA', flexShrink: 0 }} />
+        <Box sx={{ minHeight: { xs: 'calc(env(safe-area-inset-top) + 62px)', sm: 62 }, pt: { xs: 'env(safe-area-inset-top)', sm: 0 }, px: 2, display: 'flex', alignItems: 'center', gap: 1.25, borderBottom: 1, borderColor: 'divider', flexShrink: 0 }}>
+          <PointOfSaleRounded sx={{ color: 'primary.main', flexShrink: 0 }} />
           <Box minWidth={0} flex={1}>
             <Box display="flex" alignItems="center" gap={0.65} minWidth={0}>
               <Typography fontWeight={700} noWrap>{orderLabel(detail)}</Typography>
@@ -1806,7 +1806,7 @@ export default function PosSection() {
               const payments = recordList(firstValue(check, ['payments']))
               const checkStatus = displayStatus(textValue(check, ['status', 'paymentStatus'], booleanValue(check, ['voided']) ? 'Voided' : 'Open'))
               return (
-                <Box key={textValue(check, ['guid', 'id'], String(checkIndex))} sx={{ borderTop: checkIndex ? '1px solid rgba(255,255,255,0.08)' : 0, pt: checkIndex ? 2 : 0, pb: 2 }}>
+                <Box key={textValue(check, ['guid', 'id'], String(checkIndex))} sx={{ borderTop: checkIndex ? 1 : 0, borderColor: 'divider', pt: checkIndex ? 2 : 0, pb: 2 }}>
                   <Box display="flex" justifyContent="space-between" alignItems="center" gap={1.5} mb={1.25}>
                     <Box minWidth={0}>
                       <Typography variant="body2" fontWeight={700} noWrap>{textValue(check, ['displayNumber', 'checkNumber', 'name'], `Check ${checkIndex + 1}`)}</Typography>

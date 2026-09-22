@@ -39,7 +39,9 @@ export function isPostgresTaskStoreEnabled(): boolean {
 
 export async function readTasksFromPostgres(scope: TaskStoreScope): Promise<Task[]> {
   const result = await query<TaskRow>(
-    'SELECT payload, board_id::text FROM tasks WHERE board_id = $1::uuid ORDER BY updated_at DESC, created_at DESC, id ASC',
+    `SELECT payload, board_id::text FROM tasks WHERE board_id = $1::uuid
+     ${scope.includeCrmCards ? '' : "AND source <> 'crm-projection'"}
+     ORDER BY updated_at DESC, created_at DESC, id ASC`,
     [scope.boardId],
   )
   const tasks = result.rows.map((row) => ({ ...row.payload, boardId: row.board_id }))

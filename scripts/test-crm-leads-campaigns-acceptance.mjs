@@ -862,12 +862,34 @@ async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
     const leadRow = page.getByRole('row').filter({ hasText: records.lead.referenceCode })
     await leadRow.waitFor({ timeout: 60_000 })
     await leadRow.getByRole('cell').nth(1).click()
-    await page.getByText('Edit Lead', { exact: true }).waitFor()
-    await page.getByRole('region', { name: 'Converted records' }).waitFor()
-    await page.getByRole('region', { name: 'Related CRM activity' }).waitFor()
+    const editorDrawer = page.getByRole('dialog', { name: 'View Lead', exact: true })
+    await editorDrawer.waitFor()
+    await editorDrawer.getByText(
+      'This lead has been converted. Update the linked contact, organization, or opportunity instead.',
+      { exact: true },
+    ).waitFor()
+    const convertedRecords = editorDrawer.getByRole('region', { name: 'Converted records' })
+    await convertedRecords.waitFor()
+    await convertedRecords.getByText(records.conversion.result.contactReferenceCode, { exact: true }).waitFor()
+    await convertedRecords.getByText(records.conversion.result.opportunityReferenceCode, { exact: true }).waitFor()
+    await editorDrawer.getByRole('region', { name: 'Related CRM activity' }).waitFor()
+    assert.equal(await editorDrawer.getByRole('textbox', { name: /^Lead/ }).inputValue(), FIXTURES.lead.fullName)
+    assert.equal(await editorDrawer.getByRole('textbox', { name: 'Status', exact: true }).inputValue(), 'Converted')
+    const leadFields = editorDrawer.getByRole('textbox')
+    assert.ok(await leadFields.count() > 0, 'Converted lead must still show its original fields')
+    for (const field of await leadFields.all()) {
+      assert.equal(await field.isDisabled(), true, 'Converted lead fields must not remain editable')
+    }
+    for (const label of ['Organization', 'Owner']) {
+      // MUI Select's accessible name includes both its label and selected value.
+      const field = editorDrawer.getByRole('combobox', { name: new RegExp(`^${label}(?:\\s|$)`) })
+      assert.equal(await field.count(), 1, `Converted lead must show one ${label} selector`)
+      assert.equal(await field.isDisabled(), true, `Converted lead ${label} selector must be disabled`)
+    }
+    assert.equal(await editorDrawer.getByRole('checkbox', { name: 'Do not email', exact: true }).isDisabled(), true)
+    assert.equal(await editorDrawer.getByRole('button', { name: 'Save', exact: true }).count(), 0, 'Converted lead cannot be saved again')
+    assert.equal(await editorDrawer.getByRole('button', { name: 'Convert', exact: true }).count(), 0, 'Converted lead cannot be converted again')
 
-    const editorDrawer = page.getByLabel('Close editor')
-      .locator('xpath=ancestor::*[contains(@class,"MuiDrawer-paper")][1]')
     await page.waitForTimeout(450)
     const portraitGeometry = await editorDrawer.evaluate((drawer) => {
       const rect = drawer.getBoundingClientRect()

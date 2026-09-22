@@ -212,7 +212,7 @@ const MATON_APP_PATTERN = /^[a-z][a-z0-9-]{0,63}$/
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -843,7 +843,7 @@ export default function MatonIntegrationPanel({
         </Stack>
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="section" aria-labelledby="organization-communications-heading">
         <Stack
@@ -913,10 +913,10 @@ export default function MatonIntegrationPanel({
                 <Box
                   key={app}
                   sx={{
-                    border: '1px solid rgba(255,255,255,0.09)',
+                    border: '1px solid rgba(var(--cp-neutral-rgb),0.09)',
                     borderRadius: '8px',
                     p: 1.5,
-                    backgroundColor: '#171720',
+                    backgroundColor: 'background.default',
                   }}
                 >
                   <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" mb={1.25}>
@@ -1209,7 +1209,7 @@ export default function MatonIntegrationPanel({
         />
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="section" aria-labelledby="maton-account-heading">
         <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25}>
@@ -1245,7 +1245,7 @@ export default function MatonIntegrationPanel({
         </Box>
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="section" aria-labelledby="maton-key-heading">
         <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25} flexWrap="wrap" useFlexGap>
@@ -1296,7 +1296,7 @@ export default function MatonIntegrationPanel({
         ) : null}
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="section" aria-labelledby="maton-connections-heading">
         <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={1.25}>
@@ -1357,7 +1357,7 @@ export default function MatonIntegrationPanel({
                 const selectKey = `select-connection:${connection.connectionId}`
                 return (
                   <Box key={`${connection.app}:${connection.connectionId}:${index}`}>
-                    {index > 0 ? <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} /> : null}
+                    {index > 0 ? <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.07)' }} /> : null}
                     <Box
                       sx={{
                         display: 'grid',
@@ -1428,7 +1428,7 @@ export default function MatonIntegrationPanel({
         aria-describedby="disconnect-maton-description"
         fullWidth
         maxWidth="xs"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none', border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px' } }}
+        PaperProps={{ sx: { backgroundColor: 'background.paper', backgroundImage: 'none', border: '1px solid rgba(var(--cp-neutral-rgb),0.09)', borderRadius: '8px' } }}
       >
         <DialogTitle id="disconnect-maton-title" fontWeight={700}>Disconnect Maton?</DialogTitle>
         <DialogContent>

@@ -99,16 +99,17 @@ export default function PosGuideDialog({
       maxWidth="md"
       PaperProps={{
         sx: {
-          bgcolor: '#171821',
+          bgcolor: 'background.paper',
           backgroundImage: 'none',
-          border: fullScreen ? 0 : '1px solid rgba(255,255,255,0.09)',
+          border: fullScreen ? 0 : 1,
+          borderColor: 'divider',
           borderRadius: fullScreen ? 0 : '8px',
         },
       }}
     >
       <DialogTitle component="div" id="pos-guide-title" sx={{ pr: 7, pb: 1.25 }}>
         <Box display="flex" alignItems="center" gap={1}>
-          <PointOfSaleRounded sx={{ color: '#A8C7FA' }} />
+          <PointOfSaleRounded sx={{ color: 'primary.main' }} />
           <Box minWidth={0}>
             <Typography component="h2" variant="h6" fontWeight={700}>How POS works</Typography>
             <Typography variant="caption" color="text.secondary">
@@ -139,7 +140,7 @@ export default function PosGuideDialog({
         variant="scrollable"
         scrollButtons="auto"
         aria-label="POS guide sections"
-        sx={{ px: { xs: 1, sm: 2 }, borderTop: '1px solid rgba(255,255,255,0.07)' }}
+        sx={{ px: { xs: 1, sm: 2 }, borderTop: 1, borderColor: 'divider' }}
       >
         <Tab id="pos-guide-tab-start" aria-controls="pos-guide-panel-start" value="start" label="Start here" />
         <Tab id="pos-guide-tab-orders" aria-controls="pos-guide-panel-orders" value="orders" label="Orders" />
@@ -168,7 +169,7 @@ export default function PosGuideDialog({
             </Alert>
 
             <Box>
-              <GuideHeading icon={<SyncAltRounded sx={{ color: '#70D6A7' }} />}>The data path</GuideHeading>
+              <GuideHeading icon={<SyncAltRounded sx={{ color: 'success.main' }} />}>The data path</GuideHeading>
               <Typography variant="body2" color="text.secondary" mt={0.75}>
                 Toast read-only APIs feed organization-scoped ClawPilot projections. Orders power POS reporting and sales-backed accounting drafts. Approved connector workflows can later send reviewed changes to QuickBooks. When a manager enables catalog synchronization for a selected pipeline, QuickBooks customers and products can feed that organization&apos;s CRM catalogs.
               </Typography>
@@ -191,7 +192,7 @@ export default function PosGuideDialog({
 
         {section === 'orders' ? (
           <Stack spacing={2.25}>
-            <GuideHeading icon={<ReceiptLongRounded sx={{ color: '#A8C7FA' }} />}>Orders and checks</GuideHeading>
+            <GuideHeading icon={<ReceiptLongRounded sx={{ color: 'primary.main' }} />}>Orders and checks</GuideHeading>
             <GuideStep title="Search the server-backed order list">
               Search, date, and location filters run against the active organization&apos;s durable order projection. Pagination keeps large business days usable without loading every order into the browser.
             </GuideStep>
@@ -212,7 +213,7 @@ export default function PosGuideDialog({
 
         {section === 'reports' ? (
           <Stack spacing={2.25}>
-            <GuideHeading icon={<InsightsRounded sx={{ color: '#CFC6EA' }} />}>Operational reports</GuideHeading>
+            <GuideHeading icon={<InsightsRounded sx={{ color: 'secondary.main' }} />}>Operational reports</GuideHeading>
             <GuideStep title="Reconcile the day before analyzing trends">
               Sales summaries separate net sales, discounts, service charges, tax, tips, tenders, and refunds. Checks and payments provide the evidence behind the headline totals.
             </GuideStep>
@@ -230,7 +231,7 @@ export default function PosGuideDialog({
 
         {section === 'accounting' ? (
           <Stack spacing={2.25}>
-            <GuideHeading icon={<AccountBalanceRounded sx={{ color: '#F2B76D' }} />}>Accounting workflow</GuideHeading>
+            <GuideHeading icon={<AccountBalanceRounded sx={{ color: 'warning.main' }} />}>Accounting workflow</GuideHeading>
             <GuideStep title="Connect the correct QuickBooks company">
               The active ClawPilot business must be explicitly bound to its own QuickBooks company. Accounts, items, tax codes, classes, locations, customers, and vendors are refreshed into a read-only reference catalog.
             </GuideStep>

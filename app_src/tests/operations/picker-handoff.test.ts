@@ -7,6 +7,14 @@ const appSourceUrl = new URL('../../', import.meta.url)
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
+    // Match Next's server-runtime marker resolution without mocking any
+    // authorization function reached by the real persistence module.
+    if (specifier === 'server-only') {
+      return nextResolve(
+        new URL('node_modules/next/dist/compiled/server-only/empty.js', appSourceUrl).href,
+        context,
+      )
+    }
     if (specifier.startsWith('@/')) {
       const appPath = specifier.slice(2)
       return nextResolve(

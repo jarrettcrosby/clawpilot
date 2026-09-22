@@ -358,7 +358,7 @@ assertIncludes(dashboardBootstrap, 'Promise.allSettled([', 'parallel workspace b
 assert.ok(!dashboardBootstrap.includes('ensureUserBriefs'), 'prefetch cannot generate workspace documents')
 const homeClient = read('app_src/app/HomeClient.tsx')
 assertIncludes(homeClient, 'window.addEventListener(WORKSPACE_CHANGED_EVENT', 'workspace-scoped content refresh')
-assertIncludes(homeClient, 'key={`workspace-${workspaceRevision}`}', 'workspace-scoped content remount')
+assertIncludes(homeClient, 'key={`workspace-${workspaceRevision}-${JSON.stringify(moduleCapabilities)}`}', 'workspace and permission-scoped content remount')
 assertIncludes(homeClient, 'initialWorkspaceId={activeWorkspaceId}', 'prefetched workspace dashboard handoff')
 const dashboard = read('app_src/components/dashboard/DashboardSection.tsx')
 assertIncludes(dashboard, 'const independentResultsPromise = Promise.allSettled([', 'parallel dashboard loading')

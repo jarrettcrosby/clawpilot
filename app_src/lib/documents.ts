@@ -19,6 +19,7 @@ import {
 } from '@/lib/tenancy'
 import { configuredOwnerEmail, getAppUser, normalizeUserEmail, type AppUser } from '@/lib/users'
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import { moduleCapabilitiesForUser, requireModuleAccess } from '@/lib/moduleAuthorization'
 
 export type AppDocument = {
   id: string
@@ -563,18 +564,20 @@ export async function refreshUserBriefs(
   user: AppUser,
   selection: DocumentBriefSelection = {},
 ): Promise<void> {
+  const capabilities = moduleCapabilitiesForUser(user)
+  if (!capabilities.docs) return
   const ownerEmail = normalizeUserEmail(user.email)
   const organizationId = String(user.organizationId || '').trim()
   if (!organizationId) throw new Error('Active workspace is required for documents')
   const [board, pipeline] = await Promise.all([
-    resolveProjectBoardAccess({ actorEmail: user, boardId: selection.boardId })
+    capabilities.projects ? resolveProjectBoardAccess({ actorEmail: user, boardId: selection.boardId })
       .catch((error) => selection.boardId
         ? resolveProjectBoardAccess({ actorEmail: user })
-        : Promise.reject(error)),
-    resolvePipelineSpaceAccess({ actorEmail: user, pipelineId: selection.pipelineId })
+        : Promise.reject(error)) : null,
+    capabilities.crm ? resolvePipelineSpaceAccess({ actorEmail: user, pipelineId: selection.pipelineId })
       .catch((error) => selection.pipelineId
         ? resolvePipelineSpaceAccess({ actorEmail: user })
-        : Promise.reject(error)),
+        : Promise.reject(error)) : null,
   ])
   const releaseAccess = releaseAccessFor(user)
   const [
@@ -585,7 +588,7 @@ export async function refreshUserBriefs(
     engagementResult,
     activityResult,
   ] = await Promise.all([
-    query<TaskBriefRow>(
+    board ? query<TaskBriefRow>(
       `
         SELECT
           title,
@@ -604,9 +607,9 @@ export async function refreshUserBriefs(
           updated_at DESC
       `,
       [board.id],
-    ),
-    readPipelineProjectionForSpace(pipeline),
-    query<ReleaseBriefRow>(
+    ) : { rows: [] as TaskBriefRow[] },
+    pipeline ? readPipelineProjectionForSpace(pipeline) : null,
+    capabilities.versions ? query<ReleaseBriefRow>(
       `
         SELECT title, summary, deployed_at::text, features, fixes
         FROM (
@@ -621,9 +624,9 @@ export async function refreshUserBriefs(
         LIMIT 5
       `,
       [releaseAccess.historyScope === 'full', MEMBER_RELEASE_HISTORY_DAYS],
-    ),
-    listAiRadarItems(12),
-    query<PipelineEngagementBriefRow>(
+    ) : { rows: [] as ReleaseBriefRow[] },
+    capabilities.agents ? listAiRadarItems(12) : [],
+    pipeline ? query<PipelineEngagementBriefRow>(
       `
         SELECT
           opportunity.reference_code,
@@ -677,8 +680,8 @@ export async function refreshUserBriefs(
         ORDER BY opportunity.amount DESC, opportunity.updated_at DESC
       `,
       [pipeline.id],
-    ),
-    query<PipelineActivityBriefRow>(
+    ) : { rows: [] as PipelineEngagementBriefRow[] },
+    pipeline ? query<PipelineActivityBriefRow>(
       `
         SELECT
           count(*) FILTER (WHERE COALESCE(occurred_at, updated_at) >= now() - interval '30 days')::text AS total_30d,
@@ -694,7 +697,7 @@ export async function refreshUserBriefs(
         WHERE pipeline_id = $1::uuid
       `,
       [pipeline.id],
-    ),
+    ) : { rows: [] as PipelineActivityBriefRow[] },
   ])
 
   const now = new Date().toISOString()
@@ -731,15 +734,15 @@ export async function refreshUserBriefs(
     `Updated: ${now}`,
     '',
     '## Board Summary',
-    `Board: ${singleLine(board.name)}`,
+    `Board: ${singleLine(board?.name)}`,
     ...statusCounts.map(({ status, count }) => `- ${status}: ${count}`),
     '',
     '## Priority Work',
     markdownList(openTasks.slice(0, 10).map((task) => `${task.title} (${task.status}, ${task.priority})${task.next_action ? ` - Next: ${task.next_action}` : ''}`), 'No open work.'),
   ].join('\n')
 
-  const summary = pipelineProjection.summary || {}
-  const opportunities = Array.isArray(pipelineProjection.opportunities) ? pipelineProjection.opportunities : []
+  const summary = pipelineProjection?.summary || {}
+  const opportunities = Array.isArray(pipelineProjection?.opportunities) ? pipelineProjection.opportunities : []
   const activity = activityResult.rows[0] || {
     total_30d: '0', total_90d: '0', linked_30d: '0', email_30d: '0', call_30d: '0', meeting_30d: '0',
     inbound_30d: '0', outbound_30d: '0', failed_30d: '0',
@@ -787,9 +790,9 @@ export async function refreshUserBriefs(
     '',
     `Updated: ${now}`,
     '',
-    `Pipeline: ${singleLine(pipeline.name || 'My pipeline')}`,
-    `Source: ${pipelineSourceLabel(pipelineProjection.source)}`,
-    `Last synchronized: ${singleLine(pipelineProjection.syncedAt || 'Not synchronized')}`,
+    `Pipeline: ${singleLine(pipeline?.name || 'My pipeline')}`,
+    `Source: ${pipelineSourceLabel(pipelineProjection?.source)}`,
+    `Last synchronized: ${singleLine(pipelineProjection?.syncedAt || 'Not synchronized')}`,
     '',
     '## Summary',
     `- Opportunities: ${Number(summary.opportunities || 0)}`,
@@ -853,10 +856,10 @@ export async function refreshUserBriefs(
   ].join('\n')
 
   await Promise.all([
-    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:build-brief', source: 'system', kind: 'build-brief', status: 'generated', title: 'Build Brief', slug: 'build-brief', category: 'briefings', content: buildContent, tags: ['build', 'releases'], generatedAt: now }),
-    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:project-brief', source: 'system', kind: 'project-report', status: 'generated', title: 'Project Board Brief', slug: 'project-board-brief', category: 'projects', content: projectContent, tags: ['projects', 'tasks'], boardId: board.id, generatedAt: now }),
-    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }),
-    upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }),
+    board && capabilities.versions ? upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:build-brief', source: 'system', kind: 'build-brief', status: 'generated', title: 'Build Brief', slug: 'build-brief', category: 'briefings', content: buildContent, tags: ['build', 'releases'], generatedAt: now }) : null,
+    board ? upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:project-brief', source: 'system', kind: 'project-report', status: 'generated', title: 'Project Board Brief', slug: 'project-board-brief', category: 'projects', content: projectContent, tags: ['projects', 'tasks'], boardId: board.id, generatedAt: now }) : null,
+    pipeline ? upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:pipeline-brief', source: 'system', kind: 'pipeline-report', status: 'generated', title: 'Pipeline Brief', slug: 'pipeline-brief', category: 'pipeline', content: pipelineContent, tags: ['pipeline', 'report'], pipelineId: pipeline.id, generatedAt: now }) : null,
+    board && capabilities.agents ? upsertDocument({ ownerEmail, organizationId, sourceKey: 'system:ai-opportunity-radar', source: 'system', kind: 'research-radar', status: 'generated', title: 'AI and Opportunity Radar', slug: 'ai-opportunity-radar', category: 'radar', content: radarContent, tags: ['ai', 'research', 'opportunities'], generatedAt: now }) : null,
   ])
 }
 
@@ -898,16 +901,17 @@ export async function generateUserDocument(input: {
   boardId?: string | null
   pipelineId?: string | null
 }): Promise<{ id: string; title: string; slug: string }> {
+  requireModuleAccess(input.user, 'docs')
+  if (input.kind === 'pipeline-report') requireModuleAccess(input.user, 'crm')
+  else requireModuleAccess(input.user, 'projects')
+  if (input.kind === 'build-brief') requireModuleAccess(input.user, 'versions')
+  if (input.kind === 'research-radar') requireModuleAccess(input.user, 'agents')
   const ownerEmail = normalizeUserEmail(input.user.email)
   const organizationId = String(input.user.organizationId || '').trim()
   if (!organizationId) throw new Error('Active workspace is required for documents')
   if (!Object.hasOwn(GENERATED_SOURCE_KEYS, input.kind)) throw new Error('Unsupported document type')
 
-  const [board, pipeline] = await Promise.all([
-    resolveProjectBoardAccess({ actorEmail: input.user, boardId: input.boardId }),
-    resolvePipelineSpaceAccess({ actorEmail: input.user, pipelineId: input.pipelineId }),
-  ])
-  await refreshUserBriefs(input.user, { boardId: board.id, pipelineId: pipeline.id })
+  await refreshUserBriefs(input.user, { boardId: input.boardId, pipelineId: input.pipelineId })
 
   const template = await query<GeneratedDocumentTemplateRow>(
     `
@@ -964,6 +968,11 @@ export async function ensureUserBriefs(
   user: AppUser,
   selection: DocumentBriefSelection = {},
 ): Promise<void> {
+  const capabilities = moduleCapabilitiesForUser(user)
+  if (!capabilities.docs) return
+  // Restricted users can explicitly refresh their permitted briefs. Automatic
+  // all-brief provisioning must not resolve denied boards or pipelines.
+  if (!capabilities.projects || !capabilities.crm || !capabilities.versions || !capabilities.agents) return
   const ownerEmail = normalizeUserEmail(user.email)
   const organizationId = String(user.organizationId || '').trim()
   if (!organizationId) throw new Error('Active workspace is required for documents')
@@ -1196,6 +1205,8 @@ function toDocument(row: DocumentRow): AppDocument {
 }
 
 export async function listUserDocuments(user: AppUser, searchValue?: unknown): Promise<AppDocument[]> {
+  requireModuleAccess(user, 'docs')
+  const capabilities = moduleCapabilitiesForUser(user)
   const ownerEmail = normalizeUserEmail(user.email)
   const organizationId = String(user.organizationId || '').trim()
   if (!organizationId) throw new Error('Active workspace is required for documents')
@@ -1219,6 +1230,10 @@ export async function listUserDocuments(user: AppUser, searchValue?: unknown): P
       FROM app_documents
       WHERE owner_email = $1
         AND workspace_organization_id = $2::uuid
+        AND ($6::boolean OR (board_id IS NULL AND kind NOT IN ('project-report', 'build-brief', 'research-radar')))
+        AND ($7::boolean OR (pipeline_id IS NULL AND kind <> 'pipeline-report'))
+        AND ($8::boolean OR kind <> 'build-brief')
+        AND ($9::boolean OR kind <> 'research-radar')
         AND (
           $3 = ''
           OR search_vector @@ websearch_to_tsquery('english'::regconfig, $3)
@@ -1253,7 +1268,7 @@ export async function listUserDocuments(user: AppUser, searchValue?: unknown): P
         updated_at DESC,
         title ASC
     `,
-    [ownerEmail, organizationId, search, semantic?.vector || null, semantic?.model || ''],
+    [ownerEmail, organizationId, search, semantic?.vector || null, semantic?.model || '', capabilities.projects, capabilities.crm, capabilities.versions, capabilities.agents],
   )
   return result.rows.map(toDocument)
 }

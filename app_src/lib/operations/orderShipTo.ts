@@ -38,6 +38,15 @@ export type OrderShipToIssue = Readonly<{
   code: 'required' | 'invalid_format'
 }>
 
+const SHIP_TO_FIELD_LABELS: Record<OrderShipToIssue['field'], string> = {
+  name: 'recipient name',
+  line1: 'address',
+  city: 'city',
+  region: 'state / province',
+  postalCode: 'postal code',
+  country: 'country code',
+}
+
 const REQUIRED_FIELDS: ReadonlyArray<Exclude<OrderShipToField, 'line2'>> = [
   'name',
   'line1',
@@ -107,6 +116,33 @@ export function orderShipToReadiness(
   return orderShipToIssues(value).length === 0
     ? 'carrier_ready'
     : 'incomplete'
+}
+
+function sentenceList(values: string[]) {
+  if (values.length <= 1) return values[0] || ''
+  if (values.length === 2) return `${values[0]} and ${values[1]}`
+  return `${values.slice(0, -1).join(', ')}, and ${values.at(-1)}`
+}
+
+export function orderShipToIssueSummary(
+  value: OrderShipToDraft,
+): string | null {
+  const issues = orderShipToIssues(value)
+  if (!issues.length) return null
+  const missing = issues
+    .filter((issue) => issue.code === 'required')
+    .map((issue) => SHIP_TO_FIELD_LABELS[issue.field])
+  const messages = missing.length
+    ? [`Needed for rates: ${sentenceList(missing)}.`]
+    : []
+  if (issues.some((issue) => (
+    issue.field === 'country' && issue.code === 'invalid_format'
+  ))) {
+    messages.push(
+      'Country code must use a 2-letter ISO code (for example, US).',
+    )
+  }
+  return messages.join(' ')
 }
 
 export function orderShipToStorageValue(

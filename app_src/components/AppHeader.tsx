@@ -26,6 +26,8 @@ import KeyboardRounded from '@mui/icons-material/KeyboardRounded'
 import InfoRounded from '@mui/icons-material/InfoRounded'
 import LogoutRounded from '@mui/icons-material/LogoutRounded'
 import GroupRounded from '@mui/icons-material/GroupRounded'
+import PaletteOutlined from '@mui/icons-material/PaletteOutlined'
+import AppearancePreference from '@/components/AppearancePreference'
 import ActivityLogPage from '@/components/activity/ActivityLogPage'
 import ShortcutsModal from '@/components/help/ShortcutsModal'
 import UserAccessDialog from '@/components/settings/UserAccessDialog'
@@ -86,6 +88,7 @@ export default function AppHeader({
     events: ActivityPreview[]
   }>({ workspaceRevision: 0, events: [] })
   const [helpAnchor, setHelpAnchor] = useState<null | HTMLElement>(null)
+  const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [health, setHealth] = useState<{ status: string; errors: string[] }>({ status: 'ok', errors: [] })
   const [healthAnchor, setHealthAnchor] = useState<null | HTMLElement>(null)
@@ -171,7 +174,7 @@ export default function AppHeader({
     }
   }, [onShortcutsOpen])
 
-  const label = title || MODULE_LABELS[activeSection] || activeSection
+  const label = title || MODULE_LABELS[activeSection.split('/')[0]] || activeSection
 
   function openShortcuts() {
     setHelpAnchor(null)
@@ -196,7 +199,7 @@ export default function AppHeader({
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         px: { xs: 2, md: 3 }, py: 1.25,
         pt: { xs: 'calc(env(safe-area-inset-top) + 10px)', md: 1.25 },
-        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
         flexShrink: 0,
         minHeight: { xs: 'calc(env(safe-area-inset-top) + 52px)', md: 52 },
         '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
@@ -217,11 +220,11 @@ export default function AppHeader({
               onClick={onOpenMobileNav}
               sx={{
                 display: { xs: 'inline-flex', md: 'none' },
-                color: 'rgba(255,255,255,0.55)',
+                color: 'rgba(var(--cp-neutral-rgb),0.55)',
                 p: 1,
                 minWidth: 48,
                 minHeight: 48,
-                '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' },
+                '&:hover': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' },
               }}
             >
               <MenuRounded sx={{ fontSize: 22 }} />
@@ -236,11 +239,11 @@ export default function AppHeader({
               onClick={onToggleDesktopNav}
               sx={{
                 display: { xs: 'none', md: 'inline-flex' },
-                color: 'rgba(255,255,255,0.55)',
+                color: 'rgba(var(--cp-neutral-rgb),0.55)',
                 p: 1,
                 minWidth: 48,
                 minHeight: 48,
-                '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' },
+                '&:hover': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' },
               }}
             >
               <MenuRounded sx={{ fontSize: 22 }} />
@@ -260,7 +263,7 @@ export default function AppHeader({
                 size="small"
                 label={`${runtimeInfo.lane}:${runtimeInfo.port}`}
                 onClick={(e) => setRuntimeAnchor(e.currentTarget)}
-                sx={{ display: { xs: 'none', sm: 'inline-flex' }, height: 22, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.12)', color: '#A8C7FA', border: '1px solid rgba(168,199,250,0.3)' }}
+                sx={{ display: { xs: 'none', sm: 'inline-flex' }, height: 22, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)', color: 'var(--mui-palette-primary-main)', border: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.3)' }}
               />
             </Tooltip>
           )}
@@ -289,7 +292,7 @@ export default function AppHeader({
             <IconButton
               onClick={(e) => setHelpAnchor(e.currentTarget)}
               aria-label="Settings"
-              sx={{ color: 'rgba(255,255,255,0.45)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: '#CFC6EA', backgroundColor: 'rgba(207,198,234,0.08)' } }}
+              sx={{ color: 'rgba(var(--cp-neutral-rgb),0.45)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: 'var(--mui-palette-secondary-main)', backgroundColor: 'rgba(207,198,234,0.08)' } }}
             >
               <SettingsRounded sx={{ fontSize: 22 }} />
             </IconButton>
@@ -300,7 +303,7 @@ export default function AppHeader({
             <IconButton
               onClick={() => setDrawerOpen(true)}
               aria-label="Activity log"
-              sx={{ color: unreadCount > 0 ? '#A8C7FA' : 'rgba(255,255,255,0.60)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}
+              sx={{ color: unreadCount > 0 ? 'var(--mui-palette-primary-main)' : 'rgba(var(--cp-neutral-rgb),0.60)', p: { xs: 1.5, md: 1 }, minWidth: 48, minHeight: 48, '&:hover': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}
             >
               <Badge
                 badgeContent={unreadCount}
@@ -322,7 +325,7 @@ export default function AppHeader({
         transformOrigin={{ vertical: 'top', horizontal: 'right' }}
         PaperProps={{
           sx: {
-            backgroundColor: '#1A1A23',
+            backgroundColor: 'var(--mui-palette-background-paper)',
             border: `1px solid ${health.status === 'ok' ? 'rgba(102,187,106,0.3)' : 'rgba(239,83,80,0.3)'}`,
             borderRadius: 2, p: 2, maxWidth: 360, mt: 0.5,
           }
@@ -350,12 +353,21 @@ export default function AppHeader({
         transformOrigin={{ horizontal: 'right', vertical: 'top' }}
         anchorOrigin={{ horizontal: 'right', vertical: 'bottom' }}
         PaperProps={{
-          sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, minWidth: 200, mt: 0.5 }
+          sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 2, minWidth: 200, mt: 0.5 }
         }}
       >
+        <MenuItem onClick={() => { setHelpAnchor(null); setUserAccessOpen(true) }} sx={{ py: 1.25 }}>
+          <ListItemIcon sx={{ minWidth: 36 }}><GroupRounded fontSize="small" /></ListItemIcon>
+          <ListItemText primary="Profile & workspace settings" secondary="Your profile, people and integrations" />
+        </MenuItem>
+        <MenuItem onClick={() => { setHelpAnchor(null); setAppearanceOpen(true) }} sx={{ py: 1.25 }}>
+          <ListItemIcon sx={{ minWidth: 36 }}><PaletteOutlined fontSize="small" /></ListItemIcon>
+          <ListItemText primary="Appearance" secondary="Light, dark or device setting" />
+        </MenuItem>
+        <Divider />
         <MenuItem
           onClick={() => { setHelpAnchor(null); setBuildOpen(true) }}
-          sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' } }}
+          sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)' } }}
         >
           <ListItemIcon sx={{ minWidth: 36 }}>
             <InfoRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
@@ -368,7 +380,7 @@ export default function AppHeader({
           />
         </MenuItem>
 
-        <MenuItem onClick={openShortcuts} sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' } }}>
+        <MenuItem onClick={openShortcuts} sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)' } }}>
           <ListItemIcon sx={{ minWidth: 36 }}>
             <KeyboardRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
           </ListItemIcon>
@@ -380,45 +392,36 @@ export default function AppHeader({
           />
         </MenuItem>
 
-        <MenuItem
-          onClick={() => { setHelpAnchor(null); setUserAccessOpen(true) }}
-          sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' } }}
-        >
-          <ListItemIcon sx={{ minWidth: 36 }}>
-            <GroupRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
-          </ListItemIcon>
-          <ListItemText
-            primary="Workspace settings"
-            secondary="Profile, access and sharing"
-            primaryTypographyProps={{ variant: 'body2', color: 'text.primary' }}
-            secondaryTypographyProps={{ variant: 'caption', color: 'text.disabled' }}
-          />
-        </MenuItem>
-
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
+        <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
         <MenuItem onClick={async () => {
           setHelpAnchor(null)
           try { await fetch('/api/auth/logout', { method: 'POST' }) } catch {}
           window.location.href = '/login'
-        }} sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' } }}>
+        }} sx={{ py: 1.25, '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)' } }}>
           <ListItemIcon sx={{ minWidth: 36 }}>
             <LogoutRounded sx={{ fontSize: 18, color: 'text.secondary' }} />
           </ListItemIcon>
           <ListItemText
             primary="Log out"
-            secondary="End local session"
+            secondary="Sign out of this browser"
             primaryTypographyProps={{ variant: 'body2', color: 'text.primary' }}
             secondaryTypographyProps={{ variant: 'caption', color: 'text.disabled' }}
           />
         </MenuItem>
       </Menu>
 
+      <Dialog open={appearanceOpen} onClose={() => setAppearanceOpen(false)} fullWidth maxWidth="xs" aria-labelledby="appearance-title">
+        <DialogTitle id="appearance-title">Appearance</DialogTitle>
+        <DialogContent sx={{ pt: '12px !important' }}><AppearancePreference /></DialogContent>
+        <DialogActions><Button onClick={() => setAppearanceOpen(false)}>Done</Button></DialogActions>
+      </Dialog>
+
       {/* Build info */}
       <Dialog
         open={buildOpen}
         onClose={() => setBuildOpen(false)}
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 3, width: { xs: '92vw', sm: 520 } } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 3, width: { xs: '92vw', sm: 520 } } }}
       >
         <DialogTitle sx={{ color: 'text.primary', fontWeight: 700 }}>Build info</DialogTitle>
         <DialogContent>
@@ -456,7 +459,7 @@ export default function AppHeader({
         onClose={() => setRuntimeAnchor(null)}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
         transformOrigin={{ vertical: 'top', horizontal: 'left' }}
-        PaperProps={{ sx: { p: 1.5, backgroundColor: '#12141C', border: '1px solid rgba(255,255,255,0.08)' } }}
+        PaperProps={{ sx: { p: 1.5, backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' } }}
       >
         <Typography variant="caption" color="text.secondary" display="block">Lane: {runtimeInfo?.lane || 'unknown'}</Typography>
         <Typography variant="caption" color="text.secondary" display="block">Port: {runtimeInfo?.port || 'unknown'}</Typography>
@@ -478,8 +481,8 @@ export default function AppHeader({
             width: { xs: '100vw', sm: 560 },
             maxWidth: '100vw',
             height: '100dvh',
-            backgroundColor: '#0F0F13',
-            borderLeft: '1px solid rgba(255,255,255,0.08)',
+            backgroundColor: 'var(--mui-palette-background-default)',
+            borderLeft: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
           }
         }}
       >

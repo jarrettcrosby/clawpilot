@@ -310,7 +310,7 @@ export default function ReceivingPanel({ workspace, onRefresh }: Props) {
         </Stack>
 
         {!workspace?.inboundReceipts?.length ? (
-          <Box sx={{ py: 7, textAlign: 'center', borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+          <Box sx={{ py: 7, textAlign: 'center', borderTop: '1px solid', borderColor: 'divider' }}>
             <MoveToInboxRounded sx={{ fontSize: 38, color: 'text.disabled' }} />
             <Typography sx={{ mt: 1 }} fontWeight={700}>No inbound receipts</Typography>
             <Typography variant="body2" color="text.secondary">

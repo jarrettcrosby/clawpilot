@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v5'
+  'clawpilot-production-rebind-target-schema-attestation-v6'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -38,6 +38,14 @@ export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({
     filename: '0359_operations_commerce_fulfillment_recovery_budget.sql',
     checksum: 'f1ff432cb7e8af0ca83e87db75d1a6372a74fb25fcff1648c2d07eb7b3e54e11',
+  }),
+  Object.freeze({
+    filename: '0370_verified_login_email.sql',
+    checksum: 'f41d34e7fb00df0f688238e8ce851074a2861efd6103a5fc5a2e5e7e24b8cb44',
+  }),
+  Object.freeze({
+    filename: '0371_organization_web_domains.sql',
+    checksum: 'caedcbe05a2af7c88d5a17c9373d206c24a4b48dd37b43bfdd1e67dd379da416',
   }),
 ])
 
@@ -99,8 +107,8 @@ const PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
 // versions. Each supported major is therefore exercised against the complete
 // migration chain and enrolled explicitly. Unknown majors fail closed.
 const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: 'e8e3ce7233e3c33e22064e4833f93dffff7ea6d585fdb55bfe69f602cf2665d2',
-  18: '048935a6dca7fbe7c79850f7a326cda075eb2aa1720865f6dccdb9534be66bfe',
+  16: '77741d50693a7e652606937398f7fb66507371a3ab9bfc4d4b63b684178c7aa2',
+  18: '0501ba51ff372ea79c083f4c21de8a89c8f1d98ccea962701c0dc37be671196f',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -714,7 +722,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349 and 0353 through 0359',
+      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0371',
     )
   }
   if (

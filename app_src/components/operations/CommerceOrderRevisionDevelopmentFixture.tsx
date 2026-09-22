@@ -188,9 +188,9 @@ export default function CommerceOrderRevisionDevelopmentFixture() {
           style={{
             minWidth: 0,
             padding: '20px',
-            border: '1px solid rgba(255,255,255,0.14)',
+            border: '1px solid var(--mui-palette-divider)',
             borderRadius: '10px',
-            background: '#17171f',
+            background: 'var(--mui-palette-background-paper)',
           }}
         >
           <h2 style={{ margin: 0, fontSize: '1.05rem' }}>{scenario.title}</h2>

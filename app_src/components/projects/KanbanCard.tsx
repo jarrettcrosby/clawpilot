@@ -72,15 +72,15 @@ export default function KanbanCard({ task }: Props) {
           openDrawer(task.id)
         }}
         sx={{
-          backgroundColor: '#1A1A23',
+          backgroundColor: 'var(--mui-palette-background-paper)',
           border: '1px solid',
           borderColor: isDragging
-            ? 'rgba(168,199,250,0.4)'
+            ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.4)'
             : isFocused
-              ? 'rgba(168,199,250,0.6)'
-              : 'rgba(255,255,255,0.06)',
+              ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.6)'
+              : 'rgba(var(--cp-neutral-rgb),0.06)',
           boxShadow: isFocused
-            ? '0 0 0 2px rgba(168,199,250,0.15)'
+            ? '0 0 0 2px rgba(var(--mui-palette-primary-mainChannel) / 0.15)'
             : isDragging
               ? '0 8px 24px rgba(0,0,0,0.4)'
               : 'none',
@@ -88,7 +88,7 @@ export default function KanbanCard({ task }: Props) {
           touchAction: 'auto',
           cursor: 'pointer',
           transition: 'border-color 0.15s, box-shadow 0.15s',
-          '&:hover': { borderColor: isFocused ? 'rgba(168,199,250,0.6)' : 'rgba(168,199,250,0.2)' },
+          '&:hover': { borderColor: isFocused ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.6)' : 'rgba(var(--mui-palette-primary-mainChannel) / 0.2)' },
         }}>
 
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, mb: 1 }}>
@@ -97,11 +97,11 @@ export default function KanbanCard({ task }: Props) {
             <Box {...listeners} {...attributes}
               onClick={e => e.stopPropagation()}
               sx={{
-                color: 'rgba(255,255,255,0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: 'rgba(var(--cp-neutral-rgb),0.25)', display: 'flex', alignItems: 'center', justifyContent: 'center',
                 cursor: 'grab', '&:active': { cursor: 'grabbing' }, mr: 0.5,
                 touchAction: 'none',
                 minWidth: { xs: 40, md: 28 }, minHeight: { xs: 40, md: 28 }, borderRadius: 1.5,
-                '&:hover': { color: 'rgba(255,255,255,0.6)', backgroundColor: 'rgba(255,255,255,0.05)' },
+                '&:hover': { color: 'rgba(var(--cp-neutral-rgb),0.6)', backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)' },
               }}>
               <DragIndicatorRounded sx={{ fontSize: { xs: 22, md: 18 } }} />
             </Box>
@@ -113,7 +113,7 @@ export default function KanbanCard({ task }: Props) {
             <IconButton
               size="small"
               onClick={e => { e.stopPropagation(); openDrawer(task.id) }}
-              sx={{ p: 0.5, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}
+              sx={{ p: 0.5, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}
             >
               <OpenInFullRounded sx={{ fontSize: 14 }} />
             </IconButton>
@@ -139,11 +139,11 @@ export default function KanbanCard({ task }: Props) {
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
           {task.crm && (
             <Chip size="small" label={task.crm.entity === 'organizations' ? 'Organization' : 'Contact'} variant="outlined"
-              sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(168,199,250,0.3)', color: '#A8C7FA', borderRadius: 1 }} />
+              sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.3)', color: 'var(--mui-palette-primary-main)', borderRadius: 1 }} />
           )}
           {showCategoryChip && (
             <Chip size="small" label={displayCategory(task.category)} variant="outlined"
-              sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />
+              sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.1)', color: 'text.disabled', borderRadius: 1 }} />
           )}
           {!isCrmCard && (
             <Chip size="small" label={PRIORITY_LABELS[task.priority]}
@@ -152,16 +152,16 @@ export default function KanbanCard({ task }: Props) {
         </Box>
 
         {/* Assignee + Due Date */}
-        {!isCrmCard && <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+        {!isCrmCard && <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1, pt: 1, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.05)' }}>
           {task.assignedAgent ? (() => {
               const assigned = task.assignedAgent
               const p = PEOPLE.find(x => x.id === assigned || x.name === assigned)
-              const color = p?.color || '#A8C7FA'
+              const color = p?.color || 'var(--mui-palette-primary-main)'
               const initials = p?.initials || String(assigned).slice(0, 2).toUpperCase()
               const label = p?.name || assigned
               return (
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                  <Box sx={{ width: 18, height: 18, borderRadius: '50%', backgroundColor: color + '22', border: `1px solid ${color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Box sx={{ width: 18, height: 18, borderRadius: '50%', backgroundColor: `color-mix(in srgb, ${color} 13%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 27%, transparent)`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     <Typography sx={{ color, fontWeight: 700, fontSize: '0.52rem', lineHeight: 1 }}>{initials}</Typography>
                   </Box>
                   <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.68rem' }}>{label}</Typography>
@@ -169,7 +169,7 @@ export default function KanbanCard({ task }: Props) {
               )
           })() : (
             <Tooltip title="Assign task">
-              <IconButton size="small" onClick={(e) => { e.stopPropagation(); setAssignAnchor(e.currentTarget) }} sx={{ p: 0.3, color: 'rgba(255,255,255,0.45)', '&:hover': { color: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+              <IconButton size="small" onClick={(e) => { e.stopPropagation(); setAssignAnchor(e.currentTarget) }} sx={{ p: 0.3, color: 'rgba(var(--cp-neutral-rgb),0.45)', '&:hover': { color: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>
                 <PersonAddAlt1Rounded sx={{ fontSize: 15 }} />
               </IconButton>
             </Tooltip>
@@ -179,7 +179,7 @@ export default function KanbanCard({ task }: Props) {
               const now = new Date()
               const isOverdue = due < now
               const isSoon = !isOverdue && (due.getTime() - now.getTime()) < 2 * 24 * 60 * 60 * 1000
-              const color = isOverdue ? '#EF5350' : isSoon ? '#FFA726' : 'rgba(255,255,255,0.35)'
+              const color = isOverdue ? '#EF5350' : isSoon ? '#FFA726' : 'rgba(var(--cp-neutral-rgb),0.35)'
               const label = due.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
               return (
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
@@ -201,10 +201,10 @@ export default function KanbanCard({ task }: Props) {
                 px: 0.75,
                 py: 0.35,
                 borderRadius: 1,
-                border: '1px solid rgba(168,199,250,0.35)',
-                color: '#A8C7FA',
+                border: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.35)',
+                color: 'var(--mui-palette-primary-main)',
                 fontSize: '0.66rem',
-                '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' },
               }}
             >
               <ForumRounded sx={{ fontSize: 12 }} />
@@ -220,8 +220,8 @@ export default function KanbanCard({ task }: Props) {
           const pct = Math.round((done / total) * 100)
           return (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 0.75 }}>
-              <Box sx={{ flex: 1, height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
-                <Box sx={{ height: '100%', width: `${pct}%`, backgroundColor: pct === 100 ? '#66BB6A' : '#A8C7FA', borderRadius: 2, transition: 'width 0.3s' }} />
+              <Box sx={{ flex: 1, height: 3, borderRadius: 2, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.08)', overflow: 'hidden' }}>
+                <Box sx={{ height: '100%', width: `${pct}%`, backgroundColor: pct === 100 ? '#66BB6A' : 'var(--mui-palette-primary-main)', borderRadius: 2, transition: 'width 0.3s' }} />
               </Box>
               <Typography variant="caption" sx={{ color: 'text.disabled', fontSize: '0.62rem', whiteSpace: 'nowrap' }}>{done}/{total}</Typography>
             </Box>
@@ -234,7 +234,7 @@ export default function KanbanCard({ task }: Props) {
         anchorEl={assignAnchor}
         onClose={() => setAssignAnchor(null)}
         anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
-        PaperProps={{ sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, p: 0.5, minWidth: 170 } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 2, p: 0.5, minWidth: 170 } }}
       >
         {PEOPLE.filter((p) => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map((p) => (
           <MenuItem key={p.id} onClick={() => assignTo(p.id)} sx={{ fontSize: '0.8rem' }}>{p.name}</MenuItem>

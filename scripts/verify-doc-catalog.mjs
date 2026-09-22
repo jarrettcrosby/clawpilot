@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
@@ -62,6 +63,8 @@ const allowedCorePlugins = new Set([
   'tag-pane',
   'properties',
   'templates',
+  'bookmarks',
+  'bases',
 ])
 
 function parseDocument(source, path) {
@@ -148,6 +151,28 @@ const vaultMap = vaultDocuments.find((document) => document.relativePath === 'do
 assert.ok(vaultMap, 'docs/README.md is missing')
 assert.equal(vaultMap.metadata.status, 'active', 'docs/README.md must be active')
 assert.equal(vaultMap.metadata.app_visible, false, 'docs/README.md must remain vault-only')
+const vaultPaths = new Set(vaultDocuments.map(({ relativePath }) => relativePath))
+const vaultLinks = new Map(vaultDocuments.map((document) => [
+  document.relativePath,
+  relativeLinks(document.source)
+    .map((link) => repoPath(resolve(dirname(document.absolutePath), link)))
+    .filter((target) => vaultPaths.has(target)),
+]))
+const reachableVaultPaths = new Set([vaultMap.relativePath])
+const pendingVaultPaths = [vaultMap.relativePath]
+while (pendingVaultPaths.length > 0) {
+  const source = pendingVaultPaths.shift()
+  for (const target of vaultLinks.get(source) || []) {
+    if (reachableVaultPaths.has(target)) continue
+    reachableVaultPaths.add(target)
+    pendingVaultPaths.push(target)
+  }
+}
+const unreachableVaultPaths = vaultDocuments
+  .map(({ relativePath }) => relativePath)
+  .filter((relativePath) => !reachableVaultPaths.has(relativePath))
+assert.equal(unreachableVaultPaths.length, 0,
+  `non-template vault notes are unreachable from docs/README.md: ${unreachableVaultPaths.join(', ')}`)
 const index = readFileSync(resolve(repo, 'docs/index.md'), 'utf8')
 for (const relativePath of requiredCurrentDocuments) {
   const target = relativePath.replace(/^docs\//, '')
@@ -186,28 +211,47 @@ for (const document of visibleDocuments) {
   assert.ok([...sources].some((source) => mocPaths.has(source)), `${document.relativePath} is not connected from a Map of Content`)
 }
 
-const obsidianApp = JSON.parse(readFileSync(resolve(repo, '.obsidian/app.json'), 'utf8'))
+const obsidianDirectory = resolve(repo, 'docs/.obsidian')
+const obsidianApp = JSON.parse(readFileSync(resolve(obsidianDirectory, 'app.json'), 'utf8'))
 assert.equal(obsidianApp.alwaysUpdateLinks, true, 'Obsidian must update internal links after note moves')
-assert.equal(obsidianApp.newFileFolderPath, 'docs', 'new Obsidian notes must default to docs/')
+assert.equal(obsidianApp.newFileFolderPath, 'inbox', 'new Obsidian notes must default to docs/inbox/')
 assert.equal(obsidianApp.useMarkdownLinks, true, 'Obsidian must preserve portable Markdown links')
-const corePlugins = JSON.parse(readFileSync(resolve(repo, '.obsidian/core-plugins.json'), 'utf8'))
-assert.ok(Array.isArray(corePlugins), 'Obsidian core plugins must be an array')
+assert.equal(obsidianApp.newLinkFormat, 'relative', 'Obsidian links must be relative')
+const corePluginConfig = JSON.parse(readFileSync(resolve(obsidianDirectory, 'core-plugins.json'), 'utf8'))
+assert.ok(Array.isArray(corePluginConfig) || (corePluginConfig && typeof corePluginConfig === 'object'),
+  'Obsidian core plugins must be an array or an enabled-state object')
+const corePlugins = Array.isArray(corePluginConfig)
+  ? corePluginConfig
+  : Object.entries(corePluginConfig).filter(([, enabled]) => enabled === true).map(([plugin]) => plugin)
 for (const plugin of corePlugins) assert.ok(allowedCorePlugins.has(plugin), `unexpected Obsidian core plugin: ${plugin}`)
 assert.ok(corePlugins.includes('templates'), 'Obsidian templates must be enabled')
-const templates = JSON.parse(readFileSync(resolve(repo, '.obsidian/templates.json'), 'utf8'))
-assert.equal(templates.folder, 'docs/templates', 'Obsidian templates must use docs/templates')
+const templates = JSON.parse(readFileSync(resolve(obsidianDirectory, 'templates.json'), 'utf8'))
+assert.equal(templates.folder, 'templates', 'Obsidian templates must use docs/templates')
 for (const template of ['decision-record.md', 'module-contract.md', 'incident.md', 'research-note.md']) {
   assert.ok(existsSync(resolve(repo, 'docs/templates', template)), `missing Obsidian template ${template}`)
 }
 for (const forbiddenPath of [
-  '.obsidian/workspace.json',
-  '.obsidian/workspace-mobile.json',
-  '.obsidian/community-plugins.json',
-  '.obsidian/plugins',
+  'docs/.obsidian/community-plugins.json',
+  'docs/.obsidian/plugins',
 ]) {
-  assert.ok(!existsSync(resolve(repo, forbiddenPath)), `${forbiddenPath} must not be committed`)
+  assert.ok(!existsSync(resolve(repo, forbiddenPath)), `${forbiddenPath} must not be in the portable vault`)
 }
-assert.ok(statSync(resolve(repo, '.obsidian/.gitignore')).isFile(), '.obsidian/.gitignore is required')
+assert.ok(statSync(resolve(obsidianDirectory, '.gitignore')).isFile(), 'docs/.obsidian/.gitignore is required')
+const portableConfigFiles = new Set([
+  'docs/.obsidian/.gitignore',
+  'docs/.obsidian/app.json',
+  'docs/.obsidian/appearance.json',
+  'docs/.obsidian/core-plugins.json',
+  'docs/.obsidian/graph.json',
+  'docs/.obsidian/templates.json',
+])
+const trackedObsidianFiles = execFileSync('git', ['ls-files', '--', 'docs/.obsidian'], {
+  cwd: repo,
+  encoding: 'utf8',
+}).trim().split('\n').filter(Boolean)
+for (const trackedPath of trackedObsidianFiles) {
+  assert.ok(portableConfigFiles.has(trackedPath), `${trackedPath} is non-portable Obsidian state and must not be tracked`)
+}
 
 const releases = JSON.parse(readFileSync(resolve(repo, 'docs/releases/catalog.json'), 'utf8'))
 const defaultRelease = releases?.releases?.default
@@ -218,4 +262,4 @@ assert.ok(Array.isArray(defaultRelease?.fixes) && defaultRelease.fixes.length > 
 assert.equal(defaultRelease?.oncePerEnvironment, true, 'default release copy must be one-time per environment')
 
 const edgeCount = [...inbound.values()].reduce((count, sources) => count + sources.size, 0)
-console.log(`PASS verify-doc-catalog (${currentDocuments.length} current, ${visibleDocuments.length} indexed, ${edgeCount} graph edges, ${corePlugins.length} portable core plugins)`)
+console.log(`PASS verify-doc-catalog (${currentDocuments.length} current, ${visibleDocuments.length} indexed, ${reachableVaultPaths.size} vault notes reachable, ${edgeCount} graph edges, ${corePlugins.length} portable core plugins)`)

@@ -39,6 +39,7 @@ const users = runTypeScript('app_src/lib/users.ts', {
 const authorization = runTypeScript('app_src/lib/operations/authorization.ts', {
   '@/lib/users': users,
 })
+const moduleAccess = runTypeScript('app_src/lib/moduleAccess.ts', {})
 
 class TestPersistenceError extends Error {
   constructor(code, message, status = 400) {
@@ -350,18 +351,30 @@ assert.match(migration, /FOREIGN KEY \(organization_id, order_id, ad_hoc_order_l
 for (const key of ['viewShipping', 'createShipments', 'purchaseLivePostage']) {
   assert.ok(accessUi.includes(`key: '${key}'`), `User Access UI is missing ${key}`)
 }
-assert.match(
-  accessUi,
-  /key === 'purchaseLivePostage' && enabled[\s\S]*next\.viewShipping = true[\s\S]*next\.createShipments = true/,
+const postageEnabled = moduleAccess.modulePermissionDependencies(
+  { viewShipping: false, createShipments: false, purchaseLivePostage: false },
+  'purchaseLivePostage',
+  true,
 )
-assert.match(
-  accessUi,
-  /key === 'createShipments' && !enabled\) next\.purchaseLivePostage = false/,
+assert.equal(postageEnabled.viewShipping, true)
+assert.equal(postageEnabled.createShipments, true)
+assert.equal(postageEnabled.purchaseLivePostage, true)
+const shipmentCreationDisabled = moduleAccess.modulePermissionDependencies(
+  { viewShipping: true, createShipments: true, purchaseLivePostage: true },
+  'createShipments',
+  false,
 )
-assert.match(
-  accessUi,
-  /key === 'viewShipping' && !enabled[\s\S]*next\.purchaseLivePostage = false/,
+assert.equal(shipmentCreationDisabled.viewShipping, true)
+assert.equal(shipmentCreationDisabled.createShipments, false)
+assert.equal(shipmentCreationDisabled.purchaseLivePostage, false)
+const shippingViewDisabled = moduleAccess.modulePermissionDependencies(
+  { viewShipping: true, createShipments: true, purchaseLivePostage: true },
+  'viewShipping',
+  false,
 )
+assert.equal(shippingViewDisabled.viewShipping, false)
+assert.equal(shippingViewDisabled.createShipments, false)
+assert.equal(shippingViewDisabled.purchaseLivePostage, false)
 for (const fragment of [
   'What are you shipping?',
   'Existing inventory',

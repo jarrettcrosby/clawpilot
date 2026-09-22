@@ -3,6 +3,7 @@ import type { Page } from '@playwright/test'
 
 type ShortLinkRecord = {
   id: string
+  publicDomain?: 'eigenracing' | 'bpo'
   shortUrl: string
   slug: string
   destinationUrl: string
@@ -22,9 +23,11 @@ type ApiState = {
   posts: Array<Record<string, unknown>>
   patches: Array<Record<string, unknown>>
   deletes: string[]
+  defaultDomain: 'eigenracing' | 'bpo'
+  preferences: Array<Record<string, unknown>>
 }
 
-async function installShortLinksApi(page: Page): Promise<ApiState> {
+async function installShortLinksApi(page: Page, bpoAvailable = true, defaultDomain: 'eigenracing' | 'bpo' = 'eigenracing'): Promise<ApiState> {
   const now = Date.now()
   const state: ApiState = {
     records: [
@@ -62,12 +65,22 @@ async function installShortLinksApi(page: Page): Promise<ApiState> {
     posts: [],
     patches: [],
     deletes: [],
+    defaultDomain,
+    preferences: [],
   }
 
   await page.route('**/api/shortlinks**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
     const method = request.method()
+
+    if (url.pathname === '/api/shortlinks/preferences' && method === 'PUT') {
+      const body = request.postDataJSON() as Record<string, unknown>
+      state.preferences.push(body)
+      state.defaultDomain = body.defaultDomain === 'bpo' ? 'bpo' : 'eigenracing'
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, defaultDomain: state.defaultDomain }) })
+      return
+    }
 
     if (method === 'GET') {
       const query = (url.searchParams.get('q') || '').toLowerCase()
@@ -79,7 +92,17 @@ async function installShortLinksApi(page: Page): Promise<ApiState> {
           && (!tag || record.tags.includes(tag))
           && (!status || record.status === status)
       })
-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, records }) })
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        ok: true,
+        records,
+        currentOwnerEmail: 'operator@example.test',
+        canManageOrganization: true,
+        defaultDomain: bpoAvailable ? state.defaultDomain : 'eigenracing',
+        availableDomains: [
+          { key: 'eigenracing', label: 'eigenracing.com' },
+          ...(bpoAvailable ? [{ key: 'bpo', label: 'bposupplychain.com' }] : []),
+        ],
+      }) })
       return
     }
 
@@ -89,9 +112,11 @@ async function installShortLinksApi(page: Page): Promise<ApiState> {
       const durationHours = typeof body.durationHours === 'number' ? body.durationHours : null
       const maxClicks = typeof body.maxClicks === 'number' ? body.maxClicks : null
       const slug = String(body.slug || `generated-${state.records.length + 1}`)
+      const publicDomain = body.publicDomain === 'bpo' ? 'bpo' : 'eigenracing'
       const record: ShortLinkRecord = {
         id: `link-${state.records.length + 1}`,
-        shortUrl: `https://go.clawpilot.test/${slug}`,
+        publicDomain,
+        shortUrl: publicDomain === 'bpo' ? `https://bposupplychain.com/s/${slug}` : `https://go.clawpilot.test/${slug}`,
         slug,
         destinationUrl: String(body.destinationUrl),
         title: String(body.title),
@@ -240,4 +265,77 @@ test('short links: mobile navigation and controls stay contained', async ({ page
 
   const dimensions = await page.evaluate(() => ({ viewport: window.innerWidth, document: document.documentElement.scrollWidth }))
   expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport)
+})
+
+test('short links: BPO domain selection is per-link and unavailable until enabled', async ({ page }) => {
+  const api = await installShortLinksApi(page)
+  await page.goto('/#links')
+  test.skip(await page.getByTestId('nav-desktop-links').count() === 0, 'Short-link UI requires PostgreSQL')
+
+  await page.getByTestId('create-short-link').click()
+  await page.getByLabel('Short URL domain').click()
+  await page.getByRole('option', { name: 'bposupplychain.com' }).click()
+  await page.getByLabel('Destination URL').fill('https://example.com/bpo-campaign')
+  await page.getByLabel('Custom slug').fill('bpo-campaign')
+  await page.getByRole('button', { name: 'Create link' }).click()
+  await expect(page.getByTestId('short-link-link-3')).toContainText('bposupplychain.com/s/bpo-campaign')
+  expect(api.posts.at(-1)?.publicDomain).toBe('bpo')
+
+  await page.getByRole('button', { name: 'Edit bpo-campaign' }).click()
+  await expect(page.getByLabel('Short URL domain')).toBeDisabled()
+  await page.getByRole('button', { name: 'Cancel' }).click()
+
+  const gatedPage = await page.context().newPage()
+  await installShortLinksApi(gatedPage, false)
+  await gatedPage.goto('/#links')
+  await gatedPage.getByTestId('create-short-link').click()
+  await gatedPage.getByLabel('Short URL domain').click()
+  await expect(gatedPage.getByRole('option', { name: 'bposupplychain.com' })).toHaveCount(0)
+})
+
+test('short links: saved workspace default persists independently of each new link', async ({ page }) => {
+  const api = await installShortLinksApi(page, true, 'bpo')
+  await page.goto('/#links')
+  test.skip(await page.getByTestId('nav-desktop-links').count() === 0, 'Short-link UI requires PostgreSQL')
+  await expect(page.getByLabel('Default short-link domain')).toContainText('bposupplychain.com')
+  await expect(page.getByRole('button', { name: 'Save default', exact: true })).toBeDisabled()
+
+  await page.getByTestId('create-short-link').click()
+  await expect(page.getByLabel('Short URL domain', { exact: true })).toContainText('bposupplychain.com')
+  await page.getByLabel('Short URL domain', { exact: true }).click()
+  await page.getByRole('option', { name: 'eigenracing.com', exact: true }).click()
+  await page.getByLabel('Destination URL').fill('https://example.com/one-off-eigen')
+  await page.getByRole('button', { name: 'Create link', exact: true }).click()
+  await expect(page.getByTestId('short-link-link-3')).toBeVisible()
+  expect(api.posts.at(-1)?.publicDomain).toBe('eigenracing')
+  expect(api.preferences).toHaveLength(0)
+  await page.getByTestId('create-short-link').click()
+  await expect(page.getByLabel('Short URL domain', { exact: true })).toContainText('bposupplychain.com')
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+
+  await page.getByLabel('Default short-link domain').click()
+  await page.getByRole('option', { name: 'eigenracing.com', exact: true }).click()
+  await page.getByRole('button', { name: 'Save default', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Save default', exact: true })).toBeDisabled()
+  expect(api.preferences).toEqual([{ defaultDomain: 'eigenracing' }])
+  await page.reload()
+  await page.getByTestId('create-short-link').click()
+  await expect(page.getByLabel('Short URL domain', { exact: true })).toContainText('eigenracing.com')
+})
+
+test('short links: workspace changes discard drafts and reload its default', async ({ page }) => {
+  const api = await installShortLinksApi(page, true, 'bpo')
+  await page.goto('/#links')
+  test.skip(await page.getByTestId('nav-desktop-links').count() === 0, 'Short-link UI requires PostgreSQL')
+  await page.getByTestId('create-short-link').click()
+  await page.getByLabel('Destination URL').fill('https://example.com/old-workspace-draft')
+  api.defaultDomain = 'eigenracing'
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('clawpilot:workspace-changed', {
+    detail: { organizationId: '22222222-2222-4222-8222-222222222222', organizationName: 'Another workspace' },
+  })))
+  await expect(page.getByRole('dialog', { name: 'Create short link' })).toHaveCount(0)
+  await page.goto('/#links')
+  await page.getByTestId('create-short-link').click()
+  await expect(page.getByLabel('Destination URL')).toHaveValue('')
+  await expect(page.getByLabel('Short URL domain', { exact: true })).toContainText('eigenracing.com')
 })

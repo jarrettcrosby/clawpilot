@@ -29,7 +29,7 @@ export default function KanbanColumn({ status, label, color, tasks, fullWidth }:
           {label}
         </Typography>
         <Chip size="small" label={tasks.length}
-          sx={{ height: 18, fontSize: '0.65rem', ml: 'auto', backgroundColor: 'rgba(255,255,255,0.06)', color: 'text.disabled', borderRadius: 1 }} />
+          sx={{ height: 18, fontSize: '0.65rem', ml: 'auto', backgroundColor: 'rgba(var(--cp-neutral-rgb),0.06)', color: 'text.disabled', borderRadius: 1 }} />
       </Box>
 
       <Box ref={setNodeRef} sx={{
@@ -37,14 +37,14 @@ export default function KanbanColumn({ status, label, color, tasks, fullWidth }:
         WebkitOverflowScrolling: 'touch',
         // allow horizontal gestures to bubble to board scroller when starting on cards/column
         touchAction: 'auto',
-        backgroundColor: isOver ? 'rgba(168,199,250,0.04)' : 'transparent',
-        border: isOver ? '1px dashed rgba(168,199,250,0.2)' : '1px dashed transparent',
+        backgroundColor: isOver ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.04)' : 'transparent',
+        border: isOver ? '1px dashed rgba(var(--mui-palette-primary-mainChannel) / 0.2)' : '1px dashed transparent',
         minHeight: 80,
         scrollbarWidth: 'thin',
-        scrollbarColor: 'rgba(168,199,250,0.28) transparent',
+        scrollbarColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.28) transparent',
         '&::-webkit-scrollbar': { width: 8 },
         '&::-webkit-scrollbar-track': { background: 'transparent' },
-        '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(168,199,250,0.28)', borderRadius: 8, border: '2px solid transparent', backgroundClip: 'padding-box' },
+        '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.28)', borderRadius: 8, border: '2px solid transparent', backgroundClip: 'padding-box' },
       }}>
         <SortableContext items={tasks.map(t => t.id)} strategy={verticalListSortingStrategy}>
           {tasks.map(task => <KanbanCard key={task.id} task={task} />)}

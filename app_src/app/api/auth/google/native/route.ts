@@ -65,6 +65,8 @@ export async function POST(req: NextRequest) {
       email: actor.email,
       authMethod: 'google_sso',
       headers: req.headers,
+      verifiedLoginEmail: identity.email,
+      verifiedGoogleSubject: identity.subject,
       organizationId: actor.organizationId,
     })
     const response = json({ ok: true })

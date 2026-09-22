@@ -146,7 +146,7 @@ for (const fragment of [
   assert.ok(securityPanel.includes(fragment), `security UI missing ${fragment}`)
 }
 const shell = read('app_src/app/HomeClient.tsx')
-assert.ok(shell.includes('<SessionGuard enabled={sessionGuardEnabled} />'))
+assert.ok(shell.includes('<SessionGuard key={`session-${workspaceRevision}`} enabled={sessionGuardEnabled} onSession={receiveSession} onUnavailable={reportAccessUnavailable} />'))
 assert.ok(shell.includes('<ImpersonationBanner />'))
 const sessionGuard = read('app_src/components/auth/SessionGuard.tsx')
 assert.ok(sessionGuard.includes('if (!enabled) return'), 'local auth-disabled runtime must not redirect through SessionGuard')

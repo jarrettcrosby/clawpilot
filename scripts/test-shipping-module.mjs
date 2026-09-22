@@ -56,8 +56,9 @@ assert.match(
   'Shipping must be a standalone top-level module with its own submodules',
 )
 assertIncludes(navigation, [
-  '(flyout?.item.children || []).map',
-  "`${flyout?.item.label || 'Module'} submodules`",
+  "const visibleFlyout = items.some((item) => item.id === flyout?.item.id) ? flyout : null",
+  '(visibleFlyout?.item.children || []).map',
+  "`${visibleFlyout?.item.label || 'Module'} submodules`",
 ], 'Collapsed navigation flyout')
 assert.doesNotMatch(
   section(navigation, '<Menu', '</Menu>', 'Collapsed navigation flyout'),
@@ -97,6 +98,13 @@ assertIncludes(shippingSection, [
   'standaloneOneOffExecutionEligible',
   'One-off pack and postage',
   'canCreateShipments={Boolean(workspace?.capabilities.canCreate)}',
+  'Search shipment records',
+  'Sort shipment records',
+  'Shipment record pages',
+  'No shipments match this search',
+  "' · Tracking '",
+  'Refreshing shipping records…',
+  'Shipping data could not be loaded',
 ], 'Shipping module')
 assertIncludes(shippingExecutionPanel, [
   "action: 'confirm-pack'",

@@ -14,6 +14,7 @@ for (const fragment of [
   'Used for this ClawPilot shipment',
   'Ready for rates',
   'Ship-to needed for rates',
+  'orderShipToIssueSummary',
   'Store address',
   "fetch('/api/operations/shipment-address'",
   'expectedOrderRowVersion',

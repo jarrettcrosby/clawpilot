@@ -248,7 +248,7 @@ export default function VersionsSection() {
             value={tab}
             onChange={(_, value: 'releases' | 'checkpoints') => setTab(value)}
             aria-label="Release history views"
-            sx={{ mb: 3, borderBottom: '1px solid rgba(255,255,255,0.08)' }}
+            sx={{ mb: 3, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}
           >
             <Tab value="releases" label={localHistory ? 'Commits' : 'Release Notes'} sx={{ textTransform: 'none', color: 'text.secondary' }} />
             {canManageBackups && (
@@ -270,8 +270,8 @@ export default function VersionsSection() {
                     px: 1.5,
                     py: 1.25,
                     mb: 2,
-                    backgroundColor: 'rgba(168,199,250,0.08)',
-                    borderLeft: '3px solid #A8C7FA',
+                    backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)',
+                    borderLeft: '3px solid var(--mui-palette-primary-main)',
                   }}
                 >
                   <Typography variant="body2" color="text.secondary">
@@ -302,7 +302,7 @@ export default function VersionsSection() {
                           borderRadius: 1,
                           fontSize: '0.68rem',
                           backgroundColor: 'rgba(207,198,234,0.10)',
-                          color: '#CFC6EA',
+                          color: 'var(--mui-palette-secondary-main)',
                         }}
                       />
                       <Chip
@@ -314,8 +314,8 @@ export default function VersionsSection() {
                           borderRadius: 1,
                           fontSize: '0.68rem',
                           fontFamily: 'monospace',
-                          backgroundColor: 'rgba(168,199,250,0.10)',
-                          color: '#A8C7FA',
+                          backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.10)',
+                          color: 'var(--mui-palette-primary-main)',
                         }}
                       />
                       {release.branch && (
@@ -345,7 +345,7 @@ export default function VersionsSection() {
                     )}
                   </Box>
                   {index < payload.releases.length - 1 && (
-                    <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
+                    <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
                   )}
                 </Box>
               ))}
@@ -369,7 +369,7 @@ export default function VersionsSection() {
                     aria-label="Create data checkpoint"
                     onClick={openCheckpointDialog}
                     disabled={creatingCheckpoint}
-                    sx={{ color: '#A8C7FA', flexShrink: 0 }}
+                    sx={{ color: 'var(--mui-palette-primary-main)', flexShrink: 0 }}
                   >
                     {creatingCheckpoint ? <CircularProgress size={20} /> : <AddRounded />}
                   </IconButton>
@@ -407,7 +407,7 @@ export default function VersionsSection() {
                           minHeight: 22,
                           borderRadius: 1,
                           fontSize: '0.68rem',
-                          backgroundColor: 'rgba(255,255,255,0.06)',
+                          backgroundColor: 'rgba(var(--cp-neutral-rgb),0.06)',
                           color: 'text.secondary',
                         }}
                       />
@@ -435,7 +435,7 @@ export default function VersionsSection() {
                     </Typography>
                   </Box>
                   {index < checkpoints.length - 1 && (
-                    <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
+                    <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
                   )}
                 </Box>
               ))}
@@ -454,8 +454,8 @@ export default function VersionsSection() {
         fullScreen={shortLandscape}
         PaperProps={{
           sx: {
-            backgroundColor: '#1A1A23',
-            border: '1px solid rgba(255,255,255,0.08)',
+            backgroundColor: 'var(--mui-palette-background-paper)',
+            border: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
             borderRadius: shortLandscape ? 0 : 1,
           },
         }}

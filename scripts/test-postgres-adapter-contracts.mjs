@@ -1032,7 +1032,12 @@ assertIncludes(crmWriteRoute, 'providerIdentities', 'visible CRM provider identi
 assertIncludes(crmWriteRoute, 'calendarOwnerEmail', 'meeting Calendar organizer persistence')
 
 const crmReferenceRoute = read('app_src/app/crm/[reference]/route.ts')
-assertIncludes(crmReferenceRoute, "new URL('/', appPublicUrl())", 'trusted public CRM reference redirect origin')
+assertIncludes(crmReferenceRoute, "new URL('/', appBrowserReturnUrl(req))", 'allowlisted request-host CRM reference redirect origin')
+const publicUrlHelper = read('app_src/lib/publicUrl.ts')
+assertIncludes(publicUrlHelper, 'canonicalOrigin: appPublicUrl()', 'canonical CRM redirect fallback')
+assertIncludes(publicUrlHelper, 'additionalOrigins: additionalPublicOrigins(', 'environment-scoped CRM redirect allowlist')
+const publicOriginRouting = read('app_src/lib/publicOriginRouting.mjs')
+assertIncludes(publicOriginRouting, 'forwarded && allowed.has(forwarded) ? forwarded : input.canonicalOrigin', 'untrusted CRM redirect host fallback')
 assertIncludes(crmReferenceRoute, 'resolveCrmReferenceRoute', 'legacy CRM reference alias and pipeline resolution')
 assertIncludes(crmReferenceRoute, 'resolved.pipelineId', 'CRM reference inferred owning pipeline handoff')
 assertIncludes(crmReferenceRoute, "destination.searchParams.set('pipeline', pipelineId)", 'CRM reference owning pipeline handoff')
