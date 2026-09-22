@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs'
 import { architectureHarness, root } from './lib/architecture-test-harness.mjs'
 
 const { state, metadata, viewer } = architectureHarness()
+const applicationPackage = JSON.parse(readFileSync(`${root}/package.json`, 'utf8'))
+assert.equal(applicationPackage.engines.node, '>=24 <25', 'Railway must build the architecture viewer with the tested Node 24 runtime, not its former Node 20 minimum')
+assert.equal(readFileSync(`${root}/.nvmrc`, 'utf8').trim(), '24', 'Local runtime selection matches hosted builds and CI')
 const request = new Request('http://localhost/api/settings/architecture/viewer')
 const owner = { ...state.actor }
 const session = { ...state.session }

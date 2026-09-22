@@ -139,9 +139,9 @@ export default function DocViewer({ doc, loading }: Props) {
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', backgroundColor: 'var(--mui-palette-background-default)', overflow: 'hidden' }}>
 
-      <Box sx={{
+      <Box data-testid="docs-reader-header" sx={{
         px: { xs: 2, sm: 3, md: 5 }, pt: { xs: 2.5, md: 4 }, pb: 3,
-        backgroundColor: 'rgba(15,15,19,0.96)',
+        backgroundColor: 'background.paper',
         backdropFilter: 'blur(12px)',
         borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
         flexShrink: 0,
@@ -212,10 +212,10 @@ export default function DocViewer({ doc, loading }: Props) {
               h1: ({ children }) => <Typography variant="h4" fontWeight={700} sx={{ mt: 4, mb: 2, color: 'text.primary', lineHeight: 1.3 }}>{children}</Typography>,
               h2: ({ children }) => <Typography variant="h5" fontWeight={600} sx={{ mt: 3.5, mb: 1.5, color: 'text.primary' }}>{children}</Typography>,
               h3: ({ children }) => <Typography variant="h6" fontWeight={600} sx={{ mt: 3, mb: 1, color: 'text.primary' }}>{children}</Typography>,
-              p: ({ children }) => <Typography variant="body1" sx={{ mb: 2, color: 'rgba(228,225,236,0.85)', lineHeight: 1.85 }}>{applyIcons(children as ReactNode)}</Typography>,
+              p: ({ children }) => <Typography variant="body1" sx={{ mb: 2, color: 'text.primary', lineHeight: 1.85 }}>{applyIcons(children as ReactNode)}</Typography>,
               ul: ({ children }) => <Box component="ul" sx={{ mb: 2, pl: 3, '& li': { mb: 0.75 } }}>{children}</Box>,
               ol: ({ children }) => <Box component="ol" sx={{ mb: 2, pl: 3, '& li': { mb: 0.75 } }}>{children}</Box>,
-              li: ({ children }) => <Typography component="li" variant="body1" sx={{ color: 'rgba(228,225,236,0.85)', lineHeight: 1.75 }}>{applyIcons(children as ReactNode)}</Typography>,
+              li: ({ children }) => <Typography component="li" variant="body1" sx={{ color: 'text.primary', lineHeight: 1.75 }}>{applyIcons(children as ReactNode)}</Typography>,
               strong: ({ children }) => <Box component="strong" sx={{ color: 'text.primary', fontWeight: 700 }}>{children}</Box>,
               blockquote: ({ children }) => (
                 <Box component="blockquote" sx={{ borderLeft: '3px solid var(--mui-palette-primary-main)', pl: 2.5, ml: 0, my: 2.5, color: 'text.secondary', fontStyle: 'italic' }}>
@@ -237,7 +237,7 @@ export default function DocViewer({ doc, loading }: Props) {
                 </Box>
               ),
               thead: ({ children }) => <Box component="thead" sx={{ '& th': { borderBottom: '2px solid rgba(var(--cp-neutral-rgb),0.1)', pb: 1, pr: 3, textAlign: 'left', color: 'text.secondary', fontWeight: 600, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.06em' } }}>{children}</Box>,
-              td: ({ children }) => <Box component="td" sx={{ py: 1.5, pr: 3, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.05)', color: 'rgba(228,225,236,0.75)', verticalAlign: 'top' }}>{applyIcons(children as ReactNode)}</Box>,
+              td: ({ children }) => <Box component="td" sx={{ py: 1.5, pr: 3, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.05)', color: 'text.secondary', verticalAlign: 'top' }}>{applyIcons(children as ReactNode)}</Box>,
               hr: () => <Divider sx={{ my: 3.5, borderColor: 'rgba(var(--cp-neutral-rgb),0.07)' }} />,
               a: ({ href, children }) => <Box component="a" href={repositoryLink(doc!, href)} sx={{ color: 'var(--mui-palette-primary-main)', textDecoration: 'none', borderBottom: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.3)', '&:hover': { borderBottomColor: 'var(--mui-palette-primary-main)' } }}>{children}</Box>,
             }}

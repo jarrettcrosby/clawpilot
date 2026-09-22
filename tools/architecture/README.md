@@ -6,7 +6,8 @@ route is live. Review the evidence links in
 [`docs/architecture/clawpilot-likec4.md`](../../docs/architecture/clawpilot-likec4.md)
 before changing a relationship or status label.
 
-From this directory, with Node.js 22.22.3 or newer:
+From this directory, with Node.js 24 (the supported application and CI runtime;
+see the repository `.nvmrc`):
 
 ```bash
 npm run build

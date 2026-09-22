@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { resolveWearablePendingConfirmationState } from '../../lib/operations/wearablePicking.ts'
+import { moduleAccessFromPermissions, modulePermissionDependencies } from '../../lib/moduleAccess.ts'
 
 const root = new URL('../../', import.meta.url)
 const read = (path: string) => readFileSync(new URL(path, root), 'utf8')
@@ -833,7 +834,35 @@ test('picker setup and UPH use durable Operations evidence', () => {
   assert.match(persistence, /EXTRACT\(epoch FROM completed_at - assigned_at\)/)
   assert.match(migration, /ADD COLUMN IF NOT EXISTS assigned_at timestamptz/)
   assert.match(people, /label: 'Picker access'/)
-  assert.match(people, /next\.viewOperations = true/)
+  assert.match(people, /modulePermissionDependencies\(\s*user\.permissions,\s*key,\s*event\.target\.checked,/)
+})
+
+test('picker permission changes preserve the shared Operations view dependency without granting unrelated access', () => {
+  const initial = {
+    viewOperations: false,
+    executeWarehouse: false,
+    manageOperations: false,
+    viewShipping: false,
+    viewAccounting: false,
+  }
+  const enabled = modulePermissionDependencies(initial, 'executeWarehouse', true)
+  assert.equal(enabled.executeWarehouse, true)
+  assert.equal(enabled.viewOperations, true, 'Picker access must also grant the view needed to load assigned work')
+  assert.equal(moduleAccessFromPermissions(enabled).operations, true)
+  assert.equal(enabled.manageOperations, false, 'Picker access does not grant Operations management')
+  assert.equal(enabled.viewShipping, false)
+  assert.equal(enabled.viewAccounting, false)
+  assert.equal(initial.viewOperations, false, 'Toggling a draft must not mutate the original saved permission object')
+  assert.equal(initial.executeWarehouse, false)
+
+  const disabledView = modulePermissionDependencies({ ...enabled, manageOperations: true }, 'viewOperations', false)
+  assert.equal(disabledView.executeWarehouse, false, 'Removing Operations view must remove dependent Picker access')
+  assert.equal(disabledView.manageOperations, false)
+  assert.equal(moduleAccessFromPermissions(disabledView).operations, false)
+
+  const disabledPicker = modulePermissionDependencies(enabled, 'executeWarehouse', false)
+  assert.equal(disabledPicker.executeWarehouse, false)
+  assert.equal(disabledPicker.viewOperations, true, 'Removing Picker access must not revoke independently granted Operations viewing')
 })
 
 test('mobile app gates workflows behind the shared ClawPilot session', () => {

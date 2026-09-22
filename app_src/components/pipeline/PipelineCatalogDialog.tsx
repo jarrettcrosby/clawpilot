@@ -462,7 +462,7 @@ export default function PipelineCatalogDialog({
       fullScreen={fullScreen}
       fullWidth
       maxWidth="md"
-      PaperProps={{ sx: { bgcolor: '#16161E', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: fullScreen ? 0 : 1, maxHeight: fullScreen ? '100dvh' : 'min(820px, 92dvh)' } }}
+      PaperProps={{ sx: { bgcolor: 'background.paper', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: fullScreen ? 0 : 1, maxHeight: fullScreen ? '100dvh' : 'min(820px, 92dvh)' } }}
     >
       <DialogTitle sx={{ px: { xs: 2, sm: 3 }, py: 2 }}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>

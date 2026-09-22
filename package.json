@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "ClawPilot command center web app and local operating surface.",
   "engines": {
-    "node": ">=20"
+    "node": ">=24 <25"
   },
   "scripts": {
     "dev": "npm --prefix app_src run dev -- --hostname 0.0.0.0 --port ${PORT:-4002}",
@@ -167,7 +167,7 @@
     "test:commerce-product-name-reconciliation": "node scripts/reconcile-ag-alchemy-commerce-product-names.mjs --self-test",
     "test:cartonization-preview": "node scripts/test-cartonization-preview.mjs",
     "test:ui-controls": "node scripts/test-ui-control-layout.mjs && node scripts/test-commerce-sales-channel-catalog-ui.mjs && node scripts/test-shopify-inventory-location-routing-ui.mjs && npm run test:customer-ux",
-    "test:customer-ux": "node scripts/test-appearance-ux-ui.mjs && node scripts/test-accounting-ux-ui.mjs",
+    "test:customer-ux": "node scripts/test-appearance-ux-ui.mjs && node scripts/test-theme-surface-readability-ui.mjs && node scripts/test-accounting-ux-ui.mjs",
     "test:carrier-sandbox-label": "node scripts/test-carrier-sandbox-label.mjs",
     "test:carrier-rate-test-labels": "node scripts/test-carrier-rate-test-labels.mjs && node scripts/test-carrier-rate-test-sample-close.mjs",
     "test:carrier-shipping-diagnostics": "node scripts/test-carrier-shipping-account-diagnostics.mjs && node scripts/test-carrier-shipping-diagnostic-actions.mjs && node scripts/test-carrier-shipping-diagnostic-health.mjs && node scripts/test-carrier-shipping-account-diagnostics-postgres.mjs",
