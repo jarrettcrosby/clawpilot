@@ -1,0 +1,145 @@
+// Hand-curated architecture snapshot, not runtime discovery.
+// Evidence: docs/maps/platform-data-map.md; docs/modules/crm-and-reporting.md;
+// docs/modules/toast-and-accounting.md; docs/modules/user-integrations.md;
+// docs/operations/infrastructure-and-cost-control-register.md;
+// docs/operations/bpo-public-domains.md. Review dates/status before reuse.
+
+specification {
+  element actor
+  element system
+  element component
+}
+
+model {
+  operator = actor 'ClawPilot operator'
+
+  production = system 'ClawPilot Railway production' {
+    description 'Active production environment; separate app, Postgres, SuiteCRM, MariaDB, and optimizer services.'
+    app = component 'ClawPilot Next.js app' {
+      description 'Authenticated UI, API routes, and leased workers in the Railway app service.'
+    }
+    postgres = component 'Railway Postgres' {
+      description 'Durable ClawPilot-owned users, workspaces, projections, outboxes, operations, and audit.'
+    }
+    suitecrm = component 'SuiteCRM' {
+      description 'CRM business-record projection and native administration surface.'
+    }
+    mariadb = component 'SuiteCRM MariaDB' {
+      description 'Persistent database for the separate SuiteCRM service.'
+    }
+    optimizer = component 'Fulfillment optimizer' {
+      description 'Separate Railway service, called over Railway private networking.'
+    }
+  }
+
+  development = system 'Railway development — suspended' {
+    description 'Retained environment and services; ClawPilot has no active deployment as observed on 2026-09-21. Not a live serving path.'
+  }
+
+  eigenAppHost = system 'aiapp.eigenracing.com' {
+    description 'Current production app and canonical provider callback origin.'
+  }
+  bpoAppHost = system 'aiapp.bposupplychain.com' {
+    description 'Additional production domain registered in Railway; DNS and TLS validation pending at 2026-09-21 review.'
+  }
+  eigenDevHost = system 'dev.aiapp.eigenracing.com' {
+    description 'Existing development domain; app suspended.'
+  }
+  bpoDevHost = system 'dev.aiapp.bposupplychain.com' {
+    description 'Additional development domain registered in Railway; DNS/TLS pending and app suspended.'
+  }
+  bpoWebsite = system 'BPO Supply Chain website' {
+    description 'Existing bposupplychain.com Vercel website; proposed /s/{slug} resolver route is not active until released and verified.'
+  }
+
+  googleSheets = system 'Google Sheets / Drive' {
+    description 'Operator-owned pipeline workbook inputs and managed Google resources.'
+  }
+  googleMailCalendar = system 'Gmail / Google Calendar' {
+    description 'Connected user mailbox and calendar state used by CRM actions.'
+  }
+  maton = system 'Maton' {
+    description 'User-owned brokered provider connections, including QuickBooks, Gmail, and Calendar.'
+  }
+  shopify = system 'Shopify' {
+    description 'Sales-channel order/catalog/inventory provider.'
+  }
+  faire = system 'Faire' {
+    description 'Sales-channel order/catalog provider.'
+  }
+  toast = system 'Toast' {
+    description 'Read-only POS orders and restaurant-sales source.'
+  }
+  quickbooks = system 'QuickBooks Online' {
+    description 'Connected company catalog and authority for posted accounting transactions.'
+  }
+
+  operator -> eigenAppHost 'uses production app'
+  eigenAppHost -> production.app 'routes HTTPS'
+  bpoAppHost -> production.app 'additional HTTPS route after DNS/TLS activation'
+  production.app -> production.postgres 'reads and writes organization-scoped state'
+  production.app -> production.optimizer 'private optimization request'
+  production.app -> production.suitecrm 'CRM projection and reconciliation'
+  production.suitecrm -> production.mariadb 'persists native CRM records'
+
+  production.app -> googleSheets 'pipeline provisioning and synchronization'
+  production.app -> maton 'brokered user integration actions'
+  maton -> googleMailCalendar 'connected mail and calendar APIs'
+  maton -> quickbooks 'connected accounting APIs'
+  production.app -> shopify 'commerce provider reads and scoped writes'
+  production.app -> faire 'commerce provider reads and scoped writes'
+  production.app -> toast 'read-only POS ingestion'
+
+  bpoWebsite -> production.app 'planned server-side short-link resolver; not active yet'
+  eigenDevHost -> development 'retained domain; runtime suspended'
+  bpoDevHost -> development 'registered domain; DNS pending and runtime suspended'
+}
+
+views {
+  view index {
+    title 'ClawPilot system context'
+    description 'Current production integrations; BPO route and development state are separated in other views.'
+    include operator
+    include production
+    include googleSheets
+    include maton
+    include shopify
+    include faire
+    include toast
+    include quickbooks
+  }
+
+  view runtimeData {
+    title 'Production runtime and durable data'
+    include operator
+    include eigenAppHost
+    include production.*
+    include googleSheets
+    include maton
+  }
+
+  view commerceAccounting {
+    title 'Commerce, POS, CRM, and accounting connections'
+    include production.app
+    include production.postgres
+    include production.suitecrm
+    include shopify
+    include faire
+    include toast
+    include maton
+    include quickbooks
+    include googleMailCalendar
+  }
+
+  view domainsAndEnvironments {
+    title 'App domains and environment state — 2026-09-21'
+    description 'Registration does not prove DNS, TLS, or login acceptance. Development is retained but suspended.'
+    include eigenAppHost
+    include bpoAppHost
+    include production.app
+    include eigenDevHost
+    include bpoDevHost
+    include development
+    include bpoWebsite
+  }
+}

@@ -10,6 +10,9 @@ node_modules/
 .railway/
 coverage/
 dist/
+tools/architecture/.likec4/
+tools/architecture/.vite/
+tools/architecture/.cache/
 backups/
 *.tsbuildinfo
 __pycache__/

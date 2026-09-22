@@ -17,7 +17,7 @@ Keep ClawPilot product knowledge concise, navigable in Obsidian, and searchable 
 
 ## Source Boundaries
 
-- The canonical vault is the ClawPilot repository root. [Vault Map](../README.md) is its human entry point.
+- The canonical Obsidian vault is the repository's `docs/` directory; the repository remains the source of truth. [Home](../Home.md) is its concise entry point and the [Vault Map](../README.md) is the complete index. Keeping Obsidian inside `docs/` prevents dependency packages and generated files from becoming notes.
 - [Knowledge Index](../index.md) is the application-visible entry point and must cover every active application document. [ClawPilot Context Map](../maps/context-map.md) is the root Map of Content for cross-module retrieval.
 - Active module and operating contracts describe current behavior.
 - [Decision records](../decisions/index.md) explain durable tradeoffs but do not replace current contracts.
@@ -93,7 +93,7 @@ Never delete historical Markdown first. Audit it for still-useful product, modul
 
 ## Portable Obsidian State
 
-The committed `.obsidian/` directory contains only link, note-location, appearance, core-plugin, and template defaults. Core graph, backlinks, outgoing links, properties, search, and templates support the workflow without a community-plugin dependency. Workspace layouts, hotkeys, cache, themes, snippets, and community plugins are ignored because they are machine- or user-specific. Add a plugin only after repeated use proves that the same result cannot be maintained simply.
+The committed `docs/.obsidian/` directory contains only link, note-location, appearance, core-plugin, and template defaults. Core graph, backlinks, outgoing links, properties, search, and templates support the workflow without a community-plugin dependency. Workspace layouts, hotkeys, cache, themes, snippets, and community plugins are ignored because they are machine- or user-specific. Add a plugin only after repeated use proves that the same result cannot be maintained simply.
 
 ## Verification
 
