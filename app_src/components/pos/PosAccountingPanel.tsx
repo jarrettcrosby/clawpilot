@@ -108,14 +108,14 @@ type PreparedProductDraft = {
 }
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1, borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: '#15151D',
+  backgroundColor: 'background.paper',
 }
 
 const controlSx = {
   minWidth: 0,
-  '& .MuiInputBase-root': { minHeight: 40, borderRadius: '8px', backgroundColor: '#121219' },
+  '& .MuiInputBase-root': { minHeight: 40, borderRadius: '8px', backgroundColor: 'background.default' },
   '& input': { minWidth: 0 },
 }
 
@@ -350,8 +350,8 @@ function ToastProductThumbnail({ imagePath, productName, size = 44, fallbackLabe
         height: size,
         flexShrink: 0,
         borderRadius: '8px',
-        border: '1px solid rgba(255,255,255,0.12)',
-        backgroundColor: 'rgba(255,255,255,0.04)',
+        border: 1, borderColor: 'divider',
+        backgroundColor: 'action.hover',
         objectFit: 'cover',
       }}
     />
@@ -1109,10 +1109,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         <Box display="flex" flexDirection={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'flex-start' }} gap={1.5}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
-              <AccountBalanceRounded sx={{ color: '#A8C7FA' }} />
+              <AccountBalanceRounded sx={{ color: 'primary.main' }} />
               <Typography fontWeight={700}>Posting configuration</Typography>
               <ReadinessChip ready={quickBooks.bound === true} readyLabel="QuickBooks bound" waitingLabel="QuickBooks not bound" />
               <Chip size="small" variant="outlined" label={`Revision ${number(amount(profile.profileRevision))}`} />
+              {profileDirty ? <Chip size="small" color="warning" label="Unsaved profile changes" /> : null}
             </Box>
             <Typography variant="caption" color="text.secondary" display="block" mt={0.4}>
               {text(quickBooks.companyName, 'No QuickBooks company')} | {text(locationRecord.locationName || locationRecord.restaurantName, 'Selected Toast location')}
@@ -1158,6 +1159,13 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         </Box>
 
         <Divider sx={{ my: 1.75 }} />
+        <Typography variant="caption" color="text.secondary" display="block" mb={1.25} role="status">
+          {savingProfile ? 'Saving posting configuration…' : profileDirty
+            ? 'Posting configuration has unsaved changes. Save profile to keep them; catalog mappings are saved separately below.'
+            : profile.exists === true
+              ? 'Showing saved posting configuration. Saving a profile does not post anything to QuickBooks.'
+              : 'This posting configuration has not been saved yet. Save profile to keep these settings.'}
+        </Typography>
         <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))', lg: 'repeat(4, minmax(0, 1fr))' }} gap={1.25}>
           <TextField
             select
@@ -1301,7 +1309,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         <Box px={{ xs: 1.5, sm: 2 }} py={1.5} display="flex" flexDirection={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'stretch', sm: 'center' }} justifyContent="space-between" gap={1.25}>
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={0.75}>
-              <Inventory2Rounded sx={{ color: '#A8C7FA' }} />
+              <Inventory2Rounded sx={{ color: 'primary.main' }} />
               <Typography fontWeight={700}>Catalog mappings</Typography>
               <Chip size="small" variant="outlined" color={mappedCount < sourceCatalog.length ? 'warning' : 'success'} label={`${number(mappedCount)}/${number(sourceCatalog.length)} saved mappings`} />
             </Box>
@@ -1317,6 +1325,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search mappings"
+              inputProps={{ 'aria-label': 'Search catalog mappings' }}
               size="small"
               sx={{ ...controlSx, width: { xs: '100%', sm: 260 } }}
               InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
@@ -1347,6 +1356,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           </Alert>
         ) : null}
         {mappingError ? <Alert severity="error" onClose={() => setMappingError(null)} sx={{ mx: { xs: 1.5, sm: 2 }, mb: 1.5 }}>{mappingError}</Alert> : null}
+        {dirtyMappingKeys.size > 0 ? <Typography variant="caption" color="text.secondary" display="block" px={{ xs: 1.5, sm: 2 }} pb={1.5} role="status">
+          {number(dirtyMappingKeys.size)} unsaved mapping {dirtyMappingKeys.size === 1 ? 'change' : 'changes'}. Save keeps all changed mappings, including changes hidden by your search. Save suggestions only accepts the suggestions currently shown.
+        </Typography> : null}
         {visibleMappings.map((mapping) => {
           const options = targetOptions[mapping.targetType] || []
           const source = sourceByKey.get(`${mapping.sourceKind}:${mapping.sourceId}`)
@@ -1386,7 +1398,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               }}
               px={{ xs: 1.5, sm: 2 }}
               py={1.25}
-              borderTop="1px solid rgba(255,255,255,0.065)"
+              borderTop={1} borderColor="divider"
               display="grid"
               gridTemplateColumns={{ xs: '1fr', md: 'minmax(180px, 0.8fr) 150px minmax(240px, 1.2fr)' }}
               gap={1.25}
@@ -1396,8 +1408,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 outline: focusAction?.kind === 'mapping'
                   && focusAction.sourceKind === mapping.sourceKind
                   && focusAction.sourceId === mapping.sourceId
-                  ? '2px solid rgba(242,183,109,0.7)'
+                  ? '2px solid'
                   : 'none',
+                outlineColor: 'warning.main',
                 outlineOffset: -2,
               }}
             >
@@ -1507,7 +1520,10 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             </Box>
           )
         })}
-        {!visibleMappings.length ? <Typography variant="body2" color="text.secondary" px={2} py={2}>{search ? 'No mappings match this search.' : 'No Toast sources are available yet.'}</Typography> : null}
+        {!visibleMappings.length ? <Box px={2} py={2}>
+          <Typography variant="body2" color="text.secondary">{search ? 'No mappings match this search.' : 'No Toast sources are available yet. Refresh the Menu catalog above to load products for mapping.'}</Typography>
+          {search ? <Button size="small" onClick={() => setSearch('')} sx={{ mt: 0.5 }}>Clear mapping search</Button> : null}
+        </Box> : null}
       </Box>
 
       {hasAccountingDraft ? (
@@ -1530,8 +1546,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
             {rows(journal.lines).map((line, index) => {
               const target = record(line.target)
               return (
-                <Box key={`${text(line.code)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} alignItems="center" borderBottom="1px solid rgba(255,255,255,0.055)">
-                  <Typography variant="caption" color={text(line.side) === 'debit' ? '#A8C7FA' : '#CFC6EA'} fontWeight={700}>{text(line.side).toUpperCase()}</Typography>
+                <Box key={`${text(line.code)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} alignItems="center" borderBottom={1} borderColor="divider">
+                  <Typography variant="caption" color={text(line.side) === 'debit' ? 'primary.main' : 'secondary.main'} fontWeight={700}>{text(line.side).toUpperCase()}</Typography>
                   <Box minWidth={0}><Typography variant="body2" noWrap>{text(line.label)}</Typography><Typography variant="caption" color={target.id ? 'text.secondary' : 'warning.main'} display="block" noWrap>{target.name ? text(target.name) : 'Mapping required'}</Typography></Box>
                   <Typography variant="body2" fontWeight={650}>{money(amount(line.amount))}</Typography>
                 </Box>
@@ -1570,7 +1586,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         onClose={() => { if (!preparingProduct) closeProductDraft() }}
         fullWidth
         maxWidth="sm"
-        PaperProps={{ sx: { borderRadius: '8px', bgcolor: '#171821', backgroundImage: 'none' } }}
+        PaperProps={{ sx: { borderRadius: '8px', bgcolor: 'background.paper', backgroundImage: 'none' } }}
       >
         <DialogTitle>Prepare QuickBooks product</DialogTitle>
         <DialogContent dividers>
@@ -1591,7 +1607,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                 </Alert>
               ) : null}
               {productDraft.sourceImagePath ? (
-                <Box display="flex" alignItems="center" gap={1.25} sx={{ p: 1.25, border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px' }}>
+                <Box display="flex" alignItems="center" gap={1.25} sx={{ p: 1.25, border: 1, borderColor: 'divider', borderRadius: '8px' }}>
                   <ToastProductThumbnail
                     imagePath={productDraft.sourceImagePath}
                     productName={productDraft.name}

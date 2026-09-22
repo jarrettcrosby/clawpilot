@@ -10,6 +10,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded';
 import RefreshRounded from '@mui/icons-material/RefreshRounded';
 import AddRounded from '@mui/icons-material/AddRounded';
 import Alert from '@mui/material/Alert';
+import Button from '@mui/material/Button';
 import DocSidebar from './DocSidebar';
 import DocViewer from './DocViewer';
 import DocGeneratorDialog from './DocGeneratorDialog';
@@ -117,7 +118,7 @@ export default function DocsSection() {
         display: 'flex',
         height: '100%',
         overflow: 'hidden',
-        backgroundColor: '#0F0F13',
+        backgroundColor: 'var(--mui-palette-background-default)',
       }}
     >
       <Drawer
@@ -132,13 +133,13 @@ export default function DocsSection() {
           sx: {
             width: 'min(280px, 86vw)',
             maxWidth: '100vw',
-            backgroundColor: '#1A1A23',
-            borderRight: '1px solid #232330',
+            backgroundColor: 'var(--mui-palette-background-paper)',
+            borderRight: '1px solid var(--mui-palette-surfaceVariant)',
           },
         }}
         ModalProps={{ keepMounted: true }}
       >
-        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 1.25, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 1.25, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
           <Typography variant="subtitle2" fontWeight={700} color="text.primary">Docs</Typography>
           <IconButton
             data-testid="docs-navigation-close"
@@ -166,8 +167,8 @@ export default function DocsSection() {
           display: { xs: 'none', md: 'flex' },
           width: 280,
           flexShrink: 0,
-          backgroundColor: '#1A1A23',
-          borderRight: '1px solid #232330',
+          backgroundColor: 'var(--mui-palette-background-paper)',
+          borderRight: '1px solid var(--mui-palette-surfaceVariant)',
           height: '100%',
         }}
       >
@@ -189,12 +190,12 @@ export default function DocsSection() {
           minWidth: 0,
           overflow: 'hidden',
           height: '100%',
-          backgroundColor: '#0F0F13',
+          backgroundColor: 'var(--mui-palette-background-default)',
           display: 'flex',
           flexDirection: 'column',
         }}
       >
-        {error && <Alert severity="error" sx={{ m: 2 }}>{error}</Alert>}
+        {error && <Alert severity="error" sx={{ m: 2 }} action={<Button color="inherit" size="small" disabled={loading} onClick={() => void loadDocs('GET', search)}>Retry</Button>}>{error}</Alert>}
         <Box
           data-testid="docs-mobile-toolbar"
           sx={{
@@ -204,7 +205,7 @@ export default function DocsSection() {
             minHeight: 56,
             px: 1.5,
             flexShrink: 0,
-            borderBottom: '1px solid rgba(255,255,255,0.06)',
+            borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
             '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
               minHeight: 44,
               px: 0.75,
@@ -220,10 +221,10 @@ export default function DocsSection() {
             aria-haspopup="dialog"
             onClick={() => setDrawerOpen(true)}
             sx={{
-              color: '#A8C7FA',
+              color: 'var(--mui-palette-primary-main)',
               width: 44,
               height: 44,
-              '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' },
+              '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' },
               '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
                 width: 36,
                 height: 36,

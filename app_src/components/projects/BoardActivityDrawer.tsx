@@ -39,13 +39,13 @@ function formatDate(iso: string, settings: UserDateTimeSettings) {
 
 function ActorAvatar({ actor }: { actor: string }) {
   const person = PEOPLE.find(p => p.id === actor || p.name === actor)
-  const color = person?.color || '#A8C7FA'
+  const color = person?.color || 'var(--mui-palette-primary-main)'
   const botIds = new Set(['clawpilot', 'projects', 'pipeline', 'docs', 'calendar'])
   const isBot = person?.id ? botIds.has(person.id) : false
   const initials = person?.initials || actor?.slice(0, 2).toUpperCase() || '?'
 
   return (
-    <Box sx={{ width: 30, height: 30, borderRadius: '50%', backgroundColor: color + '22', border: `1px solid ${color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+    <Box sx={{ width: 30, height: 30, borderRadius: '50%', backgroundColor: `color-mix(in srgb, ${color} 13%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 27%, transparent)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
       {isBot ? (
         <SmartToyRounded sx={{ fontSize: 16, color }} />
       ) : (
@@ -57,13 +57,13 @@ function ActorAvatar({ actor }: { actor: string }) {
 
 function ActivityIcon({ type }: { type: string }) {
   const sx = { fontSize: 14 }
-  if (type === 'moved') return <SwapHorizRounded sx={{ ...sx, color: '#A8C7FA' }} />
-  if (type === 'label_added' || type === 'label_removed') return <LabelRounded sx={{ ...sx, color: '#CFC6EA' }} />
+  if (type === 'moved') return <SwapHorizRounded sx={{ ...sx, color: 'var(--mui-palette-primary-main)' }} />
+  if (type === 'label_added' || type === 'label_removed') return <LabelRounded sx={{ ...sx, color: 'var(--mui-palette-secondary-main)' }} />
   if (type === 'created') return <AddCircleOutlineRounded sx={{ ...sx, color: '#66BB6A' }} />
   if (type === 'comment') return <ChatBubbleOutlineRounded sx={{ ...sx, color: '#FFA726' }} />
   if (type === 'checklist') return <CheckBoxRounded sx={{ ...sx, color: '#AB47BC' }} />
   if (type === 'updated') return <EditRounded sx={{ ...sx, color: '#78909C' }} />
-  return <AccessTimeRounded sx={{ ...sx, color: 'rgba(255,255,255,0.3)' }} />
+  return <AccessTimeRounded sx={{ ...sx, color: 'rgba(var(--cp-neutral-rgb),0.3)' }} />
 }
 
 export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
@@ -96,10 +96,10 @@ export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
 
   return (
     <Drawer anchor="right" open={open} onClose={onClose} PaperProps={{
-      sx: { width: { xs: '100vw', sm: 420 }, backgroundColor: '#1A1A23', borderLeft: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' }
+      sx: { width: { xs: '100vw', sm: 420 }, backgroundColor: 'var(--mui-palette-background-paper)', borderLeft: '1px solid rgba(var(--cp-neutral-rgb),0.08)', display: 'flex', flexDirection: 'column' }
     }}>
       {/* Header */}
-      <Box sx={{ px: 3, pt: 3, pb: 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+      <Box sx={{ px: 3, pt: 3, pb: 2, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)', flexShrink: 0 }}>
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <Box>
             <Typography variant="h6" fontWeight={700} color="text.primary">Board Activity</Typography>
@@ -147,8 +147,8 @@ export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
                         <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.68rem' }}>
                           {formatDate(entry.timestamp, dateTimeSettings)}
                         </Typography>
-                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(168,199,250,0.5)' }}>·</Typography>
-                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: '#A8C7FA', opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 180 }}>
+                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'rgba(var(--mui-palette-primary-mainChannel) / 0.5)' }}>·</Typography>
+                        <Typography variant="caption" sx={{ fontSize: '0.68rem', color: 'var(--mui-palette-primary-main)', opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 180 }}>
                           {entry._taskTitle || entry.taskTitle}
                         </Typography>
                       </Stack>
@@ -156,15 +156,15 @@ export default function BoardActivityDrawer({ open, onClose, tasks }: Props) {
                       {entry.from && entry.to && (
                         <Stack direction="row" spacing={0.5} alignItems="center" mt={0.5}>
                           <Chip size="small" label={STATUS_LABELS[entry.from as Task['status']] || entry.from} variant="outlined"
-                            sx={{ height: 18, fontSize: '0.62rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />
+                            sx={{ height: 18, fontSize: '0.62rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.1)', color: 'text.disabled', borderRadius: 1 }} />
                           <SwapHorizRounded sx={{ fontSize: 12, color: 'text.disabled' }} />
                           <Chip size="small" label={STATUS_LABELS[entry.to as Task['status']] || entry.to}
-                            sx={{ height: 18, fontSize: '0.62rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.1)', color: '#A8C7FA', border: 'none' }} />
+                            sx={{ height: 18, fontSize: '0.62rem', borderRadius: 1, backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)', color: 'var(--mui-palette-primary-main)', border: 'none' }} />
                         </Stack>
                       )}
                     </Box>
                   </Box>
-                  {i < entries.length - 1 && <Divider sx={{ borderColor: 'rgba(255,255,255,0.04)', ml: 5.5 }} />}
+                  {i < entries.length - 1 && <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.04)', ml: 5.5 }} />}
                 </Box>
               ))}
             </Stack>

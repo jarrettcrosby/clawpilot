@@ -79,6 +79,8 @@ const ASSIGNABLE_PEOPLE = PEOPLE.filter(person => (
 export default function KanbanBoard({ externalFilter, onFilterChange }: Props = {}) {
   const [tasks, setTasks] = useState<Task[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [loadAttempt, setLoadAttempt] = useState(0)
   const [activeTask, setActiveTask] = useState<Task | null>(null)
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null)
   const [drawerTaskId, setDrawerTaskId] = useState<string | null>(null)
@@ -111,6 +113,9 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
 
   useEffect(() => {
     const controller = new AbortController()
+    let active = true
+    setLoading(true)
+    setLoadError('')
     const timeout = setTimeout(() => controller.abort(), 8000)
 
     fetch('/api/tasks?includeCrmCards=true', { signal: controller.signal })
@@ -118,18 +123,24 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
         if (!response.ok) throw new Error('Unable to load tasks')
         return response.json()
       })
-      .then(taskData => setTasks(Array.isArray(taskData) ? taskData : []))
-      .catch(() => setTasks([]))
+      .then(taskData => {
+        if (!Array.isArray(taskData)) throw new Error('Invalid task response')
+        if (active) setTasks(taskData)
+      })
+      .catch(() => {
+        if (active) setLoadError('We could not load this project board. Try again to see your tasks.')
+      })
       .finally(() => {
         clearTimeout(timeout)
-        setLoading(false)
+        if (active) setLoading(false)
       })
 
     return () => {
+      active = false
       clearTimeout(timeout)
       controller.abort()
     }
-  }, [])
+  }, [loadAttempt])
 
   useEffect(() => {
     if (!hasActiveAgentDispatch) return
@@ -322,15 +333,19 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
   if (loading) {
     return (
       <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-        <CircularProgress size={32} sx={{ color: '#A8C7FA' }} />
+        <CircularProgress size={32} aria-label="Loading project board" sx={{ color: 'var(--mui-palette-primary-main)' }} />
       </Box>
     )
   }
 
+  if (loadError) {
+    return <Box sx={{ p: { xs: 2, md: 4 } }}><Alert severity="error" action={<Button color="inherit" onClick={() => setLoadAttempt(value => value + 1)}>Retry</Button>}>{loadError}</Alert></Box>
+  }
+
   return (
     <BoardContext.Provider value={{ updateTask, focusedTaskId, setFocusedTaskId, openDrawer, notify: setMoveError }}>
-      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, backgroundColor: '#0F0F13', overflowY: shortLandscape ? 'hidden' : { xs: 'auto', md: 'hidden' }, overflowX: 'hidden', WebkitOverflowScrolling: 'touch' }}>
-        <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 4 }, pt: shortLandscape ? 0.5 : { xs: 2, md: 3 }, pb: shortLandscape ? 0.5 : 2, flexShrink: 0, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, backgroundColor: 'var(--mui-palette-background-default)', overflowY: shortLandscape ? 'hidden' : { xs: 'auto', md: 'hidden' }, overflowX: 'hidden', WebkitOverflowScrolling: 'touch' }}>
+        <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 4 }, pt: shortLandscape ? 0.5 : { xs: 2, md: 3 }, pb: shortLandscape ? 0.5 : 2, flexShrink: 0, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
           <Stack spacing={shortLandscape ? 0.5 : 1.5}>
             <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: shortLandscape ? 'nowrap' : 'wrap', gap: 1, minWidth: 0 }}>
               <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
@@ -366,7 +381,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
                     variant="contained"
                     startIcon={<AddRounded />}
                     onClick={() => setNewTaskOpen(true)}
-                    sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36', '&:hover': { backgroundColor: '#C2D7FA' }, whiteSpace: 'nowrap' }}
+                    sx={{ textTransform: 'none', backgroundColor: 'primary.main', color: 'primary.contrastText', '&:hover': { backgroundColor: 'primary.dark' }, whiteSpace: 'nowrap' }}
                   >
                     New task
                   </Button>
@@ -419,7 +434,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
                 overflowX: 'auto', overflowY: 'hidden', pb: 2,
                 WebkitOverflowScrolling: 'touch', touchAction: 'pan-x', overscrollBehaviorX: 'contain',
                 '&::-webkit-scrollbar': { height: 6 },
-                '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(255,255,255,0.1)', borderRadius: 3 },
+                '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.1)', borderRadius: 3 },
               }}>
                 {COLUMNS.map(column => (
                   <KanbanColumn
@@ -514,7 +529,7 @@ export default function KanbanBoard({ externalFilter, onFilterChange }: Props = 
           </DialogContent>
           <DialogActions sx={{ px: 3, pb: 2 }}>
             <Button onClick={closeNewTask} disabled={creatingTask} sx={{ textTransform: 'none' }}>Cancel</Button>
-            <Button type="submit" variant="contained" disabled={creatingTask} sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36' }}>
+            <Button type="submit" variant="contained" disabled={creatingTask} sx={{ textTransform: 'none', backgroundColor: 'primary.main', color: 'primary.contrastText' }}>
               {creatingTask ? 'Creating...' : 'Create task'}
             </Button>
           </DialogActions>

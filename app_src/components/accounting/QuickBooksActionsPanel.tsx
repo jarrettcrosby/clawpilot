@@ -145,7 +145,7 @@ const statusColors: Record<RequestStatus, 'default' | 'info' | 'warning' | 'succ
 const drawerSx = {
   width: { xs: '100%', sm: 520 },
   maxWidth: '100vw',
-  bgcolor: '#171821',
+  bgcolor: 'background.paper',
   backgroundImage: 'none',
 }
 
@@ -247,7 +247,7 @@ function RequestReview({ request, money }: { request: WriteRequest; money: (valu
               </Box>
             ))}
           </Stack>
-          <Box display="flex" justifyContent="space-between" mt={1.5} pt={1.5} borderTop="1px solid rgba(255,255,255,0.1)">
+          <Box display="flex" justifyContent="space-between" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
             <Typography fontWeight={700}>Total</Typography>
             <Typography fontWeight={700}>{money(Number(payload.totalAmount || 0))}</Typography>
           </Box>
@@ -368,7 +368,7 @@ export default function QuickBooksActionsPanel({
   }
 
   async function saveDraft() {
-    if (!formKind) return
+    if (!formKind || busy) return
     setBusy(true)
     setError(null)
     setNotice(null)
@@ -469,7 +469,7 @@ export default function QuickBooksActionsPanel({
 
   return (
     <Stack spacing={2.25}>
-      {error ? <Alert severity="error" onClose={() => setError(null)}>{error}</Alert> : null}
+      {error ? <Alert severity="error" onClose={() => setError(null)} action={!workspace ? <Button color="inherit" onClick={() => { void load() }} disabled={loading}>Retry</Button> : undefined}>{error}</Alert> : null}
       {notice ? <Alert severity="success" onClose={() => setNotice(null)}>{notice}</Alert> : null}
 
       {workspace ? (
@@ -513,17 +513,17 @@ export default function QuickBooksActionsPanel({
             </Alert>
           ) : null}
 
-          <Box sx={{ border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px', overflow: 'hidden', bgcolor: '#15151D' }}>
+          <Box sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', overflow: 'hidden', bgcolor: 'background.paper' }}>
             <TableContainer sx={{ display: { xs: 'none', md: 'block' } }}>
               <Table size="small" aria-label="QuickBooks accounting actions">
                 <TableHead>
                   <TableRow>
-                    {['Change', 'Record', 'Prepared by', 'Created', 'Status', 'Actions'].map((label) => <TableCell key={label} sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700 }}>{label}</TableCell>)}
+                    {['Change', 'Record', 'Prepared by', 'Created', 'Status', 'Actions'].map((label) => <TableCell key={label} sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700 }}>{label}</TableCell>)}
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {workspace.requests.map((request) => (
-                    <TableRow key={request.id} hover onClick={() => setSelected(request)} sx={{ cursor: 'pointer', '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+                    <TableRow key={request.id} hover onClick={() => setSelected(request)} sx={{ cursor: 'pointer', '& td': { borderColor: 'divider' } }}>
                       <TableCell>{operationLabels[request.operationKind]}</TableCell>
                       <TableCell><Typography variant="body2" fontWeight={650}>{requestTitle(request)}</Typography>{requestAmount(request) !== null ? <Typography variant="caption" color="text.secondary">{money(requestAmount(request)!)}</Typography> : null}</TableCell>
                       <TableCell>{request.requestedByName || request.requestedBy}</TableCell>
@@ -538,7 +538,7 @@ export default function QuickBooksActionsPanel({
 
             <Box sx={{ display: { xs: 'block', md: 'none' } }}>
               {workspace.requests.map((request) => (
-                <Box key={request.id} borderBottom="1px solid rgba(255,255,255,0.07)" p={1.75}>
+                <Box key={request.id} borderBottom={1} borderColor="divider" p={1.75}>
                   <Box component="button" type="button" onClick={() => setSelected(request)} sx={{ width: '100%', border: 0, bgcolor: 'transparent', color: 'inherit', p: 0, textAlign: 'left' }}>
                     <Box display="flex" justifyContent="space-between" gap={1.5}>
                       <Box minWidth={0}><Typography fontWeight={650}>{requestTitle(request)}</Typography><Typography variant="caption" color="text.secondary">{operationLabels[request.operationKind]}</Typography></Box>
@@ -557,13 +557,15 @@ export default function QuickBooksActionsPanel({
 
       <Drawer anchor="right" open={Boolean(formKind)} onClose={() => { if (!busy) setFormKind(null) }} PaperProps={{ sx: drawerSx }}>
         {formKind ? (
-          <Box height="100%" display="flex" flexDirection="column">
+          <Box component="form" onSubmit={(event) => { event.preventDefault(); void saveDraft() }} height="100%" display="flex" flexDirection="column">
             <Box px={2.5} py={2} display="flex" alignItems="center" justifyContent="space-between">
               <Box><Typography variant="h6" fontWeight={700}>{operationLabels[formKind]}</Typography><Typography variant="caption" color="text.secondary">Save as an immutable review draft</Typography></Box>
               <IconButton aria-label="Close accounting draft" onClick={() => setFormKind(null)} disabled={busy}><CloseRounded /></IconButton>
             </Box>
             <Divider />
             <Box flex={1} overflow="auto" p={2.5}>
+              <Alert severity="info" sx={{ mb: 2 }}>Creating a draft does not change QuickBooks. Review and submit it for approval before it can be posted.</Alert>
+              <Box component="fieldset" disabled={busy} inert={busy} sx={{ border: 0, p: 0, m: 0, minWidth: 0 }}>
               {formKind === 'customer.create' ? <CustomerForm value={customer} onChange={setCustomer} /> : null}
               {formKind === 'item.create' ? <ItemForm
                 value={item}
@@ -587,11 +589,15 @@ export default function QuickBooksActionsPanel({
                   money={money}
                 />
               ) : null}
+              </Box>
             </Box>
             <Divider />
-            <Box p={2} display="flex" justifyContent="flex-end" gap={1}>
-              <Button onClick={() => setFormKind(null)} disabled={busy}>Cancel</Button>
-              <Button variant="contained" startIcon={busy ? <CircularProgress size={16} /> : <AddRounded />} onClick={() => { void saveDraft() }} disabled={busy}>Create draft</Button>
+            <Box p={2} display="flex" flexDirection="column" gap={1}>
+              {error ? <Alert severity="error">{error}</Alert> : null}
+              <Box display="flex" justifyContent="flex-end" gap={1}>
+                <Button onClick={() => setFormKind(null)} disabled={busy}>Cancel</Button>
+                <Button type="submit" variant="contained" startIcon={busy ? <CircularProgress size={16} /> : <AddRounded />} disabled={busy}>{busy ? 'Preparing draft…' : 'Create draft'}</Button>
+              </Box>
             </Box>
           </Box>
         ) : null}
@@ -771,7 +777,7 @@ function InvoiceForm({ value, onChange, lines, onLinesChange, customers, items, 
       <TextField label="Customer memo" multiline minRows={2} value={value.customerMemo} onChange={field('customerMemo')} sx={fieldSx} />
       <Box display="flex" alignItems="center" justifyContent="space-between"><Typography fontWeight={700}>Line items</Typography><Button size="small" startIcon={<AddRounded />} onClick={() => onLinesChange([...lines, newLine()])}>Add line</Button></Box>
       {lines.map((line, index) => (
-        <Box key={line.key} sx={{ borderTop: index ? '1px solid rgba(255,255,255,0.08)' : 0, pt: index ? 2 : 0 }}>
+        <Box key={line.key} sx={{ borderTop: index ? 1 : 0, borderColor: 'divider', pt: index ? 2 : 0 }}>
           <Box display="flex" alignItems="center" gap={1}>
             <TextField select required fullWidth label={`Item ${index + 1}`} value={line.itemId} onChange={(event) => {
               const selected = items.find((item) => item.id === event.target.value)
@@ -787,7 +793,7 @@ function InvoiceForm({ value, onChange, lines, onLinesChange, customers, items, 
           </Box>
         </Box>
       ))}
-      <Box display="flex" justifyContent="space-between" borderTop="1px solid rgba(255,255,255,0.1)" pt={2}><Typography variant="h6" fontWeight={700}>Total</Typography><Typography variant="h6" fontWeight={700}>{money(total)}</Typography></Box>
+      <Box display="flex" justifyContent="space-between" borderTop={1} borderColor="divider" pt={2}><Typography variant="h6" fontWeight={700}>Total</Typography><Typography variant="h6" fontWeight={700}>{money(total)}</Typography></Box>
     </Stack>
   )
 }

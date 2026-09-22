@@ -17,6 +17,7 @@ import {
   Typography,
 } from '@mui/material'
 import BrandMark from '@/components/BrandMark'
+import AppearancePreference from '@/components/AppearancePreference'
 
 type LoginMode = 'email' | 'code'
 type PendingAction = 'request' | 'verify' | null
@@ -164,8 +165,8 @@ export default function LoginPage() {
         placeItems: 'center',
         px: 2,
         py: 4,
-        bgcolor: '#0F0F13',
-        color: '#E4E1EC',
+        bgcolor: 'var(--mui-palette-background-default)',
+        color: 'var(--mui-palette-text-primary)',
       }}
     >
       <CssBaseline />
@@ -177,8 +178,8 @@ export default function LoginPage() {
           width: 'min(100%, 420px)',
           p: { xs: 3, sm: 4 },
           borderRadius: 1,
-          border: '1px solid rgba(255,255,255,0.08)',
-          bgcolor: '#1A1A23',
+          border: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
+          bgcolor: 'var(--mui-palette-background-paper)',
           color: 'inherit',
         }}
       >
@@ -260,10 +261,10 @@ export default function LoginPage() {
             sx={{
               minHeight: 44,
               borderRadius: 1,
-              bgcolor: '#A8C7FA',
-              color: '#001D36',
+              bgcolor: 'primary.main',
+              color: 'primary.contrastText',
               fontWeight: 750,
-              '&:hover': { bgcolor: '#BDD4FB' },
+              '&:hover': { bgcolor: 'primary.dark' },
             }}
           >
             {primaryLabel}
@@ -284,6 +285,7 @@ export default function LoginPage() {
           </Stack>
         ) : null}
 
+        <Box sx={{ mt: 3, pt: 2, borderTop: 1, borderColor: 'divider' }}><AppearancePreference /></Box>
       </Paper>
     </Box>
   )
@@ -294,10 +296,10 @@ const fieldSx = {
   '& .MuiInputLabel-root': { color: 'text.secondary' },
   '& .MuiOutlinedInput-root': {
     color: 'text.primary',
-    bgcolor: '#232330',
+    bgcolor: 'var(--mui-palette-surfaceVariant)',
     borderRadius: 1,
-    '& fieldset': { borderColor: 'rgba(255,255,255,0.14)' },
-    '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.28)' },
-    '&.Mui-focused fieldset': { borderColor: '#A8C7FA' },
+    '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.14)' },
+    '&:hover fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.28)' },
+    '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' },
   },
 } as const

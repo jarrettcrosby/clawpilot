@@ -217,7 +217,7 @@ const controlSx = {
   '& .MuiInputBase-root': {
     minHeight: 40,
     borderRadius: '8px',
-    backgroundColor: '#15151D',
+    backgroundColor: 'background.paper',
   },
 }
 
@@ -500,9 +500,10 @@ function ReadinessMetric({
         flex: '1 1 150px',
         minWidth: 0,
         p: 1.5,
-        border: '1px solid rgba(255,255,255,0.1)',
+        border: '1px solid',
+        borderColor: 'divider',
         borderRadius: '8px',
-        backgroundColor: '#13131A',
+        backgroundColor: 'background.paper',
       }}
     >
       <Typography variant="caption" color="text.secondary">{label}</Typography>
@@ -1241,9 +1242,10 @@ export default function PackagingMaterialsPanel() {
             aria-label="Cartonization readiness"
             sx={{
               p: { xs: 1.5, sm: 2 },
-              border: '1px solid rgba(255,255,255,0.12)',
+              border: '1px solid',
+              borderColor: 'divider',
               borderRadius: '10px',
-              backgroundColor: '#101017',
+              backgroundColor: 'background.paper',
             }}
           >
             <Typography fontWeight={700}>Optimizer readiness</Typography>
@@ -1348,7 +1350,8 @@ export default function PackagingMaterialsPanel() {
               py: 6,
               px: 2,
               textAlign: 'center',
-              border: '1px dashed rgba(255,255,255,0.16)',
+              border: '1px dashed',
+              borderColor: 'divider',
               borderRadius: '10px',
             }}
           >
@@ -1380,9 +1383,10 @@ export default function PackagingMaterialsPanel() {
                 sx={{
                   minWidth: 0,
                   p: { xs: 1.5, sm: 2 },
-                  border: '1px solid rgba(255,255,255,0.12)',
+                  border: '1px solid',
+                  borderColor: 'divider',
                   borderRadius: '10px',
-                  backgroundColor: '#111118',
+                  backgroundColor: 'background.paper',
                 }}
               >
                 <Stack

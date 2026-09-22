@@ -30,21 +30,21 @@ type Props = {
 const DASHBOARD_FONT = 'Roboto, Arial, sans-serif'
 const NUMBER_FONT = '"Roboto Mono", ui-monospace, SFMono-Regular, Menlo, monospace'
 const MATERIAL = {
-  primary: '#8AB4F8',
+  primary: 'var(--mui-palette-primary-main)',
   primaryStrong: '#4E79A7',
-  secondary: '#66CDBD',
+  secondary: 'var(--mui-palette-secondary-main)',
   potential: '#FF8A65',
   probable: '#4DB6AC',
-  success: '#66BB6A',
-  warning: '#F4BE62',
-  summary: '#C7D2FE',
-  summarySurface: 'rgba(199, 210, 254, 0.06)',
-  surface: '#181A22',
-  surfaceHigh: '#20232D',
-  outline: '#353A48',
-  ink: '#E9ECF4',
-  muted: '#AEB6C7',
-  grid: '#343947',
+  success: 'var(--mui-palette-success-main)',
+  warning: 'var(--mui-palette-warning-main)',
+  summary: 'var(--mui-palette-primary-main)',
+  summarySurface: 'rgba(var(--mui-palette-primary-mainChannel) / 0.06)',
+  surface: 'var(--mui-palette-background-paper)',
+  surfaceHigh: 'var(--mui-palette-surfaceVariant)',
+  outline: 'var(--mui-palette-divider)',
+  ink: 'var(--mui-palette-text-primary)',
+  muted: 'var(--mui-palette-text-secondary)',
+  grid: 'var(--mui-palette-divider)',
 } as const
 
 const STAGE_COLORS: Record<string, string> = {
@@ -610,7 +610,7 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
               height: 26,
               fontFamily: DASHBOARD_FONT,
               fontSize: 11,
-              color: customPeriodIncomplete ? MATERIAL.muted : dataNeedsAttention ? '#FFB4AB' : syncState === 'syncing' || isReportPending ? MATERIAL.primary : MATERIAL.success,
+              color: customPeriodIncomplete ? MATERIAL.muted : dataNeedsAttention ? 'var(--mui-palette-error-main)' : syncState === 'syncing' || isReportPending ? MATERIAL.primary : MATERIAL.success,
               backgroundColor: customPeriodIncomplete ? MATERIAL.surfaceHigh : dataNeedsAttention ? 'rgba(255,180,171,0.12)' : syncState === 'syncing' || isReportPending ? 'rgba(138,180,248,0.12)' : 'rgba(102,187,106,0.12)',
             }}
           />

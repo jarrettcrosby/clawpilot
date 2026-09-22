@@ -75,12 +75,12 @@ function formatDate(iso: string, settings: UserDateTimeSettings) {
 
 function ActivityIcon({ type }: { type: string }) {
   const sx = { fontSize: 15 }
-  if (type === 'moved') return <SwapHorizRounded sx={{ ...sx, color: '#A8C7FA' }} />
-  if (type === 'label_added' || type === 'label_removed') return <LabelRounded sx={{ ...sx, color: '#CFC6EA' }} />
+  if (type === 'moved') return <SwapHorizRounded sx={{ ...sx, color: 'var(--mui-palette-primary-main)' }} />
+  if (type === 'label_added' || type === 'label_removed') return <LabelRounded sx={{ ...sx, color: 'var(--mui-palette-secondary-main)' }} />
   if (type === 'created') return <AddCircleOutlineRounded sx={{ ...sx, color: '#66BB6A' }} />
   if (type === 'comment') return <ChatBubbleOutlineRounded sx={{ ...sx, color: '#FFA726' }} />
   if (type === 'checklist') return <CheckBoxRounded sx={{ ...sx, color: '#AB47BC' }} />
-  return <AccessTimeRounded sx={{ ...sx, color: 'rgba(255,255,255,0.3)' }} />
+  return <AccessTimeRounded sx={{ ...sx, color: 'rgba(var(--cp-neutral-rgb),0.3)' }} />
 }
 
 function PersonAvatar({ personId, size = 28 }: { personId?: string; size?: number }) {
@@ -119,14 +119,14 @@ function PersonAvatar({ personId, size = 28 }: { personId?: string; size?: numbe
 }
 
 const selectSx = {
-  fontSize: '0.8rem', backgroundColor: '#232330', borderRadius: 2, color: 'text.primary',
-  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.12)' },
-  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.24)' },
-  '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#A8C7FA' },
+  fontSize: '0.8rem', backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, color: 'text.primary',
+  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(var(--cp-neutral-rgb),0.12)' },
+  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(var(--cp-neutral-rgb),0.24)' },
+  '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--mui-palette-primary-main)' },
   '& .MuiSelect-select': { py: 0.75, px: 1.25 },
   '& .MuiSvgIcon-root': { color: 'text.disabled' },
 }
-const menuPaper = { PaperProps: { sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, mt: 0.5 } } }
+const menuPaper = { PaperProps: { sx: { backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 2, mt: 0.5 } } }
 
 function NextActionEditor({ initialValue, onSave }: NextActionEditorProps) {
   const [value, setValue] = useState(initialValue)
@@ -147,7 +147,7 @@ function NextActionEditor({ initialValue, onSave }: NextActionEditorProps) {
         sx={{
           flex: 1,
           '& .MuiOutlinedInput-root': {
-            backgroundColor: '#232330',
+            backgroundColor: 'var(--mui-palette-surfaceVariant)',
             borderRadius: 2,
             fontSize: '0.78rem',
           },
@@ -206,14 +206,14 @@ function renderCommentText(text: string) {
           key={i}
           href={documentLink[2]}
           underline="hover"
-          sx={{ color: '#A8C7FA', fontWeight: 600, overflowWrap: 'anywhere' }}
+          sx={{ color: 'var(--mui-palette-primary-main)', fontWeight: 600, overflowWrap: 'anywhere' }}
         >
           {documentLink[1]}
         </Link>
       )
     }
     return part.startsWith('@') ? (
-      <Box key={i} component="span" sx={{ color: '#A8C7FA', fontWeight: 600, backgroundColor: 'rgba(168,199,250,0.1)', borderRadius: 0.5, px: 0.4 }}>{part}</Box>
+      <Box key={i} component="span" sx={{ color: 'var(--mui-palette-primary-main)', fontWeight: 600, backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)', borderRadius: 0.5, px: 0.4 }}>{part}</Box>
     ) : part
   })
 }
@@ -366,20 +366,20 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
         width: shortLandscape ? '100vw' : touchLandscape ? { xs: '96vw', sm: 520 } : { xs: '100vw', sm: 480 },
         maxWidth: '100vw',
         height: '100dvh',
-        backgroundColor: '#1A1A23',
-        borderLeft: '1px solid rgba(255,255,255,0.08)',
+        backgroundColor: 'var(--mui-palette-background-paper)',
+        borderLeft: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
         display: 'flex',
         flexDirection: 'column',
       }
     }}>
       {/* Header */}
-      <Box sx={{ px: shortLandscape ? 1.5 : 3, pt: shortLandscape ? 1 : 3, pb: shortLandscape ? 1 : 2, borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}>
+      <Box sx={{ px: shortLandscape ? 1.5 : 3, pt: shortLandscape ? 1 : 3, pb: shortLandscape ? 1 : 2, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)', flexShrink: 0 }}>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <Stack direction="row" spacing={1} alignItems="center" mb={1.5}>
             {generatedCrmCard ? (
               <>
-                <CodeRounded sx={{ fontSize: 16, color: '#A8C7FA' }} />
-                <Typography variant="overline" sx={{ color: '#A8C7FA', fontSize: '0.65rem', letterSpacing: 1.5 }}>CRM RECORD</Typography>
+                <CodeRounded sx={{ fontSize: 16, color: 'var(--mui-palette-primary-main)' }} />
+                <Typography variant="overline" sx={{ color: 'var(--mui-palette-primary-main)', fontSize: '0.65rem', letterSpacing: 1.5 }}>CRM RECORD</Typography>
               </>
             ) : (
               <>
@@ -399,7 +399,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Box sx={{ display: 'flex', gap: 1 }}>
             <TextField autoFocus fullWidth multiline maxRows={3} value={titleVal} onChange={e => setTitleVal(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveTitle() } if (e.key === 'Escape') setEditingTitle(false) }}
-              size="small" sx={{ '& .MuiOutlinedInput-root': { fontSize: '1.05rem', fontWeight: 700, backgroundColor: '#232330', borderRadius: 2 } }} />
+              size="small" sx={{ '& .MuiOutlinedInput-root': { fontSize: '1.05rem', fontWeight: 700, backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2 } }} />
             <IconButton size="small" onClick={saveTitle} sx={{ color: '#66BB6A' }}><CheckRounded /></IconButton>
           </Box>
         ) : (
@@ -424,7 +424,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Status</Typography>
               <Select disabled={readOnly} size="small" value={task.status} onChange={e => patch({ status: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {COLUMNS.map(c => (
-                  <MenuItem key={c.status} value={c.status} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+                  <MenuItem key={c.status} value={c.status} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>
                     <Stack direction="row" spacing={1} alignItems="center">
                       <Box sx={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: c.color }} />
                       <span>{STATUS_LABELS[c.status]}</span>
@@ -439,7 +439,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Priority</Typography>
               <Select disabled={readOnly} size="small" value={task.priority} onChange={e => patch({ priority: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {(['high','medium','low'] as const).map(p => (
-                  <MenuItem key={p} value={p} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+                  <MenuItem key={p} value={p} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>
                     <Stack direction="row" spacing={1} alignItems="center">
                       <FlagRounded sx={{ fontSize: 14, color: PRIORITY_COLORS[p] }} />
                       <span style={{ color: PRIORITY_COLORS[p] }}>{PRIORITY_LABELS[p]}</span>
@@ -452,7 +452,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Typography variant="body2" color="text.disabled" sx={{ minWidth: 80, fontSize: '0.8rem' }}>Category</Typography>
               <Select disabled={readOnly} size="small" value={task.category} onChange={e => patch({ category: e.target.value })} sx={selectSx} MenuProps={menuPaper}>
                 {CATEGORY_OPTIONS.map(c => (
-                  <MenuItem key={c} value={c} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>{displayCategory(c)}</MenuItem>
+                  <MenuItem key={c} value={c} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>{displayCategory(c)}</MenuItem>
                 ))}
               </Select>
             </Stack>
@@ -466,7 +466,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               ) : <Typography variant="body2" color="text.disabled" sx={{ fontSize: '0.8rem' }}>Unassigned</Typography>}>
                 <MenuItem value="" sx={{ fontSize: '0.8rem' }}>Unassigned</MenuItem>
                 {PEOPLE.filter(p => ASSIGNABLE_PRODUCT_AGENT_IDS.includes(p.id as typeof ASSIGNABLE_PRODUCT_AGENT_IDS[number])).map(p => (
-                  <MenuItem key={p.id} value={p.id} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+                  <MenuItem key={p.id} value={p.id} sx={{ fontSize: '0.8rem', '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>
                     <Stack direction="row" spacing={1} alignItems="center">
                       <PersonAvatar personId={p.id} size={22} />
                       <span>{p.name}</span>
@@ -484,7 +484,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               />
             </Stack>
             {(task.workItem?.lastConcreteAction || task.workItem?.waitingOn) && (
-              <Box sx={{ ml: '80px', p: 1, borderRadius: 1.5, backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+              <Box sx={{ ml: '80px', p: 1, borderRadius: 1.5, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.03)', border: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
                 {task.workItem?.lastConcreteAction && (
                   <Typography variant="caption" color="text.secondary" sx={{ display: 'block', lineHeight: 1.4 }}>
                     <Box component="span" sx={{ color: 'text.disabled' }}>Last action:</Box> {task.workItem.lastConcreteAction}
@@ -502,11 +502,11 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                 <Box sx={{ position: 'relative' }}>
                   <Box component="input" disabled={readOnly} type="date" value={task.dueDate || ''} onChange={(e: React.ChangeEvent<HTMLInputElement>) => patch({ dueDate: e.target.value })}
-                    sx={{ backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.8rem', outline: 'none', cursor: 'pointer', minWidth: 150,
+                    sx={{ backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.12)', borderRadius: 2, color: 'text.primary', px: 1.25, py: 0.75, fontSize: '0.8rem', outline: 'none', cursor: 'pointer', minWidth: 150,
                       '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' },
-                      '&:hover': { borderColor: 'rgba(255,255,255,0.24)' } }} />
+                      '&:hover': { borderColor: 'rgba(var(--cp-neutral-rgb),0.24)' } }} />
                   {!task.dueDate && (
-                    <Typography variant="caption" sx={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'rgba(255,255,255,0.45)', pointerEvents: 'none', fontSize: '0.72rem' }}>
+                    <Typography variant="caption" sx={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'rgba(var(--cp-neutral-rgb),0.45)', pointerEvents: 'none', fontSize: '0.72rem' }}>
                       MM/DD/YYYY
                     </Typography>
                   )}
@@ -523,13 +523,13 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           </Stack>
         </Box>
 
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+        <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
 
         {/* Labels */}
         <Box>
           <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5 }}>LABELS</Typography>
-            <IconButton disabled={readOnly} size="small" onClick={e => setLabelAnchor(e.currentTarget)} sx={{ color: 'text.disabled', '&:hover': { color: '#A8C7FA' } }}>
+            <IconButton disabled={readOnly} size="small" onClick={e => setLabelAnchor(e.currentTarget)} sx={{ color: 'text.disabled', '&:hover': { color: 'var(--mui-palette-primary-main)' } }}>
               <AddRounded sx={{ fontSize: 16 }} />
             </IconButton>
           </Box>
@@ -538,28 +538,28 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             {visibleLabels.map(tag => {
               const def = AVAILABLE_LABELS.find(l => l.id === tag)
               return <Chip key={tag} size="small" label={def?.label || tag} onDelete={() => { const next = (task.tags||[]).filter(t=>t!==tag); patch({ tags: next }) }}
-                sx={{ height: 24, fontSize: '0.7rem', borderRadius: 1.5, border: 'none', backgroundColor: (def?.color||'#A8C7FA')+'22', color: def?.color||'#A8C7FA', '& .MuiChip-deleteIcon': { fontSize: 14, color: def?.color||'#A8C7FA', opacity: 0.7 } }} />
+                sx={{ height: 24, fontSize: '0.7rem', borderRadius: 1.5, border: 'none', backgroundColor: (def?.color||'var(--mui-palette-primary-main)')+'22', color: def?.color||'var(--mui-palette-primary-main)', '& .MuiChip-deleteIcon': { fontSize: 14, color: def?.color||'var(--mui-palette-primary-main)', opacity: 0.7 } }} />
             })}
           </Stack>
           <Popover open={Boolean(labelAnchor)} anchorEl={labelAnchor} onClose={() => setLabelAnchor(null)} anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
-            PaperProps={{ sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, p: 1.5, width: 260 } }}>
+            PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 2, p: 1.5, width: 260 } }}>
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1 }}>ALL LABELS</Typography>
             <Stack direction="row" flexWrap="wrap" gap={0.75}>
               {AVAILABLE_LABELS.map(l => {
                 const active = (task.tags||[]).includes(l.id)
                 return <Chip key={l.id} size="small" label={l.label} onClick={() => { const cur=task.tags||[]; patch({ tags: active?cur.filter(t=>t!==l.id):[...cur,l.id] }) }}
-                  sx={{ height: 26, fontSize: '0.72rem', borderRadius: 1.5, cursor: 'pointer', border: 'none', backgroundColor: active?l.color+'33':'rgba(255,255,255,0.06)', color: active?l.color:'rgba(255,255,255,0.5)', outline: active?`1px solid ${l.color}55`:'none', transition: 'all 0.15s', '&:hover': { backgroundColor: l.color+'22', color: l.color } }} />
+                  sx={{ height: 26, fontSize: '0.72rem', borderRadius: 1.5, cursor: 'pointer', border: 'none', backgroundColor: active?l.color+'33':'rgba(var(--cp-neutral-rgb),0.06)', color: active?l.color:'rgba(var(--cp-neutral-rgb),0.5)', outline: active?`1px solid ${l.color}55`:'none', transition: 'all 0.15s', '&:hover': { backgroundColor: l.color+'22', color: l.color } }} />
               })}
             </Stack>
           </Popover>
         </Box>
 
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+        <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
 
         {/* Description */}
         <Box>
           {task.crm && (
-            <Stack spacing={1.1} sx={{ mb: 2, p: 1.5, border: '1px solid rgba(168,199,250,0.18)', borderRadius: 2, backgroundColor: 'rgba(168,199,250,0.035)' }}>
+            <Stack spacing={1.1} sx={{ mb: 2, p: 1.5, border: '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.18)', borderRadius: 2, backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.035)' }}>
               <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5 }}>CRM RECORD</Typography>
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={{ xs: 0.25, sm: 1 }}>
                 <Typography variant="caption" color="text.disabled" sx={{ minWidth: 104 }}>Global ID</Typography>
@@ -593,16 +593,16 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <TextField multiline minRows={3} maxRows={8} fullWidth value={descVal} onChange={e => setDescVal(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Escape') setEditingDesc(false) }} placeholder="Add a description..."
-                sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: '#232330', borderRadius: 2, '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' }, '&.Mui-focused fieldset': { borderColor: '#A8C7FA' } } }} />
+                sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }, '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' } } }} />
               <Stack direction="row" spacing={1}>
                 <Button size="small" variant="contained" onClick={saveDesc} disabled={saving}
-                  sx={{ borderRadius: 2, textTransform: 'none', fontWeight: 600, backgroundColor: '#A8C7FA', color: '#001D36', fontSize: '0.8rem' }}>Save</Button>
+                  sx={{ borderRadius: 2, textTransform: 'none', fontWeight: 600, backgroundColor: 'var(--mui-palette-primary-main)', color: 'primary.contrastText', fontSize: '0.8rem' }}>Save</Button>
                 <Button size="small" onClick={() => setEditingDesc(false)} sx={{ borderRadius: 2, textTransform: 'none', color: 'text.secondary', fontSize: '0.8rem' }}>Cancel</Button>
               </Stack>
             </Box>
           ) : (
             <Box onClick={() => { if (!readOnly) { setDescVal(displayedDescription); setEditingDesc(true) } }}
-              sx={{ cursor: readOnly ? 'default' : 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.1)', backgroundColor: readOnly ? 'transparent' : 'rgba(255,255,255,0.02)' } }}>
+              sx={{ cursor: readOnly ? 'default' : 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: readOnly ? 'transparent' : 'rgba(var(--cp-neutral-rgb),0.1)', backgroundColor: readOnly ? 'transparent' : 'rgba(var(--cp-neutral-rgb),0.02)' } }}>
               <Typography variant="body2" color={displayedDescription ? 'text.secondary' : 'text.disabled'} sx={{ lineHeight: 1.7, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
                 {displayedDescription || 'Click to add a description...'}
               </Typography>
@@ -610,7 +610,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           )}
         </Box>
 
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+        <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
 
         {!generatedCrmCard && (
           <>
@@ -623,7 +623,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 CHECKLIST
               </Typography>
             </Stack>
-            {!readOnly ? <Button size="small" onClick={() => setShowCheckAdd(v => !v)} sx={{ textTransform: 'none', fontSize: '0.72rem', color: '#A8C7FA' }}>
+            {!readOnly ? <Button size="small" onClick={() => setShowCheckAdd(v => !v)} sx={{ textTransform: 'none', fontSize: '0.72rem', color: 'var(--mui-palette-primary-main)' }}>
               {showCheckAdd ? 'Cancel' : 'Add item'}
             </Button> : null}
           </Box>
@@ -634,14 +634,14 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 <Typography variant="caption" color="text.disabled">{doneCount}/{totalCount} complete</Typography>
                 <Typography variant="caption" color="text.disabled">{progress}%</Typography>
               </Stack>
-              <LinearProgress variant="determinate" value={progress} sx={{ height: 6, borderRadius: 6, backgroundColor: 'rgba(255,255,255,0.08)', '& .MuiLinearProgress-bar': { backgroundColor: progress === 100 ? '#66BB6A' : '#A8C7FA' } }} />
+              <LinearProgress variant="determinate" value={progress} sx={{ height: 6, borderRadius: 6, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.08)', '& .MuiLinearProgress-bar': { backgroundColor: progress === 100 ? '#66BB6A' : 'var(--mui-palette-primary-main)' } }} />
             </Box>
           )}
 
           {showCheckAdd && (
-            <Box sx={{ p: 1.25, mb: 1, borderRadius: 2, backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)' }}>
+            <Box sx={{ p: 1.25, mb: 1, borderRadius: 2, backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
               <TextField size="small" fullWidth placeholder="Add checklist item" value={newCheckItem} onChange={e => setNewCheckItem(e.target.value)}
-                sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: '#1A1A23', borderRadius: 2, fontSize: '0.85rem' } }} />
+                sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2, fontSize: '0.85rem' } }} />
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }} mb={1}>
                 <Select size="small" value={checkItemAssignee} onChange={e => setCheckItemAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: { xs: 0, sm: 160 }, width: { xs: '100%', sm: 'auto' } }} MenuProps={menuPaper}
                   renderValue={v => v ? (PEOPLE.find(p => p.id === v)?.name || v as string) : 'Assignee (optional)'}>
@@ -651,12 +651,12 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   ))}
                 </Select>
                 <Box component="input" type="date" value={checkItemDue} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setCheckItemDue(e.target.value)}
-                  sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
+                  sx={{ backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.12)', borderRadius: 2, color: 'text.primary', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
                     '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' } }} />
               </Stack>
               <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1 }}>
                 <Button size="small" onClick={() => { setShowCheckAdd(false); setNewCheckItem(''); setCheckItemAssignee(''); setCheckItemDue('') }} sx={{ textTransform: 'none', color: 'text.secondary' }}>Cancel</Button>
-                <Button size="small" variant="contained" onClick={addChecklistItem} disabled={!newCheckItem.trim()} sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36' }}>Add</Button>
+                <Button size="small" variant="contained" onClick={addChecklistItem} disabled={!newCheckItem.trim()} sx={{ textTransform: 'none', backgroundColor: 'var(--mui-palette-primary-main)', color: 'primary.contrastText' }}>Add</Button>
               </Box>
             </Box>
           )}
@@ -667,13 +667,13 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
 
           <Stack spacing={0.5}>
             {(task.checklist || []).map(it => (
-              <Box key={it.id} sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, py: 0.5, px: 0.5, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.02)' }}>
+              <Box key={it.id} sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, py: 0.5, px: 0.5, borderRadius: 1, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.02)' }}>
                 <Checkbox disabled={readOnly} size="small" checked={!!it.done} onChange={() => patch({ _checklistToggle: it.id })} sx={{ p: 0.5 }} />
                 <Box sx={{ flex: 1 }}>
                   {editingChecklistId === it.id ? (
                     <Box>
                       <TextField size="small" fullWidth value={editCheckText} onChange={(e) => setEditCheckText(e.target.value)}
-                        sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: '#1A1A23', borderRadius: 2, fontSize: '0.85rem' } }} />
+                        sx={{ mb: 1, '& .MuiOutlinedInput-root': { backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2, fontSize: '0.85rem' } }} />
                       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }} mb={1}>
                         <Select size="small" value={editCheckAssignee} onChange={e => setEditCheckAssignee(e.target.value)} displayEmpty sx={{ ...selectSx, minWidth: { xs: 0, sm: 160 }, width: { xs: '100%', sm: 'auto' } }} MenuProps={menuPaper}
                           renderValue={v => v ? (PEOPLE.find(p => p.id === v)?.name || v as string) : 'Assignee (optional)'}>
@@ -683,11 +683,11 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                           ))}
                         </Select>
                         <Box component="input" type="date" value={editCheckDue} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEditCheckDue(e.target.value)}
-                          sx={{ backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2, color: 'white', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
+                          sx={{ backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.12)', borderRadius: 2, color: 'text.primary', px: 1.25, py: 0.75, fontSize: '0.75rem', outline: 'none', cursor: 'pointer', minWidth: { xs: 0, sm: 150 }, width: { xs: '100%', sm: 'auto' }, boxSizing: 'border-box',
                             '&::-webkit-calendar-picker-indicator': { filter: 'invert(0.6)', cursor: 'pointer' } }} />
                       </Stack>
                       <Stack direction="row" spacing={1}>
-                        <Button size="small" variant="contained" onClick={saveChecklistEdit} disabled={!editCheckText.trim()} sx={{ textTransform: 'none', backgroundColor: '#A8C7FA', color: '#001D36' }}>Save</Button>
+                        <Button size="small" variant="contained" onClick={saveChecklistEdit} disabled={!editCheckText.trim()} sx={{ textTransform: 'none', backgroundColor: 'var(--mui-palette-primary-main)', color: 'primary.contrastText' }}>Save</Button>
                         <Button size="small" onClick={() => { setEditingChecklistId(null); setEditCheckText(''); setEditCheckAssignee(''); setEditCheckDue('') }} sx={{ textTransform: 'none', color: 'text.secondary' }}>Cancel</Button>
                       </Stack>
                     </Box>
@@ -697,12 +697,12 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                       <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 0.25 }}>
                         {it.assignee && (
                           <Tooltip title={it.assignee}>
-                            <PersonRounded sx={{ fontSize: 12, color: 'rgba(255,255,255,0.45)' }} />
+                            <PersonRounded sx={{ fontSize: 12, color: 'rgba(var(--cp-neutral-rgb),0.45)' }} />
                           </Tooltip>
                         )}
                         {it.dueDate && (
                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                            <CalendarTodayRounded sx={{ fontSize: 12, color: 'rgba(255,255,255,0.45)' }} />
+                            <CalendarTodayRounded sx={{ fontSize: 12, color: 'rgba(var(--cp-neutral-rgb),0.45)' }} />
                             <Typography variant="caption" color="text.disabled">{new Date(it.dueDate).toLocaleDateString()}</Typography>
                           </Box>
                         )}
@@ -713,12 +713,12 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                 {editingChecklistId !== it.id && !readOnly && (
                   <Stack direction="row" spacing={0.25}>
                     <Tooltip title="Edit item">
-                      <IconButton size="small" onClick={() => startEditChecklist(it)} sx={{ p: 0.25, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA' } }}>
+                      <IconButton size="small" onClick={() => startEditChecklist(it)} sx={{ p: 0.25, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: 'var(--mui-palette-primary-main)' } }}>
                         <EditRounded sx={{ fontSize: 14 }} />
                       </IconButton>
                     </Tooltip>
                     <Tooltip title="Delete item">
-                      <IconButton size="small" onClick={() => patch({ _checklistDelete: it.id })} sx={{ p: 0.25, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#EF5350' } }}>
+                      <IconButton size="small" onClick={() => patch({ _checklistDelete: it.id })} sx={{ p: 0.25, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: '#EF5350' } }}>
                         <DeleteOutlineRounded sx={{ fontSize: 14 }} />
                       </IconButton>
                     </Tooltip>
@@ -729,7 +729,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           </Stack>
           </Box>
 
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+          <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
           </>
         )}
 
@@ -741,8 +741,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Box sx={{ display: 'flex', gap: 1, mb: 2.5, alignItems: 'flex-end' }}>
             <TextField disabled={readOnly} inputRef={commentRef} multiline maxRows={4} fullWidth placeholder={readOnly ? 'View-only board' : 'Write a comment... (@ to mention)'} size="small"
               value={commentText} onChange={e => setCommentText(e.target.value)} onKeyDown={handleCommentKey}
-              sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: '#232330', borderRadius: 2, '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' }, '&.Mui-focused fieldset': { borderColor: '#A8C7FA' } } }} />
-            <IconButton onClick={() => { void submitComment() }} disabled={readOnly||!commentText.trim()||saving} sx={{ color: commentText.trim()?'#A8C7FA':'text.disabled', mb: 0.25 }}>
+              sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }, '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' } } }} />
+            <IconButton onClick={() => { void submitComment() }} disabled={readOnly||!commentText.trim()||saving} sx={{ color: commentText.trim()?'var(--mui-palette-primary-main)':'text.disabled', mb: 0.25 }}>
               <SendRounded sx={{ fontSize: 20 }} />
             </IconButton>
           </Box>
@@ -760,11 +760,11 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           )}
           {/* @ mention picker */}
           <Popover open={Boolean(mentionAnchor)} anchorEl={mentionAnchor} onClose={() => setMentionAnchor(null)} anchorOrigin={{ vertical: 'top', horizontal: 'left' }}
-            PaperProps={{ sx: { backgroundColor: '#232330', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 2, p: 0.5, minWidth: 180 } }}>
+            PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-surfaceVariant)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 2, p: 0.5, minWidth: 180 } }}>
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.6rem', letterSpacing: 1.5, px: 1.5, py: 0.5, display: 'block' }}>MENTION</Typography>
             {PEOPLE.filter((person) => person.id === task.assignedAgent).map(p => (
               <MenuItem key={p.id} onClick={() => insertMention(`@${p.name}`)}
-                sx={{ borderRadius: 1.5, fontSize: '0.85rem', '&:hover': { backgroundColor: 'rgba(168,199,250,0.08)' } }}>
+                sx={{ borderRadius: 1.5, fontSize: '0.85rem', '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}>
                 <Stack direction="row" spacing={1.5} alignItems="center">
                   <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: p.color+'22', border: `1px solid ${p.color}44`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     <Typography variant="caption" sx={{ color: p.color, fontWeight: 700, fontSize: '0.68rem' }}>{p.initials}</Typography>
@@ -784,7 +784,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
               <Box key={c.id}>
                 <Stack direction="row" spacing={1} alignItems="center" mb={0.75}>
                   {PersonAvatar({ personId: c.author, size: 28 }) || (
-                    <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(var(--cp-neutral-rgb),0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                       <Typography variant="caption" sx={{ color: 'text.disabled', fontWeight: 700, fontSize: '0.72rem' }}>{String(c.author || '?').slice(0, 1).toUpperCase()}</Typography>
                     </Box>
                   )}
@@ -794,18 +794,18 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   </Box>
                   <Tooltip title="Edit comment">
                     <IconButton disabled={readOnly} size="small" onClick={() => { setEditingCommentId(c.id); setEditingCommentText(c.text || '') }}
-                      sx={{ p: 0.5, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA' } }}>
+                      sx={{ p: 0.5, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: 'var(--mui-palette-primary-main)' } }}>
                       <EditRounded sx={{ fontSize: 14 }} />
                     </IconButton>
                   </Tooltip>
                   <Tooltip title="Delete comment">
                     <IconButton disabled={readOnly} size="small" onClick={() => patch({ _deleteCommentId: c.id })}
-                      sx={{ p: 0.5, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#EF5350' } }}>
+                      sx={{ p: 0.5, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: '#EF5350' } }}>
                       <DeleteOutlineRounded sx={{ fontSize: 14 }} />
                     </IconButton>
                   </Tooltip>
                 </Stack>
-                <Box sx={{ ml: 4.5, backgroundColor: '#232330', borderRadius: 2, px: 2, py: 1.25 }}>
+                <Box sx={{ ml: 4.5, backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, px: 2, py: 1.25 }}>
                   {editingCommentId === c.id ? (
                     <Box>
                       <TextField
@@ -815,7 +815,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                         size="small"
                         value={editingCommentText}
                         onChange={(e) => setEditingCommentText(e.target.value)}
-                        sx={{ mb: 1, '& .MuiOutlinedInput-root': { fontSize: '0.85rem', backgroundColor: '#1A1A23', borderRadius: 2 } }}
+                        sx={{ mb: 1, '& .MuiOutlinedInput-root': { fontSize: '0.85rem', backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2 } }}
                       />
                       <Stack direction="row" spacing={1}>
                         <Button size="small" variant="contained" onClick={saveEditedComment} disabled={!editingCommentText.trim()} sx={{ textTransform: 'none', borderRadius: 2 }}>Save</Button>
@@ -835,7 +835,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           </Stack>
         </Box>
 
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+        <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
 
         {/* Activity */}
         <Box>
@@ -843,7 +843,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
           <Stack spacing={2}>
             {[...(task.activity||[])].reverse().map((entry, i) => (
               <Box key={i} sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
-                <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <Box sx={{ width: 28, height: 28, borderRadius: '50%', backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <ActivityIcon type={entry.type} />
                 </Box>
                 <Box sx={{ flex: 1 }}>
@@ -854,7 +854,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                     </Box>
                     <Tooltip title={expandedJson===`a${i}` ? 'Hide JSON' : 'View raw JSON'}>
                       <IconButton size="small" onClick={() => setExpandedJson(expandedJson===`a${i}` ? null : `a${i}`)}
-                        sx={{ p: 0.25, color: 'rgba(255,255,255,0.15)', flexShrink: 0, '&:hover': { color: '#A8C7FA' } }}>
+                        sx={{ p: 0.25, color: 'rgba(var(--cp-neutral-rgb),0.15)', flexShrink: 0, '&:hover': { color: 'var(--mui-palette-primary-main)' } }}>
                         <CodeRounded sx={{ fontSize: 13 }} />
                       </IconButton>
                     </Tooltip>
@@ -862,13 +862,13 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                   <Typography variant="caption" color="text.disabled" display="block" mt={0.25}>{formatDate(entry.timestamp, dateTimeSettings)}</Typography>
                   {entry.from && entry.to && (
                     <Stack direction="row" spacing={0.75} alignItems="center" mt={0.75}>
-                      <Chip size="small" label={STATUS_LABELS[entry.from as Task['status']]||entry.from} variant="outlined" sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(255,255,255,0.1)', color: 'text.disabled', borderRadius: 1 }} />
+                      <Chip size="small" label={STATUS_LABELS[entry.from as Task['status']]||entry.from} variant="outlined" sx={{ height: 20, fontSize: '0.65rem', borderColor: 'rgba(var(--cp-neutral-rgb),0.1)', color: 'text.disabled', borderRadius: 1 }} />
                       <SwapHorizRounded sx={{ fontSize: 14, color: 'text.disabled' }} />
-                      <Chip size="small" label={STATUS_LABELS[entry.to as Task['status']]||entry.to} sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(168,199,250,0.1)', color: '#A8C7FA', border: 'none' }} />
+                      <Chip size="small" label={STATUS_LABELS[entry.to as Task['status']]||entry.to} sx={{ height: 20, fontSize: '0.65rem', borderRadius: 1, backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)', color: 'var(--mui-palette-primary-main)', border: 'none' }} />
                     </Stack>
                   )}
                   <Collapse in={expandedJson===`a${i}`}>
-                    <Box sx={{ backgroundColor: '#12141C', borderRadius: 2, p: 1.5, mt: 1, border: '1px solid rgba(255,255,255,0.06)' }}>
+                    <Box sx={{ backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2, p: 1.5, mt: 1, border: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
                       <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.75 }}>
                         <Typography variant="caption" color="text.disabled" sx={{ fontFamily: 'monospace', fontSize: '0.65rem', letterSpacing: 0.5 }}>JSON RECORD</Typography>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
@@ -889,7 +889,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                                 const ok = await tryCopyToClipboard(text)
                                 if (!ok) setCopyFallbackText(text)
                               }}
-                              sx={{ p: 0.25, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#66BB6A' } }}
+                              sx={{ p: 0.25, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: '#66BB6A' } }}
                             >
                               <ContentCopyRounded sx={{ fontSize: 12 }} />
                             </IconButton>
@@ -912,14 +912,14 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                                   // user cancelled share sheet
                                 }
                               }}
-                              sx={{ p: 0.25, color: 'rgba(255,255,255,0.2)', '&:hover': { color: '#A8C7FA' } }}
+                              sx={{ p: 0.25, color: 'rgba(var(--cp-neutral-rgb),0.2)', '&:hover': { color: 'var(--mui-palette-primary-main)' } }}
                             >
                               <IosShareRounded sx={{ fontSize: 12 }} />
                             </IconButton>
                           </Tooltip>
                         </Box>
                       </Box>
-                      <Box component="pre" sx={{ m: 0, fontFamily: 'monospace', fontSize: '0.72rem', color: '#A8C7FA', overflowX: 'auto', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                      <Box component="pre" sx={{ m: 0, fontFamily: 'monospace', fontSize: '0.72rem', color: 'var(--mui-palette-primary-main)', overflowX: 'auto', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
                         {JSON.stringify(entry, null, 2)}
                       </Box>
 
@@ -934,7 +934,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
                               if (!match?.id) return
                               patch({ _restoreCommentId: match.id, _actor: entry.actor || 'Jarrett' })
                             }}
-                            sx={{ borderColor: 'rgba(168,199,250,0.35)', color: '#A8C7FA', fontSize: '0.72rem', '&:hover': { borderColor: '#A8C7FA', backgroundColor: 'rgba(168,199,250,0.08)' } }}
+                            sx={{ borderColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.35)', color: 'var(--mui-palette-primary-main)', fontSize: '0.72rem', '&:hover': { borderColor: 'var(--mui-palette-primary-main)', backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' } }}
                           >
                             Restore deleted comment
                           </Button>
@@ -953,7 +953,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
       <Dialog
         open={!!copyFallbackText}
         onClose={() => setCopyFallbackText(null)}
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 3, width: { xs: '92vw', sm: 560 } } }}
+        PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 3, width: { xs: '92vw', sm: 560 } } }}
       >
         <DialogTitle sx={{ color: 'text.primary', fontWeight: 700 }}>Copy JSON</DialogTitle>
         <DialogContent>
@@ -967,7 +967,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             fullWidth
             autoFocus
             onFocus={(e) => e.target.select()}
-            sx={{ '& .MuiOutlinedInput-root': { fontFamily: 'monospace', fontSize: '0.78rem', backgroundColor: '#12141C', borderRadius: 2 } }}
+            sx={{ '& .MuiOutlinedInput-root': { fontFamily: 'monospace', fontSize: '0.78rem', backgroundColor: 'var(--mui-palette-background-paper)', borderRadius: 2 } }}
           />
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>

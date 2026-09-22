@@ -1,6 +1,7 @@
 import { ReactNode } from 'react';
 import type { Metadata } from 'next';
 import ThemeRegistry from '@/components/ThemeRegistry';
+import InitColorSchemeScript from '@mui/material/InitColorSchemeScript';
 
 function assertDevIsolationEnv() {
   if (process.env.NEXT_PHASE === 'phase-production-build') return
@@ -45,16 +46,17 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   assertDevIsolationEnv()
 
   return (
-    <html lang="en" style={{ height: '100%' }}>
+    <html lang="en" style={{ height: '100%' }} suppressHydrationWarning>
       <body
         style={{
           margin: 0,
           height: '100dvh',
           overflow: 'auto',
-          backgroundColor: '#0F0F13',
+          backgroundColor: 'var(--mui-palette-background-default)',
         }}
         suppressHydrationWarning
       >
+        <InitColorSchemeScript attribute="class" defaultMode="system" modeStorageKey="clawpilot-color-mode" />
         <ThemeRegistry>{children}</ThemeRegistry>
       </body>
     </html>

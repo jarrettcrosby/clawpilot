@@ -24,6 +24,7 @@ try {
       entry: {
         shortlinks: join(root, 'scripts/fixtures/shortlink-ui.tsx'),
         organization: join(root, 'scripts/fixtures/organization-web-ui.tsx'),
+        crm: join(root, 'scripts/fixtures/crm-feedback-ui.tsx'),
       },
       output: { path: output, filename: '[name].js' },
       resolve: {
@@ -38,13 +39,14 @@ try {
       else resolvePromise()
     }))
   })
-  const bundles = new Map(await Promise.all(['shortlinks', 'organization'].map(async (name) => [
+  const bundles = new Map(await Promise.all(['shortlinks', 'organization', 'crm'].map(async (name) => [
     `/${name}.js`, await readFile(join(output, `${name}.js`)),
   ])))
   server = createServer((req, res) => {
     const bundle = bundles.get(req.url)
     res.setHeader('Content-Type', bundle ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8')
-    const fixture = req.url === '/organization' ? 'organization' : 'shortlinks'
+    const pathname = new URL(req.url, 'http://localhost').pathname
+    const fixture = pathname === '/organization' ? 'organization' : pathname === '/crm' ? 'crm' : 'shortlinks'
     res.end(bundle || `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script src="/${fixture}.js"></script>`)
   })
   await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise))
@@ -58,6 +60,8 @@ try {
   let canOverrideDefault = true
   let bpoAvailable = true
   let failPreference = false
+  let failCreation = false
+  let failDeletion = false
   const preferences = []
   const posts = []
   const now = new Date().toISOString()
@@ -80,14 +84,19 @@ try {
       ok: true, links: records, currentOwnerEmail: 'operator@example.test', canManageOrganization: true,
       ...domainState(),
     })
-    const body = request.postDataJSON()
+    const body = request.method() === 'DELETE' ? null : request.postDataJSON()
     if (request.method() === 'PUT') {
       if (failPreference) return json({ ok: false, error: 'Preference save rejected' }, 403)
       preferences.push(body)
       userDefaultDomain = body.defaultDomain
       return json({ ok: true, ...domainState() })
     }
-    if (request.method() === 'POST') { posts.push(body); return json({ ok: true, link: { id: 'new' } }, 201) }
+    if (request.method() === 'POST') {
+      posts.push(body)
+      if (failCreation) return json({ ok: false, error: 'Link could not be created. Try again.' }, 503)
+      return json({ ok: true, link: { id: 'new' } }, 201)
+    }
+    if (request.method() === 'DELETE' && failDeletion) return json({ ok: false, error: 'Link could not be deleted. Try again.' }, 503)
     return json({ ok: true })
   })
   await page.goto(origin)
@@ -175,6 +184,35 @@ try {
   await page.setViewportSize({ width: 390, height: 844 })
   const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }))
   assert.ok(dimensions.content <= dimensions.width, 'Mobile controls remain within the viewport')
+  await page.goto(`${origin}/?mode=light`)
+  await page.getByTestId('create-short-link').click()
+  const linkDialog = page.getByRole('dialog', { name: 'Create short link' })
+  assert.equal(await linkDialog.evaluate((element) => getComputedStyle(element).backgroundColor), 'rgb(255, 255, 255)', 'Link dialog follows light palette')
+  const beforeInvalidPosts = posts.length
+  for (const invalidDestination of ['http://localhost:4002/test', 'https://operator:password@example.test']) {
+    await linkDialog.getByLabel('Destination URL').fill(invalidDestination)
+    await linkDialog.getByRole('button', { name: 'Create link', exact: true }).click()
+    await expect(linkDialog.getByRole('alert')).toContainText('Destination must use HTTPS without an embedded username or password')
+  }
+  assert.equal(posts.length, beforeInvalidPosts, 'Invalid destinations never reach the create API')
+  await linkDialog.getByLabel('Destination URL').fill('https://example.test/preserved-draft')
+  failCreation = true
+  await linkDialog.getByRole('button', { name: 'Create link', exact: true }).click()
+  await expect(linkDialog.getByRole('alert')).toContainText('Link could not be created. Try again.')
+  await expect(linkDialog.getByLabel('Destination URL')).toHaveValue('https://example.test/preserved-draft')
+  await expect(linkDialog.getByRole('button', { name: 'Create link', exact: true })).toBeEnabled()
+  failCreation = false
+  await linkDialog.getByRole('button', { name: 'Create link', exact: true }).click()
+  await expect(linkDialog).toHaveCount(0)
+  await page.getByRole('button', { name: 'Delete Existing BPO', exact: true }).click()
+  const deleteDialog = page.getByRole('dialog', { name: 'Delete short link?' })
+  await expect(deleteDialog.getByText(/Existing copies of this URL will stop working/)).toBeVisible()
+  failDeletion = true
+  await deleteDialog.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(deleteDialog.getByRole('alert')).toContainText('Link could not be deleted. Try again.')
+  await expect(deleteDialog.getByRole('button', { name: 'Delete', exact: true })).toBeEnabled()
+  await deleteDialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await expect(page.getByTestId('short-link-existing-bpo')).toBeVisible()
   assert.deepEqual(errors, [], 'No browser runtime exceptions')
   console.log('Short-link real React/MUI component acceptance passed: personal override, inheritance/reset, organization lock/unlock, save failure/retry, reload, workspace reset, unavailable preference fallback, immutable edit, mobile width')
 
@@ -187,6 +225,7 @@ try {
   let rejectOrganizationSave = false
   let organizationReadGate = null
   let organizationCanEdit = true
+  let rejectOrganizationLoad = true
   let organizationBpoAvailable = true
   let organizationName = 'First Organization'
   let organizationPreferences = {
@@ -207,6 +246,7 @@ try {
   await organizationPage.route('**/api/settings/organization-web', async (route) => {
     if (route.request().method() === 'GET') {
       organizationReads += 1
+      if (rejectOrganizationLoad) return route.fulfill({ status: 503, json: { ok: false, error: 'Organization settings temporarily unavailable' } })
       const payload = organizationPayload()
       if (organizationReadGate) await organizationReadGate
       await route.fulfill({ json: payload })
@@ -224,6 +264,9 @@ try {
   const overrideSwitch = organizationPage.getByLabel('Allow users to choose their own short-link default and per-link domain')
   const organizationSave = organizationPage.getByRole('button', { name: 'Save organization web defaults', exact: true })
   await organizationPage.goto(`${origin}/organization`)
+  await expect(organizationPage.getByRole('alert')).toContainText('Organization settings temporarily unavailable')
+  rejectOrganizationLoad = false
+  await organizationPage.getByRole('button', { name: 'Retry', exact: true }).click()
   await expect(appChoice).toContainText('aiapp.bposupplychain.com')
   await expect(organizationSave).toBeDisabled()
   await expect(organizationPage.getByRole('link', { name: 'Open organization app' })).toHaveAttribute('href', 'https://aiapp.bposupplychain.com')
@@ -254,6 +297,7 @@ try {
   await expect(shortChoice).toBeDisabled()
   await expect(overrideSwitch).toBeDisabled()
   await expect(organizationSave).toHaveCount(0)
+  await expect(organizationPage.getByText(/Only an organization owner or administrator can change/)).toBeVisible()
 
   organizationCanEdit = true
   organizationBpoAvailable = false
@@ -296,6 +340,92 @@ try {
   assert.ok(organizationDimensions.content <= organizationDimensions.width, 'Organization settings fit the mobile viewport')
   assert.deepEqual(errors, [], 'No browser runtime exceptions across domain controls')
   console.log('Organization web settings real React/MUI acceptance passed: admin/viewer, optimistic-lock failure/retry, saved defaults, no navigation, unavailable-domain fallback, preserved settings, workspace reset/late response, mobile width')
+
+  // Real CRM editor/composer with mocked network: failures must be visible above the form.
+  const crmPage = await browser.newPage({ viewport: { width: 390, height: 844 } })
+  crmPage.on('pageerror', (error) => errors.push(error.message))
+  const crmOrganization = { id: 'organization-1', referenceCode: 'ga12345678', name: 'Example customer', email: 'customer@example.test', syncStatus: 'synced' }
+  let failCrmSave = true
+  let failCrmAction = true
+  let failWorkspaceLoad = true
+  let crmAccessRole = 'owner'
+  const actionRequests = []
+  await crmPage.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.pathname === '/api/workspaces') {
+      if (request.method() === 'POST') return route.fulfill({ status: 503, json: { ok: false, error: 'Pipeline selection unavailable' } })
+      if (failWorkspaceLoad) return route.fulfill({ status: 503, json: { ok: false, error: 'Pipelines temporarily unavailable' } })
+      return route.fulfill({ json: { ok: true, selectedPipelineId: 'pipeline-1', pipelines: [
+        { id: 'pipeline-1', name: 'Customer pipeline', ownerEmail: 'operator@example.test', accessRole: 'owner' },
+        { id: 'pipeline-2', name: 'Other pipeline', ownerEmail: 'operator@example.test', accessRole: 'owner' },
+      ] } })
+    }
+    if (url.pathname === '/api/crm/actions') {
+      actionRequests.push(request.postDataJSON())
+      return route.fulfill({ status: failCrmAction ? 400 : 200, json: failCrmAction
+        ? { ok: false, error: 'Provider rejected this request; check the linked account.' }
+        : { ok: true, action: { status: 'succeeded' } } })
+    }
+    if (url.pathname === '/api/crm' && request.method() === 'POST') {
+      return route.fulfill({ status: failCrmSave ? 503 : 200, json: failCrmSave
+        ? { ok: false, error: 'CRM save temporarily unavailable; retry your changes.' }
+        : { ok: true } })
+    }
+    if (url.pathname === '/api/crm') return route.fulfill({ json: {
+      ok: true, records: url.searchParams.get('entity') === 'organizations' ? [crmOrganization] : [],
+      pipeline: { id: 'pipeline-1', name: 'Customer pipeline', accessRole: crmAccessRole },
+      providerIdentities: { googleMailSource: 'organization', googleMail: 'operator@example.test', googleMailAccountEmail: 'operator@example.test' },
+    } })
+    return route.fulfill({ json: { ok: true } })
+  })
+  await crmPage.goto(`${origin}/crm?mode=light`)
+  await expect(crmPage.getByRole('alert')).toContainText('Pipelines temporarily unavailable')
+  failWorkspaceLoad = false
+  await crmPage.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(crmPage.getByRole('combobox', { name: /^Pipeline/ })).toContainText('Customer pipeline')
+  await crmPage.getByRole('combobox', { name: /^Pipeline/ }).click()
+  await crmPage.getByRole('option', { name: 'Other pipeline', exact: true }).click()
+  await expect(crmPage.getByRole('alert')).toContainText('Your current pipeline is unchanged')
+  await expect(crmPage.getByRole('combobox', { name: /^Pipeline/ })).toContainText('Customer pipeline')
+  assert.equal(crmPage.url(), `${origin}/crm?mode=light`)
+  await crmPage.getByText('ga12345678', { exact: true }).click()
+  const editor = crmPage.getByRole('dialog', { name: 'Edit Organization' })
+  await expect(editor).toBeVisible()
+  await editor.getByRole('textbox', { name: /^Organization/ }).fill('')
+  await expect(editor.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
+  await expect(editor.getByText('Complete the required fields marked with * to save.')).toBeVisible()
+  await editor.getByRole('textbox', { name: /^Organization/ }).fill('Preserved customer draft')
+  await editor.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(editor.getByRole('alert')).toContainText('CRM save temporarily unavailable; retry your changes.')
+  await expect(editor.getByRole('alert')).toBeInViewport()
+  await expect(editor.getByRole('textbox', { name: /^Organization/ })).toHaveValue('Preserved customer draft')
+  await editor.getByRole('button', { name: 'Email', exact: true }).click()
+  const composer = crmPage.getByRole('dialog', { name: 'Send email', exact: true })
+  await expect(composer.getByRole('alert')).toHaveCount(0)
+  await composer.getByRole('textbox', { name: /^Message/ }).fill('A message retained after a provider failure.')
+  await composer.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(composer.getByRole('alert')).toContainText('Provider rejected this request; check the linked account.')
+  await expect(composer.getByRole('alert')).toBeInViewport()
+  await expect(composer.getByRole('textbox', { name: /^Message/ })).toHaveValue('A message retained after a provider failure.')
+  failCrmAction = false
+  await composer.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(composer).toHaveCount(0)
+  assert.equal(actionRequests.length, 2)
+  assert.equal(actionRequests[0].idempotencyKey, actionRequests[1].idempotencyKey, 'Retry keeps the same CRM action identity')
+  await expect(editor.getByRole('alert')).toContainText('CRM action completed and logged')
+  failCrmSave = false
+  await editor.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(editor).toHaveCount(0)
+  await expect(crmPage.getByText('Saved and queued for CRM sync')).toBeVisible()
+  crmAccessRole = 'viewer'
+  await crmPage.reload()
+  await crmPage.getByText('ga12345678', { exact: true }).click()
+  const viewer = crmPage.getByRole('dialog', { name: 'View Organization' })
+  await expect(viewer.getByRole('alert')).toContainText('You have view-only access to this pipeline')
+  await expect(viewer.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0)
+  assert.deepEqual(errors, [], 'No browser exceptions in CRM and settings acceptance')
+  console.log('CRM/mobile light-mode acceptance passed: workspace load retry/switch failure, visible editor/composer errors, preserved drafts, retry identity, and success feedback')
 } finally {
   await browser?.close()
   if (server) await new Promise((resolvePromise) => server.close(resolvePromise))

@@ -1800,10 +1800,22 @@ export default function CrmSection() {
     && editorMeetingTimingReady
     && editorMeetingLocationReady
   )
+  const editorRequiredFieldsReady = ({
+    organizations: ['name'],
+    contacts: ['fullName', 'organizationId'],
+    leads: ['fullName'],
+    opportunities: ['name', 'organizationId'],
+    products: ['name'],
+    meetings: ['subject'],
+    interactions: ['subject', 'interactionType'],
+    campaigns: ['name'],
+  } satisfies Record<CrmEntity, string[]>)[editorEntity].every((key) => Boolean(fields[key]?.trim()))
 
   function openEditor(record: RecordValue | null) {
     if (!record && !editable) return
     if (!record && entity === 'products' && !currencyPreferenceReady) return
+    setError('')
+    setNotice('')
     setEditorMeetingIdempotencyKey(entity === 'meetings'
       ? `crm-ui:meeting:${record ? 'update' : 'create'}:${crypto.randomUUID()}`
       : '')
@@ -1922,6 +1934,8 @@ export default function CrmSection() {
   }
 
   function openLifecycleDialog(type: LifecycleDialog['type'], record: RecordValue) {
+    setError('')
+    setNotice('')
     if (type === 'convert-lead') {
       const accountName = textValue(record, 'organizationName') || textValue(record, 'companyName')
         || `${textValue(record, 'fullName')} Account`
@@ -1937,9 +1951,10 @@ export default function CrmSection() {
   }
 
   async function submitLifecycleAction() {
-    if (!lifecycleDialog) return
+    if (!lifecycleDialog || busy) return
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       const response = await fetch('/api/crm', {
         method: 'PATCH',
@@ -1976,9 +1991,10 @@ export default function CrmSection() {
   }
 
   async function saveRecord() {
-    if (editorRecord === undefined) return
+    if (editorRecord === undefined || busy || !editorRequiredFieldsReady || !editorMeetingReady) return
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       const occurredAt = editorEntity === 'interactions' && fields.occurredAt
         ? zonedDateTimeToIso(fields.occurredAt, dateTimeSettings.timeZone)
@@ -2085,9 +2101,10 @@ export default function CrmSection() {
 
   async function createProductCategory() {
     const name = productCategoryName.trim()
-    if (!name) return
+    if (!name || busy) return
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       const response = await fetch('/api/crm/product-categories', {
         method: 'POST',
@@ -2118,6 +2135,8 @@ export default function CrmSection() {
   }
 
   function openAction(type: CrmActionType, record: RecordValue) {
+    setError('')
+    setNotice('')
     const recordName = textValue(record, 'fullName') || textValue(record, 'name')
       || textValue(record, 'subject') || textValue(record, 'referenceCode')
     const idempotencyKey = `crm-ui:${type}:${crypto.randomUUID()}`
@@ -2189,9 +2208,10 @@ export default function CrmSection() {
   }
 
   async function submitAction() {
-    if (!actionComposer) return
+    if (!actionComposer || busy) return
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       if (!actionFields.idempotencyKey) {
         throw new Error('CRM action request identity is unavailable; close and reopen the form')
@@ -2341,7 +2361,7 @@ export default function CrmSection() {
             {workspaceHierarchy.length > 0 && (
               narrowMobile ? (
                 <Tooltip title="Organization hierarchy">
-                  <IconButton aria-label="Organization hierarchy" color="primary" onClick={() => setHierarchyOpen(true)}>
+                  <IconButton aria-label="Organization hierarchy" color="primary" onClick={() => { setError(''); setNotice(''); setHierarchyOpen(true) }}>
                     <AccountTreeRounded />
                   </IconButton>
                 </Tooltip>
@@ -2349,7 +2369,7 @@ export default function CrmSection() {
                 <Button
                   startIcon={<AccountTreeRounded />}
                   variant="outlined"
-                  onClick={() => setHierarchyOpen(true)}
+                  onClick={() => { setError(''); setNotice(''); setHierarchyOpen(true) }}
                 >
                   Hierarchy
                 </Button>
@@ -2441,8 +2461,10 @@ export default function CrmSection() {
       </Box>
       <Divider />
       <Box sx={{ px: shortLandscape ? 1 : { xs: 2, md: 3 }, pt: shortLandscape ? 0.25 : 1.25, flexShrink: 0 }}>
-        {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
-        {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
+        {!actionComposer && !lifecycleDialog && !productCategoryOpen && !hierarchyOpen && editorRecord === undefined && <>
+          {error && <Alert severity="error" onClose={() => setError('')} sx={{ mb: 1 }}>{error}</Alert>}
+          {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 1 }}>{notice}</Alert>}
+        </>}
         {entity === 'products' && !currencyPreferenceReady ? (
           <Alert
             severity={measurementPreferencesError ? 'warning' : 'info'}
@@ -2589,7 +2611,8 @@ export default function CrmSection() {
               left: 0,
               zIndex: 2,
               backgroundColor: 'background.paper',
-              boxShadow: '1px 0 0 0 rgba(255, 255, 255, 0.12)',
+              borderRight: 1,
+              borderColor: 'divider',
             },
             '& th:first-of-type': { zIndex: 4 },
           }}>
@@ -2726,7 +2749,7 @@ export default function CrmSection() {
         fullScreen={shortLandscape}
         fullWidth
         maxWidth="xs"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none', borderRadius: '8px' } }}
+        PaperProps={{ sx: { backgroundColor: 'background.paper', backgroundImage: 'none', borderRadius: '8px' } }}
       >
         <DialogTitle>SuiteCRM sign in</DialogTitle>
         <DialogContent>
@@ -2777,13 +2800,15 @@ export default function CrmSection() {
         fullScreen={shortLandscape}
         fullWidth
         maxWidth="sm"
+        aria-labelledby="crm-action-title"
       >
-        <DialogTitle>
+        <DialogTitle id="crm-action-title">
           {actionComposer?.type === 'send_email' ? 'Send email'
             : actionComposer?.type === 'log_call' ? 'Call and log interaction'
               : actionComposer?.type === 'create_calendar_event' ? 'Schedule meeting'
                 : 'Send campaign'}
         </DialogTitle>
+        {actionComposer && error && <Alert severity="error" sx={{ mx: 3, mb: 1 }} onClose={() => setError('')}>{error}</Alert>}
         <DialogContent>
           <Stack spacing={2} mt={0.5}>
             {actionComposer?.type === 'send_email' && <>
@@ -3057,8 +3082,10 @@ export default function CrmSection() {
         fullScreen={shortLandscape}
         fullWidth
         maxWidth="xs"
+        aria-labelledby="crm-lifecycle-title"
       >
-        <DialogTitle>{lifecycleDialog?.type === 'convert-lead' ? 'Convert lead' : 'Archive record'}</DialogTitle>
+        <DialogTitle id="crm-lifecycle-title">{lifecycleDialog?.type === 'convert-lead' ? 'Convert lead' : 'Archive record'}</DialogTitle>
+        {lifecycleDialog && error && <Alert severity="error" sx={{ mx: 3, mb: 1 }} onClose={() => setError('')}>{error}</Alert>}
         <DialogContent>
           {lifecycleDialog?.type === 'convert-lead' ? (
             <Stack spacing={2} mt={0.5}>
@@ -3121,6 +3148,8 @@ export default function CrmSection() {
           <IconButton aria-label="Close hierarchy" onClick={() => setHierarchyOpen(false)} disabled={busy}><CloseRounded /></IconButton>
         </Box>
         <Divider />
+        {hierarchyOpen && error && <Alert severity="error" sx={{ m: 2 }} onClose={() => setError('')}>{error}</Alert>}
+        {hierarchyOpen && notice && <Alert severity="success" sx={{ m: 2 }} onClose={() => setNotice('')}>{notice}</Alert>}
         <Stack divider={<Divider flexItem />} sx={{ overflowY: 'auto' }}>
           {workspaceHierarchy.map((organization) => {
             const excluded = hierarchyDescendants(workspaceHierarchy, organization.id)
@@ -3167,7 +3196,7 @@ export default function CrmSection() {
         anchor="right"
         open={editorRecord !== undefined}
         onClose={closeEditor}
-        PaperProps={{ sx: { width: { xs: '100%', sm: 460 }, maxWidth: '100vw', overflowX: 'hidden' } }}
+        PaperProps={{ role: 'dialog', 'aria-labelledby': 'crm-editor-title', sx: { width: { xs: '100%', sm: 460 }, maxWidth: '100vw', overflowX: 'hidden' } }}
       >
         <Box sx={{ p: shortLandscape ? 1.5 : 2.5, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1, minWidth: 0 }}>
           <Stack direction="row" alignItems="center" gap={0.5} sx={{ minWidth: 0 }}>
@@ -3178,14 +3207,21 @@ export default function CrmSection() {
                 </IconButton>
               </Tooltip>
             )}
-            <Typography variant="h6" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
-              {editorRecord ? 'Edit' : 'Add'} {ENTITY_SINGULAR_LABELS[editorEntity]}
+            <Typography id="crm-editor-title" variant="h6" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+              {editorRecord ? recordEditable ? 'Edit' : 'View' : 'Add'} {ENTITY_SINGULAR_LABELS[editorEntity]}
             </Typography>
           </Stack>
           <IconButton aria-label="Close editor" onClick={closeEditor} disabled={busy}><CloseRounded /></IconButton>
         </Box>
         <Divider />
+        {editorRecord !== undefined && !actionComposer && !lifecycleDialog && !productCategoryOpen && error && <Alert severity="error" sx={{ m: 2 }} onClose={() => setError('')}>{error}</Alert>}
+        {editorRecord !== undefined && !actionComposer && !lifecycleDialog && !productCategoryOpen && notice && <Alert severity="success" sx={{ m: 2 }} onClose={() => setNotice('')}>{notice}</Alert>}
         <Stack spacing={2} sx={{ p: shortLandscape ? 1.5 : 2.5, overflowY: 'auto', overflowX: 'hidden', minWidth: 0 }}>
+          {!recordEditable && <Alert severity="info">{!editorEditable
+            ? 'You have view-only access to this pipeline. Ask its owner for editing access.'
+            : convertedLead
+              ? 'This lead has been converted. Update the linked contact, organization, or opportunity instead.'
+              : 'This record is managed by your organization settings and cannot be edited here.'}</Alert>}
           {editorRecord && Boolean(editorRecord.referenceCode) && (
             <Stack direction="row" gap={1} alignItems="center">
               <Chip label={textValue(editorRecord, 'referenceCode')} color="primary" variant="outlined" />
@@ -3672,7 +3708,7 @@ export default function CrmSection() {
                 </TextField>
                 <Tooltip title="Add category">
                   <span>
-                    <IconButton disabled={!recordEditable} aria-label="Add product category" onClick={() => setProductCategoryOpen(true)}>
+                    <IconButton disabled={!recordEditable} aria-label="Add product category" onClick={() => { setError(''); setNotice(''); setProductCategoryOpen(true) }}>
                       <AddRounded />
                     </IconButton>
                   </span>
@@ -3736,7 +3772,7 @@ export default function CrmSection() {
               <Box
                 component="section"
                 aria-label="Meeting delivery status"
-                sx={{ border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px', p: 1.5 }}
+                sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', p: 1.5 }}
               >
                 <Typography variant="subtitle2" fontWeight={700} mb={1}>Delivery status</Typography>
                 <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap>
@@ -4397,18 +4433,22 @@ export default function CrmSection() {
             </Box>
           )}
           {recordEditable && (
+            <>
+            {!editorRequiredFieldsReady && <Typography variant="caption" color="text.secondary">Complete the required fields marked with * to save.</Typography>}
             <Button
               variant="contained"
               onClick={saveRecord}
-              disabled={busy || !editorMeetingReady}
+              disabled={busy || !editorMeetingReady || !editorRequiredFieldsReady}
             >
               {busy ? 'Saving…' : 'Save'}
             </Button>
+            </>
           )}
         </Stack>
       </Drawer>
-      <Dialog open={productCategoryOpen} onClose={() => { if (!busy) setProductCategoryOpen(false) }} fullWidth maxWidth="sm">
-        <DialogTitle>Add product category</DialogTitle>
+      <Dialog open={productCategoryOpen} onClose={() => { if (!busy) setProductCategoryOpen(false) }} fullWidth maxWidth="sm" aria-labelledby="crm-product-category-title">
+        <DialogTitle id="crm-product-category-title">Add product category</DialogTitle>
+        {productCategoryOpen && error && <Alert severity="error" sx={{ mx: 3, mb: 1 }} onClose={() => setError('')}>{error}</Alert>}
         <DialogContent>
           <Stack spacing={2} sx={{ pt: 1 }}>
             <TextField

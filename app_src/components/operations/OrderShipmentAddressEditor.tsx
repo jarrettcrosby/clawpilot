@@ -14,6 +14,7 @@ import {
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import {
   normalizeOrderShipToDraft,
+  orderShipToIssueSummary,
   orderShipToReadiness,
   type OrderShipToDraft,
 } from '@/lib/operations/orderShipTo'
@@ -87,6 +88,10 @@ export default function OrderShipmentAddressEditor({
       !== fingerprint(normalizeOrderShipToDraft(shipmentAddress.value))
   ), [shipTo, shipmentAddress.value])
   const readiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
+  const readinessGuidance = useMemo(
+    () => orderShipToIssueSummary(shipTo),
+    [shipTo],
+  )
   const editable = canManage && shipmentAddress.editable && !disabled
 
   const update = (field: keyof OrderShipToDraft, value: string) => {
@@ -182,6 +187,12 @@ export default function OrderShipmentAddressEditor({
         />
       </Stack>
 
+      {readinessGuidance && (
+        <Alert severity="warning" variant="outlined">
+          {readinessGuidance}
+        </Alert>
+      )}
+
       <Stack spacing={1.25}>
         <TextField
           size="small"
@@ -248,7 +259,7 @@ export default function OrderShipmentAddressEditor({
       </Stack>
 
       {shipmentAddress.provenance === 'local' && (
-        <Box sx={{ px: 1.25, py: 1, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
+        <Box sx={{ px: 1.25, py: 1, borderRadius: 1, backgroundColor: 'action.hover' }}>
           <Typography variant="caption" color="text.secondary">Store address</Typography>
           <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
             {addressLine(shipmentAddress.sourceValue)}

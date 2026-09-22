@@ -65,7 +65,7 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
   }, [product])
 
   async function prepareUpdate() {
-    if (!product || !clientRequestId) return
+    if (!product || !clientRequestId || busy || !hasChanges || !name.trim() || !validPrice || !validCost) return
     setBusy(true)
     setError(null)
     try {
@@ -107,6 +107,15 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
 
   const validPrice = unitPrice.trim() !== '' && Number.isFinite(Number(unitPrice)) && Number(unitPrice) >= 0
   const validCost = purchaseCost.trim() !== '' && Number.isFinite(Number(purchaseCost)) && Number(purchaseCost) >= 0
+  const hasChanges = Boolean(product && (
+    name.trim() !== product.name.trim()
+    || sku.trim() !== (product.sku || '').trim()
+    || description.trim() !== (product.description || '').trim()
+    || Number(unitPrice) !== product.unitPrice
+    || Number(purchaseCost) !== product.purchaseCost
+    || taxable !== product.taxable
+    || taxClassificationId !== product.taxClassificationId
+  ))
 
   return (
     <Dialog open={Boolean(product)} onClose={busy ? undefined : onClose} fullWidth maxWidth="sm">
@@ -117,20 +126,22 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
             This prepares a reviewable change. Nothing is updated in QuickBooks until an authorized user approves it.
           </Alert>
           {error ? <Alert severity="error">{error}</Alert> : null}
-          <TextField label="Product name" value={name} onChange={(event) => setName(event.target.value)} required />
-          <TextField label="SKU" value={sku} onChange={(event) => setSku(event.target.value)} />
-          <TextField label="Sales description" value={description} onChange={(event) => setDescription(event.target.value)} multiline minRows={2} inputProps={{ maxLength: 4000 }} />
+          <TextField label="Product name" value={name} onChange={(event) => setName(event.target.value)} required disabled={busy} error={!name.trim()} helperText={!name.trim() ? 'Enter a product name.' : undefined} />
+          <TextField label="SKU" value={sku} onChange={(event) => setSku(event.target.value)} disabled={busy} />
+          <TextField label="Sales description" value={description} onChange={(event) => setDescription(event.target.value)} multiline minRows={2} inputProps={{ maxLength: 4000 }} disabled={busy} />
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={1.5}>
-            <TextField label="Sales price or rate" type="number" value={unitPrice} onChange={(event) => setUnitPrice(event.target.value)} required inputProps={{ min: 0, step: '0.01' }} />
-            <TextField label="Purchase cost" type="number" value={purchaseCost} onChange={(event) => setPurchaseCost(event.target.value)} required inputProps={{ min: 0, step: '0.01' }} />
+            <TextField label="Sales price or rate" type="number" value={unitPrice} onChange={(event) => setUnitPrice(event.target.value)} required inputProps={{ min: 0, step: '0.01' }} disabled={busy} error={!validPrice} helperText={!validPrice ? 'Enter zero or a positive price.' : undefined} />
+            <TextField label="Purchase cost" type="number" value={purchaseCost} onChange={(event) => setPurchaseCost(event.target.value)} required inputProps={{ min: 0, step: '0.01' }} disabled={busy} error={!validCost} helperText={!validCost ? 'Enter zero or a positive cost.' : undefined} />
           </Box>
-          <FormControlLabel control={<Switch checked={taxable} onChange={(event) => setTaxable(event.target.checked)} />} label="Taxable" />
+          <FormControlLabel control={<Switch checked={taxable} onChange={(event) => setTaxable(event.target.checked)} disabled={busy} />} label="Taxable" />
           {product && ['Inventory', 'NonInventory', 'Service'].includes(product.itemType) ? (
             <QuickBooksTaxClassificationPicker
               key={product.id}
+              disabled={busy}
               itemType={product.itemType}
               value={taxClassificationId ? { id: taxClassificationId, name: taxClassificationName || taxClassificationId, parentId: taxClassificationParentId || null } : null}
               onChange={(choice) => {
+                if (busy) return
                 setTaxClassificationId(choice?.id || '')
                 setTaxClassificationName(choice?.name || '')
                 setTaxClassificationParentId(choice?.parentId || '')
@@ -150,11 +161,14 @@ export default function QuickBooksProductEditDialog({ product, onClose, onPrepar
           <Typography variant="caption" color="text.secondary">
             Product type, accounting category, accounts, and stock quantity stay unchanged in this edit.
           </Typography>
+          <Typography variant="caption" color="text.secondary" role="status">
+            {!product?.syncToken ? 'Refresh QuickBooks to load this product version before editing.' : hasChanges ? 'Unsaved changes. Prepare a draft to review and approve them.' : 'No changes yet. Update a field to prepare a review draft.'}
+          </Typography>
         </Stack>
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} disabled={busy}>Cancel</Button>
-        <Button variant="contained" onClick={() => { void prepareUpdate() }} disabled={busy || !product?.syncToken || !name.trim() || !validPrice || !validCost}>
+        <Button variant="contained" onClick={() => { void prepareUpdate() }} disabled={busy || !product?.syncToken || !hasChanges || !name.trim() || !validPrice || !validCost}>
           {busy ? <CircularProgress size={18} /> : 'Prepare for review'}
         </Button>
       </DialogActions>

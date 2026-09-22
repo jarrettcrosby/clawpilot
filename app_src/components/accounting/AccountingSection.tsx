@@ -221,9 +221,9 @@ const TRANSACTION_TYPES = [
 ] as const
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1, borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: '#15151D',
+  backgroundColor: 'background.paper',
 }
 
 function value(row: ExplorerRow, key: string) {
@@ -259,7 +259,7 @@ function recordTitle(view: View, row: ExplorerRow) {
   return `${textValue(row, 'entityType', 'Transaction')}${documentNumber ? ` ${documentNumber}` : ''}`
 }
 
-function Metric({ label, value, detail, color = '#F3F4F6', onClick }: {
+function Metric({ label, value, detail, color = 'text.primary', onClick }: {
   label: string
   value: string
   detail?: string
@@ -280,7 +280,7 @@ function Metric({ label, value, detail, color = '#F3F4F6', onClick }: {
         font: 'inherit',
         cursor: onClick ? 'pointer' : 'default',
         ...panelSx,
-        '&:hover': onClick ? { borderColor: 'rgba(168,199,250,0.42)', backgroundColor: '#181923' } : undefined,
+        '&:hover': onClick ? { borderColor: 'primary.main', backgroundColor: 'action.hover' } : undefined,
       }}
     >
       <Typography variant="caption" color="text.secondary">{label}</Typography>
@@ -303,8 +303,8 @@ function TrendChart({ rows, money }: {
           <Typography variant="caption" color="text.secondary">Six-month transaction-form trend</Typography>
         </Box>
         <Stack direction="row" spacing={1.5} flexShrink={0}>
-          <Typography variant="caption" color="#70D6A7">Sales</Typography>
-          <Typography variant="caption" color="#F2B76D">Expenses</Typography>
+          <Typography variant="caption" color="success.main">Sales</Typography>
+          <Typography variant="caption" color="warning.main">Expenses</Typography>
         </Stack>
       </Box>
       <Box display="grid" gridTemplateColumns={`repeat(${Math.max(rows.length, 1)}, minmax(44px, 1fr))`} gap={1} height={158}>
@@ -312,8 +312,8 @@ function TrendChart({ rows, money }: {
           <Tooltip key={row.month} title={`${money(row.sales)} sales · ${money(row.expenses)} expenses`}>
             <Box display="grid" gridTemplateRows="1fr auto" minWidth={0}>
               <Box display="flex" alignItems="flex-end" justifyContent="center" gap="4px" minHeight={0}>
-                <Box aria-label={`${row.month} sales ${money(row.sales)}`} sx={{ width: '34%', maxWidth: 24, height: `${Math.max(2, (row.sales / max) * 100)}%`, bgcolor: '#70D6A7', borderRadius: '3px 3px 0 0' }} />
-                <Box aria-label={`${row.month} expenses ${money(row.expenses)}`} sx={{ width: '34%', maxWidth: 24, height: `${Math.max(2, (row.expenses / max) * 100)}%`, bgcolor: '#F2B76D', borderRadius: '3px 3px 0 0' }} />
+                <Box aria-label={`${row.month} sales ${money(row.sales)}`} sx={{ width: '34%', maxWidth: 24, height: `${Math.max(2, (row.sales / max) * 100)}%`, bgcolor: 'success.main', borderRadius: '3px 3px 0 0' }} />
+                <Box aria-label={`${row.month} expenses ${money(row.expenses)}`} sx={{ width: '34%', maxWidth: 24, height: `${Math.max(2, (row.expenses / max) * 100)}%`, bgcolor: 'warning.main', borderRadius: '3px 3px 0 0' }} />
               </Box>
               <Typography variant="caption" color="text.disabled" textAlign="center" mt={0.75} noWrap>
                 {new Intl.DateTimeFormat(undefined, { month: 'short' }).format(new Date(`${row.month}-15T12:00:00Z`))}
@@ -368,7 +368,7 @@ function FinancialReportPanel({
         scrollButtons="auto"
         allowScrollButtonsMobile
         aria-label="Financial report"
-        sx={{ borderBottom: '1px solid rgba(255,255,255,0.08)', '& .MuiTab-root': { minHeight: 44, textTransform: 'none', letterSpacing: 0, whiteSpace: 'nowrap' } }}
+        sx={{ borderBottom: 1, borderColor: 'divider', '& .MuiTab-root': { minHeight: 44, textTransform: 'none', letterSpacing: 0, whiteSpace: 'nowrap' } }}
       >
         {REPORTS.map((candidate) => <Tab key={candidate.id} value={candidate.id} label={candidate.label} />)}
       </Tabs>
@@ -416,7 +416,7 @@ function FinancialReportPanel({
           </Box>
 
           <Box sx={{ ...panelSx, overflow: 'hidden', position: 'relative', minHeight: 240 }}>
-            {loading ? <Box sx={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', bgcolor: 'rgba(15,15,19,0.62)', zIndex: 5 }}><CircularProgress size={28} /></Box> : null}
+            {loading ? <Box sx={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', bgcolor: 'background.paper', zIndex: 5 }}><CircularProgress size={28} /></Box> : null}
             <TableContainer sx={{ display: { xs: 'none', md: 'block' }, maxHeight: 'calc(100dvh - 360px)' }}>
               <Table stickyHeader size="small" aria-label={`${report.reportName} statement`}>
                 <TableHead>
@@ -426,7 +426,7 @@ function FinancialReportPanel({
                         key={`${column.title}-${index}`}
                         align={index === 0 ? 'left' : 'right'}
                         sx={{
-                          bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap',
+                          bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap',
                           ...(index === 0 ? { position: 'sticky', left: 0, zIndex: 4, minWidth: 240 } : { minWidth: 118 }),
                         }}
                       >
@@ -439,9 +439,9 @@ function FinancialReportPanel({
                   {report.rows.map((row, rowIndex) => {
                     const cells = Array.from({ length: columnCount }, (_, index) => row.cells?.[index]?.value || '')
                     const label = cells[0] || row.group || 'Section'
-                    const background = row.kind === 'summary' ? '#1B1C24' : row.kind === 'section' ? '#171821' : 'transparent'
+                    const background = row.kind === 'summary' ? 'background.default' : row.kind === 'section' ? 'background.paper' : 'transparent'
                     return (
-                      <TableRow key={`${row.kind || 'row'}-${rowIndex}`} sx={{ bgcolor: background, '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+                      <TableRow key={`${row.kind || 'row'}-${rowIndex}`} sx={{ bgcolor: background, '& td': { borderColor: 'divider' } }}>
                         {cells.map((cell, cellIndex) => (
                           <TableCell
                             key={cellIndex}
@@ -451,7 +451,7 @@ function FinancialReportPanel({
                               whiteSpace: cellIndex === 0 ? 'normal' : 'nowrap',
                               ...(cellIndex === 0 ? {
                                 position: 'sticky', left: 0, zIndex: 1, minWidth: 240,
-                                bgcolor: background === 'transparent' ? '#15151D' : background,
+                                bgcolor: background === 'transparent' ? 'background.paper' : background,
                                 pl: 2 + Math.min(Number(row.depth || 0), 5) * 2,
                               } : undefined),
                             }}
@@ -479,8 +479,8 @@ function FinancialReportPanel({
                     key={`${row.kind || 'row'}-${rowIndex}`}
                     sx={{
                       px: 2, py: row.kind === 'section' ? 1.5 : 1.25,
-                      borderBottom: '1px solid rgba(255,255,255,0.065)',
-                      bgcolor: row.kind === 'summary' ? '#1B1C24' : row.kind === 'section' ? '#171821' : 'transparent',
+                      borderBottom: 1, borderColor: 'divider',
+                      bgcolor: row.kind === 'summary' ? 'background.default' : row.kind === 'section' ? 'background.paper' : 'transparent',
                     }}
                   >
                     <Typography fontWeight={row.kind === 'data' ? 500 : 700} sx={{ pl: Math.min(Number(row.depth || 0), 4) * 1.25 }}>
@@ -536,14 +536,14 @@ function AttachmentPreview({ attachment, compact = false }: {
   const isImage = contentType.startsWith('image/') || /\.(avif|gif|heic|heif|jpe?g|png|webp)$/.test(fileName)
   const isPdf = contentType === 'application/pdf' || fileName.endsWith('.pdf')
   return (
-    <Box sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px', overflow: 'hidden', minWidth: 0 }}>
+    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: '8px', overflow: 'hidden', minWidth: 0 }}>
       {isImage ? (
         <Box
           component="img"
           src={compact ? `${href}?thumbnail=1` : href}
           alt={attachment.fileName || 'QuickBooks receipt'}
           referrerPolicy="no-referrer"
-          sx={{ width: '100%', height: compact ? 140 : 260, objectFit: 'contain', display: 'block', bgcolor: '#0F0F13' }}
+          sx={{ width: '100%', height: compact ? 140 : 260, objectFit: 'contain', display: 'block', bgcolor: 'background.default' }}
         />
       ) : isPdf && !compact ? (
         <Box
@@ -551,14 +551,14 @@ function AttachmentPreview({ attachment, compact = false }: {
           src={href}
           title={attachment.fileName || 'QuickBooks receipt PDF'}
           referrerPolicy="no-referrer"
-          sx={{ width: '100%', height: 360, border: 0, display: 'block', bgcolor: '#0F0F13' }}
+          sx={{ width: '100%', height: 360, border: 0, display: 'block', bgcolor: 'background.default' }}
         />
       ) : (
-        <Box display="grid" sx={{ placeItems: 'center', bgcolor: '#111219' }} height={compact ? 100 : 160}>
+        <Box display="grid" sx={{ placeItems: 'center', bgcolor: 'background.default' }} height={compact ? 100 : 160}>
           <AttachFileRounded sx={{ fontSize: 36, color: 'text.disabled' }} />
         </Box>
       )}
-      <Box p={1.25} display="flex" alignItems="center" justifyContent="space-between" gap={1} bgcolor="#1B1C24">
+      <Box p={1.25} display="flex" alignItems="center" justifyContent="space-between" gap={1} bgcolor="background.default">
         <Box minWidth={0}>
           <Typography variant="body2" fontWeight={600} noWrap>{attachment.fileName || 'QuickBooks attachment'}</Typography>
           <Typography variant="caption" color="text.disabled">{formatBytes(attachment.sizeBytes)}</Typography>
@@ -711,6 +711,7 @@ export default function AccountingSection() {
   const [financialReport, setFinancialReport] = useState<FinancialReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [reload, setReload] = useState(0)
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<{ view: View; row: ExplorerRow } | null>(null)
@@ -769,6 +770,7 @@ export default function AccountingSection() {
           report?: FinancialReport | null
         }
         if (!response.ok || !payload.ok) throw new Error(payload.error || 'Accounting data is unavailable')
+        if (controller.signal.aborted) return
         if (payload.capabilities) setCapabilities(payload.capabilities)
         if (payload.overview) setOverview(payload.overview)
         if (payload.result) setResult(payload.result)
@@ -781,7 +783,7 @@ export default function AccountingSection() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [effectiveReportPeriod, entityType, page, range, reportKey, search, status, view])
+  }, [effectiveReportPeriod, entityType, page, range, reportKey, search, status, view, reload])
 
   useEffect(() => {
     const isInvoice = selected
@@ -990,12 +992,12 @@ export default function AccountingSection() {
   }, [])
 
   return (
-    <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="#0F0F13">
+    <Box height="100%" display="flex" flexDirection="column" minWidth={0} bgcolor="background.default">
       <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, pb: 1.5, flexShrink: 0 }}>
         <Box display="flex" alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" gap={2} flexWrap="wrap">
           <Box minWidth={0}>
             <Box display="flex" alignItems="center" gap={1.25}>
-              <AccountBalanceRounded sx={{ color: '#A8C7FA' }} />
+              <AccountBalanceRounded sx={{ color: 'primary.main' }} />
               <Typography variant="h5" fontWeight={700}>Accounting</Typography>
               <Chip size="small" label="Approval controlled" variant="outlined" />
             </Box>
@@ -1015,7 +1017,7 @@ export default function AccountingSection() {
             {capabilities?.canManage && connection?.configured ? (
               <Tooltip title="Refresh QuickBooks data">
                 <span>
-                  <IconButton aria-label="Refresh QuickBooks data" onClick={() => { void queueRefresh() }} disabled={refreshing} sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px' }}>
+                  <IconButton aria-label="Refresh QuickBooks data" onClick={() => { void queueRefresh() }} disabled={refreshing} sx={{ border: 1, borderColor: 'divider', borderRadius: '8px' }}>
                     {refreshing ? <CircularProgress size={20} /> : <RefreshRounded />}
                   </IconButton>
                 </span>
@@ -1036,14 +1038,14 @@ export default function AccountingSection() {
         variant="scrollable"
         scrollButtons="auto"
         allowScrollButtonsMobile
-        sx={{ px: { xs: 1, md: 2 }, borderBottom: '1px solid rgba(255,255,255,0.08)', flexShrink: 0, '& .MuiTab-root': { minHeight: 48, textTransform: 'none', letterSpacing: 0, whiteSpace: 'nowrap' } }}
+        sx={{ px: { xs: 1, md: 2 }, borderBottom: 1, borderColor: 'divider', flexShrink: 0, '& .MuiTab-root': { minHeight: 48, textTransform: 'none', letterSpacing: 0, whiteSpace: 'nowrap' } }}
       >
         {VIEWS.map((candidate) => <Tab key={candidate.id} value={candidate.id} label={candidate.label} />)}
       </Tabs>
 
       <Box flex={1} minHeight={0} overflow="auto" sx={{ WebkitOverflowScrolling: 'touch' }}>
         <Box sx={{ px: { xs: 2, md: 3 }, py: 2.5, maxWidth: 1500, mx: 'auto' }}>
-          {error ? <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert> : null}
+          {error ? <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" disabled={loading} onClick={() => setReload((value) => value + 1)}>Retry loading</Button>}>{error}</Alert> : null}
           {notice ? <Alert severity="success" onClose={() => setNotice(null)} sx={{ mb: 2 }}>{notice}</Alert> : null}
 
           {!connection?.configured && !loading && !error ? (
@@ -1064,15 +1066,15 @@ export default function AccountingSection() {
               <Stack spacing={2.5}>
                 <Box display="flex" gap={1.5} overflow="auto" pb={0.5} sx={{ scrollbarWidth: 'thin' }}>
                   <Metric label={`Invoices · ${rangeLabel}`} value={money(overview.metrics.invoiced, null, true)} detail="Issued invoice value" onClick={() => setView('invoices')} />
-                  <Metric label="Open receivables" value={money(overview.metrics.openInvoices, null, true)} detail={`${overview.metrics.openInvoiceCount} invoices`} color="#A8C7FA" onClick={() => { setView('invoices'); setStatus('Open') }} />
-                  <Metric label="Overdue" value={money(overview.metrics.overdueInvoices, null, true)} detail={`${overview.metrics.overdueInvoiceCount} invoices`} color={overview.metrics.overdueInvoiceCount ? '#FF8A80' : '#70D6A7'} onClick={() => { setView('invoices'); setStatus('Overdue') }} />
+                  <Metric label="Open receivables" value={money(overview.metrics.openInvoices, null, true)} detail={`${overview.metrics.openInvoiceCount} invoices`} color="primary.main" onClick={() => { setView('invoices'); setStatus('Open') }} />
+                  <Metric label="Overdue" value={money(overview.metrics.overdueInvoices, null, true)} detail={`${overview.metrics.overdueInvoiceCount} invoices`} color={overview.metrics.overdueInvoiceCount ? 'error.main' : 'success.main'} onClick={() => { setView('invoices'); setStatus('Overdue') }} />
                   <Metric label={`Sales receipts · ${rangeLabel}`} value={money(overview.metrics.receivedSales, null, true)} detail="Paid at sale" onClick={() => setView('receipts')} />
-                  <Metric label={`Expenses · ${rangeLabel}`} value={money(overview.metrics.expenses, null, true)} detail="Purchases and bills" color="#F2B76D" onClick={() => setView('receipts')} />
+                  <Metric label={`Expenses · ${rangeLabel}`} value={money(overview.metrics.expenses, null, true)} detail="Purchases and bills" color="warning.main" onClick={() => setView('receipts')} />
                   <Metric
                     label="Financial statements"
                     value={overview.counts.reports.toLocaleString(dateTimeSettings.locale)}
                     detail={overview.counts.reportErrors ? `${overview.counts.reportErrors} refresh warnings` : 'QuickBooks report snapshots'}
-                    color="#A8C7FA"
+                    color="primary.main"
                     onClick={() => setView('reports')}
                   />
                   <Metric label="Products & services" value={overview.counts.products.toLocaleString(dateTimeSettings.locale)} detail={`${overview.counts.accounts} accounts`} onClick={() => setView('products')} />
@@ -1120,7 +1122,7 @@ export default function AccountingSection() {
                   </Box>
                   <Divider />
                   {overview.recent.length ? overview.recent.map((row) => (
-                    <Box key={`${row.entityType}-${row.id}`} component="button" type="button" onClick={() => setSelected({ view: 'transactions', row })} sx={{ width: '100%', border: 0, borderBottom: '1px solid rgba(255,255,255,0.06)', bgcolor: 'transparent', color: 'inherit', p: 1.75, display: 'grid', gridTemplateColumns: { xs: '1fr auto', sm: '150px minmax(160px, 1fr) 140px 110px' }, gap: 1.5, alignItems: 'center', textAlign: 'left', cursor: 'pointer', '&:hover': { bgcolor: 'rgba(255,255,255,0.025)' } }}>
+                    <Box key={`${row.entityType}-${row.id}`} component="button" type="button" onClick={() => setSelected({ view: 'transactions', row })} sx={{ width: '100%', border: 0, borderBottom: 1, borderColor: 'divider', bgcolor: 'transparent', color: 'inherit', p: 1.75, display: 'grid', gridTemplateColumns: { xs: '1fr auto', sm: '150px minmax(160px, 1fr) 140px 110px' }, gap: 1.5, alignItems: 'center', textAlign: 'left', cursor: 'pointer', '&:hover': { bgcolor: 'action.hover' } }}>
                       <Box><Typography variant="body2" fontWeight={600}>{textValue(row, 'entityType')}</Typography><Typography variant="caption" color="text.disabled">{textValue(row, 'documentNumber')}</Typography></Box>
                       <Typography variant="body2" noWrap sx={{ display: { xs: 'none', sm: 'block' } }}>{textValue(row, 'partyName')}</Typography>
                       <Typography variant="body2" textAlign={{ xs: 'right', sm: 'left' }}>{money(Number(value(row, 'totalAmount') || 0), textValue(row, 'currencyCode', ''))}</Typography>
@@ -1144,6 +1146,9 @@ export default function AccountingSection() {
             />
           ) : (
             <Stack spacing={2}>
+              {view === 'products' && capabilities?.canPrepare ? <Alert severity="info" variant="outlined" action={<Button color="inherit" onClick={() => setView('actions')}>Product actions</Button>}>
+                Open a product to prepare an edit, or use Product actions to create a product or service. Changes require review and approval before posting.
+              </Alert> : null}
               <Box display="flex" alignItems={{ xs: 'stretch', sm: 'center' }} gap={1.25} flexDirection={{ xs: 'column', sm: 'row' }}>
                 <TextField
                   size="small"
@@ -1152,7 +1157,7 @@ export default function AccountingSection() {
                   placeholder={`Search ${VIEWS.find((candidate) => candidate.id === view)?.label.toLowerCase()}`}
                   inputProps={{ 'aria-label': `Search ${view}` }}
                   InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
-                  sx={{ flex: 1, minWidth: 0, '& .MuiOutlinedInput-root': { borderRadius: '8px', bgcolor: '#15151D' } }}
+                  sx={{ flex: 1, minWidth: 0, '& .MuiOutlinedInput-root': { borderRadius: '8px', bgcolor: 'background.paper' } }}
                 />
                 {view === 'invoices' || view === 'transactions' ? (
                   <TextField select size="small" label="Status" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }} sx={{ minWidth: { sm: 140 }, '& .MuiOutlinedInput-root': { borderRadius: '8px' } }}>
@@ -1176,13 +1181,13 @@ export default function AccountingSection() {
               </Box>
 
               <Box sx={{ ...panelSx, overflow: 'hidden', minHeight: 260, position: 'relative' }}>
-                {loading ? <Box sx={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', bgcolor: 'rgba(15,15,19,0.62)', zIndex: 2 }}><CircularProgress size={28} /></Box> : null}
+                {loading ? <Box sx={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', bgcolor: 'background.paper', zIndex: 2 }}><CircularProgress size={28} /></Box> : null}
                 <TableContainer sx={{ display: { xs: 'none', md: 'block' }, maxHeight: 'calc(100dvh - 310px)' }}>
                   <Table stickyHeader size="small" aria-label={`${view} table`}>
-                    <TableHead><TableRow>{columns.map((column) => <TableCell key={column.key} align={column.align || 'left'} sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{column.label}</TableCell>)}</TableRow></TableHead>
+                    <TableHead><TableRow>{columns.map((column) => <TableCell key={column.key} align={column.align || 'left'} sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{column.label}</TableCell>)}</TableRow></TableHead>
                     <TableBody>
                       {result.rows.map((row) => (
-                        <TableRow key={row.id} hover tabIndex={0} onClick={() => setSelected({ view, row })} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelected({ view, row }) }} sx={{ cursor: 'pointer', '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+                        <TableRow key={row.id} hover tabIndex={0} onClick={() => setSelected({ view, row })} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelected({ view, row }) }} sx={{ cursor: 'pointer', '& td': { borderColor: 'divider' } }}>
                           {columns.map((column) => <TableCell key={column.key} align={column.align || 'left'}>{column.render(row)}</TableCell>)}
                         </TableRow>
                       ))}
@@ -1192,7 +1197,7 @@ export default function AccountingSection() {
 
                 <Box sx={{ display: { xs: 'block', md: 'none' } }}>
                   {result.rows.map((row) => (
-                    <Box key={row.id} component="button" type="button" onClick={() => setSelected({ view, row })} sx={{ width: '100%', border: 0, borderBottom: '1px solid rgba(255,255,255,0.07)', bgcolor: 'transparent', color: 'inherit', p: 1.75, textAlign: 'left', cursor: 'pointer' }}>
+                    <Box key={row.id} component="button" type="button" onClick={() => setSelected({ view, row })} sx={{ width: '100%', border: 0, borderBottom: 1, borderColor: 'divider', bgcolor: 'transparent', color: 'inherit', p: 1.75, textAlign: 'left', cursor: 'pointer' }}>
                       <Box display="flex" alignItems="flex-start" justifyContent="space-between" gap={1.5}>
                         <Typography fontWeight={650} lineHeight={1.35}>{recordTitle(view, row)}</Typography>
                         {'status' in row ? <Chip size="small" variant="outlined" color={statusColor(textValue(row, 'status'))} label={textValue(row, 'status')} /> : null}
@@ -1204,7 +1209,7 @@ export default function AccountingSection() {
                               : view === 'attachments' ? [textValue(row, 'contentType', ''), formatBytes(value(row, 'sizeBytes'))].filter(Boolean).join(' · ')
                                 : [dateOnly(value(row, 'transactionDate')), textValue(row, 'partyName', '')].filter(Boolean).join(' · ')}
                       </Typography>
-                      <Typography variant="body2" mt={0.75} color={view === 'accounts' || view === 'products' || view === 'customers' || view === 'vendors' ? 'text.primary' : '#70D6A7'}>
+                      <Typography variant="body2" mt={0.75} color={view === 'accounts' || view === 'products' || view === 'customers' || view === 'vendors' ? 'text.primary' : 'success.main'}>
                         {view === 'accounts' ? money(Number(value(row, 'currentBalance') || 0), textValue(row, 'currencyCode', ''))
                           : view === 'products' ? money(Number(value(row, 'unitPrice') || 0))
                             : view === 'customers' || view === 'vendors' ? money(Number(value(row, 'balance') || 0), textValue(row, 'currencyCode', ''))
@@ -1241,7 +1246,7 @@ export default function AccountingSection() {
           sx: {
             width: selectedIsInvoice ? { xs: '100%', sm: 760, lg: 920 } : { xs: '100%', sm: 440 },
             maxWidth: '100vw',
-            bgcolor: '#171821',
+            bgcolor: 'background.paper',
             backgroundImage: 'none',
           },
         }}

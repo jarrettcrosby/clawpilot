@@ -38,6 +38,7 @@ import type {
 import { currentOrderTrackingEvents } from '@/lib/operations/orderTrackingSummary'
 import {
   normalizeOrderShipToDraft,
+  orderShipToIssueSummary,
   orderShipToReadiness,
   type OrderShipToDraft,
 } from '@/lib/operations/orderShipTo'
@@ -315,6 +316,10 @@ export default function ImportedOrderWorkingCopyDrawer({
     shipTo,
   ])
   const draftReadiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
+  const draftReadinessGuidance = useMemo(
+    () => orderShipToIssueSummary(shipTo),
+    [shipTo],
+  )
   const currentProviderStatus = order ? providerOrderStatus(order) : null
   const providerTerminal = currentProviderStatus?.terminal === true
   const editorUnavailable = providerTerminal || order?.actionAvailable === false
@@ -1084,6 +1089,12 @@ export default function ImportedOrderWorkingCopyDrawer({
                 />
               )}
             </Stack>
+
+            {draftReadinessGuidance && !providerTerminal && (
+              <Alert severity="warning" variant="outlined" sx={{ mb: 1.5 }}>
+                {draftReadinessGuidance}
+              </Alert>
+            )}
 
             <Stack spacing={1.5}>
               <TextField

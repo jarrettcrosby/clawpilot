@@ -121,7 +121,7 @@ export default function OrganizationBrandingPanel() {
   const displayedLogo = previewUrl || (!removeLogo ? branding.logoUrl : '/brand/email/clawpilot-mark-email.png')
   return (
     <Box sx={{ mt: 3 }}>
-      <Divider sx={{ mb: 2.5, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ mb: 2.5, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
       <Typography variant="subtitle2" fontWeight={700}>Organization branding</Typography>
       <Typography variant="caption" color="text.secondary">Managed Google workbooks</Typography>
       {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mt: 1.5 }}>{error}</Alert> : null}
@@ -130,7 +130,7 @@ export default function OrganizationBrandingPanel() {
         <Box
           sx={{
             height: 126,
-            border: '1px solid rgba(255,255,255,0.1)',
+            border: '1px solid rgba(var(--cp-neutral-rgb),0.1)',
             borderRadius: 1,
             bgcolor: primaryColor,
             display: 'grid',

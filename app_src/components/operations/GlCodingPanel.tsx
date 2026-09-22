@@ -212,7 +212,7 @@ const fieldSx = {
   minWidth: 0,
   '& .MuiInputBase-root': {
     borderRadius: '8px',
-    backgroundColor: '#15151D',
+    backgroundColor: 'background.paper',
   },
 }
 

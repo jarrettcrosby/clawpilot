@@ -57,7 +57,7 @@ const EMPTY_FORM: FormValues = {
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -105,9 +105,8 @@ function validatedDestination(value: string): string {
   } catch {
     throw new Error('Destination must be a valid URL')
   }
-  const localDevelopmentUrl = url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)
-  if (url.protocol !== 'https:' && !localDevelopmentUrl) {
-    throw new Error('Destination must use HTTPS')
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error('Destination must use HTTPS without an embedded username or password')
   }
   return url.toString()
 }
@@ -144,6 +143,7 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (busy) return
     setError('')
     try {
       const destinationUrl = validatedDestination(values.destinationUrl)
@@ -198,8 +198,9 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
       PaperProps={{
         sx: {
           borderRadius: fullScreen ? 0 : '8px',
-          backgroundColor: '#1A1A23',
-          border: { sm: '1px solid rgba(255,255,255,0.09)' },
+          backgroundColor: 'background.paper',
+          border: { sm: 1 },
+          borderColor: 'divider',
         },
       }}
     >
@@ -219,8 +220,8 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
           </IconButton>
         </DialogTitle>
 
-        <DialogContent dividers sx={{ px: { xs: 2, sm: 3 }, py: 2.5, borderColor: 'rgba(255,255,255,0.07)' }}>
-          {error ? <Alert severity="error" sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+        {error ? <Alert severity="error" sx={{ mx: { xs: 2, sm: 3 }, mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
+        <DialogContent dividers sx={{ px: { xs: 2, sm: 3 }, py: 2.5, borderColor: 'divider' }}>
           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 2 }}>
             <TextField
               select
@@ -259,6 +260,7 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
               onChange={(event) => update('destinationUrl', event.target.value)}
               disabled={busy}
               inputProps={{ maxLength: 2048 }}
+              helperText="Use a complete HTTPS address, without a username or password in the URL."
               sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
             />
             <TextField
@@ -269,6 +271,7 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
               disabled={busy}
               inputProps={{ maxLength: 64, autoCapitalize: 'none', spellCheck: false }}
               InputProps={{ startAdornment: <InputAdornment position="start">/</InputAdornment> }}
+              helperText={record ? 'Changing the slug changes the public URL.' : 'Leave blank to generate a short URL automatically.'}
               sx={fieldSx}
             />
             {!record && !values.slug.trim() ? (
@@ -302,6 +305,7 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
               disabled={busy}
               inputProps={{ min: 1, step: 1, inputMode: 'numeric' }}
               InputProps={{ endAdornment: <InputAdornment position="end">hours</InputAdornment> }}
+              helperText={record ? 'Leave unchanged to keep the current expiry. Change to restart the duration, or clear for no expiry.' : 'Starts when created. Clear this field for no expiry.'}
               sx={fieldSx}
             />
             <TextField
@@ -312,6 +316,7 @@ export default function ShortLinkFormDialog({ open, record, availableDomains, de
               onChange={(event) => update('maxClicks', event.target.value)}
               disabled={busy}
               inputProps={{ min: 1, step: 1, inputMode: 'numeric' }}
+              helperText="Total lifetime clicks allowed. Leave blank for unlimited clicks."
               sx={fieldSx}
             />
           </Box>

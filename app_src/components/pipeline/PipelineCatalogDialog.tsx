@@ -462,7 +462,7 @@ export default function PipelineCatalogDialog({
       fullScreen={fullScreen}
       fullWidth
       maxWidth="md"
-      PaperProps={{ sx: { bgcolor: '#16161E', border: '1px solid rgba(255,255,255,0.08)', borderRadius: fullScreen ? 0 : 1, maxHeight: fullScreen ? '100dvh' : 'min(820px, 92dvh)' } }}
+      PaperProps={{ sx: { bgcolor: '#16161E', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: fullScreen ? 0 : 1, maxHeight: fullScreen ? '100dvh' : 'min(820px, 92dvh)' } }}
     >
       <DialogTitle sx={{ px: { xs: 2, sm: 3 }, py: 2 }}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
@@ -477,7 +477,7 @@ export default function PipelineCatalogDialog({
         value={tab}
         onChange={(_, value) => { setTab(value); setImportResult(null); setError(''); setNotice('') }}
         variant="fullWidth"
-        sx={{ borderTop: '1px solid rgba(255,255,255,0.06)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}
+        sx={{ borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.06)', borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}
       >
         <Tab value="people" label={`People (${catalog.people.length})`} />
         <Tab value="products" label={`Products (${catalog.products.length})`} />
@@ -674,7 +674,7 @@ export default function PipelineCatalogDialog({
         )}
 
         {personEditorOpen ? (
-          <Box component="section" aria-label="CRM-only team member editor" sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+          <Box component="section" aria-label="CRM-only team member editor" sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
             <Typography variant="subtitle1" fontWeight={700} mb={1.5}>{person.id ? 'Edit CRM-only team member' : 'Add CRM-only team member'}</Typography>
             <Stack gap={1.5}>
               <TextField required label="Full name" value={person.fullName} onChange={(event) => setPerson({ ...person, fullName: event.target.value })} />
@@ -700,7 +700,7 @@ export default function PipelineCatalogDialog({
             component="section"
             aria-label="Product editor"
             tabIndex={-1}
-            sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.08)', scrollMarginTop: 16 }}
+            sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)', scrollMarginTop: 16 }}
           >
             <Typography variant="subtitle1" fontWeight={700} mb={1.5}>{product.id ? 'Edit product' : 'Add product'}</Typography>
             <Stack gap={1.5}>
@@ -803,7 +803,7 @@ export default function PipelineCatalogDialog({
           </Box>
         ) : null}
       </DialogContent>
-      <DialogActions sx={{ px: { xs: 2, sm: 3 }, py: 2, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+      <DialogActions sx={{ px: { xs: 2, sm: 3 }, py: 2, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
         <Button onClick={onClose} disabled={saving}>Done</Button>
       </DialogActions>
     </Dialog>

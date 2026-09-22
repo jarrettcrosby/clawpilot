@@ -74,7 +74,7 @@ const blockerLabels: Record<string, string> = {
 }
 
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 function nextCredentialCommandIdempotencyKey() {
@@ -324,7 +324,7 @@ export default function BrokeredTransportIntegrationPanel({
   return (
     <Box sx={focus === 'ltl'
       ? { maxWidth: 840, mx: 'auto' }
-      : { mt: 4, pt: 3, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+      : { mt: 4, pt: 3, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
       <Stack spacing={2.25}>
         <Box>
           <Typography variant="h6" sx={{ fontWeight: 700 }}>

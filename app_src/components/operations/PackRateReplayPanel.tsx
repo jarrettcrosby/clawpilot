@@ -223,7 +223,7 @@ function StageShell({
     <Paper
       component="section"
       variant="outlined"
-      sx={{ p: { xs: 1.5, sm: 2 }, borderColor: 'rgba(255,255,255,0.1)' }}
+      sx={{ p: { xs: 1.5, sm: 2 }, borderColor: 'divider' }}
     >
       <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
         <Stack direction="row" spacing={1.25} alignItems="center" sx={{ minWidth: 0 }}>
@@ -234,8 +234,8 @@ function StageShell({
               display: 'grid',
               placeItems: 'center',
               borderRadius: '8px',
-              color: '#A8C7FA',
-              backgroundColor: 'rgba(126,171,255,0.12)',
+              color: 'primary.main',
+              backgroundColor: 'action.selected',
               flexShrink: 0,
             }}
           >
@@ -316,7 +316,7 @@ function PackageCards({ packages }: { packages: OperationsRegressionPackage[] })
         <Paper
           key={item.packageKey}
           variant="outlined"
-          sx={{ p: 1.25, backgroundColor: 'rgba(255,255,255,0.015)' }}
+          sx={{ p: 1.25, backgroundColor: 'background.paper' }}
         >
           <Stack
             direction={{ xs: 'column', sm: 'row' }}

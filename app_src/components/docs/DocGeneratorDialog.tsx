@@ -109,7 +109,7 @@ export default function DocGeneratorDialog({ open, onClose, onGenerated }: Props
       fullWidth
       maxWidth="sm"
       fullScreen={narrowScreen}
-      PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none' } }}
+      PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', backgroundImage: 'none' } }}
     >
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontWeight: 700 }}>
         New document
@@ -117,7 +117,7 @@ export default function DocGeneratorDialog({ open, onClose, onGenerated }: Props
           <CloseRounded />
         </IconButton>
       </DialogTitle>
-      <DialogContent dividers sx={{ borderColor: 'rgba(255,255,255,0.07)', pt: 3 }}>
+      <DialogContent dividers sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.07)', pt: 3 }}>
         <Box sx={{ display: 'grid', gap: 2.5 }}>
           {error && <Alert severity="error">{error}</Alert>}
           <FormControl fullWidth disabled={loading || generating}>

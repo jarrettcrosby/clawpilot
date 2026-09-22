@@ -47,6 +47,27 @@ blind rotation. Re-audit without printing values. The detailed order and stop
 conditions live in
 [ClawPilot Environments and Deployment](clawpilot-environments.md).
 
+### Legacy Vercel containment — September 22, 2026
+
+The ClawPilot application project `prj_OYGgLt8zrpNTpl5sgQ6LQZtfgaDm` had no Git
+connection and only the `clawpilot-nu.vercel.app` alias, but its obsolete runtime
+was publicly reachable. For the reviewed application release, Vercel
+Authentication was changed from `all_except_custom_domains` to `all`, covering
+existing and future deployments, and the project was paused. The project API
+confirmed `paused=true`; the public alias returned HTTP 503 after pausing.
+The two sampled historical production/preview deployment URLs returned
+authentication redirects after all-deployment protection was enabled.
+
+No deployment, variable, credential, database, or service was deleted. This is
+reversible access containment, **not credential retirement**; trusted Vercel
+team access to protected historical artifacts still requires care. Keep the
+login-email-change release gate off until its separate retirement checks pass.
+Rollback is project unpause followed, only if intended, by restoring the former
+protection scope. Neither action should happen implicitly during a source push.
+Both Railway application domains remained healthy, and the existing Eigen
+short-link canary still redirected to Railway after protection. The BPO website
+project and its staged short-link bridge were not changed by this containment.
+
 | Platform | Responsibility | Intended boundary |
 | --- | --- | --- |
 | GitHub | Source and validation | `dev` is the development branch; promotion normally uses a pull request to `main`; Railway waits for successful GitHub Actions before deploying connected services. |

@@ -7,6 +7,7 @@ import EventAvailableRounded from '@mui/icons-material/EventAvailableRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import SearchRounded from '@mui/icons-material/SearchRounded'
 import {
   Alert,
   Box,
@@ -18,6 +19,9 @@ import {
   DialogTitle,
   Divider,
   IconButton,
+  InputAdornment,
+  MenuItem,
+  Pagination,
   Paper,
   Stack,
   Tab,
@@ -28,6 +32,7 @@ import {
   TableHead,
   TableRow,
   Tabs,
+  TextField,
   Tooltip,
   ToggleButton,
   ToggleButtonGroup,
@@ -61,6 +66,18 @@ const SHIPPING_TARGETS: Record<ShippingView, string> = {
   pickups: 'shipping/pickups',
 }
 const iconActionSx = { minWidth: 44, minHeight: 44 }
+const SHIPMENT_PAGE_SIZE = 25
+
+type ShippingRecordSort = 'updated_desc' | 'updated_asc' | 'order_asc'
+
+const SHIPPING_RECORD_SORTS: ReadonlyArray<{
+  value: ShippingRecordSort
+  label: string
+}> = [
+  { value: 'updated_desc', label: 'Updated: newest' },
+  { value: 'updated_asc', label: 'Updated: oldest' },
+  { value: 'order_asc', label: 'Order: A–Z' },
+]
 
 function display(value: string) {
   return value
@@ -132,7 +149,7 @@ function ModeSelector({
           py: 0.75,
           fontWeight: 750,
           textTransform: 'none',
-          borderColor: 'rgba(255,255,255,0.16)',
+          borderColor: 'divider',
         },
       }}
     >
@@ -146,18 +163,35 @@ function ModeSelector({
   )
 }
 
-function EmptyRecords({ mode }: { mode: ShippingTransportMode }) {
+function EmptyRecords({
+  mode,
+  filtered,
+  onClear,
+}: {
+  mode: ShippingTransportMode
+  filtered?: boolean
+  onClear?: () => void
+}) {
   return (
     <Box sx={{ py: 8, px: 3, textAlign: 'center' }}>
       <LocalShippingRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
       <Typography sx={{ mt: 1 }} fontWeight={700}>
-        No {mode === 'parcel' ? 'Parcel' : 'LTL'} shipment records
+        {filtered
+          ? 'No shipments match this search'
+          : `No ${mode === 'parcel' ? 'Parcel' : 'LTL'} shipment records`}
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-        {mode === 'parcel'
+        {filtered
+          ? 'Search by order, customer, carrier, destination, or tracking reference.'
+          : mode === 'parcel'
           ? 'Planned one-off shipments and carrier-confirmed parcel shipments will appear here.'
           : 'Only a successful LTL tender will appear here. LTL tendering is not connected yet.'}
       </Typography>
+      {filtered && onClear && (
+        <Button size="small" onClick={onClear} sx={{ mt: 1.5 }}>
+          Clear search
+        </Button>
+      )}
     </Box>
   )
 }
@@ -167,13 +201,19 @@ function ShipmentRecords({
   mode,
   mobile,
   onOpen,
+  filtered,
+  onClear,
 }: {
   records: ShippingRecord[]
   mode: ShippingTransportMode
   mobile: boolean
   onOpen: (record: ShippingRecord) => void
+  filtered?: boolean
+  onClear?: () => void
 }) {
-  if (!records.length) return <EmptyRecords mode={mode} />
+  if (!records.length) {
+    return <EmptyRecords mode={mode} filtered={filtered} onClear={onClear} />
+  }
 
   if (mobile) {
     return (
@@ -195,8 +235,18 @@ function ShipmentRecords({
                 </Box>
                 <Chip size="small" label={recordStage(record)} color={recordStageColor(record)} />
               </Stack>
+              <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                {record.carrierName
+                  ? `${record.carrierName}${record.serviceCode ? ` · ${record.serviceCode}` : ''}`
+                  : 'Carrier not tendered'}
+                {' · Tracking '}
+                {record.trackingNumber
+                  || (record.trackingNumbers.length > 1
+                    ? `${record.trackingNumbers.length} references`
+                    : 'not available')}
+              </Typography>
               <Stack direction="row" justifyContent="space-between" gap={1}>
-                <Typography variant="caption" color="#A8C7FA">{record.orderGlobalId}</Typography>
+                <Typography variant="caption" color="primary.main" sx={{ overflowWrap: 'anywhere' }}>{record.orderGlobalId}</Typography>
                 <Typography variant="caption" color="text.secondary">{formatDate(record.occurredAt)}</Typography>
               </Stack>
             </Stack>
@@ -231,7 +281,7 @@ function ShipmentRecords({
             >
               <TableCell>
                 <Typography fontWeight={650}>{record.orderNumber}</Typography>
-                <Typography variant="caption" color="#A8C7FA">{record.orderGlobalId}</Typography>
+                <Typography variant="caption" color="primary.main">{record.orderGlobalId}</Typography>
               </TableCell>
               <TableCell>
                 <Typography>{record.customerName}</Typography>
@@ -244,7 +294,15 @@ function ShipmentRecords({
               <TableCell>{formatDate(record.occurredAt)}</TableCell>
               <TableCell padding="checkbox">
                 <Tooltip title="View shipment record">
-                  <IconButton sx={iconActionSx} size="small" aria-label={`View shipment ${record.orderNumber}`}>
+                  <IconButton
+                    sx={iconActionSx}
+                    size="small"
+                    aria-label={`View shipment ${record.orderNumber}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onOpen(record)
+                    }}
+                  >
                     <OpenInNewRounded fontSize="small" />
                   </IconButton>
                 </Tooltip>
@@ -292,10 +350,10 @@ function RecordDialog({
       {record && (
         <DialogContent dividers>
           <Stack spacing={2}>
-            <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 2 }}>
               <Box><Typography variant="caption" color="text.secondary">Mode</Typography><Typography>{record.transportMode === 'parcel' ? 'Parcel' : 'LTL'}</Typography></Box>
               <Box><Typography variant="caption" color="text.secondary">Status</Typography><Typography>{recordStage(record)}</Typography></Box>
-              <Box><Typography variant="caption" color="text.secondary">Order Global ID</Typography><Typography color="#A8C7FA">{record.orderGlobalId}</Typography></Box>
+              <Box><Typography variant="caption" color="text.secondary">Order Global ID</Typography><Typography color="primary.main" sx={{ overflowWrap: 'anywhere' }}>{record.orderGlobalId}</Typography></Box>
               <Box><Typography variant="caption" color="text.secondary">Reference</Typography><Typography>{record.referenceNumber}</Typography></Box>
               <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{record.customerName}</Typography></Box>
               <Box><Typography variant="caption" color="text.secondary">Destination</Typography><Typography>{record.destination || '—'}</Typography></Box>
@@ -360,6 +418,9 @@ export default function ShippingSection({
   const [notice, setNotice] = useState('')
   const [parcelDialogOpen, setParcelDialogOpen] = useState(false)
   const [selectedRecord, setSelectedRecord] = useState<ShippingRecord | null>(null)
+  const [recordSearch, setRecordSearch] = useState('')
+  const [recordSort, setRecordSort] = useState<ShippingRecordSort>('updated_desc')
+  const [recordPage, setRecordPage] = useState(1)
 
   const loadWorkspace = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -392,6 +453,55 @@ export default function ShippingSection({
     () => workspace?.records.filter((record) => record.transportMode === mode) || [],
     [mode, workspace],
   )
+  const filteredRecords = useMemo(() => {
+    const query = recordSearch.trim().toLocaleLowerCase()
+    return records
+      .filter((record) => !query || [
+        record.orderNumber,
+        record.orderGlobalId,
+        record.referenceNumber,
+        record.customerName,
+        record.destination,
+        record.carrierName,
+        record.serviceCode,
+        record.trackingNumber,
+        ...record.trackingNumbers,
+      ].some((value) => String(value || '').toLocaleLowerCase().includes(query)))
+      .sort((left, right) => {
+        if (recordSort === 'order_asc') {
+          return left.orderNumber.localeCompare(
+            right.orderNumber,
+            undefined,
+            { numeric: true, sensitivity: 'base' },
+          )
+        }
+        const difference = Date.parse(left.occurredAt) - Date.parse(right.occurredAt)
+        return recordSort === 'updated_asc' ? difference : -difference
+      })
+  }, [recordSearch, recordSort, records])
+  const recordPageCount = Math.max(
+    1,
+    Math.ceil(filteredRecords.length / SHIPMENT_PAGE_SIZE),
+  )
+  const currentRecordPage = Math.min(recordPage, recordPageCount)
+  const visibleRecords = useMemo(() => {
+    const start = (currentRecordPage - 1) * SHIPMENT_PAGE_SIZE
+    return filteredRecords.slice(start, start + SHIPMENT_PAGE_SIZE)
+  }, [currentRecordPage, filteredRecords])
+
+  useEffect(() => {
+    setRecordPage((current) => Math.min(current, recordPageCount))
+  }, [recordPageCount])
+
+  useEffect(() => {
+    setSelectedRecord((current) => {
+      if (!current || !workspace) return current
+      return workspace.records.find((record) => (
+        record.recordId === current.recordId
+        && record.transportMode === current.transportMode
+      )) || null
+    })
+  }, [workspace])
 
   const onCreated = (result: OneOffShipmentCreateResult) => {
     setNotice(result.orderStatus === 'packed'
@@ -408,7 +518,7 @@ export default function ShippingSection({
       : 'Schedule Pickups'
   return (
     <Box data-testid="shipping-section" sx={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
-      <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, borderBottom: '1px solid rgba(255,255,255,0.07)', flexShrink: 0 }}>
+      <Box sx={{ px: { xs: 2, md: 3 }, pt: { xs: 2, md: 2.5 }, borderBottom: '1px solid', borderColor: 'divider', flexShrink: 0 }}>
         <Stack direction="row" justifyContent="space-between" gap={2} alignItems="flex-start">
           <Box>
             <Typography variant="h5" fontWeight={750}>{title}</Typography>
@@ -437,12 +547,38 @@ export default function ShippingSection({
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', WebkitOverflowScrolling: 'touch' }}>
         <Stack spacing={2} sx={{ p: { xs: 2, md: 3 }, maxWidth: view === 'shipments' ? 'none' : 1120, mx: view === 'shipments' ? 0 : 'auto' }}>
-          {error && <Alert severity="error">{error}</Alert>}
+          {error && (
+            <Alert
+              severity="error"
+              action={!workspace ? (
+                <Button color="inherit" size="small" onClick={() => void loadWorkspace()}>
+                  Retry
+                </Button>
+              ) : undefined}
+            >
+              {error}
+            </Alert>
+          )}
           {notice && <Alert severity="success" onClose={() => setNotice('')}>{notice}</Alert>}
-          <ModeSelector mode={mode} onChange={setMode} />
+          <ModeSelector mode={mode} onChange={(nextMode) => {
+            setMode(nextMode)
+            setRecordPage(1)
+          }} />
+          {loading && workspace && (
+            <Alert severity="info" icon={<CircularProgress size={18} />}>
+              Refreshing shipping records…
+            </Alert>
+          )}
 
           {loading && !workspace ? (
             <Box sx={{ py: 8, display: 'grid', placeItems: 'center' }}><CircularProgress size={28} /></Box>
+          ) : !workspace ? (
+            <Box sx={{ py: 8, px: 3, textAlign: 'center' }}>
+              <Typography fontWeight={700}>Shipping data could not be loaded</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Retry after checking your connection. No shipping action was attempted.
+              </Typography>
+            </Box>
           ) : view === 'create' ? (
             mode === 'parcel' ? (
               <Stack spacing={1.25} alignItems="flex-start">
@@ -483,15 +619,89 @@ export default function ShippingSection({
             )
           ) : view === 'shipments' ? (
             <Paper variant="outlined" sx={{ overflow: 'hidden' }}>
-              <Box sx={{ px: 2, py: 1.5, borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
-                <Stack direction="row" justifyContent="space-between" gap={1} alignItems="center">
+              <Box sx={{ px: 2, py: 1.5, borderBottom: '1px solid', borderColor: 'divider' }}>
+                <Stack direction={{ xs: 'column', md: 'row' }} justifyContent="space-between" gap={1.25} alignItems={{ xs: 'stretch', md: 'center' }}>
                   <Box>
                     <Typography fontWeight={750}>{mode === 'parcel' ? 'Parcel' : 'LTL'} shipments</Typography>
                   </Box>
-                  <Chip label={`${records.length} records`} variant="outlined" />
+                  <Stack direction={{ xs: 'column', sm: 'row' }} gap={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                    <TextField
+                      size="small"
+                      value={recordSearch}
+                      onChange={(event) => {
+                        setRecordSearch(event.target.value)
+                        setRecordPage(1)
+                      }}
+                      placeholder="Order, customer, carrier, or tracking"
+                      inputProps={{ 'aria-label': 'Search shipment records' }}
+                      InputProps={{
+                        startAdornment: (
+                          <InputAdornment position="start">
+                            <SearchRounded fontSize="small" />
+                          </InputAdornment>
+                        ),
+                      }}
+                      sx={{ minWidth: { sm: 280 } }}
+                    />
+                    <TextField
+                      select
+                      size="small"
+                      value={recordSort}
+                      onChange={(event) => {
+                        setRecordSort(event.target.value as ShippingRecordSort)
+                        setRecordPage(1)
+                      }}
+                      inputProps={{ 'aria-label': 'Sort shipment records' }}
+                      sx={{ minWidth: 165 }}
+                    >
+                      {SHIPPING_RECORD_SORTS.map((option) => (
+                        <MenuItem key={option.value} value={option.value}>
+                          {option.label}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    <Chip
+                      label={recordSearch.trim()
+                        ? `${filteredRecords.length} of ${records.length}`
+                        : `${records.length} records`}
+                      variant="outlined"
+                    />
+                  </Stack>
                 </Stack>
               </Box>
-              <ShipmentRecords records={records} mode={mode} mobile={mobile} onOpen={setSelectedRecord} />
+              <ShipmentRecords
+                records={visibleRecords}
+                mode={mode}
+                mobile={mobile}
+                onOpen={setSelectedRecord}
+                filtered={Boolean(recordSearch.trim())}
+                onClear={() => {
+                  setRecordSearch('')
+                  setRecordPage(1)
+                }}
+              />
+              {filteredRecords.length > SHIPMENT_PAGE_SIZE && (
+                <Stack
+                  direction={{ xs: 'column', sm: 'row' }}
+                  alignItems={{ xs: 'stretch', sm: 'center' }}
+                  justifyContent="space-between"
+                  gap={1}
+                  sx={{ px: 2, py: 1.5, borderTop: '1px solid', borderColor: 'divider' }}
+                >
+                  <Typography variant="caption" color="text.secondary">
+                    {(currentRecordPage - 1) * SHIPMENT_PAGE_SIZE + 1}–{Math.min(currentRecordPage * SHIPMENT_PAGE_SIZE, filteredRecords.length)} of {filteredRecords.length}
+                  </Typography>
+                  <Pagination
+                    count={recordPageCount}
+                    page={currentRecordPage}
+                    onChange={(_event, page) => setRecordPage(page)}
+                    size="small"
+                    siblingCount={mobile ? 0 : 1}
+                    boundaryCount={mobile ? 0 : 1}
+                    aria-label="Shipment record pages"
+                  />
+                </Stack>
+              )}
             </Paper>
           ) : (
             <Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>

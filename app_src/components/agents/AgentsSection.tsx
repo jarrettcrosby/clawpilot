@@ -242,6 +242,9 @@ export default function AgentsSection() {
   const [sending, setSending] = useState(false)
   const [sendingMode, setSendingMode] = useState<InteractionMode | null>(null)
   const [notice, setNotice] = useState('')
+  const [workspaceError, setWorkspaceError] = useState('')
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [tasksAccessDenied, setTasksAccessDenied] = useState(false)
   const [authStarting, setAuthStarting] = useState(false)
   const [authDisconnecting, setAuthDisconnecting] = useState(false)
   const [deviceLogin, setDeviceLogin] = useState<DeviceLogin | null>(null)
@@ -255,16 +258,35 @@ export default function AgentsSection() {
   const messageListRef = useRef<HTMLDivElement | null>(null)
 
   const loadWorkspace = useCallback(async () => {
+    setWorkspaceLoading(true)
+    try {
     const [agentResponse, taskResponse] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/tasks'),
     ])
-    const agentPayload = await agentResponse.json()
-    const taskPayload = await taskResponse.json()
-    const nextAgents = Array.isArray(agentPayload?.agents) ? agentPayload.agents : []
+    const agentPayload = await agentResponse.json().catch(() => null)
+    const taskPayload = await taskResponse.json().catch(() => null)
+    if (!agentResponse.ok) throw new Error('Unable to load agent workspace. Please try again.')
+    if (!Array.isArray(agentPayload?.agents)) throw new Error('The agent workspace returned an incomplete response. Please try again.')
+    const nextAgents = agentPayload.agents
     setAgents(nextAgents)
     setRuntime(agentPayload?.runtime || null)
-    const nextTasks = Array.isArray(taskPayload) ? taskPayload : []
+    // Agents/provider access is independent from Projects. Never discard the
+    // authorized roster just because this user cannot read project tasks.
+    setTasksAccessDenied(taskResponse.status === 403)
+    if (taskResponse.status === 403) {
+      setTasks([])
+      setMessages([])
+      setSelectedTaskId('')
+      setRepositoryState(null)
+      setSelectedAgentId((current) => nextAgents.some((agent: Agent) => agent.id === current) ? current : nextAgents[0]?.id || '')
+      setWorkspaceError('')
+      return
+    }
+    if (!taskResponse.ok) throw new Error('Unable to load project tasks. Please try again.')
+    if (!Array.isArray(taskPayload)) throw new Error('Project tasks returned an incomplete response. Please try again.')
+    setWorkspaceError('')
+    const nextTasks = taskPayload
     setTasks(nextTasks)
     const pendingOpen = consumeAgentTaskOpen()
     const pendingTask = pendingOpen
@@ -279,10 +301,16 @@ export default function AgentsSection() {
       task.assignedAgent === agent.id && task.status !== 'done' && !task.archived && !task.deletedAt
     )))
     setSelectedAgentId((current) => current || firstAssignedAgent?.id || nextAgents[0]?.id || '')
+    } catch (error) {
+      setWorkspaceError(error instanceof Error ? error.message : 'Unable to load agent workspace. Please try again.')
+      throw error
+    } finally {
+      setWorkspaceLoading(false)
+    }
   }, [])
 
   useEffect(() => {
-    loadWorkspace().catch(() => setNotice('Unable to load agent workspace.'))
+    void loadWorkspace().catch(() => undefined)
   }, [loadWorkspace])
 
   useEffect(() => {
@@ -682,7 +710,7 @@ export default function AgentsSection() {
         </Box>
         <Stack direction="row" spacing={shortLandscape ? 0.5 : 1} alignItems="center" flexWrap={shortLandscape ? 'nowrap' : 'wrap'} sx={{ overflowX: 'auto', minWidth: 0 }}>
           <Chip size="small" label={`${agents.length} agents`} />
-          <Chip size="small" label={`${assignedCount}/${openTasks.length} assigned`} />
+          <Chip size="small" label={tasksAccessDenied ? 'Projects access required' : `${assignedCount}/${openTasks.length} assigned`} />
           <Tooltip title={codexConnected ? codexAccountDetails || 'ChatGPT connected' : ''}>
             <Chip
               size="small"
@@ -709,11 +737,14 @@ export default function AgentsSection() {
         </Stack>
       </Stack>
 
+      {workspaceError && <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" size="small" disabled={workspaceLoading} onClick={() => void loadWorkspace().catch(() => undefined)}>Retry</Button>}>{workspaceError}</Alert>}
+      {tasksAccessDenied && <Alert severity="info" sx={{ mb: 2 }}>Agent and provider settings are available. To view task assignments and threads, ask an administrator for Projects access and access to the project board.</Alert>}
+
       {runtime && !runtime.ready && (
         <Alert severity="warning" sx={{ mb: 2, borderRadius: 1, '& .MuiAlert-message': { width: '100%', minWidth: 0 } }}>
           <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" spacing={1} minWidth={0}>
             <Typography variant="body2" sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-              {runtime.label}. Assignments and task history remain available; agent messages are disabled.
+              {runtime.label}. {tasksAccessDenied ? 'You can connect your provider here; Projects access is required for task assignments and messages.' : 'Assignments and task history remain available; agent messages are disabled.'}
             </Typography>
             {runtime.provider === 'openai-codex' && !codexConnected && (
               <Button
@@ -746,7 +777,7 @@ export default function AgentsSection() {
                 onClick={() => setSelectedAgentId(agent.id)}
                 sx={{ width: shortLandscape ? 180 : '100%', minWidth: shortLandscape ? 180 : 0, textAlign: 'left', borderRadius: 1, flexShrink: 0 }}
               >
-                <Card sx={{ width: '100%', p: 1.25, borderRadius: 1, backgroundColor: active ? 'rgba(168,199,250,0.12)' : '#1A1A23', border: active ? '1px solid rgba(168,199,250,0.5)' : '1px solid rgba(255,255,255,0.08)' }}>
+                <Card sx={{ width: '100%', p: 1.25, borderRadius: 1, backgroundColor: active ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)' : 'var(--mui-palette-background-paper)', border: active ? '1px solid rgba(var(--mui-palette-primary-mainChannel) / 0.5)' : '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
                     <Typography variant="subtitle2" fontWeight={700}>{agent.name}</Typography>
                     <Chip size="small" label={taskCount} />
@@ -759,7 +790,7 @@ export default function AgentsSection() {
           })}
         </Stack>
 
-        <Card data-testid="agents-thread" sx={{ minHeight: shortLandscape ? 200 : 520, p: shortLandscape ? 1 : 1.5, borderRadius: 1, backgroundColor: '#15151D', border: '1px solid rgba(255,255,255,0.08)', display: 'flex', flexDirection: 'column' }}>
+        <Card data-testid="agents-thread" sx={{ minHeight: shortLandscape ? 200 : 520, p: shortLandscape ? 1 : 1.5, borderRadius: 1, backgroundColor: 'var(--mui-palette-background-default)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', display: 'flex', flexDirection: 'column' }}>
           <Stack direction={shortLandscape ? 'row' : { xs: 'column', sm: 'row' }} justifyContent="space-between" spacing={1} mb={shortLandscape ? 0.75 : 1.25}>
             <Box minWidth={0}>
               <Typography variant="subtitle1" fontWeight={700}>{selectedAgent?.name || 'Agent thread'}</Typography>
@@ -774,7 +805,7 @@ export default function AgentsSection() {
           </Stack>
 
           {selectedTask && (
-            <Box data-testid="agent-task-status" sx={{ px: shortLandscape ? 0.75 : 1.25, py: shortLandscape ? 0.5 : 1, mb: shortLandscape ? 0.75 : 1.25, maxHeight: shortLandscape ? 112 : 'none', overflow: shortLandscape ? 'auto' : 'visible', borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.04)' }}>
+            <Box data-testid="agent-task-status" sx={{ px: shortLandscape ? 0.75 : 1.25, py: shortLandscape ? 0.5 : 1, mb: shortLandscape ? 0.75 : 1.25, maxHeight: shortLandscape ? 112 : 'none', overflow: shortLandscape ? 'auto' : 'visible', borderRadius: 1, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.04)' }}>
               <Stack direction="row" spacing={0.75} flexWrap="wrap" alignItems="center" mb={0.75}>
                 <Chip size="small" label={selectedTask.status} />
                 <Chip size="small" label={selectedTask.priority} />
@@ -884,15 +915,15 @@ export default function AgentsSection() {
             </Box>
           )}
 
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: shortLandscape ? 0.75 : 1.25 }} />
+          <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.08)', mb: shortLandscape ? 0.75 : 1.25 }} />
           <Stack data-testid="agent-thread-messages" ref={messageListRef} spacing={1} sx={{ flex: 1, minHeight: shortLandscape ? 40 : 220, maxHeight: shortLandscape ? 72 : 380, overflowY: 'auto', pr: 0.5 }}>
             {!selectedTaskId ? (
-              <Typography variant="body2" color="text.disabled">No open tasks assigned to this agent.</Typography>
+              <Typography variant="body2" color="text.disabled">{tasksAccessDenied ? 'Project task access is required to view this agent’s threads.' : 'No open tasks assigned to this agent.'}</Typography>
             ) : messages.length === 0 ? (
               <Typography variant="body2" color="text.disabled">No task thread yet.</Typography>
             ) : messages.map((message) => (
               <Box key={message.id} sx={{ alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '88%' }}>
-                <Box sx={{ px: 1.2, py: 0.9, borderRadius: 1, backgroundColor: message.role === 'user' ? 'rgba(168,199,250,0.2)' : message.role === 'system' ? 'rgba(239,83,80,0.12)' : 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                <Box sx={{ px: 1.2, py: 0.9, borderRadius: 1, backgroundColor: message.role === 'user' ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.2)' : message.role === 'system' ? 'rgba(239,83,80,0.12)' : 'rgba(var(--cp-neutral-rgb),0.06)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
                   <Typography variant="body2" color="text.primary" sx={{ whiteSpace: 'pre-wrap', lineHeight: 1.45, overflowWrap: 'anywhere' }}>{message.text}</Typography>
                 </Box>
                 <Typography variant="caption" color="text.disabled" sx={{ px: 0.5 }}>
@@ -976,7 +1007,7 @@ export default function AgentsSection() {
       <Typography variant="subtitle2" color="text.primary" mt={3} mb={1}>Open task ownership</Typography>
       <Stack spacing={0.75}>
         {openTasks.map((task) => (
-          <Box key={task.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 220px' }, gap: 1, alignItems: 'center', px: 1.25, py: 1, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+          <Box key={task.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 220px' }, gap: 1, alignItems: 'center', px: 1.25, py: 1, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
             <ButtonBase
               onClick={() => {
                 if (!task.assignedAgent) return
@@ -1016,7 +1047,7 @@ export default function AgentsSection() {
         maxWidth="xs"
         fullWidth
         fullScreen={shortLandscape}
-        PaperProps={{ sx: { mx: shortLandscape ? 0 : 2, borderRadius: shortLandscape ? 0 : 1, backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)' } }}
+        PaperProps={{ sx: { mx: shortLandscape ? 0 : 2, borderRadius: shortLandscape ? 0 : 1, backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' } }}
       >
         <DialogTitle sx={{ pb: 1, color: 'text.primary', fontWeight: 700 }}>Connect ChatGPT</DialogTitle>
         <DialogContent>
@@ -1027,7 +1058,7 @@ export default function AgentsSection() {
           )}
 
           <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>Device code</Typography>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0, px: 1.25, py: 1, borderRadius: 1, backgroundColor: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0, px: 1.25, py: 1, borderRadius: 1, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
             <Typography
               component="code"
               sx={{ flex: 1, minWidth: 0, color: 'text.primary', fontFamily: 'monospace', fontSize: '1.35rem', fontWeight: 700, lineHeight: 1.3, overflowWrap: 'anywhere' }}

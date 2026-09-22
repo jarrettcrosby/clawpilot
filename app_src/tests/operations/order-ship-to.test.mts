@@ -5,6 +5,7 @@ import {
   changedOrderShipToFields,
   mergeOrderShipToDraft,
   normalizeOrderShipToDraft,
+  orderShipToIssueSummary,
   orderShipToIssues,
   orderShipToReadiness,
   orderShipToStorageValue,
@@ -77,6 +78,10 @@ test('allows a user to clear a field and reports only compact field issues', () 
   assert.deepEqual(orderShipToIssues(after), [
     { field: 'line1', code: 'required' },
   ])
+  assert.equal(
+    orderShipToIssueSummary(after),
+    'Needed for rates: address.',
+  )
 })
 
 test('normalizes a known provider country alias before readiness validation', () => {
@@ -133,12 +138,20 @@ test('retains an unknown country value and fails closed', () => {
   assert.deepEqual(orderShipToIssues(address), [
     { field: 'country', code: 'invalid_format' },
   ])
+  assert.equal(
+    orderShipToIssueSummary(address),
+    'Country code must use a 2-letter ISO code (for example, US).',
+  )
 })
 
 test('an empty local working copy remains a valid missing draft', () => {
   const empty = normalizeOrderShipToDraft(null)
   assert.equal(orderShipToReadiness(empty), 'missing')
   assert.deepEqual(orderShipToStorageValue(empty), {})
+  assert.equal(
+    orderShipToIssueSummary(empty),
+    'Needed for rates: recipient name, address, city, state / province, postal code, and country code.',
+  )
 })
 
 test('normalizes legacy dispatch contact and country aliases', () => {

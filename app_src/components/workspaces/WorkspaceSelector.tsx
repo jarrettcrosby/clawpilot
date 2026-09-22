@@ -1,6 +1,9 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
 import CircularProgress from '@mui/material/CircularProgress'
 import MenuItem from '@mui/material/MenuItem'
 import TextField from '@mui/material/TextField'
@@ -30,22 +33,28 @@ export default function WorkspaceSelector({
 }) {
   const [payload, setPayload] = useState<WorkspacePayload>({})
   const [pending, setPending] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadRevision, setLoadRevision] = useState(0)
+  const [error, setError] = useState('')
   const resources = useMemo(() => kind === 'board' ? payload.boards || [] : payload.pipelines || [], [kind, payload])
   const selectedId = kind === 'board' ? payload.selectedBoardId || '' : payload.selectedPipelineId || ''
 
   useEffect(() => {
     let active = true
+    setLoading(true)
+    setError('')
     fetch('/api/workspaces')
       .then(async (response) => {
         const result = await response.json().catch(() => ({})) as WorkspacePayload
         if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to load workspaces')
         if (active) setPayload(result)
       })
-      .catch(() => {
-        if (active) setPayload({})
+      .catch((failure) => {
+        if (active) setError(failure instanceof Error ? failure.message : 'Unable to load workspaces')
       })
+      .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [])
+  }, [loadRevision])
 
   useEffect(() => {
     onAccessChange?.(resources.find((resource) => resource.id === selectedId) || null)
@@ -54,6 +63,7 @@ export default function WorkspaceSelector({
   async function select(id: string) {
     if (!id || id === selectedId || pending) return
     setPending(true)
+    setError('')
     try {
       const response = await fetch('/api/workspaces', {
         method: 'POST',
@@ -66,17 +76,22 @@ export default function WorkspaceSelector({
       for (const parameter of ['board', 'pipeline', 'crm', 'crmAction', 'doc']) url.searchParams.delete(parameter)
       url.searchParams.set(kind, id)
       window.location.assign(url.toString())
-    } catch {
-      // Keep the current resource selected when switching fails.
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : 'Unable to switch workspace'
+      setError(`${message}. Your current ${kind} is unchanged; try selecting again.`)
     } finally {
       setPending(false)
     }
   }
 
-  if (resources.length === 0) return pending ? <CircularProgress size={18} /> : null
+  if (loading) return <CircularProgress size={18} aria-label={`Loading ${kind === 'board' ? 'boards' : 'pipelines'}`} />
+  if (resources.length === 0 && !error) return null
 
   return (
-    <TextField
+    <Box sx={{ maxWidth: '100%', minWidth: 0 }}>
+    {error && <Alert severity="error" sx={{ mb: resources.length ? 1 : 0, maxWidth: 360 }}
+      action={resources.length === 0 ? <Button color="inherit" size="small" onClick={() => setLoadRevision((current) => current + 1)}>Retry</Button> : undefined}>{error}</Alert>}
+    {resources.length > 0 && <TextField
       select
       size="small"
       label={kind === 'board' ? 'Board' : 'Pipeline'}
@@ -94,6 +109,7 @@ export default function WorkspaceSelector({
           {resource.name}{resource.accessRole === 'viewer' ? ' (view only)' : resource.accessRole !== 'owner' ? ' (shared)' : ''}
         </MenuItem>
       ))}
-    </TextField>
+    </TextField>}
+    </Box>
   )
 }

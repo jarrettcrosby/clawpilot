@@ -39,9 +39,9 @@ type PosReportsPanelProps = {
 }
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1, borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: '#15151D',
+  backgroundColor: 'background.paper',
 }
 
 function record(value: unknown): DataRecord {
@@ -70,7 +70,7 @@ function availableMetric(value: unknown) {
   }
 }
 
-function MetricCard({ label, value, detail, color = '#F3F4F6' }: {
+function MetricCard({ label, value, detail, color = 'text.primary' }: {
   label: string
   value: string
   detail: string
@@ -88,7 +88,7 @@ function MetricCard({ label, value, detail, color = '#F3F4F6' }: {
 function SectionHeader({ icon, title, detail }: { icon: ReactNode; title: string; detail: string }) {
   return (
     <Box display="flex" alignItems="center" gap={1} px={{ xs: 1.5, sm: 2 }} py={1.5}>
-      <Box color="#A8C7FA" display="flex" alignItems="center">{icon}</Box>
+      <Box color="primary.main" display="flex" alignItems="center">{icon}</Box>
       <Box minWidth={0}>
         <Typography fontWeight={700}>{title}</Typography>
         <Typography variant="caption" color="text.secondary" display="block" noWrap>{detail}</Typography>
@@ -108,7 +108,7 @@ function RankedRows({ items, money, number }: {
       {items.map((item, index) => {
         const netSales = amount(item.netSales)
         return (
-          <Box key={`${text(item.productId || item.categoryId || item.name)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1.2} borderTop="1px solid rgba(255,255,255,0.065)">
+          <Box key={`${text(item.productId || item.categoryId || item.name)}-${index}`} px={{ xs: 1.5, sm: 2 }} py={1.2} borderTop={1} borderColor="divider">
             <Box display="grid" gridTemplateColumns="minmax(0, 1fr) auto" gap={1.5} alignItems="center">
               <Box minWidth={0}>
                 <Typography variant="body2" fontWeight={650} noWrap>{text(item.name, 'Uncategorized')}</Typography>
@@ -118,8 +118,8 @@ function RankedRows({ items, money, number }: {
               </Box>
               <Typography variant="body2" fontWeight={700} whiteSpace="nowrap">{money(netSales)}</Typography>
             </Box>
-            <Box mt={0.85} height={4} borderRadius="2px" bgcolor="rgba(255,255,255,0.06)" overflow="hidden">
-              <Box width={`${Math.max(2, (netSales / maximum) * 100)}%`} height="100%" bgcolor="#70D6A7" />
+            <Box mt={0.85} height={4} borderRadius="2px" bgcolor='action.hover' overflow="hidden">
+              <Box width={`${Math.max(2, (netSales / maximum) * 100)}%`} height="100%" bgcolor="success.main" />
             </Box>
           </Box>
         )
@@ -145,7 +145,7 @@ function DailySalesRows({ items, money, number, dateLabel }: {
                 <TableCell
                   key={label}
                   align={index > 0 ? 'right' : 'left'}
-                  sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}
+                  sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}
                 >
                   {label}
                 </TableCell>
@@ -154,7 +154,7 @@ function DailySalesRows({ items, money, number, dateLabel }: {
           </TableHead>
           <TableBody>
             {items.map((item, index) => (
-              <TableRow key={`${text(item.businessDate)}-${index}`} sx={{ '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+              <TableRow key={`${text(item.businessDate)}-${index}`} sx={{ '& td': { borderColor: 'divider' } }}>
                 <TableCell><Typography variant="body2" fontWeight={650}>{dateLabel(item.businessDate)}</Typography></TableCell>
                 <TableCell align="right">{number(amount(item.orderCount))}</TableCell>
                 <TableCell align="right">{number(amount(item.checkCount))}</TableCell>
@@ -170,10 +170,10 @@ function DailySalesRows({ items, money, number, dateLabel }: {
       </TableContainer>
       <Box sx={{ display: { xs: 'block', md: 'none' } }}>
         {items.map((item, index) => (
-          <Box key={`${text(item.businessDate)}-${index}`} px={1.5} py={1.25} borderTop="1px solid rgba(255,255,255,0.065)">
+          <Box key={`${text(item.businessDate)}-${index}`} px={1.5} py={1.25} borderTop={1} borderColor="divider">
             <Box display="flex" alignItems="baseline" justifyContent="space-between" gap={1.5}>
               <Typography variant="body2" fontWeight={700}>{dateLabel(item.businessDate)}</Typography>
-              <Typography variant="body2" fontWeight={750} color="#70D6A7">{money(amount(item.netSales))}</Typography>
+              <Typography variant="body2" fontWeight={750} color="success.main">{money(amount(item.netSales))}</Typography>
             </Box>
             <Box display="grid" gridTemplateColumns="repeat(3, minmax(0, 1fr))" gap={1} mt={1}>
               <Box><Typography variant="caption" color="text.disabled" display="block">Orders</Typography><Typography variant="body2">{number(amount(item.orderCount))}</Typography></Box>
@@ -205,13 +205,13 @@ function ProductTable({ items, totalNetSales, money, number }: {
           <TableHead>
             <TableRow>
               {['Product', 'Category', 'Quantity', 'Checks', 'Net sales', 'Sales share'].map((label, index) => (
-                <TableCell key={label} align={index > 1 ? 'right' : 'left'} sx={{ bgcolor: '#171821', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{label}</TableCell>
+                <TableCell key={label} align={index > 1 ? 'right' : 'left'} sx={{ bgcolor: 'background.paper', color: 'text.secondary', fontWeight: 700, whiteSpace: 'nowrap' }}>{label}</TableCell>
               ))}
             </TableRow>
           </TableHead>
           <TableBody>
             {items.map((item, index) => (
-              <TableRow key={`${text(item.productId || item.name)}-${index}`} sx={{ '& td': { borderColor: 'rgba(255,255,255,0.065)' } }}>
+              <TableRow key={`${text(item.productId || item.name)}-${index}`} sx={{ '& td': { borderColor: 'divider' } }}>
                 <TableCell><Typography variant="body2" fontWeight={650}>{text(item.name, 'Unnamed item')}</Typography><Typography variant="caption" color="text.disabled">{text(item.plu, 'No PLU')}</Typography></TableCell>
                 <TableCell>{text(item.categoryName, 'Uncategorized')}</TableCell>
                 <TableCell align="right">{number(amount(item.quantity), 2)}</TableCell>
@@ -333,12 +333,12 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
       {report ? (
         <>
           <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))', xl: 'repeat(6, minmax(0, 1fr))' }} gap={1.25}>
-            <MetricCard label="Net sales" value={money(amount(receiptTotals.netSales), true)} detail={`Gross ${money(amount(receiptTotals.grossSales), true)}`} color="#70D6A7" />
-            <MetricCard label="Checks" value={number(amount(receiptTotals.checkCount))} detail={`${number(amount(receiptTotals.orderCount))} orders`} color="#A8C7FA" />
+            <MetricCard label="Net sales" value={money(amount(receiptTotals.netSales), true)} detail={`Gross ${money(amount(receiptTotals.grossSales), true)}`} color="success.main" />
+            <MetricCard label="Checks" value={number(amount(receiptTotals.checkCount))} detail={`${number(amount(receiptTotals.orderCount))} orders`} color="primary.main" />
             <MetricCard label="Average check" value={money(amount(receiptTotals.averageCheckNetSales))} detail="Net sales per check" />
-            <MetricCard label="Tips" value={money(amount(receiptTotals.tips), true)} detail="Recorded service tips" color="#CFC6EA" />
+            <MetricCard label="Tips" value={money(amount(receiptTotals.tips), true)} detail="Recorded service tips" color="secondary.main" />
             <MetricCard label="Tax" value={money(amount(receiptTotals.tax), true)} detail="Recorded sales tax" />
-            <MetricCard label="Discounts" value={money(amount(receiptTotals.discounts), true)} detail="Applied discounts" color="#F2B76D" />
+            <MetricCard label="Discounts" value={money(amount(receiptTotals.discounts), true)} detail="Applied discounts" color="warning.main" />
           </Box>
 
           <Tabs
@@ -349,7 +349,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
             aria-label="POS report views"
             sx={{
               minHeight: 42,
-              borderBottom: '1px solid rgba(255,255,255,0.08)',
+              borderBottom: 1, borderColor: 'divider',
               '& .MuiTab-root': { minHeight: 42, minWidth: 96, textTransform: 'none', letterSpacing: 0 },
             }}
           >
@@ -366,7 +366,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
                 <Box sx={{ ...panelSx, overflow: 'hidden' }}>
                   <SectionHeader icon={<ReceiptLongRounded fontSize="small" />} title="Check status" detail={`${number(amount(checkSummaries.totals && record(checkSummaries.totals).checkCount))} checks with detail`} />
                   {checkStatuses.map((item, index) => (
-                    <Box key={`${text(item.paymentStatus)}-${index}`} display="grid" gridTemplateColumns="minmax(0, 1fr) auto auto" gap={1.5} px={{ xs: 1.5, sm: 2 }} py={1.1} borderTop="1px solid rgba(255,255,255,0.065)" alignItems="center">
+                    <Box key={`${text(item.paymentStatus)}-${index}`} display="grid" gridTemplateColumns="minmax(0, 1fr) auto auto" gap={1.5} px={{ xs: 1.5, sm: 2 }} py={1.1} borderTop={1} borderColor="divider" alignItems="center">
                       <Typography variant="body2" fontWeight={650}>{text(item.paymentStatus, 'Unknown')}</Typography>
                       <Typography variant="caption" color="text.secondary">{number(amount(item.checkCount))} checks</Typography>
                       <Typography variant="body2" fontWeight={700}>{money(amount(item.total))}</Typography>
@@ -387,7 +387,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
                     ['Tips', receiptTotals.tips],
                     ['Grand total', receiptTotals.total],
                   ].map(([label, value], index) => (
-                    <Box key={String(label)} display="flex" justifyContent="space-between" gap={1.5} py={0.6} borderTop={index === 6 ? '1px solid rgba(255,255,255,0.08)' : 0} mt={index === 6 ? 0.5 : 0}>
+                    <Box key={String(label)} display="flex" justifyContent="space-between" gap={1.5} py={0.6} borderTop={index === 6 ? 1 : 0} borderColor="divider" mt={index === 6 ? 0.5 : 0}>
                       <Typography variant="body2" color={index === 6 ? 'text.primary' : 'text.secondary'} fontWeight={index === 6 ? 700 : 400}>{String(label)}</Typography>
                       <Typography variant="body2" fontWeight={index === 6 ? 750 : 650}>{money(amount(value))}</Typography>
                     </Box>
@@ -421,7 +421,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
                     </Box>
                   ))}
                 </Box>
-                <Box px={{ xs: 1.5, sm: 2 }} pb={1.5} borderLeft={{ sm: '1px solid rgba(255,255,255,0.065)' }}>
+                <Box px={{ xs: 1.5, sm: 2 }} pb={1.5} borderLeft={{ sm: 1 }} borderColor="divider">
                   <Typography variant="caption" color="text.disabled" fontWeight={700}>CARD TYPE</Typography>
                   {cardTypes.map((item, index) => (
                     <Box key={`${text(item.cardType)}-${index}`} display="flex" justifyContent="space-between" gap={1.5} py={0.65}>
@@ -442,7 +442,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
                 </Box>
                 <Box display="flex" justifyContent="space-between" gap={1.5} py={0.75}>
                   <Typography variant="body2">Calculated card settlement</Typography>
-                  <Typography variant="body2" fontWeight={700} color={settlement.available ? '#70D6A7' : 'text.secondary'}>{settlement.available ? money(settlement.value) : 'Unavailable'}</Typography>
+                  <Typography variant="body2" fontWeight={700} color={settlement.available ? 'success.main' : 'text.secondary'}>{settlement.available ? money(settlement.value) : 'Unavailable'}</Typography>
                 </Box>
                 <Typography variant="caption" color="text.secondary" display="block">
                   {settlement.available ? 'Card payments + tips - processing fees. This is not a verified bank deposit.' : settlement.reason}
@@ -458,7 +458,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
 
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'repeat(2, minmax(0, 1fr))' }} gap={2}>
             <Box sx={{ ...panelSx, p: 1.5 }}>
-              <Box display="flex" alignItems="center" gap={0.75} mb={1}><PaymentsRounded fontSize="small" sx={{ color: '#A8C7FA' }} /><Typography fontWeight={700}>Cash operations</Typography></Box>
+              <Box display="flex" alignItems="center" gap={0.75} mb={1}><PaymentsRounded fontSize="small" sx={{ color: 'primary.main' }} /><Typography fontWeight={700}>Cash operations</Typography></Box>
               <Box display="flex" justifyContent="space-between" gap={1.5}><Typography variant="body2" color="text.secondary">Cash tender</Typography><Typography variant="body2" fontWeight={700}>{money(amount(cash.tendered))}</Typography></Box>
               <Typography variant="caption" color="text.disabled" display="block" mt={0.75}>Deposits and cash over/short require accounting evidence.</Typography>
             </Box>
@@ -484,7 +484,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
             <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))' }} gap={1.25} px={{ xs: 1.5, sm: 2 }} pb={1.5}>
               <Box minWidth={0}><Typography variant="caption" color="text.disabled">Observed days</Typography><Typography fontWeight={700}>{number(businessDays)}</Typography></Box>
               <Box minWidth={0}><Typography variant="caption" color="text.disabled">Daily run rate</Typography><Typography fontWeight={700}>{money(dailyRunRate)}</Typography></Box>
-              <Box minWidth={0} gridColumn={{ xs: '1 / -1', sm: 'auto' }}><Typography variant="caption" color="text.disabled">Next 7 days</Typography><Typography fontWeight={700} color="#A8C7FA">{money(projectedSevenDays)}</Typography></Box>
+              <Box minWidth={0} gridColumn={{ xs: '1 / -1', sm: 'auto' }}><Typography variant="caption" color="text.disabled">Next 7 days</Typography><Typography fontWeight={700} color="primary.main">{money(projectedSevenDays)}</Typography></Box>
             </Box>
             <Divider />
             <Typography variant="caption" color="text.secondary" display="block" px={{ xs: 1.5, sm: 2 }} py={1.25}>
@@ -498,7 +498,7 @@ export default function PosReportsPanel({ from, to, location, revision, money, n
           </Stack> : null}
 
           <Box sx={{ ...panelSx, p: 1.5, display: 'flex', alignItems: 'flex-start', gap: 1 }}>
-            <ReceiptLongRounded fontSize="small" sx={{ color: '#A8C7FA', mt: 0.15 }} />
+            <ReceiptLongRounded fontSize="small" sx={{ color: 'primary.main', mt: 0.15 }} />
             <Box>
               <Typography variant="body2" fontWeight={700}>Evidence coverage</Typography>
               <Typography variant="caption" color="text.secondary">

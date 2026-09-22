@@ -152,7 +152,7 @@ export default function OneOffShippingExecutionPanel({
 
       {state && (
         <>
-          <Box sx={{ p: 1.5, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}>
+          <Box sx={{ p: 1.5, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}>
             <Stack direction="row" justifyContent="space-between" gap={1} alignItems="flex-start">
               <Box>
                 <Typography fontWeight={700}>Planning selection</Typography>
@@ -191,7 +191,7 @@ export default function OneOffShippingExecutionPanel({
 
           {state.packedRate && (
             <Box
-              sx={{ p: 1.5, border: '1px solid rgba(168,199,250,0.32)', borderRadius: 2 }}
+              sx={{ p: 1.5, border: '1px solid', borderColor: 'primary.main', borderRadius: 2 }}
               data-testid="one-off-packed-rate"
             >
               <Stack direction="row" justifyContent="space-between" gap={1} alignItems="flex-start">
@@ -228,7 +228,8 @@ export default function OneOffShippingExecutionPanel({
                         gridTemplateColumns: 'minmax(0, 1fr) auto',
                         gap: 1,
                         p: 1,
-                        border: '1px solid rgba(255,255,255,0.1)',
+                        border: '1px solid',
+                        borderColor: 'divider',
                         borderRadius: 1.5,
                       }}
                     >
@@ -267,9 +268,8 @@ export default function OneOffShippingExecutionPanel({
             <Box
               sx={{
                 p: 1.5,
-                border: group.active
-                  ? '1px solid rgba(129,199,132,0.4)'
-                  : '1px solid rgba(255,255,255,0.12)',
+                border: '1px solid',
+                borderColor: group.active ? 'success.main' : 'divider',
                 borderRadius: 2,
               }}
               data-testid="one-off-carrier-group-result"

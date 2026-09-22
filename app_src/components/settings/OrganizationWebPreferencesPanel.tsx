@@ -40,8 +40,11 @@ function OrganizationWebPreferencesContent() {
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [loadRevision, setLoadRevision] = useState(0)
   useEffect(() => {
     let active = true
+    setLoading(true)
+    setError('')
     fetch('/api/settings/organization-web', { cache: 'no-store' }).then(async (response) => {
       const result = await response.json() as Payload
       if (!response.ok || !result.ok) throw new Error(result.error || 'Unable to load organization web settings')
@@ -49,7 +52,7 @@ function OrganizationWebPreferencesContent() {
     }).catch((failure) => { if (active) setError(failure instanceof Error ? failure.message : 'Unable to load organization web settings') })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [])
+  }, [loadRevision])
   const dirty = Boolean(state && draft && (draft.appDomain !== state.preferences.appDomain || draft.shortLinkDomain !== state.preferences.shortLinkDomain || draft.allowUserShortLinkOverride !== state.preferences.allowUserShortLinkOverride))
   async function save() {
     if (!state?.canEdit || !draft || !dirty || saving) return
@@ -64,7 +67,7 @@ function OrganizationWebPreferencesContent() {
     finally { setSaving(false) }
   }
   if (loading) return <Box sx={{ mt: 3 }}><CircularProgress size={20} aria-label="Loading organization web settings" /></Box>
-  if (!state || !draft) return error ? <Alert severity="error" sx={{ mt: 3 }}>{error}</Alert> : null
+  if (!state || !draft) return error ? <Alert severity="error" sx={{ mt: 3 }} action={<Button color="inherit" size="small" onClick={() => setLoadRevision((current) => current + 1)}>Retry</Button>}>{error}</Alert> : null
   const disabled = !state.canEdit || saving
   const fallback = state.preferences.appDomain !== state.effectiveApp.key || state.preferences.shortLinkDomain !== state.effectiveShortLink.key
   function choices(available: DomainChoice[]) {
@@ -77,6 +80,7 @@ function OrganizationWebPreferencesContent() {
     <Divider sx={{ mb: 2.5 }} />
     <Typography id="organization-web-heading" variant="subtitle2" fontWeight={700}>Organization web addresses</Typography>
     <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>Defaults for {state.organizationName || 'this organization'}. BPO Supply Chain is preferred when its addresses are enabled.</Typography>
+    {!state.canEdit && <Alert severity="info" sx={{ mb: 2 }}>Only an organization owner or administrator can change these defaults. You can still use either enabled app address.</Alert>}
     {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
     {notice && <Alert severity="success" sx={{ mb: 2 }}>{notice}</Alert>}
     {fallback && <Alert severity="info" sx={{ mb: 2 }}>A preferred address is not enabled yet. Currently using {state.effectiveApp.label} for app links and {state.effectiveShortLink.label} for short links. Saved preferences are preserved.</Alert>}

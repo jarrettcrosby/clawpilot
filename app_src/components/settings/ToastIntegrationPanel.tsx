@@ -159,7 +159,7 @@ const EMPTY_STATE: IntegrationState = {
 }
 
 const fieldSx = {
-  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: '#20202A' },
+  '& .MuiOutlinedInput-root': { borderRadius: '8px', backgroundColor: 'background.default' },
 }
 
 const buttonSx = {
@@ -489,7 +489,7 @@ export default function ToastIntegrationPanel() {
           sx={{
             display: 'grid',
             gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' },
-            borderBlock: '1px solid rgba(255,255,255,0.1)',
+            borderBlock: '1px solid rgba(var(--cp-neutral-rgb),0.1)',
           }}
         >
           {[
@@ -510,9 +510,9 @@ export default function ToastIntegrationPanel() {
               sx={{
                 py: 1.5,
                 px: { xs: 1, sm: 1.5 },
-                borderLeft: index % 2 ? '1px solid rgba(255,255,255,0.08)' : 0,
-                borderTop: { xs: index > 1 ? '1px solid rgba(255,255,255,0.08)' : 0, sm: 0 },
-                '&:not(:first-of-type)': { borderLeft: { sm: '1px solid rgba(255,255,255,0.08)' } },
+                borderLeft: index % 2 ? '1px solid rgba(var(--cp-neutral-rgb),0.08)' : 0,
+                borderTop: { xs: index > 1 ? '1px solid rgba(var(--cp-neutral-rgb),0.08)' : 0, sm: 0 },
+                '&:not(:first-of-type)': { borderLeft: { sm: '1px solid rgba(var(--cp-neutral-rgb),0.08)' } },
               }}
             >
               <Typography variant="caption" color="text.secondary">{label}</Typography>
@@ -573,7 +573,7 @@ export default function ToastIntegrationPanel() {
           const credential = integration.credentials[accessType]
           const form = forms[accessType]
           return (
-            <Box key={accessType} component="section" sx={{ border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', p: 2 }}>
+            <Box key={accessType} component="section" sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.1)', borderRadius: '8px', p: 2 }}>
               <Stack direction="row" spacing={1} alignItems="center" mb={2} flexWrap="wrap" useFlexGap>
                 {accessType === 'analytics' ? <AnalyticsRounded color="primary" /> : <CloudDoneRounded color="primary" />}
                 <Typography fontWeight={700}>{accessLabel(accessType)}</Typography>
@@ -694,9 +694,9 @@ export default function ToastIntegrationPanel() {
         </Stack>
       </Box>
 
-      <Stack spacing={0} sx={{ border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px', overflow: 'hidden' }}>
+      <Stack spacing={0} sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.1)', borderRadius: '8px', overflow: 'hidden' }}>
         {integration.locations.length ? integration.locations.map((location, index) => (
-          <Box key={location.restaurantGuid} sx={{ p: 1.5, borderTop: index ? '1px solid rgba(255,255,255,0.08)' : 0 }}>
+          <Box key={location.restaurantGuid} sx={{ p: 1.5, borderTop: index ? '1px solid rgba(var(--cp-neutral-rgb),0.08)' : 0 }}>
             <Stack direction="row" spacing={1.5} alignItems="center" justifyContent="space-between">
               <Box minWidth={0}>
                 <Typography fontWeight={650} noWrap>{location.restaurantName}</Typography>

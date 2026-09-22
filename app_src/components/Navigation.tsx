@@ -224,16 +224,16 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                     justifyContent: collapsed ? 'center' : 'flex-start',
                     minHeight: 48,
                     '&.Mui-selected': {
-                      backgroundColor: 'rgba(168,199,250,0.12)',
-                      '&:hover': { backgroundColor: 'rgba(168,199,250,0.16)' },
+                      backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)',
+                      '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.16)' },
                     },
-                    '&:hover': { backgroundColor: 'rgba(255,255,255,0.05)' },
+                    '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.05)' },
                   }}
                 >
                   <ListItemIcon
                     sx={{
                       minWidth: collapsed ? 0 : 36,
-                      color: activeRoot === item.id ? '#A8C7FA' : 'rgba(255,255,255,0.5)',
+                      color: activeRoot === item.id ? 'var(--mui-palette-primary-main)' : 'rgba(var(--cp-neutral-rgb),0.5)',
                       justifyContent: 'center',
                     }}
                   >
@@ -245,7 +245,7 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                       primaryTypographyProps={{
                         fontSize: '0.875rem',
                         fontWeight: activeRoot === item.id ? 600 : 400,
-                        color: activeRoot === item.id ? '#A8C7FA' : 'text.secondary',
+                        color: activeRoot === item.id ? 'var(--mui-palette-primary-main)' : 'text.secondary',
                       }}
                     />
                   )}
@@ -273,7 +273,7 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                         minHeight: 40,
                         pl: 2,
                         '&.Mui-selected': {
-                          backgroundColor: 'rgba(168,199,250,0.1)',
+                          backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)',
                         },
                       }}
                     >
@@ -281,8 +281,8 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                         sx={{
                           minWidth: 32,
                           color: activeSection === child.id
-                            ? '#A8C7FA'
-                            : 'rgba(255,255,255,0.45)',
+                            ? 'var(--mui-palette-primary-main)'
+                            : 'rgba(var(--cp-neutral-rgb),0.45)',
                         }}
                       >
                         <child.Icon sx={{ fontSize: 18 }} />
@@ -292,7 +292,7 @@ function NavigationList({ activeSection, collapsed = false, onSelect, surface, s
                         primaryTypographyProps={{
                           fontSize: '0.8rem',
                           color: activeSection === child.id
-                            ? '#A8C7FA'
+                            ? 'var(--mui-palette-primary-main)'
                             : 'text.secondary',
                         }}
                       />
@@ -372,8 +372,8 @@ export default function Navigation({
             width: desktopWidth,
             height: '100%',
             overflowX: 'hidden',
-            backgroundColor: '#12141C',
-            borderRight: '1px solid rgba(255,255,255,0.06)',
+            backgroundColor: 'var(--mui-palette-background-paper)',
+            borderRight: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
             display: 'flex',
             flexDirection: 'column',
             boxSizing: 'border-box',
@@ -399,7 +399,7 @@ export default function Navigation({
               </Typography>
             )}
           </Box>
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+          <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
           <NavigationList
             activeSection={activeSection}
             collapsed={collapsed}
@@ -424,8 +424,8 @@ export default function Navigation({
             width: 'min(320px, 86vw)',
             maxWidth: '100vw',
             overflowX: 'hidden',
-            backgroundColor: '#12141C',
-            borderRight: '1px solid rgba(255,255,255,0.08)',
+            backgroundColor: 'var(--mui-palette-background-paper)',
+            borderRight: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
             boxSizing: 'border-box',
           },
         }}
@@ -458,7 +458,7 @@ export default function Navigation({
               <CloseRounded />
             </IconButton>
           </Box>
-          <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)' }} />
+          <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)' }} />
           <NavigationList
             activeSection={activeSection}
             onSelect={navigateFromMobile}
@@ -488,8 +488,8 @@ export default function Navigation({
           maxWidth: '100vw',
           height: 'calc(var(--mobile-navigation-height, 64px) + env(safe-area-inset-bottom))',
           paddingBottom: 'env(safe-area-inset-bottom)',
-          backgroundColor: '#12141C',
-          borderTop: '1px solid rgba(255,255,255,0.06)',
+          backgroundColor: 'var(--mui-palette-background-paper)',
+          borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
           zIndex: 1100,
           '@media (orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)': {
             '& .MuiBottomNavigationAction-root': { py: 0.25 },
@@ -506,8 +506,8 @@ export default function Navigation({
             aria-label={item.label}
             icon={<item.Icon />}
             sx={{
-              color: 'rgba(255,255,255,0.4)',
-              '&.Mui-selected': { color: '#A8C7FA' },
+              color: 'rgba(var(--cp-neutral-rgb),0.4)',
+              '&.Mui-selected': { color: 'var(--mui-palette-primary-main)' },
               minWidth: 0,
               maxWidth: 'none',
               flex: '1 1 0',
@@ -532,8 +532,8 @@ export default function Navigation({
           aria-controls="mobile-navigation-drawer"
           icon={<MoreHorizRounded />}
           sx={{
-            color: 'rgba(255,255,255,0.4)',
-            '&.Mui-selected': { color: '#A8C7FA' },
+            color: 'rgba(var(--cp-neutral-rgb),0.4)',
+            '&.Mui-selected': { color: 'var(--mui-palette-primary-main)' },
             minWidth: 0,
             maxWidth: 'none',
             flex: '1 1 0',

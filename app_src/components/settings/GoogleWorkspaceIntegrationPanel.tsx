@@ -77,7 +77,7 @@ const EMPTY_INTEGRATION: GoogleIntegrationState = {
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -445,7 +445,7 @@ export default function GoogleWorkspaceIntegrationPanel() {
         />
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="form" onSubmit={saveApiKey}>
         <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25} flexWrap="wrap" useFlexGap>
@@ -478,7 +478,7 @@ export default function GoogleWorkspaceIntegrationPanel() {
         </Box>
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box component="form" onSubmit={saveServiceAccount}>
         <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25} flexWrap="wrap" useFlexGap>
@@ -525,7 +525,7 @@ export default function GoogleWorkspaceIntegrationPanel() {
         </Stack>
       </Box>
 
-      <Divider sx={{ my: 3, borderColor: 'rgba(255,255,255,0.08)' }} />
+      <Divider sx={{ my: 3, borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }} />
 
       <Box>
         <Stack direction="row" spacing={0.75} alignItems="center" mb={1.25} flexWrap="wrap" useFlexGap>
@@ -577,7 +577,7 @@ export default function GoogleWorkspaceIntegrationPanel() {
         aria-labelledby="disconnect-google-title"
         fullWidth
         maxWidth="xs"
-        PaperProps={{ sx: { backgroundColor: '#1A1A23', backgroundImage: 'none', border: '1px solid rgba(255,255,255,0.09)', borderRadius: '8px' } }}
+        PaperProps={{ sx: { backgroundColor: 'background.paper', backgroundImage: 'none', border: '1px solid rgba(var(--cp-neutral-rgb),0.09)', borderRadius: '8px' } }}
       >
         <DialogTitle id="disconnect-google-title" fontWeight={700}>Disconnect Google Workspace?</DialogTitle>
         <DialogContent>

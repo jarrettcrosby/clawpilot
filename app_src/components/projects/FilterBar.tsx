@@ -40,28 +40,28 @@ type Props = {
 const selectSx = {
   fontSize: 13,
   height: 36,
-  backgroundColor: '#1A1A23',
+  backgroundColor: 'var(--mui-palette-background-paper)',
   borderRadius: 2,
   color: 'text.primary',
-  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.08)' },
-  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.2)' },
-  '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#A8C7FA' },
+  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' },
+  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(var(--cp-neutral-rgb),0.2)' },
+  '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--mui-palette-primary-main)' },
   '& .MuiSelect-icon': { color: 'text.disabled', fontSize: 18 },
 }
 
 const menuProps = {
   PaperProps: {
     sx: {
-      backgroundColor: '#232330',
-      border: '1px solid rgba(255,255,255,0.08)',
+      backgroundColor: 'var(--mui-palette-surfaceVariant)',
+      border: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
       borderRadius: 2,
       mt: 0.5,
       '& .MuiMenuItem-root': {
         fontSize: 13,
         py: 1,
-        '&:hover': { backgroundColor: 'rgba(255,255,255,0.06)' },
-        '&.Mui-selected': { backgroundColor: 'rgba(168,199,250,0.12)', color: '#A8C7FA' },
-        '&.Mui-selected:hover': { backgroundColor: 'rgba(168,199,250,0.18)' },
+        '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.06)' },
+        '&.Mui-selected': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.12)', color: 'var(--mui-palette-primary-main)' },
+        '&.Mui-selected:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.18)' },
       },
     },
   },
@@ -70,7 +70,7 @@ const menuProps = {
 const labelSx = {
   fontSize: 12,
   color: 'text.disabled',
-  '&.Mui-focused': { color: '#A8C7FA' },
+  '&.Mui-focused': { color: 'var(--mui-palette-primary-main)' },
   '&.MuiInputLabel-shrink': { fontSize: 11 },
 }
 
@@ -90,7 +90,7 @@ function FilterControls({ filter, onChange, onClear }: Props) {
       display: 'flex', gap: 1, alignItems: 'center', overflowX: isXs ? 'auto' : 'visible', pb: isXs ? 0.5 : 0,
       WebkitOverflowScrolling: 'touch',
       '&::-webkit-scrollbar': { height: 4 },
-      '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(255,255,255,0.18)', borderRadius: 2 },
+      '&::-webkit-scrollbar-thumb': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.18)', borderRadius: 2 },
       scrollbarWidth: isXs ? 'thin' : 'auto',
     }}>
       {/* Priority */}
@@ -135,8 +135,8 @@ function FilterControls({ filter, onChange, onClear }: Props) {
         >
           {[
             { value: 'active', label: 'Active (all)', color: '#FFA726' },
-            { value: 'in-progress', label: 'In Progress', color: '#A8C7FA' },
-            { value: 'todo', label: 'To Do', color: '#CFC6EA' },
+            { value: 'in-progress', label: 'In Progress', color: 'var(--mui-palette-primary-main)' },
+            { value: 'todo', label: 'To Do', color: 'var(--mui-palette-secondary-main)' },
             { value: 'review', label: 'Review', color: '#AB47BC' },
             { value: 'backlog', label: 'Backlog', color: '#546E7A' },
             { value: 'done', label: 'Done', color: '#66BB6A' },
@@ -182,8 +182,8 @@ function FilterControls({ filter, onChange, onClear }: Props) {
               width: 36,
               height: 36,
               flexShrink: 0,
-              backgroundColor: '#1A1A23',
-              border: '1px solid rgba(255,255,255,0.08)',
+              backgroundColor: 'var(--mui-palette-background-paper)',
+              border: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
               borderRadius: 2,
               color: 'text.disabled',
               '&:hover': { backgroundColor: 'rgba(239,83,80,0.1)', borderColor: '#EF5350', color: '#EF5350' },
@@ -216,12 +216,12 @@ export default function FilterBar({ filter, onChange, onClear }: Props) {
             borderRadius: 3,
             height: 40,
             px: 2,
-            backgroundColor: active ? 'rgba(168,199,250,0.14)' : 'transparent',
-            borderColor: 'rgba(255,255,255,0.12)',
-            color: active ? '#A8C7FA' : 'text.secondary',
+            backgroundColor: active ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.14)' : 'transparent',
+            borderColor: 'rgba(var(--cp-neutral-rgb),0.12)',
+            color: active ? 'var(--mui-palette-primary-main)' : 'text.secondary',
             '&:hover': {
-              backgroundColor: active ? 'rgba(168,199,250,0.18)' : 'rgba(255,255,255,0.06)',
-              borderColor: 'rgba(255,255,255,0.22)',
+              backgroundColor: active ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.18)' : 'rgba(var(--cp-neutral-rgb),0.06)',
+              borderColor: 'rgba(var(--cp-neutral-rgb),0.22)',
             },
           }}
         >
@@ -234,10 +234,10 @@ export default function FilterBar({ filter, onChange, onClear }: Props) {
           onClose={() => setOpen(false)}
           PaperProps={{
             sx: {
-              backgroundColor: '#12141C',
+              backgroundColor: 'var(--mui-palette-background-paper)',
               borderTopLeftRadius: 20,
               borderTopRightRadius: 20,
-              borderTop: '1px solid rgba(255,255,255,0.08)',
+              borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
               pb: 'env(safe-area-inset-bottom)',
             },
           }}
@@ -249,7 +249,7 @@ export default function FilterBar({ filter, onChange, onClear }: Props) {
                 <CloseRounded />
               </IconButton>
             </Box>
-            <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', mt: 1.25 }} />
+            <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)', mt: 1.25 }} />
           </Box>
 
           <Box sx={{ px: 2, pb: 2 }}>

@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -37,7 +37,11 @@ export default function QuickBooksTaxClassificationPicker({
   const [levels, setLevels] = useState<PickerLevel[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [failedSelection, setFailedSelection] = useState<{ levelIndex: number; selectedId: string } | null>(null)
   const requestEpoch = useRef(0)
+  const selectionHandler = useRef({ onChange, disabled })
+  useEffect(() => { selectionHandler.current = { onChange, disabled } }, [onChange, disabled])
+  useEffect(() => () => { requestEpoch.current += 1 }, [])
 
   const openPicker = async () => {
     setExpanded(true)
@@ -45,6 +49,7 @@ export default function QuickBooksTaxClassificationPicker({
     const epoch = ++requestEpoch.current
     setLoading(true)
     setError(null)
+    setFailedSelection(null)
     try {
       const page = await loadPage(null)
       if (epoch === requestEpoch.current) setLevels([{ parentId: null, rows: page, selectedId: '' }])
@@ -63,6 +68,7 @@ export default function QuickBooksTaxClassificationPicker({
     const epoch = ++requestEpoch.current
     setLevels(currentPath)
     setError(null)
+    setFailedSelection(null)
     // Browsing another branch must not erase a previously selected category.
     // Only a valid leaf selection commits a change to the parent form.
     if (!selected) return
@@ -74,10 +80,15 @@ export default function QuickBooksTaxClassificationPicker({
         setLevels([...currentPath, { parentId: selected.id, rows: page, selectedId: '' }])
       } else if (taxClassificationAppliesToItem(selected, itemType)) {
         const names = currentPath.map((entry) => entry.rows.find((row) => row.id === entry.selectedId)?.name || '')
-        onChange({ id: selected.id, name: names.join(':'), parentId: level.parentId })
+        if (!selectionHandler.current.disabled) {
+          selectionHandler.current.onChange({ id: selected.id, name: names.join(':'), parentId: level.parentId })
+        }
       }
     } catch (cause) {
-      if (epoch === requestEpoch.current) setError(cause instanceof Error ? cause.message : 'Sales tax subcategories could not be loaded')
+      if (epoch === requestEpoch.current) {
+        setError(cause instanceof Error ? cause.message : 'Sales tax subcategories could not be loaded')
+        setFailedSelection({ levelIndex, selectedId })
+      }
     } finally {
       if (epoch === requestEpoch.current) setLoading(false)
     }
@@ -98,7 +109,12 @@ export default function QuickBooksTaxClassificationPicker({
       {expanded ? (
         <Stack spacing={1}>
           {loading ? <Box display="flex" alignItems="center" gap={1}><CircularProgress size={16} /><Typography variant="caption">Loading QuickBooks categories…</Typography></Box> : null}
-          {error ? <Alert severity="error">{error}</Alert> : null}
+          {error ? <Alert severity="error" action={(
+            <Button color="inherit" size="small" disabled={disabled || loading} onClick={() => {
+              if (failedSelection) void selectCategory(failedSelection.levelIndex, failedSelection.selectedId)
+              else void openPicker()
+            }}>Retry categories</Button>
+          )}>{error} Your selected tax category has not changed.</Alert> : null}
           {levels.map((level, index) => {
             const eligible = level.rows.filter((row) => row.applicableTo.length === 0
               || taxClassificationAppliesToItem(row, itemType))
@@ -109,10 +125,9 @@ export default function QuickBooksTaxClassificationPicker({
               <MenuItem value="">Select a category</MenuItem>
               {eligible.map((category) => <MenuItem key={category.id} value={category.id}>{category.name}</MenuItem>)}
             </TextField> : <Alert key={level.parentId || 'root'} severity="info">
-              No sales tax subcategories apply to this product type.
+              {level.parentId ? 'No sales tax subcategories apply to this product type.' : 'QuickBooks returned no sales tax categories for this product type.'}
             </Alert>
           })}
-          {levels.length === 1 && levels[0].rows.length === 0 ? <Alert severity="info">QuickBooks returned no sales tax categories for this company.</Alert> : null}
         </Stack>
       ) : null}
     </Stack>

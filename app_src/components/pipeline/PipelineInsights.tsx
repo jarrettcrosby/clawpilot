@@ -56,7 +56,7 @@ const percent = new Intl.NumberFormat('en-US', {
 
 function Metric({ label, value, tone = 'default' }: { label: string; value: string | number; tone?: 'default' | 'positive' | 'warning' }) {
   return (
-    <Box sx={{ minWidth: 0, py: 1.25, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+    <Box sx={{ minWidth: 0, py: 1.25, borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)' }}>
       <Typography variant="caption" color="text.secondary">{label}</Typography>
       <Typography
         variant="h6"
@@ -91,7 +91,7 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
                   {group.count} · {formatPipelineCurrency(value)}
                 </Typography>
               </Stack>
-              <Box sx={{ mt: 0.65, height: 6, backgroundColor: 'rgba(255,255,255,0.07)', borderRadius: 1 }}>
+              <Box sx={{ mt: 0.65, height: 6, backgroundColor: 'rgba(var(--cp-neutral-rgb),0.07)', borderRadius: 1 }}>
                 <Tooltip
                   title={`${group.label} · ${weighted ? 'Weighted value' : 'Active value'}: ${formatPipelineCurrency(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
                   arrow
@@ -107,7 +107,7 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
                     sx={{
                       height: '100%',
                       width: `${Math.max(2, (value / max) * 100)}%`,
-                      backgroundColor: weighted ? '#A8C7FA' : '#66BB6A',
+                      backgroundColor: weighted ? 'var(--mui-palette-primary-main)' : '#66BB6A',
                       borderRadius: 1,
                       '&:focus-visible': {
                         outline: '2px solid #E9ECF4',
@@ -152,7 +152,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
           display: 'grid',
           gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))', lg: 'repeat(6, minmax(0, 1fr))' },
           columnGap: { xs: 2, md: 3 },
-          borderTop: '1px solid rgba(255,255,255,0.06)',
+          borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.06)',
           mb: 3,
         }}
       >
@@ -177,7 +177,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
             Counts cover the full pipeline. Detail links below come from up to 1,000 recently updated opportunity rows.
           </Typography>
-          <Box sx={{ mt: 1.25, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+          <Box sx={{ mt: 1.25, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
             {attentionDeals.map((deal) => {
               const reasons = [
                 conflictIds.has(deal.id) ? `${deal.status || 'Unspecified'} status conflicts with ${deal.stage || 'unspecified'} stage` : '',
@@ -188,7 +188,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
                 <ButtonBase
                   key={deal.id}
                   onClick={() => onOpenDeal(deal)}
-                  sx={{ width: '100%', minHeight: 48, py: 1, textAlign: 'left', borderBottom: '1px solid rgba(255,255,255,0.06)', justifyContent: 'flex-start' }}
+                  sx={{ width: '100%', minHeight: 48, py: 1, textAlign: 'left', borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.06)', justifyContent: 'flex-start' }}
                 >
                   <Box sx={{ minWidth: 0, flex: 1 }}>
                     <Typography variant="body2" fontWeight={600} noWrap>{deal.org || 'Unknown organization'}</Typography>
@@ -206,7 +206,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
         <Distribution title="Weighted forecast by close quarter" groups={forecastGroups} weighted />
       </Box>
 
-      <Box component="section" sx={{ mt: 4, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+      <Box component="section" sx={{ mt: 4, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}>
         <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ py: 1.5 }}>
           <Typography variant="subtitle2" fontWeight={700}>Largest among loaded opportunity details</Typography>
           <Chip size="small" label={`${topDeals.length} shown · ${deals.length} loaded`} sx={{ borderRadius: 1 }} />
@@ -215,7 +215,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
           <ButtonBase
             key={deal.id}
             onClick={() => onOpenDeal(deal)}
-            sx={{ width: '100%', minHeight: 56, py: 1, borderTop: '1px solid rgba(255,255,255,0.06)', textAlign: 'left', justifyContent: 'flex-start' }}
+            sx={{ width: '100%', minHeight: 56, py: 1, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.06)', textAlign: 'left', justifyContent: 'flex-start' }}
           >
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <Typography variant="body2" fontWeight={600} noWrap>{deal.org || 'Unknown organization'}</Typography>

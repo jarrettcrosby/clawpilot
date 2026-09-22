@@ -44,13 +44,13 @@ function Key({ label }: { label: string }) {
     <Box component="span" sx={{
       display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
       minWidth: 28, height: 24, px: 0.75,
-      backgroundColor: 'rgba(255,255,255,0.08)',
-      border: '1px solid rgba(255,255,255,0.15)',
-      borderBottom: '2px solid rgba(255,255,255,0.2)',
+      backgroundColor: 'rgba(var(--cp-neutral-rgb),0.08)',
+      border: '1px solid rgba(var(--cp-neutral-rgb),0.15)',
+      borderBottom: '2px solid rgba(var(--cp-neutral-rgb),0.2)',
       borderRadius: 1,
       fontFamily: 'monospace',
       fontSize: '0.75rem',
-      color: 'rgba(255,255,255,0.85)',
+      color: 'rgba(var(--cp-neutral-rgb),0.85)',
       fontWeight: 600,
     }}>
       {label}
@@ -64,7 +64,7 @@ export default function ShortcutsModal({ open, onClose }: Props) {
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth fullScreen={shortLandscape}
-      PaperProps={{ sx: { backgroundColor: '#1A1A23', border: '1px solid rgba(255,255,255,0.08)', borderRadius: shortLandscape ? 0 : 3 } }}>
+      PaperProps={{ sx: { backgroundColor: 'var(--mui-palette-background-paper)', border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: shortLandscape ? 0 : 3 } }}>
       <Box display="flex" alignItems="center" justifyContent="space-between" px={3} pt={2.5} pb={1}>
         <Typography variant="h6" fontWeight={700} color="text.primary">Keyboard Shortcuts</Typography>
         <IconButton aria-label="Close keyboard shortcuts" onClick={onClose} size="small" sx={{ color: 'text.secondary' }}>
@@ -77,7 +77,7 @@ export default function ShortcutsModal({ open, onClose }: Props) {
             <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.7rem', letterSpacing: 1.2 }}>
               {section.label}
             </Typography>
-            <Divider sx={{ borderColor: 'rgba(255,255,255,0.06)', mt: 0.5, mb: 1.5 }} />
+            <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.06)', mt: 0.5, mb: 1.5 }} />
             {section.shortcuts.map(s => (
               <Box key={s.desc} display="flex" alignItems="center" justifyContent="space-between" mb={1.25}>
                 <Typography variant="body2" color="text.secondary">{s.desc}</Typography>

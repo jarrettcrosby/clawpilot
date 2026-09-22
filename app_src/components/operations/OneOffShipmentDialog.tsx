@@ -1365,7 +1365,8 @@ export default function OneOffShipmentDialog({
                           key={mode.mode}
                           sx={{
                             p: 1.5,
-                            border: '1px solid rgba(255,255,255,0.12)',
+                            border: '1px solid',
+                            borderColor: 'divider',
                             borderRadius: 2,
                           }}
                         >
@@ -1439,7 +1440,7 @@ export default function OneOffShipmentDialog({
                           </Typography>
                         </Box>
                       )}
-                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                      sx={{ m: 0, p: 1.25, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}
                     />
                     <FormControlLabel
                       value="new"
@@ -1452,7 +1453,7 @@ export default function OneOffShipmentDialog({
                           </Typography>
                         </Box>
                       )}
-                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                      sx={{ m: 0, p: 1.25, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}
                     />
                     <FormControlLabel
                       value="ad_hoc"
@@ -1465,7 +1466,7 @@ export default function OneOffShipmentDialog({
                           </Typography>
                         </Box>
                       )}
-                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                      sx={{ m: 0, p: 1.25, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}
                     />
                   </RadioGroup>
                   <Typography variant="overline" color="text.secondary">Order information</Typography>
@@ -1595,7 +1596,7 @@ export default function OneOffShipmentDialog({
                   </Stack>
 
                   {lines.map((line, index) => (
-                    <Box key={line.lineKey} sx={{ p: { xs: 1.5, sm: 2 }, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}>
+                    <Box key={line.lineKey} sx={{ p: { xs: 1.5, sm: 2 }, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{ mb: 2 }}>
                         <Typography fontWeight={700}>Line {index + 1}</Typography>
                         <Tooltip title={lines.length === 1 ? 'A shipment needs at least one line' : 'Remove line'}>
@@ -1676,7 +1677,8 @@ export default function OneOffShipmentDialog({
                     data-testid="one-off-carrier-selection"
                     sx={{
                       p: 2,
-                      border: '1px solid rgba(255,255,255,0.12)',
+                      border: '1px solid',
+                      borderColor: 'divider',
                       borderRadius: 2,
                     }}
                   >
@@ -1749,7 +1751,7 @@ export default function OneOffShipmentDialog({
                     <Button startIcon={<AddRounded />} onClick={addPackage} disabled={packages.length >= ONE_OFF_MAX_SYNCHRONOUS_PACKAGES}>Add parcel</Button>
                   </Stack>
                   {packages.map((parcel, packageIndex) => (
-                    <Box key={parcel.packageKey} sx={{ p: { xs: 1.5, sm: 2 }, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}>
+                    <Box key={parcel.packageKey} sx={{ p: { xs: 1.5, sm: 2 }, border: '1px solid', borderColor: 'divider', borderRadius: 2 }}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} sx={{ mb: 2 }}>
                         <Typography fontWeight={700}>Parcel {packageIndex + 1}</Typography>
                         <Tooltip title={packages.length === 1 ? 'A shipment needs at least one parcel' : 'Remove parcel'}>
@@ -1876,7 +1878,20 @@ export default function OneOffShipmentDialog({
                       {sortedQuoteOffers.map((offer) => {
                         const rateOnly = offer.executionCapability === 'rate_only'
                         return (
-                        <Box key={offer.globalId} sx={{ border: `1px solid ${selectedOfferGlobalId === offer.globalId ? '#A8C7FA' : 'rgba(255,255,255,0.12)'}`, borderRadius: 2, p: 1.25, backgroundColor: selectedOfferGlobalId === offer.globalId ? 'rgba(168,199,250,0.08)' : 'transparent' }}>
+                        <Box
+                          key={offer.globalId}
+                          sx={{
+                            border: '1px solid',
+                            borderColor: selectedOfferGlobalId === offer.globalId
+                              ? 'primary.main'
+                              : 'divider',
+                            borderRadius: 2,
+                            p: 1.25,
+                            backgroundColor: selectedOfferGlobalId === offer.globalId
+                              ? 'action.selected'
+                              : 'transparent',
+                          }}
+                        >
                           <FormControlLabel
                             value={offer.globalId}
                             disabled={rateOnly}

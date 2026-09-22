@@ -115,7 +115,7 @@ export default function MeasurementPreferencesPanel({
     <Box
       component="section"
       aria-labelledby="regional-preferences-title"
-      sx={{ mt: 3, pt: 2.5, borderTop: '1px solid rgba(255,255,255,0.08)' }}
+      sx={{ mt: 3, pt: 2.5, borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)' }}
     >
       <Stack direction="row" spacing={1} alignItems="center" mb={0.5}>
         <StraightenRounded color="primary" fontSize="small" />

@@ -495,9 +495,9 @@ type ChipColor = 'default' | 'success' | 'warning' | 'error' | 'info'
 const CACHED_CLEARING_OFFSET_STATUS = 'cached_account_offset'
 
 const sectionSx = {
-  border: '1px solid rgba(255,255,255,0.10)',
+  border: 1, borderColor: 'divider',
   borderRadius: '8px',
-  bgcolor: '#15151D',
+  bgcolor: 'background.paper',
   overflow: 'hidden',
 }
 
@@ -759,8 +759,8 @@ function EvidenceButton({ evidence, status, contextLabel, showStatus = true, onO
         sx={{
           width: '100%', minWidth: 0, justifyContent: 'stretch', textAlign: 'left', px: 1, py: 0.75,
           borderRadius: '6px', color: 'inherit',
-          '&:hover': { bgcolor: 'rgba(255,255,255,0.04)' },
-          '&:focus-visible': { outline: '2px solid #A8C7FA', outlineOffset: '-2px' },
+          '&:hover': { bgcolor: 'action.hover' },
+          '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: '-2px' },
         }}
       >
         <Box display="grid" gridTemplateColumns="24px minmax(0, 1fr) auto" gap={1} alignItems="center" width="100%" minWidth={0}>
@@ -800,7 +800,7 @@ function ReceiptLineList({ lines, formatCents }: {
           gridTemplateColumns={{ xs: 'minmax(0, 1fr) auto', sm: 'minmax(0, 1fr) 90px 120px' }}
           gap={1.25}
           py={1}
-          borderTop="1px solid rgba(255,255,255,0.065)"
+          borderTop={1} borderColor="divider"
           alignItems="center"
         >
           <Box minWidth={0}>
@@ -830,7 +830,7 @@ function JournalLineList({ lines, formatCents }: {
           gridTemplateColumns={{ xs: 'auto minmax(0, 1fr) auto', sm: '80px minmax(0, 1fr) 120px' }}
           gap={1.25}
           py={1}
-          borderTop="1px solid rgba(255,255,255,0.065)"
+          borderTop={1} borderColor="divider"
           alignItems="center"
         >
           <Chip size="small" variant="outlined" label={line.side} color={line.side === 'debit' ? 'info' : 'default'} />
@@ -851,7 +851,7 @@ function AmountComparisonRow({ label, comparison, formatCents }: {
   formatCents: (value: number | null | undefined) => string
 }) {
   return (
-    <Box display="grid" gridTemplateColumns={{ xs: 'minmax(0, 1fr) auto', sm: 'minmax(120px, 1fr) repeat(3, 110px) auto' }} gap={1} py={1} borderTop="1px solid rgba(255,255,255,0.065)" alignItems="center">
+    <Box display="grid" gridTemplateColumns={{ xs: 'minmax(0, 1fr) auto', sm: 'minmax(120px, 1fr) repeat(3, 110px) auto' }} gap={1} py={1} borderTop={1} borderColor="divider" alignItems="center">
       <Box minWidth={0}>
         <Typography variant="body2" fontWeight={650}>{label}</Typography>
         <Typography variant="caption" color="text.secondary" display={{ xs: 'block', sm: 'none' }}>
@@ -1186,7 +1186,7 @@ function ComparisonDetails({ expected, comparison, formatCents }: {
           <AmountComparisonRow label="Tax" comparison={receiptComparison.tax} formatCents={formatCents} />
           <Typography variant="subtitle2" fontWeight={700} mt={2} mb={0.5}>Item line deltas</Typography>
           {receiptComparison.lines.length ? receiptComparison.lines.map((line) => (
-            <Box key={line.itemId} display="grid" gridTemplateColumns="minmax(0, 1fr) auto" gap={1} py={1} borderTop="1px solid rgba(255,255,255,0.065)" alignItems="center">
+            <Box key={line.itemId} display="grid" gridTemplateColumns="minmax(0, 1fr) auto" gap={1} py={1} borderTop={1} borderColor="divider" alignItems="center">
               <Box minWidth={0}>
                 <Typography variant="body2" fontWeight={650}>{line.itemName || 'QuickBooks item'}</Typography>
                 <Typography variant="caption" color="text.secondary" display="block">
@@ -1206,7 +1206,7 @@ function ComparisonDetails({ expected, comparison, formatCents }: {
           <AmountComparisonRow label="Credits" comparison={journalComparison.credits} formatCents={formatCents} />
           <Typography variant="subtitle2" fontWeight={700} mt={2} mb={0.5}>Account line deltas</Typography>
           {journalComparison.lines.length ? journalComparison.lines.map((line) => (
-            <Box key={`${line.side}:${line.accountId}`} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} py={1} borderTop="1px solid rgba(255,255,255,0.065)" alignItems="center">
+            <Box key={`${line.side}:${line.accountId}`} display="grid" gridTemplateColumns="auto minmax(0, 1fr) auto" gap={1} py={1} borderTop={1} borderColor="divider" alignItems="center">
               <Chip size="small" variant="outlined" label={line.side} color={line.side === 'debit' ? 'info' : 'default'} />
               <Box minWidth={0}>
                 <Typography variant="body2" fontWeight={650}>{line.accountName || 'QuickBooks account'}</Typography>
@@ -1643,7 +1643,7 @@ export default function PosAccountingParityPanel() {
       <Box display="flex" alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" gap={2} flexWrap="wrap">
         <Box minWidth={0}>
           <Box display="flex" alignItems="center" gap={1}>
-            <CompareArrowsRounded sx={{ color: '#A8C7FA' }} />
+            <CompareArrowsRounded sx={{ color: 'primary.main' }} />
             <Typography variant="h6" fontWeight={700}>POS posting parity</Typography>
             <Chip size="small" label={capabilities.canApprove ? 'Review & post' : 'Read only'} variant="outlined" />
           </Box>
@@ -1661,7 +1661,7 @@ export default function PosAccountingParityPanel() {
                 setError(null)
                 setRefreshToken((value) => value + 1)
               }}
-              sx={{ border: '1px solid rgba(255,255,255,0.12)', borderRadius: '8px' }}
+              sx={{ border: 1, borderColor: 'divider', borderRadius: '8px' }}
             >
               {loading ? <CircularProgress size={20} /> : <RefreshRounded />}
             </IconButton>
@@ -1779,14 +1779,14 @@ export default function PosAccountingParityPanel() {
             </Typography>
             <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(4, minmax(0, 1fr))', lg: 'repeat(7, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
               <Metric label="Records" value={baseline.summary.cachedTransactions} />
-              <Metric label="Paired dates" value={baseline.summary.pairCount} tone="#A8C7FA" />
-              <Metric label="Posting bundles" value={baseline.summary.postingBundleCount || 0} tone="#70D6A7" />
-              <Metric label="Clearing cycles" value={displayedClearingLifecycleCount} tone="#A8C7FA" />
-              <Metric label="Exact marker pairs" value={baseline.summary.exactMarkerPairs} tone="#70D6A7" />
+              <Metric label="Paired dates" value={baseline.summary.pairCount} tone="primary.main" />
+              <Metric label="Posting bundles" value={baseline.summary.postingBundleCount || 0} tone="success.main" />
+              <Metric label="Clearing cycles" value={displayedClearingLifecycleCount} tone="primary.main" />
+              <Metric label="Exact marker pairs" value={baseline.summary.exactMarkerPairs} tone="success.main" />
               <Metric label="Date fallback" value={baseline.summary.dateFallbackPairs} />
-              <Metric label="Unmatched" value={baseline.summary.unmatchedEvidence} tone={baseline.summary.unmatchedEvidence ? '#F2B76D' : '#70D6A7'} />
-              <Metric label="Ambiguous" value={baseline.summary.ambiguousEvidence} tone={baseline.summary.ambiguousEvidence ? '#FF8A80' : '#70D6A7'} />
-              <Metric label="Receipt variances" value={baseline.summary.receiptArithmetic.variance} tone={baseline.summary.receiptArithmetic.variance ? '#FF8A80' : '#70D6A7'} />
+              <Metric label="Unmatched" value={baseline.summary.unmatchedEvidence} tone={baseline.summary.unmatchedEvidence ? 'warning.main' : 'success.main'} />
+              <Metric label="Ambiguous" value={baseline.summary.ambiguousEvidence} tone={baseline.summary.ambiguousEvidence ? 'error.main' : 'success.main'} />
+              <Metric label="Receipt variances" value={baseline.summary.receiptArithmetic.variance} tone={baseline.summary.receiptArithmetic.variance ? 'error.main' : 'success.main'} />
             </Box>
             {displayedClearingLifecycleCount > 0 ? (
               <>
@@ -1796,23 +1796,23 @@ export default function PosAccountingParityPanel() {
                 </Typography>
                 <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(3, minmax(0, 1fr))', lg: 'repeat(6, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={1.5}>
                   <Metric label="Cycles" value={displayedClearingLifecycleCount} />
-                  <Metric label="Offsets observed" value={displayedClearingStatusCounts.settled} tone="#A8C7FA" />
-                  <Metric label="Pending" value={displayedClearingStatusCounts.pending} tone="#A8C7FA" />
-                  <Metric label="Partially settled" value={displayedClearingStatusCounts.partiallySettled} tone={displayedClearingStatusCounts.partiallySettled ? '#F2B76D' : '#70D6A7'} />
-                  <Metric label="Ambiguous" value={displayedClearingStatusCounts.ambiguous} tone={displayedClearingStatusCounts.ambiguous ? '#F2B76D' : '#70D6A7'} />
-                  <Metric label="Overdue unresolved" value={displayedClearingStatusCounts.overdueUnresolved} tone={displayedClearingStatusCounts.overdueUnresolved ? '#FF8A80' : '#70D6A7'} />
+                  <Metric label="Offsets observed" value={displayedClearingStatusCounts.settled} tone="primary.main" />
+                  <Metric label="Pending" value={displayedClearingStatusCounts.pending} tone="primary.main" />
+                  <Metric label="Partially settled" value={displayedClearingStatusCounts.partiallySettled} tone={displayedClearingStatusCounts.partiallySettled ? 'warning.main' : 'success.main'} />
+                  <Metric label="Ambiguous" value={displayedClearingStatusCounts.ambiguous} tone={displayedClearingStatusCounts.ambiguous ? 'warning.main' : 'success.main'} />
+                  <Metric label="Overdue unresolved" value={displayedClearingStatusCounts.overdueUnresolved} tone={displayedClearingStatusCounts.overdueUnresolved ? 'error.main' : 'success.main'} />
                 </Box>
               </>
             ) : null}
             <Divider />
             <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.5} px={{ xs: 1.5, sm: 2 }} py={1.5}>
               <Typography variant="body2" color="text.secondary">
-                Receipt arithmetic: <Box component="span" color="#70D6A7">{baseline.summary.receiptArithmetic.match} balanced</Box>
+                Receipt arithmetic: <Box component="span" color="success.main">{baseline.summary.receiptArithmetic.match} balanced</Box>
                 {' · '}{baseline.summary.receiptArithmetic.insufficientEvidence} incomplete
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                Journal balance: <Box component="span" color="#70D6A7">{baseline.summary.journalBalance.match} balanced</Box>
-                {' · '}<Box component="span" color={baseline.summary.journalBalance.variance ? '#FF8A80' : 'inherit'}>{baseline.summary.journalBalance.variance} variances</Box>
+                Journal balance: <Box component="span" color="success.main">{baseline.summary.journalBalance.match} balanced</Box>
+                {' · '}<Box component="span" color={baseline.summary.journalBalance.variance ? 'error.main' : 'inherit'}>{baseline.summary.journalBalance.variance} variances</Box>
               </Typography>
             </Box>
             <Typography variant="caption" color="text.disabled" display="block" px={{ xs: 1.5, sm: 2 }} pb={1.5}>
@@ -1832,7 +1832,7 @@ export default function PosAccountingParityPanel() {
                 px={{ xs: 1.5, sm: 2 }}
                 py={1.5}
                 alignItems="center"
-                borderBottom="1px solid rgba(255,255,255,0.06)"
+                borderBottom={1} borderColor="divider"
               >
                 <Box>
                   <Typography variant="body2" fontWeight={700}>{pair.businessDate}</Typography>
@@ -1879,7 +1879,7 @@ export default function PosAccountingParityPanel() {
                     key={`${bundle.businessDate}-${bundle.marker}`}
                     px={{ xs: 0.5, sm: 1 }}
                     py={1}
-                    borderTop="1px solid rgba(255,255,255,0.06)"
+                    borderTop={1} borderColor="divider"
                   >
                     <Box px={1} pb={0.75} display="flex" alignItems="center" justifyContent="space-between" gap={2}>
                       <Box minWidth={0}>
@@ -1928,9 +1928,9 @@ export default function PosAccountingParityPanel() {
                 my={1.5}
                 px={1.25}
                 py={1}
-                border="1px solid rgba(168,199,250,0.24)"
+                border={1} borderColor="primary.main"
                 borderRadius="8px"
-                bgcolor="rgba(168,199,250,0.05)"
+                bgcolor="action.selected"
               >
                 <Typography variant="body2" fontWeight={700}>
                   Organization-level QuickBooks account reconciliation
@@ -1977,7 +1977,7 @@ export default function PosAccountingParityPanel() {
                     key={lifecycle.lifecycleId}
                     px={{ xs: 1.5, sm: 2 }}
                     py={1.5}
-                    borderTop="1px solid rgba(255,255,255,0.06)"
+                    borderTop={1} borderColor="divider"
                   >
                     <Box display="flex" alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" gap={1.5} flexDirection={{ xs: 'column', sm: 'row' }}>
                       <Box minWidth={0}>
@@ -2091,7 +2091,7 @@ export default function PosAccountingParityPanel() {
                 This is organization-level QuickBooks account evidence; it is not Toast-location attribution and does not trigger notifications.
               </Alert>
               {visibleLegacyJournalOnlyCaptures.map((capture) => (
-                <Box key={`${capture.businessDate}-${capture.journalEntry.evidenceId}`} px={{ xs: 1.5, sm: 2 }} py={1.25} borderTop="1px solid rgba(255,255,255,0.06)">
+                <Box key={`${capture.businessDate}-${capture.journalEntry.evidenceId}`} px={{ xs: 1.5, sm: 2 }} py={1.25} borderTop={1} borderColor="divider">
                   <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>{capture.businessDate}</Typography>
                   <EvidenceButton evidence={capture.journalEntry} status="pending" contextLabel="Payment Exceptions credit" showStatus={false} onOpen={openHistoricalEvidence} />
                 </Box>
@@ -2104,7 +2104,7 @@ export default function PosAccountingParityPanel() {
               <SectionHeader title="Posting history exceptions" detail={`${baseline.summary.unmatchedEvidence + baseline.summary.ambiguousEvidence} records require review`} />
               <Divider />
               {visibleAmbiguous.map((group, index) => (
-                <Box key={`ambiguous-${group.businessDate}-${group.documentNumber}-${index}`} px={{ xs: 0.5, sm: 1 }} py={1} borderBottom="1px solid rgba(255,255,255,0.06)">
+                <Box key={`ambiguous-${group.businessDate}-${group.documentNumber}-${index}`} px={{ xs: 0.5, sm: 1 }} py={1} borderBottom={1} borderColor="divider">
                   <Box px={1} pb={0.5} display="flex" alignItems="center" justifyContent="space-between" gap={2}>
                     <Box minWidth={0}>
                       <Typography variant="body2" fontWeight={700}>{group.businessDate} · {group.documentNumber || 'No document number'}</Typography>
@@ -2120,7 +2120,7 @@ export default function PosAccountingParityPanel() {
                 </Box>
               ))}
               {visibleUnmatched.map((group, index) => (
-                <Box key={`unmatched-${group.businessDate}-${group.documentNumber}-${group.entityType}-${index}`} px={{ xs: 0.5, sm: 1 }} py={1} borderBottom="1px solid rgba(255,255,255,0.06)">
+                <Box key={`unmatched-${group.businessDate}-${group.documentNumber}-${group.entityType}-${index}`} px={{ xs: 0.5, sm: 1 }} py={1} borderBottom={1} borderColor="divider">
                   <Box px={1} pb={0.5} display="flex" alignItems="center" justifyContent="space-between" gap={2}>
                     <Box minWidth={0}>
                       <Typography variant="body2" fontWeight={700}>{group.businessDate} · {group.documentNumber || 'No document number'}</Typography>
@@ -2190,7 +2190,7 @@ export default function PosAccountingParityPanel() {
                   gap={1.5}
                   px={{ xs: 1.5, sm: 2 }}
                   py={1.5}
-                  borderTop="1px solid rgba(255,255,255,0.06)"
+                  borderTop={1} borderColor="divider"
                   alignItems="center"
                 >
                   <Box minWidth={0}>
@@ -2215,10 +2215,10 @@ export default function PosAccountingParityPanel() {
             <Divider />
             <Box display="grid" gridTemplateColumns={{ xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' }} gap={2} px={{ xs: 1.5, sm: 2 }} py={2}>
               <Metric label="Drafts" value={report.summary.drafts} />
-              <Metric label="Matched" value={report.summary.matched} tone="#70D6A7" />
-              <Metric label="Scheduled" value={report.summary.scheduled || 0} tone="#A8C7FA" />
-              <Metric label="Missing" value={report.summary.missingQuickBooks} tone={report.summary.missingQuickBooks ? '#F2B76D' : '#70D6A7'} />
-              <Metric label="Variances" value={report.summary.comparisonsWithVariance} tone={report.summary.comparisonsWithVariance ? '#FF8A80' : '#70D6A7'} />
+              <Metric label="Matched" value={report.summary.matched} tone="success.main" />
+              <Metric label="Scheduled" value={report.summary.scheduled || 0} tone="primary.main" />
+              <Metric label="Missing" value={report.summary.missingQuickBooks} tone={report.summary.missingQuickBooks ? 'warning.main' : 'success.main'} />
+              <Metric label="Variances" value={report.summary.comparisonsWithVariance} tone={report.summary.comparisonsWithVariance ? 'error.main' : 'success.main'} />
             </Box>
             <Divider />
             {report.rows.length ? report.rows.map((row) => (
@@ -2239,11 +2239,11 @@ export default function PosAccountingParityPanel() {
                 bgcolor="transparent"
                 textAlign="left"
                 border={0}
-                borderBottom="1px solid rgba(255,255,255,0.06)"
+                borderBottom={1} borderColor="divider"
                 sx={{
                   cursor: 'pointer',
-                  '&:hover': { bgcolor: 'rgba(255,255,255,0.025)' },
-                  '&:focus-visible': { outline: '2px solid #A8C7FA', outlineOffset: '-2px' },
+                  '&:hover': { bgcolor: 'action.hover' },
+                  '&:focus-visible': { outline: '2px solid', outlineColor: 'primary.main', outlineOffset: '-2px' },
                 }}
               >
                 <Box>
@@ -2297,7 +2297,7 @@ export default function PosAccountingParityPanel() {
           sx: {
             width: { xs: '100%', sm: 680, md: 760 },
             maxWidth: '100vw',
-            bgcolor: '#171821',
+            bgcolor: 'background.paper',
             backgroundImage: 'none',
           },
         }}
@@ -2408,7 +2408,7 @@ export default function PosAccountingParityPanel() {
         fullWidth
         maxWidth="sm"
         aria-labelledby="external-posting-dialog-title"
-        PaperProps={{ sx: { borderRadius: '8px', bgcolor: '#1B1C25', backgroundImage: 'none' } }}
+        PaperProps={{ sx: { borderRadius: '8px', bgcolor: 'background.paper', backgroundImage: 'none' } }}
       >
         <DialogTitle id="external-posting-dialog-title">Acknowledge external posting</DialogTitle>
         <DialogContent>

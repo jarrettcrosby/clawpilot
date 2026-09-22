@@ -45,6 +45,7 @@ import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
 import ArchitectureRounded from '@mui/icons-material/ArchitectureRounded'
 import ArchitecturePanel from './ArchitecturePanel'
+import AppearancePreference from '@/components/AppearancePreference'
 import LoginEmailPanel from './LoginEmailPanel'
 import { SESSION_REFRESH_EVENT } from '@/components/auth/SessionGuard'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
@@ -354,9 +355,10 @@ function permissionsForRolePreset(role: EditableRole, current: UserPermissions):
 }
 
 const panelSx = {
-  border: '1px solid rgba(255,255,255,0.09)',
+  border: 1,
+  borderColor: 'divider',
   borderRadius: '8px',
-  backgroundColor: 'rgba(255,255,255,0.025)',
+  backgroundColor: 'background.paper',
 }
 
 const compactButtonSx = {
@@ -369,7 +371,7 @@ const compactButtonSx = {
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
-    backgroundColor: '#20202A',
+    backgroundColor: 'background.default',
   },
 }
 
@@ -1085,9 +1087,10 @@ export default function UserAccessDialog({
           width: '100%',
           height: fullScreen ? '100%' : 'min(780px, calc(100vh - 48px))',
           maxHeight: fullScreen ? '100%' : 'calc(100vh - 48px)',
-          backgroundColor: '#1A1A23',
+          backgroundColor: 'background.paper',
           backgroundImage: 'none',
-          border: '1px solid rgba(255,255,255,0.09)',
+          border: 1,
+          borderColor: 'divider',
           borderRadius: fullScreen ? 0 : '8px',
           overflow: 'hidden',
         },
@@ -1131,7 +1134,7 @@ export default function UserAccessDialog({
             minHeight: 42,
             p: '3px',
             borderRadius: '8px',
-            backgroundColor: '#232330',
+            backgroundColor: 'background.default',
             '& .MuiTabs-indicator': { display: 'none' },
             '& .MuiTab-root': {
               minHeight: 36,
@@ -1146,7 +1149,7 @@ export default function UserAccessDialog({
             },
             '& .MuiTab-root.Mui-selected': {
               color: 'text.primary',
-              backgroundColor: 'rgba(168,199,250,0.12)',
+              backgroundColor: 'action.selected',
             },
           }}
         >
@@ -1159,7 +1162,7 @@ export default function UserAccessDialog({
         </Tabs>
       </Box>
 
-      <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+      <Divider />
 
       <DialogContent sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 2, sm: 2.5 }, pb: { xs: 'calc(env(safe-area-inset-bottom) + 20px)', sm: 2.5 } }}>
         {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
@@ -1183,7 +1186,7 @@ export default function UserAccessDialog({
             {currentUser ? (
               <>
                 <Stack direction="row" spacing={1.5} alignItems="center" mb={2.5}>
-                  <Avatar sx={{ width: 44, height: 44, bgcolor: 'rgba(168,199,250,0.16)', color: 'primary.main', fontWeight: 700 }}>
+                  <Avatar sx={{ width: 44, height: 44, bgcolor: 'action.selected', color: 'primary.main', fontWeight: 700 }}>
                     {initials(currentUser)}
                   </Avatar>
                   <Box minWidth={0}>
@@ -1290,6 +1293,7 @@ export default function UserAccessDialog({
                     Save profile
                   </Button>
                 </Box>
+                <Box sx={{ mt: 3 }}><AppearancePreference /></Box>
                 <MeasurementPreferencesPanel
                   organizationName={
                     usersPayload?.currentOrganization?.name
@@ -1538,7 +1542,7 @@ export default function UserAccessDialog({
                   <Box key={`${user.email}:${user.organizationId || 'identity'}`} sx={panelSx}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 1.5, alignItems: 'start', p: { xs: 1.5, sm: 2 } }}>
                       <Stack direction="row" spacing={1.25} alignItems="center" minWidth={0}>
-                        <Avatar sx={{ width: 38, height: 38, bgcolor: '#2D3442', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>
+                        <Avatar sx={{ width: 38, height: 38, bgcolor: 'action.selected', color: 'primary.main', fontSize: '0.8rem', fontWeight: 700 }}>
                           {initials(user)}
                         </Avatar>
                         <Box minWidth={0}>
@@ -1603,7 +1607,7 @@ export default function UserAccessDialog({
                       ) : userPending ? <CircularProgress size={18} /> : null}
                     </Box>
 
-                    <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                    <Divider />
 
                     <Box sx={{ p: { xs: 1.5, sm: 2 }, pt: { xs: 1.25, sm: 1.5 } }}>
                       {crmMappingManageable ? (
@@ -1986,7 +1990,7 @@ export default function UserAccessDialog({
 
                           {owned ? (
                             <>
-                              <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                              <Divider />
                               <Box sx={{ p: { xs: 1.5, sm: 2 } }}>
                                 <Typography variant="caption" color="text.disabled" fontWeight={700}>Share</Typography>
                                 <Box
@@ -2037,7 +2041,7 @@ export default function UserAccessDialog({
                           ) : null}
 
                           {owned ? <>
-                            <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />
+                            <Divider />
 
                             <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5 }}>
                             {resource.members.length > 0 ? resource.members.map((member, index) => (
@@ -2054,7 +2058,8 @@ export default function UserAccessDialog({
                                   alignItems: 'center',
                                   gap: 1,
                                   py: 1.25,
-                                  borderTop: index === 0 ? 0 : '1px solid rgba(255,255,255,0.06)',
+                                  borderTop: index === 0 ? 0 : 1,
+                                  borderColor: 'divider',
                                 }}
                               >
                                 <Box minWidth={0} sx={{ gridArea: 'identity' }}>
@@ -2163,9 +2168,10 @@ export default function UserAccessDialog({
         maxWidth="xs"
         PaperProps={{
           sx: {
-            backgroundColor: '#1A1A23',
+            backgroundColor: 'background.paper',
             backgroundImage: 'none',
-            border: '1px solid rgba(255,255,255,0.09)',
+            border: 1,
+            borderColor: 'divider',
             borderRadius: fullScreen ? 0 : '8px',
           },
         }}

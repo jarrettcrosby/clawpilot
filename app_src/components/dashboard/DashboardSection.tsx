@@ -58,10 +58,10 @@ const STATUS_LABELS: Record<string, string> = {
 const ACTIVE_STATUS_ORDER = ['in-progress', 'todo', 'review', 'backlog']
 const BOARD_STATUS_ORDER = ['backlog', 'todo', 'in-progress', 'review', 'done']
 const STATUS_COLORS: Record<string, string> = {
-  'in-progress': '#A8C7FA',
-  todo: '#CFC6EA',
+  'in-progress': 'var(--mui-palette-primary-main)',
+  todo: 'var(--mui-palette-secondary-main)',
   review: '#FFA726',
-  backlog: 'rgba(255,255,255,0.35)',
+  backlog: 'rgba(var(--cp-neutral-rgb),0.35)',
   done: '#66BB6A',
 }
 const EMPTY_AVAILABILITY: Availability = {
@@ -74,7 +74,7 @@ function greeting(timeZone: string) {
   const hour = hourInUserTimeZone(new Date(), timeZone)
   if (hour < 12) return { text: 'Good morning', color: '#FDD663' }
   if (hour < 17) return { text: 'Good afternoon', color: '#FFA726' }
-  return { text: 'Good evening', color: '#CFC6EA' }
+  return { text: 'Good evening', color: 'var(--mui-palette-secondary-main)' }
 }
 
 function ownerLabel(agent?: string) {
@@ -314,9 +314,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
   const pipelineLoading = loading || selectionPending === 'pipeline'
   const pipelineSummary = pipelineSnapshot?.summary
   const metrics = [
-    { label: 'In progress', value: inProgress.length, available: availability.tasks, loading: taskLoading, Icon: TrendingUpRounded, color: '#A8C7FA', action: () => navigateToProjects({ priority: [], status: ['in-progress'], labels: [] }) },
+    { label: 'In progress', value: inProgress.length, available: availability.tasks, loading: taskLoading, Icon: TrendingUpRounded, color: 'var(--mui-palette-primary-main)', action: () => navigateToProjects({ priority: [], status: ['in-progress'], labels: [] }) },
     { label: 'High priority', value: highPriority.length, available: availability.tasks, loading: taskLoading, Icon: PriorityHighRounded, color: '#FFA726', action: () => navigateToProjects({ priority: ['high'], status: [], labels: [] }) },
-    { label: 'Open tasks', value: activeTasks.length, available: availability.tasks, loading: taskLoading, Icon: RadioButtonUncheckedRounded, color: '#CFC6EA', action: () => navigateToProjects({ priority: [], status: ACTIVE_STATUS_ORDER, labels: [] }) },
+    { label: 'Open tasks', value: activeTasks.length, available: availability.tasks, loading: taskLoading, Icon: RadioButtonUncheckedRounded, color: 'var(--mui-palette-secondary-main)', action: () => navigateToProjects({ priority: [], status: ACTIVE_STATUS_ORDER, labels: [] }) },
     { label: 'Completed', value: done.length, available: availability.tasks, loading: taskLoading, Icon: CheckCircleRounded, color: '#66BB6A', action: () => navigateToProjects({ priority: [], status: ['done'], labels: [] }) },
     { label: 'Agent attention', value: agentAttention.length, available: availability.tasks, loading: taskLoading, Icon: SmartToyRounded, color: '#4FD1B8', action: () => onNavigate('agents') },
   ].filter((metric) => canProjects && (metric.label !== 'Agent attention' || canAgents))
@@ -444,13 +444,13 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         sx={{
           display: 'grid',
           gridTemplateColumns: { xs: 'repeat(2, minmax(0, 1fr))', sm: 'repeat(5, minmax(0, 1fr))' },
-          borderTop: '1px solid rgba(255,255,255,0.08)',
-          borderBottom: '1px solid rgba(255,255,255,0.08)',
+          borderTop: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
+          borderBottom: '1px solid rgba(var(--cp-neutral-rgb),0.08)',
           mb: 3.5,
         }}
       >
         {metrics.map(({ label, value, available, loading: metricLoading, Icon, color, action }) => (
-          <ButtonBase key={label} onClick={action} sx={{ minWidth: 0, minHeight: 88, px: 1.5, py: 1.25, justifyContent: 'flex-start', textAlign: 'left', borderRadius: 0, '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+          <ButtonBase key={label} onClick={action} sx={{ minWidth: 0, minHeight: 88, px: 1.5, py: 1.25, justifyContent: 'flex-start', textAlign: 'left', borderRadius: 0, '&:hover': { bgcolor: 'rgba(var(--cp-neutral-rgb),0.035)' } }}>
             <Box minWidth={0}>
               <Icon sx={{ color, fontSize: 19, mb: 0.75 }} />
               <MetricValue available={available} loading={metricLoading} value={value} />
@@ -460,14 +460,14 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         ))}
       </Box>}
 
-      {canProjects && canAgents && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: { xs: 1.75, sm: 2.25 }, mb: 3 }}>
+      {canProjects && canAgents && <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 1, p: { xs: 1.75, sm: 2.25 }, mb: 3 }}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1.5} mb={1}>
           <Typography variant="subtitle2" fontWeight={700} color="text.primary">Current Agent Activity</Typography>
           {taskLoading ? <Skeleton variant="rounded" width={92} height={24} /> : (
             <Chip
               size="small"
               label={availability.tasks ? nowWorking?.label || 'No recent run' : 'Unavailable'}
-              sx={{ height: 24, borderRadius: 1, bgcolor: nowWorking?.state === 'now_working' ? 'rgba(79,209,184,0.14)' : 'rgba(255,255,255,0.07)', color: nowWorking?.state === 'now_working' ? '#4FD1B8' : 'text.secondary' }}
+              sx={{ height: 24, borderRadius: 1, bgcolor: nowWorking?.state === 'now_working' ? 'rgba(79,209,184,0.14)' : 'rgba(var(--cp-neutral-rgb),0.07)', color: nowWorking?.state === 'now_working' ? '#4FD1B8' : 'text.secondary' }}
             />
           )}
         </Stack>
@@ -491,7 +491,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
         )}
       </Box>}
 
-      {canProjects && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, px: { xs: 1.75, sm: 2.25 }, py: 1, mb: 3 }}>
+      {canProjects && <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 1, px: { xs: 1.75, sm: 2.25 }, py: 1, mb: 3 }}>
         <Typography variant="subtitle2" fontWeight={700} color="text.primary" py={1.25}>Next Actions</Typography>
         {taskLoading ? (
           <Stack spacing={1.25} pb={1.5}><Skeleton height={28} /><Skeleton height={28} /><Skeleton height={28} /></Stack>
@@ -501,7 +501,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
           <Typography variant="body2" color="text.secondary" pb={1.5}>No active work needs attention.</Typography>
         ) : nextActions.map(({ task, guidance, blocker, live }, index) => (
           <Box key={task.id}>
-            {index > 0 && <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)' }} />}
+            {index > 0 && <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.07)' }} />}
             <Box sx={{ py: 1.5 }}>
               <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ sm: 'center' }} justifyContent="space-between" gap={1}>
                 <Box minWidth={0}>
@@ -523,10 +523,10 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
       </Box>}
 
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'repeat(2, minmax(0, 1fr))', lg: 'repeat(3, minmax(0, 1fr))' }, gap: 2.5 }}>
-        {canProjects && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canProjects && <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5} gap={1}>
             <Stack direction="row" alignItems="center" spacing={1} minWidth={0}>
-              <ViewKanbanRounded sx={{ fontSize: 19, color: '#A8C7FA' }} />
+              <ViewKanbanRounded sx={{ fontSize: 19, color: 'var(--mui-palette-primary-main)' }} />
               <Box minWidth={0}>
                 <Typography variant="subtitle2" fontWeight={700} color="text.primary">Project Board</Typography>
                 <Typography variant="caption" color="text.secondary" noWrap display="block">{selectedBoard?.name || 'Default board'}</Typography>
@@ -535,7 +535,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
             <Button size="small" variant="text" onClick={() => onNavigate('projects')} sx={{ flexShrink: 0 }}>View board</Button>
           </Stack>
           {BOARD_STATUS_ORDER.map(status => (
-            <ButtonBase key={status} onClick={() => navigateToProjects({ priority: [], status: [status], labels: [] })} sx={{ width: '100%', minHeight: 40, px: 0.5, borderRadius: 1, justifyContent: 'space-between', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+            <ButtonBase key={status} onClick={() => navigateToProjects({ priority: [], status: [status], labels: [] })} sx={{ width: '100%', minHeight: 40, px: 0.5, borderRadius: 1, justifyContent: 'space-between', '&:hover': { bgcolor: 'rgba(var(--cp-neutral-rgb),0.035)' } }}>
               <Stack direction="row" alignItems="center" spacing={1}>
                 <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: STATUS_COLORS[status] }} />
                 <Typography variant="body2" color="text.secondary">{STATUS_LABELS[status]}</Typography>
@@ -547,9 +547,9 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
               )}
             </ButtonBase>
           ))}
-          {availability.tasks && inProgress.slice(0, 4).length > 0 && <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', my: 1.5 }} />}
+          {availability.tasks && inProgress.slice(0, 4).length > 0 && <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.07)', my: 1.5 }} />}
           {availability.tasks && inProgress.slice(0, 4).map(task => (
-            <ButtonBase key={task.id} onClick={() => openTask(task.id)} sx={{ width: '100%', minHeight: 42, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+            <ButtonBase key={task.id} onClick={() => openTask(task.id)} sx={{ width: '100%', minHeight: 42, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(var(--cp-neutral-rgb),0.035)' } }}>
               <Box minWidth={0}>
                 <Typography variant="body2" color="text.primary" noWrap>{task.title}</Typography>
                 <Typography variant="caption" color="text.disabled">{ownerLabel(task.assignedAgent)}</Typography>
@@ -558,7 +558,7 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
           ))}
         </Box>}
 
-        {canPipeline && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canPipeline && <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5} gap={1}>
             <Stack direction="row" alignItems="center" spacing={1} minWidth={0}>
               <AccountBalanceRounded sx={{ fontSize: 19, color: '#4FD1B8' }} />
@@ -588,10 +588,10 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
           </Box>
         </Box>}
 
-        {canDocs && <Box sx={{ border: '1px solid rgba(255,255,255,0.08)', borderRadius: 1, p: 2 }}>
+        {canDocs && <Box sx={{ border: '1px solid rgba(var(--cp-neutral-rgb),0.08)', borderRadius: 1, p: 2 }}>
           <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1.5}>
             <Stack direction="row" alignItems="center" spacing={1}>
-              <DescriptionRounded sx={{ fontSize: 19, color: '#CFC6EA' }} />
+              <DescriptionRounded sx={{ fontSize: 19, color: 'var(--mui-palette-secondary-main)' }} />
               <Typography variant="subtitle2" fontWeight={700} color="text.primary">Documents</Typography>
             </Stack>
             <Button size="small" variant="text" onClick={() => onNavigate('docs')}>View docs</Button>
@@ -604,14 +604,14 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
             <>
               <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap mb={1.5}>
                 {Object.entries(docsByCategory).slice(0, 6).map(([category, count]) => (
-                  <Chip key={category} size="small" label={`${category} ${count}`} sx={{ height: 24, borderRadius: 1, bgcolor: 'rgba(207,198,234,0.09)', color: '#CFC6EA' }} />
+                  <Chip key={category} size="small" label={`${category} ${count}`} sx={{ height: 24, borderRadius: 1, bgcolor: 'rgba(207,198,234,0.09)', color: 'var(--mui-palette-secondary-main)' }} />
                 ))}
               </Stack>
-              <Divider sx={{ borderColor: 'rgba(255,255,255,0.07)', mb: 0.75 }} />
+              <Divider sx={{ borderColor: 'rgba(var(--cp-neutral-rgb),0.07)', mb: 0.75 }} />
               {recentDocs.length === 0 ? (
                 <Typography variant="body2" color="text.secondary" py={1}>No documents yet.</Typography>
               ) : recentDocs.map(doc => (
-                <ButtonBase key={doc.id} onClick={() => openDoc(doc)} sx={{ width: '100%', minHeight: 48, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(255,255,255,0.035)' } }}>
+                <ButtonBase key={doc.id} onClick={() => openDoc(doc)} sx={{ width: '100%', minHeight: 48, px: 0.5, borderRadius: 1, justifyContent: 'flex-start', textAlign: 'left', '&:hover': { bgcolor: 'rgba(var(--cp-neutral-rgb),0.035)' } }}>
                   <Box minWidth={0}>
                     <Typography variant="body2" color="text.primary" noWrap>{doc.title}</Typography>
                     <Typography variant="caption" color="text.disabled">{doc.category}{doc.date ? ` · ${doc.date}` : ''}</Typography>

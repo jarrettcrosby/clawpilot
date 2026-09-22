@@ -71,7 +71,7 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCr
     .filter(g => g.docs.length > 0)
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', minWidth: 0, backgroundColor: '#12141C', flexShrink: 0 }}>
+    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%', minWidth: 0, backgroundColor: 'var(--mui-palette-background-paper)', flexShrink: 0 }}>
       
       {/* Header */}
       <Box sx={{ px: 2, pt: 2.5, pb: 1.5 }}>
@@ -116,11 +116,11 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCr
           sx={{
             '& .MuiOutlinedInput-root': {
               borderRadius: 2.5,
-              backgroundColor: '#1E2030',
+              backgroundColor: 'var(--mui-palette-surfaceVariant)',
               fontSize: '0.875rem',
-              '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
-              '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.16)' },
-              '&.Mui-focused fieldset': { borderColor: '#A8C7FA' },
+              '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' },
+              '&:hover fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.16)' },
+              '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' },
             },
           }}
         />
@@ -137,7 +137,7 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCr
                 sx={{ borderRadius: 2, px: 1.5, py: 0.75, mb: 0.25 }}
               >
                 <ListItemIcon sx={{ minWidth: 32 }}>
-                  <Icon sx={{ fontSize: 18, color: expanded[group.key] ? '#A8C7FA' : 'rgba(255,255,255,0.4)' }} />
+                  <Icon sx={{ fontSize: 18, color: expanded[group.key] ? 'var(--mui-palette-primary-main)' : 'rgba(var(--cp-neutral-rgb),0.4)' }} />
                 </ListItemIcon>
                 <ListItemText
                   primary={group.label}
@@ -162,14 +162,14 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCr
                       mb: 0.25,
                       minHeight: 44,
                       '&.Mui-selected': {
-                        backgroundColor: 'rgba(168,199,250,0.1)',
-                        '&:hover': { backgroundColor: 'rgba(168,199,250,0.15)' },
+                        backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.1)',
+                        '&:hover': { backgroundColor: 'rgba(var(--mui-palette-primary-mainChannel) / 0.15)' },
                       },
-                      '&:hover': { backgroundColor: 'rgba(255,255,255,0.04)' },
+                      '&:hover': { backgroundColor: 'rgba(var(--cp-neutral-rgb),0.04)' },
                     }}
                   >
                     <ListItemIcon sx={{ minWidth: 26 }}>
-                      <ArticleRounded sx={{ fontSize: 15, color: selectedId === doc.id ? '#A8C7FA' : 'rgba(255,255,255,0.3)' }} />
+                      <ArticleRounded sx={{ fontSize: 15, color: selectedId === doc.id ? 'var(--mui-palette-primary-main)' : 'rgba(var(--cp-neutral-rgb),0.3)' }} />
                     </ListItemIcon>
                     <ListItemText
                       primary={doc.title}
@@ -178,7 +178,7 @@ export default function DocSidebar({ docs, selectedId, onSelect, onRefresh, onCr
                         fontSize: '0.8rem',
                         noWrap: true,
                         fontWeight: selectedId === doc.id ? 600 : 400,
-                        color: selectedId === doc.id ? '#A8C7FA' : 'text.primary',
+                        color: selectedId === doc.id ? 'var(--mui-palette-primary-main)' : 'text.primary',
                       }}
                       secondaryTypographyProps={{ fontSize: '0.7rem', color: 'text.disabled' }}
                     />

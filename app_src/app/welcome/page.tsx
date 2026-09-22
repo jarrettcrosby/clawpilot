@@ -80,9 +80,9 @@ export default function WelcomePage() {
   }
 
   return (
-    <Box component="main" sx={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', px: 2, py: 4, bgcolor: '#0F0F13', color: '#E4E1EC' }}>
+    <Box component="main" sx={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', px: 2, py: 4, bgcolor: 'var(--mui-palette-background-default)', color: 'var(--mui-palette-text-primary)' }}>
       <CssBaseline />
-      <Paper elevation={0} sx={{ width: 'min(100%, 560px)', p: { xs: 3, sm: 4 }, borderRadius: 1, border: '1px solid rgba(255,255,255,0.09)', bgcolor: '#1A1A23', color: 'inherit' }}>
+      <Paper elevation={0} sx={{ width: 'min(100%, 560px)', p: { xs: 3, sm: 4 }, borderRadius: 1, border: '1px solid rgba(var(--cp-neutral-rgb),0.09)', bgcolor: 'var(--mui-palette-background-paper)', color: 'inherit' }}>
         <BrandMark size={52} sx={{ mb: 2.5 }} />
         <Typography component="h1" variant="h4" fontWeight={750} sx={{ fontSize: { xs: '1.7rem', sm: '2rem' }, mb: 1 }}>
           Welcome to ClawPilot

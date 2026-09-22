@@ -245,7 +245,7 @@ export default function HomeClient({
           '--mobile-navigation-height': '52px',
         },
         maxWidth: '100vw',
-        backgroundColor: '#0F0F13',
+        backgroundColor: 'var(--mui-palette-background-default)',
         overflow: 'hidden',
       }}
     >
