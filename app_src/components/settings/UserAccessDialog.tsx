@@ -43,6 +43,7 @@ import SecurityRounded from '@mui/icons-material/SecurityRounded'
 import ShareRounded from '@mui/icons-material/ShareRounded'
 import TableChartRounded from '@mui/icons-material/TableChartRounded'
 import ViewKanbanRounded from '@mui/icons-material/ViewKanbanRounded'
+import LoginEmailPanel from './LoginEmailPanel'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDateTime'
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
@@ -88,6 +89,7 @@ type UserPermissions = {
 
 type AppUser = {
   email: string
+  trashedAt?: string | null
   referenceCode: string | null
   contactReferenceCode: string
   crmUserEnabled: boolean
@@ -461,6 +463,8 @@ export default function UserAccessDialog({
   const fullScreen = narrowScreen || shortViewport
   const [activeTab, setActiveTab] = useState(0)
   const [usersPayload, setUsersPayload] = useState<UsersPayload | null>(null)
+  const [usersView, setUsersView] = useState<'active' | 'trash'>('active')
+  const [trashedUsers, setTrashedUsers] = useState<AppUser[]>([])
   const [workspacesPayload, setWorkspacesPayload] = useState<WorkspacesPayload | null>(null)
   const [profile, setProfile] = useState<ProfileForm>(EMPTY_PROFILE)
   const [inviteEmail, setInviteEmail] = useState('')
@@ -487,9 +491,10 @@ export default function UserAccessDialog({
 
   const displayedUsers = useMemo(() => {
     if (!currentUser) return []
+    if (usersView === 'trash') return trashedUsers
     if (!usersPayload?.isAdmin) return [currentUser]
     return usersPayload.users || [currentUser]
-  }, [currentUser, usersPayload])
+  }, [currentUser, usersPayload, usersView, trashedUsers])
 
   const eligibleShareEmails = useMemo(() => {
     return (usersPayload?.users || [])
@@ -541,6 +546,8 @@ export default function UserAccessDialog({
     let active = true
     setActiveTab(initialTab)
     setUsersPayload(null)
+    setUsersView('active')
+    setTrashedUsers([])
     setWorkspacesPayload(null)
     setProfile(EMPTY_PROFILE)
     setInviteEmail('')
@@ -747,6 +754,37 @@ export default function UserAccessDialog({
     if (!usersPayload?.canManageUserAccess || !currentUser || user.role === 'owner') return false
     if (currentUser.role === 'owner') return true
     return currentUser.role === 'admin' && user.role === 'member' && user.email !== currentUser.email
+  }
+
+  async function changeUsersView(view: 'active' | 'trash') {
+    if (busy) return
+    startAction('users-view')
+    try {
+      const result = await requestJson<UsersPayload>(`/api/users${view === 'trash' ? '?view=trash' : ''}`)
+      if (view === 'trash') setTrashedUsers(result.users || [])
+      else setUsersPayload(result)
+      setUsersView(view)
+    } catch (loadError) {
+      setError(messageFrom(loadError, 'Unable to load users'))
+    } finally { finishAction() }
+  }
+
+  async function changeUserTrash(user: AppUser, trashed: boolean) {
+    if (busy || !canManageUser(user)) return
+    if (trashed && !window.confirm(`Move ${user.email} to Trash in ${user.organizationName}? Their access to this organization stops now. Other organizations and historical records are preserved.`)) return
+    startAction(`trash:${user.email}`)
+    try {
+      await requestJson<UserMutationPayload>('/api/users', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: trashed ? 'trash-user' : 'restore-user', email: user.email, organizationId: user.organizationId }) })
+      const [active, trash] = await Promise.all([
+        requestJson<UsersPayload>('/api/users'), requestJson<UsersPayload>('/api/users?view=trash'),
+      ])
+      setUsersPayload(active)
+      setTrashedUsers(trash.users || [])
+      setNotice(trashed ? 'User moved to organization Trash. Historical records were preserved.' : 'User restored to their previous access state. Invited users need a new invitation.')
+    } catch (updateError) {
+      setError(messageFrom(updateError, 'Unable to update Trash'))
+    } finally { finishAction() }
   }
 
   async function updateStatus(user: AppUser) {
@@ -1210,7 +1248,7 @@ export default function UserAccessDialog({
                   </TextField>
                   <TextField
                     size="small"
-                    label="Email"
+                    label="Historical account identity"
                     value={currentUser.email}
                     disabled
                     sx={{ ...fieldSx, gridColumn: { sm: '1 / -1' } }}
@@ -1255,6 +1293,7 @@ export default function UserAccessDialog({
                     || currentUser.organizationName
                   }
                 />
+                <LoginEmailPanel identityEmail={currentUser.email} />
                 <OrganizationBrandingPanel />
               </>
             ) : (
@@ -1452,9 +1491,19 @@ export default function UserAccessDialog({
               </Box>
             ) : null}
 
+            {usersPayload?.canManageUserAccess ? <Stack direction="row" spacing={1} mb={2}>
+              <Button variant={usersView === 'active' ? 'contained' : 'outlined'} disabled={busy} onClick={() => { void changeUsersView('active') }}>Users</Button>
+              <Button variant={usersView === 'trash' ? 'contained' : 'outlined'} disabled={busy} onClick={() => { void changeUsersView('trash') }}>Trashed users</Button>
+            </Stack> : null}
             <Stack spacing={1.5}>
               {displayedUsers.map((user) => {
                 const manageable = canManageUser(user)
+                if (user.trashedAt) return <Box key={`${user.email}:${user.organizationId}`} sx={{ ...panelSx, p: 2 }}>
+                  <Typography fontWeight={700}>{user.displayName || user.email}</Typography>
+                  <Typography variant="body2">{user.email} · {user.organizationName}</Typography>
+                  <Typography variant="caption" color="text.secondary">Removed from this organization. Historical records and other organization memberships are preserved.</Typography>
+                  {manageable ? <Button disabled={busy} startIcon={<RestoreRounded />} onClick={() => { void changeUserTrash(user, false) }}>Restore user</Button> : null}
+                </Box>
                 const userOrganizations = inviteOrganizationOptions.filter((organization) => (
                   displayedUsers.some((candidate) => (
                     candidate.email === user.email && candidate.organizationId === organization.id
@@ -1527,6 +1576,10 @@ export default function UserAccessDialog({
                       </Stack>
 
                       {manageable ? (
+                        <Stack direction="row">
+                        <Tooltip title="Move to organization Trash">
+                          <span><IconButton aria-label={`Move ${user.email} to Trash`} disabled={busy} onClick={() => { void changeUserTrash(user, true) }}><DeleteOutlineRounded fontSize="small" /></IconButton></span>
+                        </Tooltip>
                         <Tooltip title={user.status === 'disabled' ? 'Restore access' : 'Disable access'}>
                           <span>
                             <IconButton
@@ -1542,6 +1595,7 @@ export default function UserAccessDialog({
                             </IconButton>
                           </span>
                         </Tooltip>
+                        </Stack>
                       ) : userPending ? <CircularProgress size={18} /> : null}
                     </Box>
 
@@ -1722,7 +1776,7 @@ export default function UserAccessDialog({
               })}
 
               {displayedUsers.length === 0 ? (
-                <Typography variant="body2" color="text.secondary">Account unavailable.</Typography>
+                <Typography variant="body2" color="text.secondary">{usersView === 'trash' ? 'No trashed users.' : 'Account unavailable.'}</Typography>
               ) : null}
             </Stack>
           </Box>

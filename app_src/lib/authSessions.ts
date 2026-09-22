@@ -4,6 +4,7 @@ import { getCookieName, getCookieNames, verifySessionToken } from '@/lib/auth'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { observedRequestIpAddress } from '@/lib/requestIpAddress'
+import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
 
 const ABSOLUTE_TTL_SECONDS = 24 * 60 * 60
 const ADMIN_IDLE_TTL_SECONDS = 60 * 60
@@ -195,83 +196,99 @@ export async function createBrowserSession(input: {
   authMethod: SessionAuthMethod
   headers: Headers
   organizationId?: string | null
+  verifiedLoginEmail?: string
+  verifiedGoogleSubject?: string
 }): Promise<IssuedBrowserSession> {
   const email = String(input.email || '').trim().toLowerCase()
   const requestedOrganizationId = String(input.organizationId || '').trim() || null
   if (requestedOrganizationId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedOrganizationId)) {
     throw new Error('Active workspace is invalid')
   }
-  const user = await query<{
-    role: SessionRole
-    status: string
-    organization_id: string
-    membership_role: SessionRole
-  }>(
-    `SELECT app_user.role, app_user.status, membership.organization_id::text, membership.role AS membership_role
-     FROM app_users app_user
-     JOIN LATERAL (
-       SELECT organization_id, role
-       FROM app_user_organization_memberships
-       WHERE user_email = app_user.email
-         AND status = 'active'
-         AND ($2::uuid IS NULL OR organization_id = $2::uuid)
-       ORDER BY is_default DESC, created_at
-       LIMIT 1
-     ) membership ON true
-     WHERE app_user.email = $1`,
-    [email, requestedOrganizationId],
-  )
-  if (!user.rows[0] || user.rows[0].status !== 'active') throw new Error('User access is not active')
-  const token = newToken()
-  const idleSeconds = idleTtl(user.rows[0].membership_role)
-  const fingerprint = networkFingerprint(input.headers)
-  const ipAddress = observedRequestIpAddress(input.headers)
-  const result = await query<SessionRow>(
-    `WITH inserted AS (
-       INSERT INTO app_sessions (
-         token_hash, authenticated_user_email, effective_user_email, auth_method,
-         device_label, user_agent, initial_network_fingerprint, last_network_fingerprint,
-         initial_ip_address, last_ip_address, idle_timeout_seconds,
-         idle_expires_at, absolute_expires_at, active_workspace_organization_id
-       ) VALUES (
-         $1, $2, $2, $3, $4, $5, $6, $6, $7::inet, $7::inet, $8,
-         now() + ($8::integer * interval '1 second'),
-         now() + ($9::integer * interval '1 second'), $10::uuid
-       ) RETURNING *
-     )
-     ${SESSION_SELECT.replace('FROM app_sessions session', 'FROM inserted session')}`,
-    [
-      hashToken(token),
-      email,
-      input.authMethod,
-      deviceLabel(input.headers),
-      String(input.headers.get('user-agent') || '').slice(0, 512) || null,
-      fingerprint,
-      ipAddress,
-      idleSeconds,
-      ABSOLUTE_TTL_SECONDS,
-      user.rows[0].organization_id,
-    ],
-  )
-  const session = fromRow(result.rows[0])
-  await recordAuditEvent({
-    actor: email,
-    subject: email,
-    eventType: 'auth.session.created',
-    aggregateType: 'app_session',
-    aggregateId: session.id,
-    organizationId: session.activeWorkspaceOrganizationId,
-    payload: {
-      sessionId: session.id,
-      deviceLabel: session.deviceLabel,
-      authMethod: session.authMethod,
-      idleExpiresAt: session.idleExpiresAt,
-      absoluteExpiresAt: session.absoluteExpiresAt,
+  return withTransaction(async (client) => {
+    // Email changes and credential-based session issuance serialize on the durable user.
+    await client.query('SELECT email FROM app_users WHERE email = $1 FOR SHARE', [email])
+    if (input.verifiedLoginEmail && await resolveLoginAccountEmail(input.verifiedLoginEmail, client) !== email) throw new Error('Login address changed; sign in again')
+    if (input.verifiedGoogleSubject) {
+      const linked = await client.query(`SELECT 1 FROM app_effective_google_identities WHERE provider = 'google' AND provider_subject = $1 AND user_email = $2
+        AND (verified_email = $3 OR (verified_email = $2 AND NOT EXISTS (SELECT 1 FROM app_user_login_addresses WHERE user_email = $2)))`, [input.verifiedGoogleSubject, email, input.verifiedLoginEmail])
+      if (!linked.rows.length) throw new Error('Google identity changed; sign in again')
+    }
+    if (input.authMethod === 'legacy_upgrade') {
+      const changed = await client.query('SELECT 1 FROM app_user_login_addresses WHERE user_email = $1', [email])
+      if (changed.rows.length) throw new Error('Sign in again after changing your login email')
+    }
+    const user = await client.query<{
+      role: SessionRole
+      status: string
+      organization_id: string
+      membership_role: SessionRole
+    }>(
+      `SELECT app_user.role, app_user.status, membership.organization_id::text, membership.role AS membership_role
+       FROM app_users app_user
+       JOIN LATERAL (
+         SELECT organization_id, role
+         FROM app_user_organization_memberships
+         WHERE user_email = app_user.email
+           AND status = 'active'
+           AND ($2::uuid IS NULL OR organization_id = $2::uuid)
+         ORDER BY is_default DESC, created_at
+         LIMIT 1
+       ) membership ON true
+       WHERE app_user.email = $1`,
+      [email, requestedOrganizationId],
+    )
+    if (!user.rows[0] || user.rows[0].status !== 'active') throw new Error('User access is not active')
+    const token = newToken()
+    const idleSeconds = idleTtl(user.rows[0].membership_role)
+    const fingerprint = networkFingerprint(input.headers)
+    const ipAddress = observedRequestIpAddress(input.headers)
+    const result = await client.query<SessionRow>(
+      `WITH inserted AS (
+         INSERT INTO app_sessions (
+           token_hash, authenticated_user_email, effective_user_email, auth_method,
+           device_label, user_agent, initial_network_fingerprint, last_network_fingerprint,
+           initial_ip_address, last_ip_address, idle_timeout_seconds,
+           idle_expires_at, absolute_expires_at, active_workspace_organization_id
+         ) VALUES (
+           $1, $2, $2, $3, $4, $5, $6, $6, $7::inet, $7::inet, $8,
+           now() + ($8::integer * interval '1 second'),
+           now() + ($9::integer * interval '1 second'), $10::uuid
+         ) RETURNING *
+       )
+       ${SESSION_SELECT.replace('FROM app_sessions session', 'FROM inserted session')}`,
+      [
+        hashToken(token),
+        email,
+        input.authMethod,
+        deviceLabel(input.headers),
+        String(input.headers.get('user-agent') || '').slice(0, 512) || null,
+        fingerprint,
+        ipAddress,
+        idleSeconds,
+        ABSOLUTE_TTL_SECONDS,
+        user.rows[0].organization_id,
+      ],
+    )
+    const session = fromRow(result.rows[0])
+    await recordAuditEvent({
+      actor: email,
+      subject: email,
+      eventType: 'auth.session.created',
+      aggregateType: 'app_session',
+      aggregateId: session.id,
       organizationId: session.activeWorkspaceOrganizationId,
-      organizationName: session.activeWorkspaceName,
-    },
-  }).catch(() => undefined)
-  return { token, session }
+      payload: {
+        sessionId: session.id,
+        deviceLabel: session.deviceLabel,
+        authMethod: session.authMethod,
+        idleExpiresAt: session.idleExpiresAt,
+        absoluteExpiresAt: session.absoluteExpiresAt,
+        organizationId: session.activeWorkspaceOrganizationId,
+        organizationName: session.activeWorkspaceName,
+      },
+    }, client)
+    return { token, session }
+  })
 }
 
 async function expireSession(row: SessionRow, reason: string): Promise<null> {
@@ -366,6 +383,8 @@ export async function resolveRequestSession(req: NextRequest): Promise<BrowserSe
     if (durable) return durable
     const legacy = verifySessionToken(token)
     if (legacy.ok) {
+      const changed = await query('SELECT 1 FROM app_user_login_addresses WHERE user_email = $1', [legacy.user.toLowerCase()])
+      if (changed.rows.length) continue
       return {
         id: 'legacy',
         authenticatedUser: legacy.user.toLowerCase(),

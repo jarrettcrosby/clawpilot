@@ -1,6 +1,6 @@
 import crypto from 'crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
+import { currentLoginEmail, resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
 import {
   GoogleSsoError,
   googleSsoClientConfiguration,
@@ -158,7 +158,7 @@ export async function getGoogleUserAuthState(
       AND membership.status = 'active'
      LEFT JOIN app_organization_auth_policies policy
        ON policy.organization_id = organization.id
-     LEFT JOIN app_user_external_identities identity
+     LEFT JOIN app_effective_google_identities identity
        ON identity.provider = 'google'
       AND identity.user_email = $2
      WHERE organization.id = $1::uuid
@@ -185,7 +185,7 @@ export async function getGoogleUserAuthState(
     webClientId: client.clientId,
     identity: {
       linked: Boolean(state.linked_at),
-      email: actor.email,
+      email: await currentLoginEmail(actor.email),
       linkedAt: state.linked_at,
     },
   }
@@ -349,21 +349,14 @@ export async function linkGoogleIdentity(input: {
 }): Promise<GoogleIdentityLinkResult> {
   const organizationId = activeOrganization(input.actor)
   const actorEmail = normalizeUserEmail(input.actor.email)
-  if (input.identity.email !== actorEmail) {
+  if (input.identity.email !== await currentLoginEmail(actorEmail)) {
     throw new GoogleSsoError(
       'GOOGLE_SSO_EMAIL_MISMATCH',
-      `Choose the Google account for ${actorEmail}`,
+      `Choose the Google account for ${await currentLoginEmail(actorEmail)}`,
       403,
     )
   }
   const idempotencyKey = commandKey(input.idempotencyKey)
-  const hash = requestHash({
-    command: 'google_identity_link',
-    organizationId,
-    email: actorEmail,
-    subject: input.identity.subject,
-  })
-
   return withTransaction(async (client) => {
     const identityLocks = [
       `google-identity-email:${actorEmail}`,
@@ -372,6 +365,15 @@ export async function linkGoogleIdentity(input: {
     for (const lock of identityLocks) {
       await acquireTransactionAdvisoryLock(client, lock)
     }
+    await client.query('SELECT email FROM app_users WHERE email = $1 FOR SHARE', [actorEmail])
+    if (await resolveLoginAccountEmail(input.identity.email, client) !== actorEmail) {
+      throw new GoogleSsoError('GOOGLE_SSO_EMAIL_MISMATCH', 'Your login address changed. Sign in again.', 403)
+    }
+    const loginVersion = await client.query<{ verified_at: string }>('SELECT verified_at::text FROM app_user_login_addresses WHERE user_email = $1', [actorEmail])
+    const hash = requestHash({ command: 'google_identity_link', organizationId, email: actorEmail,
+      subject: input.identity.subject,
+      ...(loginVersion.rows[0] ? { verifiedEmail: input.identity.email, loginVersion: loginVersion.rows[0].verified_at } : {}),
+    })
     const receipt = await client.query<ReceiptRow>(
       `SELECT command_type, request_hash, result
        FROM app_auth_mutation_receipts
@@ -404,6 +406,9 @@ export async function linkGoogleIdentity(input: {
         403,
       )
     }
+    if (await resolveLoginAccountEmail(input.identity.email, client) !== actorEmail) {
+      throw new GoogleSsoError('GOOGLE_SSO_EMAIL_MISMATCH', 'Your login address changed. Sign in again.', 403)
+    }
 
     const existing = await client.query<{
       provider_subject: string
@@ -411,10 +416,10 @@ export async function linkGoogleIdentity(input: {
       linked_at: string
     }>(
       `SELECT provider_subject, user_email, linked_at::text
-       FROM app_user_external_identities
+       FROM app_effective_google_identities
        WHERE provider = 'google'
          AND (provider_subject = $1 OR user_email = $2)
-       FOR UPDATE`,
+       `,
       [input.identity.subject, actorEmail],
     )
     const subjectIdentity = existing.rows.find(
@@ -435,17 +440,21 @@ export async function linkGoogleIdentity(input: {
     const alreadyLinked = Boolean(subjectIdentity && userIdentity)
     const linkedAt = subjectIdentity?.linked_at || userIdentity?.linked_at || new Date().toISOString()
     if (!alreadyLinked) {
+      const bindingTable = loginVersion.rows.length ? 'app_user_google_login_bindings' : 'app_user_external_identities'
+      // Subject ownership remains reserved even when a historical binding is inactive.
+      const historical = await client.query('SELECT user_email FROM app_google_subject_owners WHERE provider_subject = $1', [input.identity.subject])
+      if (historical.rows.some((row) => row.user_email !== actorEmail)) throw new GoogleSsoError('GOOGLE_SSO_IDENTITY_CONFLICT', 'This Google account belongs to another user', 409)
       await client.query(
-        `INSERT INTO app_user_external_identities (
+        `INSERT INTO ${bindingTable} (
            provider, provider_subject, user_email, verified_email,
            linked_organization_id, linked_by, row_version, linked_at
-         ) VALUES ('google', $1, $2, $2, $3::uuid, $2, 0, $4::timestamptz)`,
-        [input.identity.subject, actorEmail, organizationId, linkedAt],
+         ) VALUES ('google', $1, $2, $5, $3::uuid, $2, 0, $4::timestamptz)`,
+        [input.identity.subject, actorEmail, organizationId, linkedAt, input.identity.email],
       )
     }
     const result: GoogleIdentityLinkResult = {
       linked: true,
-      email: actorEmail,
+      email: input.identity.email,
       linkedAt,
       alreadyLinked,
     }
@@ -467,7 +476,7 @@ export async function linkGoogleIdentity(input: {
         eventKey: `google-identity-link:${organizationId}:${actorEmail}:${idempotencyKey}`,
         payload: {
           provider: 'google',
-          verifiedEmail: actorEmail,
+          verifiedEmail: input.identity.email,
           linkedOrganizationId: organizationId,
         },
       }, client)
@@ -490,7 +499,7 @@ export async function resolveLinkedGoogleIdentity(
   }>(
     `SELECT identity.user_email, app_user.status AS user_status,
        eligible.organization_id::text
-     FROM app_user_external_identities identity
+     FROM app_effective_google_identities identity
      JOIN app_users app_user ON app_user.email = identity.user_email
      LEFT JOIN LATERAL (
        SELECT membership.organization_id
@@ -507,9 +516,10 @@ export async function resolveLinkedGoogleIdentity(
      WHERE identity.provider = 'google'
        AND identity.provider_subject = $1
        AND identity.user_email = $2
-       AND identity.verified_email = $2
+       AND (identity.verified_email = $3 OR (identity.verified_email = $2
+         AND NOT EXISTS (SELECT 1 FROM app_user_login_addresses login WHERE login.user_email = $2)))
      LIMIT 1`,
-    [identity.subject, accountEmail],
+    [identity.subject, accountEmail, identity.email],
   )
   const linked = result.rows[0]
   if (!linked) {
