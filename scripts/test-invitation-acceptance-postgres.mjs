@@ -343,8 +343,8 @@ async function verifyAcceptance(databaseUrl) {
       async retireUnusedWorkspaceOrganization() {},
     },
     '@/lib/persistence/postgres': persistenceMock,
-    '@/lib/publicUrl': {
-      appPublicUrl() {
+    '@/lib/organizationWebPreferences': {
+      organizationAppPublicUrl() {
         return 'https://clawpilot.test'
       },
     },

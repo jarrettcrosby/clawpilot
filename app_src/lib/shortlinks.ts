@@ -19,6 +19,24 @@ const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 const RESERVED_SLUGS = new Set(['admin', 'api', 'app', 'auth', 'new', 'privacy', 'settings'])
 const MAX_TAGS = 20
 const MAX_LIST_RESULTS = 250
+const BPO_PUBLIC_ORIGIN = 'https://bposupplychain.com'
+const BPO_DOMAIN_KEY = 'bpo'
+
+export type ShortLinkPublicDomain = 'eigenracing' | 'bpo'
+export type ShortLinkDomainChoice = { key: ShortLinkPublicDomain; label: string }
+
+type ShortLinkDefaultDomainRow = QueryResultRow & {
+  short_link_default_domain: string | null
+  short_link_domain?: string | null
+  allow_user_short_link_override?: boolean | null
+}
+export type ShortLinkDomainPreferences = {
+  defaultDomain: ShortLinkPublicDomain
+  userDefaultDomain: ShortLinkPublicDomain | null
+  organizationDefaultDomain: ShortLinkPublicDomain
+  canOverrideDefault: boolean
+  availableDomains: ShortLinkDomainChoice[]
+}
 
 export type ShortLinkStatus = 'active' | 'disabled' | 'expired' | 'exhausted'
 
@@ -26,6 +44,7 @@ export type ShortLink = {
   id: string
   ownerEmail: string
   sourceApp: string
+  publicDomain: ShortLinkPublicDomain
   slug: string
   shortUrl: string
   destinationUrl: string
@@ -45,6 +64,7 @@ type ShortLinkRow = QueryResultRow & {
   id: string
   owner_email: string
   source_app: string
+  public_domain: string | null
   slug: string
   destination_url: string
   title: string
@@ -131,6 +151,130 @@ export function shortLinkUrl(slug: string): string {
   return `${canonicalOrigin()}/s/${slug}`
 }
 
+function shortLinkUrlForDomain(slug: string, publicDomain: string | null): string {
+  if (publicDomain === BPO_DOMAIN_KEY) return `${BPO_PUBLIC_ORIGIN}/s/${slug}`
+  if (publicDomain === null) return shortLinkUrl(slug)
+  throw new Error('Stored short-link domain is invalid')
+}
+
+function bpoResolverSecret(): string {
+  const secret = String(process.env.SHORTLINK_BPO_RESOLVER_SECRET || '')
+  if (secret.length < 32) throw new ShortLinkRequestError('BPO short-link resolver is unavailable', 503)
+  return secret
+}
+
+function bpoAllowedOrganizationIds(): Set<string> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(String(process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON || ''))
+  } catch {
+    throw new ShortLinkRequestError('BPO short-link organization scope is misconfigured', 503)
+  }
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 20
+    || parsed.some((id) => typeof id !== 'string' || !UUID_PATTERN.test(id))
+    || new Set(parsed.map((id) => id.toLowerCase())).size !== parsed.length) {
+    throw new ShortLinkRequestError('BPO short-link organization scope is misconfigured', 503)
+  }
+  return new Set(parsed.map((id) => id.toLowerCase()))
+}
+
+function bpoPublicRouteReady(): boolean {
+  return process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY === '1'
+}
+
+export function availableShortLinkDomains(actor: ShortLinkActor): ShortLinkDomainChoice[] {
+  const choices: ShortLinkDomainChoice[] = [{ key: 'eigenracing', label: new URL(canonicalOrigin()).hostname }]
+  if (bpoPublicRouteReady() && !actor.service && bpoAllowedOrganizationIds().has(actor.organizationId.toLowerCase())) {
+    bpoResolverSecret()
+    choices.push({ key: 'bpo', label: 'bposupplychain.com' })
+  }
+  return choices
+}
+
+function normalizeDefaultDomain(value: unknown): ShortLinkPublicDomain {
+  if (value === 'eigenracing' || value === 'bpo') return value
+  throw new ShortLinkRequestError('Unsupported default short-link domain')
+}
+
+export async function readShortLinkDomainPreferences(actor: ShortLinkActor): Promise<ShortLinkDomainPreferences> {
+  const available = availableShortLinkDomains(actor)
+  if (actor.service) return { defaultDomain: 'eigenracing', userDefaultDomain: null, organizationDefaultDomain: 'eigenracing', canOverrideDefault: false, availableDomains: available }
+  requirePostgresStorage()
+  const result = await query<ShortLinkDefaultDomainRow>(
+    `SELECT preference.short_link_default_domain, organization_preference.short_link_domain,
+       organization_preference.allow_user_short_link_override
+     FROM app_user_organization_memberships membership
+     LEFT JOIN app_user_workspace_preferences preference
+       ON preference.user_email = membership.user_email
+      AND preference.workspace_organization_id = membership.organization_id
+     LEFT JOIN workspace_organization_web_preferences organization_preference
+       ON organization_preference.organization_id = membership.organization_id
+     WHERE membership.user_email = $1
+       AND membership.organization_id = $2::uuid
+       AND membership.status = 'active'
+     LIMIT 1`,
+    [actor.ownerEmail, actor.organizationId],
+  )
+  if (!result.rows[0]) throw new ShortLinkRequestError('Active workspace is not available', 403)
+  const row = result.rows[0]
+  const enabled = (domain: string | null | undefined) => available.some((choice) => choice.key === domain)
+  const organizationDefaultDomain: ShortLinkPublicDomain = row.short_link_domain === 'eigenracing' ? 'eigenracing' : enabled('bpo') ? 'bpo' : 'eigenracing'
+  const canOverrideDefault = row.allow_user_short_link_override !== false
+  const saved = row.short_link_default_domain
+  const userDefaultDomain = saved === 'eigenracing' || saved === 'bpo' ? saved : null
+  const defaultDomain = canOverrideDefault && enabled(userDefaultDomain) ? userDefaultDomain! : organizationDefaultDomain
+  return { defaultDomain, userDefaultDomain, organizationDefaultDomain, canOverrideDefault,
+    availableDomains: canOverrideDefault ? available : available.filter((choice) => choice.key === organizationDefaultDomain) }
+}
+
+export async function readShortLinkDefaultDomain(actor: ShortLinkActor): Promise<ShortLinkPublicDomain> {
+  return (await readShortLinkDomainPreferences(actor)).defaultDomain
+}
+
+export async function saveShortLinkDefaultDomain(actor: ShortLinkActor, value: unknown): Promise<ShortLinkPublicDomain> {
+  if (actor.service) throw new ShortLinkRequestError('Service clients cannot change user preferences', 403)
+  requirePostgresStorage()
+  const selected = value === null ? null : normalizeDefaultDomain(value)
+  if (selected !== null && !availableShortLinkDomains(actor).some((choice) => choice.key === selected)) {
+    throw new ShortLinkRequestError('Short-link domain is unavailable for this workspace', 403)
+  }
+  const result = await query<ShortLinkDefaultDomainRow>(
+    `INSERT INTO app_user_workspace_preferences (
+       user_email, workspace_organization_id, short_link_default_domain, created_at, updated_at
+     )
+     SELECT $1, $2::uuid, $3, now(), now()
+     FROM app_user_organization_memberships membership
+     LEFT JOIN workspace_organization_web_preferences organization_preference
+       ON organization_preference.organization_id = membership.organization_id
+     WHERE membership.user_email = $1
+       AND membership.organization_id = $2::uuid
+       AND membership.status = 'active'
+       AND coalesce(organization_preference.allow_user_short_link_override, true)
+     ON CONFLICT (user_email, workspace_organization_id) DO UPDATE SET
+       short_link_default_domain = EXCLUDED.short_link_default_domain,
+       updated_at = now()
+     RETURNING short_link_default_domain`,
+    [actor.ownerEmail, actor.organizationId, selected],
+  )
+  if (!result.rows[0]) throw new ShortLinkRequestError('Active workspace is unavailable or its administrator controls the domain default', 403)
+  return readShortLinkDefaultDomain(actor)
+}
+
+function requestedPublicDomain(actor: ShortLinkActor, value: unknown): string | null {
+  if (value === undefined || value === null || value === 'eigenracing') return null
+  if (value !== BPO_DOMAIN_KEY) throw new ShortLinkRequestError('Unsupported short-link domain')
+  if (!availableShortLinkDomains(actor).some((choice) => choice.key === 'bpo')) {
+    throw new ShortLinkRequestError('BPO short-link domain is unavailable for this workspace', 403)
+  }
+  return BPO_DOMAIN_KEY
+}
+
+export function assertBpoShortLinkResolverAuthorization(authorization: string | null): void {
+  const secret = bpoResolverSecret()
+  const provided = String(authorization || '').match(/^Bearer ([^\s]+)$/i)?.[1] || ''
+  if (!provided || !secureEqual(provided, secret)) throw new ShortLinkRequestError('Unauthorized', 401)
+}
+
 function toSafeInteger(value: string | number | null): number | null {
   if (value === null) return null
   const number = Number(value)
@@ -138,14 +282,16 @@ function toSafeInteger(value: string | number | null): number | null {
 }
 
 function toShortLink(row: ShortLinkRow): ShortLink {
+  const shortUrl = shortLinkUrlForDomain(row.slug, row.public_domain)
   const maxClicks = toSafeInteger(row.max_clicks)
   const clickCount = toSafeInteger(row.click_count) || 0
   return {
     id: row.id,
     ownerEmail: row.owner_email,
     sourceApp: row.source_app,
+    publicDomain: row.public_domain === BPO_DOMAIN_KEY ? 'bpo' : 'eigenracing',
     slug: row.slug,
-    shortUrl: shortLinkUrl(row.slug),
+    shortUrl,
     destinationUrl: row.destination_url,
     title: row.title,
     tags: Array.isArray(row.tags) ? row.tags : [],
@@ -228,6 +374,10 @@ export function validateShortLinkConfiguration(options: { requireServiceClient?:
   }
   const origin = canonicalOrigin()
   const clients = configuredServiceClients()
+  if (bpoPublicRouteReady()) {
+    bpoAllowedOrganizationIds()
+    bpoResolverSecret()
+  }
   if (options.requireServiceClient && clients.length === 0) {
     throw new Error('At least one short-link service client must be configured')
   }
@@ -454,7 +604,7 @@ function normalizeDestination(value: unknown): string {
     throw new ShortLinkRequestError('Destination must be an HTTPS URL without embedded credentials')
   }
   const canonical = new URL(canonicalOrigin())
-  if (url.origin === canonical.origin && /^\/s\//.test(url.pathname)) {
+  if ((url.origin === canonical.origin || url.origin === BPO_PUBLIC_ORIGIN) && /^\/s\//.test(url.pathname)) {
     throw new ShortLinkRequestError('A short link cannot point to another link on the same short-link service')
   }
   return url.toString()
@@ -493,15 +643,16 @@ export async function listShortLinks(actor: ShortLinkActor, filters: {
   const result = await query<ShortLinkRow>(
     `
       SELECT
-        id::text, owner_email, source_app, slug, destination_url, title, tags,
+        id::text, owner_email, source_app, public_domain, slug, destination_url, title, tags,
         ${statusSql} AS link_status,
         expires_at::text, max_clicks, click_count, last_clicked_at::text,
         created_at::text, updated_at::text
       FROM short_links
       WHERE deleted_at IS NULL
+        AND organization_root_id = $10::uuid
         AND (
           owner_email = $1
-          OR (($2::boolean OR NOT $8::boolean) AND organization_root_id = $10::uuid)
+          OR ($2::boolean OR NOT $8::boolean)
         )
         AND (NOT $8::boolean OR source_app = $9)
         AND (
@@ -551,6 +702,15 @@ export async function createShortLink(actor: ShortLinkActor, value: unknown): Pr
   const maxClicks = optionalMaxClicks(input.maxClicks)
   const expiresAt = optionalExpiry(input)
   const customSlug = String(input.slug || '').trim() ? normalizeSlug(input.slug) : null
+  let domainInput = input.publicDomain
+  if (!actor.service) {
+    const preferences = await readShortLinkDomainPreferences(actor)
+    if (domainInput === undefined || domainInput === null) domainInput = preferences.defaultDomain
+    if (!preferences.canOverrideDefault && domainInput !== preferences.organizationDefaultDomain) {
+      throw new ShortLinkRequestError('The organization administrator controls the short-link domain', 403)
+    }
+  }
+  const publicDomain = requestedPublicDomain(actor, domainInput)
 
   for (let attempt = 0; attempt < (customSlug ? 1 : 8); attempt += 1) {
     const slug = customSlug || generatedSlug(input.slugLength)
@@ -558,12 +718,12 @@ export async function createShortLink(actor: ShortLinkActor, value: unknown): Pr
       const result = await query<ShortLinkRow>(
         `
           INSERT INTO short_links (
-            owner_email, organization_root_id, source_app, slug, destination_url, title, tags,
+            owner_email, organization_root_id, source_app, public_domain, slug, destination_url, title, tags,
             max_clicks, expires_at, created_at, updated_at
           )
-          VALUES ($1, $2::uuid, $3, $4, $5, $6, $7::text[], $8, $9::timestamptz, now(), now())
+          VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8::text[], $9, $10::timestamptz, now(), now())
           RETURNING
-            id::text, owner_email, source_app, slug, destination_url, title, tags,
+            id::text, owner_email, source_app, public_domain, slug, destination_url, title, tags,
             ${statusSql} AS link_status,
             expires_at::text, max_clicks, click_count, last_clicked_at::text,
             created_at::text, updated_at::text
@@ -572,6 +732,7 @@ export async function createShortLink(actor: ShortLinkActor, value: unknown): Pr
           actor.ownerEmail,
           actor.organizationId,
           actor.sourceApp,
+          publicDomain,
           slug,
           destinationUrl,
           title,
@@ -593,6 +754,9 @@ export async function updateShortLink(actor: ShortLinkActor, value: unknown): Pr
   requirePostgresStorage()
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ShortLinkRequestError('Request body is required')
   const input = value as Record<string, unknown>
+  if (Object.prototype.hasOwnProperty.call(input, 'publicDomain')) {
+    throw new ShortLinkRequestError('Short-link domain cannot be changed after creation')
+  }
   const id = String(input.id || '').trim()
   if (!/^[0-9a-f-]{36}$/i.test(id)) throw new ShortLinkRequestError('A valid short-link id is required')
   const action = String(input.action || '').trim().toLowerCase()
@@ -602,16 +766,17 @@ export async function updateShortLink(actor: ShortLinkActor, value: unknown): Pr
       const selected = await client.query<ShortLinkRow>(
         `
           SELECT
-            id::text, owner_email, source_app, slug, destination_url, title, tags,
+            id::text, owner_email, source_app, public_domain, slug, destination_url, title, tags,
             ${statusSql} AS link_status,
             expires_at::text, max_clicks, click_count, last_clicked_at::text,
             created_at::text, updated_at::text
           FROM short_links
           WHERE id = $1::uuid
             AND deleted_at IS NULL
+            AND organization_root_id = $6::uuid
             AND (
               owner_email = $2
-              OR ($3::boolean AND organization_root_id = $6::uuid)
+              OR $3::boolean
             )
             AND (NOT $4::boolean OR source_app = $5)
           FOR UPDATE
@@ -654,7 +819,7 @@ export async function updateShortLink(actor: ShortLinkActor, value: unknown): Pr
               updated_at = now()
           WHERE id = $1::uuid
           RETURNING
-            id::text, owner_email, source_app, slug, destination_url, title, tags,
+            id::text, owner_email, source_app, public_domain, slug, destination_url, title, tags,
             ${statusSql} AS link_status,
             expires_at::text, max_clicks, click_count, last_clicked_at::text,
             created_at::text, updated_at::text
@@ -679,9 +844,10 @@ export async function deleteShortLink(actor: ShortLinkActor, idValue: unknown): 
       SET deleted_at = now(), updated_at = now()
       WHERE id = $1::uuid
         AND deleted_at IS NULL
+        AND organization_root_id = $6::uuid
         AND (
           owner_email = $2
-          OR ($3::boolean AND organization_root_id = $6::uuid)
+          OR $3::boolean
         )
         AND (NOT $4::boolean OR source_app = $5)
     `,
@@ -709,6 +875,7 @@ export async function resolveShortLink(input: {
   slug: unknown
   sourceApp?: unknown
   referrer?: unknown
+  publicDomain?: 'bpo'
 }): Promise<{ status: 'found' | 'not-found' | Exclude<ShortLinkStatus, 'active'>; destinationUrl?: string }> {
   if (getStorageDriver() !== 'postgres') return { status: 'not-found' }
   let slug: string
@@ -736,9 +903,10 @@ export async function resolveShortLink(input: {
         SELECT id::text, destination_url, disabled_at::text, expires_at::text, max_clicks, click_count
         FROM short_links
         WHERE slug = $1 AND deleted_at IS NULL
+          AND public_domain IS NOT DISTINCT FROM $2::text
         FOR UPDATE
       `,
-      [slug],
+      [slug, input.publicDomain || null],
     )
     const link = selected.rows[0]
     if (!link) return { status: 'not-found' as const }

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { globalIdPattern } from '@/lib/globalIds.mjs'
 import { resolveCrmReferenceRoute } from '@/lib/persistence/crm'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
-import { appPublicUrl } from '@/lib/publicUrl'
+import { appBrowserReturnUrl } from '@/lib/publicUrl'
 import { sessionEmail } from '@/lib/requestUser'
 
 const CRM_REFERENCE_PATTERN = globalIdPattern(['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go', 'gp'])
@@ -22,7 +22,7 @@ export async function GET(req: NextRequest, context: { params: Promise<{ referen
   if (isPostgresStorageEnabled() && !resolved.found) {
     return NextResponse.json({ ok: false, error: 'CRM record not found' }, { status: 404 })
   }
-  const destination = new URL('/', appPublicUrl())
+  const destination = new URL('/', appBrowserReturnUrl(req))
   destination.searchParams.set('crm', resolved.referenceCode)
   const pipelineId = CRM_PIPELINE_PATTERN.test(requestedPipelineId)
     ? requestedPipelineId

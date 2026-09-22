@@ -1,3 +1,5 @@
+import { additionalPublicOrigins } from './publicOriginRouting.mjs'
+
 type HeaderReader = Pick<Headers, 'get'>
 
 function normalizeOrigin(value: unknown): string | null {
@@ -53,6 +55,7 @@ export function isBrowserSameOriginRequest(input: {
     input.requestOrigin,
     routedOrigin(input.headers),
     ...(input.trustedOrigins || []),
+    ...additionalPublicOrigins(process.env.CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON),
   ]) {
     const normalized = normalizeOrigin(candidate)
     if (normalized) allowed.add(normalized)

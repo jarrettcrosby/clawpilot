@@ -13,6 +13,7 @@ import {
 } from '@/lib/authSessions'
 import { resolveAgentDispatchWorker } from '@/lib/workerAuth'
 import { demoMutationIsRestricted } from '@/lib/demoMode'
+import { isPublicBpoShortlinkResolvePath } from '@/lib/bpoShortlinkPublicPath.mjs'
 
 const HOSTED_RUNTIME = Boolean(
   process.env.RAILWAY_ENVIRONMENT_NAME
@@ -40,7 +41,7 @@ function missingDevIsolationEnv(req: NextRequest) {
   return required.filter((key) => !process.env[key])
 }
 
-function isPublicApi(pathname: string) {
+function isPublicApi(pathname: string, method: string) {
   const normalizedPath = pathname.endsWith('/') && pathname.length > 1 ? pathname.slice(0, -1) : pathname
 
   return (
@@ -84,6 +85,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/operations/print-agent/jobs'
     || normalizedPath === '/api/operations/print-agent/pair'
     || normalizedPath === '/api/shortlinks'
+    || isPublicBpoShortlinkResolvePath(normalizedPath, method)
     || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')
   )
@@ -169,7 +171,7 @@ export async function proxy(req: NextRequest) {
   }
 
   if (!AUTH_REQUIRED) return NextResponse.next()
-  if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
+  if (pathname.startsWith('/api/') && isPublicApi(pathname, req.method)) return NextResponse.next()
   if (isPublicAppleAppLink(pathname)) return NextResponse.next()
   if (pathname.startsWith('/s/')) return NextResponse.next()
 

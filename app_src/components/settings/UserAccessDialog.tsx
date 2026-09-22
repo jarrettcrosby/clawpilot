@@ -49,6 +49,7 @@ import { announceUserDateTimeSettings, formatUserDateTime } from '@/lib/userDate
 import IntegrationSettingsPanel from './IntegrationSettingsPanel'
 import MeasurementPreferencesPanel from './MeasurementPreferencesPanel'
 import OrganizationBrandingPanel from './OrganizationBrandingPanel'
+import OrganizationWebPreferencesPanel from './OrganizationWebPreferencesPanel'
 import SessionSecurityPanel from './SessionSecurityPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
@@ -1295,6 +1296,7 @@ export default function UserAccessDialog({
                 />
                 <LoginEmailPanel identityEmail={currentUser.email} />
                 <OrganizationBrandingPanel />
+                <OrganizationWebPreferencesPanel />
               </>
             ) : (
               <Typography color="text.secondary">Profile unavailable.</Typography>

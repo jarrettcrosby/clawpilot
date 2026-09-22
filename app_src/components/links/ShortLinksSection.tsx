@@ -31,9 +31,10 @@ import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
 import ShortLinkFormDialog from './ShortLinkFormDialog'
-import type { ShortLinkRecord, ShortLinkWriteInput } from './types'
+import type { ShortLinkDomainChoice, ShortLinkRecord, ShortLinkWriteInput } from './types'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import { WORKSPACE_CHANGED_EVENT } from '@/lib/workspaceClient'
 
 type StatusKey = 'active' | 'disabled' | 'expired' | 'exhausted'
 
@@ -139,6 +140,18 @@ async function copyText(value: string) {
 }
 
 export default function ShortLinksSection() {
+  const [workspaceEpoch, setWorkspaceEpoch] = useState(0)
+  useEffect(() => {
+    const reset = () => setWorkspaceEpoch((current) => current + 1)
+    window.addEventListener(WORKSPACE_CHANGED_EVENT, reset)
+    return () => window.removeEventListener(WORKSPACE_CHANGED_EVENT, reset)
+  }, [])
+  // Drafts, selection, records, and in-flight responses must not follow the user
+  // into another workspace, even when the surrounding shell stays mounted.
+  return <WorkspaceShortLinks key={workspaceEpoch} />
+}
+
+function WorkspaceShortLinks() {
   const dateTimeSettings = useUserDateTime()
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [records, setRecords] = useState<ShortLinkRecord[]>([])
@@ -156,6 +169,17 @@ export default function ShortLinksSection() {
   const [mutation, setMutation] = useState<string | null>(null)
   const [currentOwnerEmail, setCurrentOwnerEmail] = useState('')
   const [canManageOrganization, setCanManageOrganization] = useState(false)
+  const [availableDomains, setAvailableDomains] = useState<ShortLinkDomainChoice[]>([
+    { key: 'eigenracing', label: 'eigenracing.com' },
+  ])
+  const [domainPreference, setDomainPreference] = useState<{ saved: ShortLinkDomainChoice['key'] | 'organization'; selected: ShortLinkDomainChoice['key'] | 'organization' }>({
+    saved: 'organization', selected: 'organization',
+  })
+  const [effectiveDefaultDomain, setEffectiveDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [organizationDefaultDomain, setOrganizationDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [canOverrideDefault, setCanOverrideDefault] = useState(true)
+  const [formDefaultDomain, setFormDefaultDomain] = useState<ShortLinkDomainChoice['key']>('eigenracing')
+  const [savingPreference, setSavingPreference] = useState(false)
   const requestSequence = useRef(0)
 
   useEffect(() => {
@@ -192,6 +216,22 @@ export default function ShortLinksSection() {
           const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
           setCurrentOwnerEmail(String(data.currentOwnerEmail || '').toLowerCase())
           setCanManageOrganization(data.canManageOrganization === true)
+          const domains = Array.isArray(data.availableDomains) ? data.availableDomains as ShortLinkDomainChoice[] : []
+          setAvailableDomains(domains.some((domain) => domain.key === 'eigenracing' || domain.key === 'bpo')
+            ? domains.filter((domain) => domain.key === 'eigenracing' || domain.key === 'bpo')
+            : [{ key: 'eigenracing', label: 'eigenracing.com' }])
+          const defaultDomain = data.defaultDomain === 'bpo' && domains.some((domain) => domain.key === 'bpo')
+            ? 'bpo' : 'eigenracing'
+          const overrideAllowed = data.canOverrideDefault !== false
+          const saved = overrideAllowed && (data.userDefaultDomain === 'bpo' || data.userDefaultDomain === 'eigenracing') ? data.userDefaultDomain : 'organization'
+          setEffectiveDefaultDomain(defaultDomain)
+          setOrganizationDefaultDomain(data.organizationDefaultDomain === 'bpo' ? 'bpo' : 'eigenracing')
+          setCanOverrideDefault(overrideAllowed)
+          setDomainPreference((current) => ({
+            saved,
+            selected: !overrideAllowed || current.selected === current.saved || (current.selected !== 'organization' && !domains.some((domain) => domain.key === current.selected))
+              ? saved : current.selected,
+          }))
         }
       })
       .catch((loadError: unknown) => {
@@ -218,12 +258,38 @@ export default function ShortLinksSection() {
 
   function openCreate() {
     setEditing(null)
+    setFormDefaultDomain(effectiveDefaultDomain)
     setFormOpen(true)
   }
 
   function openEdit(record: ShortLinkRecord) {
     setEditing(record)
     setFormOpen(true)
+  }
+
+  async function saveDefaultDomain() {
+    const selected = domainPreference.selected
+    setSavingPreference(true)
+    setError('')
+    try {
+      const response = await fetch('/api/shortlinks/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ defaultDomain: selected === 'organization' ? null : selected }),
+      })
+      const payload = await responsePayload(response)
+      if (!response.ok || payload.ok === false) throw new Error(errorMessage(payload, 'Unable to save default domain'))
+      const saved = payload.userDefaultDomain === 'bpo' || payload.userDefaultDomain === 'eigenracing' ? payload.userDefaultDomain : 'organization'
+      setEffectiveDefaultDomain(payload.defaultDomain === 'bpo' ? 'bpo' : 'eigenracing')
+      requestSequence.current += 1
+      setDomainPreference({ saved, selected: saved })
+      setRefreshKey((current) => current + 1)
+      setNotice('Default short-link domain saved for this workspace')
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save default domain')
+    } finally {
+      setSavingPreference(false)
+    }
   }
 
   async function saveLink(input: ShortLinkWriteInput) {
@@ -320,9 +386,39 @@ export default function ShortLinksSection() {
           variant="contained"
           startIcon={<AddLinkRounded />}
           onClick={openCreate}
+          disabled={loading || savingPreference}
           sx={{ minHeight: 40, borderRadius: '8px', px: 2, flexShrink: 0 }}
         >
           New link
+        </Button>
+      </Box>
+
+      <Box display="flex" alignItems="flex-start" flexWrap="wrap" gap={1.5} mb={2.5}>
+        <TextField
+          select
+          size="small"
+          label="Default short-link domain"
+          value={domainPreference.selected}
+          onChange={(event) => setDomainPreference((current) => ({ ...current, selected: event.target.value as ShortLinkDomainChoice['key'] | 'organization' }))}
+          disabled={loading || savingPreference || !canOverrideDefault}
+          helperText={!canOverrideDefault ? 'Your organization administrator controls the domain for new links.'
+            : domainPreference.selected !== 'organization' && !availableDomains.some((domain) => domain.key === domainPreference.selected)
+              ? `Your saved domain is temporarily unavailable. New links currently use ${availableDomains.find((domain) => domain.key === effectiveDefaultDomain)?.label || effectiveDefaultDomain}; your preference is preserved.`
+              : 'Inherit the organization default, or choose your own. Each new link can use another enabled domain.'}
+          sx={{ ...fieldSx, flex: '1 1 280px', maxWidth: 520 }}
+        >
+          <MenuItem value="organization">Organization default ({availableDomains.find((domain) => domain.key === organizationDefaultDomain)?.label || organizationDefaultDomain})</MenuItem>
+          {domainPreference.selected !== 'organization' && !availableDomains.some((domain) => domain.key === domainPreference.selected)
+            ? <MenuItem value={domainPreference.selected} disabled>{domainPreference.selected === 'bpo' ? 'bposupplychain.com' : 'eigenracing.com'} — temporarily unavailable</MenuItem> : null}
+          {availableDomains.map((domain) => <MenuItem key={domain.key} value={domain.key}>{domain.label}</MenuItem>)}
+        </TextField>
+        <Button
+          variant="outlined"
+          onClick={() => void saveDefaultDomain()}
+          disabled={loading || savingPreference || !canOverrideDefault || domainPreference.selected === domainPreference.saved}
+          sx={{ minHeight: 40, borderRadius: '8px' }}
+        >
+          {savingPreference ? 'Saving default…' : 'Save default'}
         </Button>
       </Box>
 
@@ -571,6 +667,9 @@ export default function ShortLinksSection() {
       <ShortLinkFormDialog
         open={formOpen}
         record={editing}
+        availableDomains={availableDomains}
+        defaultPublicDomain={formDefaultDomain}
+        domainLocked={!canOverrideDefault}
         busy={mutation?.startsWith('POST:') === true || mutation?.startsWith('PATCH:') === true}
         onClose={() => { if (!mutation) setFormOpen(false) }}
         onSubmit={saveLink}

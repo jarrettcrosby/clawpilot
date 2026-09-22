@@ -3,6 +3,7 @@ export type ShortLinkRecord = {
   ownerEmail?: string
   sourceApp?: string
   shortUrl: string
+  publicDomain?: 'eigenracing' | 'bpo'
   slug: string
   destinationUrl: string
   title: string
@@ -16,7 +17,10 @@ export type ShortLinkRecord = {
   updatedAt: string
 }
 
+export type ShortLinkDomainChoice = { key: 'eigenracing' | 'bpo'; label: string }
+
 export type ShortLinkWriteInput = {
+  publicDomain?: 'eigenracing' | 'bpo'
   destinationUrl?: string
   title?: string
   slug?: string

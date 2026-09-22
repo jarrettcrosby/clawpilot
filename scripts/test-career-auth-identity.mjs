@@ -30,7 +30,7 @@ try {
   }
   const aliases = load('app_src/lib/authLoginIdentity.ts', {
     '@/lib/users': users,
-    '@/lib/persistence/postgres': { query: async (_sql, [email]) => ({ rows: independentAccounts.has(email) ? [{ email }] : [] }) },
+    '@/lib/persistence/postgres': { query: async (sql, [email]) => ({ rows: sql.includes('app_user_login_addresses') ? [] : independentAccounts.has(email) ? [{ email }] : [] }) },
   })
   assert.equal(await aliases.resolveLoginAccountEmail('OWNER@RENAMED.EXAMPLE'), 'owner@original.example')
   assert.equal(await aliases.resolveLoginAccountEmail('member@gmail.com'), 'member@gmail.com')
@@ -53,7 +53,7 @@ try {
       query: async (sql, [subject, email]) => {
         queries.push({ sql, subject, email })
         assert.match(sql, /identity\.provider_subject = \$1/)
-        assert.match(sql, /identity\.verified_email = \$2/)
+        assert.match(sql, /identity\.verified_email = \$3 OR \(identity\.verified_email = \$2/)
         return { rows: subject === 'original-google-subject' && email === 'owner@original.example'
           ? [{ user_email: email, user_status: status, organization_id: membership }] : [] }
       },
