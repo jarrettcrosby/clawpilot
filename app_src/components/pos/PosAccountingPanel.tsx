@@ -384,6 +384,8 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const [notice, setNotice] = useState<string | null>(null)
   const [mappingRegenerationDate, setMappingRegenerationDate] = useState<string | null>(null)
   const [reload, setReload] = useState(0)
+  const requestKey = JSON.stringify([location, businessDate, revision, reload])
+  const [loadedRequestKey, setLoadedRequestKey] = useState('')
   const dateControlsRef = useRef<HTMLDivElement | null>(null)
   const configurationRef = useRef<HTMLDivElement | null>(null)
   const mappingsRef = useRef<HTMLDivElement | null>(null)
@@ -392,6 +394,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   const productDetailControllerRef = useRef<AbortController | null>(null)
   const selectedScopeRef = useRef<MappingScope>('organization_default')
   const scopeContextRef = useRef('')
+  const pendingEditsRef = useRef({ profile, profileDirty, mappingDrafts, dirtyMappingKeys, targetInputBySource })
+
+  useEffect(() => {
+    pendingEditsRef.current = { profile, profileDirty, mappingDrafts, dirtyMappingKeys, targetInputBySource }
+  }, [profile, profileDirty, mappingDrafts, dirtyMappingKeys, targetInputBySource])
 
   useEffect(() => () => productDetailControllerRef.current?.abort(), [])
 
@@ -406,6 +413,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
       try {
         const response = await fetch(`/api/pos/accounting?${params}`, { cache: 'no-store', signal: controller.signal })
         const payload = await response.json().catch(() => ({})) as DataRecord
+        if (controller.signal.aborted) return
         if (!response.ok || payload.ok !== true || !payload.accounting) {
           throw new Error(text(payload.error, 'POS accounting is unavailable'))
         }
@@ -424,15 +432,24 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         const availableScope = nextScope === 'location_override' && !locationGuid
           ? 'organization_default'
           : nextScope
+        const pending = pendingEditsRef.current
+        const retainEdits = scopeContextRef.current === scopeContext && selectedScopeRef.current === availableScope
+        const retainedMappings = new Map((retainEdits ? pending.mappingDrafts : [])
+          .filter((entry) => pending.dirtyMappingKeys.has(mappingDraftKey(entry.sourceKind, entry.sourceId)))
+          .map((entry) => [mappingDraftKey(entry.sourceKind, entry.sourceId), entry]))
         scopeContextRef.current = scopeContext
         selectedScopeRef.current = availableScope
         setWorkspace(nextWorkspace)
-        setProfile(profileForScope(nextWorkspace, availableScope))
-        setProfileDirty(false)
+        setLoadedRequestKey(requestKey)
+        setProfile(retainEdits && pending.profileDirty ? pending.profile : profileForScope(nextWorkspace, availableScope))
+        setProfileDirty(retainEdits && pending.profileDirty)
         setScope(availableScope)
-        setMappingDrafts(mappingDraftsForScope(nextWorkspace, availableScope))
-        setDirtyMappingKeys(new Set())
-        setTargetInputBySource({})
+        setMappingDrafts(mappingDraftsForScope(nextWorkspace, availableScope).map((entry) => (
+          retainedMappings.get(mappingDraftKey(entry.sourceKind, entry.sourceId)) || entry
+        )))
+        setDirtyMappingKeys(new Set(retainedMappings.keys()))
+        setTargetInputBySource(Object.fromEntries(Object.entries(pending.targetInputBySource)
+          .filter(([key]) => retainedMappings.has(key))))
         setMappingError(null)
       } catch (loadError) {
         if ((loadError as Error).name !== 'AbortError') setError((loadError as Error).message)
@@ -443,11 +460,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
 
     void load()
     return () => controller.abort()
-  }, [businessDate, location, reload, revision])
+  }, [businessDate, location, reload, revision, requestKey])
 
   const capabilities = record(workspace?.capabilities)
-  const canEdit = capabilities.canManage === true
-    || (capabilities.canPrepare === true && scope === 'location_override')
+  const canEdit = !loading && loadedRequestKey === requestKey && (capabilities.canManage === true
+    || (capabilities.canPrepare === true && scope === 'location_override'))
   const locationRecord = record(workspace?.location)
   const quickBooks = record(workspace?.quickBooks)
   const targets = record(workspace?.targets)
@@ -559,7 +576,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   }
 
   function changeConfigurationScope(nextScope: MappingScope) {
-    if (nextScope === scope || !workspace) return
+    if (nextScope === scope || !workspace || savingMappings || savingProfile) return
     if (dirtyMappingKeys.size > 0 || profileDirty) {
       setMappingError('Save the current scope changes before switching configuration scope, or reload the page to discard them.')
       return
@@ -594,22 +611,6 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
         : entry
     )))
     setDirtyMappingKeys((current) => new Set(current).add(key))
-    setMappingError(null)
-  }
-
-  function acceptVisibleSuggestions() {
-    const accepted = new Map(acceptableSuggestions.map((mapping) => [
-      mappingDraftKey(mapping.sourceKind, mapping.sourceId),
-      (targetOptions[mapping.targetType] || []).find((target) => target.id === mapping.targetId)!,
-    ]))
-    if (!accepted.size) return
-    setMappingDrafts((current) => current.map((entry) => {
-      const target = accepted.get(mappingDraftKey(entry.sourceKind, entry.sourceId))
-      return target
-        ? { ...entry, targetName: target.name, active: true, suggested: false, suggestionConfidence: '' }
-        : entry
-    }))
-    setDirtyMappingKeys((current) => new Set([...current, ...accepted.keys()]))
     setMappingError(null)
   }
 
@@ -787,6 +788,9 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
   }
 
   async function saveProfile() {
+    if (!canEdit || savingProfile) return
+    const saveContext = scopeContextRef.current
+    const submittedProfile = profilePayload(profile)
     setSavingProfile(true)
     setError(null)
     setNotice(null)
@@ -799,12 +803,15 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           scope,
           restaurantGuid: locationGuid,
           businessDate,
-          profile: profilePayload(profile),
+          profile: submittedProfile,
         }),
       })
       const payload = await response.json().catch(() => ({})) as DataRecord
       if (!response.ok || payload.ok !== true) throw new Error(text(payload.error, 'Accounting profile could not be saved'))
-      setProfileDirty(false)
+      if (scopeContextRef.current !== saveContext || selectedScopeRef.current !== scope) return
+      const hasLaterEdits = JSON.stringify(profilePayload(pendingEditsRef.current.profile)) !== JSON.stringify(submittedProfile)
+      pendingEditsRef.current = { ...pendingEditsRef.current, profileDirty: hasLaterEdits }
+      setProfileDirty(hasLaterEdits)
       setNotice(`Accounting profile saved to ${scope === 'organization_default' ? 'the organization default' : 'this location override'} as a new revision.`)
       setReload((value) => value + 1)
     } catch (saveError) {
@@ -814,15 +821,19 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     }
   }
 
-  async function saveMappings() {
+  async function saveMappings(suggestions: MappingDraft[] = []) {
+    if (!canEdit || savingMappings) return
+    const saveContext = scopeContextRef.current
     setSavingMappings(true)
     setError(null)
     setMappingError(null)
     setNotice(null)
     try {
-      const changedMappings = mappingDrafts.filter((entry) => (
-        dirtyMappingKeys.has(mappingDraftKey(entry.sourceKind, entry.sourceId))
-      ))
+      const changedMappings = suggestions.length ? suggestions.map((entry) => {
+        const target = (targetOptions[entry.targetType] || []).find((option) => option.id === entry.targetId)
+        if (!target || !entry.suggested) throw new Error('Refresh the QuickBooks catalog before saving this suggestion.')
+        return { ...entry, targetName: target.name, active: true }
+      }) : mappingDrafts.filter((entry) => dirtyMappingKeys.has(mappingDraftKey(entry.sourceKind, entry.sourceId)))
       if (!changedMappings.length) throw new Error('Select or change a QuickBooks target before saving mappings.')
       const unresolved = changedMappings.find((entry) => {
         const typedLabel = text(targetInputBySource[mappingDraftKey(entry.sourceKind, entry.sourceId)])
@@ -868,6 +879,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
           ? `The mapping for "${unconfirmed.sourceName}" was not activated (${validationStatus.replaceAll('_', ' ')}). Refresh the Toast and QuickBooks catalogs, then try again.`
           : `The mapping for "${unconfirmed.sourceName}" was not confirmed by the server. Refresh the catalogs, then try again.`)
       }
+      if (scopeContextRef.current !== saveContext || selectedScopeRef.current !== scope) return
+      const savedKeys = new Set(changedMappings.map((entry) => mappingDraftKey(entry.sourceKind, entry.sourceId)))
+      const remainingKeys = new Set([...pendingEditsRef.current.dirtyMappingKeys].filter((key) => !savedKeys.has(key)))
+      pendingEditsRef.current = { ...pendingEditsRef.current, dirtyMappingKeys: remainingKeys }
+      setDirtyMappingKeys(remainingKeys)
       const changedCount = Number(payload.changedCount)
       setNotice(changedCount > 0
         ? `${changedCount} accounting ${changedCount === 1 ? 'mapping' : 'mappings'} saved to ${scope === 'organization_default' ? 'the organization default' : 'this location override'} as a new revision.`
@@ -951,8 +967,14 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
     }
   }
 
-  if (loading && !workspace) {
-    return <Box minHeight={220} display="grid" sx={{ placeItems: 'center' }}><CircularProgress size={28} /></Box>
+  if (loading || loadedRequestKey !== requestKey) {
+    return loading ? (
+      <Box minHeight={220} display="grid" sx={{ placeItems: 'center' }}><CircularProgress size={28} aria-label="Loading accounting configuration" /></Box>
+    ) : (
+      <Alert severity="error" action={<Button color="inherit" onClick={() => setReload((value) => value + 1)}>Retry</Button>}>
+        {error || 'Accounting configuration must finish loading before changes can be saved.'}
+      </Alert>
+    )
   }
 
   return (
@@ -1287,7 +1309,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               {scope === 'organization_default'
                 ? 'Organization-default Toast sources to stable QuickBooks targets'
                 : 'Location overrides with inherited organization defaults clearly labeled'}
-              {' Suggestions shown in the target field are previews until accepted and saved.'}
+              {' Save a suggestion directly, or save the suggestions shown by your current search. This saves configuration only; it never posts to QuickBooks.'}
             </Typography>
           </Box>
           <Box display="flex" flexWrap="wrap" gap={1}>
@@ -1300,11 +1322,11 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
               InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
             />
             {acceptableSuggestions.length ? (
-              <Button variant="outlined" size="small" onClick={acceptVisibleSuggestions} disabled={!canEdit || savingMappings} sx={{ whiteSpace: 'nowrap' }}>
-                Accept {number(acceptableSuggestions.length)} {acceptableSuggestions.length === 1 ? 'suggestion' : 'suggestions'}
+              <Button variant="outlined" size="small" onClick={() => void saveMappings(acceptableSuggestions)} disabled={!canEdit || savingMappings} sx={{ whiteSpace: 'nowrap' }}>
+                Save {number(acceptableSuggestions.length)} {acceptableSuggestions.length === 1 ? 'suggestion' : 'suggestions'}
               </Button>
             ) : null}
-            <Button variant="outlined" size="small" startIcon={savingMappings ? <CircularProgress size={16} /> : <SaveRounded />} onClick={saveMappings} disabled={!canEdit || savingMappings || dirtyMappingKeys.size === 0}>
+            <Button variant="outlined" size="small" startIcon={savingMappings ? <CircularProgress size={16} /> : <SaveRounded />} onClick={() => void saveMappings()} disabled={!canEdit || savingMappings || dirtyMappingKeys.size === 0}>
               Save
             </Button>
           </Box>
@@ -1384,6 +1406,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                   <Box display="flex" gap={0.6} alignItems="center" flexWrap="wrap" minWidth={0}>
                     <Typography variant="body2" fontWeight={650} noWrap>{mapping.sourceName}</Typography>
                     {mapping.suggested ? <Chip size="small" color="info" variant="outlined" label="Suggested · not saved" /> : null}
+                    {!mappingIsDirty && mappingIsUsable(mapping) ? <Chip size="small" color="success" variant="outlined" label="Saved" /> : null}
                     {text(source?.catalogOrigin) === 'menu' ? <Chip size="small" variant="outlined" label="Menu" /> : null}
                     {exactToastProductSource && source?.hasImage === true ? (
                       <Chip size="small" variant="outlined" label="Image available" />
@@ -1421,7 +1444,7 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                     active: false,
                   })
                 }}
-                disabled={!canEdit || targetTypesFor(mapping.sourceKind).length === 1}
+                disabled={!canEdit || savingMappings || targetTypesFor(mapping.sourceKind).length === 1}
                 sx={controlSx}
               >
                 {targetTypesFor(mapping.sourceKind).map((entry) => <MenuItem key={entry} value={entry}>{entry.replaceAll('_', ' ')}</MenuItem>)}
@@ -1449,10 +1472,21 @@ export default function PosAccountingPanel({ location, businessDate, revision, m
                         ? { active: false }
                         : { targetId: '', targetName: '', active: false })
                   }}
-                  disabled={!canEdit || !options.length}
+                  disabled={!canEdit || savingMappings || !options.length}
                   sx={{ flex: 1, minWidth: 0 }}
                   renderInput={(params) => <TextField {...params} label={options.length ? 'QuickBooks target' : 'Refresh QuickBooks catalog'} size="small" sx={controlSx} />}
                 />
+                {mapping.suggested ? (
+                  <Button
+                    variant="outlined"
+                    size="small"
+                    onClick={() => void saveMappings([mapping])}
+                    disabled={!canEdit || savingMappings || !acceptableSuggestions.some((entry) => entry.sourceId === mapping.sourceId && entry.sourceKind === mapping.sourceKind)}
+                    sx={{ whiteSpace: 'nowrap' }}
+                  >
+                    Save suggestion
+                  </Button>
+                ) : null}
                 {Object.keys(productSuggestion).length ? (
                   <Tooltip title="Prepare a reviewable QuickBooks product draft using this Toast menu item">
                     <span>

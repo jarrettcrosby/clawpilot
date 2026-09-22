@@ -820,7 +820,8 @@ test('POS accounting saves only one exact changed mapping from a catalog larger 
   expect(clearedMappings[0]).toMatchObject({ targetId, targetName, active: false })
 })
 
-test('POS accounting accepts only visible catalog-backed suggestions before saving them', async ({ page }) => {
+for (const saveAction of ['row', 'bulk'] as const) {
+test(`POS accounting saves catalog-backed suggestions directly via ${saveAction} action and retains them after reload`, async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 })
   await authenticateIfConfigured(page)
   await mockPos(page)
@@ -886,10 +887,8 @@ test('POS accounting accepts only visible catalog-backed suggestions before savi
   await expect(page.getByText('0/2 saved mappings')).toBeVisible()
   await expect(page.getByText('Suggested · not saved')).toHaveCount(2)
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
-  await page.getByRole('button', { name: 'Accept 1 suggestion' }).click()
-  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled()
-  await expect(page.getByText('0/2 saved mappings')).toBeVisible()
-  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Save suggestion', exact: true }).nth(1)).toBeDisabled()
+  await page.getByRole('button', { name: saveAction === 'row' ? 'Save suggestion' : 'Save 1 suggestion', exact: true }).first().click()
 
   await expect.poll(() => submittedBodies.length).toBe(1)
   expect(submittedBodies[0]).toMatchObject({ action: 'save-mappings', scope: 'organization_default' })
@@ -899,6 +898,214 @@ test('POS accounting accepts only visible catalog-backed suggestions before savi
   }])
   await expect(page.getByText('1/2 saved mappings')).toBeVisible()
   await expect(page.getByText('Suggested · not saved')).toHaveCount(1)
+  await expect(page.getByText('Saved', { exact: true })).toHaveCount(1)
+  await page.reload()
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  await activatePos(page)
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+  await expect(page.getByText('1/2 saved mappings')).toBeVisible()
+  expect(submittedBodies).toHaveLength(1)
+})
+}
+
+type MappingRegressionState = {
+  submissions: Array<Record<string, unknown>>
+  mappings: Array<Record<string, unknown>>
+  profile: Record<string, unknown>
+  mappingReply: 'success' | 'unconfirmed' | 'failure'
+  profileGate: Promise<void> | null
+  readGate: Promise<void> | null
+  reads: number
+}
+
+async function openMappingRegression(page: Page): Promise<MappingRegressionState> {
+  test.setTimeout(90_000)
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await authenticateIfConfigured(page)
+  await mockPos(page)
+  await page.addInitScript((organizationId) => {
+    window.localStorage.setItem(`clawpilot.pos.guide.seen:${organizationId}`, '1')
+  }, posSnapshot.organizationId)
+  const state: MappingRegressionState = {
+    submissions: [], mappings: [], mappingReply: 'success', profileGate: null, readGate: null, reads: 0,
+    profile: {
+      scope: 'organization_default', profileRevision: 1, postingMethod: 'itemized_sales_receipt',
+      breakoutDimensions: [], trackSalesTax: true, memoMode: 'standard', customMemo: null,
+      customTransactionNumber: false, transactionNumberSuffix: null, suppressZeroOverShort: true,
+      autoPayoutTips: false, depositChecksWithCash: false, openCheckPolicy: 'hold',
+      batchHoldPolicy: 'hold', emailNotificationsEnabled: false,
+    },
+  }
+  const sources = [
+    { sourceKind: 'sales_item', sourceId: '11111111-1111-4111-8111-111111111121', sourceName: 'Visible Sparkling',
+      suggestedTarget: { id: '101', name: 'Sparkling Item', confidence: 'exact' } },
+    { sourceKind: 'sales_item', sourceId: '11111111-1111-4111-8111-111111111122', sourceName: 'Hidden Soda',
+      suggestedTarget: { id: '102', name: 'Soda Item', confidence: 'exact' } },
+    { sourceKind: 'sales_item', sourceId: '11111111-1111-4111-8111-111111111123', sourceName: 'Manual Bread', suggestedTarget: null },
+  ]
+  const targets = [
+    { id: '101', name: 'Sparkling Item' }, { id: '102', name: 'Soda Item' }, { id: '103', name: 'Bread Item' },
+  ]
+  await page.route((url) => url.pathname === '/api/pos/accounting', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.submissions.push(body)
+      if (body.action === 'save-profile') {
+        if (state.profileGate) await state.profileGate
+        state.profile = { ...state.profile, ...(body.profile as Record<string, unknown>), profileRevision: Number(state.profile.profileRevision) + 1 }
+        return route.fulfill({ json: { ok: true, profile: state.profile } })
+      }
+      expect(body.action).toBe('save-mappings')
+      if (state.mappingReply === 'failure') return route.fulfill({ status: 409, json: { ok: false, code: 'catalog_changed', error: 'Catalog changed; refresh and retry' } })
+      if (state.mappingReply === 'unconfirmed') return route.fulfill({ json: { ok: true, mappings: [], changedCount: 0 } })
+      const mappings = (body.mappings as Array<Record<string, unknown>>).map((mapping): Record<string, unknown> => ({
+        ...mapping, scope: body.scope, mappingRevision: 1, validationStatus: 'valid',
+      }))
+      for (const mapping of mappings) {
+        state.mappings = state.mappings.filter((existing) => existing.sourceId !== mapping.sourceId)
+        state.mappings.push(mapping)
+      }
+      return route.fulfill({ json: { ok: true, mappings, changedCount: mappings.length } })
+    }
+    state.reads += 1
+    if (state.readGate) await state.readGate
+    return route.fulfill({ json: {
+      ok: true, capabilities: { canView: true, canManage: true, canPrepare: true, canApprove: true },
+      accounting: {
+        organizationId: posSnapshot.organizationId,
+        location: { restaurantGuid: locationId, restaurantName: 'Acceptance Restaurant', locationName: 'Downtown' },
+        profile: state.profile,
+        quickBooks: { configured: true, bound: true, companyName: 'Acceptance Books', status: 'active', catalog: {} },
+        sourceCatalog: sources, mappings: state.mappings,
+        targets: { accounts: [], customers: [], vendors: [], taxCodes: [], classes: [], departments: [], locations: [],
+          items: targets.map((target) => ({ ...target, fullyQualifiedName: target.name, itemType: 'NonInventory' })) },
+        preview: { readiness: { missingMappings: [] }, salesReceipt: {}, journal: {}, evidence: {} },
+        draft: null, draftHistory: [], latestCommand: null,
+      },
+    } })
+  })
+  await page.goto('/#pos')
+  await expect(page.getByTestId('app-shell')).toBeVisible()
+  const closeGuide = page.getByRole('button', { name: 'Close POS guide' })
+  if (await closeGuide.isVisible()) await closeGuide.click()
+  await activatePos(page)
+  await page.getByRole('tab', { name: 'Accounting', exact: true }).click()
+  await expect(page.getByText('0/3 saved mappings')).toBeVisible()
+  return state
+}
+
+for (const failure of ['unconfirmed', 'failure'] as const) {
+test(`POS accounting regression: ${failure} suggestion save stays unsaved and retryable`, async ({ page }) => {
+  const state = await openMappingRegression(page)
+  state.mappingReply = failure
+  await page.getByPlaceholder('Search mappings').fill('Visible Sparkling')
+  await page.getByRole('button', { name: 'Save suggestion', exact: true }).click()
+  await expect(page.getByText(failure === 'unconfirmed'
+    ? /was not confirmed by the server/
+    : /Catalog changed; refresh and retry/)).toBeVisible()
+  await expect(page.getByText('Suggested · not saved')).toHaveCount(1)
+  await expect(page.getByText('Saved', { exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Save suggestion', exact: true })).toBeEnabled()
+  await expect(page.getByText('0/3 saved mappings')).toBeVisible()
+  expect(state.mappings).toHaveLength(0)
+  expect(state.submissions).toHaveLength(1)
+  state.mappingReply = 'success'
+  await page.getByRole('button', { name: 'Save suggestion', exact: true }).click()
+  await expect(page.getByText('1/3 saved mappings')).toBeVisible()
+  await expect(page.getByText('Saved', { exact: true })).toHaveCount(1)
+})
+}
+
+test('POS accounting regression: bulk suggestion save excludes hidden search results', async ({ page }) => {
+  const state = await openMappingRegression(page)
+  await expect(page.getByRole('button', { name: 'Save 2 suggestions', exact: true })).toBeVisible()
+  await page.getByPlaceholder('Search mappings').fill('Visible Sparkling')
+  await page.getByRole('button', { name: 'Save 1 suggestion', exact: true }).click()
+  await expect(page.getByText('1/3 saved mappings')).toBeVisible()
+  expect(state.submissions).toHaveLength(1)
+  expect(state.submissions[0].mappings).toEqual([expect.objectContaining({ sourceName: 'Visible Sparkling', targetId: '101' })])
+  await page.getByPlaceholder('Search mappings').clear()
+  await expect(page.getByText('Suggested · not saved')).toHaveCount(1)
+  expect(state.mappings.some((mapping) => mapping.sourceName === 'Hidden Soda')).toBe(false)
+})
+
+test('POS accounting regression: one suggestion save preserves other dirty mapping and profile', async ({ page }) => {
+  const state = await openMappingRegression(page)
+  const search = page.getByPlaceholder('Search mappings')
+  await search.fill('Manual Bread')
+  const target = page.getByRole('combobox', { name: 'QuickBooks target' })
+  await target.fill('Bread Item')
+  await page.getByRole('option', { name: 'Bread Item', exact: true }).click()
+  await page.getByLabel('Track sales tax', { exact: true }).uncheck()
+  await search.fill('Visible Sparkling')
+  await page.getByRole('button', { name: 'Save suggestion', exact: true }).click()
+  await expect(page.getByText('1/3 saved mappings')).toBeVisible()
+  expect(state.submissions).toHaveLength(1)
+  expect(state.submissions[0].mappings).toEqual([expect.objectContaining({ sourceName: 'Visible Sparkling' })])
+  await expect(page.getByLabel('Track sales tax', { exact: true })).not.toBeChecked()
+  await search.fill('Manual Bread')
+  await expect(target).toHaveValue('Bread Item')
+  await expect(page.getByText('Unsaved organization default', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.getByText('2/3 saved mappings')).toBeVisible()
+  expect(state.submissions[1].mappings).toEqual([expect.objectContaining({ sourceName: 'Manual Bread', targetId: '103' })])
+  await expect(page.getByLabel('Track sales tax', { exact: true })).not.toBeChecked()
+  await page.getByRole('button', { name: 'Save profile', exact: true }).click()
+  await expect.poll(() => state.submissions.length).toBe(3)
+  expect(state.submissions[2]).toMatchObject({ action: 'save-profile', profile: { trackSalesTax: false } })
+  expect(state.submissions.every((body) => ['save-mappings', 'save-profile'].includes(String(body.action)))).toBe(true)
+})
+
+test('POS accounting regression: profile edits during an in-flight save survive reload', async ({ page }) => {
+  const state = await openMappingRegression(page)
+  let finishSave = () => {}
+  state.profileGate = new Promise<void>((resolve) => { finishSave = resolve })
+  await page.getByLabel('Track sales tax', { exact: true }).uncheck()
+  await page.getByRole('button', { name: 'Save profile', exact: true }).click()
+  await expect.poll(() => state.submissions.length).toBe(1)
+  expect(state.submissions[0]).toMatchObject({ profile: { trackSalesTax: false, emailNotificationsEnabled: false } })
+  await page.getByLabel('Email issue alerts', { exact: true }).check()
+  const priorReads = state.reads
+  finishSave()
+  await expect.poll(() => state.reads).toBeGreaterThan(priorReads)
+  await expect(page.getByRole('button', { name: 'Save profile', exact: true })).toBeEnabled()
+  await expect(page.getByLabel('Email issue alerts', { exact: true })).toBeChecked()
+  await expect(page.getByLabel('Track sales tax', { exact: true })).not.toBeChecked()
+  state.profileGate = null
+  await page.getByRole('button', { name: 'Save profile', exact: true }).click()
+  await expect.poll(() => state.submissions.length).toBe(2)
+  expect(state.submissions[1]).toMatchObject({ profile: { trackSalesTax: false, emailNotificationsEnabled: true } })
+})
+
+test('POS accounting regression: date changes prevent saving stale accounting while the new view loads', async ({ page }) => {
+  const state = await openMappingRegression(page)
+  await page.getByPlaceholder('Search mappings').fill('Manual Bread')
+  await page.getByRole('combobox', { name: 'QuickBooks target' }).fill('Bread Item')
+  await page.getByRole('option', { name: 'Bread Item', exact: true }).click()
+  await page.getByLabel('Track sales tax', { exact: true }).uncheck()
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Save profile', exact: true })).toBeEnabled()
+  await page.getByPlaceholder('Search mappings').fill('Visible Sparkling')
+  await expect(page.getByRole('button', { name: 'Save suggestion', exact: true })).toBeEnabled()
+
+  let finishLoad = () => {}
+  state.readGate = new Promise<void>((resolve) => { finishLoad = resolve })
+  const priorReads = state.reads
+  const dateField = page.getByLabel('To', { exact: true })
+  const priorDate = new Date(`${await dateField.inputValue()}T12:00:00Z`)
+  priorDate.setUTCDate(priorDate.getUTCDate() - 1)
+  try {
+    await dateField.fill(priorDate.toISOString().slice(0, 10))
+    await expect.poll(() => state.reads).toBeGreaterThan(priorReads)
+    for (const name of ['Save', 'Save profile', 'Save suggestion']) {
+      const action = page.getByRole('button', { name, exact: true })
+      await expect.poll(async () => await action.isVisible() && await action.isEnabled()).toBe(false)
+    }
+    expect(state.submissions).toHaveLength(0)
+  } finally {
+    state.readGate = null
+    finishLoad()
+  }
 })
 
 test('POS accounting keeps organization defaults and location overrides visibly separated', async ({ page }) => {
