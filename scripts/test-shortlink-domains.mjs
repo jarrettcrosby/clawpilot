@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import vm from 'node:vm'
+import { spawnSync } from 'node:child_process'
 
 const appRequire = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = appRequire('typescript')
@@ -113,18 +114,22 @@ try {
 
   process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY = '1'
   assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor()), (choice) => choice.key), ['eigenracing', 'bpo'])
-  assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor(otherOrg)), (choice) => choice.key), ['eigenracing'])
+  assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor(otherOrg)), (choice) => choice.key), ['eigenracing', 'bpo'],
+    'An enabled domain is available to every organization, not just the original rollout workspace')
   assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor(bpoOrg, true)), (choice) => choice.key), ['eigenracing'])
   process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON = '["not-a-uuid"]'
-  assert.throws(() => shortlinks.availableShortLinkDomains(actor()), (error) => error?.status === 503)
-  process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON = JSON.stringify([bpoOrg])
+  assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor(otherOrg)), (choice) => choice.key), ['eigenracing', 'bpo'],
+    'A retired rollout allowlist cannot disable admin domain choices')
+  delete process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON
+  assert.doesNotThrow(() => shortlinks.validateShortLinkConfiguration())
   process.env.SHORTLINK_BPO_RESOLVER_SECRET = 'too-short'
   assert.throws(() => shortlinks.availableShortLinkDomains(actor()), (error) => error?.status === 503)
   process.env.SHORTLINK_BPO_RESOLVER_SECRET = secret
-  await assert.rejects(
-    shortlinks.createShortLink(actor(otherOrg), { destinationUrl: 'https://destination.example.test', publicDomain: 'bpo', slug: 'bpo-test' }),
-    (error) => error?.status === 403,
-  )
+  const otherOrganizationLink = await shortlinks.createShortLink(actor(otherOrg), {
+    destinationUrl: 'https://destination.example.test', publicDomain: 'bpo', slug: 'other-org-bpo',
+  })
+  assert.equal(otherOrganizationLink.shortUrl, 'https://bposupplychain.com/s/other-org-bpo')
+  assert.equal(calls.at(-1).params[1], otherOrg, 'BPO links still belong to the active organization')
   await assert.rejects(
     shortlinks.createShortLink(actor(bpoOrg, true), { destinationUrl: 'https://destination.example.test', publicDomain: 'bpo', slug: 'bpo-test' }),
     (error) => error?.status === 403,
@@ -210,6 +215,33 @@ try {
   const head = await bpoRoute.HEAD()
   assert.equal(head.status, 405)
   assert.equal(routedResolutions, 3, 'HEAD must never count a click')
+
+  const runtimeEnvironment = {
+    SHORTLINK_PUBLIC_ORIGIN: 'https://eigenracing.com',
+    SHORTLINK_SERVICE_CLIENTS_JSON: JSON.stringify([{
+      sourceApp: 'jarrett-career-agents', secret: 'test-service-secret-at-least-thirty-two-characters',
+      ownerDomain: 'suburbiasandwichco.com', ownerEmail: 'jarrett@suburbiasandwichco.com',
+      organizationId: '405bb919-0364-4a88-8a62-b4c9da42cd8f',
+    }]),
+    CAREER_SITE_AGENTS_ENABLED: '1',
+    CAREER_SITE_SUBMISSIONS_OWNER_EMAIL: 'jarrett@suburbiasandwichco.com',
+    CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID: '405bb919-0364-4a88-8a62-b4c9da42cd8f',
+    SHORTLINK_BPO_PUBLIC_ROUTE_READY: '1',
+    SHORTLINK_BPO_RESOLVER_SECRET: secret,
+    INTEGRATION_EVIDENCE_FINGERPRINT_KEY: 'test-fingerprint-key-at-least-thirty-two-characters',
+    INTEGRATION_EVIDENCE_ACTIVE_KEY_ID: 'test-v1',
+    INTEGRATION_EVIDENCE_ENCRYPTION_KEYS: JSON.stringify({ 'test-v1': 'test-evidence-key-at-least-thirty-two-characters' }),
+  }
+  const validateRuntime = (overrides = {}) => spawnSync(process.execPath, ['scripts/validate-runtime-config.mjs'], {
+    cwd: root, encoding: 'utf8', env: { ...runtimeEnvironment, ...overrides },
+  })
+  const readyRuntime = validateRuntime()
+  assert.equal(readyRuntime.status, 0, readyRuntime.stderr)
+  assert.match(readyRuntime.stdout, /bpoShortLinkDomain=ready/, 'No organization allowlist is required at startup')
+  assert.notEqual(validateRuntime({ SHORTLINK_BPO_RESOLVER_SECRET: 'too-short' }).status, 0)
+  assert.notEqual(validateRuntime({ SHORTLINK_BPO_PUBLIC_ROUTE_READY: 'invalid' }).status, 0)
+  assert.equal(validateRuntime({ SHORTLINK_BPO_PUBLIC_ROUTE_READY: '0', SHORTLINK_BPO_RESOLVER_SECRET: '' }).status, 0,
+    'Suspended or unconfigured environments can leave the public domain disabled')
 
   assert.match(source('db/migrations/0367_short_link_public_domain.sql'), /CHECK \(public_domain IS NULL OR public_domain = 'bpo'\)/)
   const route = source('app_src/app/api/shortlinks/bpo/resolve/[slug]/route.ts')

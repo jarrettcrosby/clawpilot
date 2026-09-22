@@ -39,17 +39,6 @@ function validateBpoShortLinkDomain() {
   if (ready === '0') return 'disabled'
   const secret = String(process.env.SHORTLINK_BPO_RESOLVER_SECRET || '')
   if (secret.length < 32) fail('SHORTLINK_BPO_RESOLVER_SECRET must contain at least 32 characters when the BPO route is ready')
-  let ids
-  try {
-    ids = JSON.parse(String(process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON || ''))
-  } catch {
-    fail('SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON must be a JSON array of exact workspace UUIDs')
-  }
-  if (!Array.isArray(ids) || ids.length < 1 || ids.length > 20
-    || ids.some((id) => typeof id !== 'string' || !uuidPattern.test(id))
-    || new Set(ids.map((id) => id.toLowerCase())).size !== ids.length) {
-    fail('SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON must contain 1-20 unique workspace UUIDs')
-  }
   return 'ready'
 }
 

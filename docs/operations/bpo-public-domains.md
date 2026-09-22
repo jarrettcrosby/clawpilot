@@ -81,9 +81,14 @@ Do not change apex, `www`, MX, SPF, DKIM, or unrelated DNS records.
    website does not follow the upstream redirect, forward session cookies, or
    expose provider error bodies. Both new endpoints reject HEAD without
    consuming a click.
-4. Configure exact permitted workspace UUIDs in
-   `SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON`. Initially scope to BPO Supply
-   Chain Services unless the operator explicitly chooses broader availability.
+4. Domain availability is deployment-wide; each organization's active owner or
+   admin controls its default in Settings → Profile → Organization web addresses.
+   BPO is preferred when enabled, with Eigen available as an alternative. User
+   overrides are permitted only when that organization's admin allows them.
+   The initial `SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON` rollout whitelist is
+   retired and ignored. An admin must switch to each organization they administer;
+   changing one organization's preferences never changes another's. Service
+   clients retain their existing Eigen-only behavior.
 5. Verify the website route, resolver authentication/domain isolation, limits,
    expiration, privacy headers, and an approved disposable test link before
    setting `SHORTLINK_BPO_PUBLIC_ROUTE_READY=1`. Until then the BPO creation

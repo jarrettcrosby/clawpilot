@@ -163,28 +163,15 @@ function bpoResolverSecret(): string {
   return secret
 }
 
-function bpoAllowedOrganizationIds(): Set<string> {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(String(process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON || ''))
-  } catch {
-    throw new ShortLinkRequestError('BPO short-link organization scope is misconfigured', 503)
-  }
-  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 20
-    || parsed.some((id) => typeof id !== 'string' || !UUID_PATTERN.test(id))
-    || new Set(parsed.map((id) => id.toLowerCase())).size !== parsed.length) {
-    throw new ShortLinkRequestError('BPO short-link organization scope is misconfigured', 503)
-  }
-  return new Set(parsed.map((id) => id.toLowerCase()))
-}
-
 function bpoPublicRouteReady(): boolean {
   return process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY === '1'
 }
 
 export function availableShortLinkDomains(actor: ShortLinkActor): ShortLinkDomainChoice[] {
   const choices: ShortLinkDomainChoice[] = [{ key: 'eigenracing', label: new URL(canonicalOrigin()).hostname }]
-  if (bpoPublicRouteReady() && !actor.service && bpoAllowedOrganizationIds().has(actor.organizationId.toLowerCase())) {
+  // Domain availability is deployment-wide. Active membership, organization
+  // admin defaults, and optional user overrides are enforced separately below.
+  if (bpoPublicRouteReady() && !actor.service) {
     bpoResolverSecret()
     choices.push({ key: 'bpo', label: 'bposupplychain.com' })
   }
@@ -375,7 +362,6 @@ export function validateShortLinkConfiguration(options: { requireServiceClient?:
   const origin = canonicalOrigin()
   const clients = configuredServiceClients()
   if (bpoPublicRouteReady()) {
-    bpoAllowedOrganizationIds()
     bpoResolverSecret()
   }
   if (options.requireServiceClient && clients.length === 0) {

@@ -171,7 +171,7 @@ async function main() {
         await pool.query(`INSERT INTO app_user_organization_memberships
           (user_email, organization_id, status) VALUES ($1, $2::uuid, 'active')`, [email, organizationId])
       }
-      await pool.query("UPDATE app_user_organization_memberships SET role = 'admin' WHERE user_email = $1 AND organization_id = $2", [sameEmail, orgA])
+      await pool.query("UPDATE app_user_organization_memberships SET role = 'admin' WHERE user_email = $1 AND organization_id = ANY($2::uuid[])", [sameEmail, [orgA, orgB]])
       const fixtures = [
         [IDs.ownA, sameEmail, orgA, 'clawpilot', 'scope-a-own'],
         [IDs.otherA, otherEmail, orgA, 'clawpilot', 'scope-a-other'],
@@ -225,11 +225,18 @@ async function main() {
         'Cross-organization rows remain unchanged')
 
       process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY = '1'
-      process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON = JSON.stringify([orgA])
+      delete process.env.SHORTLINK_BPO_ALLOWED_ORGANIZATION_IDS_JSON
       process.env.SHORTLINK_BPO_RESOLVER_SECRET = 'test-bpo-resolver-secret-longer-than-thirty-two-characters'
-      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'bpo', 'Eligible user begins with BPO default')
-      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'eigenracing')
+      for (const organizationId of [orgA, orgB]) {
+        assert.deepEqual(Array.from(shortlinks.availableShortLinkDomains(actor({ organizationId })), (choice) => choice.key), ['eigenracing', 'bpo'],
+          'Every organization can select either enabled domain without an organization allowlist')
+        assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId })), 'bpo',
+          'Each organization begins with BPO as its inherited default')
+      }
       assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ ownerEmail: otherEmail })), 'bpo')
+      assert.equal(await shortlinks.saveShortLinkDefaultDomain(actor({ organizationId: orgB }), 'eigenracing'), 'eigenracing')
+      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'bpo',
+        "Changing the same user's other workspace does not change this workspace's default")
       assert.equal(await shortlinks.saveShortLinkDefaultDomain(actor(), 'eigenracing'), 'eigenracing')
       assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'eigenracing')
       assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ ownerEmail: otherEmail })), 'bpo',
@@ -239,9 +246,10 @@ async function main() {
       assert.equal(await reloadedShortlinks.readShortLinkDefaultDomain(actor()), 'bpo',
         'Saved default survives a fresh module instance')
       assert.equal(await reloadedShortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'eigenracing',
-        "Same user's other workspace remains independent")
-      await assert.rejects(shortlinks.saveShortLinkDefaultDomain(actor({ organizationId: orgB }), 'bpo'),
-        (error) => error?.status === 403)
+        "Same user's other workspace independently retains its saved Eigen default")
+      assert.equal(await shortlinks.saveShortLinkDefaultDomain(actor({ organizationId: orgB }), 'bpo'), 'bpo')
+      assert.equal(await reloadedShortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'bpo',
+        'The second organization can also persist BPO as its explicit user default')
       await assert.rejects(shortlinks.saveShortLinkDefaultDomain(serviceActor, 'bpo'),
         (error) => error?.status === 403)
       assert.equal(await shortlinks.readShortLinkDefaultDomain(serviceActor), 'eigenracing')
@@ -250,20 +258,55 @@ async function main() {
       await assert.rejects(shortlinks.saveShortLinkDefaultDomain(actor({ organizationId: '44444444-4444-4444-8444-444444444444' }), 'eigenracing'),
         (error) => error?.status === 403)
       process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY = '0'
-      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'eigenracing',
-        'Saved BPO choice falls back while its route is unavailable')
-      const savedPreference = await pool.query(`SELECT short_link_default_domain FROM app_user_workspace_preferences
-        WHERE user_email = $1 AND workspace_organization_id = $2::uuid`, [sameEmail, orgA])
-      assert.equal(savedPreference.rows[0].short_link_default_domain, 'bpo', 'Unavailable domain does not erase saved choice')
+      for (const organizationId of [orgA, orgB]) {
+        assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId })), 'eigenracing',
+          'Saved BPO choices in every organization fall back while the route is unavailable')
+        const savedPreference = await pool.query(`SELECT short_link_default_domain FROM app_user_workspace_preferences
+          WHERE user_email = $1 AND workspace_organization_id = $2::uuid`, [sameEmail, organizationId])
+        assert.equal(savedPreference.rows[0].short_link_default_domain, 'bpo', 'Unavailable domain does not erase saved choice')
+      }
       process.env.SHORTLINK_BPO_PUBLIC_ROUTE_READY = '1'
       assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'bpo')
+      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'bpo')
+
+      const bpoLinks = new Map()
+      for (const [organizationId, slug] of [[orgA, 'bpo-scope-a'], [orgB, 'bpo-scope-b']]) {
+        const link = await shortlinks.createShortLink(actor({ organizationId }), {
+          destinationUrl: 'https://destination.example.test', publicDomain: 'bpo', slug,
+        })
+        assert.equal(link.publicDomain, 'bpo')
+        bpoLinks.set(organizationId, link)
+      }
+      for (const [organizationId, otherOrganizationId] of [[orgA, orgB], [orgB, orgA]]) {
+        const ownLink = bpoLinks.get(organizationId)
+        const otherLink = bpoLinks.get(otherOrganizationId)
+        const visibleIds = await listIds(actor({ organizationId }))
+        assert.ok(visibleIds.includes(ownLink.id))
+        assert.ok(!visibleIds.includes(otherLink.id), 'All-organization domain availability does not broaden link visibility')
+        for (const manageOrganization of [false, true]) {
+          const who = actor({ organizationId, manageOrganization })
+          await assert.rejects(shortlinks.updateShortLink(who, { id: otherLink.id, title: 'cross-org-bpo' }),
+            (error) => error?.status === 404)
+          await assert.rejects(shortlinks.deleteShortLink(who, otherLink.id),
+            (error) => error?.status === 404)
+        }
+        assert.equal((await shortlinks.updateShortLink(actor({ organizationId }),
+          { id: ownLink.id, title: `owned-${organizationId}` })).title, `owned-${organizationId}`)
+      }
+      const retainedBpoLinks = await pool.query('SELECT id::text, title, deleted_at FROM short_links WHERE id = ANY($1::uuid[])',
+        [[...bpoLinks.values()].map((link) => link.id)])
+      assert.equal(retainedBpoLinks.rows.length, 2)
+      assert.ok(retainedBpoLinks.rows.every((link) => link.deleted_at === null && link.title.startsWith('owned-')),
+        'Denied cross-organization mutations leave both BPO links intact')
 
       process.env.CLAWPILOT_PUBLIC_URL = 'https://aiapp.eigenracing.com'
       process.env.CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON = JSON.stringify(['https://aiapp.bposupplychain.com', 'https://dev.aiapp.bposupplychain.com'])
       const organizationPreferences = loadOrganizationPreferences(pool)
       const admin = { email: sameEmail, organizationId: orgA, role: 'admin' }
-      const domains = shortlinks.availableShortLinkDomains(actor())
-      const save = (changes = {}, user = admin) => organizationPreferences.saveOrganizationWebPreferences(user, { appDomain: 'bpo', shortLinkDomain: 'bpo', allowUserShortLinkOverride: true, revision: 0, ...changes }, domains)
+      const adminB = { ...admin, organizationId: orgB }
+      const save = (changes = {}, user = admin) => organizationPreferences.saveOrganizationWebPreferences(user,
+        { appDomain: 'bpo', shortLinkDomain: 'bpo', allowUserShortLinkOverride: true, revision: 0, ...changes },
+        shortlinks.availableShortLinkDomains(actor({ organizationId: user.organizationId })))
       assert.equal((await organizationPreferences.readOrganizationWebPreferences(orgA)).appDomain, 'bpo')
       assert.equal(await organizationPreferences.organizationAppPublicUrl(orgA), 'https://aiapp.bposupplychain.com')
       assert.ok(organizationPreferences.availableOrganizationAppDomains().every((choice) => !choice.url.includes('dev.')), 'Never expose a different environment app host')
@@ -291,6 +334,25 @@ async function main() {
       await save({ revision: 2, shortLinkDomain: 'eigenracing' })
       assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'eigenracing', 'Inherited default follows subsequent admin changes')
       assert.equal((await organizationPreferences.readOrganizationWebPreferences(orgB)).revision, 0, 'Other organization settings remain untouched')
+      const orgABeforeBUpdates = await organizationPreferences.readOrganizationWebPreferences(orgA)
+      const lockedB = await save({ appDomain: 'eigenracing', shortLinkDomain: 'eigenracing', allowUserShortLinkOverride: false }, adminB)
+      assert.equal(lockedB.revision, 1)
+      assert.equal(await organizationPreferences.organizationAppPublicUrl(orgB), 'https://aiapp.eigenracing.com')
+      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'eigenracing',
+        'The second organization administrator can independently lock its saved BPO user preference to Eigen')
+      await assert.rejects(save({}, adminB), (error) => error.status === 409,
+        'The second organization has its own optimistic revision fence')
+      assert.deepEqual(await organizationPreferences.readOrganizationWebPreferences(orgA), orgABeforeBUpdates,
+        'Saving the second organization does not change the first organization settings')
+      const restoredB = await save({ revision: 1 }, adminB)
+      assert.equal(restoredB.revision, 2)
+      assert.equal(restoredB.appDomain, 'bpo')
+      assert.equal(restoredB.shortLinkDomain, 'bpo')
+      assert.equal(await organizationPreferences.organizationAppPublicUrl(orgB), 'https://aiapp.bposupplychain.com')
+      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor({ organizationId: orgB })), 'bpo',
+        'The second organization administrator can independently restore BPO and its saved user default')
+      assert.equal(await shortlinks.readShortLinkDefaultDomain(actor()), 'eigenracing')
+      assert.deepEqual(await organizationPreferences.readOrganizationWebPreferences(orgA), orgABeforeBUpdates)
       process.env.CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON = '[]'
       assert.equal(await organizationPreferences.organizationAppPublicUrl(orgA), 'https://aiapp.eigenracing.com', 'Unavailable saved BPO address falls back without changing preference')
       assert.equal((await organizationPreferences.readOrganizationWebPreferences(orgA)).appDomain, 'bpo')
