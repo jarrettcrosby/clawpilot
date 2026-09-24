@@ -175,3 +175,5 @@ The active endpoints are `/api/crm`, `/api/crm/actions`, `/api/crm/data-transfer
 ## Operations
 
 Use the [SuiteCRM Railway runbook](../operations/suitecrm.md) for service variables, volume, worker, migration, and rollback checks. Use [Pipeline and synchronization](pipeline-and-sync.md) for Google provisioning and workbook access.
+
+The [Fractional CRM gateway](fractional-crm-gateway.md) documents the separately scoped machine integration, disabled-by-default configuration, conditional company/contact updates, and atomic onboarding rules. Its local source acceptance does not establish hosted activation.
