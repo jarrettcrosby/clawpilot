@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { isFractionalCrmGatewayPath } from '../app_src/lib/fractionalCrmGatewayPath.mjs'
 
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
@@ -60,6 +61,7 @@ const proxy = load('app_src/proxy.ts', {
   'next/server': { NextResponse }, '@/lib/authAttribution': { createAuthAttributionHeaders: () => ({}) }, '@/lib/authSessions': authSessions,
   '@/lib/workerAuth': { resolveAgentDispatchWorker: async () => worker }, '@/lib/demoMode': { demoMutationIsRestricted: () => false },
   '@/lib/bpoShortlinkPublicPath.mjs': { isPublicBpoShortlinkResolvePath: (path) => path.startsWith('/api/shortlinks/bpo/resolve/') },
+  '@/lib/fractionalCrmGatewayPath.mjs': { isFractionalCrmGatewayPath },
   '@/lib/moduleAuthorization': authorization, '@/lib/workspaceMemberships': workspace,
 }).proxy
 const mapped = {
