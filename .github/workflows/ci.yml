@@ -75,6 +75,13 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Fractional scoped gateway PostgreSQL and HTTP acceptance
+        env:
+          CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
+          CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: 256m
+          CLAWPILOT_TEST_POSTGRES_CPUS: '1'
+        run: npm run test:fractional-crm-gateway
+
       - name: Tests
         run: npm run test
 

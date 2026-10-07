@@ -1563,7 +1563,9 @@ async function seedCapturedRead(client, ids, envelope) {
     )
     await client.query(
       `WITH policy_clock AS (
-         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+         -- This fixture uses a fixed historical observation timestamp. Freeze its
+         -- immutable history policy at the same time so it cannot age out.
+         SELECT $5::timestamptz AS value
        )
        INSERT INTO operations_commerce_order_history_policies (
          organization_id, integration_account_id, provider, history_mode,
@@ -1579,6 +1581,7 @@ async function seedCapturedRead(client, ids, envelope) {
         ids.integrationAccount,
         ids.faireIntegrationAccount,
         actorEmail,
+        observedAt,
       ],
     )
     await client.query(
