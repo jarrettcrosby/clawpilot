@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import vm from "node:vm";
 import { isPublicBpoShortlinkResolvePath } from "../app_src/lib/bpoShortlinkPublicPath.mjs";
+import { isFractionalCrmGatewayPath } from "../app_src/lib/fractionalCrmGatewayPath.mjs";
 
 const root = process.cwd();
 const requireFromApp = createRequire(
@@ -116,6 +117,9 @@ function loadProxy({ session = null, actor = null, membershipError = false } = {
         }
         if (specifier === "@/lib/bpoShortlinkPublicPath.mjs") {
           return { isPublicBpoShortlinkResolvePath };
+        }
+        if (specifier === "@/lib/fractionalCrmGatewayPath.mjs") {
+          return { isFractionalCrmGatewayPath };
         }
         if (specifier === "@/lib/moduleAuthorization") return moduleAuthorization;
         if (specifier === "@/lib/workspaceMemberships") {
@@ -480,6 +484,35 @@ try {
   assert.equal(bpoPost.status, 401);
   assert.equal(bpoSibling.status, 401);
   assert.equal(proxyRuntime.sessionCalls(), 3, "BPO resolver methods and sibling paths must not bypass browser sessions");
+
+  const gatewayRuntime = loadProxy();
+  const gatewayBase = "/api/integrations/fractional-crm/v1";
+  for (const [path, method] of [
+    ["/companies/ga0000002", "GET"],
+    ["/companies/ga0000002", "PATCH"],
+    ["/companies/ga0000002/contacts", "GET"],
+    ["/companies/ga0000002/contacts/gc0000003", "GET"],
+    ["/companies/ga0000002/contacts/gc0000003", "PATCH"],
+    ["/onboarding/resolve-or-create", "POST"],
+  ]) {
+    const response = await gatewayRuntime.proxy({ ...proxyRequest(gatewayBase + path), method });
+    assert.equal(response.kind, "next", `${method} ${path} must reach independent gateway authentication`);
+  }
+  assert.equal(gatewayRuntime.sessionCalls(), 0, "Exact gateway methods must not acquire browser sessions");
+  const deniedGatewayPaths = [
+    ["/companies/ga0000002/", "GET"],
+    ["/companies/ga0000002/extra", "GET"],
+    ["/companies/gc0000003", "GET"],
+    ["/companies/ga0000002", "POST"],
+    ["/companies/ga0000002", "DELETE"],
+    ["/onboarding/resolve-or-create", "GET"],
+    ["/onboarding/resolve-or-create/extra", "POST"],
+  ];
+  for (const [path, method] of deniedGatewayPaths) {
+    const response = await gatewayRuntime.proxy({ ...proxyRequest(gatewayBase + path), method });
+    assert.equal(response.status, 401, `${method} ${path} must retain browser authentication`);
+  }
+  assert.equal(gatewayRuntime.sessionCalls(), deniedGatewayPaths.length);
 
   const session = {
     id: "permission-test-session",
