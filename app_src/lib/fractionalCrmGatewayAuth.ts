@@ -65,6 +65,21 @@ export function fractionalCrmCredentialId(token: string): string {
   return id
 }
 
+function hasFractionalCrmGatewayOrigin(request: Request, origin: string): boolean {
+  const url = new URL(request.url)
+  if (url.origin === origin) return true
+  // Next constructs initURL from the configured bind address (0.0.0.0) and
+  // forwarded protocol on Railway. Accept that internal URL only when both
+  // public host headers exactly match the configured HTTPS gateway. Never
+  // substitute a forwarded origin for another public host or infer a default.
+  const host = new URL(origin).host
+  return url.protocol === 'https:' && url.hostname === '0.0.0.0' && url.port !== ''
+    && !url.username && !url.password
+    && request.headers.get('host') === host
+    && request.headers.get('x-forwarded-host') === host
+    && request.headers.get('x-forwarded-proto') === 'https'
+}
+
 export async function authenticateFractionalCrmGateway(
   request: Request,
   config: FractionalCrmGatewayConfiguration,
@@ -72,7 +87,7 @@ export async function authenticateFractionalCrmGateway(
   capability: FractionalCrmCapability,
   now = Date.now(),
 ): Promise<FractionalCrmPrincipal> {
-  if (new URL(request.url).origin !== config.origin) throw new FractionalCrmGatewayError(403, 'ORIGIN_DENIED')
+  if (!hasFractionalCrmGatewayOrigin(request, config.origin)) throw new FractionalCrmGatewayError(403, 'ORIGIN_DENIED')
   // A machine request carries no ambient browser authority or cross-site context.
   if (request.headers.has('cookie') || request.headers.has('origin') || request.headers.has('sec-fetch-site')) {
     throw new FractionalCrmGatewayError(403, 'MACHINE_REQUEST_REQUIRED')
