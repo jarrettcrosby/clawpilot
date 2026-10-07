@@ -80,7 +80,10 @@ jobs:
           CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
           CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: 256m
           CLAWPILOT_TEST_POSTGRES_CPUS: '1'
-        run: npm run test:fractional-crm-gateway
+        run: |
+          docker pull pgvector/pgvector:pg16
+          docker image inspect pgvector/pgvector:pg16 --format '{{json .RepoDigests}}'
+          npm run test:fractional-crm-gateway
 
       - name: Tests
         run: npm run test
