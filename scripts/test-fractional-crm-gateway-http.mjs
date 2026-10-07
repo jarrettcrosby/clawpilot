@@ -97,6 +97,56 @@ test('pure company read authenticates each call and returns private no-store res
   assert.equal((await app.request()).status, 401)
   assert.equal(app.lookups.length, 2); assert.equal(app.calls.length, 1)
 })
+test('Next adapts a proxied Railway request with the bind URL and exact HTTPS public host', async () => {
+  const { NextRequestAdapter } = require('next/dist/server/web/spec-extension/adapters/next-request')
+  const { addRequestMeta } = require('next/dist/server/request-meta')
+  const path = `${base}/companies/${company}?${new URLSearchParams(scope)}`
+  const nodeRequest = { method: 'GET', url: path, headers: {
+    authorization: `Bearer ${token}`, host: new URL(origin).host,
+    'x-forwarded-host': new URL(origin).host, 'x-forwarded-proto': 'https',
+  } }
+  addRequestMeta(nodeRequest, 'initURL', `https://0.0.0.0:8080${path}`)
+  const request = NextRequestAdapter.fromNodeNextRequest(nodeRequest, new AbortController().signal)
+  assert.equal(new URL(request.url).origin, 'https://0.0.0.0:8080')
+  const app = harness()
+  assert.equal((await http.handleFractionalCrmGateway(request, app.services, env)).status, 200)
+  assert.equal(app.lookups.length, 1); assert.equal(app.calls[0].name, 'readFractionalCrmCompany')
+})
+test('proxy headers cannot admit another public host, insecure URL or missing/conflicting metadata', async () => {
+  const host = new URL(origin).host
+  const valid = { host, 'x-forwarded-host': host, 'x-forwarded-proto': 'https' }
+  for (const [requestOrigin, headers] of [
+    ['https://other.example.invalid', valid], ['https://127.0.0.1:8080', valid],
+    ['http://0.0.0.0:8080', valid], ['https://0.0.0.0', valid],
+    ['https://0.0.0.0:8080', {}],
+    ...['host', 'x-forwarded-host', 'x-forwarded-proto'].flatMap(key =>
+      ['', 'other.example.invalid', 'http', `${valid[key]}, ${valid[key]}`].map(value =>
+        ['https://0.0.0.0:8080', { ...valid, [key]: value }])),
+  ]) {
+    const app = harness(), response = await app.request(undefined, { origin: requestOrigin, headers })
+    assert.equal(response.status, 403, `${requestOrigin} ${JSON.stringify(headers)}`)
+    assert.equal((await response.json()).error, 'ORIGIN_DENIED')
+    assert.equal(app.lookups.length, 0); assert.equal(app.calls.length, 0)
+  }
+})
+test('proxied gateway requests still require machine context, credentials, capability and exact tenant scope', async () => {
+  const host = new URL(origin).host
+  const proxy = { host, 'x-forwarded-host': host, 'x-forwarded-proto': 'https' }
+  for (const headers of [{ cookie: 'session=anything' }, { origin }, { 'sec-fetch-site': 'same-origin' }, { authorization: '' }]) {
+    const app = harness(), response = await app.request(undefined, { origin: 'https://0.0.0.0:8080', headers: { ...proxy, ...headers } })
+    assert.ok([401, 403].includes(response.status)); assert.equal(app.lookups.length, 0); assert.equal(app.calls.length, 0)
+  }
+  const revoked = harness({ row: fixture({ revokedAt: new Date() }) })
+  assert.equal((await revoked.request(undefined, { origin: 'https://0.0.0.0:8080', headers: proxy })).status, 401)
+  assert.equal(revoked.calls.length, 0)
+  const limited = harness({ row: fixture({ capabilities: ['crm.onboarding.write'] }) })
+  assert.equal((await limited.request(undefined, { origin: 'https://0.0.0.0:8080', headers: proxy })).status, 403)
+  assert.equal(limited.calls.length, 0)
+  const otherTenant = harness()
+  assert.equal((await otherTenant.request(undefined, { origin: 'https://0.0.0.0:8080', headers: proxy,
+    query: new URLSearchParams({ ...scope, pipelineId: 'other' }).toString() })).status, 403)
+  assert.equal(otherTenant.calls.length, 0)
+})
 test('unknown, expired, disabled, revoked, malformed and mismatched credentials fail without data access', async () => {
   for (const row of [null, fixture({ tokenHash: '0'.repeat(64) }), fixture({ tokenHash: 'invalid' }), fixture({ enabled: false }),
     fixture({ revokedAt: '2020-01-01' }), fixture({ expiresAt: '2020-01-01' }), fixture({ expiresAt: 'invalid' }),
