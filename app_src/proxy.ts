@@ -14,6 +14,7 @@ import {
 import { resolveAgentDispatchWorker } from '@/lib/workerAuth'
 import { demoMutationIsRestricted } from '@/lib/demoMode'
 import { isPublicBpoShortlinkResolvePath } from '@/lib/bpoShortlinkPublicPath.mjs'
+import { isFractionalCrmGatewayPath } from '@/lib/fractionalCrmGatewayPath.mjs'
 import { ModuleAccessError, requiredModulesForApiPath, requireModuleAccess } from '@/lib/moduleAuthorization'
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
@@ -88,6 +89,7 @@ function isPublicApi(pathname: string, method: string) {
     || normalizedPath === '/api/operations/print-agent/pair'
     || normalizedPath === '/api/shortlinks'
     || isPublicBpoShortlinkResolvePath(normalizedPath, method)
+    || isFractionalCrmGatewayPath(pathname, method)
     || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')
   )

@@ -117,6 +117,8 @@ export type StageOrganizationInput = CommonStageInput & {
 
 export type StageContactInput = CommonStageInput & {
   entity: 'contacts'
+  /** Explicit gateway creation must never resolve or overwrite an existing identity. */
+  createOnly?: boolean
   fields: {
     organizationId?: string | null
     organizationSuiteCrmId?: string | null
@@ -146,6 +148,8 @@ export type StageContactInput = CommonStageInput & {
     emailOptOut?: boolean
     pipelineUser?: boolean
   }
+  /** Internal conditional gateway updates retain the locked record's owner metadata. */
+  preserveOwner?: boolean
 }
 
 export type StageProductInput = CommonStageInput & {
@@ -1082,7 +1086,7 @@ async function stageContact(
         $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26,
         'pending', NULL, $27, $27, COALESCE($28::boolean, false), $29, $30, $31
       )
-      ON CONFLICT (pipeline_id, identity_key) DO UPDATE SET
+      ON CONFLICT (pipeline_id, identity_key) ${input.createOnly ? 'DO NOTHING' : `DO UPDATE SET
         organization_id = EXCLUDED.organization_id,
         suitecrm_id = COALESCE(crm_contacts.suitecrm_id, EXCLUDED.suitecrm_id),
         source_key = EXCLUDED.source_key,
@@ -1115,7 +1119,7 @@ async function stageContact(
         sync_status = CASE WHEN crm_contacts.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN 'pending' ELSE crm_contacts.sync_status END,
         sync_error = CASE WHEN crm_contacts.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN NULL ELSE crm_contacts.sync_error END,
         updated_by = EXCLUDED.updated_by,
-        updated_at = now()
+        updated_at = now()`}
       RETURNING id::text, suitecrm_id, reference_code
     `,
     [
@@ -1129,6 +1133,7 @@ async function stageContact(
       nullable(fields.ownerUserReferenceCode), nullable(fields.ownerEmail), nullable(fields.ownerDisplayName),
     ],
   )
+  if (!result.rows[0]) throw new Error('CRM contact identity already exists; select the existing contact')
   return applyAppUserContactIdentity(
     client,
     result.rows[0],
@@ -2076,7 +2081,11 @@ async function normalizeStageCrmRecordInput(
   client: PoolClient,
   input: StageCrmRecordInput,
 ): Promise<StageCrmRecordInput> {
+  if (input.entity === 'contacts' && input.createOnly && input.localId) {
+    throw new Error('Create-only CRM contact persistence cannot target an existing record')
+  }
   if (input.entity === 'contacts') {
+    if (input.preserveOwner) return input
     return normalizeStageContactOwner(client, input)
   }
   if (input.entity === 'opportunities') {
@@ -2275,7 +2284,7 @@ export function stageCrmRecordWithClient(
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
   let input = await normalizeStageCrmRecordInput(client, rawInput)
   let contactAliases: ContactStageResolution['aliases'] = []
-  if (input.entity === 'contacts') {
+  if (input.entity === 'contacts' && !input.createOnly) {
     const contactResolution = await resolveContactStageIdentity(client, input)
     input = contactResolution.input
     contactAliases = contactResolution.aliases
