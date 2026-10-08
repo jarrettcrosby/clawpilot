@@ -1,0 +1,190 @@
+[
+  {
+    "id": "index",
+    "title": "ClawPilot platform",
+    "type": "Architecture",
+    "summary": "An authenticated application coordinates durable workspace data, operator-managed pipeline rows and narrowly scoped provider integrations.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Different systems own different facts",
+        "text": "Postgres owns app records and durable jobs. Google Sheets remains the writable pipeline operator table; SuiteCRM is a CRM projection. Providers own their delivered mail, calendar events and posted accounting transactions."
+      },
+      {
+        "title": "Documentation, not live discovery",
+        "text": "This source-reviewed map does not measure deployment health or prove provider-write enablement. Global architecture is restricted to the configured platform owner outside impersonation."
+      }
+    ],
+    "sources": [
+      { "path": "docs/maps/platform-data-map.md", "symbol": "Authority By Data Type" },
+      { "path": "docs/maps/platform-data-map.md", "symbol": "Synchronization Graph" },
+      { "path": "app_src/lib/crm/worker.ts", "symbol": "processSuiteCrmOutbox" },
+      { "path": "app_src/lib/integrations/googleWorkspaceClient.ts", "symbol": "GoogleWorkspaceClient" },
+      { "path": "app_src/lib/architectureViewer.ts", "symbol": "requireArchitectureAccess" }
+    ]
+  },
+  {
+    "id": "orders",
+    "title": "Commerce order intake",
+    "type": "Flowchart",
+    "summary": "Commerce candidates retain provider history and pass resolution and promotion gates before becoming canonical orders for warehouse planning.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Readiness comes before execution",
+        "text": "Customer, product, address, delivery and source-evidence blockers must clear before canonical import. Warehouse release, complete picks, packing and verified label evidence remain separate gates."
+      },
+      {
+        "title": "Shipment is not provider acknowledgment",
+        "text": "Provider fulfillment export is a separate durable outcome and can fail after local shipment confirmation. Universal live carrier dispatch is not complete: successful active-dispatch materialization still rejects with an explicit implementation gap."
+      }
+    ],
+    "sources": [
+      { "path": "app_src/lib/integrations/commerceIntake.ts", "symbol": "executeCommerceIntakeCommand" },
+      { "path": "app_src/lib/persistence/commerceIntake.ts", "symbol": "validateCommerceCandidateInPostgres" },
+      { "path": "app_src/lib/persistence/commerceIntake.ts", "symbol": "promoteCommerceCandidateInPostgres" },
+      { "path": "app_src/lib/persistence/operations.ts", "symbol": "releaseOperationsOrderFromPostgres" },
+      { "path": "app_src/lib/persistence/operations.ts", "symbol": "confirmOperationsOrderPicksFromPostgres" },
+      { "path": "app_src/lib/persistence/operations.ts", "symbol": "verifyOperationsOrderPackFromPostgres" },
+      { "path": "app_src/lib/persistence/operations.ts", "symbol": "confirmOperationsOrderShipmentFromPostgres" },
+      { "path": "app_src/lib/persistence/operations.ts", "symbol": "executeOperationsCommerceFulfillmentExportFromPostgres" },
+      { "path": "app_src/lib/operations/activeCarrierDispatchPersistence.ts", "symbol": "finalizeActiveCarrierDispatchAttemptInPostgres" }
+    ]
+  },
+  {
+    "id": "accounting",
+    "title": "Toast to QuickBooks",
+    "type": "Flowchart",
+    "summary": "Read-only Toast evidence and scoped QuickBooks references support accounting drafts, readiness review, approved posting or exact external-posting acknowledgment.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "A draft does not post",
+        "text": "Mappings and draft regeneration are preparation only. Posting requires source readiness, a current approved fingerprint, a verified connection and enabled write policy; deployed enablement is not inferred from this map."
+      },
+      {
+        "title": "Existing postings require exact evidence",
+        "text": "External acknowledgment records existing same-date QuickBooks documents only after exact draft parity checks. It sends no new posting, and calculated card settlement does not establish a verified bank deposit."
+      }
+    ],
+    "sources": [
+      { "path": "app_src/lib/toastSyncWorker.ts", "symbol": "refreshAccountingState" },
+      { "path": "app_src/lib/quickBooksSyncWorker.ts", "symbol": "processQuickBooksSyncOutbox" },
+      { "path": "app_src/lib/persistence/posAccounting.ts", "symbol": "regeneratePosAccountingDraftInPostgres" },
+      { "path": "app_src/lib/persistence/posAccounting.ts", "symbol": "evaluatePosAccountingReadiness" },
+      { "path": "app_src/lib/persistence/posAccountingPosting.ts", "symbol": "approvePosAccountingPostingBatchInPostgres" },
+      { "path": "app_src/lib/quickBooksWriteWorker.ts", "symbol": "processQuickBooksWriteOutbox" },
+      { "path": "app_src/lib/persistence/posAccountingPosting.ts", "symbol": "recordExternalPostingInPostgres" },
+      { "path": "app_src/lib/persistence/posAccountingParity.ts", "symbol": "buildPosAccountingParityReport" }
+    ]
+  },
+  {
+    "id": "email",
+    "title": "CRM email lifecycle",
+    "type": "Architecture",
+    "summary": "Reviewed sender selections and selected Gmail polling connect customer correspondence to permanent CRM references, durable interactions and guarded projections.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Authentication messages stay out of CRM",
+        "text": "Confirmed ClawPilot and Career Desk sign-in notices are skipped before storage using exact sender, subject and producer-header or full-template evidence. Replies, forwards and ordinary customer code discussions remain eligible."
+      },
+      {
+        "title": "Identity and association are rechecked",
+        "text": "Outbound delivery rechecks the reviewed organization/default or actor-owned sender. Polling uses the owner's selected mailbox; ambiguous participant matches remain unlinked. Durable intent is not a guarantee of exactly-once external delivery."
+      }
+    ],
+    "sources": [
+      { "path": "app_src/lib/crm/integrationActions.ts", "symbol": "prepareAction" },
+      { "path": "app_src/lib/crm/integrationActions.ts", "symbol": "verifiedGmailSelectionForAction" },
+      { "path": "app_src/lib/crm/integrationActions.ts", "symbol": "sendEmailAction" },
+      { "path": "app_src/lib/crm/emailIngestion.ts", "symbol": "selectedMailboxes" },
+      { "path": "app_src/lib/crm/emailIngestion.ts", "symbol": "isClawPilotAuthEmail" },
+      { "path": "app_src/lib/crm/emailIngestion.ts", "symbol": "participantEmailTargets" },
+      { "path": "app_src/lib/crm/emailIngestion.ts", "symbol": "processMessage" },
+      { "path": "app_src/lib/persistence/crm.ts", "symbol": "stageCrmRecordWithClient" },
+      { "path": "app_src/lib/globalIds.mjs", "symbol": "normalizeGlobalId" }
+    ]
+  },
+  {
+    "id": "meetings",
+    "title": "Meetings and Calendar",
+    "type": "Sequence",
+    "summary": "A canonical CRM meeting and reviewed Calendar identity coordinate invitations, mode-specific join details and guarded bidirectional reconciliation.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Calendar delivery is explicit",
+        "text": "Selection uses an organization default or a verified actor-owned writable calendar. Without a configured Calendar connection, a local meeting may remain unsent. Google Meet is requested only for Meet mode; in-person and custom-link modes keep their own requirements."
+      },
+      {
+        "title": "Preserve identity and unsent intent",
+        "text": "Native edits retain the original delivered Calendar identity. Reverse sync reads linked events only and defers matching unresolved outbound updates; inaccessible or missing events do not prove cancellation."
+      }
+    ],
+    "sources": [
+      { "path": "app_src/components/crm/CrmSection.tsx", "symbol": "meetingCalendarChoices" },
+      { "path": "app_src/lib/integrations/organizationCommunications.ts", "symbol": "resolveVerifiedPipelineCalendarSelection" },
+      { "path": "app_src/lib/persistence/organizationCommunications.ts", "symbol": "resolvePipelineCommunicationSnapshotInPostgres" },
+      { "path": "app_src/lib/crm/integrationActions.ts", "symbol": "stageCrmMeetingAndEnqueueCalendarAction" },
+      { "path": "app_src/lib/crm/integrationActions.ts", "symbol": "createCalendarEventAction" },
+      { "path": "app_src/lib/crm/suiteCrmMeetingIngestion.ts", "symbol": "reconcileMeeting" },
+      { "path": "app_src/lib/crm/calendarIngestion.ts", "symbol": "hasUnresolvedCalendarAction" },
+      { "path": "app_src/lib/crm/calendarIngestion.ts", "symbol": "pollRecordedCalendar" },
+      { "path": "app_src/app/api/crm/route.ts", "symbol": "POST" }
+    ]
+  },
+  {
+    "id": "access",
+    "title": "Workspace and module access",
+    "type": "Flowchart",
+    "summary": "Active direct membership determines scoped permissions; session capabilities filter the shell while server module gates and resource access checks protect data and actions.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Sidebar visibility is not authorization",
+        "text": "The shell denies missing or malformed capability payloads and refreshes after workspace changes. API module checks and resource editor/viewer rules remain separate; Pipeline and CRM share one view permission."
+      },
+      {
+        "title": "Architecture has a stricter boundary",
+        "text": "Global architecture requires the active configured platform owner with no impersonation or identity mismatch. Organization-admin roles and the synthetic local-development user do not grant access; authorization precedes private artifact reads."
+      }
+    ],
+    "sources": [
+      { "path": "app_src/lib/workspaceMemberships.ts", "symbol": "requireWorkspaceAppUser" },
+      { "path": "app_src/lib/users.ts", "symbol": "effectiveUserPermissions" },
+      { "path": "app_src/lib/moduleAccess.ts", "symbol": "moduleAccessFromPermissions" },
+      { "path": "app_src/lib/moduleAuthorization.ts", "symbol": "requireRequestModuleAccess" },
+      { "path": "app_src/app/HomeClient.tsx", "symbol": "receiveSession" },
+      { "path": "app_src/components/Navigation.tsx", "symbol": "NavigationList" },
+      { "path": "app_src/lib/tenancy.ts", "symbol": "requireResourceEditor" },
+      { "path": "app_src/lib/architectureViewer.ts", "symbol": "requireArchitectureAccess" }
+    ]
+  },
+  {
+    "id": "domains",
+    "title": "Domains and retained environments",
+    "type": "Architecture",
+    "summary": "The documented host contract routes two production app origins to the same ClawPilot application and retains isolated on-demand development; this is dated documentation, not live DNS or runtime verification.",
+    "reviewed": "2026-10-08",
+    "notes": [
+      {
+        "title": "Two hosts do not share a browser session",
+        "text": "The September 21, 2026 contract lists aiapp.eigenracing.com and aiapp.bposupplychain.com for the same production app. Cookies remain host-only; allowed browser returns preserve the chosen host while provider callbacks retain the canonical origin."
+      },
+      {
+        "title": "Suspended means retained, not deleted",
+        "text": "September 21, 2026 documentation records suspended development with services, domains, data and credentials retained for approved test sessions. The BPO website short-link bridge was staged, not publicly activated; current state requires independent verification."
+      }
+    ],
+    "sources": [
+      { "path": "docs/operations/bpo-public-domains.md", "symbol": "Host routing" },
+      { "path": "docs/operations/bpo-public-domains.md", "symbol": "Cookies remain host-only" },
+      { "path": "docs/operations/bpo-public-domains.md", "symbol": "BPO short-link rollout" },
+      { "path": "docs/operations/development-on-demand.md", "symbol": "Scope and preservation" },
+      { "path": "docs/operations/development-on-demand.md", "symbol": "Restart for a test session" },
+      { "path": "app_src/lib/publicUrl.ts", "symbol": "appBrowserReturnUrl" },
+      { "path": "app_src/lib/publicUrl.ts", "symbol": "appPublicUrl" }
+    ]
+  }
+]

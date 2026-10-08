@@ -65,7 +65,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Google Workspace integration](operations/google-workspace-integration.md)
 - [Owner login aliases and domain transition](auth-login-domain-transition.md) (current, vault-only operator contract)
 - [BPO public domains](operations/bpo-public-domains.md) (additive app hosts and branded short-link rollout)
-- [Local LikeC4 architecture views](architecture/clawpilot-likec4.md) (hand-maintained, local-only diagrams)
+- [Architecture and workflow diagrams](architecture/clawpilot-diagrams.md) (private root-owner Diagram Design views; static source-reviewed documentation)
 - [Infrastructure and cost control register](operations/infrastructure-and-cost-control-register.md)
 - [Railway Postgres backups](operations/railway-postgres-backups.md)
 - [Career Desk Maton LinkedIn source](operations/career-maton-linkedin.md)
@@ -124,6 +124,7 @@ These vault-only notes explain earlier environment or migration work. They are n
 - [Commerce workspace production migration](operations/commerce-workspace-production-migration.md) (historical DEV-to-PROD cutover plan; migration not currently authorized)
 - [Express Parcel development warehouse normalization](operations/express-parcel-development-warehouse-normalization.md) (historical one-time procedure for the retired Railway development database)
 - [System operating model](architecture/system-operating-model.md) (superseded compatibility pointer)
+- [Former LikeC4 architecture model](architecture/clawpilot-likec4.md) (superseded backlink pointer; Diagram Design is the only active renderer)
 - [Development contract](operations/development-contract.md) (superseded compatibility pointer)
 
 ## App Search Flow

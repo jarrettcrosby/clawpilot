@@ -10,9 +10,6 @@ node_modules/
 .railway/
 coverage/
 dist/
-tools/architecture/.likec4/
-tools/architecture/.vite/
-tools/architecture/.cache/
 app_src/server-assets/architecture/
 backups/
 *.tsbuildinfo

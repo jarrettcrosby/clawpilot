@@ -203,7 +203,7 @@
     "test:user-lifecycle-postgres": "node scripts/test-user-lifecycle-postgres.mjs",
     "test:user-lifecycle-ui": "node scripts/test-user-lifecycle-ui.mjs",
     "test:module-access": "node scripts/test-module-access-backend.mjs && node scripts/test-module-access-ui.mjs && node scripts/test-user-access-permissions-ui.mjs",
-    "test:architecture-viewer": "node scripts/build-architecture-viewer.mjs && node scripts/test-architecture-viewer.mjs && node scripts/test-architecture-viewer-ui.mjs",
+    "test:architecture-viewer": "node scripts/build-architecture-viewer.mjs && node scripts/test-architecture-diagrams.mjs && node scripts/test-architecture-viewer.mjs && node scripts/test-architecture-viewer-ui.mjs",
     "test:invitation-acceptance-postgres": "node scripts/test-invitation-acceptance-postgres.mjs",
     "test:auth-sessions": "node scripts/test-browser-session-security.mjs",
     "test:audit": "node scripts/test-audit-activity.mjs",

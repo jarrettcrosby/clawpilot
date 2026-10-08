@@ -16,6 +16,6 @@ This `docs/` folder is the local Obsidian vault. The enclosing [ClawPilot reposi
 - [Current product knowledge](index.md) — application-visible contracts and topic maps.
 - [Vault Map](README.md) — complete navigation, operator-only notes, and retained history.
 - [Environment and release contract](operations/clawpilot-environments.md) — current deployment boundaries and validation.
-- [Local architecture views](architecture/clawpilot-likec4.md) — hand-maintained LikeC4 diagrams; no runtime or public hosting.
+- [Architecture and workflow diagrams](architecture/clawpilot-diagrams.md) — private root-owner Diagram Design views; static source-reviewed documentation, not live health checks.
 
 New observations go to the [knowledge inbox](inbox/README.md) only until they can be reconciled with the owning contract. Historical records do not override current contracts.
