@@ -8,6 +8,6 @@ export async function GET(request: NextRequest) {
   try {
     await requireArchitectureAccess(request)
     const artifact = await readArchitectureManifest()
-    return Response.json({ ok: true, sourceHash: artifact.sourceHash, toolVersion: artifact.toolVersion, views: artifact.views }, { headers: architecturePrivateHeaders() })
+    return Response.json({ ok: true, sourceHash: artifact.sourceHash, renderer: artifact.renderer, toolVersion: artifact.toolVersion, views: artifact.views }, { headers: architecturePrivateHeaders() })
   } catch (error) { return architectureFailure(error) }
 }

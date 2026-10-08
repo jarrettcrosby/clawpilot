@@ -9,7 +9,7 @@ import { isRootAppOwner, requireActiveAppUser } from '@/lib/users'
 
 type ArchitectureManifest = {
   format: number; sourceHash: string; htmlHash: string; bytes: number
-  toolVersion: string; views: string[]
+  renderer: string; toolVersion: string; upstreamCommit: string; views: string[]
 }
 
 export class ArchitectureAccessError extends Error {
@@ -44,9 +44,13 @@ const artifactDirectory = path.join(process.cwd(), 'server-assets', 'architectur
 
 export async function readArchitectureManifest(): Promise<ArchitectureManifest> {
   const manifest = JSON.parse(await readFile(path.join(artifactDirectory, 'manifest.json'), 'utf8')) as ArchitectureManifest
-  if (manifest.format !== 1 || !/^[a-f0-9]{64}$/.test(manifest.sourceHash) || !/^[a-f0-9]{64}$/.test(manifest.htmlHash)
+  if (manifest.format !== 2 || manifest.renderer !== 'Diagram Design' || !/^[a-f0-9]{40}$/.test(manifest.upstreamCommit)
+    || !/^\d+\.\d+\.\d+$/.test(manifest.toolVersion)
+    || !/^[a-f0-9]{64}$/.test(manifest.sourceHash) || !/^[a-f0-9]{64}$/.test(manifest.htmlHash)
     || !Number.isInteger(manifest.bytes) || manifest.bytes < 1 || manifest.bytes > 20_000_000
-    || !Array.isArray(manifest.views) || !manifest.views.every((view) => /^[a-zA-Z][a-zA-Z0-9]*$/.test(view))) {
+    || !Array.isArray(manifest.views) || manifest.views.length < 1 || manifest.views.length > 16
+    || new Set(manifest.views).size !== manifest.views.length
+    || !manifest.views.every((view) => /^[a-zA-Z][a-zA-Z0-9]*$/.test(view))) {
     throw new Error('Invalid architecture artifact')
   }
   return manifest

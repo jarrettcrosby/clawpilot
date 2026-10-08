@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- Adapted from Diagram Design template-full.html; see NOTICE.md / LICENSE.diagram-design. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClawPilot architecture and workflows</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root { color-scheme: light; --paper:#F6F7FB; --surface:#FFFFFF; --ink:#20232B; --muted:#505866; --rule:#737D8D; --accent:#245CA6; --tint:#E7EFFB; --sans:-apple-system,BlinkMacSystemFont,"Inter","SF Pro Display",sans-serif; --mono:ui-monospace,Menlo,Consolas,monospace; --serif:Georgia,"Times New Roman",serif; }
+    :root[data-theme="dark"] { color-scheme:dark; --paper:#0F0F13; --surface:#1A1A23; --ink:#E4E1EC; --muted:#CAC4D0; --rule:#46464F; --accent:#A8C7FA; --tint:#232F44; }
+    body { margin:0; padding:24px; background:var(--paper); color:var(--ink); font-family:var(--sans); font-size:14px; line-height:1.55; }
+    .container { max-width:1200px; margin:auto; min-width:0; }
+    .toolbar { display:flex; align-items:end; flex-wrap:wrap; gap:16px; padding-bottom:24px; border-bottom:1px solid var(--rule); margin-bottom:32px; }
+    .field { flex:1 1 320px; min-width:0; } .field.theme { flex:0 1 160px; }
+    label { display:block; font-size:12px; font-weight:600; margin-bottom:8px; }
+    select { width:100%; min-height:44px; border:1px solid var(--rule); border-radius:6px; padding:8px 12px; font:inherit; color:var(--ink); background:var(--surface); }
+    :focus-visible { outline:2px solid var(--accent); outline-offset:4px; }
+    .eyebrow { color:var(--muted); font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; margin:0 0 8px; }
+    h1 { font-family:var(--serif); font-size:clamp(28px,4vw,36px); font-weight:400; line-height:1.2; margin:0 0 12px; }
+    .subtitle { max-width:80ch; color:var(--muted); margin:0; }
+    .header { margin-bottom:24px; }
+    .scroll-hint { color:var(--muted); font-size:12px; margin:0 0 8px; }
+    .diagram-container { width:100%; max-width:100%; min-width:0; overflow-x:auto; }
+    svg { display:block; width:100%; min-width:var(--canvas-width); }
+    svg text { fill:var(--ink); font-family:var(--sans); }
+    .edge { fill:none; stroke:var(--muted); stroke-width:1.2; }
+    .focal-edge { stroke:var(--accent); } .dashed { stroke-dasharray:5 4; }
+    .marker-arrow,.marker-link { fill:var(--muted); } .marker-accent { fill:var(--accent); }
+    .node > rect,.node > path { fill:var(--surface); stroke:var(--rule); stroke-width:1; }
+    .node.focal > rect,.node.focal > path { fill:var(--tint); stroke:var(--accent); stroke-width:1.2; }
+    .node.store > rect { fill:var(--surface); stroke:var(--muted); }
+    .node.external > rect { fill:var(--paper); }
+    .node-title { font-size:12px; font-weight:600; }
+    .node-detail { font-family:var(--mono); fill:var(--muted); font-size:9px; }
+    .tag { font-family:var(--mono); fill:var(--muted); font-size:8px; letter-spacing:.08em; }
+    .focal .tag { fill:var(--accent); }
+    .edge-label rect { fill:var(--paper); } .edge-label text { fill:var(--muted); font-family:var(--mono); font-size:8px; letter-spacing:.06em; }
+    .legend > line:not(.edge) { stroke:var(--rule); stroke-width:.8; } .legend text { fill:var(--muted); font-family:var(--mono); font-size:9px; }
+    .legend-focus { stroke:var(--accent); fill:var(--tint); }
+    .lifeline { stroke:var(--rule); stroke-dasharray:3 3; stroke-width:1; }
+    .activation { fill:var(--surface); stroke:var(--muted); stroke-width:.8; }
+    .callout { font-size:11px; fill:var(--muted); }
+    .diagram-note { color:var(--muted); font-size:13px; border-left:2px solid var(--accent); padding-left:12px; }
+    .cards { display:grid; grid-template-columns:1.1fr 1fr; gap:16px; margin-top:24px; }
+    .card { background:var(--surface); border:1px solid var(--rule); border-radius:6px; padding:20px; }
+    .card:first-child { border-left:3px solid var(--accent); }
+    .card h2 { font-size:14px; margin:0 0 8px; font-weight:600; } .card p { color:var(--muted); font-size:13px; margin:0; }
+    .sources { margin-top:24px; border-top:1px solid var(--rule); padding-top:16px; }
+    summary { min-height:44px; cursor:pointer; color:var(--muted); }
+    .sources ul { padding-left:20px; } .sources li { margin:12px 0; overflow-wrap:anywhere; }
+    code { font-family:var(--mono); font-size:11px; } .sources span { display:block; color:var(--muted); font-size:12px; }
+    footer { margin-top:24px; border-top:1px solid var(--rule); padding-top:16px; font-size:11px; color:var(--muted); }
+    [hidden] { display:none !important; }
+    @media(max-width:640px) { body { padding:16px; } .cards { grid-template-columns:1fr; } .toolbar { gap:12px; } }
+    @media print { .toolbar,.scroll-hint { display:none; } .diagram-container { overflow-x:visible; } svg { min-width:0; } body { padding:0; } }
+  </style>
+</head>
+<body>
+  <main class="container" id="diagram-design-root">
+    <div class="toolbar"><div class="field"><label for="diagram-select">Diagram</label><select id="diagram-select"><!-- DIAGRAM_OPTIONS --></select></div>
+      <div class="field theme"><label for="theme-select">Appearance</label><select id="theme-select"><option value="app">Match app</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div>
+    <!-- DIAGRAM_SECTIONS -->
+    <footer>Private platform-owner documentation · Diagram Design · Simplified, source-reviewed maps; not live health, deployment status, or provider-write authorization.</footer>
+    <noscript>JavaScript is disabled. The platform overview remains readable; diagram selection requires JavaScript.</noscript>
+  </main>
+  <!-- VIEWER_SCRIPT -->
+</body>
+</html>
