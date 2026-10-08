@@ -66,6 +66,7 @@ import ContextHelp from '@/components/ContextHelp'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
+import { crmRecordNavigationPath } from '@/lib/crm/recordNavigation.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import type {
   CrmEntity,
@@ -1012,6 +1013,9 @@ export default function CrmSection() {
     || actionComposer?.type === 'send_campaign'
   const meetingCalendarComposerOpen = actionComposer?.type === 'create_calendar_event'
   const meetingEditorOpen = editorEntity === 'meetings' && editorRecord !== undefined
+  const editorRecordPath = editorRecord
+    ? crmRecordNavigationPath(editorRecord.referenceCode, editorRecord.pipelineId || pipeline?.id)
+    : null
   const organizationDefaultEmailSender = useMemo<EmailSenderChoice | null>(() => {
     const senderEmail = providerIdentities.googleMail || ''
     if (providerIdentities.googleMailSource !== 'organization' || !senderEmail) return null
@@ -2642,11 +2646,11 @@ export default function CrmSection() {
                 >
                   {tableColumns.map(([key]) => (
                     <TableCell key={key}>
-                      {key === 'referenceCode' && record.shortUrl ? (
+                      {key === 'referenceCode' && crmRecordNavigationPath(record.referenceCode, record.pipelineId || pipeline?.id) ? (
                         <Link
-                          href={textValue(record, 'shortUrl')}
+                          href={crmRecordNavigationPath(record.referenceCode, record.pipelineId || pipeline?.id) || undefined}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           onClick={(event) => event.stopPropagation()}
                           underline="hover"
                         >
@@ -3225,12 +3229,12 @@ export default function CrmSection() {
           {editorRecord && Boolean(editorRecord.referenceCode) && (
             <Stack direction="row" gap={1} alignItems="center">
               <Chip label={textValue(editorRecord, 'referenceCode')} color="primary" variant="outlined" />
-              {editorRecord.shortUrl ? (
+              {editorRecordPath ? (
                 <Button
                   component="a"
-                  href={textValue(editorRecord, 'shortUrl')}
+                  href={editorRecordPath}
                   target="_blank"
-                  rel="noreferrer"
+                  rel="noopener noreferrer"
                   size="small"
                   endIcon={<OpenInNewRounded />}
                 >

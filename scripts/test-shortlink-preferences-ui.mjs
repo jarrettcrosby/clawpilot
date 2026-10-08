@@ -424,7 +424,69 @@ try {
   const viewer = crmPage.getByRole('dialog', { name: 'View Organization' })
   await expect(viewer.getByRole('alert')).toContainText('You have view-only access to this pipeline')
   await expect(viewer.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0)
+
+  // Published short URLs can belong to another domain. Neither internal link
+  // should use that URL, and clicking the row must still open the editor.
+  const pipelineId = '00000000-0000-4000-8000-000000000100'
+  const reference = 'gipebk1lgu9tk9'
+  const recordPath = `/crm/${reference}?pipeline=${pipelineId}`
+  for (const appOrigin of ['https://aiapp.bposupplychain.com', 'https://aiapp.eigenracing.com']) {
+    const navigationPage = await browser.newPage({ viewport: { width: 1100, height: 800 } })
+    navigationPage.on('pageerror', (error) => errors.push(error.message))
+    const interaction = {
+      id: 'interaction-1', referenceCode: reference, pipelineId,
+      shortUrl: `https://eigenracing.com/s/${reference}`,
+      subject: 'Existing customer email', interactionType: 'email',
+      description: 'Preserved email body', syncStatus: 'synced', occurredAt: now,
+    }
+    await navigationPage.context().route('**/*', async (route) => {
+      const url = new URL(route.request().url())
+      assert.equal(url.origin, appOrigin, 'Internal CRM navigation must not request a foreign origin')
+      if (url.pathname === '/api/workspaces') return route.fulfill({ json: {
+        ok: true, selectedPipelineId: pipelineId,
+        pipelines: [{ id: pipelineId, name: 'Customer pipeline', accessRole: 'owner' }],
+      } })
+      if (url.pathname === '/api/crm') return route.fulfill({ json: {
+        ok: true,
+        records: url.searchParams.get('entity') === 'interactions' ? [
+          interaction,
+          { ...interaction, id: 'invalid-reference', referenceCode: 'gi1234567/other' },
+          { ...interaction, id: 'without-short-url', referenceCode: 'gi1234567', shortUrl: null, pipelineId: null },
+        ] : [],
+        pipeline: { id: pipelineId, name: 'Customer pipeline', accessRole: 'owner' },
+      } })
+      if (url.pathname.startsWith('/api/')) return route.fulfill({ json: { ok: true } })
+      if (url.pathname === `/crm/${reference}`) return route.fulfill({
+        contentType: 'text/html', body: '<h1>Internal CRM destination</h1>',
+      })
+      const bundle = bundles.get(url.pathname)
+      return route.fulfill({
+        contentType: bundle ? 'text/javascript' : 'text/html',
+        body: bundle || '<!doctype html><div id="root"></div><script src="/crm.js"></script>',
+      })
+    })
+    await navigationPage.goto(`${appOrigin}/crm?mode=light`)
+    await navigationPage.getByRole('tab', { name: 'Interactions', exact: true }).click()
+    const recordLink = navigationPage.getByRole('link', { name: reference, exact: true })
+    await expect(recordLink).toHaveAttribute('href', recordPath)
+    await expect(navigationPage.getByRole('link', { name: 'gi1234567', exact: true })).toHaveAttribute('href', `/crm/gi1234567?pipeline=${pipelineId}`)
+    await expect(navigationPage.getByRole('link', { name: 'gi1234567/other', exact: true })).toHaveCount(0)
+    const [destination] = await Promise.all([
+      navigationPage.waitForEvent('popup'), recordLink.click(),
+    ])
+    await destination.waitForLoadState()
+    assert.equal(destination.url(), `${appOrigin}${recordPath}`)
+    await expect(navigationPage.getByRole('dialog', { name: 'Edit Interaction' })).toHaveCount(0)
+    await destination.close()
+    await navigationPage.getByText('Existing customer email', { exact: true }).first().click()
+    const interactionEditor = navigationPage.getByRole('dialog', { name: 'Edit Interaction' })
+    await expect(interactionEditor).toBeVisible()
+    await expect(interactionEditor.getByRole('link', { name: 'Open link', exact: true })).toHaveAttribute('href', recordPath)
+    await expect(interactionEditor.getByRole('link', { name: 'Open link', exact: true })).toHaveAttribute('rel', 'noopener noreferrer')
+    await navigationPage.close()
+  }
   assert.deepEqual(errors, [], 'No browser exceptions in CRM and settings acceptance')
+  console.log('CRM same-origin navigation acceptance passed on BPO and Eigen: interaction ID, new tab, editor link, pipeline context, missing short URL, and invalid reference')
   console.log('CRM/mobile light-mode acceptance passed: workspace load retry/switch failure, visible editor/composer errors, preserved drafts, retry identity, and success feedback')
 } finally {
   await browser?.close()
