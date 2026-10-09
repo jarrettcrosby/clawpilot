@@ -88,6 +88,9 @@ jobs:
       - name: Tests
         run: npm run test
 
+      - name: Managed workbook bootstrap PostgreSQL acceptance
+        run: npm run test:pipeline-workbook-postgres
+
       - name: Shopify test-store canonical E2E contract
         run: npm run test:shopify-test-store-canonical-e2e
 

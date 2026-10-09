@@ -151,7 +151,7 @@ export function shortLinkUrl(slug: string): string {
   return `${canonicalOrigin()}/s/${slug}`
 }
 
-function shortLinkUrlForDomain(slug: string, publicDomain: string | null): string {
+export function shortLinkUrlForDomain(slug: string, publicDomain: string | null): string {
   if (publicDomain === BPO_DOMAIN_KEY) return `${BPO_PUBLIC_ORIGIN}/s/${slug}`
   if (publicDomain === null) return shortLinkUrl(slug)
   throw new Error('Stored short-link domain is invalid')

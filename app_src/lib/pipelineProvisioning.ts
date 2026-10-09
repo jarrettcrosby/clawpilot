@@ -14,6 +14,7 @@ import {
 import {
   completePipelineProvisioningInPostgres,
   deletePipelineGooglePermissionTrackingInPostgres,
+  enqueuePipelineInitialCrmProjectionInPostgres,
   enqueuePipelineProvisioningInPostgres,
   markPipelineProvisioningStartedInPostgres,
   readPipelineGooglePermissionContextInPostgres,
@@ -36,6 +37,7 @@ import {
   type OrganizationBranding,
 } from '@/lib/organizationBranding'
 import { normalizeUserEmail } from '@/lib/users'
+import { enqueuePipelineGoogleShareNotificationInPostgres, pipelineShareRecipientHasVerifiedGoogleAccount } from '@/lib/persistence/pipelineShareNotifications'
 
 const DRIVE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
 const SHEET_MIME_TYPE = 'application/vnd.google-apps.spreadsheet'
@@ -428,6 +430,9 @@ export async function queuePipelineProvisioning(input: { actorEmail: unknown; pi
         expectedShortLinkId: pipeline.shortLinkId,
         shortLinkId,
       })
+    }
+    if (pipeline.googleServiceAccountEmail && pipeline.googleSharedDriveId) {
+      await enqueuePipelineInitialCrmProjectionInPostgres(pipeline.id)
     }
     return {
       outboxId: null,
@@ -2662,12 +2667,19 @@ async function createDrivePermission(
   resourceId: string,
   email: string,
   role: 'reader' | 'writer',
+  pipelineName: string,
 ) {
+  const knownGoogleAccount = await pipelineShareRecipientHasVerifiedGoogleAccount(email)
   const parameters = new URLSearchParams({
     supportsAllDrives: 'true',
-    sendNotificationEmail: 'true',
+    // Known Google accounts receive only ClawPilot's branded notice. Unknown
+    // addresses still need Google's visitor invitation to accept their access.
+    sendNotificationEmail: knownGoogleAccount ? 'false' : 'true',
     fields: 'id,type,role,emailAddress,permissionDetails(inherited,inheritedFrom,permissionType,role)',
   })
+  if (!knownGoogleAccount) {
+    parameters.set('emailMessage', `ClawPilot shared your ${cleanDriveName(pipelineName, 'pipeline')} folder. This invitation comes from ClawPilot's managed Google Workspace service account. Accept Google's invitation to access the workbook; ClawPilot Stewards will also send a branded access notice.`)
+  }
   return googleDriveJson<DrivePermission>(
     runtime,
     `/drive/v3/files/${resourceId}/permissions?${parameters.toString()}`,
@@ -2811,7 +2823,20 @@ async function reconcilePipelineGooglePermissionsUnlocked(
         permissionRoleRank(candidate.role) >= permissionRoleRank(role)
       ))
       if (inheritedAccess) continue
-      permission = await createDrivePermission(runtime, resourceId, email, role)
+    }
+    const tracked = context.trackedPermissions.some((candidate) => (
+      candidate.resourceId === resourceId && candidate.userEmail === email
+      && (!permission || candidate.permissionId === permission.id)
+    ))
+    if (!tracked) {
+      // Durable first: a crash between the Google grant and local tracking must
+      // not lose the invitation. Existing tracked grants are never mass-mailed.
+      await enqueuePipelineGoogleShareNotificationInPostgres({
+        pipelineId: pipeline.id, resourceId, recipientEmail: email, googleRole: role,
+      })
+    }
+    if (!permission) {
+      permission = await createDrivePermission(runtime, resourceId, email, role, pipeline.name)
     } else if (permission.role !== role) {
       if (permission.role !== 'reader' && permission.role !== 'writer') {
         throw new PipelineProvisioningRequestError(
@@ -3023,6 +3048,7 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
             shortLinkId,
           })
         }
+        await enqueuePipelineInitialCrmProjectionInPostgres(pipeline.id)
         return { pipelineId: pipeline.id, provisioningStatus: 'ready' as const }
       }
 
@@ -3059,6 +3085,30 @@ export async function provisionPipelineGoogleResources(pipelineId: string) {
 
 export async function reconcilePipelineGooglePermissions(pipelineId: string) {
   return withPipelineGoogleLock(pipelineId, () => reconcilePipelineGooglePermissionsUnlocked(pipelineId))
+}
+
+export async function verifyPipelineGoogleShareNotificationAccess(input: {
+  pipelineId: string
+  resourceId: string
+  recipientEmail: string
+  googleRole: 'reader' | 'writer'
+  permissionId: string
+}) {
+  const pipeline = await readPipelineProvisioningRecordInPostgres(input.pipelineId)
+  if (pipeline.provisioningStatus !== 'ready' || pipeline.driveFolderId !== input.resourceId) {
+    throw new PipelineProvisioningRequestError('Pipeline share resource is no longer ready', 409, 'GOOGLE_PIPELINE_SHARE_NOT_READY')
+  }
+  const runtime = await runtimeForPipeline(pipeline)
+  verifyPipelineFolder(await getDriveFile(runtime, input.resourceId), pipeline.id, runtimeSharedDriveId(runtime))
+  const permissions = await listDrivePermissions(runtime, input.resourceId)
+  const permission = permissions.find((candidate) => (
+    candidate.id === input.permissionId && candidate.type === 'user' && !candidate.deleted
+    && !permissionIsInherited(candidate) && normalizedPermissionEmail(candidate) === input.recipientEmail
+    && permissionRoleRank(candidate.role) >= permissionRoleRank(input.googleRole)
+  ))
+  if (!permission) {
+    throw new PipelineProvisioningRequestError('Pipeline share recipient access did not verify', 409, 'GOOGLE_PIPELINE_SHARE_ACCESS_UNVERIFIED')
+  }
 }
 
 function normalizeDropdownKey(input: string) {

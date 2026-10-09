@@ -15,6 +15,7 @@ import {
   reconcilePipelineGooglePermissions,
   replaceManagedPipelineDropdowns,
   sanitizePipelineProvisioningError,
+  verifyPipelineGoogleShareNotificationAccess,
   type SheetsJsonRequest,
 } from '@/lib/pipelineProvisioning'
 import { readPipelineWorkbookBranding } from '@/lib/organizationBranding'
@@ -28,6 +29,7 @@ import {
   type PipelineOutboxItem,
   type ResolvedPipelineOutboxSheetContext,
 } from '@/lib/persistence/pipeline'
+import { deliverPipelineGoogleShareNotification, PipelineShareNotificationError } from '@/lib/persistence/pipelineShareNotifications'
 
 class PermanentOutboxError extends Error {}
 
@@ -251,10 +253,22 @@ export async function processPipelineSyncOutbox(input: {
 } = {}) {
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 5), 20))
   const items = await claimPipelineSyncOutboxInPostgres({ limit: input.limit, maxAttempts })
-  const results: Array<{ id: string; operation: string; status: 'succeeded' | 'failed' | 'dead' }> = []
+  const results: Array<{ id: string; operation: string; status: 'succeeded' | 'failed' | 'dead' | 'queued' }> = []
 
   for (const item of items) {
     try {
+      if (item.operation === 'notify_pipeline_google_share') {
+        const delivery = await deliverPipelineGoogleShareNotification({
+          item, verifyAccess: verifyPipelineGoogleShareNotificationAccess,
+        })
+        if (delivery === 'deferred') {
+          results.push({ id: item.id, operation: item.operation, status: 'queued' })
+        } else {
+          await completePipelineSyncOutboxInPostgres(item)
+          results.push({ id: item.id, operation: item.operation, status: 'succeeded' })
+        }
+        continue
+      }
       if (item.operation === 'sync_pipeline_owner_profile_v1') {
         const pipelineId = workspacePipelineId(item)
         item.pipelineId = pipelineId
@@ -319,6 +333,7 @@ export async function processPipelineSyncOutbox(input: {
         item,
         error: managedWorkspaceOperation ? sanitizePipelineProvisioningError(error) : getErrorMessage(error),
         maxAttempts: error instanceof PermanentOutboxError
+          || (error instanceof PipelineShareNotificationError && error.permanent)
           || error instanceof InvalidPipelineOutboxContextError
           || (error instanceof GoogleWorkspaceClientError && !error.retryable)
           ? item.attempts
@@ -333,6 +348,7 @@ export async function processPipelineSyncOutbox(input: {
     succeeded: results.filter((result) => result.status === 'succeeded').length,
     failed: results.filter((result) => result.status === 'failed').length,
     dead: results.filter((result) => result.status === 'dead').length,
+    deferred: results.filter((result) => result.status === 'queued').length,
     items: results,
   }
 }

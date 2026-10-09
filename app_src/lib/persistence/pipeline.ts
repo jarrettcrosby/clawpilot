@@ -1563,7 +1563,10 @@ export async function completePipelineProvisioningInPostgres(
   return withTransaction(async (client) => {
     const pipeline = await readPipelineProvisioningWithClient(client, pipelineId, true)
     if (!pipeline) throw new Error('Pipeline was not found')
-    if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) return pipeline
+    if (pipeline.provisioningStatus === 'ready' && pipeline.sheetId && pipeline.syncEnabled) {
+      await enqueuePipelineInitialCrmProjectionWithClient(client, pipeline)
+      return pipeline
+    }
     if (
       !pipeline.driveFolderId
       || !pipeline.provisioningSheetId
@@ -1591,6 +1594,10 @@ export async function completePipelineProvisioningInPostgres(
     )
     const completed = await readPipelineProvisioningWithClient(client, pipelineId)
     if (!completed) throw new Error('Pipeline was not found')
+    // Bind the workbook and its initial projection in the same transaction.
+    // CRM may finish synchronizing while Drive provisioning is still running,
+    // so its normal worker notification cannot be the bootstrap trigger.
+    await enqueuePipelineInitialCrmProjectionWithClient(client, completed)
     await client.query(
       `
         INSERT INTO audit_events (actor, event_type, aggregate_type, aggregate_id, payload)
@@ -1599,6 +1606,45 @@ export async function completePipelineProvisioningInPostgres(
       [completed.ownerEmail, pipelineId, JSON.stringify({ shortLinkId: completed.shortLinkId })],
     )
     return completed
+  })
+}
+
+async function enqueuePipelineInitialCrmProjectionWithClient(
+  client: PoolClient,
+  pipeline: PipelineProvisioningRecord,
+): Promise<OutboxInsertRow> {
+  if (
+    pipeline.provisioningStatus !== 'ready'
+    || !pipeline.syncEnabled
+    || !pipeline.sheetId
+    || pipeline.sheetId !== pipeline.provisioningSheetId
+    || !pipeline.provisioningCompletedAt
+    || !pipeline.driveFolderId
+    || !pipeline.googleServiceAccountEmail
+    || !pipeline.googleSharedDriveId
+  ) {
+    throw new Error('Initial CRM projection requires a verified managed pipeline workbook')
+  }
+  return insertPipelineOutbox(client, {
+    pipelineId: pipeline.id,
+    sheetId: pipeline.sheetId,
+    aggregateType: 'pipeline_crm_projection',
+    aggregateId: pipeline.id,
+    operation: 'project_crm_workbook',
+    payload: { actorEmail: pipeline.ownerEmail, initialManagedWorkbook: true },
+    actor: pipeline.ownerEmail,
+    idempotencyKey: `crm-initial-projection:v1:${pipeline.sheetId}`,
+  })
+}
+
+export async function enqueuePipelineInitialCrmProjectionInPostgres(
+  pipelineIdValue: unknown,
+): Promise<{ id: string; status: string }> {
+  const pipelineId = requirePipelineId(pipelineIdValue)
+  return withTransaction(async (client) => {
+    const pipeline = await readPipelineProvisioningWithClient(client, pipelineId, true)
+    if (!pipeline) throw new Error('Pipeline was not found')
+    return enqueuePipelineInitialCrmProjectionWithClient(client, pipeline)
   })
 }
 
@@ -1770,13 +1816,33 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
     const result = await client.query<OutboxClaimRow>(
       `
         WITH candidates AS (
-          SELECT id
-          FROM sync_outbox
+          SELECT candidate.id
+          FROM sync_outbox candidate
           WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
             AND aggregate_type LIKE 'pipeline%'
             AND status IN ('queued', 'failed')
             AND attempts < $2
             AND available_at <= now()
+            AND (
+              operation <> 'project_crm_workbook'
+              OR payload->>'initialManagedWorkbook' IS DISTINCT FROM 'true'
+              OR (
+                NOT EXISTS (
+                  SELECT 1 FROM sync_outbox reconciliation
+                  WHERE reconciliation.target_system = 'suitecrm'
+                    AND reconciliation.payload->>'pipelineId' = candidate.payload->>'pipelineId'
+                    AND reconciliation.status <> 'succeeded'
+                )
+                AND COALESCE((
+                  SELECT import_run.status
+                  FROM crm_sync_runs import_run
+                  WHERE import_run.pipeline_id::text = candidate.payload->>'pipelineId'
+                    AND import_run.direction = 'sheet_to_crm'
+                  ORDER BY import_run.started_at DESC, import_run.id DESC
+                  LIMIT 1
+                ), 'succeeded') = 'succeeded'
+              )
+            )
           ORDER BY available_at ASC, created_at ASC
           FOR UPDATE SKIP LOCKED
           LIMIT $1
