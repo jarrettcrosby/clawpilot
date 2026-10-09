@@ -6329,7 +6329,11 @@ export async function readCrmWorkbookProjectionContext(pipelineId: string) {
 }
 
 export async function readCrmWorkbookProjectionReadiness(pipelineId: string) {
-  const result = await query<{ unresolved: string; import_status: string | null }>(
+  const result = await query<{
+    unresolved: string
+    import_status: string | null
+    managed_workbook_ready: boolean
+  }>(
     `SELECT
        (
          SELECT count(*)::text
@@ -6344,14 +6348,31 @@ export async function readCrmWorkbookProjectionReadiness(pipelineId: string) {
          WHERE pipeline_id = $1::uuid AND direction = 'sheet_to_crm'
          ORDER BY started_at DESC, id DESC
          LIMIT 1
-       ) AS import_status`,
+       ) AS import_status,
+       EXISTS (
+         SELECT 1 FROM pipeline_spaces pipeline
+         WHERE pipeline.id = $1::uuid
+           AND pipeline.provisioning_status = 'ready'
+           AND pipeline.sync_enabled = true
+           AND pipeline.sheet_id IS NOT NULL
+           AND pipeline.sheet_id = pipeline.provisioning_sheet_id
+           AND pipeline.provisioning_completed_at IS NOT NULL
+           AND pipeline.drive_folder_id IS NOT NULL
+           AND pipeline.google_service_account_email IS NOT NULL
+           AND pipeline.google_shared_drive_id IS NOT NULL
+       ) AS managed_workbook_ready`,
     [pipelineId],
   )
   const row = result.rows[0]
   const unresolved = Number(row?.unresolved || 0)
   const importStatus = row?.import_status || null
+  // A newly verified app-owned workbook has no legacy Sheet data to import.
+  // Once an import has been attempted, its existing reconciliation gate still
+  // applies: failed/running imports must not be overwritten by a projection.
+  const sourceReady = importStatus === 'succeeded'
+    || (importStatus === null && row?.managed_workbook_ready === true)
   return {
-    ready: unresolved === 0 && importStatus === 'succeeded',
+    ready: unresolved === 0 && sourceReady,
     unresolved,
     importStatus,
   }

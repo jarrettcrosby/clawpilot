@@ -9,7 +9,7 @@ import {
   type PipelineProjection,
   readPipelineProjectionFromPostgres,
 } from '@/lib/persistence/pipeline'
-import { shortLinkUrl } from '@/lib/shortlinks'
+import { shortLinkUrlForDomain } from '@/lib/shortlinks'
 import { ensurePrimaryWorkspaceOrganization } from '@/lib/organizations'
 import { createBasePipelineDropdownCatalog } from '@/lib/pipeline/baseTemplate.mjs'
 import {
@@ -116,6 +116,7 @@ type PipelineSpaceRow = {
   provisioning_completed_at: string | null
   short_link_id: string | null
   short_link_slug: string | null
+  short_link_public_domain: string | null
   projection: PipelineProjection
   created_at: string
   updated_at: string
@@ -182,10 +183,10 @@ async function resolveTenantActor(value: TenantActorInput): Promise<AppUser> {
   return requireWorkspaceAppUser(user.email, organization.id)
 }
 
-function hostedShortLinkUrl(slug: string | null) {
+function hostedShortLinkUrl(slug: string | null, publicDomain: string | null) {
   if (!slug) return null
   try {
-    const url = new URL(shortLinkUrl(slug))
+    const url = new URL(shortLinkUrlForDomain(slug, publicDomain))
     if (url.protocol !== 'https:' || url.username || url.password) return null
     return url.toString()
   } catch {
@@ -212,7 +213,7 @@ function toPipelineSpace(row: PipelineSpaceRow): PipelineSpace {
     provisioningLastAttemptedAt: row.provisioning_last_attempted_at,
     provisioningCompletedAt: row.provisioning_completed_at,
     shortLinkId: row.short_link_id,
-    shortLinkUrl: hostedShortLinkUrl(row.short_link_slug),
+    shortLinkUrl: hostedShortLinkUrl(row.short_link_slug, row.short_link_public_domain),
     projection: row.projection || { ...EMPTY_PIPELINE },
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -593,6 +594,7 @@ export async function listPipelineSpaces(
           THEN short_link.slug
           ELSE NULL
         END AS short_link_slug,
+        short_link.public_domain AS short_link_public_domain,
         pipeline.projection,
         pipeline.created_at::text,
         pipeline.updated_at::text
