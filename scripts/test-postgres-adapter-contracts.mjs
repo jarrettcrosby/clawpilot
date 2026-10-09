@@ -667,11 +667,10 @@ assertIncludes(pipelineProvisioning, "title !== 'Opportunities'", 'Opportunities
 assertIncludes(pipelineProvisioning, 'createShortLink', 'managed pipeline short link')
 assertIncludes(pipelineProvisioning, 'reconcilePipelineGooglePermissions', 'managed Google permission reconciliation')
 assertIncludes(pipelineProvisioning, 'nextPageToken,permissions', 'permission pagination')
-assertIncludes(pipelineProvisioning, "sendNotificationEmail: 'true'", 'Google visitor sharing invitation delivery')
-assert.ok(
-  !pipelineProvisioning.includes("sendNotificationEmail: 'false'"),
-  'managed Google user permissions must notify recipients so non-Google login emails can accept visitor sharing',
-)
+assertIncludes(pipelineProvisioning, 'pipelineShareRecipientHasVerifiedGoogleAccount(email)', 'verified Google recipient notification policy')
+assertIncludes(pipelineProvisioning, "sendNotificationEmail: knownGoogleAccount ? 'false' : 'true'", 'Google visitor sharing invitation delivery fallback')
+assertIncludes(pipelineProvisioning, "parameters.set('emailMessage'", 'recognizable ClawPilot visitor invitation')
+assertIncludes(pipelineProvisioning, 'enqueuePipelineGoogleShareNotificationInPostgres', 'durable branded pipeline share notification')
 assertIncludes(pipelineProvisioning, "['anyone', 'domain', 'group']", 'direct broad permission rejection')
 assertIncludes(pipelineProvisioning, 'permissionIsInherited', 'Shared Drive governing permission preservation')
 assertIncludes(pipelineProvisioning, "`hierarchy:${managedEnvironmentName()}`", 'serialized Drive hierarchy reconciliation')

@@ -97,6 +97,53 @@ function opportunityRow(record: CrmOpportunity): unknown[] {
   ]
 }
 
+function initialOpportunityCell(value: unknown, column: number): string {
+  if (column === 11 && value !== '' && value != null) {
+    const timestamp = typeof value === 'number'
+      ? (value - 25_569) * 86_400_000
+      : Date.parse(String(value))
+    if (Number.isFinite(timestamp)) return new Date(timestamp).toISOString().slice(0, 10)
+  }
+  return String(value ?? '').replace(/\r\n/g, '\n').trim()
+}
+
+export function assertInitialWorkbookOpportunityRows(actual: unknown[][], expected: unknown[][]) {
+  const expectedById = new Map(expected.map((row) => [String(row[0] || ''), row]))
+  const seen = new Set<string>()
+  for (const row of actual) {
+    if (!row.some((cell) => String(cell ?? '').trim())) continue
+    const id = String(row[0] || '')
+    const match = expectedById.get(id)
+    if (!match || seen.has(id) || row.slice(13).some((cell) => String(cell ?? '').trim()) || Array.from({ length: 13 }, (_, column) => (
+      initialOpportunityCell(row[column], column) !== initialOpportunityCell(match[column], column)
+    )).some(Boolean)) {
+      throw new Error('Initial workbook population found unsynchronized Opportunities edits; import and reconcile the Sheet before refreshing it')
+    }
+    seen.add(id)
+  }
+}
+
+async function protectInitialOpportunityEdits(
+  context: PipelineSheetContext,
+  expected: unknown[][],
+  runtime: GoogleWorkspaceRuntime | null,
+  importStatus: string | null,
+) {
+  if (!runtime || importStatus !== null) return
+  const previous = await query<{ projected: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM crm_sync_runs
+     WHERE pipeline_id = $1::uuid AND direction = 'crm_to_sheet' AND status = 'succeeded') AS projected`,
+    [context.pipelineId],
+  )
+  if (previous.rows[0]?.projected) return
+  // A user may start editing the writable tab while the bootstrap job waits
+  // for CRM. Preserve those edits; retrying our own completed rows is safe.
+  const current = await googleSheetsJson<{ values?: unknown[][] }>(runtime,
+    `/v4/spreadsheets/${context.sheetId}/values/${encodeURIComponent("'Opportunities'!A5:Z20000")}?valueRenderOption=FORMULA`,
+  )
+  assertInitialWorkbookOpportunityRows(current.values || [], expected)
+}
+
 export function googleSheetsDateTime(value: string | null | undefined): number | '' {
   const timestamp = Date.parse(String(value || ''))
   if (!Number.isFinite(timestamp)) return ''
@@ -152,6 +199,9 @@ export async function projectCrmWorkbook(input: {
         serviceAccountEmail: binding.googleServiceAccountEmail || '',
         sharedDriveId: binding.googleSharedDriveId || '',
       })
+  await protectInitialOpportunityEdits(
+    input.context, projection.opportunities.map(opportunityRow), runtime, readiness.importStatus,
+  )
   const runId = await beginCrmSyncRun({
     pipelineId: input.context.pipelineId,
     direction: 'crm_to_sheet',

@@ -25,6 +25,22 @@ export type SendInvitationEmailInput = {
   expiresAt: string
 }
 
+export type PipelineGoogleShareMailInput = {
+  to: string
+  organizationName: string
+  pipelineName: string
+  sheetId: string
+  folderId: string
+  accessRole: 'reader' | 'writer'
+}
+
+export class PipelineShareMailError extends Error {
+  constructor(message: string, readonly status: number | null = null, readonly ambiguous = false) {
+    super(message)
+    this.name = 'PipelineShareMailError'
+  }
+}
+
 export type SendPosAccountingIssueEmailInput = {
   to: string
   recipientName?: string | null
@@ -186,6 +202,7 @@ type MailContent = {
   text: string
   html: string
   messagePurpose?: 'auth-magic-code'
+  rfcMessageId?: string
 }
 
 type AuthInboxPlacement = 'not-applicable' | 'confirmed' | 'unconfirmed'
@@ -249,6 +266,7 @@ function buildMessage(input: MailContent & { from: string }): string {
     `Reply-To: ClawPilot Stewards <${input.from}>`,
     `To: <${input.to}>`,
     `Subject: ${subject}`,
+    ...(input.rfcMessageId ? [`Message-ID: <${pipelineShareMessageId(input.rfcMessageId)}>`] : []),
     ...(input.messagePurpose === 'auth-magic-code' ? [
       'X-ClawPilot-Message-Purpose: auth-magic-code',
       'Auto-Submitted: auto-generated',
@@ -439,6 +457,122 @@ export async function sendInvitationEmail(input: SendInvitationEmailInput): Prom
     '</div></body></html>',
   ].join('')
   return sendMessage({ to, subject: `${inviterName} invited you to ClawPilot`, text, html })
+}
+
+function pipelineShareMessageId(value: string): string {
+  if (!/^clawpilot-pipeline-share-[0-9a-f-]{36}@notifications\.clawpilot$/.test(value)) {
+    throw new PipelineShareMailError('Pipeline share message identity is invalid')
+  }
+  return value
+}
+
+function pipelineShareProviderId(value: unknown): string {
+  const id = String(value || '').trim()
+  if (!/^[a-zA-Z0-9_-]{1,200}$/.test(id)) {
+    throw new PipelineShareMailError('Pipeline share mail receipt is invalid', null, true)
+  }
+  return id
+}
+
+async function pipelineShareMailJson(path: string, input: RequestInit = {}) {
+  let response: Response
+  try {
+    response = await matonPlatformMailFetch(path, input)
+  } catch {
+    throw new PipelineShareMailError('Pipeline share mail request status is unconfirmed', null, input.method === 'POST')
+  }
+  if (!response.ok) {
+    throw new PipelineShareMailError('Pipeline share mail provider request failed', response.status, response.status >= 500 && input.method === 'POST')
+  }
+  try {
+    return await response.json() as Record<string, unknown>
+  } catch {
+    throw new PipelineShareMailError('Pipeline share mail provider receipt is invalid', null, input.method === 'POST')
+  }
+}
+
+export function buildPipelineGoogleShareEmail(input: PipelineGoogleShareMailInput): MailContent {
+  const to = assertEmail(input.to)
+  const organizationName = cleanHeader(input.organizationName.slice(0, 200), 'Organization name')
+  const pipelineName = cleanHeader(input.pipelineName.slice(0, 200), 'Pipeline name')
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(input.sheetId) || !/^[A-Za-z0-9_-]{1,256}$/.test(input.folderId)) {
+    throw new PipelineShareMailError('Pipeline Google resource is invalid')
+  }
+  if (input.accessRole !== 'reader' && input.accessRole !== 'writer') {
+    throw new PipelineShareMailError('Pipeline Google access role is invalid')
+  }
+  const sheetUrl = `https://docs.google.com/spreadsheets/d/${input.sheetId}/edit`
+  const folderUrl = `https://drive.google.com/drive/folders/${input.folderId}`
+  const accessLabel = input.accessRole === 'writer' ? 'edit' : 'view'
+  const refreshNote = 'The initial CRM refresh may still be loading. New or empty pipelines show zero until records are added.'
+  return {
+    to,
+    subject: `Your ${pipelineName} Google Sheet is ready`,
+    text: [
+      'ClawPilot pipeline access', '',
+      `You can now ${accessLabel} the Google Sheet for ${pipelineName} in ${organizationName}.`, '',
+      `Open Google Sheet: ${sheetUrl}`, `Open pipeline folder: ${folderUrl}`, '',
+      `Sign into Google using ${to}.`, refreshNote, '',
+      "ClawPilot manages this workbook using its Google Workspace service account. If Google also sent an access invitation, accept it first; non-Google addresses may need Google's visitor PIN. This notice is from ClawPilot Stewards; you do not need to contact the service account.",
+    ].join('\r\n'),
+    html: [
+      '<!doctype html><html><body style="margin:0;padding:24px;background:#0f0f13;color:#e4e1ec;font-family:Arial,sans-serif">',
+      '<div style="max-width:560px;margin:0 auto;padding:28px;background:#1a1a23;border:1px solid #343741;border-radius:8px">',
+      `<h1 style="margin:0 0 16px;font-size:24px">Your pipeline Google Sheet is ready</h1>`,
+      `<p>You can now ${accessLabel} <strong>${escapeHtml(pipelineName)}</strong> in ${escapeHtml(organizationName)}.</p>`,
+      `<p><a href="${sheetUrl}" style="display:inline-block;padding:12px 18px;border-radius:6px;background:#a8c7fa;color:#071728;text-decoration:none;font-weight:700">Open Google Sheet</a></p>`,
+      `<p><a href="${folderUrl}" style="color:#a8c7fa">Open pipeline folder</a></p>`,
+      `<p>Sign into Google using ${escapeHtml(to)}.</p><p>${refreshNote}</p>`,
+      '<p style="color:#a9adb8;font-size:13px;line-height:1.5">ClawPilot manages this workbook using its Google Workspace service account. If Google also sent an access invitation, accept it first; non-Google addresses may need Google\'s visitor PIN. This notice is from ClawPilot Stewards; you do not need to contact the service account.</p>',
+      '</div></body></html>',
+    ].join(''),
+  }
+}
+
+export type PipelineShareMailBinding = { mailboxEmail: string; senderEmail: string; connectionFingerprint: string }
+
+export async function verifyPipelineShareMailSender(): Promise<PipelineShareMailBinding> {
+  const senderEmail = mailFromAddress()
+  await verifySender('platform', senderEmail)
+  return {
+    senderEmail,
+    mailboxEmail: await gmailMailboxEmail('platform'),
+    connectionFingerprint: crypto.createHash('sha256').update(mailConnectionId('platform')).digest('hex'),
+  }
+}
+
+export async function findSentPipelineShareMail(rfcMessageId: string): Promise<string | null> {
+  const parameters = new URLSearchParams({ labelIds: 'SENT', q: `rfc822msgid:${pipelineShareMessageId(rfcMessageId)}`, maxResults: '2' })
+  const data = await pipelineShareMailJson(`/google-mail/gmail/v1/users/me/messages?${parameters}`)
+  const messages = Array.isArray(data.messages) ? data.messages : []
+  if (messages.length > 1) throw new PipelineShareMailError('Duplicate pipeline share mail requires review')
+  return messages.length ? pipelineShareProviderId((messages[0] as { id?: unknown }).id) : null
+}
+
+export async function findPipelineShareMailDraft(rfcMessageId: string): Promise<string | null> {
+  const parameters = new URLSearchParams({ q: `rfc822msgid:${pipelineShareMessageId(rfcMessageId)}`, maxResults: '2' })
+  const data = await pipelineShareMailJson(`/google-mail/gmail/v1/users/me/drafts?${parameters}`)
+  const drafts = Array.isArray(data.drafts) ? data.drafts : []
+  if (drafts.length > 1) throw new PipelineShareMailError('Duplicate pipeline share mail drafts require review')
+  return drafts.length ? pipelineShareProviderId((drafts[0] as { id?: unknown }).id) : null
+}
+
+export async function createPipelineShareMailDraft(input: PipelineGoogleShareMailInput, rfcMessageId: string): Promise<string> {
+  const from = mailFromAddress()
+  await verifySender('platform', from)
+  const content = buildPipelineGoogleShareEmail(input)
+  const raw = base64Url(buildMessage({ ...content, from, rfcMessageId: pipelineShareMessageId(rfcMessageId) }))
+  const data = await pipelineShareMailJson('/google-mail/gmail/v1/users/me/drafts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: { raw } }),
+  })
+  return pipelineShareProviderId(data.id)
+}
+
+export async function sendPipelineShareMailDraft(draftId: string): Promise<string> {
+  const data = await pipelineShareMailJson('/google-mail/gmail/v1/users/me/drafts/send', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: pipelineShareProviderId(draftId) }),
+  })
+  return pipelineShareProviderId(data.id || (data.message as { id?: unknown } | undefined)?.id)
 }
 
 function isMappingIssueCode(value: string) {
