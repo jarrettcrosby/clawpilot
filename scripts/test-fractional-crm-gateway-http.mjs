@@ -48,7 +48,7 @@ function harness(options = {}) {
   const lookups = [], calls = []
   let row = options.row === undefined ? fixture() : options.row
   const services = { readFractionalCrmCredential: async id => { lookups.push(id); return row } }
-  for (const name of ['readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
+  for (const name of ['readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
     'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding']) {
     services[name] = async (...args) => { calls.push({ name, args }); if (options.error) throw options.error; return options.result ?? { ok: true } }
   }
@@ -308,4 +308,31 @@ test('Next route exports only intended methods and all use the authenticated HTT
   assert.equal((await route.GET(new Request(url, { headers: { authorization: `Bearer ${token}` } }))).status, 200)
   assert.equal(app.calls[0].name, 'readFractionalCrmCompany')
   assert.equal(route.GET, route.PATCH); assert.equal(route.GET, route.POST)
+})
+
+test('organization name read is GET-only, uses the bound principal and preserves private response headers', async () => {
+  const app = harness(), response = await app.request('/organization')
+  assert.equal(response.status, 200)
+  assert.equal(app.calls[0].name, 'readFractionalCrmOrganization')
+  assert.equal(app.calls[0].args.length, 1)
+  assert.equal(app.calls[0].args[0].rootCompanyGlobalId, rootCompanyGlobalId)
+  assert.equal(response.headers.get('cache-control'), 'private, no-store')
+  assert.equal(response.headers.get('referrer-policy'), 'no-referrer')
+  for (const method of ['PATCH', 'POST', 'DELETE']) {
+    assert.equal(isFractionalCrmGatewayPath(`${base}/organization`, method), false)
+    assert.equal((await app.request('/organization', { method })).status, 404)
+  }
+})
+test('organization name cannot bypass capability, revoked credentials, tenant scope or the exact path', async () => {
+  for (const row of [fixture({ capabilities: ['crm.contact.read'] }), fixture({ revokedAt: new Date() }), fixture({ enabled: false })]) {
+    const app = harness({ row })
+    assert.ok([401, 403].includes((await app.request('/organization')).status))
+    assert.equal(app.calls.length, 0)
+  }
+  for (const query of [new URLSearchParams({...scope, workspaceOrganizationId: 'wrong'}), new URLSearchParams({...scope, extra: 'root'})]) {
+    const app = harness()
+    assert.ok([400, 403].includes((await app.request('/organization', {query:query.toString()})).status))
+    assert.equal(app.calls.length, 0)
+  }
+  assert.equal(isFractionalCrmGatewayPath(`${base}/organization/other`, 'GET'), false)
 })

@@ -7,7 +7,7 @@ const contactRecord = new RegExp(`^${base}/companies/${company}/contacts/${conta
 
 /** Proxy bypass only: every matched request still requires gateway machine authentication. */
 export function isFractionalCrmGatewayPath(pathname, method) {
-  return (method === 'GET' && (companyRecord.test(pathname) || contactList.test(pathname) || contactRecord.test(pathname)))
+  return (method === 'GET' && (pathname === `${base}/organization` || companyRecord.test(pathname) || contactList.test(pathname) || contactRecord.test(pathname)))
     || (method === 'PATCH' && (companyRecord.test(pathname) || contactRecord.test(pathname)))
     || (method === 'POST' && pathname === `${base}/onboarding/resolve-or-create`)
 }

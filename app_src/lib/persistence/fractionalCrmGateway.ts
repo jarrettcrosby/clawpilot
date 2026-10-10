@@ -80,6 +80,14 @@ function envelope(ctx:Context,entity:GatewayEntity,row:Row,parent:Row,requested:
  resolution:{requestedGlobalId:requested,canonicalGlobalId:str(row,'reference_code'),status:requested===row.reference_code?'exact':'alias'},version:gatewayVersion(scope(ctx),ctx.principal.sourceInstanceId,entity,row,parent),status:'active',management,
  canPush:management==='crm'&&ctx.principal.capabilities.includes(entity==='company'?'crm.company.write':'crm.contact.write'),...mapGatewayFields(entity,row)}
 }
+/** Only the credential-bound workspace root's name; never a customer or an allowlist expansion. */
+export async function readFractionalCrmOrganization(p:FractionalCrmPrincipal){return withTransaction(async client=>{
+ const ctx=await context(client,p,'crm.company.read'),name=str(ctx.root,'name').trim()
+ if(!name||name.length>160||/[\u0000-\u001f\u007f]/u.test(name))fail(404,'RECORD_NOT_FOUND')
+ const record={schemaVersion:1 as const,entity:'organization' as const,sourceInstanceId:ctx.principal.sourceInstanceId,
+  scope:scope(ctx),recordId:str(ctx.root,'id'),globalId:ctx.principal.rootCompanyGlobalId,name}
+ return {...record,version:`organization:${canonicalHash(record)}`}
+})}
 export async function readFractionalCrmCompany(p:FractionalCrmPrincipal,ga:string){return withTransaction(async client=>{const ctx=await context(client,p,'crm.company.read'),row=await companyRow(client,ctx,ga);return envelope(ctx,'company',row,row,ga)})}
 export async function readFractionalCrmContact(p:FractionalCrmPrincipal,ga:string,gc:string){return withTransaction(async client=>{const ctx=await context(client,p,'crm.contact.read'),parent=await companyRow(client,ctx,ga),row=await contactRow(client,ctx,parent,gc);return envelope(ctx,'contact',row,parent,gc)})}
 export async function listFractionalCrmContacts(p:FractionalCrmPrincipal,ga:string,page:{limit?:number;cursor?:string|null}={}){return withTransaction(async client=>{
