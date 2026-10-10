@@ -42,6 +42,21 @@ try{
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'fractional-fixture',$10,now()+interval '1 hour',true)`,[credentialId,'a'.repeat(64),instance,org,pipeline,ga,[a.referenceCode,b.referenceCode],capabilities,deployment,owner])
  let principal=await gateway.readFractionalCrmCredential(credentialId),checks=0
  const check=(condition,message)=>{assert.ok(condition,message);checks++},denied=async(fn,code)=>{await assert.rejects(fn,error=>error.code===code);checks++}
+ const organization=await gateway.readFractionalCrmOrganization(principal)
+ check(organization.entity==='organization'&&organization.recordId===root&&organization.globalId===ga&&organization.name==='Gateway root','organization read returns only the bound workspace root')
+ check(Object.keys(organization).length===8&&!('fields' in organization)&&!('actorEmail' in organization),'organization metadata has no private or writable company fields')
+ await denied(()=>gateway.readFractionalCrmCompany(principal,ga),'RECORD_NOT_FOUND')
+ await denied(()=>gateway.readFractionalCrmOrganization({...principal,workspaceOrganizationId:randomUUID()}),'CAPABILITY_DENIED')
+ await pool.query('UPDATE crm_organizations SET name=$2 WHERE id=$1',[root,'Renamed workspace'])
+ const renamedOrganization=await gateway.readFractionalCrmOrganization(principal)
+ check(renamedOrganization.name==='Renamed workspace'&&renamedOrganization.version!==organization.version,'saved organization rename advances the source version')
+ await pool.query('UPDATE crm_organizations SET name=$2 WHERE id=$1',[root,'Gateway root'])
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=array_remove(capabilities,$2) WHERE id=$1',[credentialId,'crm.company.read'])
+ await denied(()=>gateway.readFractionalCrmOrganization(principal),'CAPABILITY_DENIED')
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=$2 WHERE id=$1',[credentialId,capabilities])
+ await pool.query("UPDATE app_user_organization_memberships SET role='member' WHERE organization_id=$1 AND user_email=$2",[org,owner])
+ await denied(()=>gateway.readFractionalCrmOrganization(principal),'RECORD_NOT_FOUND')
+ await pool.query("UPDATE app_user_organization_memberships SET role='owner' WHERE organization_id=$1 AND user_email=$2",[org,owner])
  const before=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT count(*) FROM sync_outbox) AS outbox')).rows[0]
  const company=await gateway.readFractionalCrmCompany(principal,a.referenceCode),contact=await gateway.readFractionalCrmContact(principal,a.referenceCode,ca.referenceCode)
  const after=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT count(*) FROM sync_outbox) AS outbox')).rows[0];assert.deepEqual(after,before);checks++
@@ -106,7 +121,7 @@ try{
  const duplicateDifferentSource=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,request('another-new-source',"Unique O'Neil &amp; <x>",'unique-new@example.invalid'),'gateway-create-duplicate');check(duplicateDifferentSource.status==='review_required','different source ID cannot create duplicate same-company invitation')
  await pool.query("UPDATE crm_contacts SET source_payload=jsonb_set(source_payload,'{archived}','true') WHERE id=$1",[cb.id]);await denied(()=>gateway.readFractionalCrmContact(principal,b.referenceCode,cb.referenceCode),'RECORD_RETIRED')
  await assert.rejects(()=>pool.query('UPDATE fractional_crm_gateway_credentials SET token_hash=$2 WHERE id=$1',[credentialId,'b'.repeat(64)]),error=>error.code==='P0001'&&error.message.includes('credential identity is immutable'));checks++
- await pool.query('UPDATE fractional_crm_gateway_credentials SET revoked_at=now() WHERE id=$1',[credentialId]);await denied(()=>gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),'UNAUTHORIZED')
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET revoked_at=now() WHERE id=$1',[credentialId]);await denied(()=>gateway.readFractionalCrmOrganization(principal),'UNAUTHORIZED');await denied(()=>gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),'UNAUTHORIZED')
  check((await pool.query('SELECT count(*)::int AS n FROM app_users')).rows[0].n===1,'gateway creates no login or invitation user')
  console.log(`PASS ${checks} gateway PostgreSQL assertions; all migrations; real CRM staging/outbox; no external calls`)
 }finally{try{if(pool)await pool.end()}finally{if(started)execFileSync('docker',disposablePostgresDockerCleanupArgs(container),{timeout:30000,stdio:'pipe'})}}

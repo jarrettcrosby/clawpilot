@@ -13,6 +13,7 @@ export type FractionalCrmPatch = {
 }
 export type FractionalCrmGatewayServices = {
   readFractionalCrmCredential: (id: string) => Promise<FractionalCrmCredential | null>
+  readFractionalCrmOrganization: (principal: FractionalCrmPrincipal) => Promise<unknown>
   readFractionalCrmCompany: (principal: FractionalCrmPrincipal, ga: string) => Promise<unknown>
   readFractionalCrmContact: (principal: FractionalCrmPrincipal, ga: string, gc: string) => Promise<unknown>
   listFractionalCrmContacts: (principal: FractionalCrmPrincipal, ga: string, page: { limit: number; cursor?: string }) => Promise<unknown>
@@ -149,6 +150,8 @@ export async function handleFractionalCrmGateway(
     if (isOnboarding) {
       const key = idempotency(request)
       result = await services.resolveOrCreateFractionalCrmOnboarding(principal, onboarding(await readJson(request), principal), key)
+    } else if (parts[0] === 'organization') {
+      result = await services.readFractionalCrmOrganization(principal)
     } else if (request.method === 'PATCH') {
       // Reject absent write preconditions before receiving the body.
       conditionalVersion(request); idempotency(request)
