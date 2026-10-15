@@ -48,7 +48,7 @@ function harness(options = {}) {
   const lookups = [], calls = []
   let row = options.row === undefined ? fixture() : options.row
   const services = { readFractionalCrmCredential: async id => { lookups.push(id); return row } }
-  for (const name of ['readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
+  for (const name of ['readFractionalCrmProduct', 'listFractionalCrmProducts', 'readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
     'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding']) {
     services[name] = async (...args) => { calls.push({ name, args }); if (options.error) throw options.error; return options.result ?? { ok: true } }
   }
@@ -335,4 +335,26 @@ test('organization name cannot bypass capability, revoked credentials, tenant sc
     assert.equal(app.calls.length, 0)
   }
   assert.equal(isFractionalCrmGatewayPath(`${base}/organization/other`, 'GET'), false)
+})
+
+
+test('product catalog reads require their own capability and exact independent CRM scope', async () => {
+ const denied = harness({ row: fixture({ capabilities: ['crm.company.read'] }) })
+ assert.equal((await denied.request('/products')).status, 403)
+ assert.equal(denied.calls.length, 0)
+ const allowed = harness()
+ assert.equal((await allowed.request('/products')).status, 200)
+ assert.equal(allowed.calls[0].name, 'listFractionalCrmProducts')
+ assert.equal((await allowed.request('/products/gp0000009')).status, 200)
+ assert.equal(allowed.calls[1].name, 'readFractionalCrmProduct')
+ const wrong = new URLSearchParams({ ...scope, pipelineId: '00000000-0000-4000-8000-000000000099' })
+ assert.equal((await allowed.request('/products', { query: wrong.toString() })).status, 403)
+ assert.equal(allowed.calls.length, 2)
+})
+test('product routes admit bounded GET only and reject browser authority', async () => {
+ const h = harness()
+ for (const method of ['POST', 'PATCH', 'DELETE']) assert.equal((await h.request('/products/gp0000009', { method })).status, 404)
+ assert.equal((await h.request('/products', { headers: { cookie: 'native-session=forbidden' } })).status, 403)
+ assert.equal((await h.request('/products', { query: new URLSearchParams({ ...scope, limit: '101' }).toString() })).status, 400)
+ assert.equal(h.calls.length, 0)
 })

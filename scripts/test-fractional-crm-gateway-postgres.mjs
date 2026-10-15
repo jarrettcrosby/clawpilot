@@ -42,6 +42,34 @@ try{
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'fractional-fixture',$10,now()+interval '1 hour',true)`,[credentialId,'a'.repeat(64),instance,org,pipeline,ga,[a.referenceCode,b.referenceCode],capabilities,deployment,owner])
  let principal=await gateway.readFractionalCrmCredential(credentialId),checks=0
  const check=(condition,message)=>{assert.ok(condition,message);checks++},denied=async(fn,code)=>{await assert.rejects(fn,error=>error.code===code);checks++}
+ // Product reads exercise the production SQL and native canonical product identity.
+ const otherPipeline=randomUUID();await pool.query('INSERT INTO pipeline_spaces(id,name,owner_email,is_default,workspace_organization_id) VALUES($1,$2,$3,false,$4)',[otherPipeline,'Other product scope',owner,org])
+ const product=async(name,type='Service',opts={})=>(await pool.query(`INSERT INTO crm_products(pipeline_id,source_key,name,product_type,price,currency,active,source_payload,source_hash)
+  VALUES($1,$2,$3,$4,12.34,'USD',$5,$6::jsonb,'fixture') RETURNING *`,[opts.pipeline??pipeline,randomUUID(),name,type,opts.active??true,JSON.stringify(opts.payload??{})])).rows[0]
+ const pa=await product('Service A'),pb=await product('NonInventory B','NonInventory'),pi=await product('Inactive','Service',{active:false}),px=await product('Archived','Service',{payload:{archived:true}}),pf=await product('Foreign','Service',{pipeline:otherPipeline}),duplicate=await product('Canonical alias')
+ await pool.query(`INSERT INTO crm_product_identity_aliases(pipeline_id,alias_product_id,canonical_product_id,evidence_type,evidence,created_by) VALUES($1,$2,$3,'operator_confirmed','{}',$4)`,[pipeline,duplicate.id,pa.id,owner])
+ const productTables=['crm_products','crm_product_identity_aliases','fractional_crm_gateway_credentials','crm_reference_registry','crm_reference_aliases','crm_reference_number_registry','fractional_crm_gateway_operations','fractional_crm_source_mappings','fractional_crm_review_decisions','sync_outbox','crm_organizations','crm_contacts','audit_events']
+ const productState=async()=>{const result={};for(const table of productTables){const rows=(await pool.query('SELECT row_to_json(t) AS row FROM '+table+' t')).rows.map(x=>JSON.stringify(x.row)).sort();result[table]=require('node:crypto').createHash('sha256').update(JSON.stringify(rows)).digest('hex')}return result}
+ const noProductAccessBefore=await productState()
+ await denied(()=>gateway.listFractionalCrmProducts(principal,{limit:10}),'CAPABILITY_DENIED');await denied(()=>gateway.readFractionalCrmProduct(principal,pa.reference_code),'CAPABILITY_DENIED')
+ assert.deepEqual(await productState(),noProductAccessBefore);checks++
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=array_append(capabilities,$2) WHERE id=$1',[credentialId,'crm.product.read']);principal=await gateway.readFractionalCrmCredential(credentialId)
+ const productsBefore=await productState(),first=await gateway.listFractionalCrmProducts(principal,{limit:1}),second=await gateway.listFractionalCrmProducts(principal,{limit:1,cursor:first.nextCursor})
+ check(first.items.length===1&&second.items.length===1&&second.nextCursor===null&&first.items[0].globalId!==second.items[0].globalId,'canonical-only product pagination returns exactly two active records')
+ assert.deepEqual(new Set([...first.items,...second.items].map(x=>x.globalId)),new Set([pa.reference_code,pb.reference_code]));checks++
+ const actualProduct=await gateway.readFractionalCrmProduct(principal,pa.reference_code)
+ check(actualProduct.fields.productType==='Service'&&Number(actualProduct.fields.catalogPrice)===12.34&&actualProduct.fields.currency==='USD'&&actualProduct.pricingAuthority==='stored_catalog_value'&&actualProduct.invoiceDefaultVerified===false,'catalog values do not certify invoice default prices')
+ check(actualProduct.scope.pipelineId===pipeline&&actualProduct.sourceInstanceId===instance&&actualProduct.recordId===pa.id,'product response preserves exact source and scope')
+ check((await gateway.readFractionalCrmProduct(principal,duplicate.reference_code)).globalId===pa.reference_code,'native product UUID alias resolves to canonical product')
+ check((await gateway.readFractionalCrmProduct(principal,duplicate.reference_code)).resolution.status==='alias','canonical alias is explicit')
+ await denied(()=>gateway.readFractionalCrmProduct(principal,pf.reference_code),'RECORD_NOT_FOUND');await denied(()=>gateway.readFractionalCrmProduct(principal,pi.reference_code),'RECORD_RETIRED');await denied(()=>gateway.readFractionalCrmProduct(principal,px.reference_code),'RECORD_RETIRED')
+ await denied(()=>gateway.readFractionalCrmProduct({...principal,pipelineId:otherPipeline},pa.reference_code),'CAPABILITY_DENIED');await denied(()=>gateway.listFractionalCrmProducts({...principal,workspaceOrganizationId:randomUUID()},{limit:1}),'CAPABILITY_DENIED')
+ await denied(()=>gateway.listFractionalCrmProducts(principal,{limit:0}),'INVALID_PAGE');await denied(()=>gateway.listFractionalCrmProducts(principal,{limit:101}),'INVALID_PAGE')
+ const transplanted=JSON.parse(Buffer.from(first.nextCursor,'base64url').toString('utf8'));transplanted.scope='other-credential';await denied(()=>gateway.listFractionalCrmProducts(principal,{limit:1,cursor:Buffer.from(JSON.stringify(transplanted)).toString('base64url')}),'INVALID_PAGE')
+ check((await gateway.readFractionalCrmProduct(principal,pa.reference_code)).version===actualProduct.version,'unchanged product read preserves version')
+ assert.deepEqual(await productState(),productsBefore);checks++
+ await pool.query('UPDATE crm_products SET price=13.50 WHERE id=$1',[pa.id]);check((await gateway.readFractionalCrmProduct(principal,pa.reference_code)).version!==actualProduct.version,'changed price advances product version')
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=$2 WHERE id=$1',[credentialId,capabilities]);await denied(()=>gateway.readFractionalCrmProduct(principal,pa.reference_code),'CAPABILITY_DENIED');principal=await gateway.readFractionalCrmCredential(credentialId)
  const organization=await gateway.readFractionalCrmOrganization(principal)
  check(organization.entity==='organization'&&organization.recordId===root&&organization.globalId===ga&&organization.name==='Gateway root','organization read returns only the bound workspace root')
  check(Object.keys(organization).length===8&&!('fields' in organization)&&!('actorEmail' in organization),'organization metadata has no private or writable company fields')

@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 
 export const fractionalCrmCapabilities = [
-  'crm.company.read', 'crm.contact.read', 'crm.company.write', 'crm.contact.write', 'crm.onboarding.write',
+  'crm.company.read', 'crm.contact.read', 'crm.product.read', 'crm.company.write', 'crm.contact.write', 'crm.onboarding.write',
 ] as const
 export type FractionalCrmCapability = typeof fractionalCrmCapabilities[number]
 export type FractionalCrmPrincipal = {

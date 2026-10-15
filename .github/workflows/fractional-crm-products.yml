@@ -1,0 +1,39 @@
+name: Fractional CRM product reads
+on:
+  push:
+    branches: [codex/fractional-crm-invoice-products]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fractional-crm-products-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  product-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
+      CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: 256m
+      CLAWPILOT_TEST_POSTGRES_CPUS: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app_src/package-lock.json
+      - name: Install locked application dependencies
+        run: npm --prefix app_src ci
+      - name: Scoped gateway model and HTTP regression
+        run: node --test --test-concurrency=1 scripts/test-fractional-crm-gateway-model.mjs scripts/test-fractional-crm-gateway-http.mjs
+      - name: Native gateway and additive migration acceptance
+        run: |
+          docker pull pgvector/pgvector:pg16
+          docker image inspect pgvector/pgvector:pg16 --format '{{json .RepoDigests}}'
+          node scripts/test-fractional-crm-gateway-postgres.mjs
+      - name: Validate changed application sources
+        working-directory: app_src
+        run: npm exec -- eslint lib/fractionalCrmGatewayAuth.ts lib/fractionalCrmGatewayHttp.ts lib/fractionalCrmGatewayPath.mjs lib/persistence/fractionalCrmGateway.ts 'app/api/integrations/fractional-crm/v1/[...path]/route.ts'

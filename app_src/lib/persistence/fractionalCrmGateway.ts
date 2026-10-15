@@ -89,6 +89,52 @@ export async function readFractionalCrmOrganization(p:FractionalCrmPrincipal){re
  return {...record,version:`organization:${canonicalHash(record)}`}
 })}
 export async function readFractionalCrmCompany(p:FractionalCrmPrincipal,ga:string){return withTransaction(async client=>{const ctx=await context(client,p,'crm.company.read'),row=await companyRow(client,ctx,ga);return envelope(ctx,'company',row,row,ga)})}
+const productGlobalId=(value:unknown):value is string=>typeof value==='string'&&/^gp(?:[0-9]{7}|[0-9a-v]{12})$/.test(value)
+function productEnvelope(ctx:Context,row:Row,requested:string){
+ const fields={name:str(row,'name'),description:nullable(row,'description'),sku:nullable(row,'sku'),productType:str(row,'product_type'),
+  catalogPrice:nullable(row,'price'),currency:nullable(row,'currency')}
+ // Legacy CRM prices/currencies may have been filled by the native defaults.
+ // Expose their exact stored values, without certifying a negotiated invoice rate.
+ const version=canonicalHash({schemaVersion:1,scope:scope(ctx),sourceInstanceId:ctx.principal.sourceInstanceId,recordId:row.id,
+  globalId:row.reference_code,updatedAt:row.updated_at,sourceHash:row.source_hash,active:row.active,fields})
+ return {schemaVersion:1,entity:'product',sourceInstanceId:ctx.principal.sourceInstanceId,scope:scope(ctx),recordId:str(row,'id'),globalId:str(row,'reference_code'),
+  resolution:{requestedGlobalId:requested,canonicalGlobalId:str(row,'reference_code'),status:requested===row.reference_code?'exact':'alias'},version,status:'active',fields,
+  pricingAuthority:'stored_catalog_value',invoiceDefaultVerified:false}
+}
+export async function readFractionalCrmProduct(p:FractionalCrmPrincipal,requested:string){return withTransaction(async client=>{
+ const ctx=await context(client,p,'crm.product.read');if(!productGlobalId(requested))fail(422,'INVALID_GLOBAL_ID')
+ let resolved=requested;const seen=new Set<string>()
+ for(let depth=0;depth<8;depth++){
+  if(seen.has(resolved))fail(409,'IDENTITY_CONFLICT');seen.add(resolved)
+  const alias=(await client.query(`SELECT COALESCE(a.canonical_code,r.canonical_code) AS canonical_code
+   FROM crm_reference_registry r LEFT JOIN crm_reference_aliases a ON a.alias_code=r.reference_code WHERE r.reference_code=$1`,[resolved])).rows[0]
+  const next=String(alias?.canonical_code??resolved);if(!productGlobalId(next))fail(409,'IDENTITY_CONFLICT')
+  if(next===resolved){
+   const row=(await client.query(`SELECT canonical.* FROM crm_products requested JOIN crm_products canonical
+    ON canonical.pipeline_id=requested.pipeline_id AND canonical.id=resolve_crm_product_identity(requested.pipeline_id,requested.id)
+    WHERE requested.pipeline_id=$1::uuid AND requested.reference_code=$2 FOR SHARE OF requested,canonical`,[ctx.principal.pipelineId,resolved])).rows[0]
+   if(!row)fail(404,'RECORD_NOT_FOUND');if(row.active!==true||!active(row))fail(410,'RECORD_RETIRED')
+   return productEnvelope(ctx,row,requested)
+  }
+  resolved=next
+ }
+ return fail(409,'IDENTITY_CONFLICT')
+})}
+export async function listFractionalCrmProducts(p:FractionalCrmPrincipal,page:{limit:number;cursor?:string}){return withTransaction(async client=>{
+ const ctx=await context(client,p,'crm.product.read'),limit=page.limit;
+ if(!Number.isInteger(limit)||limit<1||limit>100)fail(422,'INVALID_PAGE')
+ const cursorScope=canonicalHash({credentialId:p.credentialId,sourceInstanceId:p.sourceInstanceId,scope:scope(ctx),entity:'product'});let after=''
+ if(page.cursor){const value=parse(()=>JSON.parse(Buffer.from(page.cursor!,'base64url').toString('utf8'))) as Row;
+  if(value.scope!==cursorScope||!gatewayUuid(value.after))fail(422,'INVALID_PAGE');after=String(value.after)}
+ const rows=(await client.query(`SELECT * FROM crm_products WHERE pipeline_id=$1::uuid AND active=true
+  AND COALESCE(lower(source_payload->>'archived'),'false') NOT IN ('true','1','yes')
+  AND NOT EXISTS (SELECT 1 FROM crm_product_identity_aliases a WHERE a.pipeline_id=crm_products.pipeline_id AND a.alias_product_id=crm_products.id)
+  AND ($2='' OR id>NULLIF($2,'')::uuid)
+  ORDER BY id LIMIT $3 FOR SHARE`,[ctx.principal.pipelineId,after,limit+1])).rows
+ const selected=rows.slice(0,limit)
+ return {schemaVersion:1,sourceInstanceId:p.sourceInstanceId,scope:scope(ctx),items:selected.map(row=>productEnvelope(ctx,row,str(row,'reference_code'))),
+  nextCursor:rows.length>limit?Buffer.from(JSON.stringify({scope:cursorScope,after:selected.at(-1)!.id})).toString('base64url'):null}
+})}
 export async function readFractionalCrmContact(p:FractionalCrmPrincipal,ga:string,gc:string){return withTransaction(async client=>{const ctx=await context(client,p,'crm.contact.read'),parent=await companyRow(client,ctx,ga),row=await contactRow(client,ctx,parent,gc);return envelope(ctx,'contact',row,parent,gc)})}
 export async function listFractionalCrmContacts(p:FractionalCrmPrincipal,ga:string,page:{limit?:number;cursor?:string|null}={}){return withTransaction(async client=>{
  const ctx=await context(client,p,'crm.contact.read'),parent=await companyRow(client,ctx,ga),limit=page.limit??50;if(!Number.isInteger(limit)||limit<1||limit>100)fail(422,'INVALID_PAGE')

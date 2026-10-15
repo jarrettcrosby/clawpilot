@@ -12,6 +12,8 @@ export type FractionalCrmPatch = {
   assertedFractionalActor: { userId: string; organizationId: string; customerId: string }
 }
 export type FractionalCrmGatewayServices = {
+  readFractionalCrmProduct?: (principal: FractionalCrmPrincipal, gp: string) => Promise<unknown>
+  listFractionalCrmProducts?: (principal: FractionalCrmPrincipal, page: { limit: number; cursor?: string }) => Promise<unknown>
   readFractionalCrmCredential: (id: string) => Promise<FractionalCrmCredential | null>
   readFractionalCrmOrganization: (principal: FractionalCrmPrincipal) => Promise<unknown>
   readFractionalCrmCompany: (principal: FractionalCrmPrincipal, ga: string) => Promise<unknown>
@@ -139,15 +141,23 @@ export async function handleFractionalCrmGateway(
     if (!isFractionalCrmGatewayPath(url.pathname, request.method)) invalid(404, 'RECORD_NOT_FOUND')
     const parts = url.pathname.slice(basePath.length).split('/')
     const isOnboarding = parts[0] === 'onboarding'
+    const isProduct = parts[0] === 'products'
     const isContact = parts.length >= 3
-    const isList = parts.length === 3
-    const capability: FractionalCrmCapability = isOnboarding ? 'crm.onboarding.write'
+    const isList = isProduct ? parts.length === 1 : parts.length === 3
+    const capability: FractionalCrmCapability = isProduct ? 'crm.product.read' : isOnboarding ? 'crm.onboarding.write'
       : request.method === 'PATCH' ? (isContact ? 'crm.contact.write' : 'crm.company.write')
         : isContact ? 'crm.contact.read' : 'crm.company.read'
     const principal = await authenticateFractionalCrmGateway(request, fractionalCrmGatewayConfiguration(env), services.readFractionalCrmCredential, capability)
     exactScope(url, principal, isList)
     let result: unknown
-    if (isOnboarding) {
+    if (isProduct) {
+      if (!services.readFractionalCrmProduct || !services.listFractionalCrmProducts) invalid(503, 'GATEWAY_UNAVAILABLE')
+      if (isList) {
+        const limit = url.searchParams.get('limit') ?? '50', cursor = url.searchParams.get('cursor') ?? undefined
+        if (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,1024}$/.test(cursor))) invalid()
+        result = await services.listFractionalCrmProducts(principal, { limit: Number(limit), ...(cursor ? { cursor } : {}) })
+      } else result = await services.readFractionalCrmProduct(principal, parts[1])
+    } else if (isOnboarding) {
       const key = idempotency(request)
       result = await services.resolveOrCreateFractionalCrmOnboarding(principal, onboarding(await readJson(request), principal), key)
     } else if (parts[0] === 'organization') {
