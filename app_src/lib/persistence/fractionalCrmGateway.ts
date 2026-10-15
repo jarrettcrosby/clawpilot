@@ -291,6 +291,22 @@ export async function resolveOrCreateFractionalCrmOnboarding(p:FractionalCrmPrin
  }
  const companyCreated=!chosenCompany,contactCreated=Boolean(input.contact&&!chosenContact)
  if(companyCreated){if(ctx.principal.allowedCompanyGlobalIds.length>=1000)fail(409,'DISCOVERY_LIMIT')
+ // Existing table locks serialize native writers as well as gateway calls.
+ // Include archived descendants and ungranted identities for collision checks,
+ // but never disclose their IDs/profile fields through a directory response.
+ const sameRoot=(await client.query(`WITH RECURSIVE tree AS (
+  SELECT id,ARRAY[id] AS seen FROM crm_organizations WHERE pipeline_id=$1::uuid AND id=$2::uuid
+  UNION ALL SELECT c.id,t.seen||c.id FROM crm_organizations c JOIN tree t ON c.parent_organization_id=t.id
+  WHERE c.pipeline_id=$1::uuid AND NOT c.id=ANY(t.seen) AND cardinality(t.seen)<64)
+  SELECT c.id,c.name,c.website,cardinality(t.seen) AS depth,
+   EXISTS(SELECT 1 FROM crm_organizations child WHERE child.pipeline_id=$1::uuid AND child.parent_organization_id=c.id) AS has_children
+  FROM crm_organizations c JOIN tree t ON t.id=c.id WHERE c.pipeline_id=$1::uuid AND c.id<>$2::uuid
+  ORDER BY c.id LIMIT 1001`,[p.pipelineId,ctx.root.id])).rows
+ if(sameRoot.length>1000||sameRoot.some(r=>Number(r.depth)>=64&&r.has_children))fail(409,'DISCOVERY_LIMIT')
+ const requestedName=normalizedName(input.company.fields.companyName),requestedHost=websiteHost(input.company.fields.website)
+ const hiddenMatch=sameRoot.some(r=>!allCompanies.some(known=>known.id===r.id)&&
+  (normalizedName(r.name)===requestedName||Boolean(requestedHost&&websiteHost(r.website)===requestedHost)))
+ if(hiddenMatch)return review('COMPANY_CANDIDATES')
  const staged=await stageFields(client,ctx,'company',undefined,ctx.root,input.company.fields,input.actor,`fractional:${p.fractionalDeploymentId}:${input.origin.customerId}`)
  await client.query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1',[p.credentialId,staged.referenceCode]);ctx.principal.allowedCompanyGlobalIds.push(staged.referenceCode)
  chosenCompany=await companyRow(client,ctx,staged.referenceCode,true)

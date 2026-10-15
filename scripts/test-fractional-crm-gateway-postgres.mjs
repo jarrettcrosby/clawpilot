@@ -137,6 +137,14 @@ try{
  const review=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,blocked,'gateway-onboard-weak');check(review.status==='review_required'&&review.reasonCodes.includes('COMPANY_CANDIDATES'),'name match never authorizes reuse');check(review.candidates[0].displayName==='Existing A'&&review.candidates[0].companyName==='Existing A'&&review.candidates[0].email===null,'review labels describe authorized canonical candidates')
  assert.deepEqual((await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT count(*) FROM fractional_crm_source_mappings) AS mappings,(SELECT count(*) FROM sync_outbox) AS outbox')).rows[0],counts);checks++
  const relationship=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,request('cross-company','Brand New','contact-b@example.invalid'),'gateway-onboard-cross');check(relationship.status==='review_required'&&relationship.reasonCodes.includes('CONTACT_RELATIONSHIP_REVIEW'),'pair review creates neither record')
+ // Hidden or archived same-root companies block creation without disclosing IDs.
+ const hiddenBefore=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT allowed_company_global_ids FROM fractional_crm_gateway_credentials WHERE id=$1) AS allowed',[credentialId])).rows[0]
+ for(const [i,name] of ['Ungrant company','Retired intermediate','Child under retired parent'].entries()){
+  const collision=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,request(`hidden-collision-${i}`,name,`hidden-collision-${i}@example.invalid`),`hidden-collision-${i}`)
+  check(collision.status==='review_required'&&collision.reasonCodes.includes('COMPANY_CANDIDATES')&&collision.candidates.length===0,'same-root hidden/archive collision blocks creation without disclosure')
+ }
+ const hiddenAfter=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT allowed_company_global_ids FROM fractional_crm_gateway_credentials WHERE id=$1) AS allowed',[credentialId])).rows[0]
+ assert.deepEqual(hiddenAfter,hiddenBefore);checks++
  const fresh=request('new-customer',"Unique O'Neil &amp; <x>",'unique-new@example.invalid'),results=await Promise.all([gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair')]);
  check(results[0].company.record.globalId===results[1].company.record.globalId&&results[0].contact.record.globalId===results[1].contact.record.globalId,'concurrent exact retry creates one pair')
  check(results.some(r=>r.replayed===true),'retry is visibly acknowledged')
