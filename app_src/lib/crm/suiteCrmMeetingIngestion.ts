@@ -1,11 +1,15 @@
 import crypto from 'node:crypto'
 import {
+  assertCurrentSuiteCrmMeetingProjectionWithClient,
   resolveRecordedCrmMeetingCalendarCommunication,
   stageCrmMeetingAndEnqueueCalendarAction,
 } from '@/lib/crm/integrationActions'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import {
   listSuiteCrmMeetingsUpdatedSince,
+  normalizeSuiteCrmMeetingProjectionAttributes,
+  readSuiteCrmMeetingSnapshot,
+  type SuiteCrmMeetingProjectionAttributes,
   type SuiteCrmMeetingSnapshot,
 } from '@/lib/crm/suiteCrmClient'
 import type { CrmMeeting } from '@/lib/crm/types'
@@ -45,6 +49,7 @@ type MeetingRow = {
   opportunity_id: string | null
   source_key: string
   source_hash: string
+  suitecrm_id: string
   reference_code: string
   subject: string
   description: string | null
@@ -148,7 +153,7 @@ async function localMeeting(suiteCrmId: string): Promise<MeetingRow | null> {
   const result = await query<MeetingRow>(
     `SELECT meeting.id::text, meeting.pipeline_id::text, pipeline.owner_email,
        meeting.organization_id::text, meeting.contact_id::text, meeting.lead_id::text,
-       meeting.opportunity_id::text, meeting.source_key, meeting.source_hash, meeting.reference_code,
+       meeting.opportunity_id::text, meeting.source_key, meeting.source_hash, meeting.suitecrm_id, meeting.reference_code,
        meeting.subject, meeting.description, meeting.starts_at, meeting.ends_at,
        meeting.timezone, meeting.location, meeting.attendee_emails, meeting.status,
        meeting.provider, meeting.external_event_id, meeting.external_event_url,
@@ -228,9 +233,51 @@ function suiteCrmParent(meeting: MeetingRow): Pick<
   }
 }
 
-function meetingFields(snapshot: SuiteCrmMeetingSnapshot, meeting: MeetingRow): MeetingFields {
-  const startsAt = suiteTimestamp(snapshot.attributes.date_start, 'start')
-  const endsAt = suiteMeetingEnd(snapshot.attributes, startsAt)
+type CurrentProjection = {
+  outboxId: string
+  receipt: Record<string, unknown>
+  attributes: SuiteCrmMeetingProjectionAttributes
+}
+
+async function currentProjection(meeting: MeetingRow): Promise<CurrentProjection | null> {
+  const rows = await query<{ id: string; receipt: Record<string, unknown> }>(
+    `SELECT projection.id::text, projection.payload->'suiteCrmMeetingProjection' AS receipt
+     FROM sync_outbox projection
+     WHERE projection.target_system = 'suitecrm' AND projection.aggregate_type = 'crm_meetings'
+       AND projection.aggregate_id = $1 AND projection.operation = 'upsert_record'
+       AND projection.status = 'succeeded' AND projection.payload->>'pipelineId' = $2
+       AND projection.payload->>'localId' = $1 AND projection.payload->>'suiteCrmId' = $3
+       AND projection.idempotency_key = $4
+       AND NOT EXISTS (
+         SELECT 1 FROM sync_outbox pending WHERE pending.target_system = 'suitecrm'
+           AND pending.aggregate_type = 'crm_meetings' AND pending.aggregate_id = $1
+           AND pending.operation IN ('upsert_record', 'reproject_record', 'delete_record')
+           AND pending.status IN ('queued', 'processing', 'failed', 'dead')
+       ) LIMIT 2`, [meeting.id, meeting.pipeline_id, meeting.suitecrm_id,
+      `crm:meetings:v4:${meeting.id}:default:${meeting.source_hash}`],
+  )
+  if (rows.rows.length === 0) return null
+  const { id, receipt } = rows.rows[0]
+  if (rows.rows.length !== 1 || !receipt || typeof receipt !== 'object' || Array.isArray(receipt)
+    || Buffer.byteLength(JSON.stringify(receipt), 'utf8') > 200_000
+    || Object.keys(receipt).length !== 6 || receipt.version !== 1 || receipt.outboxId !== id
+    || receipt.suiteCrmId !== meeting.suitecrm_id || receipt.sourceHash !== meeting.source_hash
+    || typeof receipt.capturedAt !== 'string' || validDate(receipt.capturedAt)?.toISOString() !== receipt.capturedAt) {
+    throw new SafeSuiteCrmMeetingIngestionError('The current SuiteCRM meeting projection receipt is invalid')
+  }
+  return { outboxId: id, receipt, attributes: normalizeSuiteCrmMeetingProjectionAttributes(receipt.attributes) }
+}
+
+function meetingFields(snapshot: SuiteCrmMeetingSnapshot, meeting: MeetingRow,
+  baseline?: SuiteCrmMeetingProjectionAttributes): MeetingFields {
+  const attributes = normalizeSuiteCrmMeetingProjectionAttributes(snapshot.attributes)
+  const unchanged = (key: keyof SuiteCrmMeetingProjectionAttributes) => Boolean(baseline && attributes[key] === baseline[key])
+  const startsAt = suiteTimestamp(unchanged('date_start') ? meeting.starts_at : attributes.date_start, 'start')
+  const durationUnchanged = unchanged('duration_hours') && unchanged('duration_minutes')
+  const endsAt = durationUnchanged && unchanged('date_end')
+    ? new Date(Date.parse(startsAt) + new Date(meeting.ends_at).getTime() - new Date(meeting.starts_at).getTime()).toISOString()
+    : suiteMeetingEnd(baseline && !durationUnchanged && unchanged('date_end')
+      ? { ...attributes, date_end: '' } : attributes, startsAt)
   if (Date.parse(endsAt) <= Date.parse(startsAt)) {
     throw new SafeSuiteCrmMeetingIngestionError('SuiteCRM meeting time range is invalid')
   }
@@ -240,14 +287,14 @@ function meetingFields(snapshot: SuiteCrmMeetingSnapshot, meeting: MeetingRow): 
     leadId: meeting.lead_id,
     opportunityId: meeting.opportunity_id,
     ...suiteCrmParent(meeting),
-    subject: cleanString(snapshot.attributes.name, 300, 'meeting subject') || meeting.subject,
-    description: cleanMultiline(snapshot.attributes.description, 50_000, 'meeting description'),
+    subject: unchanged('name') ? meeting.subject : cleanString(attributes.name, 300, 'meeting subject') || meeting.subject,
+    description: unchanged('description') ? meeting.description || '' : cleanMultiline(attributes.description, 50_000, 'meeting description'),
     startsAt,
     endsAt,
     timezone: meeting.timezone || 'America/New_York',
-    location: cleanMultiline(snapshot.attributes.location, 1_000, 'meeting location'),
+    location: unchanged('location') ? meeting.location || '' : cleanMultiline(attributes.location, 1_000, 'meeting location'),
     attendeeEmails: Array.isArray(meeting.attendee_emails) ? meeting.attendee_emails : [],
-    status: suiteMeetingStatus(snapshot.attributes.status, meeting),
+    status: unchanged('status') ? meeting.status : suiteMeetingStatus(attributes.status, meeting),
     provider: meeting.provider || 'maton',
     externalEventId: meeting.external_event_id,
     externalEventUrl: meeting.external_event_url,
@@ -257,13 +304,23 @@ function meetingFields(snapshot: SuiteCrmMeetingSnapshot, meeting: MeetingRow): 
 
 function hasMeaningfulChanges(meeting: MeetingRow, fields: MeetingFields): boolean {
   return (
-    meeting.subject.trim() !== fields.subject.trim()
-    || cleanMultiline(meeting.description, 50_000, 'stored meeting description') !== fields.description
+    meeting.subject !== fields.subject
+    || (meeting.description || '') !== fields.description
     || validDate(meeting.starts_at)?.getTime() !== validDate(fields.startsAt)?.getTime()
     || validDate(meeting.ends_at)?.getTime() !== validDate(fields.endsAt)?.getTime()
-    || cleanMultiline(meeting.location, 1_000, 'stored meeting location') !== fields.location
+    || (meeting.location || '') !== fields.location
     || meeting.status !== fields.status
   )
+}
+
+function meetingModeAfterLocationEdit(meeting: MeetingRow, location: string | undefined): unknown {
+  const mode = meeting.source_payload?.meetingMode
+  if ((mode !== 'unspecified' && mode !== 'in_person')
+    || String(meeting.join_url || '').trim()
+    || String(meeting.source_payload?.customJoinUrl || '').trim()) return mode
+  // Native CRM exposes a location, not ClawPilot's mode selector. Keep the
+  // two consistent without changing any existing conferencing identity.
+  return location?.trim() ? 'in_person' : 'unspecified'
 }
 
 async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
@@ -273,11 +330,20 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
 }> {
   const meeting = await localMeeting(snapshot.id)
   if (!meeting) return { matched: false, staged: false, calendarActionQueued: false }
-  const fields = meetingFields(snapshot, meeting)
+  const projection = await currentProjection(meeting)
+  const fields = meetingFields(snapshot, meeting, projection?.attributes)
   if (!hasMeaningfulChanges(meeting, fields)) {
     return { matched: true, staged: false, calendarActionQueued: false }
   }
+  if (!projection) throw new SafeSuiteCrmMeetingIngestionError('The current SuiteCRM meeting projection is unproven; synchronize before importing edits')
+  const attributes = normalizeSuiteCrmMeetingProjectionAttributes(snapshot.attributes)
+  const live = await readSuiteCrmMeetingSnapshot(snapshot.id)
+  if (live.id !== snapshot.id
+    || JSON.stringify(normalizeSuiteCrmMeetingProjectionAttributes(live.attributes)) !== JSON.stringify(attributes)) {
+    throw new SafeSuiteCrmMeetingIngestionError('The native SuiteCRM meeting changed after polling; retry with a fresh snapshot')
+  }
   const dateModified = suiteTimestamp(snapshot.attributes.date_modified, 'modified time')
+  const meetingMode = meetingModeAfterLocationEdit(meeting, fields.location)
   const stageInput: StageMeetingInput = {
     entity: 'meetings',
     pipelineId: meeting.pipeline_id,
@@ -287,6 +353,7 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
       ...(meeting.source_payload || {}),
       source: 'suitecrm-inbound',
       suiteCrmDateModified: dateModified,
+      meetingMode,
     },
     actorEmail: meeting.owner_email,
     fields,
@@ -310,6 +377,10 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
       if (!meeting.source_hash || current.rows[0]?.source_hash !== meeting.source_hash) {
         throw new SafeSuiteCrmMeetingIngestionError('The meeting changed during SuiteCRM reconciliation')
       }
+      await assertCurrentSuiteCrmMeetingProjectionWithClient(client, {
+        pipelineId: meeting.pipeline_id, meetingId: meeting.id, sourceHash: meeting.source_hash,
+        projection: { outboxId: projection.outboxId, receipt: projection.receipt },
+      })
       await stageCrmRecordWithClient(client, stageInput)
     })
     return { matched: true, staged: true, calendarActionQueued: false }
@@ -325,6 +396,10 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
     .update(snapshot.id)
     .update('\u0000')
     .update(dateModified)
+    .update('\u0000')
+    .update(JSON.stringify(attributes))
+    .update('\u0000')
+    .update(meeting.source_hash)
     .digest('hex')
     .slice(0, 24)
   const queued = await stageCrmMeetingAndEnqueueCalendarAction({
@@ -338,12 +413,13 @@ async function reconcileMeeting(snapshot: SuiteCrmMeetingSnapshot): Promise<{
       location: fields.location,
       attendeeEmails: fields.attendeeEmails,
       meetingStatus: fields.status,
-      meetingMode: meeting.source_payload?.meetingMode,
+      meetingMode,
       customJoinUrl: meeting.source_payload?.customJoinUrl,
     },
     communication: recorded.communication,
     previousCalendar: recorded.previousCalendar,
     expectedMeetingSourceHash: meeting.source_hash,
+    expectedSuiteCrmProjection: { outboxId: projection.outboxId, receipt: projection.receipt },
     idempotencyKey: `crm:suitecrm-meeting-calendar:${meeting.reference_code}:${revision}`,
   })
   return { matched: true, staged: true, calendarActionQueued: queued.created }
