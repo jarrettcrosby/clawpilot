@@ -40,6 +40,10 @@ const PRE_GATEWAY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: '77741d50693a7e652606937398f7fb66507371a3ab9bfc4d4b63b684178c7aa2',
   18: '0501ba51ff372ea79c083f4c21de8a89c8f1d98ccea962701c0dc37be671196f',
 })
+const PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'a1af2c30e5b28aec8e60d1689330b72c2fdff5666c7da382f5cfa9fbc4869615',
+  18: '73040be0231764cb9fbcfd8d9d5fd7eadab2c9debd428b3317150b5a844ba741',
+})
 const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_gateway_credentials_actor_email_fkey', 'public.app_users'],
   ['fractional_crm_verified_identifiers_accepted_by_fkey', 'public.app_users'],
@@ -48,8 +52,15 @@ const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_source_mappings_workspace_organization_id_fkey', 'public.workspace_organizations'],
   ['fractional_crm_verified_identifi_workspace_organization_id_fkey', 'public.workspace_organizations'],
 ])
+const CALENDAR_REFERENCE_CONSTRAINTS = new Map([
+  ['crm_calendar_discovery_sources_workspace_organization_id_fkey', 'public.workspace_organizations'],
+  ['crm_calendar_discovery_sources_credential_owner_email_fkey', 'public.app_users'],
+  ['crm_calendar_discovery_sources_created_by_fkey', 'public.app_users'],
+  ['crm_meeting_contacts_created_by_fkey', 'public.app_users'],
+])
 const NEW_REFERENCE_CONSTRAINTS = new Map([
   ...GATEWAY_REFERENCE_CONSTRAINTS,
+  ...CALENDAR_REFERENCE_CONSTRAINTS,
   ['app_user_login_addresses_user_email_fkey', 'public.app_users'],
   ['app_login_email_changes_user_email_fkey', 'public.app_users'],
   ['app_user_google_login_bindings_user_email_fkey', 'public.app_users'],
@@ -202,7 +213,7 @@ async function exerciseImage(image) {
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0372
+    // 0370 through 0373
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -255,7 +266,7 @@ async function exerciseImage(image) {
       NEW_REFERENCE_CONSTRAINTS.has(trigger.constraint)
       || trigger.name === 'app_users_guard_login_address'
     ))
-    assert.equal(addedTriggers.length, 29, 'only the fourteen reviewed FK pairs and login guard are new')
+    assert.equal(addedTriggers.length, 37, 'only the eighteen reviewed FK pairs and login guard are new')
     const addedFunctions = baseline.catalog.functions.filter((fn) => (
       fn.schema === 'public' && fn.name === 'guard_clawpilot_login_address'
     ))
@@ -265,10 +276,24 @@ async function exerciseImage(image) {
       GATEWAY_REFERENCE_CONSTRAINTS.has(trigger.constraint)
     ))
     assert.equal(gatewayTriggers.length, 12, '0372 adds exactly six referenced-table FK pairs')
+    const calendarTriggers = baseline.catalog.triggers.filter((trigger) => (
+      CALENDAR_REFERENCE_CONSTRAINTS.has(trigger.constraint)
+    ))
+    assert.equal(calendarTriggers.length, 8, '0373 adds exactly four referenced-table FK pairs')
     assert.equal(
       productionRebindHistorySchemaDigest({
         ...baseline.catalog,
-        triggers: baseline.catalog.triggers.filter((trigger) => !gatewayTriggers.includes(trigger)),
+        triggers: baseline.catalog.triggers.filter((trigger) => !calendarTriggers.includes(trigger)),
+      }),
+      PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
+      'only the reviewed 0373 foreign-key guards explain the change from attestation v7',
+    )
+    assert.equal(
+      productionRebindHistorySchemaDigest({
+        ...baseline.catalog,
+        triggers: baseline.catalog.triggers.filter((trigger) => (
+          !gatewayTriggers.includes(trigger) && !calendarTriggers.includes(trigger)
+        )),
       }),
       PRE_GATEWAY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
       'only the reviewed 0372 foreign-key guards explain the change from attestation v6',
@@ -281,7 +306,7 @@ async function exerciseImage(image) {
     assert.equal(
       productionRebindHistorySchemaDigest(projectedPriorCatalog),
       PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
-      'the reviewed 0370 through 0372 trigger and function additions alone explain the digest change',
+      'the reviewed 0370 through 0373 trigger and function additions alone explain the digest change',
     )
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
@@ -408,6 +433,18 @@ async function exerciseImage(image) {
         pool,
         'schema_catalog_mismatch',
         `0372 referenced-table guard drift: ${constraint}`,
+        (client) => client.query(
+          `ALTER TABLE ${referencedGuard.constraintRelation} DROP CONSTRAINT ${constraint}`,
+        ),
+      )
+    }
+    for (const [constraint] of CALENDAR_REFERENCE_CONSTRAINTS) {
+      const referencedGuard = calendarTriggers.find((trigger) => trigger.constraint === constraint)
+      assert.ok(referencedGuard?.constraintRelation)
+      await expectFailure(
+        pool,
+        'schema_catalog_mismatch',
+        `0373 referenced-table guard drift: ${constraint}`,
         (client) => client.query(
           `ALTER TABLE ${referencedGuard.constraintRelation} DROP CONSTRAINT ${constraint}`,
         ),
