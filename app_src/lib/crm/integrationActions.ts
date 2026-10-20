@@ -1894,7 +1894,7 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
        AND communication_identity_email = $6
        AND ($7::uuid IS NULL OR id = $7::uuid)
        AND (
-         (aggregate_type = 'crm_meeting' AND aggregate_id = $8::uuid AND reference_code = $9)
+         (aggregate_type = 'crm_meeting' AND aggregate_id = $8::text AND reference_code = $9)
          OR response_summary->>'meetingReferenceCode' = $9
        )
      ORDER BY processed_at DESC NULLS LAST, created_at DESC, id DESC

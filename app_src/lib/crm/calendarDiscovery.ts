@@ -142,11 +142,46 @@ function isoDate(value: unknown): string | null {
   return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null
 }
 
+function eventTimeZone(value: unknown, dateTime: string, fallbackZone: string): string {
+  const label = text(value, 100, 'timezone')
+  const fixed = /^(?:GMT|UTC)([+-])(\d{2}):(\d{2})$/.exec(label)
+  if (!fixed) return timezone(label, fallbackZone)
+  const hours = Number(fixed[2])
+  const minutes = Number(fixed[3])
+  if (hours > 14 || minutes > 59 || (hours === 14 && minutes !== 0)) {
+    throw new SafeCalendarDiscoveryError('Calendar discovery returned invalid timezone')
+  }
+  // Some provider events contain a fixed-offset label instead of an IANA
+  // zone. It is evidence only when the complete RFC3339 timestamp explicitly
+  // confirms it; never apply that label to a floating time or all-day date.
+  const timestamp = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/i.exec(dateTime)
+  if (!timestamp) throw new SafeCalendarDiscoveryError('Calendar discovery returned invalid event time')
+  const offsetHours = Number(timestamp[9] || 0)
+  const offsetMinutes = Number(timestamp[10] || 0)
+  const actualOffset = (timestamp[8] === '-' ? -1 : 1) * (offsetHours * 60 + offsetMinutes)
+  const expectedOffset = (fixed[1] === '-' ? -1 : 1) * (hours * 60 + minutes)
+  const calendarDate = new Date(Date.UTC(Number(timestamp[1]), Number(timestamp[2]) - 1,
+    Number(timestamp[3]), Number(timestamp[4]), Number(timestamp[5]), Number(timestamp[6])))
+  if (offsetHours > 14 || offsetMinutes > 59 || (offsetHours === 14 && offsetMinutes !== 0)
+    || actualOffset !== expectedOffset
+    || calendarDate.getUTCFullYear() !== Number(timestamp[1])
+    || calendarDate.getUTCMonth() + 1 !== Number(timestamp[2])
+    || calendarDate.getUTCDate() !== Number(timestamp[3])
+    || calendarDate.getUTCHours() !== Number(timestamp[4])
+    || calendarDate.getUTCMinutes() !== Number(timestamp[5])
+    || calendarDate.getUTCSeconds() !== Number(timestamp[6])) {
+    throw new SafeCalendarDiscoveryError('Calendar discovery returned invalid event time')
+  }
+  // Preserve the timestamp's instant, while using the verified calendar's
+  // usable IANA zone for CRM display and later edits.
+  return timezone(fallbackZone)
+}
+
 function eventTime(value: unknown, fallbackZone: string): string | null {
   const part = record(value)
   if (!part) return null
-  const zone = timezone(part.timeZone, fallbackZone)
   const dateTime = text(part.dateTime, 100, 'event time')
+  const zone = eventTimeZone(part.timeZone, dateTime, fallbackZone)
   if (dateTime) {
     const result = zonedDateTimeToIso(dateTime, zone)
     if (!result) throw new SafeCalendarDiscoveryError('Calendar discovery returned invalid event time')
@@ -243,7 +278,9 @@ export function parseCalendarDiscoveryEvent(
   if (!['confirmed', 'tentative', 'cancelled'].includes(status)) {
     throw new SafeCalendarDiscoveryError('Calendar discovery returned invalid event status')
   }
-  const timeZone = timezone(record(event.start)?.timeZone, timezone(responseTimeZone, source.timeZone || 'UTC'))
+  const calendarTimeZone = timezone(responseTimeZone, source.timeZone || 'UTC')
+  const start = record(event.start)
+  const timeZone = eventTimeZone(start?.timeZone, text(start?.dateTime, 100, 'event time'), calendarTimeZone)
   const startsAt = eventTime(event.start, timeZone)
   const endsAt = eventTime(event.end, timeZone)
   if (status !== 'cancelled' && (!startsAt || !endsAt || Date.parse(endsAt) <= Date.parse(startsAt))) {
