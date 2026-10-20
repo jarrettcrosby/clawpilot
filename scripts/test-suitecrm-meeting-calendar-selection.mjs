@@ -150,7 +150,7 @@ async function query(sql, parameters = []) {
     assert.match(sql, /pipeline_id = \$1::uuid/)
     assert.match(sql, /communication_connection_id = \$4/)
     assert.match(sql, /communication_calendar_id = \$5/)
-    assert.match(sql, /aggregate_id = \$8::uuid AND reference_code = \$9/)
+    assert.match(sql, /aggregate_id = \$8::text AND reference_code = \$9/)
     const matches = prior && prior.status === 'succeeded' && prior.pipeline_id === parameters[0]
       && prior.external_id === parameters[1] && prior.communication_credential_owner_email === parameters[2]
       && prior.communication_connection_id === parameters[3] && prior.communication_calendar_id === parameters[4]

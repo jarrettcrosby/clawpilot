@@ -306,6 +306,74 @@ assert.throws(() => api.parseCalendarDiscoveryEvent(source, event(), source.time
   assert.equal(parsed.startsAt, '2026-10-21T14:00:00.000Z', 'optional event timezone falls back to verified calendar zone')
 }
 {
+  const providerFixedOffsetEvent = event({ id: 'provider-fixed-offset',
+    start: { dateTime: '2026-10-21T11:00:00-04:00', timeZone: 'GMT-04:00' },
+    end: { dateTime: '2026-10-21T12:00:00-04:00', timeZone: 'GMT-04:00' },
+    originalStartTime: { dateTime: '2026-10-21T10:00:00-04:00', timeZone: 'GMT-04:00' } })
+  const parsed = parse(providerFixedOffsetEvent)
+  assert.equal(parsed.startsAt, '2026-10-21T15:00:00.000Z', 'provider fixed label preserves explicit timestamp instant')
+  assert.equal(parsed.endsAt, '2026-10-21T16:00:00.000Z')
+  assert.equal(parsed.originalStartTime, '2026-10-21T14:00:00.000Z')
+  assert.equal(parsed.timeZone, source.timeZone, 'fixed label is not persisted as the display/edit timezone')
+  const f = fixture({ responses: [{ items: [providerFixedOffsetEvent, event({ id: 'following-valid-event' })], nextSyncToken: 'fixed-offset-page-complete' }] })
+  const counts = await f.run()
+  assert.equal(counts.errors, 0)
+  assert.equal(counts.created, 2, 'a verified fixed-offset item does not block later page items')
+  assert.equal(counts.sourcesPolled, 1)
+  assert.deepEqual(f.state.events.map(row => row.externalEventId), ['provider-fixed-offset', 'following-valid-event'])
+  assert.equal(f.state.cursor.syncToken, 'fixed-offset-page-complete')
+}
+{
+  for (const [label, offset, startsAt] of [
+    ['UTC+05:30', '+05:30', '2026-10-21T05:30:00.000Z'],
+    ['GMT-03:30', '-03:30', '2026-10-21T14:30:00.000Z'],
+    ['UTC+00:00', 'Z', '2026-10-21T11:00:00.000Z'],
+    ['GMT+00:00', '+00:00', '2026-10-21T11:00:00.000Z'],
+    ['UTC+14:00', '+14:00', '2026-10-20T21:00:00.000Z'],
+  ]) {
+    const parsed = parse(event({
+      start: { dateTime: `2026-10-21T11:00:00${offset}`, timeZone: label },
+      end: { dateTime: `2026-10-21T12:00:00${offset}`, timeZone: label },
+      originalStartTime: { dateTime: `2026-10-21T11:00:00${offset}`, timeZone: label },
+    }))
+    assert.equal(parsed.startsAt, startsAt, label)
+    assert.equal(parsed.originalStartTime, startsAt, `${label} original occurrence uses identical validation`)
+    assert.equal(parsed.timeZone, source.timeZone)
+  }
+}
+{
+  const invalidParts = [
+    { dateTime: '2026-10-21T11:00:00-05:00', timeZone: 'GMT-04:00' },
+    { dateTime: '2026-10-21T11:00:00', timeZone: 'GMT-04:00' },
+    { date: '2026-10-21', timeZone: 'GMT-04:00' },
+    { dateTime: '2026-10-21T11:00:00Z', timeZone: 'GMT-04:00' },
+    { dateTime: '2026-10-21T11:00:00+24:00', timeZone: 'UTC+24:00' },
+    { dateTime: '2026-10-21T11:00:00+14:01', timeZone: 'UTC+14:01' },
+    { dateTime: '2026-10-21T11:00:00+04:60', timeZone: 'GMT+04:60' },
+    { dateTime: '2026-10-21T25:00:00-04:00', timeZone: 'GMT-04:00' },
+    { dateTime: '2026-02-30T11:00:00-04:00', timeZone: 'GMT-04:00' },
+    { dateTime: '2026-10-21T11:00:00-04:00', timeZone: 'Unknown/Timezone' },
+    { dateTime: '2026-10-21T11:00:00-04:00', timeZone: 'GMT-4:00' },
+  ]
+  for (const partName of ['start', 'end', 'originalStartTime']) {
+    for (const part of invalidParts) {
+      assert.throws(() => parse(event({ [partName]: part })), /invalid (?:timezone|event time)/,
+        `${partName} rejects unproven or invalid fixed-offset time ${JSON.stringify(part)}`)
+    }
+  }
+  assert.throws(() => parse(event(), 'GMT-04:00'), /invalid timezone/,
+    'provider response timezone must remain a usable calendar zone')
+  const f = fixture()
+  assert.equal((await f.run([{ ...source, timeZone: 'GMT-04:00' }])).errors, 1)
+  assert.equal(f.state.gets.length, 0, 'fixed labels do not relax configured source timezone identity')
+  const badPage = fixture({ responses: [{ items: [event({
+    start: { dateTime: '2026-10-21T11:00:00-05:00', timeZone: 'GMT-04:00' },
+  }), event({ id: 'must-not-skip-invalid-event' })], nextSyncToken: 'must-not-acknowledge' }] })
+  assert.equal((await badPage.run()).errors, 1)
+  assert.equal(badPage.state.events.length, 0)
+  assert.equal(badPage.state.cursor.mode, 'bootstrap', 'conflicting offsets retain the failed page instead of skipping it')
+}
+{
   const parsed = parse(event({ start: { dateTime: '2020-01-01T10:00:00Z' }, end: { dateTime: '2020-01-01T11:00:00Z' } }))
   assert.equal(parsed.allowCreate, false, 'delta imports cannot broaden initial time scope')
 }

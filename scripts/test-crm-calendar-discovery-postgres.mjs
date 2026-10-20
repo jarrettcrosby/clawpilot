@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
 import { runStorageGuard } from './local-storage-guard.mjs'
@@ -170,6 +171,55 @@ try {
   check(outbox.entity === 'meetings', 'native SuiteCRM Meetings entity receives the imported meeting')
   check(outbox.relationships.filter(row => row.relatedModuleName === 'Contacts').length === 2, 'CRM outbox includes every matched contact')
   check((await query('SELECT count(*) FROM crm_integration_actions')).rows[0].count === '0', 'import queues no Calendar invitation/actions')
+  check((await query(`SELECT data_type FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='crm_integration_actions' AND column_name='aggregate_id'`))
+    .rows[0].data_type === 'text', 'recorded action aggregate identity retains its real text column type')
+  const integration = load('app_src/lib/crm/integrationActions.ts', {
+    '@/lib/globalIds.mjs': globalIds,
+    '@/lib/users': { normalizeUserEmail: value => String(value || '').trim().toLowerCase() },
+    '@/lib/persistence/postgres': postgres,
+    '@/lib/persistence/organizationCommunications': {
+      resolvePipelineCommunicationScopeInPostgres: async input => {
+        assert.equal(input.pipelineId, pipeline); assert.equal(input.actorEmail, owner)
+        return { organizationId: org }
+      },
+    },
+    '@/lib/tenancy': {
+      listPipelineSpaces: async (actor, options) => {
+        assert.equal(actor.email, owner); assert.equal(actor.organizationId, org)
+        assert.equal(options.ensureDefaults, false)
+        return [{ id: pipeline, accessRole: 'owner' }]
+      },
+      requireResourceEditor: selected => assert.equal(selected.accessRole, 'owner'),
+    },
+    '@/lib/integrations/matonGatewayCredentials': {
+      resolveUserMatonGatewayCredential: async input => {
+        assert.equal(input.ownerEmail, owner); assert.equal(input.boundConnectionId, connection)
+        return { connectionId: connection, accountEmail: calendar }
+      },
+    },
+  })
+  const recordedInput = { pipelineId: pipeline, meetingId: meeting.id, referenceCode: meeting.reference_code,
+    externalEventId: meeting.external_event_id, sourcePayload: meeting.source_payload }
+  const importedAuthority = await integration.resolveRecordedCrmMeetingCalendarCommunication(recordedInput)
+  check(importedAuthority.communication.calendarId === calendar && importedAuthority.communication.connectionId === connection,
+    'real PostgreSQL recorded-action query reaches exact imported authority without a delivery receipt')
+  await assert.rejects(integration.resolveRecordedCrmMeetingCalendarCommunication({ ...recordedInput, pipelineId: otherPipeline }),
+    /no matching successful reviewed Calendar action/); checks++
+  const deliveredId = (await query(`INSERT INTO crm_integration_actions
+    (pipeline_id, actor_email, provider, app, action_type, aggregate_type, aggregate_id, reference_code,
+      payload, status, idempotency_key, external_id, workspace_organization_id,
+      communication_credential_owner_email, communication_connection_id, communication_account_email,
+      communication_identity_email, communication_calendar_id, communication_binding_source, processed_at)
+    VALUES ($1,$2,'maton','google-calendar','create_calendar_event','crm_meeting',$3::text,$4,
+      '{}','succeeded',$5,$6,$7,$2,$8,$9,$9,$9,'meeting-override',now()) RETURNING id`,
+    [pipeline, owner, meeting.id, meeting.reference_code, `delivered-fixture:${meeting.id}`,
+      meeting.external_event_id, org, connection, calendar])).rows[0].id
+  const deliveredAuthority = await integration.resolveRecordedCrmMeetingCalendarCommunication({ ...recordedInput,
+    sourcePayload: { ...meeting.source_payload, actionId: deliveredId } })
+  check(deliveredAuthority.actorEmail === owner && deliveredAuthority.communication.calendarId === calendar
+    && deliveredAuthority.previousCalendar.eventId === event.externalEventId,
+  'real PostgreSQL text aggregate identity resolves an exact successful delivered action')
   check((await reconcile(source, event)).status === 'unchanged', 'repeat import is idempotent')
   check((await reconcile(source, { ...event, subject: 'Updated agenda' })).status === 'updated', 'Google event edit updates original CRM identity')
   check((await query('SELECT count(*) FROM crm_meetings')).rows[0].count === '1', 'updates never duplicate meeting')
@@ -185,7 +235,8 @@ try {
   }
   await query("UPDATE crm_integration_actions SET status='succeeded' WHERE id=$1", [pendingAction])
   check((await reconcile(source, { ...event, subject: 'Provider after dispatch' })).status === 'updated', 'completed outbound intent releases Calendar reconciliation fence')
-  check((await query('SELECT count(*) FROM crm_integration_actions')).rows[0].count === '1', 'discovery never adds an outbound Calendar action')
+  assert.deepEqual((await query('SELECT id::text FROM crm_integration_actions ORDER BY id')).rows.map(row => row.id),
+    [deliveredId, pendingAction].sort(), 'discovery retains only the two explicitly seeded Calendar actions'); checks++
   const observedAt = new Date(Number((await query('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now_ms')).rows[0].now_ms) - 1000).toISOString()
   await query("UPDATE crm_meetings SET subject='Newer local intent', status='scheduled', updated_at=clock_timestamp() WHERE id=$1", [meeting.id])
   check((await reconcile(source, { ...event, observedAt, subject: 'Stale confirmed event' })).status === 'deferred', 'stale snapshot cannot overwrite a completed local edit without a pending action')
