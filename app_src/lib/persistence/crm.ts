@@ -11,6 +11,7 @@ import {
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
+import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
 import {
   DEFAULT_WORKSPACE_CURRENCY_CODE,
   isIso4217CurrencyCode,
@@ -6328,6 +6329,7 @@ function tableForAggregate(aggregateType: string) {
 export async function completeSuiteCrmOutboxInPostgres(
   item: CrmOutboxItem,
   completion: {
+    meetingProjection?: SuiteCrmMeetingProjectionReadback | null
     productImageProjection?: {
       action: 'disabled' | 'unchanged' | 'attached' | 'cleared'
       mediaId: string | null
@@ -6335,13 +6337,62 @@ export async function completeSuiteCrmOutboxInPostgres(
   } = {},
 ) {
   return withTransaction(async (client) => {
+    let meetingProjectionCurrent = false
+    const isMeetingProjection = item.operation === 'upsert_record' && item.payload.entity === 'meetings'
+    let meetingReceipt: Record<string, unknown> | null = null
+    if (isMeetingProjection) {
+      const projection = completion.meetingProjection
+      const prefix = `crm:meetings:v4:${item.aggregateId}:default:`
+      const sourceHash = item.idempotencyKey?.startsWith(prefix) ? item.idempotencyKey.slice(prefix.length) : ''
+      const attributeKeys = ['name', 'description', 'date_start', 'date_end', 'duration_hours', 'duration_minutes', 'location', 'status', 'date_modified'].sort()
+      if (!projection || projection.suiteCrmId !== item.payload.suiteCrmId
+        || item.aggregateType !== 'crm_meetings' || item.payload.localId !== item.aggregateId
+        || !/^[a-f0-9]{64}$/.test(sourceHash)
+        || !Number.isFinite(Date.parse(projection.capturedAt))
+        || !projection.attributes || typeof projection.attributes !== 'object' || Array.isArray(projection.attributes)
+        || Object.keys(projection.attributes).sort().join(',') !== attributeKeys.join(',')
+        || Object.values(projection.attributes).some(value => typeof value !== 'string')) {
+        throw new Error('SuiteCRM meeting projection receipt is invalid')
+      }
+      const verifiedReceipt = { version: 1, outboxId: item.id, suiteCrmId: projection.suiteCrmId,
+        sourceHash, capturedAt: projection.capturedAt, attributes: projection.attributes }
+      if (Buffer.byteLength(JSON.stringify(verifiedReceipt), 'utf8') > 200_000) {
+        throw new Error('SuiteCRM meeting projection receipt is invalid')
+      }
+      const current = await client.query<{ source_hash: string }>(
+        // Match reverse staging's meeting-before-receipt lock order.
+        `SELECT source_hash FROM crm_meetings
+         WHERE id = $1::uuid AND pipeline_id = $2::uuid AND suitecrm_id = $3
+         FOR UPDATE`,
+        [item.aggregateId, item.payload.pipelineId, item.payload.suiteCrmId],
+      )
+      meetingProjectionCurrent = current.rows[0]?.source_hash === sourceHash
+      if (meetingProjectionCurrent) {
+        meetingReceipt = verifiedReceipt
+      }
+    }
     const completed = await client.query(
       `UPDATE sync_outbox SET status = 'succeeded', processed_at = now(), last_error = NULL,
        locked_at = NULL, lock_token = NULL, updated_at = now()
-       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2 RETURNING aggregate_type, aggregate_id`,
-      [item.id, item.lockToken],
+       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
+         AND (NOT $3::boolean OR (
+           target_system = 'suitecrm' AND aggregate_type = $4 AND aggregate_id = $5
+           AND operation = 'upsert_record' AND idempotency_key = $6 AND payload = $7::jsonb
+         ))
+       RETURNING aggregate_type, aggregate_id`,
+      [item.id, item.lockToken, isMeetingProjection, item.aggregateType, item.aggregateId,
+        item.idempotencyKey, JSON.stringify(item.payload)],
     )
-    if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
+    if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease or projection identity was lost')
+    if (meetingReceipt) {
+      // Exact successful durable payload/lease/current revision, never caller-
+      // supplied meeting metadata. A newer local revision cannot inherit it.
+      await client.query(
+        `UPDATE sync_outbox SET payload = payload || jsonb_build_object('suiteCrmMeetingProjection', $2::jsonb)
+         WHERE id = $1::uuid AND status = 'succeeded'`,
+        [item.id, JSON.stringify(meetingReceipt)],
+      )
+    }
     if (
       item.operation !== 'upsert_user_identity'
       && item.payload.entity === 'products'
@@ -6393,7 +6444,8 @@ export async function completeSuiteCrmOutboxInPostgres(
       }, client)
     }
     const table = tableForAggregate(item.aggregateType)
-    if (table && (item.operation === 'upsert_record' || item.operation === 'reproject_record')) {
+    if (table && (item.operation === 'upsert_record' || item.operation === 'reproject_record')
+      && (item.payload.entity !== 'meetings' || meetingProjectionCurrent)) {
       await client.query(
         `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
         [item.aggregateId],

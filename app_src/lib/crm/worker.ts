@@ -2,6 +2,7 @@ import {
   deleteSuiteCrmRecord,
   upsertSuiteCrmRecordWithResult,
   upsertSuiteCrmUserIdentity,
+  type SuiteCrmMeetingProjectionReadback,
 } from '@/lib/crm/suiteCrmClient'
 import type {
   SuiteCrmNativeProductImageResult,
@@ -26,6 +27,7 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
     try {
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
       let productImageProjection: SuiteCrmNativeProductImageResult | null = null
+      let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
       if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
       else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
       else if (item.operation === 'reproject_record') {
@@ -33,9 +35,9 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         // provider-schema or validation failure must never erase the last
         // visible SuiteCRM copy of a durable ClawPilot interaction.
         if (item.payload.suiteCrmModule) {
-          productImageProjection = (
-            await upsertSuiteCrmRecordWithResult(item.payload)
-          ).productImageProjection
+          const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+          productImageProjection = projection.productImageProjection
+          meetingProjection = projection.meetingProjection || null
         }
         if (item.payload.previousSuiteCrmModule) {
           await deleteSuiteCrmRecord({
@@ -48,12 +50,13 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         }
       }
       else {
-        productImageProjection = (
-          await upsertSuiteCrmRecordWithResult(item.payload)
-        ).productImageProjection
+        const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+        productImageProjection = projection.productImageProjection
+        meetingProjection = projection.meetingProjection || null
       }
       await completeSuiteCrmOutboxInPostgres(item, {
         productImageProjection,
+        ...(meetingProjection ? { meetingProjection } : {}),
       })
       if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)
       results.push({ id: item.id, status: 'succeeded' })

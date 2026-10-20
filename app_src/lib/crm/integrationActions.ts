@@ -1265,6 +1265,56 @@ function existingMeetingActionMatches(input: {
     && input.row.communication_binding_source === input.communication.source
 }
 
+/** Locks and proves the exact current native projection before reverse sync. */
+export async function assertCurrentSuiteCrmMeetingProjectionWithClient(client: PoolClient, input: {
+  pipelineId: string
+  meetingId: string
+  sourceHash: string
+  projection: { outboxId: string; receipt: JsonObject }
+}) {
+  const pipelineId = normalizeUuid(input.pipelineId, 'Pipeline ID')
+  const meetingId = normalizeUuid(input.meetingId, 'Meeting ID')
+  const outboxId = normalizeUuid(input.projection.outboxId, 'SuiteCRM projection ID')
+  const stale = () => new CrmIntegrationActionError(
+    'The meeting changed or its current SuiteCRM projection is unproven; retry after synchronization',
+    409, 'CRM_SUITECRM_PROJECTION_STALE',
+  )
+  // Match completion's meeting-before-outbox lock order. A new canonical save
+  // cannot replace this source hash while its native edit is being staged.
+  const current = await client.query<{ source_hash: string; suitecrm_id: string }>(
+    `SELECT source_hash, suitecrm_id FROM crm_meetings
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid
+       AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+     FOR UPDATE`, [pipelineId, meetingId],
+  )
+  if (!/^[a-f0-9]{64}$/.test(input.sourceHash)
+    || current.rows[0]?.source_hash !== input.sourceHash || !current.rows[0]?.suitecrm_id) throw stale()
+  const receipt = JSON.stringify(input.projection.receipt)
+  if (Buffer.byteLength(receipt, 'utf8') > 200_000) throw stale()
+  const proven = await client.query<{ id: string }>(
+    `SELECT projection.id::text FROM sync_outbox projection
+     WHERE projection.id = $1::uuid AND projection.target_system = 'suitecrm'
+       AND projection.aggregate_type = 'crm_meetings' AND projection.aggregate_id = $2
+       AND projection.operation = 'upsert_record' AND projection.status = 'succeeded'
+       AND projection.payload->>'pipelineId' = $3 AND projection.payload->>'localId' = $2
+       AND projection.payload->>'suiteCrmId' = $4
+       AND projection.idempotency_key = $5
+       AND projection.payload->'suiteCrmMeetingProjection' = $6::jsonb
+       AND projection.payload->'suiteCrmMeetingProjection'->>'outboxId' = projection.id::text
+       AND projection.payload->'suiteCrmMeetingProjection'->>'sourceHash' = $7
+       AND projection.payload->'suiteCrmMeetingProjection'->>'suiteCrmId' = $4
+       AND NOT EXISTS (
+         SELECT 1 FROM sync_outbox pending WHERE pending.target_system = 'suitecrm'
+           AND pending.aggregate_type = 'crm_meetings' AND pending.aggregate_id = $2
+           AND pending.operation IN ('upsert_record', 'reproject_record', 'delete_record')
+           AND pending.status IN ('queued', 'processing', 'failed', 'dead')
+       )
+     FOR SHARE OF projection`, [outboxId, meetingId, pipelineId, current.rows[0].suitecrm_id,
+      `crm:meetings:v4:${meetingId}:default:${input.sourceHash}`, receipt, input.sourceHash],
+  )
+  if (proven.rows.length !== 1) throw stale()
+}
+
 /**
  * Persists the app-owned meeting, SuiteCRM outbox record, and Calendar action in
  * one database transaction. A client-generated key is mandatory so a retry
@@ -1279,6 +1329,7 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
   communication: PipelineCommunicationSnapshot
   previousCalendar?: unknown
   expectedMeetingSourceHash?: string
+  expectedSuiteCrmProjection?: { outboxId: string; receipt: JsonObject }
 }) {
   if (input.idempotencyKey === undefined || input.idempotencyKey === null || input.idempotencyKey === '') {
     throw new CrmIntegrationActionError(
@@ -1363,7 +1414,15 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
       }
     }
 
-    if (input.expectedMeetingSourceHash !== undefined) {
+    if (input.expectedSuiteCrmProjection) {
+      if (!input.expectedMeetingSourceHash || !stageInput.localId) {
+        throw new CrmIntegrationActionError('SuiteCRM projection reconciliation requires a current meeting identity', 409)
+      }
+      await assertCurrentSuiteCrmMeetingProjectionWithClient(client, {
+        pipelineId, meetingId: stageInput.localId, sourceHash: input.expectedMeetingSourceHash,
+        projection: input.expectedSuiteCrmProjection,
+      })
+    } else if (input.expectedMeetingSourceHash !== undefined) {
       const current = await client.query<{ source_hash: string }>(
         `SELECT source_hash FROM crm_meetings
          WHERE pipeline_id = $1::uuid AND id = $2::uuid

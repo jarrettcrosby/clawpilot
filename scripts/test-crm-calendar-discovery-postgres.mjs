@@ -171,6 +171,54 @@ try {
   check(outbox.entity === 'meetings', 'native SuiteCRM Meetings entity receives the imported meeting')
   check(outbox.relationships.filter(row => row.relatedModuleName === 'Contacts').length === 2, 'CRM outbox includes every matched contact')
   check((await query('SELECT count(*) FROM crm_integration_actions')).rows[0].count === '0', 'import queues no Calendar invitation/actions')
+  const projectionRow = (await query(`SELECT * FROM sync_outbox WHERE aggregate_id=$1
+    AND target_system='suitecrm' AND operation='upsert_record' ORDER BY created_at DESC LIMIT 1`, [meeting.id])).rows[0]
+  const projectionToken = randomUUID()
+  await query("UPDATE sync_outbox SET status='processing',lock_token=$2 WHERE id=$1", [projectionRow.id, projectionToken])
+  const projectionItem = { id: projectionRow.id, aggregateId: meeting.id, aggregateType: 'crm_meetings',
+    operation: 'upsert_record', payload: projectionRow.payload, idempotencyKey: projectionRow.idempotency_key,
+    attempts: 1, lockToken: projectionToken }
+  const nativeProjection = { suiteCrmId: meeting.suitecrm_id, capturedAt: new Date().toISOString(), attributes: {
+    name: meeting.subject, description: meeting.description || '', date_start: new Date(meeting.starts_at).toISOString(),
+    date_end: new Date(meeting.ends_at).toISOString(), duration_hours: '0', duration_minutes: '30',
+    location: meeting.location || '', status: 'Planned', date_modified: new Date().toISOString(),
+  } }
+  for (const [label, item, receipt] of [
+    ['lost lease', { ...projectionItem, lockToken: randomUUID() }, nativeProjection],
+    ['forged payload', { ...projectionItem, payload: { ...projectionItem.payload,
+      attributes: { ...projectionItem.payload.attributes, name: 'not the durable projection' } } }, nativeProjection],
+    ['foreign pipeline', { ...projectionItem, payload: { ...projectionItem.payload, pipelineId: otherPipeline } }, nativeProjection],
+    ['wrong key', { ...projectionItem, idempotencyKey: `crm:meetings:v4:${meeting.id}:default:${'f'.repeat(64)}` }, nativeProjection],
+    ['wrong native identity', projectionItem, { ...nativeProjection, suiteCrmId: randomUUID() }],
+    ['missing receipt', projectionItem, undefined],
+  ]) {
+    await assert.rejects(crm.completeSuiteCrmOutboxInPostgres(item, { meetingProjection: receipt }), /lease|identity|receipt/); checks++
+    const retained = (await query('SELECT status,payload FROM sync_outbox WHERE id=$1', [projectionRow.id])).rows[0]
+    check(retained.status === 'processing' && !retained.payload.suiteCrmMeetingProjection,
+      `${label} cannot commit status or a receipt`)
+  }
+  await query("UPDATE crm_meetings SET source_hash=$2,sync_status='pending' WHERE id=$1", [meeting.id, 'f'.repeat(64)])
+  await crm.completeSuiteCrmOutboxInPostgres(projectionItem, { meetingProjection: nativeProjection })
+  check(!(await query('SELECT payload FROM sync_outbox WHERE id=$1', [projectionRow.id])).rows[0].payload.suiteCrmMeetingProjection,
+    'stale successful projection cannot donate its receipt to a newer meeting revision')
+  check((await query('SELECT sync_status FROM crm_meetings WHERE id=$1', [meeting.id])).rows[0].sync_status === 'pending',
+    'stale completion never marks the newer revision synced')
+  await query('UPDATE crm_meetings SET source_hash=$2 WHERE id=$1', [meeting.id, meeting.source_hash])
+  await query("UPDATE sync_outbox SET status='processing',lock_token=$2 WHERE id=$1", [projectionRow.id, projectionToken])
+  await crm.completeSuiteCrmOutboxInPostgres(projectionItem, { meetingProjection: nativeProjection })
+  let receipt = (await query('SELECT payload FROM sync_outbox WHERE id=$1', [projectionRow.id])).rows[0].payload.suiteCrmMeetingProjection
+  check(receipt.version === 1 && receipt.outboxId === projectionRow.id && receipt.sourceHash === meeting.source_hash
+    && receipt.suiteCrmId === meeting.suitecrm_id && receipt.attributes.name === meeting.subject,
+  'successful current projection stores exact leased outbox/hash/native identity evidence')
+  const internationalProjection = { ...nativeProjection, attributes: { ...nativeProjection.attributes, description: '文'.repeat(50_000) } }
+  await query("UPDATE sync_outbox SET status='processing',lock_token=$2,payload=$3::jsonb WHERE id=$1",
+    [projectionRow.id, projectionToken, JSON.stringify(projectionRow.payload)])
+  await crm.completeSuiteCrmOutboxInPostgres(projectionItem, { meetingProjection: internationalProjection })
+  receipt = (await query('SELECT payload FROM sync_outbox WHERE id=$1', [projectionRow.id])).rows[0].payload.suiteCrmMeetingProjection
+  check(receipt.attributes.description === internationalProjection.attributes.description
+    && Buffer.byteLength(JSON.stringify(receipt), 'utf8') > 100_000
+    && Buffer.byteLength(JSON.stringify(receipt), 'utf8') <= 200_000,
+  'full 50k-character international description fits the shared whole-receipt UTF8 byte ceiling')
   check((await query(`SELECT data_type FROM information_schema.columns
     WHERE table_schema='public' AND table_name='crm_integration_actions' AND column_name='aggregate_id'`))
     .rows[0].data_type === 'text', 'recorded action aggregate identity retains its real text column type')
@@ -199,6 +247,42 @@ try {
       },
     },
   })
+  const currentProjection = { pipelineId: pipeline, meetingId: meeting.id, sourceHash: meeting.source_hash,
+    projection: { outboxId: projectionRow.id, receipt } }
+  const proveProjection = input => withTransaction(client => integration.assertCurrentSuiteCrmMeetingProjectionWithClient(client, input))
+  await proveProjection(currentProjection); checks++
+  for (const forged of [
+    { ...currentProjection, pipelineId: otherPipeline },
+    { ...currentProjection, meetingId: randomUUID() },
+    { ...currentProjection, sourceHash: 'f'.repeat(64) },
+    { ...currentProjection, projection: { ...currentProjection.projection, outboxId: randomUUID() } },
+    { ...currentProjection, projection: { ...currentProjection.projection,
+      receipt: { ...receipt, suiteCrmId: randomUUID() } } },
+  ]) {
+    await assert.rejects(proveProjection(forged), /current SuiteCRM projection is unproven/); checks++
+  }
+  const changedReceipt = { ...receipt, attributes: { ...receipt.attributes, name: 'Another projection revision' } }
+  await query(`UPDATE sync_outbox SET payload=jsonb_set(payload,'{suiteCrmMeetingProjection}',$2::jsonb) WHERE id=$1`,
+    [projectionRow.id, JSON.stringify(changedReceipt)])
+  await assert.rejects(proveProjection(currentProjection), /current SuiteCRM projection is unproven/); checks++
+  await query(`UPDATE sync_outbox SET payload=jsonb_set(payload,'{suiteCrmMeetingProjection}',$2::jsonb) WHERE id=$1`,
+    [projectionRow.id, JSON.stringify(receipt)])
+  await query('UPDATE crm_meetings SET source_hash=$2 WHERE id=$1', [meeting.id, 'f'.repeat(64)])
+  await assert.rejects(proveProjection(currentProjection), /current SuiteCRM projection is unproven/); checks++
+  await query('UPDATE crm_meetings SET source_hash=$2,suitecrm_id=$3 WHERE id=$1',
+    [meeting.id, meeting.source_hash, randomUUID()])
+  await assert.rejects(proveProjection(currentProjection), /current SuiteCRM projection is unproven/); checks++
+  await query('UPDATE crm_meetings SET suitecrm_id=$2 WHERE id=$1', [meeting.id, meeting.suitecrm_id])
+  const blockingProjectionId = (await query(`INSERT INTO sync_outbox
+    (aggregate_type,aggregate_id,operation,target_system,payload,status,idempotency_key)
+    VALUES ('crm_meetings',$1,'upsert_record','suitecrm',$2::jsonb,'queued',$3) RETURNING id`,
+    [meeting.id, JSON.stringify(projectionRow.payload), `fixture-pending:${randomUUID()}`])).rows[0].id
+  for (const status of ['queued', 'processing', 'failed', 'dead']) {
+    await query('UPDATE sync_outbox SET status=$2 WHERE id=$1', [blockingProjectionId, status])
+    await assert.rejects(proveProjection(currentProjection), /current SuiteCRM projection is unproven/); checks++
+  }
+  await query('DELETE FROM sync_outbox WHERE id=$1', [blockingProjectionId])
+  await proveProjection(currentProjection); checks++
   const recordedInput = { pipelineId: pipeline, meetingId: meeting.id, referenceCode: meeting.reference_code,
     externalEventId: meeting.external_event_id, sourcePayload: meeting.source_payload }
   const importedAuthority = await integration.resolveRecordedCrmMeetingCalendarCommunication(recordedInput)
