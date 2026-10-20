@@ -12,6 +12,7 @@ import {
   CrmIntegrationActionError,
   crmIntegrationClientRequestHash,
   replayCrmMeetingSaveByIdempotencyKey,
+  resolveRecordedCrmMeetingCalendarCommunication,
   stageCrmMeetingAndEnqueueCalendarAction,
 } from '@/lib/crm/integrationActions'
 import { resolveVerifiedPipelineCalendarSelection } from '@/lib/integrations/organizationCommunications'
@@ -589,8 +590,8 @@ export async function POST(req: NextRequest) {
         ? fields.status as 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
         : 'planned'
       const meetingMode = stringValue(fields.meetingMode, 32) || 'google_meet'
-      if (!['google_meet', 'in_person', 'custom_link'].includes(meetingMode)) {
-        throw new Error('Meeting mode must be Google Meet, in person, or custom link')
+      if (!['google_meet', 'in_person', 'custom_link', 'unspecified'].includes(meetingMode)) {
+        throw new Error('Meeting mode must be Google Meet, in person, custom link, or no location')
       }
       const meetingLocation = stringValue(fields.location, 500)
       const customJoinUrlInput = stringValue(fields.customJoinUrl, 2000)
@@ -626,7 +627,12 @@ export async function POST(req: NextRequest) {
               connectionId: calendarConnectionId,
               calendarId: selectedCalendarId,
             })
-          : await resolvePipelineCommunicationSnapshotInPostgres({
+          : current?.externalEventId
+            ? (await resolveRecordedCrmMeetingCalendarCommunication({
+                pipelineId: pipeline.id, meetingId: current.id, referenceCode: current.referenceCode,
+                externalEventId: current.externalEventId, sourcePayload: current.sourcePayload,
+              })).communication
+            : await resolvePipelineCommunicationSnapshotInPostgres({
               pipelineId: pipeline.id,
               actorEmail: actor.email,
               app: 'google-calendar',

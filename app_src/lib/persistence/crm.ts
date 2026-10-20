@@ -222,6 +222,7 @@ export type StageMeetingInput = CommonStageInput & {
     organizationId?: string | null
     organizationSuiteCrmId?: string | null
     contactId?: string | null
+    contactIds?: string[]
     leadId?: string | null
     opportunityId?: string | null
     parentSuiteCrmId?: string | null
@@ -238,6 +239,8 @@ export type StageMeetingInput = CommonStageInput & {
     externalEventId?: string | null
     externalEventUrl?: string | null
     joinUrl?: string | null
+    /** Authoritative provider snapshot may explicitly remove old conference data. */
+    replaceConferenceDetails?: boolean
   }
 }
 
@@ -691,9 +694,15 @@ async function suiteCrmRelationships(
      FROM crm_organizations
      WHERE pipeline_id = $1::uuid AND id = $2::uuid AND suitecrm_id IS NOT NULL
      UNION ALL
-     SELECT 'contacts', 'Contacts', suitecrm_id
-     FROM crm_contacts
-     WHERE pipeline_id = $1::uuid AND id = $3::uuid AND suitecrm_id IS NOT NULL
+     SELECT 'contacts', 'Contacts', contact.suitecrm_id
+     FROM crm_contacts contact
+     WHERE contact.pipeline_id = $1::uuid AND contact.suitecrm_id IS NOT NULL
+       AND (contact.id = $3::uuid OR EXISTS (
+         SELECT 1 FROM crm_meeting_contacts selected
+         WHERE selected.pipeline_id = contact.pipeline_id
+           AND selected.meeting_id = $6::uuid
+           AND selected.contact_id = contact.id
+       ))
      UNION ALL
      SELECT 'leads', 'Leads', suitecrm_id
      FROM crm_leads
@@ -708,6 +717,7 @@ async function suiteCrmRelationships(
       fields.contactId || null,
       fields.leadId || null,
       fields.opportunityId || null,
+      input.localId || null,
     ],
   )
   return result.rows.map((row) => ({
@@ -1476,7 +1486,7 @@ async function stageMeeting(client: PoolClient, input: StageMeetingInput, suiteC
         provider = EXCLUDED.provider,
         external_event_id = COALESCE(EXCLUDED.external_event_id, crm_meetings.external_event_id),
         external_event_url = COALESCE(EXCLUDED.external_event_url, crm_meetings.external_event_url),
-        join_url = COALESCE(EXCLUDED.join_url, crm_meetings.join_url),
+        join_url = CASE WHEN $23::boolean THEN EXCLUDED.join_url ELSE COALESCE(EXCLUDED.join_url, crm_meetings.join_url) END,
         source_payload = EXCLUDED.source_payload,
         source_hash = EXCLUDED.source_hash,
         sync_status = CASE WHEN crm_meetings.source_hash IS DISTINCT FROM EXCLUDED.source_hash THEN 'pending' ELSE crm_meetings.sync_status END,
@@ -1491,10 +1501,26 @@ async function stageMeeting(client: PoolClient, input: StageMeetingInput, suiteC
       startsAt, endsAt, clean(fields.timezone) || 'America/New_York', nullable(fields.location), fields.attendeeEmails || [],
       fields.status || 'planned', nullable(fields.provider), fields.externalEventId || null,
       fields.externalEventUrl || null, fields.joinUrl || null, JSON.stringify(input.sourcePayload || {}),
-      sourceHash, input.actorEmail,
+      sourceHash, input.actorEmail, fields.replaceConferenceDetails === true,
     ],
   )
-  return result.rows[0]
+  const row = result.rows[0]
+  // Calendar snapshots replace the complete attendee set explicitly. Legacy
+  // primary-contact edits must not discard other durable attendee links.
+  if (fields.contactIds !== undefined) {
+    await client.query(
+      `DELETE FROM crm_meeting_contacts WHERE pipeline_id = $1::uuid AND meeting_id = $2::uuid`,
+      [input.pipelineId, row.id],
+    )
+    for (const [index, contactId] of fields.contactIds.entries()) {
+      await client.query(
+        `INSERT INTO crm_meeting_contacts (pipeline_id, meeting_id, contact_id, sort_order, created_by)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)`,
+        [input.pipelineId, row.id, contactId, index, input.actorEmail],
+      )
+    }
+  }
+  return row
 }
 
 async function stageCampaign(client: PoolClient, input: StageCampaignInput, suiteCrmId: string, sourceHash: string) {
@@ -2113,7 +2139,55 @@ async function normalizeStageCrmRecordInput(
     if (!startsAt || !endsAt || Date.parse(endsAt) <= Date.parse(startsAt)) {
       throw new Error('CRM meeting time is invalid for the selected timezone')
     }
-    return { ...input, fields: { ...input.fields, startsAt, endsAt, timezone } }
+    const fields = input.fields
+    const contactIds = fields.contactIds !== undefined
+      ? uniqueUuidList(fields.contactIds)
+      : uniqueUuidList(fields.contactId ? [fields.contactId] : [])
+    const expectedCount = fields.contactIds !== undefined ? fields.contactIds.length : fields.contactId ? 1 : 0
+    if (contactIds.length !== expectedCount) throw new Error('Meeting contact selection is invalid')
+    const primaryContactId = fields.contactIds !== undefined ? contactIds[0] || null : fields.contactId || null
+    const selected = await client.query<{ id: string; organization_id: string | null }>(
+      `SELECT contact.id::text, contact.organization_id::text
+       FROM crm_contacts contact
+       WHERE contact.pipeline_id = $1::uuid
+         AND (contact.id = ANY($2::uuid[]) OR ($3::boolean AND EXISTS (
+           SELECT 1 FROM crm_meeting_contacts relationship
+           JOIN crm_meetings meeting
+             ON meeting.pipeline_id = relationship.pipeline_id AND meeting.id = relationship.meeting_id
+           WHERE relationship.pipeline_id = contact.pipeline_id
+             AND relationship.contact_id = contact.id
+             AND (($4::uuid IS NOT NULL AND meeting.id = $4::uuid)
+               OR ($4::uuid IS NULL AND meeting.source_key = $5))
+         )))`,
+      [input.pipelineId, contactIds, fields.contactIds === undefined, input.localId || null, input.sourceKey],
+    )
+    if (contactIds.some((id) => !selected.rows.some((contact) => contact.id === id))) {
+      throw new Error('Meeting contact selection is invalid')
+    }
+    const organizationId = fields.organizationId
+      || selected.rows.find((contact) => contact.id === primaryContactId)?.organization_id
+      || selected.rows[0]?.organization_id
+      || null
+    if (selected.rows.some((contact) => contact.organization_id !== organizationId)) {
+      throw new Error('Meeting contacts must belong to the selected organization')
+    }
+    const organization = organizationId
+      ? await client.query<{ suitecrm_id: string | null }>(
+          `SELECT suitecrm_id FROM crm_organizations WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+          [input.pipelineId, organizationId],
+        )
+      : null
+    if (organizationId && !organization?.rows[0]) throw new Error('Meeting organization was not found')
+    return {
+      ...input,
+      fields: {
+        ...fields, startsAt, endsAt, timezone, organizationId, contactId: primaryContactId,
+        contactIds: fields.contactIds === undefined ? undefined : contactIds,
+        organizationSuiteCrmId: organization?.rows[0]?.suitecrm_id || fields.organizationSuiteCrmId || null,
+        parentSuiteCrmId: fields.parentSuiteCrmId || organization?.rows[0]?.suitecrm_id || null,
+        parentSuiteCrmType: fields.parentSuiteCrmType || (organization?.rows[0]?.suitecrm_id ? 'Accounts' : undefined),
+      },
+    }
   }
   if (input.entity === 'interactions') {
     const fields = input.fields
@@ -3900,7 +3974,10 @@ function leadFromRow(row: Record<string, unknown>): CrmLead {
   }
 }
 
-function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
+function meetingFromRow(
+  row: Record<string, unknown>,
+  contacts: CrmOpportunity['contacts'] = [],
+): CrmMeeting {
   const sourcePayload = row.source_payload && typeof row.source_payload === 'object' && !Array.isArray(row.source_payload)
     ? row.source_payload as Record<string, unknown>
     : {}
@@ -3909,13 +3986,21 @@ function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
     ? rawCalendarDeliveryStatus as CrmMeeting['calendarDeliveryStatus']
     : null
   const rawMeetingMode = clean(sourcePayload.meetingMode)
-  const meetingMode = ['google_meet', 'in_person', 'custom_link'].includes(rawMeetingMode)
+  const meetingMode = ['google_meet', 'in_person', 'custom_link', 'unspecified'].includes(rawMeetingMode)
     ? rawMeetingMode as CrmMeeting['meetingMode']
     : 'google_meet'
+  const relatedContacts = contacts.length > 0 ? contacts : row.contact_id ? [{
+    id: String(row.contact_id), referenceCode: clean(row.contact_reference_code),
+    fullName: clean(row.contact_name), email: clean(row.contact_email),
+    phoneWork: clean(row.contact_phone_work), phoneMobile: clean(row.contact_phone_mobile),
+    jobTitle: clean(row.contact_job_title), isPrimary: true,
+  }] : []
+  const primaryContact = relatedContacts.find((contact) => contact.id === row.contact_id) || relatedContacts[0]
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
-    contactId: nullable(row.contact_id), contactName: clean(row.contact_name), leadId: nullable(row.lead_id),
+    contactId: primaryContact?.id || nullable(row.contact_id), contactName: primaryContact?.fullName || clean(row.contact_name),
+    contactIds: relatedContacts.map((contact) => contact.id), contacts: relatedContacts, leadId: nullable(row.lead_id),
     leadName: clean(row.lead_name), opportunityId: nullable(row.opportunity_id), opportunityName: clean(row.opportunity_name),
     suiteCrmId: nullable(row.suitecrm_id), sourceKey: String(row.source_key), subject: clean(row.subject),
     description: clean(row.description), startsAt: String(row.starts_at), endsAt: String(row.ends_at),
@@ -3930,6 +4015,50 @@ function meetingFromRow(row: Record<string, unknown>): CrmMeeting {
     customJoinUrl: nullable(sourcePayload.customJoinUrl),
     syncStatus: row.sync_status as CrmMeeting['syncStatus'], syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
   }
+}
+
+async function hydrateMeetingRows(
+  rows: Record<string, unknown>[],
+  pipelineId: string,
+  runQuery: (text: string, values: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>,
+) {
+  if (rows.length === 0) return []
+  const result = await runQuery(
+    `SELECT selected.meeting_id::text, contact.id::text, contact.reference_code, contact.full_name,
+       contact.email, contact.phone_work, contact.phone_mobile, contact.job_title,
+       (contact.id = meeting.contact_id) AS is_primary
+     FROM crm_meeting_contacts selected
+     JOIN crm_meetings meeting
+       ON meeting.pipeline_id = selected.pipeline_id AND meeting.id = selected.meeting_id
+     JOIN crm_contacts contact
+       ON contact.pipeline_id = selected.pipeline_id AND contact.id = selected.contact_id
+     WHERE selected.pipeline_id = $1::uuid AND selected.meeting_id = ANY($2::uuid[])
+     UNION ALL
+     SELECT meeting.id::text, contact.id::text, contact.reference_code, contact.full_name,
+       contact.email, contact.phone_work, contact.phone_mobile, contact.job_title, true
+     FROM crm_meetings meeting
+     JOIN crm_contacts contact
+       ON contact.pipeline_id = meeting.pipeline_id AND contact.id = meeting.contact_id
+     WHERE meeting.pipeline_id = $1::uuid AND meeting.id = ANY($2::uuid[])
+       AND NOT EXISTS (
+         SELECT 1 FROM crm_meeting_contacts selected
+         WHERE selected.pipeline_id = meeting.pipeline_id AND selected.meeting_id = meeting.id
+           AND selected.contact_id = contact.id
+       )
+     ORDER BY meeting_id, is_primary DESC, full_name, id`,
+    [pipelineId, rows.map((row) => String(row.id))],
+  )
+  const byMeeting = new Map<string, CrmOpportunity['contacts']>()
+  for (const contact of result.rows) {
+    const contacts = byMeeting.get(String(contact.meeting_id)) || []
+    contacts.push({
+      id: String(contact.id), referenceCode: clean(contact.reference_code), fullName: clean(contact.full_name),
+      email: clean(contact.email), phoneWork: clean(contact.phone_work), phoneMobile: clean(contact.phone_mobile),
+      jobTitle: clean(contact.job_title), isPrimary: contact.is_primary === true,
+    })
+    byMeeting.set(String(contact.meeting_id), contacts)
+  }
+  return rows.map((row) => meetingFromRow(row, byMeeting.get(String(row.id)) || []))
 }
 
 function campaignFromRow(row: Record<string, unknown>): CrmCampaign {
@@ -4085,11 +4214,20 @@ export async function listCrmRecordsInPostgres(input: {
        LEFT JOIN crm_opportunities opportunity ON opportunity.id = meeting.opportunity_id
        WHERE meeting.pipeline_id = $1::uuid
          AND ($2 = '' OR meeting.reference_code ILIKE '%' || $2 || '%' OR meeting.subject ILIKE '%' || $2 || '%'
-           OR organization.name ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR lead.full_name ILIKE '%' || $2 || '%')
+           OR organization.name ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR lead.full_name ILIKE '%' || $2 || '%'
+           OR EXISTS (
+             SELECT 1 FROM crm_meeting_contacts selected
+             JOIN crm_contacts related_contact
+               ON related_contact.pipeline_id = selected.pipeline_id AND related_contact.id = selected.contact_id
+             WHERE selected.pipeline_id = meeting.pipeline_id AND selected.meeting_id = meeting.id
+               AND (related_contact.full_name ILIKE '%' || $2 || '%'
+                 OR related_contact.email ILIKE '%' || $2 || '%'
+                 OR related_contact.reference_code ILIKE '%' || $2 || '%')
+           ))
        ORDER BY meeting.starts_at DESC, meeting.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
-    return result.rows.map(meetingFromRow)
+    return hydrateMeetingRows(result.rows, input.pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
   }
   if (input.entity === 'campaigns') {
     const result = await query<Record<string, unknown>>(
@@ -5916,11 +6054,11 @@ export async function readCrmRecordReference(input: {
     && !Array.isArray(row.source_payload)
     ? row.source_payload as Record<string, unknown>
     : {}
-  const contactIds = input.entity === 'interactions'
+  const contactIds = input.entity === 'interactions' || input.entity === 'meetings'
     ? (await query<{ contact_id: string }>(
         `SELECT contact_id::text
-         FROM crm_interaction_contacts
-         WHERE pipeline_id = $1::uuid AND interaction_id = $2::uuid
+         FROM ${input.entity === 'meetings' ? 'crm_meeting_contacts' : 'crm_interaction_contacts'}
+         WHERE pipeline_id = $1::uuid AND ${input.entity === 'meetings' ? 'meeting_id' : 'interaction_id'} = $2::uuid
          ORDER BY sort_order, contact_id`,
         [input.pipelineId, input.id],
       )).rows.map((contact) => contact.contact_id)

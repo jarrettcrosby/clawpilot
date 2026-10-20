@@ -58,6 +58,7 @@ import UploadFileRounded from '@mui/icons-material/UploadFileRounded'
 import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
+import CalendarImportSettings from '@/components/crm/CalendarImportSettings'
 import EmailBodyPreview from '@/components/crm/EmailBodyPreview'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
 import ProductImagePanel from '@/components/crm/ProductImagePanel'
@@ -78,7 +79,7 @@ import { dateTimeLocalValue, zonedDateTimeToIso } from '@/lib/zonedDateTime'
 
 type RecordValue = Record<string, unknown>
 type CrmActionType = 'send_email' | 'create_calendar_event' | 'log_call' | 'send_campaign'
-type MeetingMode = 'google_meet' | 'in_person' | 'custom_link'
+type MeetingMode = 'google_meet' | 'in_person' | 'custom_link' | 'unspecified'
 const ORGANIZATION_DEFAULT_EMAIL_KEY = '__organization_default_email__'
 const ORGANIZATION_DEFAULT_CALENDAR_KEY = '__organization_default_calendar__'
 type EmailSenderChoice = {
@@ -267,7 +268,7 @@ const DATE_TIME_LOCAL_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/
 
 function meetingModeValue(value: unknown): MeetingMode {
   const normalized = String(value || '').trim().toLowerCase()
-  if (normalized === 'in_person' || normalized === 'custom_link') return normalized
+  if (normalized === 'in_person' || normalized === 'custom_link' || normalized === 'unspecified') return normalized
   return 'google_meet'
 }
 
@@ -2550,6 +2551,7 @@ export default function CrmSection() {
               ) : null}
               {pipeline?.accessRole === 'owner' && (
                 <>
+                  {entity === 'meetings' && <CalendarImportSettings key={pipeline.id} pipelineId={pipeline.id} />}
                   <Tooltip title="Import the connected workbook into CRM">
                     <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>
                       <UploadFileRounded />
@@ -2936,6 +2938,7 @@ export default function CrmSection() {
                 <MenuItem value="google_meet">Google Meet</MenuItem>
                 <MenuItem value="in_person">In person</MenuItem>
                 <MenuItem value="custom_link">Custom link</MenuItem>
+                <MenuItem value="unspecified">No location or conferencing</MenuItem>
               </TextField>
               {actionMeetingMode === 'in_person' ? (
                 <TextField
@@ -2960,7 +2963,7 @@ export default function CrmSection() {
                 />
               ) : (
                 <Typography variant="body2" color="text.secondary">
-                  Google Meet will add the join link to the invitation.
+                  {actionMeetingMode === 'unspecified' ? 'No address or conference link will be added.' : 'Google Meet will add the join link to the invitation.'}
                 </Typography>
               )}
               <Stack direction={{ xs: 'column', sm: 'row' }} gap={1.5}>
@@ -3935,6 +3938,7 @@ export default function CrmSection() {
               <MenuItem value="google_meet">Google Meet</MenuItem>
               <MenuItem value="in_person">In person</MenuItem>
               <MenuItem value="custom_link">Custom link</MenuItem>
+              <MenuItem value="unspecified">No location or conferencing</MenuItem>
             </TextField>
             {editorMeetingMode === 'in_person' ? (
               <TextField

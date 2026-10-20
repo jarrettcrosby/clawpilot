@@ -130,6 +130,7 @@ const linkedIds = []
 const fixtureMessages = new Map([...excluded, ...retained].map((entry) => [entry.id, entry]))
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': loadModule('app_src/lib/crm/emailAddressHeaders.ts', {}),
+  '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts', {}),
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
   '@/lib/auditWriter': { recordAuditEvent: async () => assert.fail('Normal polling must not request recovery') },

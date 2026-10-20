@@ -2055,13 +2055,16 @@ async function main() {
       await client.query('BEGIN')
       try {
         await client.query('SET LOCAL session_replication_role = replica')
+        // Freeze the policy with the August order fixtures, not the execution
+        // date, so these first-materialization tests retain a 60-day window.
         await client.query(
           `UPDATE operations_commerce_order_history_policies
            SET history_mode = 'last_60_days',
-               ingestion_floor = frozen_at - interval '60 days'
+               frozen_at = $3::timestamptz,
+               ingestion_floor = $3::timestamptz - interval '60 days'
            WHERE organization_id = $1::uuid
              AND integration_account_id = $2::uuid`,
-          [ids.organization, ids.integration],
+          [ids.organization, ids.integration, '2026-08-13T17:00:00.000Z'],
         )
         await client.query('COMMIT')
       } catch (error) {
