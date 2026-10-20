@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import { globalIdFragment } from '@/lib/globalIds.mjs'
 import { captureEmailAddressHeaders, type EmailAddressHeaders } from '@/lib/crm/emailAddressHeaders'
+import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
 import { matonFetch } from '@/lib/maton'
 import {
   readCrmRecordByReference,
@@ -633,17 +634,7 @@ async function participantEmailTargets(input: MessageRoutingInput): Promise<Refe
   const emails = ordinaryParticipantAddresses(input)
   if (!emails.length) return []
   const matches = await query<{ pipeline_id: string; reference_code: string; email: string }>(
-    `SELECT pipeline_id::text, reference_code, lower(btrim(email)) AS email
-     FROM (
-       SELECT pipeline_id, reference_code, email FROM crm_contacts
-       WHERE COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
-       UNION ALL
-       SELECT pipeline_id, reference_code, email FROM crm_leads
-       WHERE COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
-     ) candidate
-     WHERE pipeline_id = ANY($1::uuid[]) AND lower(btrim(email)) = ANY($2::text[])
-     ORDER BY reference_code ASC
-     LIMIT 101`,
+    crmParticipantEmailCandidatesSql(),
     [input.ownedPipelines.map((pipeline) => pipeline.id), emails],
   )
   // No primary-workspace tie breaker: an ambiguous message stays unlinked.

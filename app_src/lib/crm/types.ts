@@ -323,6 +323,8 @@ export type CrmMeeting = {
   organizationName: string
   contactId: string | null
   contactName: string
+  contactIds?: string[]
+  contacts?: CrmOpportunityContact[]
   leadId: string | null
   leadName: string
   opportunityId: string | null
@@ -347,7 +349,7 @@ export type CrmMeeting = {
   calendarConnectionId: string | null
   calendarOrganizerEmail: string | null
   calendarId: string | null
-  meetingMode: 'google_meet' | 'in_person' | 'custom_link'
+  meetingMode: 'google_meet' | 'in_person' | 'custom_link' | 'unspecified'
   customJoinUrl: string | null
   syncStatus: CrmSyncStatus
   syncError: string | null

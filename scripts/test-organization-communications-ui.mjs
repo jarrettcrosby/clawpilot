@@ -69,7 +69,7 @@ assert.ok(
 for (const fragment of [
   'const MEETING_DURATION_PRESETS = [15, 30, 45, 60, 90] as const',
   "type MeetingMode = 'google_meet' | 'in_person' | 'custom_link'",
-  "if (normalized === 'in_person' || normalized === 'custom_link')",
+  "if (normalized === 'in_person' || normalized === 'custom_link' || normalized === 'unspecified')",
   "new Intl.DateTimeFormat('en-US', { timeZone: timezone })",
   'function meetingEndValue(',
   'duration * 60_000',
@@ -103,6 +103,7 @@ for (const fragment of [
   '<MenuItem value="google_meet">Google Meet</MenuItem>',
   '<MenuItem value="in_person">In person</MenuItem>',
   '<MenuItem value="custom_link">Custom link</MenuItem>',
+  '<MenuItem value="unspecified">No location or conferencing</MenuItem>',
   'label="Physical address"',
   'label="Meeting link"',
   'label="Start"',
