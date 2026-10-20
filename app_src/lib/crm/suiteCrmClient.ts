@@ -409,6 +409,79 @@ function suiteCrmRecordModule(record: SuiteCrmOutboxRecord): SuiteCrmRecordModul
 export type SuiteCrmUpsertResult = {
   suiteCrmId: string
   productImageProjection: SuiteCrmNativeProductImageResult | null
+  meetingProjection?: SuiteCrmMeetingProjectionReadback
+}
+
+export type SuiteCrmMeetingProjectionAttributes = {
+  name: string
+  description: string
+  date_start: string
+  date_end: string
+  duration_hours: string
+  duration_minutes: string
+  location: string
+  status: string
+  date_modified: string
+}
+
+export type SuiteCrmMeetingProjectionReadback = {
+  suiteCrmId: string
+  capturedAt: string
+  attributes: SuiteCrmMeetingProjectionAttributes
+}
+
+/** Retain the native representation, not a guessed HTML/truncation transform. */
+export function normalizeSuiteCrmMeetingProjectionAttributes(value: unknown): SuiteCrmMeetingProjectionAttributes {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('SuiteCRM meeting projection is invalid')
+  const source = value as Record<string, unknown>
+  const string = (key: string, max: number) => {
+    if (!Object.hasOwn(source, key)) throw new Error('SuiteCRM meeting projection is incomplete')
+    const raw = source[key]
+    if (raw !== undefined && raw !== null && typeof raw !== 'string') throw new Error('SuiteCRM meeting projection is invalid')
+    const result = String(raw || '').replace(/\r\n?/g, '\n')
+    if (result.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(result)) {
+      throw new Error('SuiteCRM meeting projection is invalid')
+    }
+    return result
+  }
+  const duration = (key: string, max: number) => {
+    if (!Object.hasOwn(source, key)) throw new Error('SuiteCRM meeting projection is incomplete')
+    const raw = source[key]
+    if ((typeof raw !== 'string' && typeof raw !== 'number') || !/^\d{1,6}$/.test(String(raw))) {
+      throw new Error('SuiteCRM meeting projection duration is invalid')
+    }
+    const parsed = Number(raw)
+    if (!Number.isSafeInteger(parsed) || parsed > max) throw new Error('SuiteCRM meeting projection duration is invalid')
+    return String(parsed)
+  }
+  const attributes = {
+    name: string('name', 300), description: string('description', 50_000),
+    date_start: string('date_start', 100), date_end: string('date_end', 100),
+    duration_hours: duration('duration_hours', 100_000), duration_minutes: duration('duration_minutes', 59),
+    location: string('location', 1_000), status: string('status', 100), date_modified: string('date_modified', 100),
+  }
+  const startsAt = Date.parse(attributes.date_start)
+  const endsAt = attributes.date_end ? Date.parse(attributes.date_end) : startsAt
+    + (Number(attributes.duration_hours) * 60 + Number(attributes.duration_minutes)) * 60_000
+  if (!Number.isFinite(startsAt) || !Number.isFinite(endsAt) || endsAt <= startsAt
+    || !Number.isFinite(Date.parse(attributes.date_modified))) {
+    throw new Error('SuiteCRM meeting projection time is invalid')
+  }
+  return attributes
+}
+
+export async function readSuiteCrmMeetingSnapshot(
+  suiteCrmId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ id: string; attributes: SuiteCrmMeetingProjectionAttributes }> {
+  if (!suiteCrmId || suiteCrmId.length > 64 || !/^[a-z0-9-]+$/i.test(suiteCrmId)) {
+    throw new Error('SuiteCRM meeting identity is invalid')
+  }
+  const response = await request(`/Api/V8/module/Meetings/${encodeURIComponent(suiteCrmId)}`, { method: 'GET' }, fetchImpl) as JsonApiResponse
+  if (response.data?.id !== suiteCrmId || (response.data.type && !['Meetings', 'Meeting'].includes(response.data.type))) {
+    throw new Error('SuiteCRM returned an unexpected meeting projection identity')
+  }
+  return { id: suiteCrmId, attributes: normalizeSuiteCrmMeetingProjectionAttributes(response.data.attributes) }
 }
 
 export async function upsertSuiteCrmRecordWithResult(
@@ -444,6 +517,7 @@ export async function upsertSuiteCrmRecordWithResult(
         : attributes,
     },
   }
+  const projectionCapturedAt = new Date().toISOString()
   const response = await request('/Api/V8/module', {
     method: existing ? 'PATCH' : 'POST',
     body: JSON.stringify(body),
@@ -477,7 +551,17 @@ export async function upsertSuiteCrmRecordWithResult(
       }),
     }, fetchImpl)
   }
-  return { suiteCrmId: id, productImageProjection }
+  let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
+  if (record.entity === 'meetings' && moduleName === 'Meetings') {
+    // Keep the exact write response: a later GET could already include a
+    // concurrent operator edit and must never become our projection baseline.
+    if (response.data?.id !== id || (response.data.type && !['Meetings', 'Meeting'].includes(response.data.type))) {
+      throw new Error('SuiteCRM returned an unexpected meeting projection identity')
+    }
+    meetingProjection = { suiteCrmId: id, capturedAt: projectionCapturedAt,
+      attributes: normalizeSuiteCrmMeetingProjectionAttributes(response.data.attributes) }
+  }
+  return { suiteCrmId: id, productImageProjection, ...(meetingProjection ? { meetingProjection } : {}) }
 }
 
 export async function upsertSuiteCrmRecord(

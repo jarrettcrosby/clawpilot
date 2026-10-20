@@ -35,11 +35,24 @@ const CALENDAR = 'independent-team@example.com'
 const CONNECTION = 'nondefault-calendar-connection'
 const EVENT = 'recorded-event'
 const CUSTOM = 'https://video.example.com/customer-room'
+const PROJECTION = '88888888-8888-4888-8888-888888888888'
+const SOURCE_HASH = 'a'.repeat(64)
 const normalizeUserEmail = (value) => String(value || '').trim().toLowerCase()
 const archived = (row) => ['true', '1', 'yes'].includes(String(row.source_payload?.archived).toLowerCase())
 let meeting, prior, staged, queued, requests, scopeFailure, bindingFailure, credentialFailure
 let scopeOrganization, activeBinding, credentialAccount, racedHash, insertFailure, cursorWrites
 let pipelineRole, onMeetingRead, importedAuthority
+let projectionRow, pendingProjection, liveSnapshotOverride, lastPolledSnapshot, nativeReads, onProjectionRead
+const clientSource = ts.createSourceFile('suiteCrmClient.ts', readFileSync('app_src/lib/crm/suiteCrmClient.ts', 'utf8'),
+  ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+const normalizerNode = clientSource.statements.find((node) => ts.isFunctionDeclaration(node)
+  && node.name?.text === 'normalizeSuiteCrmMeetingProjectionAttributes')
+assert.ok(normalizerNode)
+const normalizerModule = { exports: {} }
+vm.runInNewContext(ts.transpileModule(normalizerNode.getText(clientSource), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, { module: normalizerModule, exports: normalizerModule.exports })
+const normalizeProjectionAttributes = normalizerModule.exports.normalizeSuiteCrmMeetingProjectionAttributes
 const snapshot = (source = 'organization') => ({
   organizationId: ORGANIZATION, credentialOwnerEmail: source === 'organization' ? OWNER : ACTOR,
   connectionId: CONNECTION, accountEmail: source === 'organization' ? OWNER : ACTOR,
@@ -49,7 +62,7 @@ function reset(mode = 'in_person', source = 'organization') {
   const communication = snapshot(source)
   meeting = {
     id: MEETING, pipeline_id: PIPELINE, owner_email: 'pipeline-owner@example.com',
-    source_key: 'crm-action:original:meeting', source_hash: 'original-source-hash', reference_code: REFERENCE,
+    source_key: 'crm-action:original:meeting', source_hash: SOURCE_HASH, suitecrm_id: 'suitecrm-fixture', reference_code: REFERENCE,
     subject: 'Original meeting', description: 'Original description',
     starts_at: '2026-09-04T14:00:00.000Z', ends_at: '2026-09-04T14:45:00.000Z',
     timezone: 'UTC', location: mode === 'in_person' ? '100 Example Avenue' : '',
@@ -83,12 +96,16 @@ function reset(mode = 'in_person', source = 'organization') {
   pipelineRole = 'editor'
   onMeetingRead = null
   importedAuthority = null
+  pendingProjection = false; liveSnapshotOverride = null; lastPolledSnapshot = null; nativeReads = 0; onProjectionRead = null
+  projectionRow = { id: PROJECTION, receipt: { version: 1, outboxId: PROJECTION,
+    suiteCrmId: meeting.suitecrm_id, sourceHash: meeting.source_hash, capturedAt: '2026-09-03T18:00:00.000Z',
+    attributes: normalizeProjectionAttributes(inboundSnapshot(false).attributes) } }
 }
 function inboundSnapshot(changed = true) {
   return { id: 'suitecrm-fixture', attributes: {
     name: changed ? 'Subject edited in SuiteCRM' : meeting.subject,
-    description: meeting.description, date_start: meeting.starts_at,
-    duration_hours: 0, duration_minutes: changed ? 75 : 45,
+    description: meeting.description, date_start: meeting.starts_at, date_end: '',
+    duration_hours: changed ? 1 : 0, duration_minutes: changed ? 15 : 45,
     location: meeting.location, status: 'Planned', date_modified: '2026-09-03T19:00:00.000Z',
   } }
 }
@@ -106,6 +123,16 @@ function stage(input) {
     shortUrl: 'https://clawpilot.example/m/gm1234567' }
 }
 async function query(sql, parameters = []) {
+  if (sql.includes('FROM sync_outbox projection')) {
+    assert.ok(sql.includes("projection.aggregate_type = 'crm_meetings'"))
+    assert.ok(sql.includes("projection.status = 'succeeded'"))
+    assert.ok(sql.includes("pending.status IN ('queued', 'processing', 'failed', 'dead')"))
+    assert.deepEqual(Array.from(parameters).slice(0, 3), [MEETING, PIPELINE, meeting.suitecrm_id])
+    assert.match(parameters[3], new RegExp(`^crm:meetings:v4:${MEETING}:default:[a-f0-9]{64}$`))
+    const rows = pendingProjection || !projectionRow ? [] : [structuredClone(projectionRow)]
+    if (onProjectionRead) { const callback = onProjectionRead; onProjectionRead = null; callback() }
+    return { rows }
+  }
   if (sql.includes('FROM crm_calendar_discovery_events mapping')) {
     for (const guard of [
       'source.pipeline_id = mapping.pipeline_id AND source.id = mapping.source_id',
@@ -168,10 +195,21 @@ async function query(sql, parameters = []) {
 const client = { query: async (sql, parameters = []) => {
   if (sql.includes('pg_advisory_xact_lock')) return { rows: [] }
   if (sql.includes('SELECT * FROM crm_integration_actions') && sql.includes('FOR UPDATE')) return { rows: [] }
-  if (sql.includes('SELECT source_hash FROM crm_meetings')) {
+  if (sql.includes('SELECT source_hash') && sql.includes('FROM crm_meetings')) {
     assert.match(sql, /FOR UPDATE/); assert.deepEqual(Array.from(parameters), [PIPELINE, MEETING])
     if (sql.includes("NOT IN ('true', '1', 'yes')") && archived(meeting)) return { rows: [] }
-    return { rows: [{ source_hash: racedHash || meeting.source_hash }] }
+    return { rows: [{ source_hash: racedHash || meeting.source_hash, suitecrm_id: meeting.suitecrm_id }] }
+  }
+  if (sql.includes('FROM sync_outbox projection')) {
+    for (const guard of ["projection.status = 'succeeded'", 'projection.idempotency_key = $5',
+      "projection.payload->'suiteCrmMeetingProjection' = $6::jsonb", 'FOR SHARE OF projection',
+      "pending.status IN ('queued', 'processing', 'failed', 'dead')"]) assert.ok(sql.includes(guard))
+    const same = projectionRow && !pendingProjection && projectionRow.id === parameters[0]
+      && parameters[1] === MEETING && parameters[2] === PIPELINE && parameters[3] === meeting.suitecrm_id
+      && parameters[4] === `crm:meetings:v4:${MEETING}:default:${meeting.source_hash}`
+      && parameters[6] === meeting.source_hash
+      && JSON.stringify(JSON.parse(parameters[5])) === JSON.stringify(projectionRow.receipt)
+    return { rows: same ? [{ id: PROJECTION }] : [] }
   }
   if (sql.includes('WITH inserted AS')) {
     if (insertFailure) throw new Error('simulated enqueue failure')
@@ -246,7 +284,17 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
 const inbound = load('app_src/lib/crm/suiteCrmMeetingIngestion.ts', {
   '@/lib/crm/integrationActions': integration,
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities: (value) => String(value || '') },
-  '@/lib/crm/suiteCrmClient': { listSuiteCrmMeetingsUpdatedSince: async () => ({ meetings: [inboundSnapshot()], totalPages: 1 }) },
+  '@/lib/crm/suiteCrmClient': {
+    normalizeSuiteCrmMeetingProjectionAttributes: normalizeProjectionAttributes,
+    readSuiteCrmMeetingSnapshot: async (id) => {
+      assert.equal(id, meeting.suitecrm_id); nativeReads += 1
+      return structuredClone(liveSnapshotOverride || lastPolledSnapshot || inboundSnapshot())
+    },
+    listSuiteCrmMeetingsUpdatedSince: async () => {
+      lastPolledSnapshot = inboundSnapshot()
+      return { meetings: [lastPolledSnapshot], totalPages: 1 }
+    },
+  },
   '@/lib/persistence/crm': {
     stageCrmRecordInPostgres: async (input) => stage(input),
     stageCrmRecordWithClient: async (_client, input) => stage(input),
@@ -257,6 +305,11 @@ const inbound = load('app_src/lib/crm/suiteCrmMeetingIngestion.ts', {
   } },
   '@/lib/users': { normalizeUserEmail },
 }, '\nexport { reconcileMeeting };\n')
+const reconcileMeeting = inbound.reconcileMeeting
+inbound.reconcileMeeting = async (snapshot) => {
+  lastPolledSnapshot = structuredClone(snapshot)
+  return reconcileMeeting(snapshot)
+}
 
 for (const mode of ['in_person', 'custom_link', 'google_meet']) {
   for (const source of ['organization', 'meeting-override', 'user-default']) {
@@ -289,6 +342,104 @@ for (const mode of ['in_person', 'custom_link', 'google_meet']) {
 reset()
 assert.equal((await inbound.reconcileMeeting(inboundSnapshot(false))).staged, false)
 assert.equal(staged.length, 0); assert.equal(queued, null)
+function lossyNativeProjection() {
+  reset()
+  meeting.subject = 'Customer meeting title longer than the native boundary'.padEnd(53, '!')
+  meeting.description = '<p>' + 'Retained HTML &amp; proposal. '.repeat(285) + '</p>'
+  meeting.starts_at = '2026-09-04T14:00:00.123Z'
+  meeting.ends_at = '2026-09-04T14:45:00.987Z'
+  const attributes = normalizeProjectionAttributes({ ...inboundSnapshot(false).attributes,
+    name: meeting.subject.slice(0, 50), description: 'Native plain-text projection',
+    date_start: '2026-09-04T14:00:00.000Z' })
+  projectionRow.receipt.attributes = attributes
+  return { id: meeting.suitecrm_id, attributes: structuredClone(attributes) }
+}
+{
+  const snapshot = lossyNativeProjection()
+  assert.equal((await inbound.reconcileMeeting(snapshot)).staged, false,
+    'Exact native projection echo cannot truncate title, strip HTML, round dates or send customer updates')
+  assert.equal(staged.length, 0); assert.equal(queued, null); assert.equal(requests.length, 0)
+  assert.equal(nativeReads, 0, 'No meaningful native field change needs an extra GET')
+}
+{
+  const snapshot = lossyNativeProjection()
+  const canonical = structuredClone(meeting)
+  snapshot.attributes.location = 'Actual native CRM address edit'
+  assert.equal((await inbound.reconcileMeeting(snapshot)).calendarActionQueued, true)
+  assert.equal(nativeReads, 1, 'Real native edits require exact fresh GET confirmation')
+  assert.equal(queued.payload.subject, canonical.subject)
+  assert.equal(queued.payload.description, canonical.description)
+  assert.equal(queued.payload.startsAt, canonical.starts_at)
+  assert.equal(queued.payload.endsAt, canonical.ends_at)
+  assert.equal(queued.payload.location, snapshot.attributes.location)
+  assert.equal(staged[0].fields.subject, canonical.subject)
+  assert.equal(staged[0].fields.description, canonical.description)
+}
+{
+  const snapshot = lossyNativeProjection()
+  snapshot.attributes.name = 'Genuine same-timestamp native title edit'
+  snapshot.attributes.description = '<p>Genuine native description edit</p>'
+  assert.equal((await inbound.reconcileMeeting(snapshot)).calendarActionQueued, true)
+  assert.equal(queued.payload.subject, snapshot.attributes.name)
+  assert.equal(queued.payload.description, snapshot.attributes.description)
+  assert.equal(snapshot.attributes.date_modified, projectionRow.receipt.attributes.date_modified,
+    'Changed content is accepted even when provider modification timestamps are identical')
+}
+{
+  reset()
+  const edited = inboundSnapshot()
+  await inbound.reconcileMeeting(edited)
+  const firstKey = queued.idempotency_key
+  reset()
+  const nextEdit = { ...edited, attributes: { ...edited.attributes, name: 'Second edit within the same timestamp' } }
+  await inbound.reconcileMeeting(nextEdit)
+  assert.notEqual(queued.idempotency_key, firstKey, 'Same-timestamp edits hash their native content')
+  reset()
+  meeting.source_hash = 'b'.repeat(64)
+  meeting.subject = 'Canonical intermediate edit before reverting'
+  projectionRow.receipt.sourceHash = meeting.source_hash
+  projectionRow.receipt.attributes.name = meeting.subject
+  await inbound.reconcileMeeting(edited)
+  assert.notEqual(queued.idempotency_key, firstKey,
+    'A→B→A native reverts with the same timestamp use their distinct canonical preimage')
+}
+for (const [name, mutate] of [
+  ['legacy missing projection receipt', () => { projectionRow = null }],
+  ['queued projection', () => { pendingProjection = true }],
+  ['wrong projection format', () => { projectionRow.receipt.version = 2 }],
+  ['wrong projection outbox identity', () => { projectionRow.receipt.outboxId = NEXT }],
+  ['wrong projection source hash', () => { projectionRow.receipt.sourceHash = 'b'.repeat(64) }],
+  ['wrong native projection identity', () => { projectionRow.receipt.suiteCrmId = 'different-native-meeting' }],
+  ['invalid projection capture', () => { projectionRow.receipt.capturedAt = 'invalid' }],
+  ['incomplete native projection attributes', () => { delete projectionRow.receipt.attributes.description }],
+]) {
+  reset(); mutate()
+  await assert.rejects(() => inbound.reconcileMeeting(inboundSnapshot()), /projection/i, name)
+  assert.equal(staged.length, 0, `${name}: retain canonical data`)
+  assert.equal(queued, null, `${name}: never enqueue a Calendar update`)
+  assert.equal(requests.length, 0)
+}
+{
+  reset(); projectionRow = null
+  assert.equal((await inbound.reconcileMeeting(inboundSnapshot(false))).staged, false,
+    'An unchanged legacy record is safe to ignore without synthesizing projection proof')
+}
+{
+  reset()
+  liveSnapshotOverride = inboundSnapshot()
+  liveSnapshotOverride.attributes.location = 'Newer native edit after the list response'
+  await assert.rejects(() => inbound.reconcileMeeting(inboundSnapshot()), /changed after polling/)
+  assert.equal(queued, null); assert.equal(staged.length, 0)
+}
+for (const [name, mutate] of [
+  ['projection became queued after review', () => { pendingProjection = true }],
+  ['same outbox received a different exact receipt', () => { projectionRow.receipt.attributes.description = 'Different projection after review' }],
+]) {
+  reset(); onProjectionRead = mutate
+  await assert.rejects(() => inbound.reconcileMeeting(inboundSnapshot()), /projection.*unproven/i, name)
+  assert.equal(queued, null, `${name}: atomic proof precondition prevents dispatch`)
+  assert.equal(staged.length, 0)
+}
 for (const role of [null, 'viewer']) {
   reset()
   await inbound.reconcileMeeting(inboundSnapshot())
@@ -338,6 +489,105 @@ for (const mode of ['in_person', 'custom_link', 'google_meet', 'unspecified']) {
     assert.equal(write.body.location, null, 'A location-free import does not invent an address')
     assert.equal(write.body.conferenceData, null, 'A location-free import does not create Google Meet')
     assert.equal(staged.at(-1).fields.joinUrl, null)
+  }
+}
+for (const [priorMode, nextLocation, expectedMode] of [
+  ['unspecified', 'Owner-only validation location', 'in_person'],
+  ['in_person', '', 'unspecified'],
+  ['unspecified', '', 'unspecified'],
+  ['google_meet', 'Hybrid meeting location', 'google_meet'],
+  ['custom_link', 'Hybrid custom-link location', 'custom_link'],
+]) {
+  importMeeting(priorMode)
+  const nativeEdit = inboundSnapshot()
+  nativeEdit.attributes.location = nextLocation
+  assert.equal((await inbound.reconcileMeeting(nativeEdit)).calendarActionQueued, true)
+  assert.equal(staged[0].sourcePayload.meetingMode, expectedMode,
+    'Native CRM location edit must stage the same mode that its Calendar action uses')
+  assert.equal(queued.payload.meetingMode, expectedMode)
+  assert.equal(staged[0].fields.location, nextLocation)
+  assert.equal(queued.payload.location, nextLocation)
+  await integration.createCalendarEventAction(integration.leasedAction({ ...queued,
+    status: 'processing', attempts: 1, lock_token: 'fixture-location-mode-lease' }), target())
+  const write = requests.find((request) => request.method === 'PATCH')
+  assert.ok(write.pathname.includes(`/events/${EVENT}?`), 'Location mode edits reuse the same provider event')
+  assert.equal(write.body.location, nextLocation || null)
+  if (expectedMode === 'google_meet') assert.ok(write.body.conferenceData.createRequest)
+  else assert.equal(write.body.conferenceData, null)
+  assert.equal(staged.at(-1).sourcePayload.meetingMode, expectedMode)
+}
+for (const retainedConference of ['join_url', 'customJoinUrl']) {
+  importMeeting('unspecified')
+  if (retainedConference === 'join_url') meeting.join_url = CUSTOM
+  else meeting.source_payload.customJoinUrl = CUSTOM
+  const nativeEdit = inboundSnapshot()
+  nativeEdit.attributes.location = 'Must not reinterpret an existing conference'
+  await inbound.reconcileMeeting(nativeEdit)
+  assert.equal(queued.payload.meetingMode, 'unspecified',
+    'Location inference must not override an existing conference identity')
+  assert.equal(staged[0].sourcePayload.meetingMode, 'unspecified')
+}
+importMeeting('unknown-provider-mode')
+const unknownModeEdit = inboundSnapshot()
+unknownModeEdit.attributes.location = 'Do not infer unknown mode'
+await assert.rejects(() => inbound.reconcileMeeting(unknownModeEdit), /Meeting mode/)
+assert.equal(staged.length, 0, 'Unknown meeting mode remains fail-closed before staging')
+assert.equal(queued, null)
+
+// Execute the actual editor initialization and save functions without loading
+// React/MUI, so a pre-fix row with stale metadata cannot silently lose an address.
+{
+  const path = 'app_src/components/crm/CrmSection.tsx'
+  const uiSource = readFileSync(path, 'utf8')
+  const ast = ts.createSourceFile(path, uiSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const wanted = new Set(['textValue', 'meetingModeValue', 'meetingModeForRecord',
+    'meetingCalendarChoiceKey', 'initialFields', 'saveRecord'])
+  const functions = []
+  const visit = (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name && wanted.has(node.name.text)) functions.push(node.getText(ast))
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.equal(functions.length, wanted.size)
+  const submitted = []
+  const errors = []
+  const module = { exports: {} }
+  const context = {
+    module, exports: module.exports, console,
+    MEETING_DURATION_PRESETS: [15, 30, 45, 60, 90],
+    durationForMeetingRecord: () => 45,
+    dateTimeLocalValue: (value) => String(value || ''),
+    busy: false, editorRequiredFieldsReady: true, editorMeetingReady: true,
+    editorEntity: 'meetings', editorRecord: { id: MEETING }, editorMeetingIdempotencyKey: 'fixture-editor-location-save',
+    editorMeetingCalendar: { source: 'organization-default' }, editorMeetingTimingReady: true, editorMeetingLocationReady: true,
+    setBusy() {}, setError(value) { if (value) errors.push(value) }, setNotice() {},
+    setEditorRecord() {}, setEditorMeetingIdempotencyKey() {}, setEditorHistory() {},
+    entity: 'meetings', query: '', needsReviewOnly: false, load: async () => {},
+    fetch: async (_url, init) => { submitted.push(JSON.parse(init.body)); return { ok: true, json: async () => ({ ok: true }) } },
+  }
+  const output = ts.transpileModule(functions.join('\n')
+    + '\nmodule.exports={initialFields,meetingModeForRecord,saveRecord};', {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  vm.runInNewContext(output, context, { filename: path })
+  const staleRecord = { meetingMode: 'unspecified', location: 'Owner-only validation location',
+    startsAt: '2026-09-04T14:00', endsAt: '2026-09-04T14:45', timezone: 'UTC', subject: 'Existing reverse-sync meeting' }
+  context.fields = module.exports.initialFields('meetings', staleRecord, 'UTC', 'USD')
+  context.editorMeetingMode = context.fields.meetingMode
+  context.editorMeetingEnd = context.fields.endsAt
+  assert.equal(context.fields.meetingMode, 'in_person', 'Stale metadata exposes the existing address in the editor')
+  assert.equal(context.fields.location, staleRecord.location)
+  await module.exports.saveRecord()
+  assert.deepEqual(errors, [])
+  assert.equal(submitted[0].fields.meetingMode, 'in_person')
+  assert.equal(submitted[0].fields.location, staleRecord.location,
+    'An unrelated editor save must preserve the native CRM address')
+  assert.equal(module.exports.meetingModeForRecord({ meetingMode: 'in_person', location: '' }), 'unspecified')
+  for (const mode of ['google_meet', 'custom_link']) {
+    assert.equal(module.exports.meetingModeForRecord({ ...staleRecord, meetingMode: mode }), mode)
+  }
+  for (const conference of [{ joinUrl: CUSTOM }, { customJoinUrl: CUSTOM }]) {
+    assert.equal(module.exports.meetingModeForRecord({ ...staleRecord, ...conference }), 'unspecified')
   }
 }
 importMeeting('unspecified')

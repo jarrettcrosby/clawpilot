@@ -272,6 +272,15 @@ function meetingModeValue(value: unknown): MeetingMode {
   return 'google_meet'
 }
 
+function meetingModeForRecord(record: RecordValue): MeetingMode {
+  const mode = meetingModeValue(record.meetingMode)
+  if ((record.meetingMode !== 'unspecified' && record.meetingMode !== 'in_person')
+    || textValue(record, 'joinUrl').trim() || textValue(record, 'customJoinUrl').trim()) return mode
+  // Older reverse-sync rows can have a native CRM address but stale mode
+  // metadata. Expose that address instead of clearing it on an unrelated save.
+  return textValue(record, 'location').trim() ? 'in_person' : 'unspecified'
+}
+
 function validTimeZone(value: unknown) {
   const timezone = String(value || '').trim()
   if (!timezone) return false
@@ -823,7 +832,7 @@ function initialFields(
     const durationMinutes = record ? durationForMeetingRecord(source, timezone) : 30
     const calendarConnectionId = textValue(source, 'calendarConnectionId')
     const calendarId = textValue(source, 'calendarId')
-    const meetingMode = meetingModeValue(source.meetingMode)
+    const meetingMode = meetingModeForRecord(source)
     return {
       subject: textValue(source, 'subject'), organizationId: textValue(source, 'organizationId'),
       contactId: textValue(source, 'contactId'), leadId: textValue(source, 'leadId'),
@@ -2163,7 +2172,7 @@ export default function CrmSection() {
       const durationPreset = MEETING_DURATION_PRESETS.some((value) => value === durationMinutes)
         ? String(durationMinutes)
         : 'custom'
-      const meetingMode = meetingModeValue(record.meetingMode)
+      const meetingMode = meetingModeForRecord(record)
       const calendarConnectionId = textValue(record, 'calendarConnectionId')
       const calendarId = textValue(record, 'calendarId')
       const calendarChoiceKey = calendarConnectionId && calendarId
