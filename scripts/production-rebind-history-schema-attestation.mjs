@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v7'
+  'clawpilot-production-rebind-target-schema-attestation-v8'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -50,6 +50,10 @@ export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({
     filename: '0372_fractional_crm_gateway.sql',
     checksum: '4f27ef992cf15aa55559cee9f78c2182a0d764f0638c9b22495576b6141eff8e',
+  }),
+  Object.freeze({
+    filename: '0373_crm_calendar_discovery.sql',
+    checksum: '9f8d7c862a47d99ba05c3d9176bb1780456dca3216eb1e511ccda6c40459e36d',
   }),
 ])
 
@@ -111,8 +115,8 @@ const PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
 // versions. Each supported major is therefore exercised against the complete
 // migration chain and enrolled explicitly. Unknown majors fail closed.
 const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: 'a1af2c30e5b28aec8e60d1689330b72c2fdff5666c7da382f5cfa9fbc4869615',
-  18: '73040be0231764cb9fbcfd8d9d5fd7eadab2c9debd428b3317150b5a844ba741',
+  16: '546722dd51520ea8eae9cf543ddffddf79812e7f8693f66a8be96267e4ad3434',
+  18: '2f088bed586b24e1b665277f7dee44e4333e4fb97a8e75a19aabe1d8213432fb',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -726,7 +730,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0372',
+      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0373',
     )
   }
   if (
