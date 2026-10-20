@@ -33,6 +33,7 @@ function loadModule(path, mocks = {}, extraExports = '') {
 }
 
 const headers = loadModule('app_src/lib/crm/emailAddressHeaders.ts')
+const participantEligibility = loadModule('app_src/lib/crm/participantEligibility.ts')
 const ownerEmail = 'operator@example.test'
 const mailboxEmail = 'primary@example.test'
 const ownAlias = 'operator@business.example.test'
@@ -77,6 +78,7 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
   const result = rows => ({ rows, rowCount: rows.length })
   const ingestion = loadModule(sourcePath, {
     '@/lib/crm/emailAddressHeaders': headers,
+    '@/lib/crm/participantEligibility': participantEligibility,
     '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
     '@/lib/globalIds.mjs': { globalIdFragment },
     '@/lib/auditWriter': { recordAuditEvent: async input => {
@@ -139,8 +141,17 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
         assert.match(sql, /ANY\(/, 'Participant lookup must remain an exact bounded query')
         const ordinary = !sql.includes('FROM crm_organizations')
         if (ordinary) assert.equal((sql.match(/source_payload->>'archived'/g) || []).length, 2, 'Both contacts and leads must exclude archived candidates before ambiguity checks')
-        return result(records.filter(record => ids.includes(record.pipelineId) && addresses.includes(record.email.toLowerCase()) && (!ordinary || !record.archived))
-          .map(record => ({ pipeline_id: record.pipelineId, reference_code: record.referenceCode, email: record.email.toLowerCase() })))
+        let candidates = records.filter(record => ids.includes(record.pipelineId) && addresses.includes(record.email.toLowerCase()) && (!ordinary || !record.archived))
+        if (ordinary) {
+          assert.match(sql, /FROM quickbooks_crm_links accounting_link/)
+          assert.match(sql, /accounting_pipeline\.workspace_organization_id = accounting_link\.organization_id/)
+          assert.match(sql, /crm_candidate\.email = candidate\.email AND NOT crm_candidate\.accounting_mirror/)
+          // Actual SQL provenance checks are exercised by the PostgreSQL suite.
+          candidates = candidates.filter(record => !record.accountingMirror || !candidates.some(candidate => (
+            candidate.email.toLowerCase() === record.email.toLowerCase() && !candidate.accountingMirror
+          )))
+        }
+        return result(candidates.map(record => ({ pipeline_id: record.pipelineId, reference_code: record.referenceCode, email: record.email.toLowerCase() })))
       }
       if (sql.includes('FROM crm_inbound_message_links')) {
         return result([...(links.get(values[0]) || new Map()).entries()]
@@ -284,6 +295,36 @@ await check('duplicate email contacts or contact-plus-lead fail closed', async (
     const h = harness({ records: [adrian, fixtureContact('gc4567890', adrian.email, businessPipeline, customerOrganization, entity)] })
     assert.equal((await h.ingestion.participantEmailTargets(h.input())).length, 0)
   }
+})
+
+await check('same-email accounting mirror cannot block a real CRM customer in another workspace', async () => {
+  const mirror = { ...fixtureContact('gc4567890', adrian.email, primaryPipeline, otherOrganization), accountingMirror: true }
+  for (const options of [{ from: adrian.email, to: ownerEmail }, { from: ownAlias, to: adrian.email, labels: ['SENT'] }]) {
+    const h = harness({ records: [mirror, adrian] })
+    const targets = await h.ingestion.participantEmailTargets(h.input(rawMessage('accounting-mirror', options)))
+    assert.equal(targets.length, 1)
+    assert.equal(targets[0].pipelineId, businessPipeline)
+    assert.equal(targets[0].record.referenceCode, adrian.referenceCode)
+  }
+})
+
+await check('standalone accounting contacts remain eligible and real CRM conflicts still fail closed', async () => {
+  const mirror = { ...fixtureContact('gc4567890', adrian.email, primaryPipeline, otherOrganization), accountingMirror: true }
+  const standalone = harness({ records: [mirror] })
+  assert.equal((await standalone.ingestion.participantEmailTargets(standalone.input()))[0].record.referenceCode, mirror.referenceCode)
+  const adopted = harness({ records: [adrian, { ...mirror, accountingMirror: false }] })
+  assert.equal((await adopted.ingestion.participantEmailTargets(adopted.input())).length, 0)
+  const unrelated = harness({ records: [adrian, { ...mirror, email: secondContact.email }] })
+  assert.equal((await unrelated.ingestion.participantEmailTargets(unrelated.input(rawMessage('unrelated-accounting', { cc: secondContact.email })))).length, 0)
+})
+
+await check('explicit markers still resolve accounting mirrors rather than silently retargeting them', async () => {
+  const mirror = { ...fixtureContact('gc4567890', adrian.email, primaryPipeline, otherOrganization), accountingMirror: true }
+  const h = harness({ records: [adrian, mirror] })
+  const resolved = await h.ingestion.referenceTargets(h.input(rawMessage('explicit-accounting', { body: `%gslt${mirror.referenceCode}` })))
+  assert.equal(resolved.targets.length, 1)
+  assert.equal(resolved.targets[0].record.referenceCode, mirror.referenceCode)
+  assert.equal(resolved.targets[0].matchedBy, 'marker')
 })
 
 await check('archived candidates cannot stall ingestion or make an active customer ambiguous', async () => {

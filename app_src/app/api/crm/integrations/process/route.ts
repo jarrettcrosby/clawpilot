@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { processCalendarIngestion } from '@/lib/crm/calendarIngestion'
+import { processCalendarDiscoveryInPostgres } from '@/lib/crm/calendarDiscoveryPersistence'
 import { processInboundGmailIngestion } from '@/lib/crm/emailIngestion'
 import { processDueCrmIntegrationActions } from '@/lib/crm/integrationActions'
 import { processSuiteCrmAccountContactIngestion } from '@/lib/crm/suiteCrmAccountContactIngestion'
@@ -59,11 +60,13 @@ export async function POST(req: NextRequest) {
     }
     const ingestion = await processInboundGmailIngestion()
     const calendarIngestion = await processCalendarIngestion()
+    const calendarDiscovery = await processCalendarDiscoveryInPostgres()
     return NextResponse.json({
       ok: true,
       actions,
       ingestion,
       calendarIngestion,
+      calendarDiscovery,
       suiteCrmAccountContactIngestion,
       suiteCrmMeetingIngestion,
       suiteCrmCallIngestion,

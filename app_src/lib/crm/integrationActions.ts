@@ -1786,8 +1786,79 @@ async function assertQueuedCommunicationAuthorization(
   }
 }
 
-/** Recover authority from a delivered action, never from today's default or
- * from an unverified personal override synthesized from meeting metadata. */
+type ImportedMeetingCalendarAuthority = {
+  workspace_organization_id: string
+  credential_owner_email: string
+  connection_id: string
+  account_email: string
+  calendar_id: string
+}
+
+/** A provider import has no outbound action receipt. Its durable discovery
+ * mapping and still-authorized source are the equivalent authority; meeting
+ * metadata alone must never grant access to a connection or calendar. */
+async function importedMeetingCalendarCommunication(
+  pipelineId: string,
+  meetingId: string,
+  referenceCode: string,
+  previousCalendar: PreviousCalendarEventSnapshot,
+) {
+  const result = await query<ImportedMeetingCalendarAuthority>(
+    `SELECT source.workspace_organization_id, source.credential_owner_email,
+       source.connection_id, source.account_email, source.calendar_id
+     FROM crm_calendar_discovery_events mapping
+     JOIN crm_calendar_discovery_sources source
+       ON source.pipeline_id = mapping.pipeline_id AND source.id = mapping.source_id
+       AND source.calendar_id = mapping.calendar_id
+       AND source.enabled AND source.verified_at IS NOT NULL
+     JOIN crm_meetings meeting
+       ON meeting.pipeline_id = mapping.pipeline_id AND meeting.id = mapping.meeting_id
+       AND meeting.provider = 'google-calendar'
+       AND meeting.external_event_id = mapping.external_event_id
+       AND COALESCE(lower(meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+     JOIN pipeline_spaces pipeline
+       ON pipeline.id = source.pipeline_id
+       AND pipeline.workspace_organization_id = source.workspace_organization_id
+       AND lower(pipeline.owner_email) = source.credential_owner_email
+       AND NOT pipeline.reference_access_disabled
+     JOIN app_users owner_user
+       ON owner_user.email = source.credential_owner_email AND owner_user.status = 'active'
+     JOIN app_user_organization_memberships membership
+       ON membership.user_email = source.credential_owner_email
+       AND membership.organization_id = source.workspace_organization_id AND membership.status = 'active'
+     JOIN user_maton_connections connection
+       ON connection.owner_email = source.credential_owner_email
+       AND connection.connection_id = source.connection_id
+       AND connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'
+       AND lower(connection.account_email) = source.account_email
+     WHERE mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid
+       AND meeting.reference_code = $3 AND mapping.external_event_id = $4
+       AND source.credential_owner_email = $5 AND source.connection_id = $6
+       AND mapping.calendar_id = $7 AND source.calendar_id = $8
+     LIMIT 2`,
+    [pipelineId, meetingId, referenceCode, previousCalendar.eventId,
+      previousCalendar.credentialOwnerEmail, previousCalendar.connectionId,
+      previousCalendar.calendarId, previousCalendar.organizerEmail],
+  )
+  if (result.rows.length !== 1) return null
+  const imported = result.rows[0]
+  const actorEmail = normalizeEmail(imported.credential_owner_email, 'Imported Calendar owner')
+  return {
+    actorEmail,
+    communication: normalizeCalendarCommunicationSnapshot({
+      organizationId: imported.workspace_organization_id,
+      credentialOwnerEmail: actorEmail,
+      connectionId: imported.connection_id,
+      accountEmail: imported.account_email,
+      identityEmail: imported.calendar_id,
+      calendarId: imported.calendar_id,
+      source: 'meeting-override',
+    }, actorEmail),
+  }
+}
+
+/** Recover authority from a delivered action or an exact authorized import,
+ * never from today's default or unverified meeting metadata alone. */
 export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
   pipelineId: string
   meetingId: string
@@ -1834,15 +1905,19 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
   )
   const original = result.rows[0]
   const recorded = original ? actionView(original).communication : null
-  if (!original || !recorded) {
+  const imported = !original || !recorded
+    ? await importedMeetingCalendarCommunication(pipelineId, meetingId, referenceCode, previousCalendar)
+    : null
+  if ((!original || !recorded) && !imported) {
     throw new CrmIntegrationActionError(
       'The meeting has no matching successful reviewed Calendar action; review it before syncing',
       409,
       'CRM_CALENDAR_RECONCILIATION_IDENTITY_REQUIRED',
     )
   }
-  const actorEmail = normalizeEmail(original.actor_email, 'Recorded Calendar actor')
-  const communication = normalizeCalendarCommunicationSnapshot(recorded as PipelineCommunicationSnapshot, actorEmail)
+  const actorEmail = imported?.actorEmail || normalizeEmail(original!.actor_email, 'Recorded Calendar actor')
+  const communication = imported?.communication
+    || normalizeCalendarCommunicationSnapshot(recorded as PipelineCommunicationSnapshot, actorEmail)
   if (source.communicationOrganizationId && source.communicationOrganizationId !== communication.organizationId) {
     throw new CrmIntegrationActionError('The recorded Calendar organization no longer matches the meeting', 409)
   }
@@ -2814,19 +2889,19 @@ function normalizeMeetingStatus(value: unknown): CrmMeeting['status'] {
   throw new PermanentCrmIntegrationActionError('Calendar action meeting status is invalid')
 }
 
-type CalendarMeetingMode = 'google_meet' | 'in_person' | 'custom_link'
+type CalendarMeetingMode = 'google_meet' | 'in_person' | 'custom_link' | 'unspecified'
 
 function calendarMeetingMode(value: unknown): CalendarMeetingMode | null {
   const mode = typeof value === 'string' ? value.trim().toLowerCase() : ''
   if (!mode) return 'google_meet'
-  return mode === 'google_meet' || mode === 'in_person' || mode === 'custom_link'
+  return mode === 'google_meet' || mode === 'in_person' || mode === 'custom_link' || mode === 'unspecified'
     ? mode
     : null
 }
 
 function normalizeMeetingMode(value: unknown): CalendarMeetingMode {
   const mode = calendarMeetingMode(value)
-  if (!mode) throw new CrmIntegrationActionError('Meeting mode must be Google Meet, in person, or custom link')
+  if (!mode) throw new CrmIntegrationActionError('Meeting mode must be Google Meet, in person, custom link, or unspecified')
   return mode
 }
 
@@ -3024,7 +3099,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
   let eventUrl = safeHttpsUrl(action.responseSummary.eventUrl) || safeHttpsUrl(currentEvent?.external_event_url)
   let joinUrl = meetingMode === 'custom_link'
     ? customJoinUrl
-    : meetingMode === 'in_person'
+    : meetingMode === 'in_person' || meetingMode === 'unspecified'
       ? null
       : safeHttpsUrl(action.responseSummary.joinUrl) || safeHttpsUrl(currentEvent?.join_url)
   let organizerEmail = typeof action.responseSummary.organizerEmail === 'string'

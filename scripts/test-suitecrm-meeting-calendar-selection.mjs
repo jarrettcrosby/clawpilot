@@ -39,7 +39,7 @@ const normalizeUserEmail = (value) => String(value || '').trim().toLowerCase()
 const archived = (row) => ['true', '1', 'yes'].includes(String(row.source_payload?.archived).toLowerCase())
 let meeting, prior, staged, queued, requests, scopeFailure, bindingFailure, credentialFailure
 let scopeOrganization, activeBinding, credentialAccount, racedHash, insertFailure, cursorWrites
-let pipelineRole, onMeetingRead
+let pipelineRole, onMeetingRead, importedAuthority
 const snapshot = (source = 'organization') => ({
   organizationId: ORGANIZATION, credentialOwnerEmail: source === 'organization' ? OWNER : ACTOR,
   connectionId: CONNECTION, accountEmail: source === 'organization' ? OWNER : ACTOR,
@@ -82,6 +82,7 @@ function reset(mode = 'in_person', source = 'organization') {
   credentialAccount = communication.accountEmail; racedHash = null
   pipelineRole = 'editor'
   onMeetingRead = null
+  importedAuthority = null
 }
 function inboundSnapshot(changed = true) {
   return { id: 'suitecrm-fixture', attributes: {
@@ -105,6 +106,35 @@ function stage(input) {
     shortUrl: 'https://clawpilot.example/m/gm1234567' }
 }
 async function query(sql, parameters = []) {
+  if (sql.includes('FROM crm_calendar_discovery_events mapping')) {
+    for (const guard of [
+      'source.pipeline_id = mapping.pipeline_id AND source.id = mapping.source_id',
+      'source.calendar_id = mapping.calendar_id',
+      'source.enabled AND source.verified_at IS NOT NULL',
+      'meeting.pipeline_id = mapping.pipeline_id AND meeting.id = mapping.meeting_id',
+      "meeting.provider = 'google-calendar'",
+      'meeting.external_event_id = mapping.external_event_id',
+      "NOT IN ('true', '1', 'yes')",
+      'pipeline.workspace_organization_id = source.workspace_organization_id',
+      'lower(pipeline.owner_email) = source.credential_owner_email',
+      'NOT pipeline.reference_access_disabled',
+      "owner_user.status = 'active'",
+      "membership.organization_id = source.workspace_organization_id AND membership.status = 'active'",
+      "connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'",
+      'lower(connection.account_email) = source.account_email',
+      'mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid',
+      'meeting.reference_code = $3 AND mapping.external_event_id = $4',
+      'source.credential_owner_email = $5 AND source.connection_id = $6',
+      'mapping.calendar_id = $7 AND source.calendar_id = $8',
+    ]) assert.ok(sql.includes(guard), `Imported Calendar authority must retain ${guard}`)
+    const row = importedAuthority
+    const matches = row && row.authorized && row.pipeline_id === parameters[0]
+      && row.meeting_id === parameters[1] && row.reference_code === parameters[2]
+      && row.external_event_id === parameters[3] && row.credential_owner_email === parameters[4]
+      && row.connection_id === parameters[5] && row.calendar_id === parameters[6]
+      && row.calendar_id === parameters[7]
+    return { rows: matches ? [structuredClone(row)] : [] }
+  }
   if (sql.includes('FROM crm_meetings meeting')) {
     const read = structuredClone(meeting)
     const active = !sql.includes("NOT IN ('true', '1', 'yes')") || !archived(read)
@@ -173,7 +203,7 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
   '@/lib/integrations/matonGatewayCredentials': { resolveUserMatonGatewayCredential: async (input) => {
     if (credentialFailure) throw new Error('revoked connection')
     assert.equal(input.boundConnectionId, CONNECTION)
-    assert.equal(input.ownerEmail, prior.communication_credential_owner_email)
+    assert.equal(input.ownerEmail, importedAuthority?.credential_owner_email || prior.communication_credential_owner_email)
     return { connectionId: CONNECTION, accountEmail: credentialAccount }
   } },
   '@/lib/persistence/organizationCommunications': {
@@ -204,6 +234,10 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
       { id: prior.communication_account_email, primary: true, accessRole: 'owner' },
       { id: CALENDAR, summary: 'Independent team', accessRole: 'writer' },
     ] })
+    if (init.method === 'DELETE') {
+      assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
+      return new Response(null, { status: 204 })
+    }
     assert.equal(init.method, 'PATCH', 'A CRM edit must not create/move/delete its recorded event')
     assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
     return Response.json({ id: EVENT, htmlLink: meeting.external_event_url, hangoutLink: 'https://meet.google.com/fixture' })
@@ -270,6 +304,80 @@ assert.equal((await inbound.reconcileMeeting(inboundSnapshot())).calendarActionQ
 reset(); delete meeting.source_payload.actionId
 assert.equal((await inbound.reconcileMeeting(inboundSnapshot())).calendarActionQueued, true,
   'Historical rows without actionId still require exact delivered event and recorded identity')
+
+function importMeeting(mode = 'in_person') {
+  reset(mode, 'meeting-override')
+  delete meeting.source_payload.actionId
+  meeting.source_payload.source = 'google_calendar_discovery'
+  meeting.provider = 'google-calendar'
+  prior.status = 'failed'
+  importedAuthority = {
+    authorized: true, pipeline_id: PIPELINE, meeting_id: MEETING,
+    reference_code: REFERENCE, external_event_id: EVENT,
+    workspace_organization_id: ORGANIZATION, credential_owner_email: ACTOR,
+    connection_id: CONNECTION, account_email: ACTOR, calendar_id: CALENDAR,
+  }
+}
+for (const mode of ['in_person', 'custom_link', 'google_meet', 'unspecified']) {
+  importMeeting(mode)
+  assert.equal((await inbound.reconcileMeeting(inboundSnapshot())).calendarActionQueued, true,
+    'An imported meeting edit must queue against its authoritative discovery source')
+  assert.equal(queued.communication_binding_source, 'meeting-override')
+  assert.equal(queued.communication_calendar_id, CALENDAR)
+  assert.equal(queued.communication_connection_id, CONNECTION)
+  assert.equal(queued.actor_email, ACTOR)
+  assert.equal(queued.payload.previousCalendar.eventId, EVENT)
+  assert.equal(requests.length, 0, 'Import reconciliation must only queue a provider update')
+  await integration.createCalendarEventAction(integration.leasedAction({ ...queued,
+    status: 'processing', attempts: 1, lock_token: 'fixture-import-lease' }), target())
+  const write = requests.find((request) => request.method === 'PATCH')
+  assert.equal(write.body.summary, 'Subject edited in SuiteCRM')
+  assert.equal(write.body.end.dateTime, '2026-09-04T15:15:00.000Z')
+  if (mode === 'unspecified') {
+    assert.equal(queued.payload.meetingMode, 'unspecified')
+    assert.equal(write.body.location, null, 'A location-free import does not invent an address')
+    assert.equal(write.body.conferenceData, null, 'A location-free import does not create Google Meet')
+    assert.equal(staged.at(-1).fields.joinUrl, null)
+  }
+}
+importMeeting('unspecified')
+const cancellation = inboundSnapshot()
+cancellation.attributes.status = 'Not Held'
+assert.equal((await inbound.reconcileMeeting(cancellation)).calendarActionQueued, true)
+await integration.createCalendarEventAction(integration.leasedAction({ ...queued,
+  status: 'processing', attempts: 1, lock_token: 'fixture-import-cancel-lease' }), target())
+assert.equal(requests.filter((request) => request.method === 'DELETE').length, 1,
+  'An unspecified imported meeting can still be cancelled on its exact calendar')
+assert.equal(requests.filter((request) => request.method === 'PATCH').length, 0)
+assert.equal(staged.at(-1).fields.status, 'cancelled')
+importMeeting(); prior = null
+const imported = await integration.resolveRecordedCrmMeetingCalendarCommunication({
+  pipelineId: PIPELINE, meetingId: MEETING, referenceCode: REFERENCE,
+  externalEventId: EVENT, sourcePayload: meeting.source_payload,
+})
+assert.equal(imported.communication.calendarId, CALENDAR,
+  'An authoritative imported event does not require any outbound action receipt')
+for (const [name, mutate] of [
+  ['disabled or revoked import source', () => { importedAuthority.authorized = false }],
+  ['different imported pipeline', () => { importedAuthority.pipeline_id = NEXT }],
+  ['different imported meeting', () => { importedAuthority.meeting_id = NEXT }],
+  ['different imported reference', () => { importedAuthority.reference_code = 'gm7654321' }],
+  ['different imported event', () => { importedAuthority.external_event_id = 'another-event' }],
+  ['different imported connection', () => { importedAuthority.connection_id = 'another-connection' }],
+  ['different imported calendar', () => { importedAuthority.calendar_id = 'another@example.com' }],
+  ['different imported owner', () => { importedAuthority.credential_owner_email = OWNER }],
+  ['metadata without import mapping', () => { importedAuthority = null }],
+  ['revoked imported credential', () => { credentialFailure = true }],
+  ['changed imported provider account', () => { credentialAccount = 'changed@example.com' }],
+  ['revoked imported membership', () => { scopeFailure = true }],
+  ['revoked imported pipeline access', () => { pipelineRole = null }],
+]) {
+  importMeeting(); mutate()
+  await assert.rejects(() => inbound.reconcileMeeting(inboundSnapshot()), undefined, name)
+  assert.equal(staged.length, 0, `${name}: do not consume the inbound edit`)
+  assert.equal(queued, null, `${name}: do not switch to a default calendar`)
+  assert.equal(requests.length, 0, `${name}: do not write to Google`)
+}
 
 for (const [name, mutate] of [
   ['revoked actor membership', () => { scopeFailure = true }],

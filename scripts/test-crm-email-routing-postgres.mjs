@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { decodeHtmlEntities } from '../app_src/lib/htmlEntities.mjs'
@@ -15,6 +15,7 @@ import {
   disposablePostgresDockerArgs,
   disposablePostgresDockerCleanupArgs,
 } from './lib/disposable-postgres-docker.mjs'
+import { runStorageGuard } from './local-storage-guard.mjs'
 
 const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -22,6 +23,27 @@ const ts = requireFromApp('typescript')
 const { Pool } = requireFromApp('pg')
 const read = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
 const unexpected = name => { throw new Error(`Unexpected external dependency: ${name}`) }
+
+// An explicit opt-in for an already-created, private local fixture. This is not
+// a general DATABASE_URL override: the database, port, owner and SSL behavior
+// remain fixed, and no application environment or credentials are loaded.
+const args = process.argv.slice(2)
+assert.ok(args.length === 0 || (args.length === 1 && args[0].startsWith('--native-socket=')),
+  'Only --native-socket=/tmp/clawpilot-bpo-crm-pg.<id> is supported')
+const nativeSocket = args[0]?.slice('--native-socket='.length)
+if (nativeSocket !== undefined) {
+  assert.match(nativeSocket, /^\/tmp\/clawpilot-bpo-crm-pg\.[A-Za-z0-9]+$/u,
+    'Native socket must be an explicit disposable fixture path')
+  const socketDirectory = lstatSync(nativeSocket)
+  assert.ok(socketDirectory.isDirectory() && !socketDirectory.isSymbolicLink(),
+    'Native fixture socket path must be a real directory')
+  assert.equal(socketDirectory.uid, process.getuid(), 'Native fixture must belong to the current user')
+  assert.equal(socketDirectory.mode & 0o077, 0, 'Native fixture must be private to the current user')
+  assert.equal(realpathSync(nativeSocket), `${realpathSync('/tmp')}/${nativeSocket.split('/').at(-1)}`,
+    'Native fixture may not traverse a symlink')
+  assert.ok(process.env.USER, 'Native fixture requires the current local USER')
+  assert.equal(runStorageGuard({ argv: ['--preflight'] }), 0, 'Local disk guard must pass')
+}
 
 function loadModule(path, dependencies = {}, extraSource = '') {
   const module = { exports: {} }
@@ -165,6 +187,10 @@ const fixtureSchema = `
       REFERENCES crm_organizations(pipeline_id,id)
   );
   CREATE TABLE crm_leads (LIKE crm_contacts INCLUDING ALL);
+  CREATE TABLE quickbooks_crm_links (
+    organization_id uuid, pipeline_id uuid, provider_entity_type text,
+    provider_entity_id text, crm_entity_type text, crm_record_id uuid
+  );
   CREATE TABLE crm_products (id uuid, pipeline_id uuid, reference_code text);
   CREATE TABLE crm_product_identity_aliases (pipeline_id uuid, alias_product_id uuid, canonical_product_id uuid);
   CREATE TABLE crm_reference_registry (reference_code text, canonical_code text);
@@ -230,6 +256,7 @@ async function run(pool) {
     '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
     '@/lib/globalIds.mjs': { globalIdFragment },
     '@/lib/crm/emailAddressHeaders': addressHeaders,
+    '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts'),
     '@/lib/persistence/crm': persistence,
     '@/lib/persistence/postgres': { query },
     '@/lib/tenancy': { resolvePipelineSpaceAccess: () => unexpected('tenancy fallback') },
@@ -384,6 +411,52 @@ async function run(pool) {
     await query('DELETE FROM crm_contacts WHERE id=$1', [id(51)])
     assert.equal((await linksFor('a7')).length + (await linksFor('a8')).length, 0)
   })
+  await check('authoritative accounting-only mirrors cannot block the actual CRM conversation', async () => {
+    const mirrorId = id(60)
+    const payload = { provider: 'quickbooks', customerId: 'qb-customer-1', customer: { Id: 'qb-customer-1' } }
+    await insertRecord('crm_contacts', mirrorId, PRIMARY, 'gc6789012', 'business-contact@customer.example.test', CUSTOMER_PRIMARY)
+    // Contact identity normalization deliberately does not retain a QuickBooks
+    // source-key prefix. The routing policy must use producer/link provenance.
+    await query(`UPDATE crm_contacts SET source_key=$2,source_payload=$3::jsonb WHERE id=$1`,
+      [mirrorId, 'contact:email:business-contact@customer.example.test', JSON.stringify(payload)])
+    await query(`INSERT INTO quickbooks_crm_links VALUES ($1,$2,'customer',$3,'contact',$4)`,
+      [id(11), PRIMARY, payload.customerId, mirrorId])
+    const received = await process('af')
+    assert.equal(received.interactions, 1)
+    assert.deepEqual((await linksFor('af')).map(row => row.reference_code), ['gc2345678'])
+    const sent = await process('b0', { from: ALIAS, to: 'business-contact@customer.example.test', labels: ['SENT'] })
+    assert.equal(sent.interactions, 1)
+    assert.equal((await query('SELECT pipeline_id FROM crm_interactions WHERE provider_message_id=$1', ['b0'])).rows[0].pipeline_id, BUSINESS)
+
+    for (const [messageId, changed] of [
+      ['b1', { ...payload, source: 'clawpilot' }],
+      ['b2', { ...payload, source: 'suitecrm' }],
+      ['b3', { ...payload, reviewedBy: OWNER }],
+      ['b4', { ...payload, customer: { Id: 'different-customer' } }],
+    ]) {
+      await query('UPDATE crm_contacts SET source_payload=$2::jsonb WHERE id=$1', [mirrorId, JSON.stringify(changed)])
+      assert.equal((await process(messageId)).unmatched, true, 'Adopted or uncertain accounting provenance must remain real CRM ambiguity')
+      assert.equal((await linksFor(messageId)).length, 0)
+    }
+    await query('UPDATE crm_contacts SET source_payload=$2::jsonb WHERE id=$1', [mirrorId, JSON.stringify(payload)])
+    await query('DELETE FROM quickbooks_crm_links WHERE crm_record_id=$1', [mirrorId])
+    assert.equal((await process('b5')).unmatched, true, 'A provider-shaped payload without authoritative linkage is not a confirmed mirror')
+    await query(`INSERT INTO quickbooks_crm_links VALUES ($1,$2,'customer',$3,'contact',$4)`,
+      [id(12), PRIMARY, payload.customerId, mirrorId])
+    assert.equal((await process('b6')).unmatched, true, 'A link in another workspace cannot authorize mirror suppression')
+    await query('DELETE FROM quickbooks_crm_links WHERE crm_record_id=$1', [mirrorId])
+    await query('DELETE FROM crm_contacts WHERE id=$1', [mirrorId])
+  })
+  await check('standalone QuickBooks contacts remain eligible without an independent CRM replacement', async () => {
+    const mirrorId = id(61)
+    const payload = { provider: 'quickbooks', customerId: 'qb-customer-2', customer: { Id: 'qb-customer-2' } }
+    await insertRecord('crm_contacts', mirrorId, PRIMARY, 'gc6789013', 'standalone-accounting@example.test', CUSTOMER_PRIMARY)
+    await query('UPDATE crm_contacts SET source_payload=$2::jsonb WHERE id=$1', [mirrorId, JSON.stringify(payload)])
+    await query(`INSERT INTO quickbooks_crm_links VALUES ($1,$2,'customer',$3,'contact',$4)`,
+      [id(11), PRIMARY, payload.customerId, mirrorId])
+    assert.equal((await process('b7', { from: 'standalone-accounting@example.test' })).interactions, 1)
+    assert.deepEqual((await linksFor('b7')).map(row => row.reference_code), ['gc6789013'])
+  })
   await check('legacy null-thread exact provider message is reused without duplicating the sent interaction', async () => {
     const staged = await stageSent('a9')
     const before = await count('crm_interactions')
@@ -427,29 +500,36 @@ const container = `clawpilot-email-routing-test-${process.pid}-${randomUUID().sl
 let started = false
 let pool
 try {
-  execFileSync('docker', disposablePostgresDockerArgs([
-    'run', '--rm', '-d', '--name', container, '--pull', 'never',
-    '-e', 'POSTGRES_PASSWORD=email_routing_test', '-e', 'POSTGRES_DB=email_routing_test',
-    '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
-  ], {
-    environment: {
-      ...process.env,
-      CLAWPILOT_TEST_POSTGRES_MEMORY: '512m',
-      CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: '256m',
-      CLAWPILOT_TEST_POSTGRES_CPUS: '1',
-    },
-  }), { timeout: 60_000, stdio: 'pipe' })
-  started = true
-  const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8', timeout: 10_000 })
-    .match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
-  assert.ok(port, 'Disposable PostgreSQL must only bind to loopback')
-  pool = new Pool({ host: '127.0.0.1', port: Number(port), user: 'postgres', password: 'email_routing_test',
-    database: 'email_routing_test', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
-  const deadline = Date.now() + 30_000
-  while (true) {
-    try { await pool.query('SELECT 1'); break } catch (error) {
-      if (Date.now() >= deadline) throw error
-      await new Promise(resolve => setTimeout(resolve, 100))
+  if (nativeSocket) {
+    pool = new Pool({ host: nativeSocket, port: 55473, user: process.env.USER, password: '',
+      database: 'email_routing_test', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+    assert.equal((await pool.query(`SELECT count(*) FROM pg_tables WHERE schemaname='public'`)).rows[0].count,
+      '0', 'Native email_routing_test fixture must be empty before use')
+  } else {
+    execFileSync('docker', disposablePostgresDockerArgs([
+      'run', '--rm', '-d', '--name', container, '--pull', 'never',
+      '-e', 'POSTGRES_PASSWORD=email_routing_test', '-e', 'POSTGRES_DB=email_routing_test',
+      '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg16',
+    ], {
+      environment: {
+        ...process.env,
+        CLAWPILOT_TEST_POSTGRES_MEMORY: '512m',
+        CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: '256m',
+        CLAWPILOT_TEST_POSTGRES_CPUS: '1',
+      },
+    }), { timeout: 60_000, stdio: 'pipe' })
+    started = true
+    const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8', timeout: 10_000 })
+      .match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
+    assert.ok(port, 'Disposable PostgreSQL must only bind to loopback')
+    pool = new Pool({ host: '127.0.0.1', port: Number(port), user: 'postgres', password: 'email_routing_test',
+      database: 'email_routing_test', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+    const deadline = Date.now() + 30_000
+    while (true) {
+      try { await pool.query('SELECT 1'); break } catch (error) {
+        if (Date.now() >= deadline) throw error
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
     }
   }
   await run(pool)

@@ -525,6 +525,8 @@ async function recordedCalendars(): Promise<SelectedCalendar[]> {
        AND app_user.status = 'active'
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
+         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
      ORDER BY connection.owner_email, connection.connection_id`,
     [CALENDAR_APP],
   )
@@ -549,6 +551,8 @@ async function recordedMeetingPage(calendar: SelectedCalendar, afterMeetingId: s
        AND meeting.source_payload->>'calendarConnectionId' = $2
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
+         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
        AND ($3::uuid IS NULL OR meeting.id > $3::uuid)
      ORDER BY meeting.id ASC
      LIMIT $4`,
