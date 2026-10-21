@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-/** Install only owned overrides. Never replace an operator's custom Home action. */
+/** Install only owned overrides. Never replace an operator's custom action/bean. */
 function install_clawpilot_email_search(string $sourceRoot, string $legacyRoot): void
 {
     $resolvedRoot = realpath($legacyRoot);
@@ -9,10 +9,20 @@ function install_clawpilot_email_search(string $sourceRoot, string $legacyRoot):
         throw new RuntimeException('SuiteCRM legacy root is unavailable');
     }
     $legacyRoot = $resolvedRoot;
+    $meetingBean = $GLOBALS['beanList']['Meetings'] ?? 'Meeting';
+    $customMeetingBean = $GLOBALS['customBeanList']['Meetings'] ?? 'ClawPilotMeeting';
+    $customMeetingObject = $GLOBALS['customObjectList']['Meetings'] ?? 'Meeting';
+    $customMeetingFile = $GLOBALS['customBeanFiles']['ClawPilotMeeting'] ?? 'custom/include/ClawPilot/MeetingList.php';
+    if ($meetingBean !== 'Meeting' || $customMeetingBean !== 'ClawPilotMeeting' || $customMeetingObject !== 'Meeting'
+        || isset($GLOBALS['customBeanFiles']['Meeting']) || $customMeetingFile !== 'custom/include/ClawPilot/MeetingList.php') {
+        throw new RuntimeException('Unmanaged Meeting bean override requires review');
+    }
     $files = [
         // Install dependencies before publishing either entry point.
         'EmailSearch.php' => 'custom/include/ClawPilot/EmailSearch.php',
         'search.results.tpl' => 'custom/include/ClawPilot/search.results.tpl',
+        'MeetingList.php' => 'custom/include/ClawPilot/MeetingList.php',
+        'MeetingListRegistration.php' => 'custom/Extension/application/Ext/Include/zz_clawpilot_meeting_list.php',
         'Search.php' => 'custom/modules/Home/Search.php',
         'UnifiedSearch.php' => 'custom/modules/Home/UnifiedSearch.php',
     ];
