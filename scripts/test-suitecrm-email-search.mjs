@@ -38,6 +38,7 @@ try {
   const smartyRoot = join(dependencyRoot, `smarty-${smartyCommit}`)
   const nativeFiles = {
     'SugarBean.php': ['data/SugarBean.php', '5edf1050ee0ad01c1de57f235ebae55bab2e5476f58d979ebfc8eb14fc155547'],
+    'BeanFactory.php': ['data/BeanFactory.php', '240a50bd7e8878223230ac466e453de91c1332091d6acf960afb6abf75b75640'],
     'listvardefoverride.php': ['include/VarDefHandler/listvardefoverride.php', '6deaec13faa7047e64e81774d80740cfa6106220955d6d56efbb775a042fa435'],
   }
   for (const [name, [source, checksum]] of Object.entries(nativeFiles)) {

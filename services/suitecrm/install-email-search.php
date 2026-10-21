@@ -10,7 +10,11 @@ function install_clawpilot_email_search(string $sourceRoot, string $legacyRoot):
     }
     $legacyRoot = $resolvedRoot;
     $meetingBean = $GLOBALS['beanList']['Meetings'] ?? 'Meeting';
-    if (!in_array($meetingBean, ['Meeting', 'ClawPilotMeeting'], true)) {
+    $customMeetingBean = $GLOBALS['customBeanList']['Meetings'] ?? 'ClawPilotMeeting';
+    $customMeetingObject = $GLOBALS['customObjectList']['Meetings'] ?? 'Meeting';
+    $customMeetingFile = $GLOBALS['customBeanFiles']['ClawPilotMeeting'] ?? 'custom/include/ClawPilot/MeetingList.php';
+    if ($meetingBean !== 'Meeting' || $customMeetingBean !== 'ClawPilotMeeting' || $customMeetingObject !== 'Meeting'
+        || isset($GLOBALS['customBeanFiles']['Meeting']) || $customMeetingFile !== 'custom/include/ClawPilot/MeetingList.php') {
         throw new RuntimeException('Unmanaged Meeting bean override requires review');
     }
     $files = [

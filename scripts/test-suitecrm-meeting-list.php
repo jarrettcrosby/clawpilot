@@ -99,15 +99,19 @@ $repoRoot = dirname(__DIR__);
 $root = sys_get_temp_dir() . '/clawpilot-meeting-list-' . bin2hex(random_bytes(8));
 mkdir($root . '/modules/Meetings', 0700, true);
 mkdir($root . '/include/VarDefHandler', 0700, true);
+mkdir($root . '/data', 0700, true);
+mkdir($root . '/custom/include/ClawPilot', 0700, true);
 file_put_contents($root . '/modules/Meetings/Meeting.php', '<?php // Fixture class is already loaded.');
+file_put_contents($root . '/data/SugarBean.php', '<?php // Pinned methods are already loaded.');
 file_put_contents($root . '/Contact.php', '<?php // Fixture class is already loaded.');
+copy($repoRoot . '/services/suitecrm/email-search/MeetingList.php', $root . '/custom/include/ClawPilot/MeetingList.php');
 copy($nativeRoot . '/listvardefoverride.php', $root . '/include/VarDefHandler/listvardefoverride.php');
 $GLOBALS['beanFiles'] = ['Contact' => $root . '/Contact.php'];
 $GLOBALS['beanList'] = ['Contacts' => 'Contact'];
 $previous = getcwd();
 chdir($root);
 try {
-    require $repoRoot . '/services/suitecrm/email-search/MeetingList.php';
+    require $root . '/custom/include/ClawPilot/MeetingList.php';
     $native = new Meeting();
     $fixed = new ClawPilotMeeting();
     $queries = [];
@@ -141,11 +145,25 @@ try {
         catch (InvalidArgumentException $expected) {}
     }
     $beanList = ['Meetings' => 'Meeting', 'Contacts' => 'Contact'];
-    $beanFiles = ['Contact' => 'native-contact'];
+    $beanFiles = ['Meeting' => 'modules/Meetings/Meeting.php', 'Contact' => 'native-contact'];
+    $customBeanList = [];
+    $customBeanFiles = [];
+    $customObjectList = [];
     require $repoRoot . '/services/suitecrm/email-search/MeetingListRegistration.php';
     require $repoRoot . '/services/suitecrm/email-search/MeetingListRegistration.php';
-    if ($beanList !== ['Meetings' => 'ClawPilotMeeting', 'Contacts' => 'Contact'] || $beanFiles['Contact'] !== 'native-contact') {
+    if ($beanList !== ['Meetings' => 'Meeting', 'Contacts' => 'Contact'] || $beanFiles['Contact'] !== 'native-contact'
+        || $customBeanList !== ['Meetings' => 'ClawPilotMeeting'] || $customObjectList !== ['Meetings' => 'Meeting']) {
         throw new RuntimeException('Registration changed an unrelated bean');
+    }
+    if (hash_file('sha256', $nativeRoot . '/BeanFactory.php') !== '240a50bd7e8878223230ac466e453de91c1332091d6acf960afb6abf75b75640') {
+        throw new RuntimeException('Expected pinned native BeanFactory source');
+    }
+    require $nativeRoot . '/BeanFactory.php';
+    if (BeanFactory::getObjectName('Meetings') !== 'Meeting'
+        || BeanFactory::getCustomObjectName('Meetings') !== 'Meeting'
+        || BeanFactory::getBeanClass('Meetings') !== 'ClawPilotMeeting'
+        || !(BeanFactory::newBean('Meetings') instanceof ClawPilotMeeting)) {
+        throw new RuntimeException('Native Meeting dictionary/bean identity changed');
     }
     echo 'CLAWPILOT_MEETING_QUERIES=' . json_encode($queries, JSON_THROW_ON_ERROR) . "\n";
 } finally {
@@ -153,6 +171,9 @@ try {
     unlink($root . '/modules/Meetings/Meeting.php');
     unlink($root . '/include/VarDefHandler/listvardefoverride.php');
     unlink($root . '/Contact.php');
+    unlink($root . '/data/SugarBean.php');
+    unlink($root . '/custom/include/ClawPilot/MeetingList.php');
     rmdir($root . '/modules/Meetings'); rmdir($root . '/modules');
-    rmdir($root . '/include/VarDefHandler'); rmdir($root . '/include'); rmdir($root);
+    rmdir($root . '/include/VarDefHandler'); rmdir($root . '/include'); rmdir($root . '/data');
+    rmdir($root . '/custom/include/ClawPilot'); rmdir($root . '/custom/include'); rmdir($root . '/custom'); rmdir($root);
 }

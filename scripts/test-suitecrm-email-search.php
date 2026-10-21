@@ -244,6 +244,13 @@ namespace {
             finally { unset($GLOBALS['beanList']['Meetings']); }
             check(!file_exists($root . '/custom/include/ClawPilot/EmailSearch.php'), 'Bean rejection occurred after a write');
         });
+        scenario('unmanaged custom Meeting bean rejects without replacing it', function () use ($sourceRoot) {
+            $root = fixtureDirectory('unmanaged-custom-meeting-bean');
+            $GLOBALS['customBeanList']['Meetings'] = 'OperatorMeeting';
+            try { expectInstallerRejection($sourceRoot, $root, 'Unmanaged custom Meeting bean was accepted'); }
+            finally { unset($GLOBALS['customBeanList']['Meetings']); }
+            check(!file_exists($root . '/custom/include/ClawPilot/EmailSearch.php'), 'Custom-bean rejection occurred after a write');
+        });
         scenario('unmanaged late target rejects before any managed write', function () use ($sourceRoot) {
             $root = fixtureDirectory('unmanaged');
             $path = $root . '/custom/modules/Home/UnifiedSearch.php';
