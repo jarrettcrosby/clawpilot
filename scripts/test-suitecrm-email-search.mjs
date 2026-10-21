@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,6 +17,11 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const dependencyRoot = await mkdtemp(join(tmpdir(), 'clawpilot-email-search-deps-'))
 
 try {
+  // The bind is read-only and contains only checksum-verified public sources.
+  // Make it readable by the container's unprivileged UID on Linux; host-only
+  // 0700/0600 permissions can appear readable through Docker Desktop on macOS.
+  await chmod(dependencyRoot, 0o755)
+  assert.equal((await stat(dependencyRoot)).mode & 0o777, 0o755, 'Pinned public dependency directory must be traversable')
   const response = await fetch(`https://codeload.github.com/smarty-php/smarty/tar.gz/${smartyCommit}`, {
     signal: AbortSignal.timeout(60_000),
   })
@@ -48,7 +53,10 @@ try {
     if (content.length > 1024 * 1024 || createHash('sha256').update(content).digest('hex') !== checksum) {
       throw new Error(`Pinned native ${name} checksum mismatch`)
     }
-    await writeFile(join(dependencyRoot, name), content, { mode: 0o600 })
+    const publicSourcePath = join(dependencyRoot, name)
+    await writeFile(publicSourcePath, content, { mode: 0o644 })
+    await chmod(publicSourcePath, 0o644)
+    assert.equal((await stat(publicSourcePath)).mode & 0o777, 0o644, 'Pinned public source must be container-readable')
   }
   // --mount uses comma-separated fields. Refuse an ambiguous host path rather
   // than interpreting it as extra mount settings. Arguments never use a shell.
@@ -69,6 +77,7 @@ try {
   ], { stdio: 'inherit', timeout: 300_000 })
   const queryOutput = execFileSync('docker', [
     'run', '--rm', '--network', 'none', '--read-only',
+    '--user', '65534:65534',
     '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
     '--pids-limit', '64', '--memory', '256m', '--cpus', '1',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
