@@ -1,0 +1,17 @@
+{
+  "version": "8.10.1",
+  "source": "https://github.com/SuiteCRM/SuiteCRM-Core/blob/v8.10.1/public/legacy/include/language/en_us.lang.php",
+  "key": "sales_stage_dom",
+  "values": [
+    "Prospecting",
+    "Qualification",
+    "Needs Analysis",
+    "Value Proposition",
+    "Id. Decision Makers",
+    "Perception Analysis",
+    "Proposal/Price Quote",
+    "Negotiation/Review",
+    "Closed Won",
+    "Closed Lost"
+  ]
+}

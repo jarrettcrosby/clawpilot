@@ -193,7 +193,7 @@
     "test:crm-data-transfer": "node --experimental-strip-types --test app_src/tests/crm/data-transfer-csv.test.ts && node scripts/test-crm-data-transfer.mjs",
     "test:dashboard-workspace-preferences": "node scripts/test-dashboard-workspace-preferences.mjs",
     "test:measurement-preferences": "node --experimental-strip-types --test app_src/tests/measurements/measurements.test.ts && node scripts/test-measurement-preferences.mjs",
-    "test:pipeline-opportunities": "node scripts/test-pipeline-opportunity-workflow.mjs",
+    "test:pipeline-opportunities": "node scripts/test-pipeline-opportunity-workflow.mjs && node scripts/test-suitecrm-opportunity-stage.mjs",
     "test:pipeline-reporting": "node --experimental-strip-types --test app_src/tests/crm/pipeline-currency.test.ts && node scripts/test-pipeline-reporting.mjs && node scripts/test-pipeline-reporting-postgres.mjs && node scripts/test-pipeline-reporting-ui.mjs",
     "test:pipeline-workbook": "node scripts/test-pipeline-workbook-dashboard.mjs && node scripts/test-pipeline-initial-crm-projection.mjs && node scripts/test-pipeline-workbook-bootstrap-safety.mjs && node scripts/test-pipeline-share-notifications.mjs",
     "test:pipeline-workbook-postgres": "node scripts/test-pipeline-initial-crm-projection.mjs --postgres",

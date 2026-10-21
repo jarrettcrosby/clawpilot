@@ -25,6 +25,12 @@ ClawPilot does not project AOS Quotes or AOS Products Quotes. Container boot the
 
 Every ClawPilot application user owns a permanent `gu#######` identity in Postgres. When an administrator maps that person to a native SuiteCRM User, ClawPilot queues an idempotent `global_id_c` projection through the SuiteCRM outbox. The worker refuses to overwrite a different permanent ID or duplicate one onto a second SuiteCRM User. The person's CRM Contact remains a separate `gc#######` record.
 
+## Meeting search and opportunity reporting
+
+The managed Meeting bean pages distinct meeting records before hydrating attendee fields. A meeting with two Contacts must still produce one Global ID result, an accurate count, and stable pages; never delete legitimate Contact relationships to repair join fanout. Boot installs this override through SuiteCRM's Include extension and refuses an unrelated operator-owned Meeting override. `npm run test:suitecrm-email-search` exercises the pinned native query builder, counts, pagination, related-contact filters/sorts, and preserved ACL/deleted predicates. Production acceptance must also check the native V8 list and unified search after the **SuiteCRM service**, not only ClawPilot, has deployed.
+
+Opportunity projections translate the authoritative ClawPilot lifecycle to SuiteCRM's exact `Closed Won`/`Closed Lost` reporting keys. Recognized open-stage aliases use native enum keys; custom workflow labels remain unchanged in ClawPilot. An explicitly active lifecycle must not become a native win because of a conflicting board label. `npm run test:pipeline-opportunities` covers these mappings. Already-synchronized records need a separately reviewed, owner-scoped projection repair and native readback; deployment alone does not replay them or authorize a global backfill.
+
 ## Required Variables
 
 SuiteCRM service:

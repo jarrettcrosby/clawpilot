@@ -156,6 +156,8 @@ namespace {
         'UnifiedSearch.php' => 'custom/modules/Home/UnifiedSearch.php',
         'EmailSearch.php' => 'custom/include/ClawPilot/EmailSearch.php',
         'search.results.tpl' => 'custom/include/ClawPilot/search.results.tpl',
+        'MeetingList.php' => 'custom/include/ClawPilot/MeetingList.php',
+        'MeetingListRegistration.php' => 'custom/Extension/application/Ext/Include/zz_clawpilot_meeting_list.php',
     ];
 
     function check(bool $condition, string $message): void
@@ -217,7 +219,7 @@ namespace {
 
     try {
         $legacyRoot = fixtureDirectory('legacy');
-        scenario('installer writes only the four managed files', function () use ($sourceRoot, $legacyRoot, $targets) {
+        scenario('installer writes only the six managed files', function () use ($sourceRoot, $legacyRoot, $targets) {
             putFixture($legacyRoot . '/modules/Emails/metadata/listviewdefs.php', 'native-layout-preserved');
             putFixture($legacyRoot . '/custom/modules/Emails/metadata/listviewdefs.php', 'operator-layout-preserved');
             install_clawpilot_email_search($sourceRoot, $legacyRoot);
@@ -234,6 +236,13 @@ namespace {
             install_clawpilot_email_search($sourceRoot, $legacyRoot);
             clearstatcache();
             foreach ($targets as $target) { same(stat($legacyRoot . '/' . $target), $before[$target], 'Idempotent install rewrote a file'); }
+        });
+        scenario('unmanaged Meeting bean rejects before any managed write', function () use ($sourceRoot) {
+            $root = fixtureDirectory('unmanaged-meeting-bean');
+            $GLOBALS['beanList']['Meetings'] = 'OperatorMeeting';
+            try { expectInstallerRejection($sourceRoot, $root, 'Unmanaged Meeting bean was accepted'); }
+            finally { unset($GLOBALS['beanList']['Meetings']); }
+            check(!file_exists($root . '/custom/include/ClawPilot/EmailSearch.php'), 'Bean rejection occurred after a write');
         });
         scenario('unmanaged late target rejects before any managed write', function () use ($sourceRoot) {
             $root = fixtureDirectory('unmanaged');

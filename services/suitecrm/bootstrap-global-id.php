@@ -15,6 +15,13 @@ require_once 'lib/Search/SearchModules.php';
 require_once __DIR__ . '/install-email-search.php';
 
 install_clawpilot_email_search(__DIR__ . '/email-search', getcwd());
+require_once 'ModuleInstall/ModuleInstaller.php';
+$clawpilotIncludeInstaller = new ModuleInstaller();
+$clawpilotIncludeInstaller->silent = true;
+$clawpilotIncludeInstaller->rebuildExt('Include', 'modules.ext.php');
+// This CLI process loaded modules.php before installing the managed extension.
+// Apply only our validated registration now; subsequent requests load the merge.
+require 'custom/Extension/application/Ext/Include/zz_clawpilot_meeting_list.php';
 
 const CLAWPILOT_GLOBAL_ID_FIELD = 'global_id_c';
 const CLAWPILOT_GLOBAL_ID_LABEL = 'LBL_GLOBAL_ID';
