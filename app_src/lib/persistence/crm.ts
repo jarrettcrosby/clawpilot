@@ -11,6 +11,7 @@ import {
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
+import { suiteCrmOpportunitySalesStage } from '@/lib/crm/suiteCrmOpportunityStage'
 import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
 import {
   DEFAULT_WORKSPACE_CURRENCY_CODE,
@@ -479,7 +480,7 @@ function suiteCrmAttributes(input: StageCrmRecordInput, referenceCode: string) {
       ...globalId,
       name: clean(fields.name),
       account_id: clean(fields.organizationSuiteCrmId),
-      sales_stage: clean(fields.stage),
+      sales_stage: suiteCrmOpportunitySalesStage(fields),
       amount: Math.max(0, finite(fields.value)),
       probability: Math.max(0, Math.min(100, finite(fields.probability))),
       date_closed: isoDate(fields.expectedClose),

@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   suitecrm-email-search:
-    runs-on: ubuntu-latest
+    # Playwright 1.58.2 supports 24.04, not the rolling 26.04 runner image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -29,7 +30,7 @@ jobs:
         run: npm run test:suitecrm-email-search
 
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Leave room for the full PostgreSQL and browser contract matrix on a slow
     # hosted runner while still bounding a genuinely wedged validation job.
     timeout-minutes: 45
