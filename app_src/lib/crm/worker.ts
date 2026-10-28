@@ -7,6 +7,7 @@ import {
 import type {
   SuiteCrmNativeProductImageResult,
 } from '@/lib/crm/suiteCrmNativeProductImageClient'
+import { SuiteCrmEmailProjectionHeldError, type SuiteCrmEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import {
   claimSuiteCrmOutboxInPostgres,
   completeSuiteCrmOutboxInPostgres,
@@ -14,6 +15,7 @@ import {
   readCrmWorkbookProjectionContext,
   readCrmWorkbookProjectionReadiness,
   writeSuiteCrmWorkerHeartbeat,
+  withVerifiedSuiteCrmEmailPublication,
 } from '@/lib/persistence/crm'
 import { enqueuePipelineSyncOutboxInPostgres } from '@/lib/persistence/pipeline'
 
@@ -28,6 +30,7 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
       let productImageProjection: SuiteCrmNativeProductImageResult | null = null
       let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
+      let emailProjection: SuiteCrmEmailProjectionReadback | null = null
       if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
       else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
       else if (item.operation === 'reproject_record') {
@@ -35,9 +38,14 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         // provider-schema or validation failure must never erase the last
         // visible SuiteCRM copy of a durable ClawPilot interaction.
         if (item.payload.suiteCrmModule) {
-          const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+          const payload = item.payload
+          const projection = payload.suiteCrmModule === 'Emails'
+            ? await withVerifiedSuiteCrmEmailPublication(item, () => upsertSuiteCrmRecordWithResult(payload))
+            : await upsertSuiteCrmRecordWithResult(payload)
           productImageProjection = projection.productImageProjection
           meetingProjection = projection.meetingProjection || null
+          emailProjection = projection.emailProjection || null
+          if (item.payload.suiteCrmModule === 'Emails' && !emailProjection) throw new SuiteCrmEmailProjectionHeldError()
         }
         if (item.payload.previousSuiteCrmModule) {
           await deleteSuiteCrmRecord({
@@ -50,13 +58,22 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         }
       }
       else {
-        const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+        const payload = item.payload
+        const projection = payload.suiteCrmModule === 'Emails'
+          ? await withVerifiedSuiteCrmEmailPublication(item, () => upsertSuiteCrmRecordWithResult(payload))
+          : await upsertSuiteCrmRecordWithResult(payload)
         productImageProjection = projection.productImageProjection
         meetingProjection = projection.meetingProjection || null
+        emailProjection = projection.emailProjection || null
+      }
+      if (item.operation !== 'delete_record' && item.operation !== 'upsert_user_identity'
+        && item.payload.suiteCrmModule === 'Emails' && !emailProjection) {
+        throw new SuiteCrmEmailProjectionHeldError()
       }
       await completeSuiteCrmOutboxInPostgres(item, {
         productImageProjection,
         ...(meetingProjection ? { meetingProjection } : {}),
+        ...(emailProjection ? { emailProjection } : {}),
       })
       if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)
       results.push({ id: item.id, status: 'succeeded' })

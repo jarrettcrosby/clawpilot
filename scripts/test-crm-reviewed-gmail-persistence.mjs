@@ -48,14 +48,15 @@ const fixtureContext = { ts, read, assert, vm, Buffer, TextDecoder, URL, URLSear
 vm.runInNewContext(ts.transpileModule(declarations('scripts/test-crm-email-routing-postgres.mjs',
   ['loadModule', 'loadCrmPersistence', 'fixtureSchema']), {
   compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
-}).outputText + '\nglobalThis.fixture = { loadCrmPersistence, fixtureSchema };', fixtureContext)
+}).outputText + '\nglobalThis.fixture = { loadModule, loadCrmPersistence, fixtureSchema };', fixtureContext)
 
 const container = `clawpilot-reviewed-email-test-${process.pid}-${randomUUID().slice(0, 8)}`
 let pool, started = false
 try {
   if (socket) {
     pool = new Pool({ host: socket, port: 55473, user: process.env.USER, password: '',
-      database: 'reviewed_email_test', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+      database: 'reviewed_email_test', ssl: false, max: 3, connectionTimeoutMillis: 1000, statement_timeout: 5000,
+      application_name: container })
   } else {
     execFileSync('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container, '--pull', 'never',
@@ -69,7 +70,8 @@ try {
       .match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
     assert.ok(port, 'Disposable PostgreSQL binds only to loopback')
     pool = new Pool({ host: '127.0.0.1', port: Number(port), user: 'postgres', password: 'reviewed_email_test',
-      database: 'reviewed_email_test', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+      database: 'reviewed_email_test', ssl: false, max: 3, connectionTimeoutMillis: 1000, statement_timeout: 5000,
+      application_name: container })
     const deadline = Date.now() + 30_000
     while (true) {
       try { await pool.query('SELECT 1'); break }
@@ -85,23 +87,37 @@ try {
     finally { client.release() }
   }
   await query(fixtureContext.fixture.fixtureSchema)
+  const outboxTable = read('db/migrations/0001_initial_railway_postgres.sql')
+    .match(/CREATE TABLE IF NOT EXISTS sync_outbox \([\s\S]*?\n\);/u)?.[0]
+  assert.ok(outboxTable, 'Use the real outbox table definition, not a permissive mock')
+  await query(outboxTable)
+  await query(read('db/migrations/0002_pipeline_outbox_worker.sql'))
   await query(read('db/migrations/0374_crm_interaction_organizations.sql'))
   await query(`ALTER TABLE crm_contacts ADD COLUMN phone_work text, ADD COLUMN phone_mobile text, ADD COLUMN job_title text;
     ALTER TABLE crm_leads ADD COLUMN phone_work text, ADD COLUMN phone_mobile text, ADD COLUMN job_title text;
     ALTER TABLE crm_opportunities ADD COLUMN name text, ADD COLUMN reference_code text;
     ALTER TABLE crm_meetings ADD COLUMN subject text, ADD COLUMN reference_code text;
-    CREATE TABLE crm_campaigns (id uuid,pipeline_id uuid,name text,reference_code text);`)
+    CREATE TABLE crm_campaigns (id uuid,pipeline_id uuid,name text,reference_code text);
+    ALTER TABLE pipeline_spaces ADD COLUMN crm_last_synced_at timestamptz, ADD COLUMN updated_at timestamptz DEFAULT now();`)
   const persistence = fixtureContext.fixture.loadCrmPersistence(query, withTransaction)
+  const emailIdentity = fixtureContext.fixture.loadModule('app_src/lib/crm/emailIdentity.ts')
   const id = number => `00000000-0000-4000-8000-${String(number).padStart(12, '0')}`
-  const OWNER = 'operator@example.test', CONNECTION = 'reviewed-fixture-mailbox'
+  const OWNER = 'operator@example.test', CONNECTION = 'reviewed-fixture-mailbox', MAILBOX = 'mailbox@example.test'
   const PIPELINE = id(1), CACHE_PIPELINE = id(2), FOREIGN_PIPELINE = id(3), WORKSPACE = id(4)
   const GLOBUS = id(10), AIRSPACE = id(11), OTHER = id(12), GC = id(20), AC = id(21)
-  await query(`INSERT INTO app_users VALUES ($1,'active','Operator',NULL,true,'gu1234567');`, [OWNER])
+  await query(`INSERT INTO app_users VALUES ($1,'active','Operator','native-fixture-owner',true,'gu1234567');`, [OWNER])
   await query('INSERT INTO workspace_organizations VALUES ($1,true)', [WORKSPACE])
   for (const pipeline of [PIPELINE, CACHE_PIPELINE, FOREIGN_PIPELINE]) await query(`INSERT INTO pipeline_spaces
     (id,owner_email,workspace_organization_id,is_default) VALUES ($1,$2,$3,$4)`, [pipeline, OWNER, WORKSPACE, pipeline === CACHE_PIPELINE])
   await query(`INSERT INTO app_user_organization_memberships VALUES ($1,$2,'active')`, [WORKSPACE, OWNER])
   await query(`INSERT INTO user_maton_connections VALUES ($1,$2,'mailbox@example.test','google-mail','ACTIVE','maton',true)`, [OWNER, CONNECTION])
+  // Synthetic already-verified subject enters only at the trusted durable
+  // binder boundary. This fixture performs no JWT verification or provider call.
+  await persistence.bindVerifiedGmailMailboxInPostgres({ ownerEmail: OWNER, connectionId: CONNECTION,
+    identity: { subject: 'synthetic-reviewed-google-subject', email: MAILBOX }, observedAccountEmail: MAILBOX })
+  const mailboxIdentity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: OWNER,
+    connectionId: CONNECTION, accountEmail: MAILBOX })
+  assert.ok(mailboxIdentity)
   for (const [organization, name, reference, native] of [[GLOBUS, 'Globus Medical', 'ga1234567', 'native-globus'], [AIRSPACE, 'Airspace', 'ga2345678', 'native-airspace'], [OTHER, 'Other', 'ga3456789', 'native-other']]) {
     await query(`INSERT INTO crm_organizations (id,pipeline_id,name,reference_code,source_key,suitecrm_id)
       VALUES ($1,$2,$3,$4,$4,$5)`, [organization, PIPELINE, name, reference, native])
@@ -112,15 +128,18 @@ try {
   }
   const contactTargets = [{ id: GC, referenceCode: 'gc1234567', email: 'joseph@globus.example.test', organizationId: GLOBUS },
     { id: AC, referenceCode: 'gc2345678', email: 'riley@airspace.example.test', organizationId: AIRSPACE }]
-  const cacheMessage = async messageId => {
-    const headers = { from: [{ address: contactTargets[1].email }], to: [{ address: OWNER }, { address: contactTargets[0].email }], cc: [], bcc: [] }
-    await query(`INSERT INTO crm_inbound_messages (owner_email,pipeline_id,external_message_id,external_thread_id,
-      sender_email,recipient_emails,subject,received_at,snippet,body_text,marker_references,raw_metadata,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,'Synthetic reviewed subject','2026-10-27T12:00:00.123Z','Synthetic snippet','Synthetic body','{}',$7::jsonb,now())`,
-    [OWNER, CACHE_PIPELINE, messageId, `thread-${messageId}`, contactTargets[1].email, [OWNER, contactTargets[0].email],
-      JSON.stringify({ provider: 'gmail', emailAddressHeaders: headers, labelIds: ['INBOX'] })])
-  }
+  const evidence = messageId => emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: messageId,
+    externalThreadId: `thread-${messageId}`, senderEmail: contactTargets[1].email,
+    recipientEmails: [OWNER, contactTargets[0].email], subject: 'Synthetic reviewed subject',
+    receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Synthetic snippet', bodyText: 'Synthetic body', markerReferences: [],
+    emailAddressHeaders: { version: 1, from: [{ address: contactTargets[1].email }],
+      to: [{ address: OWNER }, { address: contactTargets[0].email }], cc: [], bcc: [] } })
+  const cacheMessage = messageId => persistence.recordGmailMessageIntakeInPostgres({ ownerEmail: OWNER,
+    connectionId: CONNECTION, intakePipelineId: CACHE_PIPELINE, mailboxIdentity,
+    observedAccountEmail: MAILBOX, observedAt: new Date().toISOString(), messageEvidence: evidence(messageId),
+    rawMetadata: { labelIds: ['INBOX'] } })
   const selection = messageId => ({ ownerEmail: OWNER, connectionId: CONNECTION, pipelineId: PIPELINE,
+    mailboxIdentity, messageEvidence: evidence(messageId),
     providerMessageId: messageId, providerThreadId: `thread-${messageId}`, primaryOrganization: { id: GLOBUS, referenceCode: 'ga1234567' },
     contactTargets, participantEmails: contactTargets.map(target => target.email), interaction: {
       entity: 'interactions', pipelineId: PIPELINE, actorEmail: OWNER, sourceKey: `fixture-reviewed:${messageId}`,
@@ -131,8 +150,35 @@ try {
   const counts = async () => (await query(`SELECT (SELECT count(*) FROM crm_interactions)::int AS interactions,
     (SELECT count(*) FROM crm_interaction_contacts)::int AS contacts,
     (SELECT count(*) FROM crm_interaction_organizations)::int AS organizations`)).rows[0]
+  const durableState = async () => (await query(`SELECT jsonb_build_object(
+    'interactions',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM crm_interactions row),
+    'contacts',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY interaction_id,contact_id),'[]') FROM crm_interaction_contacts row),
+    'companies',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY interaction_id,organization_id),'[]') FROM crm_interaction_organizations row),
+    'cache',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM crm_inbound_messages row),
+    'links',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY inbound_message_id,reference_code),'[]') FROM crm_inbound_message_links row),
+    'sources',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM crm_email_sources row),
+    'decisions',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM crm_email_review_decisions row),
+    'outbox',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM sync_outbox row),
+    'audits',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM audit_events row)) AS state`)).rows[0].state
+  const compatibleFixtureWrite = callback => withTransaction(async client => {
+    await client.query("SET LOCAL clawpilot.crm_shared_write_v1='on'")
+    return callback(client)
+  })
   let passed = 0
   const check = async (name, callback) => { await callback(); passed += 1; console.log(`PASS ${name}`) }
+  await check('legacy raw cache with unknown original mailbox is not silently adopted', async () => {
+    const legacyEvidence = evidence('legacy-unknown')
+    await query(`INSERT INTO crm_inbound_messages(owner_email,pipeline_id,external_message_id,external_thread_id,
+      sender_email,recipient_emails,subject,received_at,snippet,body_text,marker_references,raw_metadata)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [OWNER, CACHE_PIPELINE, legacyEvidence.messageId,
+      legacyEvidence.threadId, legacyEvidence.senderEmail, legacyEvidence.recipientEmails, legacyEvidence.subject,
+      legacyEvidence.receivedAt, legacyEvidence.snippet, legacyEvidence.bodyText, legacyEvidence.markerReferences,
+      JSON.stringify({ provider: 'gmail', emailAddressHeaders: legacyEvidence.emailAddressHeaders })])
+    const before = await durableState()
+    await assert.rejects(persistence.stageReviewedGmailInteractionInPostgres(selection('legacy-unknown')),
+      /evidence changed or conflicts/)
+    assert.deepEqual(await durableState(), before)
+  })
   await cacheMessage('d1')
   let original, firstPreview
   await check('read-only preview locks authoritative owner-default cache without cross-pipeline confusion', async () => {
@@ -156,14 +202,14 @@ try {
     assert.equal(row.occurred_at.toISOString(), '2026-10-27T12:00:00.123Z')
   })
   await check('repeat review retains original fingerprint and produces no record or relationship writes', async () => {
-    const before = (await query('SELECT * FROM crm_interactions WHERE id=$1', [original.interactionId])).rows[0]
+    const before = await durableState()
     const preview = await persistence.stageReviewedGmailInteractionInPostgres(selection('d1'))
     assert.equal(preview.targetFingerprint, firstPreview.targetFingerprint)
     const replay = await persistence.stageReviewedGmailInteractionInPostgres({ ...selection('d1'), apply: true,
       expectedExistingInteractionId: null, expectedTargetFingerprint: firstPreview.targetFingerprint })
     assert.equal(replay.applied, false)
     assert.equal(replay.interactionId, original.interactionId)
-    assert.deepEqual((await query('SELECT * FROM crm_interactions WHERE id=$1', [original.interactionId])).rows[0], before)
+    assert.deepEqual(await durableState(), before, 'Replay must not repeat cache, link, decision or audit writes')
   })
   await check('actual account history/search/list readers return the same one email and contact company labels', async () => {
     const reader = loadInteractionCompanyReader(query)
@@ -201,40 +247,19 @@ try {
     assert.equal(payload.parent_id, 'native-globus')
     assert.equal(payload.description, 'Synthetic body')
     assert.equal((await counts()).interactions, 1)
-    const module = { exports: {} }
-    vm.runInNewContext(ts.transpileModule(read('app_src/lib/crm/suiteCrmClient.ts'), {
-      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-    }).outputText, { module, exports: module.exports, Buffer, URL, URLSearchParams, Response, AbortSignal,
-      process: { env: { SUITECRM_BASE_URL: 'https://crm.example.test', SUITECRM_CLIENT_ID: 'fixture-client', SUITECRM_CLIENT_SECRET: 'fixture-secret' } },
-      require: name => name.startsWith('node:') ? require(name)
-        : new Proxy({}, { get: () => () => { throw new Error(`Unexpected native transport dependency ${name}`) } }),
+    const nativeProjection = fixtureContext.fixture.loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
+    const unavailable = new Proxy({}, { get: () => () => { throw new Error('Unexpected native transport dependency') } })
+    const transport = fixtureContext.fixture.loadModule('app_src/lib/crm/suiteCrmClient.ts', {
+      '@/lib/currency': unavailable, '@/lib/crm/productImagePublic': unavailable,
+      '@/lib/crm/suiteCrmNativeProductImageClient': unavailable, '@/lib/publicUrl': unavailable,
+      '@/lib/crm/suiteCrmNativeEmailProjection': nativeProjection,
     })
-    const accountPosts = [], emailPatches = []
-    const fetchMock = async (url, init) => {
-      if (url.endsWith('/Api/access_token')) return Response.json({ access_token: 'synthetic-test-token', expires_in: 3600 })
-      if (init.method === 'GET' && url.includes('/relationships/')) return Response.json({ data: [] })
-      if (init.method === 'GET') {
-        assert.ok(url.endsWith(`/Api/V8/module/Emails/${row.suitecrm_id}`))
-        return Response.json({ data: { id: row.suitecrm_id, attributes: {} } })
-      }
-      const body = JSON.parse(init.body)
-      if (init.method === 'PATCH') {
-        assert.equal(body.data.id, row.suitecrm_id)
-        assert.equal(body.data.type, 'Emails')
-        emailPatches.push(body)
-        return Response.json({ data: { id: row.suitecrm_id } })
-      }
-      assert.equal(init.method, 'POST')
-      assert.ok(url.includes(`/Emails/${row.suitecrm_id}/relationships/`))
-      if (url.endsWith('/relationships/accounts')) accountPosts.push(body.data.id)
-      else assert.ok(url.endsWith('/relationships/contacts'))
-      return Response.json({ data: body.data })
-    }
-    const transport = await module.exports.upsertSuiteCrmRecordWithResult({ entity: 'interactions', pipelineId: PIPELINE,
-      localId: row.id, suiteCrmId: row.suitecrm_id, suiteCrmModule: 'Emails', attributes: payload, relationships }, fetchMock)
-    assert.equal(transport.suiteCrmId, row.suitecrm_id)
-    assert.equal(emailPatches.length, 1)
-    assert.deepEqual(accountPosts.sort(), ['native-airspace', 'native-globus'])
+    let calls = 0
+    await assert.rejects(transport.upsertSuiteCrmRecordWithResult({ entity: 'interactions', pipelineId: PIPELINE,
+      localId: row.id, suiteCrmId: row.suitecrm_id, suiteCrmModule: 'Emails', attributes: payload, relationships },
+    async () => { calls += 1; throw new Error('No transport without the exact native projection contract') }),
+    error => error.code === 'SUITECRM_EMAIL_PROJECTION_HELD')
+    assert.equal(calls, 0, 'Old add-only payloads cannot publish without exact relationships and audience proof')
   })
   await check('generic writes cannot forge company scope, review receipt, provider identity or remove reviewed contacts', async () => {
     const current = (await query('SELECT * FROM crm_interactions WHERE id=$1', [original.interactionId])).rows[0]
@@ -243,7 +268,7 @@ try {
       fields: { subject: current.subject, ...fields } })
     for (const fields of [{ organizationIds: [GLOBUS, AIRSPACE, OTHER] }, { contactIds: [GC] }, { organizationId: AIRSPACE },
       { providerMessageId: 'forged' }, { interactionType: 'note' }, { metadata: { reviewedGmailRecovery: { forged: true } } }]) {
-      await assert.rejects(write(fields))
+      await assert.rejects(write(fields), JSON.stringify(fields))
     }
     await write({ description: 'Ordinary content edit', subject: 'Edited subject' })
     assert.deepEqual(await counts(), { interactions: 1, contacts: 2, organizations: 2 })
@@ -256,13 +281,13 @@ try {
     assert.equal(edited.occurred_at.toISOString(), current.occurred_at.toISOString())
     await assert.rejects(persistence.stageReviewedGmailInteractionInPostgres({ ...selection('d1'), apply: true,
       expectedExistingInteractionId: current.id, expectedTargetFingerprint: firstPreview.targetFingerprint }))
-    await query('UPDATE crm_interactions SET agent_email=NULL,agent_name=$2 WHERE id=$1', [current.id, 'Historical Author'])
+    await compatibleFixtureWrite(client => client.query('UPDATE crm_interactions SET agent_email=NULL,agent_name=$2 WHERE id=$1', [current.id, 'Historical Author']))
     await write({ subject: 'Edited legacy subject', agentEmail: '', agentName: 'Historical Author' })
     const historic = (await query('SELECT agent_email,agent_name FROM crm_interactions WHERE id=$1', [current.id])).rows[0]
     assert.deepEqual(historic, { agent_email: null, agent_name: 'Historical Author' },
       'The API-normalized empty agent email must preserve a persisted NULL without resolving the historic name')
     await assert.rejects(write({ subject: 'Forbidden reassignment', agentEmail: 'changed@example.test', agentName: 'Historical Author' }),
-      /historic agent assignment must be preserved/)
+      /historic (?:agent assignment|author, timestamp and transport status) must be preserved/)
     assert.deepEqual((await query('SELECT agent_email,agent_name FROM crm_interactions WHERE id=$1', [current.id])).rows[0], historic)
   })
   await check('CAS rechecks contact email and validates the entire batch before creating its first email', async () => {
@@ -282,8 +307,8 @@ try {
     const before = await counts()
     // This Email/Other pair is unused. Reusing its existing Airspace pair would
     // hit the pair's primary key before PostgreSQL could check pipeline scope.
-    await assert.rejects(query(`INSERT INTO crm_interaction_organizations (pipeline_id,interaction_id,organization_id)
-      VALUES ($1,$2,$3)`, [FOREIGN_PIPELINE, original.interactionId, OTHER]), error => error.code === '23503'
+    await assert.rejects(compatibleFixtureWrite(client => client.query(`INSERT INTO crm_interaction_organizations (pipeline_id,interaction_id,organization_id)
+      VALUES ($1,$2,$3)`, [FOREIGN_PIPELINE, original.interactionId, OTHER])), error => error.code === '23503'
         && ['crm_interaction_organizations_pipeline_interaction_fkey', 'crm_interaction_organizations_pipeline_organization_fkey'].includes(error.constraint))
     assert.deepEqual(await counts(), before)
   })
@@ -300,13 +325,326 @@ try {
       assert.equal((await query('SELECT count(*) FROM crm_interaction_organizations WHERE interaction_id=$1', [legacy.id])).rows[0].count, '1')
     }
   })
-  await check('a concurrent contact writer makes bounded review fail immediately without staging', async () => {
+  await check('an audit failure rolls back staged identity, cache links and decision as one transaction', async () => {
+    await query('UPDATE workspace_organizations SET is_demo=false WHERE id=$1', [WORKSPACE])
+    await cacheMessage('d5')
+    const request = selection('d5')
+    const preview = await persistence.stageReviewedGmailInteractionInPostgres(request)
+    const before = await durableState()
+    let decisionObserved = false, cacheObserved = false, outboxObserved = false
+    const failingPersistence = fixtureContext.fixture.loadCrmPersistence(query, callback => withTransaction(client => callback({
+      query: async (sql, values) => {
+        if (sql.includes('INSERT INTO crm_email_review_decisions')) decisionObserved = true
+        if (sql.includes('UPDATE crm_inbound_messages SET interaction_id=')) cacheObserved = true
+        if (sql.includes('INSERT INTO sync_outbox')) outboxObserved = true
+        if (sql.includes('INSERT INTO audit_events') && values?.[1] === 'crm.email_association.reviewed') {
+          assert.ok(decisionObserved && cacheObserved && outboxObserved, 'Fault occurs after actual outbox, cache and decision writes')
+          throw new Error('Synthetic review audit failure')
+        }
+        return client.query(sql, values)
+      },
+    })))
+    await assert.rejects(failingPersistence.stageReviewedGmailInteractionInPostgres({ ...request, apply: true,
+      expectedExistingInteractionId: null, expectedTargetFingerprint: preview.targetFingerprint }), /Synthetic review audit failure/)
+    assert.ok(decisionObserved && cacheObserved && outboxObserved)
+    assert.deepEqual(await durableState(), before, 'No partial interaction, cache assignment, provenance link, decision or audit remains')
+    await query('UPDATE workspace_organizations SET is_demo=true WHERE id=$1', [WORKSPACE])
+  })
+  await check('reviewed removal appends a correction revision while preserving canonical and native Email identity', async () => {
+    const request = selection('d5')
+    const preview = await persistence.stageReviewedGmailInteractionInPostgres(request)
+    const created = await persistence.stageReviewedGmailInteractionInPostgres({ ...request, apply: true,
+      expectedExistingInteractionId: null, expectedTargetFingerprint: preview.targetFingerprint })
+    const before = (await query('SELECT * FROM crm_interactions WHERE id=$1', [created.interactionId])).rows[0]
+    const correction = { ...request, contactTargets: [contactTargets[0]], decisionKind: 'correction',
+      correctionReason: 'Synthetic reviewer removes unrelated company discovery label' }
+    const correctionPreview = await persistence.stageReviewedGmailInteractionInPostgres(correction)
+    const corrected = await persistence.stageReviewedGmailInteractionInPostgres({ ...correction, apply: true,
+      expectedExistingInteractionId: created.interactionId, expectedTargetFingerprint: correctionPreview.targetFingerprint })
+    assert.equal(corrected.interactionId, created.interactionId)
+    const after = (await query('SELECT * FROM crm_interactions WHERE id=$1', [created.interactionId])).rows[0]
+    assert.ok(before.canonical_source_id)
+    for (const field of ['id', 'canonical_source_id', 'suitecrm_id', 'suitecrm_module', 'source_key', 'reference_code',
+      'provider_message_id', 'provider_thread_id', 'description', 'subject', 'occurred_at']) assert.deepEqual(after[field], before[field], field)
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_organizations WHERE interaction_id=$1', [after.id])).rows[0].count, '1')
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_contacts WHERE interaction_id=$1', [after.id])).rows[0].count, '1')
+    assert.deepEqual((await query('SELECT reference_code FROM crm_inbound_message_links WHERE inbound_message_id=$1 ORDER BY reference_code',
+      [corrected.inboundMessageId])).rows.map(row => row.reference_code), ['ga1234567', 'gc1234567'])
+    const decisions = (await query('SELECT * FROM crm_email_review_decisions WHERE interaction_id=$1 ORDER BY revision', [after.id])).rows
+    assert.equal(decisions.length, 2)
+    assert.deepEqual(decisions.map(row => [row.revision, row.kind]), [[1, 'review'], [2, 'correction']])
+    assert.equal(decisions[1].previous_decision_id, decisions[0].id)
+    assert.equal(decisions[1].provenance.reason, correction.correctionReason)
+    const stable = await durableState()
+    await persistence.stageReviewedGmailInteractionInPostgres({ ...correction, apply: true,
+      expectedExistingInteractionId: created.interactionId, expectedTargetFingerprint: correctionPreview.targetFingerprint })
+    assert.deepEqual(await durableState(), stable, 'Correction replay does not append another revision or repeat links')
+  })
+  await check('concurrent apply and replay serialize to one Email, one decision and one audit', async () => {
+    await cacheMessage('d6')
+    const request = selection('d6')
+    const preview = await persistence.stageReviewedGmailInteractionInPostgres(request)
+    const apply = { ...request, apply: true, expectedExistingInteractionId: null,
+      expectedTargetFingerprint: preview.targetFingerprint }
+    const results = await Promise.all([persistence.stageReviewedGmailInteractionInPostgres(apply),
+      persistence.stageReviewedGmailInteractionInPostgres(apply)])
+    assert.equal(results.filter(result => result.applied).length, 1)
+    assert.equal(results[0].interactionId, results[1].interactionId)
+    const interactionId = results[0].interactionId
+    assert.equal((await query('SELECT count(*) FROM crm_interactions WHERE provider_message_id=$1', ['d6'])).rows[0].count, '1')
+    assert.equal((await query('SELECT count(*) FROM crm_email_review_decisions WHERE interaction_id=$1', [interactionId])).rows[0].count, '1')
+    assert.equal((await query("SELECT count(*) FROM audit_events WHERE aggregate_id=$1 AND event_type='crm.email_association.reviewed'", [interactionId])).rows[0].count, '1')
+    const stable = await durableState()
+    await Promise.all([persistence.stageReviewedGmailInteractionInPostgres(apply), persistence.stageReviewedGmailInteractionInPostgres(apply)])
+    assert.deepEqual(await durableState(), stable)
+  })
+  await check('single-company canonical content edits retain provider evidence and reject identity or association forgery', async () => {
+    const current = (await query("SELECT * FROM crm_interactions WHERE provider_message_id='d5'", [])).rows[0]
+    assert.ok(current.canonical_source_id)
+    const write = fields => persistence.stageCrmRecordInPostgres({ entity: 'interactions', pipelineId: PIPELINE,
+      localId: current.id, sourceKey: current.source_key, actorEmail: OWNER, fields })
+    await write({ subject: 'Single-company canonical edit', description: 'Ordinary canonical content edit' })
+    const edited = (await query('SELECT * FROM crm_interactions WHERE id=$1', [current.id])).rows[0]
+    for (const field of ['canonical_source_id', 'provider_message_id', 'provider_thread_id', 'suitecrm_id', 'source_key',
+      'organization_id', 'contact_id', 'metadata', 'agent_email', 'agent_name', 'occurred_at', 'source_payload']) {
+      assert.deepEqual(edited[field], current[field], field)
+    }
+    const before = await durableState()
+    for (const fields of [{ providerMessageId: 'forged-message' }, { providerThreadId: 'forged-thread' },
+      { metadata: { canonicalSourceId: id(97) } }, { metadata: { inboundMessageId: id(98) } },
+      { organizationId: AIRSPACE }, { contactIds: [GC, AC] }]) await assert.rejects(write(fields), JSON.stringify(fields))
+    assert.deepEqual(await durableState(), before)
+    await compatibleFixtureWrite(client => client.query('UPDATE crm_interactions SET agent_email=NULL,agent_name=$2 WHERE id=$1', [current.id, 'Operator']))
+    await write({ subject: 'Preserve a historical name that also matches an active user' })
+    assert.deepEqual((await query('SELECT agent_email,agent_name FROM crm_interactions WHERE id=$1', [current.id])).rows[0],
+      { agent_email: null, agent_name: 'Operator' }, 'A one-company canonical Email must not re-resolve a retained historical author')
+  })
+  await check('identity phantom waits for the same email but leaves unrelated contact writers unblocked', async () => {
     const writer = await pool.connect()
+    let pending
     try {
       await writer.query('BEGIN')
-      await writer.query('LOCK TABLE crm_contacts IN ROW EXCLUSIVE MODE')
-      await assert.rejects(persistence.stageReviewedGmailInteractionInPostgres(selection('d2')), /busy; retry a fresh preview/)
-    } finally { await writer.query('ROLLBACK'); writer.release() }
+      await writer.query(`INSERT INTO crm_contacts(id,pipeline_id,organization_id,full_name,email,reference_code,source_key)
+        VALUES($1,$2,$3,'Synthetic duplicate',$4,'gc3456789','fixture-phantom')`, [id(40), PIPELINE, GLOBUS, contactTargets[0].email])
+      let settled = false
+      pending = persistence.stageReviewedGmailInteractionInPostgres(selection('d2'))
+        .then(value => ({ value }), error => ({ error })).finally(() => { settled = true })
+      const deadline = Date.now() + 2000
+      while (!(await query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event='advisory') AS waiting", [container])).rows[0].waiting) {
+        assert.ok(Date.now() < deadline, 'Review must wait on the actual owner/email advisory fence')
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      assert.equal(settled, false)
+      await query(`INSERT INTO crm_contacts(id,pipeline_id,organization_id,full_name,email,reference_code,source_key)
+        VALUES($1,$2,$3,'Unrelated writer','unrelated@example.test','gc4567890','fixture-unrelated')`, [id(41), PIPELINE, GLOBUS])
+      assert.equal(settled, false, 'Unrelated identity commits without unblocking or bypassing the shared identity fence')
+      const before = await counts()
+      await writer.query('COMMIT')
+      const result = await pending
+      assert.match(result.error?.message || '', /evidence changed or conflicts/)
+      assert.deepEqual(await counts(), before, 'Preview must see and refuse the committed duplicate before staging')
+    } finally {
+      await writer.query('ROLLBACK')
+      writer.release()
+      if (pending) await pending
+      await query('DELETE FROM crm_contacts WHERE id=ANY($1::uuid[])', [[id(40), id(41)]])
+    }
+  })
+  let queuedReview, queuedRequest, queuedPreview, queuedItem
+  await check('non-demo review atomically queues one exact native payload with both companies, contacts and pipeline audience', async () => {
+    await query('UPDATE workspace_organizations SET is_demo=false WHERE id=$1', [WORKSPACE])
+    await cacheMessage('d7')
+    queuedRequest = selection('d7')
+    queuedPreview = await persistence.stageReviewedGmailInteractionInPostgres(queuedRequest)
+    queuedReview = await persistence.stageReviewedGmailInteractionInPostgres({ ...queuedRequest, apply: true,
+      expectedExistingInteractionId: null, expectedTargetFingerprint: queuedPreview.targetFingerprint })
+    const outbox = (await query('SELECT * FROM sync_outbox WHERE aggregate_id=$1', [queuedReview.interactionId])).rows
+    assert.equal(outbox.length, 1)
+    assert.equal(outbox[0].status, 'queued')
+    const payload = outbox[0].payload
+    assert.equal(payload.suiteCrmModule, 'Emails')
+    assert.equal(payload.localId, queuedReview.interactionId)
+    assert.equal(payload.attributes.parent_id, 'native-globus')
+    assert.deepEqual(payload.emailProjection.accounts, ['native-airspace', 'native-globus'])
+    assert.deepEqual(payload.emailProjection.contacts, ['native-joseph', 'native-riley'])
+    assert.deepEqual(payload.emailProjection.contactAccounts, [
+      { contactId: 'native-joseph', accountId: 'native-globus' }, { contactId: 'native-riley', accountId: 'native-airspace' },
+    ])
+    assert.deepEqual(payload.emailProjection.previousManaged, { accounts: [], contacts: [] })
+    const { fingerprint, ...audience } = payload.emailProjection.audience
+    assert.deepEqual(audience, { policy: 'pipeline-internal', ownerSuiteCrmId: 'native-fixture-owner',
+      allowedSuiteCrmUserIds: ['native-fixture-owner'], workspaceId: WORKSPACE, pipelineId: PIPELINE })
+    assert.match(fingerprint, /^[a-f0-9]{64}$/u)
+    assert.equal((await query('SELECT count(*) FROM crm_email_review_decisions WHERE interaction_id=$1', [queuedReview.interactionId])).rows[0].count, '1')
+    assert.equal((await query("SELECT count(*) FROM audit_events WHERE aggregate_id=$1 AND event_type='crm.email_association.reviewed'", [queuedReview.interactionId])).rows[0].count, '1')
+    assert.equal((await query('SELECT count(*) FROM crm_inbound_message_links WHERE inbound_message_id=$1', [queuedReview.inboundMessageId])).rows[0].count, '4')
+    const cache = (await query('SELECT * FROM crm_inbound_messages WHERE id=$1', [queuedReview.inboundMessageId])).rows[0]
+    assert.equal(cache.interaction_id, queuedReview.interactionId)
+    assert.equal(cache.mailbox_id, mailboxIdentity.mailboxId)
+    assert.ok(cache.canonical_source_id)
+    const claimed = await persistence.claimSuiteCrmOutboxInPostgres({ limit: 1 })
+    assert.equal(claimed.length, 1)
+    queuedItem = claimed[0]
+    assert.equal(queuedItem.id, outbox[0].id)
+    assert.equal(queuedItem.attempts, 1)
+    assert.deepEqual(queuedItem.payload, payload)
+    assert.equal((await query('SELECT sync_status FROM crm_interactions WHERE id=$1', [queuedReview.interactionId])).rows[0].sync_status, 'syncing')
+  })
+  await check('publication rejects changed lease, payload, revision or revoked membership before the provider callback', async () => {
+    let callbacks = 0
+    const publish = async () => { callbacks += 1; return 'synthetic-provider-callback' }
+    await assert.rejects(persistence.withVerifiedSuiteCrmEmailPublication({ ...queuedItem, lockToken: 'wrong-lease' }, publish), /lease or revision changed/)
+    await assert.rejects(persistence.withVerifiedSuiteCrmEmailPublication({ ...queuedItem,
+      payload: { ...queuedItem.payload, attributes: { ...queuedItem.payload.attributes, name: 'Forged queued content' } } }, publish), /lease or revision changed/)
+    const currentHash = (await query('SELECT source_hash FROM crm_interactions WHERE id=$1', [queuedReview.interactionId])).rows[0].source_hash
+    await compatibleFixtureWrite(client => client.query('UPDATE crm_interactions SET source_hash=$2 WHERE id=$1', [queuedReview.interactionId, 'synthetic-stale-revision']))
+    await assert.rejects(persistence.withVerifiedSuiteCrmEmailPublication(queuedItem, publish), /lease or revision changed/)
+    await compatibleFixtureWrite(client => client.query('UPDATE crm_interactions SET source_hash=$2 WHERE id=$1', [queuedReview.interactionId, currentHash]))
+    await query("UPDATE app_user_organization_memberships SET status='disabled' WHERE organization_id=$1 AND user_email=$2", [WORKSPACE, OWNER])
+    await assert.rejects(persistence.withVerifiedSuiteCrmEmailPublication(queuedItem, publish), /audience|native identities/i)
+    assert.equal(callbacks, 0)
+    assert.equal(await persistence.failSuiteCrmOutboxInPostgres({ item: queuedItem, error: 'Synthetic membership change held publication' }), 'failed')
+    const held = (await query('SELECT status,lock_token FROM sync_outbox WHERE id=$1', [queuedItem.id])).rows[0]
+    assert.deepEqual(held, { status: 'failed', lock_token: null })
+    assert.equal((await query('SELECT sync_status FROM crm_interactions WHERE id=$1', [queuedReview.interactionId])).rows[0].sync_status, 'pending')
+    await query("UPDATE app_user_organization_memberships SET status='active' WHERE organization_id=$1 AND user_email=$2", [WORKSPACE, OWNER])
+    await query('UPDATE sync_outbox SET available_at=now() WHERE id=$1', [queuedItem.id])
+    const [reclaimed] = await persistence.claimSuiteCrmOutboxInPostgres({ limit: 1 })
+    assert.equal(reclaimed.id, queuedItem.id)
+    assert.notEqual(reclaimed.lockToken, queuedItem.lockToken)
+    queuedItem = reclaimed
+  })
+  await check('completion requires exact readback and active lease; valid proof stores a receipt and makes replay write-free', async () => {
+    // Synthetic readback at the trusted native-client boundary. Native exact
+    // readback/audience transport is tested separately, not claimed by this DB fixture.
+    const proof = { version: 1, suiteCrmId: queuedItem.payload.suiteCrmId, capturedAt: new Date().toISOString(),
+      attributes: queuedItem.payload.attributes, accounts: queuedItem.payload.emailProjection.accounts,
+      contacts: queuedItem.payload.emailProjection.contacts, contactAccounts: queuedItem.payload.emailProjection.contactAccounts,
+      audience: { fingerprint: queuedItem.payload.emailProjection.audience.fingerprint,
+        readerSuiteCrmUserIds: queuedItem.payload.emailProjection.audience.allowedSuiteCrmUserIds,
+        administratorSuiteCrmUserIds: ['native-fixture-owner'] } }
+    const before = await durableState()
+    await assert.rejects(persistence.completeSuiteCrmOutboxInPostgres(queuedItem), /readback proof is missing or changed/)
+    await assert.rejects(persistence.completeSuiteCrmOutboxInPostgres(queuedItem, { emailProjection: { ...proof, accounts: ['native-globus'] } }), /readback proof is missing or changed/)
+    await assert.rejects(persistence.completeSuiteCrmOutboxInPostgres({ ...queuedItem, lockToken: 'lost-lease' }, { emailProjection: proof }), /lease or projection identity was lost/)
+    assert.deepEqual(await durableState(), before, 'Rejected completion cannot mark success or persist a forged receipt')
+    let callbacks = 0
+    assert.equal(await persistence.withVerifiedSuiteCrmEmailPublication(queuedItem, async () => {
+      callbacks += 1; return 'synthetic-provider-success'
+    }), 'synthetic-provider-success')
+    assert.equal(callbacks, 1)
+    await persistence.completeSuiteCrmOutboxInPostgres(queuedItem, { emailProjection: proof })
+    const row = (await query('SELECT * FROM crm_interactions WHERE id=$1', [queuedReview.interactionId])).rows[0]
+    assert.equal(row.sync_status, 'synced')
+    assert.ok(row.suitecrm_synced_at)
+    assert.deepEqual(row.metadata.suiteCrmEmailProjection, proof)
+    assert.equal((await query('SELECT status FROM sync_outbox WHERE id=$1', [queuedItem.id])).rows[0].status, 'succeeded')
+    const stable = await durableState()
+    await assert.rejects(persistence.stageCrmRecordInPostgres({ entity: 'interactions', pipelineId: PIPELINE,
+      localId: row.id, sourceKey: row.source_key, actorEmail: OWNER, fields: { subject: row.subject,
+        metadata: { suiteCrmEmailProjection: { ...proof, accounts: ['forged-account'] } } } }), /projection receipts cannot be supplied/)
+    const replay = await persistence.stageReviewedGmailInteractionInPostgres({ ...queuedRequest, apply: true,
+      expectedExistingInteractionId: null, expectedTargetFingerprint: queuedPreview.targetFingerprint })
+    assert.equal(replay.applied, false)
+    assert.deepEqual(await durableState(), stable, 'Worker-owned receipt does not invalidate unchanged reviewed replay')
+  })
+  await check('actor-owned sent source needs current editor authority and publication fences reader-grant revocation', async () => {
+    const EDITOR = 'shared-editor@example.test', EDITOR_MAILBOX = 'editor-mailbox@example.test'
+    const editorConnection = 'synthetic-editor-mailbox', editorIntakePipeline = id(80)
+    await query("INSERT INTO app_users VALUES($1,'active','Synthetic Editor','native-fixture-editor',true,'gu2345678')", [EDITOR])
+    await query("INSERT INTO app_user_organization_memberships VALUES($1,$2,'active')", [WORKSPACE, EDITOR])
+    await query('INSERT INTO pipeline_spaces(id,owner_email,workspace_organization_id,is_default) VALUES($1,$2,$3,true)',
+      [editorIntakePipeline, EDITOR, WORKSPACE])
+    await query("INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'editor')", [PIPELINE, EDITOR])
+    await query("INSERT INTO user_maton_connections VALUES($1,$2,$3,'google-mail','ACTIVE','maton',true)", [EDITOR, editorConnection, EDITOR_MAILBOX])
+    await persistence.bindVerifiedGmailMailboxInPostgres({ ownerEmail: EDITOR, connectionId: editorConnection,
+      identity: { subject: 'synthetic-editor-google-subject', email: EDITOR_MAILBOX }, observedAccountEmail: EDITOR_MAILBOX })
+    const identity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: EDITOR,
+      connectionId: editorConnection, accountEmail: EDITOR_MAILBOX })
+    assert.ok(identity)
+    const capture = async messageId => {
+      const messageEvidence = emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: messageId,
+        externalThreadId: `thread-${messageId}`, senderEmail: EDITOR_MAILBOX, recipientEmails: [contactTargets[0].email, OWNER],
+        subject: 'Synthetic shared-pipeline sent message', receivedAt: '2026-10-27T12:00:00.123Z',
+        snippet: 'Synthetic editor source', bodyText: 'Synthetic exact shared editor body', markerReferences: [],
+        emailAddressHeaders: { version: 1, from: [{ address: EDITOR_MAILBOX, displayName: 'Synthetic Editor' }],
+          to: [{ address: contactTargets[0].email, displayName: 'Joseph' }], cc: [{ address: OWNER }], bcc: [] } })
+      const intake = await persistence.recordGmailMessageIntakeInPostgres({ ownerEmail: EDITOR,
+        connectionId: editorConnection, intakePipelineId: editorIntakePipeline, mailboxIdentity: identity,
+        observedAccountEmail: EDITOR_MAILBOX, observedAt: new Date().toISOString(), messageEvidence, rawMetadata: { labelIds: ['SENT'] } })
+      return { messageEvidence, intake }
+    }
+    const stageInput = ({ messageEvidence, intake }) => ({ entity: 'interactions', pipelineId: PIPELINE,
+      sourceKey: `synthetic-shared-editor:${messageEvidence.messageId}`, actorEmail: EDITOR, sourcePayload: { source: 'app-send' },
+      fields: { interactionType: 'email', organizationId: GLOBUS, contactIds: [GC], agentEmail: EDITOR,
+        subject: messageEvidence.subject, description: messageEvidence.bodyText, occurredAt: messageEvidence.receivedAt,
+        direction: 'outbound', deliveryStatus: 'sent', providerMessageId: messageEvidence.messageId,
+        providerThreadId: messageEvidence.threadId, metadata: { source: 'app-send', canonicalSourceId: intake.sourceId, inboundMessageId: intake.id } } })
+    const captured = await capture('e701'), pending = await capture('e702')
+    const staged = await persistence.stageCrmRecordInPostgres(stageInput(captured))
+    const row = (await query('SELECT * FROM crm_interactions WHERE id=$1', [staged.id])).rows[0]
+    assert.equal(row.canonical_source_id, captured.intake.sourceId)
+    const outbox = (await query('SELECT * FROM sync_outbox WHERE aggregate_id=$1', [staged.id])).rows
+    assert.equal(outbox.length, 1)
+    const payload = outbox[0].payload
+    assert.equal(payload.attributes.from_addr_name, `Synthetic Editor <${EDITOR_MAILBOX}>`)
+    assert.equal(payload.attributes.to_addrs_names, `Joseph <${contactTargets[0].email}>`)
+    assert.equal(payload.attributes.cc_addrs_names, OWNER)
+    assert.equal(payload.emailProjection.audience.ownerSuiteCrmId, 'native-fixture-owner')
+    assert.deepEqual(payload.emailProjection.audience.allowedSuiteCrmUserIds, ['native-fixture-editor', 'native-fixture-owner'])
+    for (const [change, restore] of [
+      [() => query("UPDATE pipeline_space_members SET access_role='viewer' WHERE pipeline_id=$1 AND user_email=$2", [PIPELINE, EDITOR]),
+        () => query("UPDATE pipeline_space_members SET access_role='editor' WHERE pipeline_id=$1 AND user_email=$2", [PIPELINE, EDITOR])],
+      [() => query("UPDATE app_user_organization_memberships SET status='disabled' WHERE organization_id=$1 AND user_email=$2", [WORKSPACE, EDITOR]),
+        () => query("UPDATE app_user_organization_memberships SET status='active' WHERE organization_id=$1 AND user_email=$2", [WORKSPACE, EDITOR])],
+      [() => query('DELETE FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2', [PIPELINE, EDITOR]),
+        () => query("INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'editor')", [PIPELINE, EDITOR])],
+    ]) {
+      await change()
+      try {
+        const before = await durableState()
+        await assert.rejects(persistence.stageCrmRecordInPostgres(stageInput(pending)),
+          /source is unavailable|access was revoked|agent must be an active ClawPilot user with pipeline access/)
+        assert.deepEqual(await durableState(), before, 'Denied attachment leaves no partial Email, outbox, audit or provenance mutation')
+      } finally { await restore() }
+    }
+    const [item] = await persistence.claimSuiteCrmOutboxInPostgres({ limit: 1 })
+    assert.equal(item.id, outbox[0].id)
+    let entered, release, callbacks = 0
+    const enteredPromise = new Promise(resolve => { entered = resolve })
+    const releasePromise = new Promise(resolve => { release = resolve })
+    const publishing = persistence.withVerifiedSuiteCrmEmailPublication(item, async () => {
+      callbacks += 1; entered(); await releasePromise; return 'synthetic-editor-publication'
+    })
+    const revoker = await pool.connect()
+    let revoked
+    try {
+      await enteredPromise
+      await revoker.query('BEGIN')
+      const pid = (await revoker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+      let settled = false
+      revoked = revoker.query('DELETE FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2', [PIPELINE, EDITOR])
+        .then(value => ({ value }), error => ({ error })).finally(() => { settled = true })
+      const deadline = Date.now() + 2500
+      while (!(await query('SELECT cardinality(pg_blocking_pids($1))>0 AS blocked', [pid])).rows[0].blocked) {
+        assert.ok(Date.now() < deadline, 'Reader-grant revocation must wait on the actual publication row lock')
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      assert.equal(settled, false)
+      release()
+      assert.equal(await publishing, 'synthetic-editor-publication')
+      assert.equal((await revoked).error, undefined)
+      await revoker.query('COMMIT')
+      await assert.rejects(persistence.withVerifiedSuiteCrmEmailPublication(item, async () => { callbacks += 1 }), /audience, lease or revision changed/)
+      assert.equal(callbacks, 1, 'Already-revoked reader grant blocks before a second provider callback')
+      assert.equal(await persistence.failSuiteCrmOutboxInPostgres({ item, error: 'Synthetic reader grant revoked' }), 'failed')
+    } finally {
+      release()
+      await publishing.catch(() => undefined)
+      if (revoked) await revoked
+      await revoker.query('ROLLBACK')
+      revoker.release()
+    }
   })
   console.log(`PASS ${passed} reviewed Gmail persistence checks; actual SQL/readers/native payload producer; no provider writes`)
 } finally {

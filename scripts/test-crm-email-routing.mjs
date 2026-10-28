@@ -35,9 +35,14 @@ function loadModule(path, mocks = {}, extraExports = '') {
 
 const headers = loadModule('app_src/lib/crm/emailAddressHeaders.ts')
 const participantEligibility = loadModule('app_src/lib/crm/participantEligibility.ts')
+const emailIdentity = loadModule('app_src/lib/crm/emailIdentity.ts')
+const emailReconciliation = loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity })
 const ownerEmail = 'operator@example.test'
 const mailboxEmail = 'primary@example.test'
 const ownAlias = 'operator@business.example.test'
+const mailboxIdentity = { version: 1, provider: 'gmail', mailboxId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  providerAccountId: 'stable-google-subject', accountEmail: mailboxEmail,
+  verifiedAt: '2026-09-01T00:00:00.000Z', verifiedConnectionId: 'fixture-connection' }
 const primaryPipeline = '11111111-1111-4111-8111-111111111111'
 const businessPipeline = '22222222-2222-4222-8222-222222222222'
 const unrelatedPipeline = '33333333-3333-4333-8333-333333333333'
@@ -58,10 +63,11 @@ function enrichmentHelper(query, stageCrmRecordWithClient) {
   const path = 'app_src/lib/persistence/crm.ts'
   const source = readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
   const parsed = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
-  const declarations = ['activeCrmRecordSql', 'nullable', 'clean', 'isoTimestamp',
+  const declarations = ['activeCrmRecordSql', 'nullable', 'clean', 'isoTimestamp', 'REVIEWED_GMAIL_RELATIONSHIPS',
     'enrichCrmEmailInteractionParticipantsInPostgres'].map(name => {
-    const declaration = parsed.statements.find(statement => ts.isFunctionDeclaration(statement)
-      && statement.name?.text === name && statement.body)
+    const declaration = parsed.statements.find(statement => (ts.isFunctionDeclaration(statement)
+      && statement.name?.text === name && statement.body) || (ts.isVariableStatement(statement)
+        && statement.declarationList.declarations.some(item => item.name.getText(parsed) === name)))
     assert.ok(declaration, `Production enrichment declaration ${name} must exist`)
     return declaration.getText(parsed).replace(/^export\s+/, '')
   }).join('\n')
@@ -92,9 +98,21 @@ function rawMessage(id = 'synthetic-message', {
   }
 }
 
+function knownProviderInteraction(id, raw = rawMessage(), overrides = {}) {
+  // Explicit fixture acquisition proof, independent of the later lookup input.
+  return { id, pipeline_id: businessPipeline, suitecrm_module: 'Emails', canonical_source_id: `source-${raw.id}`,
+    provider_message_id: raw.id, provider_thread_id: raw.threadId,
+    source_mailbox_id: mailboxIdentity.mailboxId, source_owner_email: ownerEmail,
+    mailbox_owner_email: ownerEmail, source_provider: 'gmail',
+    source_provider_account_id: mailboxIdentity.providerAccountId,
+    source_message_id: raw.id, source_thread_id: raw.threadId,
+    canonical_evidence: { emailAddressHeaders: headers.captureEmailAddressHeaders(raw.payload.headers) }, ...overrides }
+}
+
 function harness({ records = [adrian], organizations = [], providerInteractions = [], activePipelines = ownedPipelines,
   selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }],
-  polledMessages = [], onAudit, beforeEnrichment, beforeReferenceRead, beforeReviewedBatch } = {}) {
+  polledMessages = [], onAudit, beforeEnrichment, beforeReferenceRead, beforeReviewedBatch,
+  verifiedIdentity = mailboxIdentity, intakeIdentityStatus = 'verified' } = {}) {
   const queries = [], staged = [], providerCalls = [], audits = [], messages = new Map(), links = new Map()
   const initialProviderMessageIds = polledMessages.map(message => message.id)
   const persistedInteractions = [], enrichments = []
@@ -113,6 +131,14 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
           source_key: `existing:${row.id}`, source_payload: {}, subject: 'Retained authored subject',
           description: 'Retained authored body', metadata: { retained: true }, direction: 'outbound',
           ...row, provider_message_id: row.provider_message_id || 'already-sent', provider_thread_id: row.provider_thread_id ?? null }] : [])
+    }
+    if (sql.includes('SELECT evidence FROM crm_email_sources')) {
+      assert.equal(values[1], mailboxIdentity.mailboxId)
+      assert.equal(values[2], ownerEmail)
+      const source = [...providerInteractions, ...persistedInteractions].find(row => row.canonical_source_id === values[0])
+      return result(source && source.source_mailbox_id === values[1] && source.source_owner_email === values[2]
+        && source.source_message_id === values[3] && source.source_thread_id === values[4]
+        ? [{ evidence: source.canonical_evidence }] : [])
     }
     if (sql.includes('FROM crm_interaction_contacts')) return result((row?.contact_ids || []).map((contact_id, index) => ({ contact_id, is_primary: index === 0, sort_order: index })))
     if (sql.includes('FROM crm_contacts contact') || sql.includes('FROM crm_leads lead')) {
@@ -136,6 +162,26 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
   const ingestion = loadModule(sourcePath, {
     '@/lib/crm/emailAddressHeaders': headers,
     '@/lib/crm/participantEligibility': participantEligibility,
+    '@/lib/crm/emailIdentity': emailIdentity,
+    '@/lib/crm/emailReconciliation': emailReconciliation,
+    '@/lib/persistence/crmEmailIdentity': {
+      readVerifiedGmailMailboxIdentityInPostgres: async () => verifiedIdentity,
+      recordGmailMessageIntakeInPostgres: async input => {
+        const evidence = input.messageEvidence
+        const existing = messages.get(evidence.messageId)
+        if (existing) return { id: existing.id, pipelineId: existing.pipeline_id, inserted: false,
+          identityStatus: intakeIdentityStatus, sourceId: existing.canonical_source_id }
+        const row = { id: `inbound-${evidence.messageId}`, pipeline_id: input.intakePipelineId, owner_email: input.ownerEmail,
+          mailbox_id: input.mailboxIdentity?.mailboxId || null, canonical_source_id: `source-${evidence.messageId}`,
+          external_message_id: evidence.messageId, external_thread_id: evidence.threadId,
+          sender_email: evidence.senderEmail, recipient_emails: evidence.recipientEmails, subject: evidence.subject,
+          received_at: evidence.receivedAt, snippet: evidence.snippet, body_text: evidence.bodyText,
+          marker_references: evidence.markerReferences, raw_metadata: { ...input.rawMetadata, emailAddressHeaders: evidence.emailAddressHeaders } }
+        messages.set(evidence.messageId, row)
+        return { id: row.id, pipelineId: row.pipeline_id, inserted: true,
+          identityStatus: intakeIdentityStatus, sourceId: row.canonical_source_id }
+      },
+    },
     '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
     '@/lib/globalIds.mjs': { globalIdFragment },
     '@/lib/auditWriter': { recordAuditEvent: async input => {
@@ -148,6 +194,7 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
       assert.equal(scope.boundConnectionId, 'fixture-connection')
       providerCalls.push(path)
       const url = new URL(path, 'https://gateway.example.test')
+      if (url.pathname.endsWith('/users/me/profile')) return Response.json({ emailAddress: mailboxEmail })
       if (url.pathname.endsWith('/messages')) return Response.json({ messages: polledMessages.map(message => ({ id: message.id })) })
       const message = polledMessages.find((candidate, index) => candidate.id === url.pathname.split('/').at(-1)
         || initialProviderMessageIds[index] === url.pathname.split('/').at(-1))
@@ -175,9 +222,14 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
         assert.match(sql, /membership\.user_email = pipeline\.owner_email/)
         assert.match(sql, /membership\.status = 'active'/)
         assert.match(sql, /pipeline\.owner_email = \$1/)
-        assert.match(sql, /pipeline\.reference_access_disabled = false/)
+        if (sql.includes('AND (pipeline.id = $2::uuid OR pipeline.is_default)')) {
+          assert.match(sql, /owner_user\.status = 'active'/)
+          assert.match(sql, /NOT pipeline\.reference_access_disabled/)
+          assert.match(sql, /ORDER BY pipeline.id LIMIT 26/)
+        } else assert.match(sql, /pipeline\.reference_access_disabled = false/)
         assert.equal(values[0], ownerEmail)
-        assert.ok([primaryPipeline, businessPipeline].includes(values[1]))
+        assert.ok((sql.includes('AND (pipeline.id = $2::uuid OR pipeline.is_default)')
+          ? [primaryPipeline, businessPipeline, unrelatedPipeline] : [primaryPipeline, businessPipeline]).includes(values[1]))
         return result(activePipelines)
       }
       if (sql.includes('INSERT INTO crm_inbound_messages')) {
@@ -230,6 +282,15 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
         return result([{}])
       }
       if (sql.includes('UPDATE crm_inbound_messages SET')) return result([{}])
+      if (sql.includes('SELECT true AS placement_conflict FROM crm_email_sources source')) {
+        assert.match(sql, /interaction\.canonical_source_id = source\.id/)
+        assert.match(sql, /source\.mailbox_id = \$1::uuid AND source\.owner_email = \$2 AND source\.provider_message_id = \$3/)
+        assert.match(sql, /interaction\.pipeline_id <> \$4::uuid LIMIT 1/)
+        const placed = [...providerInteractions, ...persistedInteractions].some(row => row.canonical_source_id
+          && row.source_mailbox_id === values[0] && row.source_owner_email === values[1]
+          && row.source_message_id === values[2] && row.pipeline_id !== values[3])
+        return result(placed ? [{ placement_conflict: true }] : [])
+      }
       if (sql.includes('FROM crm_interactions')) {
         assert.match(sql, /pipeline_id/, 'Existing interaction reuse must retain pipeline scope')
         assert.match(sql, /provider_message_id/, 'Existing interaction reuse needs the exact provider message')
@@ -238,13 +299,11 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
         assert.match(sql, /LIMIT 2/, 'An ambiguous existing provider mapping must be detectable')
         assert.ok([primaryPipeline, businessPipeline].includes(values[0]))
         assert.doesNotMatch(sql.split('WHERE')[1], /provider_thread_id/, 'Do not hide a conflicting or missing thread from candidate detection')
-        if (values.length === 3) {
-          assert.match(sql, /source_key = \$3/)
-          assert.match(values[2], /^gmail:inbound:[a-f0-9]{64}$/)
-        }
-        else {
-          assert.equal(values.length, 2)
-        }
+        assert.equal(values.length, 2)
+        assert.match(sql, /LEFT JOIN crm_email_sources source ON source.id = interaction.canonical_source_id/)
+        assert.match(sql, /LEFT JOIN crm_email_mailboxes mailbox ON mailbox.id = source.mailbox_id/)
+        assert.doesNotMatch(sql.split('WHERE')[1], /source_key|source\.mailbox_id|provider_account_id/,
+          'Unknown/foreign canonical candidates stay visible and held, never hidden by a fallback predicate')
         return result([...providerInteractions, ...persistedInteractions]
           .filter(row => (!row.pipeline_id || row.pipeline_id === values[0]) && (!row.provider_message_id || row.provider_message_id === values[1])
             && (values.length !== 3 || row.source_key === values[2]))
@@ -282,9 +341,18 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
             reviewedStages.push(plain(message.interaction))
             interactionId = `reviewed-interaction-${reviewedStages.length}`
             reviewedInteractions.set(key, { interactionId, targetFingerprint })
+            const inboundId = messages.get(message.providerMessageId)?.id
+            const messageLinks = links.get(inboundId) || new Map()
+            for (const reference of message.interaction.sourcePayload.relatedReferences) messageLinks.set(reference, interactionId)
+            links.set(inboundId, messageLinks)
+            audits.push(plain({ eventKey: `reviewed:${targetFingerprint}`, payload: {
+              reviewedAssociations: [{ messageId: message.providerMessageId, threadId: message.providerThreadId,
+                primaryOrganizationReference: message.primaryOrganization.referenceCode,
+                contactReferences: message.contactTargets.map(target => target.referenceCode) }], providerWrites: 0 } }))
           }
           return { interactionId, inboundMessageId: messages.get(message.providerMessageId)?.id,
-            applied, alreadyLinked: Boolean(existing), targetFingerprint }
+            applied, alreadyLinked: Boolean(existing), targetFingerprint,
+            linksAdded: applied ? message.interaction.sourcePayload.relatedReferences.length : 0 }
         })
       },
       readCrmRecordByReference: async ({ pipelineId, referenceCode }) => {
@@ -296,19 +364,30 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
       stageCrmRecordInPostgres: async input => {
         staged.push(plain(input))
         const id = `interaction-${staged.length}`
-        persistedInteractions.push({ id, pipeline_id: input.pipelineId, source_key: input.sourceKey,
+        const retained = messages.get(input.fields.providerMessageId)
+        persistedInteractions.push({ ...knownProviderInteraction(id), id, pipeline_id: input.pipelineId, source_key: input.sourceKey,
+          canonical_source_id: input.fields.metadata?.canonicalSourceId || null,
+          source_message_id: retained?.external_message_id, source_thread_id: retained?.external_thread_id,
+          canonical_evidence: { emailAddressHeaders: retained?.raw_metadata.emailAddressHeaders },
           provider_message_id: input.fields.providerMessageId, provider_thread_id: input.fields.providerThreadId,
           organization_id: input.fields.organizationId, contact_id: input.fields.contactId || null,
           contact_ids: input.fields.contactIds || [], lead_id: input.fields.leadId || null })
         return { id }
       },
     },
-  }, '\nexport { participantEmailTargets, referenceTargets, groupReferenceTargets, stageInboundInteraction, processMessage, listGmailPage, ownedPipelines, configuredMailboxAddresses }\n')
-  const input = (raw = rawMessage(), overrides = {}) => ({
+  }, '\nexport { participantEmailTargets, referenceTargets, groupReferenceTargets, stageInboundInteraction, processMessage, listGmailPage, ownedPipelines, configuredMailboxAddresses, storeInboundMessage }\n')
+  const input = (raw = rawMessage(), overrides = {}) => {
+    const parsed = ingestion.parseGmailMessage(raw)
+    // Malformed-header cases exercise the pure routing selector, not intake.
+    let messageEvidence
+    try { messageEvidence = emailIdentity.normalizeGmailMessageEvidence(parsed) } catch {}
+    return {
     ownerEmail, mailboxEmail, selfAddresses: [ownAlias],
     defaultPipelineId: primaryPipeline, ownedPipelines,
-    message: ingestion.parseGmailMessage(raw), ...overrides,
-  })
+    message: parsed, mailboxIdentity: verifiedIdentity,
+    connectionId: 'fixture-connection', observedAccountEmail: mailboxEmail,
+    messageEvidence, ...overrides,
+  } }
   return { ingestion, input, queries, staged, enrichments, providerCalls, audits, messages, links, persistedInteractions,
     reviewedBatches, reviewedStages, reviewedInteractions }
 }
@@ -490,7 +569,7 @@ await check('SENT labels stage outbound/sent and inbox labels stage inbound/rece
 })
 
 await check('exact existing provider interaction is linked without a duplicate send record', async () => {
-  const h = harness({ providerInteractions: [{ id: 'existing-app-outbound-interaction', provider_thread_id: 'thread-already-sent' }] })
+  const h = harness({ providerInteractions: [knownProviderInteraction('existing-app-outbound-interaction', rawMessage('already-sent', { from: ownAlias, labels: ['SENT'] }))] })
   const result = await h.ingestion.processMessage(h.input(rawMessage('already-sent', { from: ownAlias, labels: ['SENT'] })))
   assert.equal(result.interactions, 0)
   assert.equal(h.staged.length, 0)
@@ -498,12 +577,12 @@ await check('exact existing provider interaction is linked without a duplicate s
   assert.equal([...h.links.values()][0].get(adrian.referenceCode), 'existing-app-outbound-interaction')
 })
 
-await check('legacy exact provider-message interaction with a null thread is reused', async () => {
+await check('legacy unbound provider-message interaction with a null thread is held without inference', async () => {
   const h = harness({ providerInteractions: [{ id: 'legacy-no-thread', provider_thread_id: null }] })
-  const result = await h.ingestion.processMessage(h.input(rawMessage('legacy-sent', { from: ownAlias, labels: ['SENT'] })))
-  assert.equal(result.interactions, 0)
+  await assert.rejects(h.ingestion.processMessage(h.input(rawMessage('legacy-sent', { from: ownAlias, labels: ['SENT'] }))), /canonical mailbox provenance/)
   assert.equal(h.staged.length, 0)
-  assert.equal([...h.links.values()][0].get(adrian.referenceCode), 'legacy-no-thread')
+  assert.equal(h.messages.size, 1, 'Current verified acquisition does not adopt the existing legacy CRM row')
+  assert.equal(h.links.size + h.enrichments.length, 0)
 })
 
 await check('late same-account participants enrich native relationships once while preserving the original email', async () => {
@@ -529,7 +608,7 @@ await check('late same-account participants enrich native relationships once whi
   assert.equal(h.enrichments.length, 1, 'Unchanged replay must not restage or emit projection work')
 })
 
-await check('existing account, primary contact, lead, mapping, owner and archive conflicts are rejected before caching', async () => {
+await check('existing account, primary contact, lead, mapping, owner and archive conflicts cannot mutate CRM after truthful acquisition', async () => {
   const unrelated = fixtureContact('gc8765432', 'unrelated@example.test', businessPipeline, otherOrganization)
   const unrelatedLead = fixtureContact('gl8765432', 'lead@example.test', businessPipeline, otherOrganization, 'leads')
   for (const evidence of [
@@ -538,9 +617,9 @@ await check('existing account, primary contact, lead, mapping, owner and archive
     { owner_email: 'other@example.test' }, { source_payload: { archived: true } },
   ]) {
     const h = harness({ records: [adrian, unrelated, unrelatedLead],
-      providerInteractions: [{ id: 'existing-conflict', provider_thread_id: null, ...evidence }] })
+      providerInteractions: [knownProviderInteraction('existing-conflict', rawMessage(), evidence)] })
     await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting CRM participant evidence/)
-    assert.equal(h.messages.size, 0)
+    assert.equal(h.messages.size, 1)
     assert.equal(h.links.size, 0)
     assert.equal(h.enrichments.length, 0)
     assert.equal(h.staged.length, 0)
@@ -549,11 +628,11 @@ await check('existing account, primary contact, lead, mapping, owner and archive
 
 await check('target email changes are rechecked under the enrichment lock before any CRM write', async () => {
   const records = [{ ...adrian }]
-  const h = harness({ records, providerInteractions: [{ id: 'raced-email' }], beforeEnrichment: () => {
+  const h = harness({ records, providerInteractions: [knownProviderInteraction('raced-email')], beforeEnrichment: () => {
     records[0].email = 'changed@example.test'
   } })
   await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting CRM participant evidence/)
-  assert.equal(h.messages.size, 0)
+  assert.equal(h.messages.size, 1)
   assert.equal(h.enrichments.length, 0)
 })
 
@@ -590,7 +669,7 @@ await check('a customer-plus-partner thread remains unlinked and cannot pass exa
 })
 
 await check('conflicting provider thread cannot become an apparently missing interaction', async () => {
-  const h = harness({ providerInteractions: [{ id: 'conflicting-thread', provider_thread_id: 'another-thread' }] })
+  const h = harness({ providerInteractions: [knownProviderInteraction('conflicting-thread', rawMessage(), { provider_thread_id: 'another-thread' })] })
   await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting CRM thread identity/)
   assert.equal(h.staged.length, 0)
   assert.equal(h.links.size, 0)
@@ -607,13 +686,13 @@ await check('ambiguous existing provider-message interactions cannot be guessed 
 await check('legacy completed links must match the scoped provider candidate and cannot redirect it', async () => {
   for (const providerInteractions of [
     [],
-    [{ id: 'different-interaction', provider_thread_id: null }],
-    [{ id: 'linked-interaction', provider_thread_id: null, pipeline_id: primaryPipeline }],
-    [{ id: 'linked-interaction', provider_thread_id: null, provider_message_id: 'another-message' }],
+    [knownProviderInteraction('different-interaction')],
+    [knownProviderInteraction('linked-interaction', rawMessage(), { pipeline_id: primaryPipeline })],
+    [knownProviderInteraction('linked-interaction', rawMessage('another-message'))],
   ]) {
     const h = harness({ providerInteractions })
     h.links.set('inbound-synthetic-message', new Map([[adrian.referenceCode, 'linked-interaction']]))
-    await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting existing CRM links/)
+    await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting existing CRM links|another CRM placement/)
     assert.equal(h.staged.length, 0)
     assert.equal(h.links.get('inbound-synthetic-message').get(adrian.referenceCode), 'linked-interaction', 'Do not rewrite legacy conflict evidence')
     assert.equal(h.queries.some(({ sql }) => sql.includes('INSERT INTO crm_inbound_message_links') || sql.includes('UPDATE crm_inbound_messages SET')), false)
@@ -621,7 +700,7 @@ await check('legacy completed links must match the scoped provider candidate and
 })
 
 await check('every selected legacy link is checked even when the first one matches', async () => {
-  const h = harness({ records: [adrian, secondContact], providerInteractions: [{ id: 'correct-interaction', provider_thread_id: null }] })
+  const h = harness({ records: [adrian, secondContact], providerInteractions: [knownProviderInteraction('correct-interaction', rawMessage('synthetic-message', { cc: secondContact.email }))] })
   h.links.set('inbound-synthetic-message', new Map([
     [adrian.referenceCode, 'correct-interaction'], [secondContact.referenceCode, 'wrong-interaction'],
   ]))
@@ -631,7 +710,7 @@ await check('every selected legacy link is checked even when the first one match
 })
 
 await check('matching legacy link remains idempotent after provider identity validation', async () => {
-  const h = harness({ providerInteractions: [{ id: 'correct-interaction', provider_thread_id: null }] })
+  const h = harness({ providerInteractions: [knownProviderInteraction('correct-interaction')] })
   h.links.set('inbound-synthetic-message', new Map([[adrian.referenceCode, 'correct-interaction']]))
   const result = await h.ingestion.processMessage(h.input())
   assert.equal(result.interactions, 0)
@@ -653,7 +732,7 @@ await check('explicit markers and archive-address routing keep their distinct be
   assert.equal(invalidMarker.targets.length, 0, 'Unknown explicit references must not fall back to ordinary participant guessing')
 })
 
-await check('multiple explicit markers and archive references retain distinct native interactions on replay', async () => {
+await check('multiple explicit markers and archive references hold before cloning one canonical email', async () => {
   for (const options of [
     { body: `%gslt${adrian.referenceCode} %gslt${secondContact.referenceCode}` },
     { to: 'archive@example.test', body: `Forwarded conversation between ${adrian.email} and ${secondContact.email}` },
@@ -661,16 +740,16 @@ await check('multiple explicit markers and archive references retain distinct na
     const h = harness({ records: [adrian, secondContact] })
     const input = h.input(rawMessage('multi-reference', options))
     const first = await h.ingestion.processMessage(input)
-    assert.equal(first.interactions, 2)
-    assert.equal(first.links, 2)
-    assert.equal(h.staged.length, 2)
-    assert.deepEqual(new Set(h.staged.map(record => record.fields.contactId)), new Set([adrian.id, secondContact.id]))
-    assert.equal(new Set(h.staged.map(record => record.sourceKey)).size, 2)
-    assert.equal(new Set(h.links.get('inbound-multi-reference').values()).size, 2)
+    assert.equal(first.unmatched, true)
+    assert.equal(first.interactions, 0)
+    assert.equal(first.links, 0)
+    assert.equal(h.staged.length, 0)
+    assert.equal(h.links.size, 0)
+    assert.equal(h.messages.size, 1, 'Truthful acquisition may be retained while multi-group routing is held')
     const replay = await h.ingestion.processMessage(input)
     assert.equal(replay.interactions, 0)
     assert.equal(replay.links, 0)
-    assert.equal(h.staged.length, 2)
+    assert.equal(h.staged.length, 0)
   }
 })
 
@@ -720,7 +799,7 @@ await check('recovery preview reads only selected exact message IDs and leaves C
   assert.match(preview.digest, /^[0-9a-f]{64}$/)
   assert.equal(preview.pipelineId, businessPipeline)
   assert.deepEqual(plain(preview.messages[0].targetReferences), [adrian.referenceCode])
-  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/profile', '/google-mail/gmail/v1/users/me/messages/a1?format=full'])
   assert.equal(crmWriteQueries(h).length, 0)
   assert.equal(h.audits.length, 0)
   assert.equal(h.staged.length, 0)
@@ -821,32 +900,27 @@ await check('recovery rechecks active pipeline membership after the review audit
   assert.equal(crmWriteQueries(h).length, 0)
 })
 
-await check('recovery preview shares null-thread reuse and conflicting-thread rejection with apply', async () => {
-  const h = harness({ polledMessages: [rawMessage('a1')], providerInteractions: [{ id: 'legacy-no-thread', provider_thread_id: null }] })
+await check('recovery preview reuses only known canonical identity and holds legacy null threads', async () => {
+  const legacy = harness({ polledMessages: [rawMessage('a1')], providerInteractions: [{ id: 'legacy-no-thread', provider_thread_id: null }] })
+  await assert.rejects(legacy.ingestion.reconcileGmailMessages(recoverySelection()), /canonical mailbox provenance/)
+  assert.equal(legacy.messages.size + legacy.links.size + legacy.staged.length, 0)
+  const h = harness({ polledMessages: [rawMessage('a1')], providerInteractions: [knownProviderInteraction('known-exact', rawMessage('a1'))] })
   const preview = await h.ingestion.reconcileGmailMessages(recoverySelection())
   assert.equal(preview.messages[0].alreadyLinked, true)
   assert.equal(crmWriteQueries(h).length, 0)
   const applied = await h.ingestion.reconcileGmailMessages(recoverySelection({ apply: true, expectedDigest: preview.digest }))
   assert.equal(applied.interactions, 0)
   assert.equal(h.staged.length, 0)
-  const conflicting = harness({ polledMessages: [rawMessage('a1')], providerInteractions: [{ id: 'wrong-thread', provider_thread_id: 'other' }] })
+  const conflicting = harness({ polledMessages: [rawMessage('a1')], providerInteractions: [knownProviderInteraction('wrong-thread', rawMessage('a1'), { provider_thread_id: 'other' })] })
   await assert.rejects(conflicting.ingestion.reconcileGmailMessages(recoverySelection()), /conflicting|thread|ambiguous/i)
   assert.equal(crmWriteQueries(conflicting).length, 0)
 })
 
-await check('recovery preview and apply preserve all explicit multi-reference groups', async () => {
+await check('ordinary recovery cannot bypass held multi-reference grouping or partially stage it', async () => {
   const raw = rawMessage('a1', { body: `%gslt${adrian.referenceCode} %gslt${secondContact.referenceCode}` })
   const h = harness({ records: [adrian, secondContact], polledMessages: [raw] })
-  const preview = await h.ingestion.reconcileGmailMessages(recoverySelection())
-  assert.equal(preview.messages[0].alreadyLinked, false)
-  const first = await h.ingestion.reconcileGmailMessages(recoverySelection({ apply: true, expectedDigest: preview.digest }))
-  assert.equal(first.interactions, 2)
-  const refreshed = await h.ingestion.reconcileGmailMessages(recoverySelection())
-  assert.equal(refreshed.messages[0].alreadyLinked, true)
-  const replay = await h.ingestion.reconcileGmailMessages(recoverySelection({ apply: true, expectedDigest: refreshed.digest }))
-  assert.equal(replay.interactions, 0)
-  assert.equal(replay.links, 0)
-  assert.equal(h.staged.length, 2)
+  await assert.rejects(h.ingestion.reconcileGmailMessages(recoverySelection()), /Multiple CRM message groups require explicit association review/)
+  assert.equal(h.staged.length + h.messages.size + h.links.size, 0)
 })
 
 async function reviewedFixture(options = {}) {
@@ -859,12 +933,18 @@ async function reviewedFixture(options = {}) {
   ]
   const activePipelines = ownedPipelines.map(pipeline => ({ ...pipeline }))
   const selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }]
-  const raw = rawMessage('a1', { from: customer.email, to: ownerEmail, cc: partner.email })
+  const raw = rawMessage('a1', { from: customer.email, to: ownerEmail, cc: partner.email, ...options.rawOptions })
   raw.threadId = 'b1'
   const polledMessages = [raw]
   const h = harness({ ...options, records, organizations, activePipelines, selectedMailboxes, polledMessages })
-  const held = await h.ingestion.processMessage(h.input(raw))
-  assert.equal(held.unmatched, true, 'Unreviewed mixed-company intake must remain held')
+  if (options.captureOnly) {
+    await h.ingestion.storeInboundMessage({ ownerEmail, pipelineId: primaryPipeline, message: h.ingestion.parseGmailMessage(raw),
+      mailboxIdentity, connectionId: 'fixture-connection', observedAccountEmail: mailboxEmail,
+      messageEvidence: emailIdentity.normalizeGmailMessageEvidence(h.ingestion.parseGmailMessage(raw)) })
+  } else {
+    const held = await h.ingestion.processMessage(h.input(raw))
+    assert.equal(held.unmatched, true, 'Unreviewed mixed-company intake must remain held')
+  }
   assert.equal(h.staged.length, 0)
   assert.equal(h.links.size, 0)
   assert.equal(h.messages.get('a1').pipeline_id, primaryPipeline, 'A held owner cache may precede review in another owned pipeline')
@@ -897,7 +977,9 @@ await check('reviewed cross-company preview keeps one exact group and leaves hel
   assert.equal(batch.messages.length, 1)
   const message = batch.messages[0]
   assert.deepEqual(Object.keys(message).sort(), ['ownerEmail', 'pipelineId', 'connectionId', 'providerMessageId',
-    'providerThreadId', 'participantEmails', 'primaryOrganization', 'contactTargets', 'interaction'].sort())
+    'providerThreadId', 'participantEmails', 'primaryOrganization', 'contactTargets', 'interaction', 'mailboxIdentity', 'messageEvidence', 'decisionKind'].sort())
+  assert.deepEqual(message.mailboxIdentity, mailboxIdentity)
+  assert.equal(message.messageEvidence.bodyText, 'A synthetic customer discussion.')
   assert.equal(message.ownerEmail, ownerEmail)
   assert.equal(message.pipelineId, businessPipeline)
   assert.equal(message.connectionId, 'fixture-connection')
@@ -910,15 +992,14 @@ await check('reviewed cross-company preview keeps one exact group and leaves hel
   assert.equal(message.interaction.fields.organizationId, customerOrganization)
   assert.deepEqual(message.interaction.fields.contactIds, [customer.id, partner.id])
   assert.equal(message.interaction.fields.description, 'A synthetic customer discussion.')
-  assert.match(message.interaction.sourceKey, /^gmail:inbound:[a-f0-9]{64}$/)
-  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+  assert.match(message.interaction.sourceKey, /^gmail:message:[a-f0-9]{64}$/)
+  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/profile', '/google-mail/gmail/v1/users/me/messages/a1?format=full'])
 })
 
 await check('reviewed cross-company apply stages one email and repeats idempotently with the same receipt-stable digest', async () => {
-  const { h, raw, customer, partner, selection } = await reviewedFixture()
-  raw.labelIds = ['SENT']
-  raw.payload.headers.find(entry => entry.name === 'From').value = ownAlias
-  raw.payload.headers.find(entry => entry.name === 'To').value = `${customer.email}, ${ownerEmail}`
+  const { h, customer, partner, selection } = await reviewedFixture({ rawOptions: {
+    labels: ['SENT'], from: ownAlias, to: `${adrian.email}, ${ownerEmail}`,
+  } })
   const preview = await h.ingestion.reconcileGmailMessages(selection())
   const apply = selection({ apply: true, expectedDigest: preview.digest })
   const first = await h.ingestion.reconcileGmailMessages(apply)
@@ -943,8 +1024,7 @@ await check('reviewed cross-company apply stages one email and repeats idempoten
   assert.equal(h.reviewedStages.length, 1)
   assert.equal(h.reviewedInteractions.size, 1)
   assert.equal(h.messages.size, 1)
-  assert.equal(h.audits.length, 2)
-  assert.equal(h.audits[0].eventKey, h.audits[1].eventKey)
+  assert.equal(h.audits.length, 1, 'Unchanged replay must not create another audited decision')
   assert.deepEqual(h.audits[0].payload.reviewedAssociations, plain(selection().reviewedAssociations))
   assert.equal(h.audits[0].payload.providerWrites, 0)
   assert.equal(h.queries.some(({ sql }) => sql.includes('INSERT INTO crm_integration_cursors')
@@ -979,13 +1059,10 @@ await check('reviewed Contact selection needs actual top-level participants, nev
 
 await check('reviewed recovery accepts actual From, To, Cc and Bcc participants without widening the selected Contact set', async () => {
   for (const field of ['From', 'To', 'Cc', 'Bcc']) {
-    const fixture = await reviewedFixture()
-    fixture.raw.payload.headers = [header('From', fixture.customer.email), header('To', ownerEmail), header('Subject', 'Exact reviewed participants')]
-    if (field === 'From') {
-      fixture.raw.payload.headers[0].value = fixture.partner.email
-      fixture.raw.payload.headers[1].value = `${fixture.customer.email}, ${ownerEmail}`
-    } else if (field === 'To') fixture.raw.payload.headers[1].value = `${fixture.partner.email}, ${ownerEmail}`
-    else fixture.raw.payload.headers.push(header(field, fixture.partner.email))
+    const fixture = await reviewedFixture({ rawOptions: field === 'From'
+      ? { from: 'partner@example.test', to: `${adrian.email}, ${ownerEmail}`, cc: '' }
+      : field === 'To' ? { to: `partner@example.test, ${ownerEmail}`, cc: '' }
+        : field === 'Bcc' ? { cc: '', bcc: 'partner@example.test' } : {} })
     const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
     assert.deepEqual(plain(preview.messages[0].contactReferences), fixture.association.contactReferences, field)
     assert.equal(fixture.h.reviewedBatches[0].messages.length, 1)
@@ -1012,8 +1089,7 @@ await check('review cannot override duplicate email, unknown, foreign-pipeline, 
 })
 
 await check('reviewed association may reinforce selected references but refuses a conflicting explicit marker', async () => {
-  const fixture = await reviewedFixture()
-  fixture.raw.payload.body.data = Buffer.from(`Selected %gslt${fixture.customer.referenceCode} %gsltga2345678`).toString('base64url')
+  const fixture = await reviewedFixture({ captureOnly: true, rawOptions: { body: `Selected %gslt${adrian.referenceCode} %gsltga2345678` } })
   assert.equal((await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())).applied, false)
   fixture.raw.payload.body.data = Buffer.from('Conflicting %gsltgc9999999').toString('base64url')
   await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /Explicit message references conflict/)
@@ -1029,7 +1105,7 @@ await check('reviewed recovery requires an existing owner cache and never fetche
     await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /existing owned cached Gmail message/)
     assert.equal(fixture.h.reviewedBatches.length, 0, change)
     assert.equal(crmWriteQueries(fixture.h).length, 0, change)
-    assert.deepEqual(fixture.h.providerCalls, ['/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+    assert.deepEqual(fixture.h.providerCalls, ['/google-mail/gmail/v1/users/me/profile', '/google-mail/gmail/v1/users/me/messages/a1?format=full'])
   }
 })
 
@@ -1062,7 +1138,7 @@ await check('reviewed apply rechecks raw content, Contact email/account, members
     if (change === 'connection') fixture.selectedMailboxes[0].connection_id = 'changed-connection'
     if (change === 'mailbox-account') fixture.selectedMailboxes[0].account_email = 'renamed@example.test'
     await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ apply: true, expectedDigest: preview.digest })),
-      /changed after preview|unambiguous current participants|unavailable|not active/, change)
+      /changed after preview|unambiguous current participants|unavailable|not active|Retained Gmail content|does not match the selected account/, change)
     assert.equal(fixture.h.reviewedBatches.some(batch => batch.apply), false, change)
     assert.equal(fixture.h.reviewedStages.length, 0, change)
     assert.equal(fixture.h.audits.length, 0, change)
@@ -1124,6 +1200,164 @@ await check('reviewed apply uses one CAS batch and safely reports helper rejecti
   assert.equal(fixture.h.links.size, 0)
   assert.equal(fixture.h.audits.length, 0)
   assert.equal(crmWriteQueries(fixture.h).length, 0)
+})
+
+await check('unknown mailbox and cross-mailbox legacy-key collisions are cached but never routed', async () => {
+  for (const options of [{ verifiedIdentity: null }, { intakeIdentityStatus: 'unknown' }]) {
+    const h = harness(options)
+    const result = await h.ingestion.processMessage(h.input(rawMessage('a1')))
+    assert.equal(result.unmatched, true)
+    assert.equal(result.interactions, 0)
+    assert.equal(h.messages.size, 1)
+    assert.equal(h.staged.length + h.enrichments.length + h.links.size, 0)
+  }
+})
+
+await check('current verified provider identity, not connection/ref placement, determines ordinary source key', async () => {
+  const h = harness()
+  await h.ingestion.processMessage(h.input(rawMessage('a1')))
+  assert.equal(h.staged[0].sourceKey, emailIdentity.gmailMessageSourceKey(mailboxIdentity, 'a1'))
+  assert.equal(h.staged[0].fields.metadata.canonicalSourceId, 'source-a1')
+  assert.equal(h.staged[0].sourcePayload.canonicalSourceId, 'source-a1')
+})
+
+await check('recovery cannot infer legacy mailbox provenance or route an arbitrary old unknown cache', async () => {
+  const fixture = await reviewedFixture()
+  fixture.h.messages.get('a1').mailbox_id = null
+  await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /three-message scope/)
+  assert.equal(fixture.h.reviewedBatches.length, 0)
+  assert.equal(fixture.h.reviewedStages.length, 0)
+})
+
+await check('review rejects every retained cache content difference before its atomic preview helper', async () => {
+  for (const field of ['subject', 'body_text', 'snippet', 'received_at', 'sender_email', 'recipient_emails', 'marker_references', 'raw_metadata']) {
+    const fixture = await reviewedFixture()
+    const row = fixture.h.messages.get('a1')
+    row[field] = field === 'recipient_emails' ? [ownerEmail] : field === 'marker_references' ? ['gc9999999']
+      : field === 'raw_metadata' ? { ...row.raw_metadata, emailAddressHeaders: { ...row.raw_metadata.emailAddressHeaders, cc: [] } }
+        : field === 'received_at' ? '2026-09-17T12:00:00.001Z' : field === 'sender_email' ? 'other@example.test' : 'changed'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /Retained Gmail content/)
+    assert.equal(fixture.h.reviewedBatches.length + fixture.h.reviewedStages.length, 0, field)
+  }
+})
+
+await check('full canonical body comparison cannot adopt a retained routing-truncated prefix', async () => {
+  const fixture = await reviewedFixture({ captureOnly: true, rawOptions: { body: 'Retained prefix %xx hidden remainder' } })
+  await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /Retained Gmail content/)
+  assert.equal(fixture.h.reviewedBatches.length, 0)
+})
+
+await check('recovery requires independently verified mailbox binding before exact message fetch', async () => {
+  const h = harness({ verifiedIdentity: null, polledMessages: [rawMessage('a1')] })
+  await assert.rejects(h.ingestion.reconcileGmailMessages(recoverySelection()), /independently verified mailbox identity/)
+  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/profile'])
+  assert.equal(h.messages.size + h.staged.length, 0)
+})
+
+await check('late-contact selection is finite, exact-email, reviewed and atomic without cursor writes', async () => {
+  const fixture = await reviewedFixture()
+  const selection = { ...fixture.selection(), participantEmail: fixture.partner.email }
+  const preview = await fixture.h.ingestion.reconcileLateContactGmailMessages(selection)
+  assert.equal(preview.applied, false)
+  assert.equal(fixture.h.reviewedBatches[0].messages[0].lateContactEmail, fixture.partner.email)
+  assert.equal(fixture.h.reviewedBatches[0].messages[0].decisionKind, 'late-contact')
+  await fixture.h.ingestion.reconcileLateContactGmailMessages({ ...selection, apply: true, expectedDigest: preview.digest })
+  assert.equal(fixture.h.reviewedBatches.filter(batch => batch.apply).length, 1)
+  assert.equal(crmWriteQueries(fixture.h).length, 0, 'All decision/cache/audit writes belong inside the atomic helper')
+  for (const participantEmail of ['quoted@example.test', 'not-an-email']) await assert.rejects(
+    fixture.h.ingestion.reconcileLateContactGmailMessages({ ...selection, participantEmail }))
+})
+
+await check('correction requires reason and a distinct reviewed digest, never a generic recovery toggle', async () => {
+  const fixture = await reviewedFixture()
+  for (const correctionReason of [undefined, '', ' ', 'x'.repeat(501)]) await assert.rejects(
+    fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ decisionKind: 'correction', correctionReason })), /correction reason/)
+  const normal = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
+  const correction = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ decisionKind: 'correction', correctionReason: 'Correct selected company associations' }))
+  assert.notEqual(normal.digest, correction.digest)
+  const last = fixture.h.reviewedBatches.at(-1).messages[0]
+  assert.equal(last.decisionKind, 'correction')
+  assert.equal(last.correctionReason, 'Correct selected company associations')
+  await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({
+    decisionKind: 'correction', correctionReason: 'Correct selected company associations', apply: true, expectedDigest: normal.digest,
+  })), /changed after preview/)
+})
+
+await check('ordinary reuse requires the original canonical mailbox namespace and exact message/thread', async () => {
+  for (const changed of [{ canonical_source_id: null }, { source_mailbox_id: 'different-mailbox' },
+    { source_provider_account_id: 'different-google-subject' }, { source_provider: 'other-provider' },
+    { source_owner_email: 'other@example.test' }, { mailbox_owner_email: 'other@example.test' },
+    { source_message_id: 'another-message' }, { source_thread_id: 'another-thread' }, { provider_thread_id: null }]) {
+    const h = harness({ providerInteractions: [knownProviderInteraction('untrusted-identity', rawMessage(), changed)] })
+    await assert.rejects(h.ingestion.processMessage(h.input()), /canonical mailbox provenance|conflicting CRM thread/)
+    assert.equal(h.messages.size, 1)
+    assert.equal(h.links.size + h.staged.length + h.enrichments.length, 0)
+  }
+})
+
+await check('known-source enrichment rechecks canonical actual headers rather than trusting later matching evidence', async () => {
+  const h = harness({ records: [adrian, secondContact], providerInteractions: [knownProviderInteraction('known-original')] })
+  await assert.rejects(h.ingestion.processMessage(h.input(rawMessage('synthetic-message', { cc: secondContact.email }))), /conflicting CRM participant evidence/)
+  assert.equal(h.messages.size, 1)
+  assert.equal(h.links.size + h.staged.length + h.enrichments.length, 0)
+})
+
+await check('delivered-message capture reads only the original verified mailbox and exact returned message', async () => {
+  const h = harness({ polledMessages: [rawMessage('a1', { from: ownAlias, labels: ['SENT'] })] })
+  const result = await h.ingestion.captureDeliveredGmailMessage({ ownerEmail, connectionId: 'fixture-connection',
+    mailboxIdentity, accountEmail: mailboxEmail, pipelineId: businessPipeline, messageId: 'a1', threadId: 'thread-a1' })
+  assert.deepEqual(plain(result), { canonicalSourceId: 'source-a1', inboundMessageId: 'inbound-a1' })
+  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/profile', '/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+  assert.equal(h.staged.length + h.links.size, 0, 'Capture records source only, never routes or resends')
+  assert.equal(h.messages.get('a1').pipeline_id, businessPipeline)
+})
+
+await check('delivered capture never substitutes a reselected connection or changed original account proof', async () => {
+  for (const change of ['reselection', 'subject', 'mailbox', 'verification', 'snapshot-connection', 'thread', 'not-sent', 'cache-collision']) {
+    const selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail,
+      connection_id: change === 'reselection' ? 'new-connection' : 'fixture-connection' }]
+    const h = harness({ selectedMailboxes, polledMessages: [rawMessage('a1', { labels: change === 'not-sent' ? ['INBOX'] : ['SENT'] })],
+      intakeIdentityStatus: change === 'cache-collision' ? 'unknown' : 'verified' })
+    const snapshot = { ...mailboxIdentity,
+      ...(change === 'subject' ? { providerAccountId: 'different' } : {}),
+      ...(change === 'mailbox' ? { mailboxId: 'different' } : {}),
+      ...(change === 'verification' ? { verifiedAt: '2026-08-01T00:00:00.000Z' } : {}),
+      ...(change === 'snapshot-connection' ? { verifiedConnectionId: 'different' } : {}) }
+    await assert.rejects(h.ingestion.captureDeliveredGmailMessage({ ownerEmail, connectionId: 'fixture-connection',
+      mailboxIdentity: snapshot, accountEmail: mailboxEmail, pipelineId: businessPipeline,
+      messageId: 'a1', threadId: change === 'thread' ? 'different' : 'thread-a1' }))
+    assert.equal(h.staged.length + h.links.size, 0, change)
+    assert.ok(h.providerCalls.every(path => !path.endsWith('/messages') && !path.includes('/send')), change)
+    if (['reselection', 'subject', 'mailbox', 'verification', 'snapshot-connection'].includes(change)) {
+      assert.ok(h.providerCalls.every(path => !path.includes('/messages/')), 'Stale original provenance fails before reading message content')
+    }
+  }
+})
+
+await check('outbound capture uses only a truthful owner intake, never an unrelated CRM target or default tie-breaker', async () => {
+  const selection = { ownerEmail, connectionId: 'fixture-connection', mailboxIdentity, accountEmail: mailboxEmail,
+    pipelineId: unrelatedPipeline, messageId: 'a1', threadId: 'thread-a1' }
+  const raw = rawMessage('a1', { labels: ['SENT'] })
+  const knownDefault = harness({ activePipelines: [{ id: primaryPipeline, is_default: true }], polledMessages: [raw] })
+  await knownDefault.ingestion.captureDeliveredGmailMessage(selection)
+  assert.equal(knownDefault.messages.get('a1').pipeline_id, primaryPipeline,
+    'Authorized shared CRM placement is not the original mailbox owner intake')
+  for (const activePipelines of [[], ownedPipelines]) {
+    const held = harness({ activePipelines, polledMessages: [raw] })
+    await assert.rejects(held.ingestion.captureDeliveredGmailMessage(selection), /unambiguous original mailbox-owner intake pipeline/)
+    assert.equal(held.messages.size + held.staged.length, 0)
+    assert.deepEqual(held.providerCalls, ['/google-mail/gmail/v1/users/me/profile'], 'No message read after missing/ambiguous source placement')
+  }
+})
+
+await check('later matching changes cannot clone one known canonical email into another pipeline', async () => {
+  const original = knownProviderInteraction('original-placement', rawMessage(), { pipeline_id: primaryPipeline })
+  const before = plain(original)
+  const h = harness({ providerInteractions: [original] })
+  await assert.rejects(h.ingestion.processMessage(h.input()), /another CRM placement/)
+  assert.equal(h.messages.size, 1, 'Current provider acquisition is retained independently of the held CRM match')
+  assert.equal(h.links.size + h.staged.length + h.enrichments.length, 0)
+  assert.deepEqual(plain(original), before)
 })
 
 console.log(`CRM email routing passed: ${passed} focused checks; no live provider or database operations`)

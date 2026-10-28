@@ -6,6 +6,10 @@ import {
   type SuiteCrmNativeProductImageResult,
 } from '@/lib/crm/suiteCrmNativeProductImageClient'
 import { appPublicUrl } from '@/lib/publicUrl'
+import {
+  projectSuiteCrmNativeEmail,
+  type SuiteCrmEmailProjectionReadback,
+} from '@/lib/crm/suiteCrmNativeEmailProjection'
 
 type SuiteCrmRecordModule =
   | 'Accounts'
@@ -127,7 +131,8 @@ function responseErrorDetail(parsed: unknown) {
     .slice(0, 500)
 }
 
-async function accessToken(fetchImpl: typeof fetch) {
+async function accessToken(fetchImpl: typeof fetch, signal?: AbortSignal) {
+  signal?.throwIfAborted()
   if (cachedToken && cachedToken.expiresAt > Date.now() + 30_000) return cachedToken.value
   const response = await fetchImpl(`${suiteCrmBaseUrl()}/Api/access_token`, {
     method: 'POST',
@@ -139,7 +144,7 @@ async function accessToken(fetchImpl: typeof fetch) {
     }),
     cache: 'no-store',
     redirect: 'error',
-    signal: AbortSignal.timeout(15_000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
   })
   const parsed = await readJson(response) as SuiteCrmToken
   const token = String(parsed.access_token || '').trim()
@@ -158,7 +163,8 @@ async function request(
   fetchImpl: typeof fetch,
   allowNotFound = false,
 ) {
-  const token = await accessToken(fetchImpl)
+  const token = await accessToken(fetchImpl, init.signal || undefined)
+  init.signal?.throwIfAborted()
   const response = await fetchImpl(`${suiteCrmBaseUrl()}${pathname}`, {
     ...init,
     headers: {
@@ -169,7 +175,7 @@ async function request(
     },
     cache: 'no-store',
     redirect: 'error',
-    signal: AbortSignal.timeout(20_000),
+    signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000),
   })
   // SuiteCRM V8 reports a valid module/id lookup with no matching bean as 400.
   // This compatibility path is used only by the deterministic upsert preflight.
@@ -410,6 +416,7 @@ export type SuiteCrmUpsertResult = {
   suiteCrmId: string
   productImageProjection: SuiteCrmNativeProductImageResult | null
   meetingProjection?: SuiteCrmMeetingProjectionReadback
+  emailProjection?: SuiteCrmEmailProjectionReadback
 }
 
 export type SuiteCrmMeetingProjectionAttributes = {
@@ -489,6 +496,11 @@ export async function upsertSuiteCrmRecordWithResult(
   fetchImpl: typeof fetch = fetch,
 ): Promise<SuiteCrmUpsertResult> {
   const moduleName = suiteCrmRecordModule(record)
+  if (moduleName === 'Emails') {
+    const emailProjection = await projectSuiteCrmNativeEmail(record,
+      (path, init, allowNotFound) => request(path, init, fetchImpl, allowNotFound))
+    return { suiteCrmId: emailProjection.suiteCrmId, productImageProjection: null, emailProjection }
+  }
   const existing = await request(
     `/Api/V8/module/${moduleName}/${encodeURIComponent(record.suiteCrmId)}`,
     { method: 'GET' },

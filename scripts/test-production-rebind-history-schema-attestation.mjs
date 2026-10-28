@@ -45,14 +45,19 @@ const PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: 'a1af2c30e5b28aec8e60d1689330b72c2fdff5666c7da382f5cfa9fbc4869615',
   18: '73040be0231764cb9fbcfd8d9d5fd7eadab2c9debd428b3317150b5a844ba741',
 })
-// Frozen v8 catalogs, before the sole 0374 dependency on a rebind-critical
-// relation: the new created_by FK's action-trigger pair on public.app_users.
+// Frozen v8 catalogs, before the exact four 0374 dependencies on a
+// rebind-critical relation: their action-trigger pairs on public.app_users.
 const PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: '546722dd51520ea8eae9cf543ddffddf79812e7f8693f66a8be96267e4ad3434',
   18: '2f088bed586b24e1b665277f7dee44e4333e4fb97a8e75a19aabe1d8213432fb',
 })
 const REVIEWED_COMPANY_MIGRATION = '0374_crm_interaction_organizations.sql'
-const REVIEWED_COMPANY_REFERENCE_CONSTRAINT = 'crm_interaction_organizations_created_by_fkey'
+const REVIEWED_EMAIL_REFERENCE_CONSTRAINTS = new Map([
+  ['crm_interaction_organizations_created_by_fkey', { relation: 'public.crm_interaction_organizations', column: 'created_by', deleteAction: 'n' }],
+  ['crm_email_mailboxes_owner_email_fkey', { relation: 'public.crm_email_mailboxes', column: 'owner_email', deleteAction: 'a' }],
+  ['crm_email_sources_owner_email_fkey', { relation: 'public.crm_email_sources', column: 'owner_email', deleteAction: 'a' }],
+  ['crm_email_review_decisions_actor_email_fkey', { relation: 'public.crm_email_review_decisions', column: 'actor_email', deleteAction: 'a' }],
+])
 const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_gateway_credentials_actor_email_fkey', 'public.app_users'],
   ['fractional_crm_verified_identifiers_accepted_by_fkey', 'public.app_users'],
@@ -70,7 +75,7 @@ const CALENDAR_REFERENCE_CONSTRAINTS = new Map([
 const NEW_REFERENCE_CONSTRAINTS = new Map([
   ...GATEWAY_REFERENCE_CONSTRAINTS,
   ...CALENDAR_REFERENCE_CONSTRAINTS,
-  [REVIEWED_COMPANY_REFERENCE_CONSTRAINT, 'public.app_users'],
+  ...[...REVIEWED_EMAIL_REFERENCE_CONSTRAINTS.keys()].map(name => [name, 'public.app_users']),
   ['app_user_login_addresses_user_email_fkey', 'public.app_users'],
   ['app_login_email_changes_user_email_fkey', 'public.app_users'],
   ['app_user_google_login_bindings_user_email_fkey', 'public.app_users'],
@@ -202,7 +207,9 @@ async function expectLedgerFailure(pool, filename, missing = false) {
   await attestProductionRebindHistorySchema(pool)
 }
 
-async function verifyReviewedCompanyReferenceTriggers(pool, catalog) {
+async function verifyReviewedEmailReferenceTriggers(pool, catalog) {
+  const verified = []
+  for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
   const result = await pool.query(
     `SELECT constraint_row.conname AS name, constraint_row.contype::text AS type,
        source_namespace.nspname || '.' || source_relation.relname AS source_relation,
@@ -228,21 +235,21 @@ async function verifyReviewedCompanyReferenceTriggers(pool, catalog) {
      JOIN pg_catalog.pg_namespace source_namespace ON source_namespace.oid = source_relation.relnamespace
      JOIN pg_catalog.pg_class target_relation ON target_relation.oid = constraint_row.confrelid
      JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.oid = target_relation.relnamespace
-     WHERE constraint_row.conrelid = 'public.crm_interaction_organizations'::regclass
+     WHERE constraint_row.conrelid = $2::regclass
        AND constraint_row.conname = $1`,
-    [REVIEWED_COMPANY_REFERENCE_CONSTRAINT],
+    [constraint, expected.relation],
   )
-  assert.equal(result.rowCount, 1, '0374 has exactly the reviewed created_by FK descriptor')
+  assert.equal(result.rowCount, 1, `0374 has exactly the reviewed ${constraint} descriptor`)
   assert.deepEqual(result.rows[0], {
-    name: REVIEWED_COMPANY_REFERENCE_CONSTRAINT, type: 'f',
-    source_relation: 'public.crm_interaction_organizations', source_columns: ['created_by'],
+    name: constraint, type: 'f',
+    source_relation: expected.relation, source_columns: [expected.column],
     target_relation: 'public.app_users', target_columns: ['email'],
     validated: true, deferrable: false, deferred: false,
-    update_action: 'a', delete_action: 'n', match_type: 's', default_delete_columns: true, enforced: true,
+    update_action: 'a', delete_action: expected.deleteAction, match_type: 's', default_delete_columns: true, enforced: true,
     no_parent: true, local: true, inheritance_count: 0,
   }, '0374 FK identity, columns, validation, action and deferral semantics are exact')
-  const triggers = catalog.triggers.filter((trigger) => trigger.constraint === REVIEWED_COMPANY_REFERENCE_CONSTRAINT)
-  assert.equal(triggers.length, 2, '0374 adds exactly two action triggers to the critical catalog')
+  const triggers = catalog.triggers.filter((trigger) => trigger.constraint === constraint)
+  assert.equal(triggers.length, 2, `0374 adds exactly two action triggers for ${constraint}`)
   assert.equal(new Set(triggers.map((trigger) => trigger.name)).size, 2)
   for (const trigger of triggers) {
     assert.match(trigger.name, /^RI_ConstraintTrigger_a_[1-9][0-9]*$/u)
@@ -251,14 +258,18 @@ async function verifyReviewedCompanyReferenceTriggers(pool, catalog) {
     assert.deepEqual(semantics, {
       relation: 'public.app_users', enabled: 'O', internal: true,
       typeMask: trigger.typeMask, argumentCount: 0, argumentsHex: '', when: null,
-      function: trigger.typeMask === 9 ? 'pg_catalog."RI_FKey_setnull_del"()' : 'pg_catalog."RI_FKey_noaction_upd"()',
-      constraint: REVIEWED_COMPANY_REFERENCE_CONSTRAINT,
-      constraintRelation: 'public.crm_interaction_organizations',
+      function: trigger.typeMask === 9 ? (expected.deleteAction === 'n'
+        ? 'pg_catalog."RI_FKey_setnull_del"()' : 'pg_catalog."RI_FKey_noaction_del"()') : 'pg_catalog."RI_FKey_noaction_upd"()',
+      constraint,
+      constraintRelation: expected.relation,
       deferrable: false, initiallyDeferred: false, parentTrigger: null, comment: null,
     }, '0374 referenced-table action trigger semantics are exact')
   }
   assert.deepEqual(triggers.map((trigger) => trigger.typeMask).sort((a, b) => a - b), [9, 17])
-  return triggers
+  verified.push(...triggers)
+  }
+  assert.equal(verified.length, 8, 'Only the four individually verified FK pairs may be projected from v9')
+  return verified
 }
 
 async function exerciseImage(image) {
@@ -312,16 +323,16 @@ async function exerciseImage(image) {
     assert.ok(applied.rows.every((row) => row.has_applied_at === true))
 
     const baseline = await inspectProductionRebindHistorySchema(pool)
-    const reviewedCompanyTriggers = await verifyReviewedCompanyReferenceTriggers(pool, baseline.catalog)
+    const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
     // This projection is test evidence only. Runtime attestation always hashes
     // and accepts the complete, unmodified catalog for its enrolled PG major.
     const v8Catalog = {
       ...baseline.catalog,
-      triggers: baseline.catalog.triggers.filter((trigger) => !reviewedCompanyTriggers.includes(trigger)),
+      triggers: baseline.catalog.triggers.filter((trigger) => !reviewedEmailTriggers.includes(trigger)),
     }
     assert.equal(productionRebindHistorySchemaDigest(v8Catalog),
       PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
-      'only the exact verified 0374 FK pair explains the change from attestation v8')
+      'only the exact four verified 0374 FK pairs explain the change from attestation v8')
     for (const [constraint, relation] of NEW_REFERENCE_CONSTRAINTS) {
       const triggers = baseline.catalog.triggers.filter((trigger) => (
         trigger.constraint === constraint && trigger.relation === relation
@@ -346,7 +357,8 @@ async function exerciseImage(image) {
       NEW_REFERENCE_CONSTRAINTS.has(trigger.constraint)
       || trigger.name === 'app_users_guard_login_address'
     ))
-    assert.equal(addedTriggers.length, 39, 'only the nineteen reviewed FK pairs and login guard are new')
+    assert.equal(addedTriggers.length, NEW_REFERENCE_CONSTRAINTS.size * 2 + 1,
+      'only the individually reviewed FK pairs and login guard are new')
     const addedFunctions = baseline.catalog.functions.filter((fn) => (
       fn.schema === 'public' && fn.name === 'guard_clawpilot_login_address'
     ))
@@ -507,29 +519,29 @@ async function exerciseImage(image) {
     }
     await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
 
-    await expectFailure(pool, 'schema_catalog_mismatch', '0374 missing created_by FK',
-      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
-        DROP CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT}`))
-    for (const [label, actions] of [
-      ['DELETE CASCADE', 'ON DELETE CASCADE'],
-      ['UPDATE CASCADE', 'ON UPDATE CASCADE ON DELETE SET NULL'],
-    ]) {
-      await expectFailure(pool, 'schema_catalog_mismatch', `0374 altered FK ${label}`,
-        (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
-          DROP CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT},
-          ADD CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT}
-            FOREIGN KEY (created_by) REFERENCES public.app_users(email) ${actions}`))
+    for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 missing ${constraint}`,
+        (client) => client.query(`ALTER TABLE ${expected.relation} DROP CONSTRAINT ${constraint}`))
+      for (const [label, actions] of [
+        ['DELETE CASCADE', 'ON DELETE CASCADE'],
+        ['UPDATE CASCADE', `ON UPDATE CASCADE ON DELETE ${expected.deleteAction === 'n' ? 'SET NULL' : 'NO ACTION'}`],
+      ]) {
+        await expectFailure(pool, 'schema_catalog_mismatch', `0374 altered ${constraint} ${label}`,
+          (client) => client.query(`ALTER TABLE ${expected.relation}
+            DROP CONSTRAINT ${constraint}, ADD CONSTRAINT ${constraint}
+              FOREIGN KEY (${expected.column}) REFERENCES public.app_users(email) ${actions}`))
+      }
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 deferred ${constraint} without replacing trigger identities`,
+        (client) => client.query(`ALTER TABLE ${expected.relation}
+          ALTER CONSTRAINT ${constraint} DEFERRABLE INITIALLY DEFERRED`))
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 renamed ${constraint}`,
+        (client) => client.query(`ALTER TABLE ${expected.relation}
+          RENAME CONSTRAINT ${constraint} TO unreviewed_email_fkey`))
     }
-    await expectFailure(pool, 'schema_catalog_mismatch', '0374 deferred FK without replacing trigger identities',
-      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
-        ALTER CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT} DEFERRABLE INITIALLY DEFERRED`))
-    for (const trigger of reviewedCompanyTriggers) {
-      await expectFailure(pool, 'schema_catalog_mismatch', `0374 disabled action trigger ${trigger.typeMask}`,
+    for (const trigger of reviewedEmailTriggers) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 disabled ${trigger.constraint} action trigger ${trigger.typeMask}`,
         (client) => client.query(`ALTER TABLE public.app_users DISABLE TRIGGER "${trigger.name}"`))
     }
-    await expectFailure(pool, 'schema_catalog_mismatch', '0374 renamed FK',
-      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
-        RENAME CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT} TO unreviewed_created_by_fkey`))
     await expectFailure(pool, 'schema_catalog_mismatch', 'unreviewed additional referenced-table FK pair',
       (client) => client.query(`CREATE TABLE public.rebind_unreviewed_fk_fixture (
         owner_email text REFERENCES public.app_users(email)

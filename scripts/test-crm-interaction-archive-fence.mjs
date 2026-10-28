@@ -26,10 +26,12 @@ function loadModule(path, mocks = {}) {
 }
 
 const stable = loadModule('app_src/lib/crm/stableId.ts')
+const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
 const plain = (value) => JSON.parse(JSON.stringify(value))
 const pipelineId = '11111111-1111-4111-8111-111111111111'
 const recordId = '22222222-2222-4222-8222-222222222222'
 const actorEmail = 'operator@example.test'
+const sharedWriteContextSql = "SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)"
 const baseRecord = {
   id: recordId, pipeline_id: pipelineId, reference_code: 'giarchivefixture',
   suitecrm_id: 'persisted-suitecrm-id', suitecrm_module: 'Emails',
@@ -47,7 +49,37 @@ function harness(initialRecord = baseRecord) {
     async query(sql, params = []) {
       calls.push({ sql, params: plain(params) })
       const result = (rows) => ({ rows, rowCount: rows.length })
+      if (sql.includes('set_config(')) {
+        assert.equal(sql, sharedWriteContextSql, 'Only the exact transaction-local authorized compatibility context is supported')
+        assert.deepEqual(plain(params), [], 'The compatibility context has no caller-supplied authority parameters')
+        return result([{ set_config: 'on' }])
+      }
       if (sql.includes('FROM app_users app_user')) return result([])
+      if (sql === 'SELECT user_email,access_role FROM pipeline_space_members WHERE pipeline_id=$1::uuid FOR SHARE') {
+        assert.equal(params[0], pipelineId)
+        return result([])
+      }
+      if (sql.includes('owner_user.suitecrm_user_id AS owner_native_id')) {
+        assert.deepEqual(plain(params), [pipelineId])
+        assert.match(sql, /owner_user\.status='active'/)
+        assert.match(sql, /NOT pipeline\.reference_access_disabled/)
+        assert.match(sql, /FOR SHARE OF pipeline,owner_user/)
+        return result([{ workspace_id: pipelineId, owner_native_id: 'native-owner' }])
+      }
+      if (sql.includes('SELECT app_user.suitecrm_user_id')) {
+        assert.deepEqual(plain(params), [pipelineId])
+        assert.match(sql, /workspace_member\.status='active'/)
+        assert.match(sql, /app_user\.email=pipeline\.owner_email OR member\.user_email IS NOT NULL/)
+        return result([{ suitecrm_user_id: 'native-owner' }])
+      }
+      if (sql.includes('SELECT contact.suitecrm_id AS contact_id')) {
+        assert.deepEqual(plain(params), [recordId, pipelineId])
+        return result([])
+      }
+      if (sql.includes("metadata->'suiteCrmEmailProjection' AS receipt")) {
+        assert.deepEqual(plain(params), [recordId, pipelineId])
+        return result([])
+      }
       if (sql.includes('WITH resolved AS')) return result([{}])
       if (sql.includes('FROM crm_contacts') && sql.includes('id = ANY')) return result([])
       if (sql.includes('pg_advisory_xact_lock')) return result([])
@@ -104,6 +136,7 @@ function harness(initialRecord = baseRecord) {
   }
   const crm = loadModule('app_src/lib/persistence/crm.ts', {
     '@/lib/crm/stableId': stable,
+    '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,
     '@/lib/persistence/postgres': { withTransaction: (callback) => callback(client) },
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.test' },
     '@/lib/shortlinks': { shortLinkUrl: (code) => `https://example.test/s/${code}` },
@@ -132,6 +165,10 @@ for (const emitSuiteCrmOutbox of [false, true]) {
     await h.crm.archiveCrmRecordInPostgres({
       pipelineId, entity: 'interactions', id: recordId, actorEmail, emitSuiteCrmOutbox: false,
     })
+    const archiveContext = h.calls.filter(({ sql }) => sql === sharedWriteContextSql)
+    assert.equal(archiveContext.length, 1, 'The real archive transaction explicitly enables its compatible writer context')
+    assert.ok(h.calls.indexOf(archiveContext[0]) < h.calls.findIndex(({ sql }) => sql.includes('FOR UPDATE')),
+      'The archive context is established before the locked mutation')
     const archived = h.record()
     assert.equal(archived.source_payload.archived, true)
     assert.equal(archived.source_payload.archivedBy, actorEmail)
@@ -148,6 +185,8 @@ for (const emitSuiteCrmOutbox of [false, true]) {
     assert.deepEqual(plain(input), originalInput, 'Staging must not alter its caller snapshot')
     assert.equal(h.linksDisabled(), true, 'Staging must not reactivate either archived short link')
     assert.equal(h.audits.length, 0)
+    assert.equal(h.calls.filter(({ sql }) => sql === sharedWriteContextSql).length, 0,
+      'An archived staging no-op cannot enter the active-write compatibility context')
     const retainedReads = h.calls.filter(({ sql }) => sql.includes('FROM crm_interaction_organizations related') && sql.includes('FOR UPDATE'))
     const archiveFenceReads = h.calls.filter(({ sql }) => sql.includes('SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module') && sql.includes('FOR UPDATE'))
     assert.equal(retainedReads.length, 1, 'Association retention reads the same locked original identity')
@@ -196,6 +235,11 @@ for (const initial of [null, baseRecord, { ...baseRecord, source_payload: { arch
     assert.ok(h.calls.some(({ sql }) => sql.includes('INSERT INTO sync_outbox')))
     const lockIndex = h.calls.findIndex(({ sql }) => sql.includes('FOR UPDATE'))
     const writeIndex = h.calls.findIndex(({ sql }) => sql.includes('INSERT INTO crm_interactions'))
+    const activeContexts = h.calls.filter(({ sql }) => sql === sharedWriteContextSql)
+    assert.equal(activeContexts.length, 1, 'Active staging explicitly enters its transaction-local compatible writer context')
+    const contextIndex = h.calls.indexOf(activeContexts[0])
+    assert.ok(contextIndex > lockIndex && contextIndex < writeIndex,
+      'Active staging establishes the context after validation and before the interaction write')
     assert.ok(lockIndex >= 0 && writeIndex > lockIndex)
   }
 }

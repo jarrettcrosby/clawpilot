@@ -222,4 +222,9 @@ The service never upgrades a persisted SuiteCRM application implicitly. A versio
 
 ## Rollback
 
+The proposed shared-email release has a stricter retained-schema compatibility
+floor. See the draft [CRM shared-email rollback certification](crm-compatible-rollback.md)
+before treating an older ClawPilot application as a writable rollback target;
+that draft does not authorize a release or production recovery.
+
 Disable `CRM_ENABLED` or stop CRM writes in ClawPilot, retain the Postgres outbox, and restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.

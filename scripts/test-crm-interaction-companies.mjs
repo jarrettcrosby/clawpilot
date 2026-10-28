@@ -60,6 +60,8 @@ assert.ok(hydratedDate[0].occurredAt.length <= 50, 'Serialized Date fits the CRM
 assert.equal(reader.interactionFromRow({ ...row, occurred_at: 'legacy timestamp string' }).occurredAt,
   'legacy timestamp string', 'Legacy string values remain unchanged')
 assert.equal(reader.interactionFromRow({ ...row, occurred_at: null }).occurredAt, null)
+assert.equal(reader.interactionFromRow({ ...row, canonical_source_id: id(99) }).canonicalEmail, true,
+  'The canonical source column, not editable metadata, protects a one-company Email editor')
 assert.equal(reader.interactionFromRow({ ...row, metadata: { reviewedGmailRecovery: { targetFingerprint: 'synthetic' } } }, [], companies.slice(0, 1)).companyAssociationsReviewed,
   true, 'A filtered or archived secondary company must not unlock reviewed associations')
 assert.equal(interactionCompanyDisplay(hydrated[0]), 'Customer (primary) · Supplier')
@@ -97,9 +99,11 @@ const requireApp = createRequire(new URL('../app_src/package.json', import.meta.
 const ts = requireApp('typescript')
 const { renderToStaticMarkup } = requireApp('react-dom/server')
 const ast = ts.createSourceFile('CrmSection.tsx', component, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+let protectedExpression
 let editorFragment
 let agentCallback, occurredAtExpression, interactionSaveBlock
 function findEditor(node) {
+  if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'sharedEmailAssociations') protectedExpression = node.initializer.getText(ast)
   if (ts.isJsxExpression(node) && node.expression
     && ts.isBinaryExpression(node.expression)
     && node.expression.left.getText(ast) === "editorEntity === 'interactions'"
@@ -140,13 +144,21 @@ const jsx = ts.transpileModule(`${utilities}\nglobalThis.interactionAgentEmail =
 }).outputText
 const mui = requireApp('@mui/material')
 const sharedRecord = hydrated[0]
-const renderFields = (shared) => {
-  const record = shared ? sharedRecord : { ...sharedRecord, organizations: sharedRecord.organizations.slice(0, 1), contacts: sharedRecord.contacts.slice(0, 1) }
+const protectedFor = record => {
+  const context = { editorEntity: 'interactions', editorRecord: record, interactionCompanies: interactionRelatedCompanies(record) }
+  vm.runInNewContext(ts.transpileModule(`${utilities}\nglobalThis.protected = ${protectedExpression};`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText, context)
+  return context.protected
+}
+const renderFields = (shared, canonical = false) => {
+  const record = shared ? sharedRecord : { ...sharedRecord, canonicalEmail: canonical,
+    organizations: sharedRecord.organizations.slice(0, 1), contacts: sharedRecord.contacts.slice(0, 1) }
   const ids = record.contacts.map((contact) => contact.id)
   const context = {
     ...mui, require: requireApp, exports: {}, recordEditable: true, editorRecord: record,
     fields: { subject: row.subject, organizationId: primaryId, contactIds: ids.join(',') },
-    sharedEmailAssociations: shared, interactionCompanies: interactionRelatedCompanies(record),
+    sharedEmailAssociations: protectedFor(record), interactionCompanies: interactionRelatedCompanies(record),
     // The supplier is deliberately not in the paged global Contact list.
     contacts: [sharedRecord.contacts[0]], interactionEditorContacts: interactionParticipantOptions(record, [sharedRecord.contacts[0]]),
     organizations: companies.map((company) => ({ ...company, id: company.id })),
@@ -167,9 +179,15 @@ assert.ok(inputTags.filter((tag) => tag.includes('disabled=""')).length >= 2, 'P
 const singleHtml = renderFields(false)
 assert.ok(!singleHtml.includes('One email, linked to these companies.'))
 assert.ok(!singleHtml.includes('Supplier Person'))
+const canonicalSingle = { ...sharedRecord, canonicalEmail: true,
+  organizations: sharedRecord.organizations.slice(0, 1), contacts: sharedRecord.contacts.slice(0, 1) }
+assert.equal(protectedFor(canonicalSingle), true)
+const canonicalHtml = renderFields(false, true)
+assert.ok(!canonicalHtml.includes('Supplier Person'))
+assert.ok((canonicalHtml.match(/<input\b[^>]*disabled=""[^>]*>/g) || []).length >= 2)
 let dateConversions = 0
 const legacyContext = {
-  sharedEmailAssociations: true, editorEntity: 'interactions',
+  sharedEmailAssociations: protectedFor(canonicalSingle), editorEntity: 'interactions',
   editorRecord: { ...sharedRecord, agentEmail: null, agentName: 'Historical Author', occurredAt: hydratedDate[0].occurredAt },
   fields: { subject: 'Edited subject', agentEmail: '', agentName: 'Historical Author',
     contactIds: `${id(5)},${id(6)}`, occurredAt: '2026-10-27T06:00' },

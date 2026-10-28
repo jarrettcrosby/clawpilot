@@ -1,3 +1,5 @@
+import type { SuiteCrmEmailProjection } from '@/lib/crm/suiteCrmNativeEmailProjection'
+
 export const CRM_ENTITIES = [
   'organizations',
   'contacts',
@@ -257,6 +259,7 @@ export type CrmInteraction = {
   organizationIds?: string[]
   organizations?: CrmInteractionOrganization[]
   companyAssociationsReviewed?: boolean
+  canonicalEmail?: boolean
   contactId: string | null
   contactName: string
   contactIds: string[]
@@ -443,6 +446,7 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmModule?: SuiteCrmInteractionModule
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
+  emailProjection?: SuiteCrmEmailProjection
   currencyCode?: string
   productImage?: {
     referenceCode: string

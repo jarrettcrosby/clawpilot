@@ -202,6 +202,11 @@ function leasedAction(row) {
 }
 
 const commonMocks = {
+  '@/lib/crm/emailIdentity': loadTypeScriptModule('app_src/lib/crm/emailIdentity.ts'),
+  '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => null },
+  '@/lib/crm/emailIngestion': { captureDeliveredGmailMessage: async () => {
+    assert.fail('An unverified original send must never infer or capture canonical mailbox provenance')
+  } },
   '@/lib/globalIds.mjs': {
     GLOBAL_ID_MAX_LENGTH: 64,
     globalIdFragment,

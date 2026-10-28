@@ -57,7 +57,7 @@ export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
   }),
   Object.freeze({
     filename: '0374_crm_interaction_organizations.sql',
-    checksum: '825065628f78d31cefaa2456f21b2b24fe5076580b8e59b04a02b64bfc32df5a',
+    checksum: '09ea3b57ed991fb2c6853f0b6855ad4ca95b8c53e8738e349e76018e0dd0203d',
   }),
 ])
 
@@ -119,8 +119,8 @@ const PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
 // versions. Each supported major is therefore exercised against the complete
 // migration chain and enrolled explicitly. Unknown majors fail closed.
 const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: '899965db18dca3a065d4a7acfddd6bb89085779ef1427bb12d889c5f52d15d89',
-  18: '42521665580c0f3e0cb40408ae141886d9d71826b7ca6a6b0053800dfd1c9a03',
+  16: 'e17b81771769049dbcbb4e0296ab259be229775cbc0b3625fb37153ea9dffc29',
+  18: '495b6c9b15e80039faf1323c4ceb2508e6c3c9e2fa363dacbeafc9a8fb2cdb50',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`

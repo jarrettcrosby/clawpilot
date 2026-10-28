@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
-import { reconcileGmailMessages, SafeEmailIngestionError } from '@/lib/crm/emailIngestion'
+import { reconcileGmailMessages, reconcileLateContactGmailMessages, SafeEmailIngestionError } from '@/lib/crm/emailIngestion'
 import { globalIdPattern } from '@/lib/globalIds.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -137,13 +137,18 @@ export async function POST(req: NextRequest) {
       throw new RecoveryCommandError('Email recovery requires Postgres storage', 503)
     }
     const body = await boundedJson(req)
-    const allowed = ['pipelineId', 'connectionId', 'messageIds', 'apply', 'expectedDigest', 'reviewedAssociations']
+    const allowed = ['pipelineId', 'connectionId', 'messageIds', 'apply', 'expectedDigest', 'reviewedAssociations', 'decisionKind', 'correctionReason', 'participantEmail']
     if (Object.keys(body).some((key) => !allowed.includes(key))
       || typeof body.pipelineId !== 'string' || !PIPELINE_ID.test(body.pipelineId)
       || typeof body.connectionId !== 'string' || !IDENTIFIER.test(body.connectionId)
       || !Array.isArray(body.messageIds) || body.messageIds.length < 1 || body.messageIds.length > 25
       || body.messageIds.some((id) => typeof id !== 'string' || !GMAIL_ID.test(id))
-      || (body.apply !== undefined && typeof body.apply !== 'boolean')) {
+      || (body.apply !== undefined && typeof body.apply !== 'boolean')
+      || (body.decisionKind !== undefined && !['review','correction','late-contact'].includes(String(body.decisionKind)))
+      || (body.correctionReason !== undefined && (typeof body.correctionReason !== 'string' || body.correctionReason.length > 500))
+      || (body.decisionKind === 'correction' && (typeof body.correctionReason !== 'string' || !body.correctionReason.trim()))
+      || (body.decisionKind === 'late-contact' && (typeof body.participantEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.participantEmail)))
+      || (body.participantEmail !== undefined && body.decisionKind !== 'late-contact')) {
       throw new RecoveryCommandError('Provide a pipeline, linked mailbox, and 1–25 unique Gmail message IDs')
     }
     const messageIds = (body.messageIds as string[]).map((id) => id.toLowerCase())
@@ -151,6 +156,9 @@ export async function POST(req: NextRequest) {
       throw new RecoveryCommandError('Gmail message IDs must be unique')
     }
     const reviewedAssociations = parseReviewedAssociations(body.reviewedAssociations, messageIds)
+    if (body.decisionKind === 'late-contact' && !reviewedAssociations) {
+      throw new RecoveryCommandError('Late-contact reconciliation requires reviewed selected-message associations')
+    }
     const apply = body.apply === true
     if ((apply && (typeof body.expectedDigest !== 'string' || !DIGEST.test(body.expectedDigest)))
       || (!apply && Object.hasOwn(body, 'expectedDigest'))) {
@@ -162,12 +170,17 @@ export async function POST(req: NextRequest) {
       || pipeline.workspaceOrganizationId !== actor.organizationId) {
       throw new RecoveryCommandError('Pipeline owner access is required in the active workspace', 403)
     }
-    const recovery = await reconcileGmailMessages({
+    const command = {
       ownerEmail: actor.email, connectionId: body.connectionId, pipelineId: pipeline.id,
       messageIds, apply,
+      decisionKind: body.decisionKind as 'review' | 'correction' | 'late-contact' | undefined,
+      correctionReason: body.correctionReason as string | undefined,
       ...(reviewedAssociations ? { reviewedAssociations } : {}),
       ...(apply ? { expectedDigest: (body.expectedDigest as string).toLowerCase() } : {}),
-    })
+    }
+    const recovery = body.decisionKind === 'late-contact'
+      ? await reconcileLateContactGmailMessages({ ...command, reviewedAssociations: reviewedAssociations!, participantEmail: body.participantEmail as string })
+      : await reconcileGmailMessages(command)
     return json({ ok: true, recovery })
   } catch (error) {
     if (error instanceof RecoveryCommandError) return json({ ok: false, error: error.message }, error.status)

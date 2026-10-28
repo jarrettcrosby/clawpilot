@@ -188,6 +188,7 @@ if [[ -f "$EMAILS_LISTVIEW_METADATA" ]] && ! php -l "$EMAILS_LISTVIEW_METADATA" 
 fi
 
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-global-id.php"
+su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/install-email-audience.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:clear --no-warmup"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:warmup"

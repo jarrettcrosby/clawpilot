@@ -60,6 +60,7 @@ import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
 import CalendarImportSettings from '@/components/crm/CalendarImportSettings'
 import EmailBodyPreview from '@/components/crm/EmailBodyPreview'
+import EmailReviewDialog from '@/components/crm/EmailReviewDialog'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
 import ProductImagePanel from '@/components/crm/ProductImagePanel'
 import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
@@ -1689,7 +1690,7 @@ export default function CrmSection() {
   const interactionCompanies = editorEntity === 'interactions' ? interactionRelatedCompanies(editorRecord) : []
   const sharedEmailAssociations = editorEntity === 'interactions'
     && textValue(editorRecord || {}, 'interactionType') === 'email'
-    && (editorRecord?.companyAssociationsReviewed === true || interactionCompanies.length > 1)
+    && (editorRecord?.canonicalEmail === true || editorRecord?.companyAssociationsReviewed === true || interactionCompanies.length > 1)
   const interactionEditorContacts: RecordValue[] = sharedEmailAssociations
     ? interactionParticipantOptions(editorRecord, contacts) : contacts
   const tableColumns = useMemo(() => columns(entity), [entity])
@@ -2573,6 +2574,8 @@ export default function CrmSection() {
               ) : null}
               {pipeline?.accessRole === 'owner' && (
                 <>
+                  {entity === 'interactions' && <EmailReviewDialog key={pipeline.id} pipelineId={pipeline.id}
+                    contacts={contacts} organizations={organizations} onApplied={() => { void load(entity, query, needsReviewOnly) }} />}
                   {entity === 'meetings' && <CalendarImportSettings key={pipeline.id} pipelineId={pipeline.id} />}
                   <Tooltip title="Import the connected workbook into CRM">
                     <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>

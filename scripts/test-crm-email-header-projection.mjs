@@ -92,7 +92,7 @@ const organizationId = '55555555-5555-4555-8555-555555555555'
 const actorEmail = 'operator@example.test'
 const providerId = 'synthetic-exact-message'
 const threadId = 'synthetic-exact-thread'
-const referenceCode = 'giheaderfixture'
+const referenceCode = 'gi1234567'
 const originalBody = '<div>Original body and PDF link <a href="https://example.test/report.pdf">Report</a></div>'
 const rawMessage = {
   id: providerId, threadId, historyId: '123', internalDate: String(Date.parse('2026-09-04T12:00:00Z')), labelIds: ['INBOX'],
@@ -102,15 +102,20 @@ const rawMessage = {
   },
 }
 const ingestionWrites = []
+const emailIdentity = loadModule('app_src/lib/crm/emailIdentity.ts')
+const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
+const mailboxIdentity = { version: 1, provider: 'gmail', mailboxId: '66666666-6666-4666-8666-666666666666',
+  providerAccountId: 'synthetic-google-subject', accountEmail: actorEmail,
+  verifiedConnectionId: 'synthetic-connection', verifiedAt: '2026-09-01T00:00:00.000Z' }
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': headers,
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
-  '@/lib/persistence/postgres': { query: async (sql, params) => {
-    ingestionWrites.push({ sql, params: plain(params) })
-    assert.match(sql, /INSERT INTO crm_inbound_messages/)
-    assert.match(sql, /ON CONFLICT \(owner_email, external_message_id\) DO NOTHING/)
-    return { rows: [{ id: inboundId, pipeline_id: pipelineId }] }
+  '@/lib/crm/emailIdentity': emailIdentity,
+  '@/lib/crm/emailReconciliation': loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
+  '@/lib/persistence/crmEmailIdentity': { recordGmailMessageIntakeInPostgres: async input => {
+    ingestionWrites.push(plain(input))
+    return { id: inboundId, pipelineId, inserted: true, identityStatus: 'verified' }
   } },
 }, '\nexport { storeInboundMessage }\n')
 const rawBefore = plain(rawMessage)
@@ -118,13 +123,16 @@ const parsed = ingestion.parseGmailMessage(rawMessage)
 assert.deepEqual(plain(parsed.emailAddressHeaders), completeEvidence)
 assert.equal(parsed.bodyText, originalBody, 'Header capture cannot rewrite the original body')
 assert.deepEqual(rawMessage, rawBefore)
-await ingestion.storeInboundMessage({ ownerEmail: actorEmail, pipelineId, message: parsed })
-const retainedMetadata = JSON.parse(ingestionWrites[0].params[11])
+await ingestion.storeInboundMessage({ ownerEmail: actorEmail, pipelineId, message: parsed,
+  mailboxIdentity, connectionId: 'synthetic-connection', observedAccountEmail: actorEmail,
+  messageEvidence: emailIdentity.normalizeGmailMessageEvidence(parsed) })
+const retainedMetadata = ingestionWrites[0].rawMetadata
 assert.deepEqual(retainedMetadata.emailAddressHeaders, completeEvidence)
 assert.equal(retainedMetadata.provider, 'gmail')
-assert.equal(ingestionWrites[0].params[9], originalBody)
-assert.equal(ingestionWrites[0].params[4], parsed.senderEmail, 'Existing matching fields stay unchanged')
-assert.deepEqual(ingestionWrites[0].params[5], plain(parsed.recipientEmails))
+assert.equal(ingestionWrites[0].messageEvidence.bodyText, originalBody)
+assert.equal(ingestionWrites[0].messageEvidence.senderEmail, parsed.senderEmail, 'Existing matching fields stay unchanged')
+assert.deepEqual(ingestionWrites[0].messageEvidence.recipientEmails, plain([...parsed.recipientEmails].sort()))
+assert.equal(ingestionWrites[0].mailboxIdentity.providerAccountId, mailboxIdentity.providerAccountId)
 
 const stable = loadModule('app_src/lib/crm/stableId.ts')
 async function stage({ retained = [{ email_address_headers: completeEvidence }], fieldOverrides = {},
@@ -138,6 +146,12 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
     calls.push({ sql, params: plain(params) })
     const result = rows => ({ rows, rowCount: rows.length })
     if (sql.includes('FROM app_users app_user')) return result([])
+    if (sql.includes('set_config(')) return result([])
+    if (sql === 'SELECT user_email,access_role FROM pipeline_space_members WHERE pipeline_id=$1::uuid FOR SHARE') return result([])
+    if (sql.includes('owner_user.suitecrm_user_id AS owner_native_id')) return result([{ workspace_id: organizationId, owner_native_id: 'native-owner' }])
+    if (sql.includes('SELECT app_user.suitecrm_user_id')) return result([{ suitecrm_user_id: 'native-owner' }])
+    if (sql.includes('SELECT contact.suitecrm_id AS contact_id')) return result([])
+    if (sql.includes("metadata->'suiteCrmEmailProjection' AS receipt")) return result([])
     if (sql.includes('WITH resolved AS')) return result([params[1]
       ? { organization_id: params[1], organization_suitecrm_id: 'native-company' } : {}])
     if (sql.includes('pg_advisory_xact_lock')) return result([])
@@ -186,6 +200,7 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
   const crm = loadModule('app_src/lib/persistence/crm.ts', {
     '@/lib/crm/stableId': stable,
     '@/lib/crm/emailAddressHeaders': headers,
+    '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,
     '@/lib/persistence/postgres': { withTransaction: callback => callback(client) },
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.test' },
     '@/lib/shortlinks': { shortLinkUrl: code => `https://example.test/s/${code}` },
@@ -195,6 +210,7 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
     entity: 'interactions', pipelineId, localId: recordId, sourceKey: `gmail:${providerId}`, actorEmail,
     emitSuiteCrmOutbox: true, sourcePayload: { source: 'gmail-inbound', untouched: true },
     fields: { interactionType: 'email', subject: 'Synthetic exact message', description: originalBody,
+      occurredAt: '2026-09-04T12:00:00.000Z',
       direction: 'inbound', deliveryStatus: 'received', providerMessageId: providerId, providerThreadId: threadId,
       metadata: { source: 'gmail-inbound', inboundMessageId: inboundId }, ...fieldOverrides },
   }
@@ -243,17 +259,61 @@ for (const fieldOverrides of [
 const forged = await stage({ retained: [], fieldOverrides: { metadata: { source: 'gmail-inbound', inboundMessageId: inboundId, emailAddressHeaders: completeEvidence } } })
 assert.equal(Object.hasOwn(forged.payload.attributes, 'from_addr_name'), false, 'Caller metadata cannot manufacture retained provider evidence')
 
-// Exercise the real V8 writer, with synthetic GET/PATCH only. Its attribute
-// transport must preserve native field names and omit every unavailable field;
-// the existing bean loaded by SuiteCRM remains authoritative for omitted fields.
-const suiteCrm = loadModule('app_src/lib/crm/suiteCrmClient.ts')
-for (const record of [staged.payload, forged.payload]) {
+// Exercise the real V8 writer AND exact Email readback/audience helper. Supply a
+// valid explicit transport association fixture; header capture above still must
+// invent no company/contact. Missing projection proof is independently held.
+const suiteCrm = loadModule('app_src/lib/crm/suiteCrmClient.ts', {
+  '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,
+})
+let unexpectedTransportCalls = 0
+await assert.rejects(suiteCrm.upsertSuiteCrmRecordWithResult({ ...staged.payload, emailProjection: undefined }, async () => {
+  unexpectedTransportCalls++; assert.fail('Missing Email projection proof must hold before transport')
+}), /projection held/)
+assert.equal(unexpectedTransportCalls, 0)
+for (const sourceRecord of [staged.payload, forged.payload]) {
+  const audience = { policy: 'pipeline-internal', ownerSuiteCrmId: 'native-owner',
+    allowedSuiteCrmUserIds: ['native-owner'], workspaceId: organizationId, pipelineId, fingerprint: '' }
+  audience.fingerprint = nativeEmail.suiteCrmEmailAudienceFingerprint(audience)
+  const record = { ...sourceRecord, relationships: [
+    { linkFieldName: 'accounts', relatedModuleName: 'Accounts', relatedBeanId: 'native-company' },
+    { linkFieldName: 'contacts', relatedModuleName: 'Contacts', relatedBeanId: 'native-contact' },
+  ], emailProjection: { version: 1, accounts: ['native-company'], contacts: ['native-contact'],
+    contactAccounts: [{ contactId: 'native-contact', accountId: 'native-company' }],
+    previousManaged: { accounts: [], contacts: [] }, audience } }
   let patches = 0
+  let savedAttributes = { global_id_c: referenceCode, bcc_addrs_names: 'existing-private@example.test' }
+  const linked = { accounts: new Set(), contacts: new Set() }
+  const audiencePhases = []
   const fetchMock = async (url, init) => {
     if (url.endsWith('/Api/access_token')) return Response.json({ access_token: 'synthetic-test-token', expires_in: 3600 })
+    const path = new URL(url).pathname
+    if (path.endsWith('/Api/V8/custom/clawpilot-email-audience')) {
+      assert.equal(init.method, 'POST')
+      const body = JSON.parse(init.body)
+      assert.ok(['before', 'after'].includes(body.phase))
+      audiencePhases.push(body.phase)
+      return Response.json({ version: 1, suiteCrmId: recordId, phase: body.phase,
+        complete: true, noImplicitSharing: true, fingerprint: audience.fingerprint,
+        capturedAt: new Date().toISOString(), readerSuiteCrmUserIds: ['native-owner'], administratorSuiteCrmUserIds: [] })
+    }
+    const relationship = path.match(/\/relationships\/(accounts|contacts)$/)?.[1]
+    if (relationship) {
+      if (init.method === 'POST') {
+        const body = JSON.parse(init.body)
+        assert.equal(body.data.type, relationship === 'accounts' ? 'Accounts' : 'Contacts')
+        linked[relationship].add(body.data.id)
+        return Response.json({ data: body.data })
+      }
+      assert.equal(init.method, 'GET')
+      return Response.json({ data: [...linked[relationship]].map(id => ({ id, type: relationship === 'accounts' ? 'Accounts' : 'Contacts' })) })
+    }
     if (init.method === 'GET') {
-      assert.ok(url.endsWith(`/Api/V8/module/Emails/${recordId}`))
-      return Response.json({ data: { id: recordId, attributes: { bcc_addrs_names: 'existing-private@example.test' } } })
+      if (path.endsWith('/Api/V8/module/Emails')) return Response.json({ data: [{ id: recordId, type: 'Emails' }] })
+      if (path.endsWith('/Api/V8/module/Contacts/native-contact')) return Response.json({ data: {
+        id: 'native-contact', type: 'Contacts', attributes: { account_id: 'native-company' },
+      } })
+      assert.ok(path.endsWith(`/Api/V8/module/Emails/${recordId}`))
+      return Response.json({ data: { id: recordId, type: 'Emails', attributes: savedAttributes } })
     }
     assert.equal(init.method, 'PATCH')
     assert.ok(url.endsWith('/Api/V8/module'))
@@ -261,10 +321,16 @@ for (const record of [staged.payload, forged.payload]) {
     assert.equal(body.data.type, 'Emails')
     assert.equal(body.data.id, recordId)
     assert.deepEqual(body.data.attributes, record.attributes)
+    savedAttributes = { ...savedAttributes, ...body.data.attributes }
     patches += 1
-    return Response.json({ data: { id: recordId } })
+    return Response.json({ data: { id: recordId, type: 'Emails', attributes: savedAttributes } })
   }
-  assert.equal((await suiteCrm.upsertSuiteCrmRecordWithResult(record, fetchMock)).suiteCrmId, recordId)
+  const result = await suiteCrm.upsertSuiteCrmRecordWithResult(record, fetchMock)
+  assert.equal(result.suiteCrmId, recordId)
+  assert.deepEqual(plain(result.emailProjection.accounts), ['native-company'])
+  assert.deepEqual(plain(result.emailProjection.contacts), ['native-contact'])
+  assert.deepEqual(audiencePhases, ['before', 'after'])
+  if (!Object.hasOwn(record.attributes, 'bcc_addrs_names')) assert.equal(savedAttributes.bcc_addrs_names, 'existing-private@example.test', 'Unavailable header remains omitted, never blanked or replaced by metadata fallback')
   assert.equal(patches, 1)
 }
 console.log('CRM email header projection passed: exact categories, invalid/CRLF/limit guards, retained scope, legacy omission, body/global-ID preservation, native V8 transport')

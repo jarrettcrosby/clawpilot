@@ -158,6 +158,13 @@ function actionRow(overrides = {}) {
 }
 
 const commonMocks = {
+  '@/lib/crm/emailIdentity': loadTypeScriptModule('app_src/lib/crm/emailIdentity.ts'),
+  '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => {
+    assert.fail('Calendar delivery cannot acquire an email mailbox identity')
+  } },
+  '@/lib/crm/emailIngestion': { captureDeliveredGmailMessage: async () => {
+    assert.fail('Calendar delivery cannot capture or send email')
+  } },
   '@/lib/globalIds.mjs': {
     GLOBAL_ID_MAX_LENGTH: 64,
     globalIdFragment,
