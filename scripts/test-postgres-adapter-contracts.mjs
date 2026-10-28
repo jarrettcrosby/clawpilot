@@ -1064,20 +1064,78 @@ for (const fragment of [
     'database-enforced quarantined pipeline access isolation',
   )
 }
-assert.equal(
-  (crmAdapter.match(/AND NOT pipeline\.reference_access_disabled/g) || []).length,
-  2,
-  'quarantined pipeline CRM reference resolution and bulk-link creation guards',
+function crmFunctionSource(name, nextName) {
+  const declaration = `async function ${name}(`
+  const start = crmAdapter.indexOf(declaration)
+  assert.notEqual(start, -1, `CRM adapter missing ${name}`)
+  const end = crmAdapter.indexOf(`async function ${nextName}(`, start + declaration.length)
+  assert.ok(end > start, `CRM adapter missing ${name} scope terminator ${nextName}`)
+  return crmAdapter.slice(start, end)
+}
+
+// Each entry point must retain its own gate; guards in another recovery path
+// cannot compensate for a missing reference-resolution or link-creation guard.
+for (const [name, nextName] of [
+  ['resolveCrmReferenceRoute', 'readCrmRecordByReference'],
+  ['ensurePipelineCrmReferenceLinks', 'claimSuiteCrmOutboxInPostgres'],
+]) {
+  assert.equal(
+    (crmFunctionSource(name, nextName).match(/AND NOT pipeline\.reference_access_disabled/g) || []).length,
+    1,
+    `${name} must independently exclude quarantined pipelines`,
+  )
+}
+const reviewedGmailPrepare = crmFunctionSource(
+  'prepareReviewedGmailInteractionWithClient', 'applyReviewedGmailInteractionWithClient',
+)
+for (const fragment of [
+  'WHERE pipeline.id = $1::uuid AND pipeline.owner_email = $2 AND NOT pipeline.reference_access_disabled',
+  'FOR SHARE OF pipeline, owner_user, membership, connection',
+  'if (scope.rows.length !== 1) throw refuse()',
+  'WHERE pipeline.owner_email = $1 AND NOT pipeline.reference_access_disabled',
+  'ORDER BY pipeline.id FOR SHARE OF pipeline, membership',
+  'crmParticipantEmailCandidatesSql(), [eligible.rows.map((row) => row.id)',
+]) {
+  assertIncludes(reviewedGmailPrepare, fragment, 'locked reviewed Gmail target and candidate-pipeline quarantine gates')
+}
+const reviewedGmailBatch = crmFunctionSource(
+  'stageReviewedGmailInteractionsInPostgres', 'stageReviewedGmailInteractionInPostgres',
+)
+const reviewedGmailValidation = reviewedGmailBatch.indexOf(
+  'plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }))',
 )
 assert.ok(
-  (crmAdapter.match(/FOR SHARE OF pipeline/g) || []).length >= 2,
-  'CRM short-link creation must serialize with pipeline quarantine',
+  reviewedGmailValidation >= 0
+    && reviewedGmailBatch.indexOf('results.push(await applyReviewedGmailInteractionWithClient(') > reviewedGmailValidation,
+  'reviewed Gmail preview and apply must both prepare all quarantined-pipeline gates before staging',
 )
-assertIncludes(
-  crmAdapter,
-  'if (owner.rows[0].reference_access_disabled) return null',
-  'quarantined pipeline per-record CRM link creation guard',
+const reviewedGmailApply = crmFunctionSource(
+  'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',
 )
+const reviewedGmailPreviewReturn = reviewedGmailApply.indexOf('if (!input.apply || plan.receiptValid) return')
+assert.ok(
+  reviewedGmailPreviewReturn >= 0
+    && reviewedGmailApply.indexOf('await stageCrmRecordWithClient(') > reviewedGmailPreviewReturn,
+  'reviewed Gmail preview must return after validation without staging a record',
+)
+const crmBulkReferenceLinks = crmFunctionSource('ensurePipelineCrmReferenceLinks', 'claimSuiteCrmOutboxInPostgres')
+const crmBulkOwnerStart = crmBulkReferenceLinks.indexOf('), owner AS (')
+const crmBulkOwnerEnd = crmBulkReferenceLinks.indexOf('), links AS (', crmBulkOwnerStart)
+assert.ok(crmBulkOwnerStart >= 0 && crmBulkOwnerEnd > crmBulkOwnerStart, 'CRM bulk-link owner query must exist')
+for (const fragment of ['AND NOT pipeline.reference_access_disabled', 'FOR SHARE OF pipeline']) {
+  assertIncludes(crmBulkReferenceLinks.slice(crmBulkOwnerStart, crmBulkOwnerEnd), fragment,
+    'CRM bulk-link owner query must independently serialize and exclude quarantined pipelines')
+}
+assertIncludes(crmBulkReferenceLinks, 'FROM links CROSS JOIN owner', 'CRM bulk-link inserts must depend on the guarded owner query')
+const crmPerRecordReferenceLink = crmFunctionSource('ensureCrmReferenceShortLink', 'currentCrmContactOwner')
+const crmPerRecordQuarantineReturn = crmPerRecordReferenceLink.indexOf('if (owner.rows[0].reference_access_disabled) return null')
+const crmPerRecordOwnerReadEnd = crmPerRecordReferenceLink.indexOf('if (!owner.rows[0])')
+assert.ok(crmPerRecordOwnerReadEnd > 0, 'CRM per-record link owner query must exist')
+assertIncludes(crmPerRecordReferenceLink.slice(0, crmPerRecordOwnerReadEnd), 'FOR SHARE OF pipeline',
+  'CRM per-record link owner query must independently serialize with quarantine')
+assert.ok(crmPerRecordQuarantineReturn > crmPerRecordOwnerReadEnd
+  && crmPerRecordReferenceLink.indexOf('INSERT INTO short_links') > crmPerRecordQuarantineReturn,
+'CRM per-record link quarantine must return before inserting or reactivating links')
 
 const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
 assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')

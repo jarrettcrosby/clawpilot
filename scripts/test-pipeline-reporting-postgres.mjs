@@ -117,6 +117,8 @@ function loadCrmPersistence(pool) {
 
 async function installReportingSchema(pool) {
   await pool.query(`
+    CREATE TABLE app_users (email text PRIMARY KEY);
+
     CREATE TABLE pipeline_spaces (
       id uuid PRIMARY KEY,
       workspace_organization_id uuid NOT NULL
@@ -127,6 +129,7 @@ async function installReportingSchema(pool) {
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
       parent_organization_id uuid,
       name text,
+      reference_code text,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced'
     );
@@ -198,6 +201,7 @@ async function installReportingSchema(pool) {
       occurred_at timestamptz,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced',
+      created_by text REFERENCES app_users(email),
       created_at timestamptz NOT NULL
     );
 
@@ -217,6 +221,9 @@ async function installReportingSchema(pool) {
       sort_order integer NOT NULL DEFAULT 0
     );
   `)
+  // Use the actual related-company schema, including composite pipeline FKs
+  // and the unique primary-company constraint, rather than a permissive copy.
+  await pool.query(readFileSync(resolve(root, 'db/migrations/0374_crm_interaction_organizations.sql'), 'utf8'))
 }
 
 async function insertTimedRows(pool, table, pipelineId, timestamps) {
@@ -568,10 +575,10 @@ async function acceptance(databaseUrl) {
     const projectedLeadInteractionId = '40000000-0000-4000-8000-000000000003'
     const projectedMeetingInteractionId = '40000000-0000-4000-8000-000000000004'
     await pool.query(
-      `INSERT INTO crm_organizations (id, pipeline_id, name, source_payload)
+      `INSERT INTO crm_organizations (id, pipeline_id, name, reference_code, source_payload)
        VALUES
-         ($1::uuid, $2::uuid, 'Projected organization', '{}'::jsonb),
-         ('20000000-0000-4000-8000-000000000002'::uuid, $2::uuid, 'Archived organization', '{"archived":true}'::jsonb)`,
+         ($1::uuid, $2::uuid, 'Projected organization', 'ga1000001', '{}'::jsonb),
+         ('20000000-0000-4000-8000-000000000002'::uuid, $2::uuid, 'Archived organization', 'ga1000099', '{"archived":true}'::jsonb)`,
       [projectedOrganizationId, pipelineC],
     )
     await pool.query(
@@ -647,6 +654,31 @@ async function acceptance(databaseUrl) {
       /cannot safely write 19997 opportunities.*capacity is 19996 data rows/,
       'workbook projection must fail before writing a partial over-capacity export',
     )
+
+    const secondaryOrganizationId = '20000000-0000-4000-8000-000000000003'
+    await pool.query(`INSERT INTO crm_organizations (id,pipeline_id,name,reference_code,source_payload)
+      VALUES ($1,$2,'Projected partner','ga1000002','{}'::jsonb)`, [secondaryOrganizationId, pipelineC])
+    await pool.query(`INSERT INTO crm_interaction_organizations
+      (pipeline_id,interaction_id,organization_id,is_primary,sort_order)
+      VALUES ($1,$2,$3,true,0),($1,$2,$4,false,1)`,
+    [pipelineC, projectedInteractionId, projectedOrganizationId, secondaryOrganizationId])
+    const sharedWorkbookSnapshot = plain(await persistence.readCrmWorkbookProjectionSnapshotInPostgres({ pipelineId: pipelineC }))
+    assert.deepEqual(sharedWorkbookSnapshot.counts, { ...workbookSnapshot.counts, organizations: 2 })
+    assert.deepEqual(sharedWorkbookSnapshot.interactions.map(record => record.id), workbookSnapshot.interactions.map(record => record.id),
+      'A secondary company must not multiply or omit any workbook interaction')
+    const sharedEmail = sharedWorkbookSnapshot.interactions.filter(record => record.id === projectedInteractionId)
+    assert.equal(sharedEmail.length, 1, 'The same Email remains one workbook row')
+    assert.equal(sharedEmail[0].organizationId, projectedOrganizationId)
+    assert.deepEqual(sharedEmail[0].organizationIds, [projectedOrganizationId, secondaryOrganizationId])
+    assert.deepEqual(sharedEmail[0].organizations, [
+      { id: projectedOrganizationId, referenceCode: 'ga1000001', name: 'Projected organization', isPrimary: true },
+      { id: secondaryOrganizationId, referenceCode: 'ga1000002', name: 'Projected partner', isPrimary: false },
+    ])
+    const unchangedReportA = plain(await persistence.readCrmPipelineActivityReportFromPostgres({
+      pipelineId: pipelineA, organizationId: organizationA, startAt, endAtExclusive,
+      timeZone: 'America/New_York', snapshotDate: '2026-08-28',
+    }))
+    assert.deepEqual(unchangedReportA, reportA, 'Adding a workbook company association must not change reporting totals')
 
     await assert.rejects(
       persistence.readCrmPipelineActivityReportFromPostgres({

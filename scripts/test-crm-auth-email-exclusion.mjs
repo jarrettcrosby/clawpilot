@@ -126,6 +126,7 @@ const storedMessageIds = []
 const stagedInteractions = []
 const cursorWrites = []
 const matchedSenders = []
+let matchedReferenceEmail = ''
 const linkedIds = []
 const fixtureMessages = new Map([...excluded, ...retained].map((entry) => [entry.id, entry]))
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
@@ -171,6 +172,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
       }
       if (sql.includes('FROM crm_contacts')) {
         matchedSenders.push(values[1])
+        matchedReferenceEmail = values[1][0]
         return { rows: [{ pipeline_id: pipelineId, reference_code: 'gc1234567', email: values[1][0] }] }
       }
       if (sql.includes('FROM crm_interactions')) return { rows: [] }
@@ -186,7 +188,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/persistence/crm': {
     async readCrmRecordByReference({ pipelineId: requestedPipeline }) {
       assert.equal(requestedPipeline, pipelineId)
-      return { entity: 'contacts', id: 'contact-id', referenceCode: 'gc1234567', pipelineId, organizationId: 'organization-id', suiteCrmId: null }
+      return { entity: 'contacts', id: 'contact-id', referenceCode: 'gc1234567', pipelineId, organizationId: 'organization-id', suiteCrmId: null, email: matchedReferenceEmail }
     },
     async stageCrmRecordInPostgres(input) {
       stagedInteractions.push(input)

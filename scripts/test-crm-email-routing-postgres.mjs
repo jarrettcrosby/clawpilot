@@ -78,6 +78,11 @@ function loadCrmPersistence(query, withTransaction) {
     'normalizedInteractionType', 'interactionSuiteCrmModule', 'interactionActivityStatus',
     'interactionDurationMinutes', 'uniqueUuidList', 'normalizeStageCrmRecordInput',
     'stageInteraction', 'stageCrmRecordWithClient', 'stageCrmRecordInPostgres',
+    'enrichCrmEmailInteractionParticipantsInPostgres',
+    'REVIEWED_GMAIL_RELATIONSHIPS', 'reviewedGmailContentFingerprint',
+    'readReviewedGmailInteractionWithClient', 'prepareReviewedGmailInteractionWithClient',
+    'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',
+    'stageReviewedGmailInteractionInPostgres',
     'crmReferenceDestination', 'crmReferenceShortUrl', 'ensureCrmReferenceShortLink',
     'crmEntityForReferenceCode', 'resolveCrmReferenceCode', 'readCrmRecordReference',
     'readCrmRecordByReference',
@@ -98,12 +103,14 @@ function loadCrmPersistence(query, withTransaction) {
   const stableId = loadModule('app_src/lib/crm/stableId.ts')
   const context = {
     query, withTransaction, ...stableId, URL, Error,
+    crmParticipantEmailCandidatesSql: loadModule('app_src/lib/crm/participantEligibility.ts').crmParticipantEmailCandidatesSql,
     isPostgresStorageEnabled: () => true,
     appPublicUrl: () => 'http://localhost:4002',
     shortLinkUrl: code => `https://example.test/s/${code}`,
   }
   vm.runInNewContext(`${output}\nglobalThis.persistence = {
-    stageCrmRecordInPostgres, readCrmRecordByReference,
+    stageCrmRecordInPostgres, readCrmRecordByReference, enrichCrmEmailInteractionParticipantsInPostgres,
+    stageReviewedGmailInteractionsInPostgres, stageReviewedGmailInteractionInPostgres,
   }`, context, { filename: path })
   return context.persistence
 }
@@ -251,16 +258,21 @@ async function run(pool) {
     } finally { client.release() }
   }
   const persistence = loadCrmPersistence(query, withTransaction)
+  const recoveryAudits = []
+  let beforeReferenceRead
   const addressHeaders = loadModule('app_src/lib/crm/emailAddressHeaders.ts')
   const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
     '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
     '@/lib/globalIds.mjs': { globalIdFragment },
     '@/lib/crm/emailAddressHeaders': addressHeaders,
     '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts'),
-    '@/lib/persistence/crm': persistence,
+    '@/lib/persistence/crm': { ...persistence, readCrmRecordByReference: async input => {
+      await beforeReferenceRead?.()
+      return persistence.readCrmRecordByReference(input)
+    } },
     '@/lib/persistence/postgres': { query },
     '@/lib/tenancy': { resolvePipelineSpaceAccess: () => unexpected('tenancy fallback') },
-    '@/lib/auditWriter': { recordAuditEvent: () => unexpected('provider/audit delivery') },
+    '@/lib/auditWriter': { recordAuditEvent: async (entry) => { recoveryAudits.push(entry) } },
     '@/lib/maton': { matonFetch: async (path, request, scope) => {
       assert.equal(request.method, 'GET', 'Integration test may never send email')
       assert.equal(scope.ownerEmail, OWNER)
@@ -275,6 +287,7 @@ async function run(pool) {
   }, 'export { ownedPipelines, configuredMailboxAddresses, selectedMailboxes, getGmailMessage, referenceTargets, processMessage };')
 
   await query(fixtureSchema)
+  await query(read('db/migrations/0374_crm_interaction_organizations.sql'))
   await query(`INSERT INTO app_users VALUES ($1,'active','Synthetic Operator',NULL,true,'gu1234567'),
     ($2,'active','Synthetic Other',NULL,true,'gu7654321')`, [OWNER, OTHER_OWNER])
   for (const [index, pipeline] of [PRIMARY, BUSINESS, FOREIGN, DISABLED_MEMBERSHIP, DISABLED_REFERENCES].entries()) {
@@ -332,11 +345,11 @@ async function run(pool) {
   const linksFor = async messageId => (await query(`SELECT link.reference_code,link.interaction_id::text
     FROM crm_inbound_message_links link JOIN crm_inbound_messages message ON message.id=link.inbound_message_id
     WHERE message.owner_email=$1 AND message.external_message_id=$2 ORDER BY link.reference_code`, [OWNER, messageId])).rows
-  const stageSent = (messageId, pipeline = BUSINESS, thread = null) => persistence.stageCrmRecordInPostgres({
+  const stageSent = (messageId, pipeline = BUSINESS, thread = null, fields = {}) => persistence.stageCrmRecordInPostgres({
     entity: 'interactions', pipelineId: pipeline, actorEmail: OWNER, sourceKey: `synthetic-sent:${messageId}:${randomUUID()}`,
     fields: { interactionType: 'email', subject: 'Synthetic sent mail', agentEmail: OWNER,
       occurredAt: '2026-09-17T12:00:00.000Z', direction: 'outbound', deliveryStatus: 'sent',
-      providerMessageId: messageId, providerThreadId: thread },
+      providerMessageId: messageId, providerThreadId: thread, ...fields },
   })
 
   await check('real ownership SQL excludes foreign, disabled membership, and disabled-reference pipelines', async () => {
@@ -467,6 +480,106 @@ async function run(pool) {
     assert.equal(await count('crm_interactions'), before)
     assert.equal((await process('a9', { from: ALIAS, to: 'business-contact@customer.example.test', labels: ['SENT'] })).links, 0)
   })
+  await check('late same-account contacts enrich native relationships once without replacing the original sent email', async () => {
+    const lateContact = id(70)
+    const messageId = 'c1'
+    const staged = await stageSent(messageId, BUSINESS, `thread-${messageId}`, {
+      organizationId: CUSTOMER_BUSINESS, contactIds: [CONTACT_BUSINESS], leadId: LEAD_BUSINESS,
+      occurredAt: '2026-09-17T12:00:00.123Z',
+      description: 'Preserve authored sent body', metadata: { source: 'app-send', retained: true },
+    })
+    const options = { from: ALIAS, to: 'business-contact@customer.example.test', cc: 'late-contact@example.test', labels: ['SENT'] }
+    await process(messageId, options)
+    const readRetained = async () => (await query(`SELECT id,suitecrm_id,reference_code,source_key,
+      source_sheet_id,source_row_number,subject,description,occurred_at,direction,delivery_status,
+      provider_message_id,provider_thread_id,metadata,source_payload,lead_id,created_by
+      FROM crm_interactions WHERE id=$1`, [staged.id])).rows[0]
+    const original = await readRetained()
+    await insertRecord('crm_contacts', lateContact, BUSINESS, 'gc7890123', 'late-contact@example.test', CUSTOMER_BUSINESS)
+    const before = await count('crm_interactions')
+    const result = await process(messageId, options)
+    assert.equal(result.interactions, 0)
+    assert.equal(result.links, 1)
+    assert.equal(await count('crm_interactions'), before)
+    assert.deepEqual(await readRetained(), original)
+    const relationships = (await query(`SELECT contact_id::text,is_primary FROM crm_interaction_contacts
+      WHERE interaction_id=$1 ORDER BY sort_order`, [staged.id])).rows
+    assert.deepEqual(relationships, [{ contact_id: CONTACT_BUSINESS, is_primary: true }, { contact_id: lateContact, is_primary: false }])
+    const snapshot = (await query('SELECT source_hash,updated_at FROM crm_interactions WHERE id=$1', [staged.id])).rows[0]
+    const replay = await process(messageId, options)
+    assert.equal(replay.interactions, 0)
+    assert.equal(replay.links, 0)
+    assert.deepEqual((await query('SELECT source_hash,updated_at FROM crm_interactions WHERE id=$1', [staged.id])).rows[0], snapshot,
+      'Unchanged replay must not restage the email or enqueue another projection')
+  })
+  await check('locked enrichment rejects stale target email, wrong owner/workspace and archived customer evidence', async () => {
+    const staged = await stageSent('c2')
+    const selection = { pipelineId: BUSINESS, interactionId: staged.id, ownerEmail: OWNER,
+      providerMessageId: 'c2', providerThreadId: 'thread-c2', apply: true,
+      targets: [{ id: CONTACT_BUSINESS, entity: 'contacts', referenceCode: 'gc2345678',
+        organizationId: CUSTOMER_BUSINESS, email: 'business-contact@customer.example.test' }] }
+    const snapshot = (await query('SELECT * FROM crm_interactions WHERE id=$1', [staged.id])).rows[0]
+    await query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CONTACT_BUSINESS, 'changed-after-routing@example.test'])
+    await assert.rejects(persistence.enrichCrmEmailInteractionParticipantsInPostgres(selection), /conflicting CRM participant evidence/)
+    await query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CONTACT_BUSINESS, 'business-contact@customer.example.test'])
+    for (const override of [{ ownerEmail: OTHER_OWNER }, { pipelineId: PRIMARY }]) {
+      await assert.rejects(persistence.enrichCrmEmailInteractionParticipantsInPostgres({ ...selection, ...override }), /conflicting CRM participant evidence/)
+    }
+    await query(`UPDATE crm_organizations SET source_payload='{"archived":true}'::jsonb WHERE id=$1`, [CUSTOMER_BUSINESS])
+    await assert.rejects(persistence.enrichCrmEmailInteractionParticipantsInPostgres(selection), /conflicting CRM participant evidence/)
+    await query(`UPDATE crm_organizations SET source_payload='{}'::jsonb WHERE id=$1`, [CUSTOMER_BUSINESS])
+    assert.deepEqual((await query('SELECT * FROM crm_interactions WHERE id=$1', [staged.id])).rows[0], snapshot)
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_contacts WHERE interaction_id=$1', [staged.id])).rows[0].count, '0')
+  })
+  await check('participant lookup retains its positive email proof across the later reference read', async () => {
+    beforeReferenceRead = async () => {
+      beforeReferenceRead = undefined
+      await query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CONTACT_BUSINESS, 'changed-before-reference-read@example.test'])
+    }
+    const result = await process('c6')
+    assert.equal(result.unmatched, true)
+    assert.equal(result.interactions, 0)
+    assert.equal((await linksFor('c6')).length, 0)
+    await query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CONTACT_BUSINESS, 'business-contact@customer.example.test'])
+  })
+  await check('native enrichment preserves unset, renamed and inactive historic agent assignments', async () => {
+    for (const [messageId, email, name] of [
+      ['c7', null, 'Synthetic Operator'], ['c8', OWNER, 'Original display name'],
+      ['c9', OTHER_OWNER, 'Inactive historic agent'],
+    ]) {
+      const staged = await stageSent(messageId)
+      await query('UPDATE crm_interactions SET agent_email=$2,agent_name=$3 WHERE id=$1', [staged.id, email, name])
+      if (messageId === 'c9') await query("UPDATE app_users SET status='disabled' WHERE email=$1", [OTHER_OWNER])
+      const result = await process(messageId)
+      assert.equal(result.interactions, 0)
+      assert.deepEqual((await query('SELECT agent_email,agent_name FROM crm_interactions WHERE id=$1', [staged.id])).rows[0],
+        { agent_email: email, agent_name: name })
+      if (messageId === 'c9') await query("UPDATE app_users SET status='active' WHERE email=$1", [OTHER_OWNER])
+    }
+  })
+  await check('archived emails and wrong-account native mappings cannot be revived or silently reparented', async () => {
+    const otherAccount = id(23), otherContact = id(71)
+    await query(`INSERT INTO crm_organizations (id,pipeline_id,name,reference_code,source_key)
+      VALUES ($1,$2,'Synthetic partner','ga7890123','synthetic-partner')`, [otherAccount, BUSINESS])
+    await insertRecord('crm_contacts', otherContact, BUSINESS, 'gc7890124', 'partner@example.test', otherAccount)
+    const wrong = await stageSent('c3', BUSINESS, null, { organizationId: otherAccount, contactIds: [otherContact] })
+    const archived = await stageSent('c4')
+    await query(`UPDATE crm_interactions SET source_payload='{"archived":true}'::jsonb WHERE id=$1`, [archived.id])
+    const before = await count('crm_interactions')
+    for (const messageId of ['c3', 'c4']) {
+      await assert.rejects(process(messageId), /conflicting CRM participant evidence/)
+      assert.equal((await linksFor(messageId)).length, 0)
+      assert.equal((await query('SELECT count(*) FROM crm_inbound_messages WHERE external_message_id=$1', [messageId])).rows[0].count, '0')
+    }
+    assert.equal(await count('crm_interactions'), before)
+    assert.equal((await query('SELECT organization_id FROM crm_interactions WHERE id=$1', [wrong.id])).rows[0].organization_id, otherAccount)
+    assert.equal((await query('SELECT source_payload FROM crm_interactions WHERE id=$1', [archived.id])).rows[0].source_payload.archived, true)
+    const result = await process('c5', { cc: 'partner@example.test' })
+    assert.equal(result.unmatched, true, 'Actual multi-account threads must continue to fail closed')
+    await assert.rejects(ingestion.reconcileGmailMessages({ ownerEmail: OWNER, connectionId: CONNECTION,
+      pipelineId: BUSINESS, messageIds: ['c5'] }), /ambiguous/)
+    assert.equal((await linksFor('c5')).length, 0)
+  })
   await check('same provider ID in another pipeline is not reused for a second-pipeline customer', async () => {
     const unrelated = await stageSent('aa', PRIMARY)
     const result = await process('aa')
@@ -489,6 +602,139 @@ async function run(pool) {
     assert.equal((await linksFor('ad')).length, 0)
     await query("UPDATE app_user_organization_memberships SET status='active' WHERE user_email=$1 AND organization_id=$2", [OWNER, id(12)])
     assert.equal((await process('ae')).interactions, 1)
+  })
+
+  const reviewedCompany = id(90), reviewedContact = id(91), extraContact = id(92)
+  await query(`INSERT INTO crm_organizations (id,pipeline_id,name,reference_code,source_key)
+    VALUES ($1,$2,'Synthetic reviewed company','ga9012345','reviewed-company')`, [reviewedCompany, BUSINESS])
+  await insertRecord('crm_contacts', reviewedContact, BUSINESS, 'gc9012345', 'reviewed-partner@example.test', reviewedCompany)
+  await insertRecord('crm_contacts', extraContact, BUSINESS, 'gc9012346', 'unselected-participant@example.test', reviewedCompany)
+  const cacheReviewed = async (messageId, overrides = {}) => {
+    const result = await process(messageId, { cc: 'reviewed-partner@example.test', threadId: `f${messageId}`, ...overrides })
+    assert.equal(result.unmatched, true, 'Automatic cross-company routing must remain held')
+    assert.equal((await linksFor(messageId)).length, 0)
+  }
+  const reviewedSelection = (messageIds, extra = {}) => ({
+    ownerEmail: OWNER, connectionId: CONNECTION, pipelineId: BUSINESS, messageIds,
+    reviewedAssociations: messageIds.map(messageId => ({ messageId, threadId: providerMessages.get(messageId).threadId,
+      primaryOrganizationReference: 'ga9012345', contactReferences: ['gc2345678', 'gc9012345'] })),
+    ...extra,
+  })
+  const recoveryCounts = () => Promise.all(['crm_interactions', 'crm_interaction_contacts',
+    'crm_interaction_organizations', 'crm_inbound_message_links', 'crm_inbound_messages'].map(count))
+
+  await check('reviewed mixed-company preview is read-only and apply uses one email with two exact company relationships', async () => {
+    await cacheReviewed('d1', { cc: 'reviewed-partner@example.test, unselected-participant@example.test' })
+    const before = await recoveryCounts(), selection = reviewedSelection(['d1'])
+    const preview = await ingestion.reconcileGmailMessages(selection)
+    assert.deepEqual(await recoveryCounts(), before)
+    assert.equal(recoveryAudits.length, 0, 'Preview must not write an audit record')
+    assert.deepEqual(Array.from(preview.messages[0].contactReferences), ['gc2345678', 'gc9012345'])
+    const applied = await ingestion.reconcileGmailMessages({ ...selection, apply: true, expectedDigest: preview.digest })
+    assert.equal(applied.interactions, 1)
+    const rows = (await query('SELECT * FROM crm_interactions WHERE pipeline_id=$1 AND provider_message_id=$2', [BUSINESS, 'd1'])).rows
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].organization_id, reviewedCompany)
+    assert.equal(rows[0].contact_id, reviewedContact, 'Primary company must be represented by the primary contact')
+    assert.equal(rows[0].provider_thread_id, 'fd1')
+    assert.equal(rows[0].suitecrm_module, 'Emails')
+    assert.deepEqual((await query(`SELECT organization_id::text FROM crm_interaction_organizations
+      WHERE interaction_id=$1 ORDER BY sort_order`, [rows[0].id])).rows.map(row => row.organization_id), [reviewedCompany, CUSTOMER_BUSINESS])
+    assert.deepEqual(new Set((await query('SELECT contact_id::text FROM crm_interaction_contacts WHERE interaction_id=$1',
+      [rows[0].id])).rows.map(row => row.contact_id)), new Set([CONTACT_BUSINESS, reviewedContact]))
+    assert.deepEqual((await linksFor('d1')).map(row => row.reference_code), ['ga2345678', 'ga9012345', 'gc2345678', 'gc9012345'])
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_contacts WHERE interaction_id=$1 AND contact_id=$2',
+      [rows[0].id, extraContact])).rows[0].count, '0', 'Unselected actual participants must not become associations')
+    const cache = (await query('SELECT pipeline_id,id::text FROM crm_inbound_messages WHERE external_message_id=$1', ['d1'])).rows[0]
+    assert.equal(cache.pipeline_id, PRIMARY, 'Owned default cache is not reparented to the reviewed target pipeline')
+    assert.equal(rows[0].metadata.inboundMessageId, cache.id)
+    const identities = [rows[0].id, rows[0].suitecrm_id, rows[0].source_key, rows[0].reference_code]
+    const after = await recoveryCounts()
+    const replay = await ingestion.reconcileGmailMessages({ ...selection, apply: true, expectedDigest: preview.digest })
+    assert.equal(replay.interactions, 0)
+    assert.equal(replay.links, 0)
+    assert.deepEqual(await recoveryCounts(), after)
+    const current = (await query('SELECT * FROM crm_interactions WHERE id=$1', [rows[0].id])).rows[0]
+    assert.deepEqual([current.id, current.suitecrm_id, current.source_key, current.reference_code], identities)
+    assert.equal(recoveryAudits.length, 2, 'Synthetic audit captures requested applies without external delivery')
+  })
+
+  await check('reviewed recovery rejects uncached, unknown, duplicate-email, foreign and unrepresented-primary associations', async () => {
+    gmailMessage('d2', { cc: 'reviewed-partner@example.test', threadId: 'fd2' })
+    const uncached = reviewedSelection(['d2'])
+    const before = await recoveryCounts()
+    await assert.rejects(ingestion.reconcileGmailMessages(uncached), /existing owned cached/)
+    await cacheReviewed('d3')
+    const base = reviewedSelection(['d3'])
+    for (const association of [
+      { ...base.reviewedAssociations[0], contactReferences: ['gc2345678', 'gc9999999'] },
+      { ...base.reviewedAssociations[0], contactReferences: ['gc2345678'] },
+      { ...base.reviewedAssociations[0], contactReferences: ['gc2345678', 'gc4567890'] },
+      { ...base.reviewedAssociations[0], threadId: 'other-thread' },
+    ]) await assert.rejects(ingestion.reconcileGmailMessages({ ...base, reviewedAssociations: [association] }))
+    await insertRecord('crm_contacts', id(93), BUSINESS, 'gc9012347', 'reviewed-partner@example.test', reviewedCompany)
+    await assert.rejects(ingestion.reconcileGmailMessages(base), /unambiguous/)
+    await query('DELETE FROM crm_contacts WHERE id=$1', [id(93)])
+    assert.equal((await linksFor('d3')).length, 0)
+    assert.deepEqual((await recoveryCounts()).slice(0, 4), before.slice(0, 4))
+  })
+
+  await check('reviewed preview digest rejects current provider, contact, account, membership and connection drift before writes', async () => {
+    await cacheReviewed('d4')
+    const selection = reviewedSelection(['d4'])
+    const variants = [
+      [async () => { providerMessages.get('d4').payload.headers.push({ name: 'X-Synthetic-Review', value: 'changed' }) },
+        async () => { providerMessages.get('d4').payload.headers.pop() }],
+      [async () => { providerMessages.get('d4').payload.body.data = Buffer.from('Changed provider body').toString('base64url') },
+        async () => { providerMessages.get('d4').payload.body.data = Buffer.from('Synthetic customer correspondence.').toString('base64url') }],
+      [() => query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [reviewedContact, 'changed@example.test']),
+        () => query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [reviewedContact, 'reviewed-partner@example.test'])],
+      [() => query('UPDATE crm_contacts SET organization_id=$2 WHERE id=$1', [reviewedContact, CUSTOMER_BUSINESS]),
+        () => query('UPDATE crm_contacts SET organization_id=$2 WHERE id=$1', [reviewedContact, reviewedCompany])],
+      [() => query("UPDATE app_user_organization_memberships SET status='disabled' WHERE user_email=$1 AND organization_id=$2", [OWNER, id(12)]),
+        () => query("UPDATE app_user_organization_memberships SET status='active' WHERE user_email=$1 AND organization_id=$2", [OWNER, id(12)])],
+      [() => query('UPDATE user_maton_connections SET is_selected=false WHERE connection_id=$1', [CONNECTION]),
+        () => query('UPDATE user_maton_connections SET is_selected=true WHERE connection_id=$1', [CONNECTION])],
+      [() => query('UPDATE pipeline_spaces SET workspace_organization_id=$2 WHERE id=$1', [BUSINESS, id(11)]),
+        () => query('UPDATE pipeline_spaces SET workspace_organization_id=$2 WHERE id=$1', [BUSINESS, id(12)])],
+    ]
+    for (const [change, restore] of variants) {
+      const preview = await ingestion.reconcileGmailMessages(selection)
+      const before = await recoveryCounts(), audits = recoveryAudits.length
+      await change()
+      try {
+        await assert.rejects(ingestion.reconcileGmailMessages({ ...selection, apply: true, expectedDigest: preview.digest }))
+        assert.deepEqual(await recoveryCounts(), before)
+        assert.equal(recoveryAudits.length, audits)
+      } finally { await restore() }
+    }
+  })
+
+  await check('reviewed helper refuses duplicate provider IDs and rolls back a batch when any fingerprint is stale', async () => {
+    await cacheReviewed('d5')
+    const duplicateA = await stageSent('d5'), duplicateB = await stageSent('d5')
+    await assert.rejects(ingestion.reconcileGmailMessages(reviewedSelection(['d5'])), /evidence/)
+    await query('DELETE FROM crm_interactions WHERE id=ANY($1::uuid[])', [[duplicateA.id, duplicateB.id]])
+    for (const messageId of ['d6', 'd7']) await cacheReviewed(messageId)
+    const entries = ['d6', 'd7'].map(providerMessageId => ({
+      ownerEmail: OWNER, pipelineId: BUSINESS, connectionId: CONNECTION, providerMessageId,
+      providerThreadId: `f${providerMessageId}`, participantEmails: ['business-contact@customer.example.test', 'reviewed-partner@example.test'],
+      primaryOrganization: { id: reviewedCompany, referenceCode: 'ga9012345' },
+      contactTargets: [
+        { id: CONTACT_BUSINESS, referenceCode: 'gc2345678', email: 'business-contact@customer.example.test', organizationId: CUSTOMER_BUSINESS },
+        { id: reviewedContact, referenceCode: 'gc9012345', email: 'reviewed-partner@example.test', organizationId: reviewedCompany },
+      ],
+      interaction: { entity: 'interactions', pipelineId: BUSINESS, actorEmail: OWNER, sourceKey: `synthetic-reviewed:${providerMessageId}`,
+        fields: { interactionType: 'email', subject: 'Synthetic reviewed email', providerMessageId, providerThreadId: `f${providerMessageId}` } },
+    }))
+    const previews = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: entries })
+    const before = await recoveryCounts()
+    await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ messages: entries.map((entry, index) => ({
+      ...entry, expectedExistingInteractionId: previews[index].interactionId,
+      expectedTargetFingerprint: index === 1 ? 'stale-fingerprint' : previews[index].targetFingerprint,
+    })), apply: true }), /evidence/)
+    assert.deepEqual(await recoveryCounts(), before, 'No first-message stage may escape a rejected later fingerprint')
+    assert.equal((await linksFor('d6')).length + (await linksFor('d7')).length, 0)
   })
   assert.ok(providerCalls.length > 0)
   assert.equal((await query(`SELECT count(*) FROM crm_interactions WHERE pipeline_id IN ($1,$2,$3)`,

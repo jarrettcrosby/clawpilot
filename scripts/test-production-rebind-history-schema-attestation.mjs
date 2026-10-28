@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   PRODUCTION_REBIND_CRITICAL_RELATIONS,
+  PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
   PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM,
   PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
   ProductionRebindHistorySchemaAttestationError,
@@ -44,6 +45,14 @@ const PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: 'a1af2c30e5b28aec8e60d1689330b72c2fdff5666c7da382f5cfa9fbc4869615',
   18: '73040be0231764cb9fbcfd8d9d5fd7eadab2c9debd428b3317150b5a844ba741',
 })
+// Frozen v8 catalogs, before the sole 0374 dependency on a rebind-critical
+// relation: the new created_by FK's action-trigger pair on public.app_users.
+const PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: '546722dd51520ea8eae9cf543ddffddf79812e7f8693f66a8be96267e4ad3434',
+  18: '2f088bed586b24e1b665277f7dee44e4333e4fb97a8e75a19aabe1d8213432fb',
+})
+const REVIEWED_COMPANY_MIGRATION = '0374_crm_interaction_organizations.sql'
+const REVIEWED_COMPANY_REFERENCE_CONSTRAINT = 'crm_interaction_organizations_created_by_fkey'
 const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_gateway_credentials_actor_email_fkey', 'public.app_users'],
   ['fractional_crm_verified_identifiers_accepted_by_fkey', 'public.app_users'],
@@ -61,6 +70,7 @@ const CALENDAR_REFERENCE_CONSTRAINTS = new Map([
 const NEW_REFERENCE_CONSTRAINTS = new Map([
   ...GATEWAY_REFERENCE_CONSTRAINTS,
   ...CALENDAR_REFERENCE_CONSTRAINTS,
+  [REVIEWED_COMPANY_REFERENCE_CONSTRAINT, 'public.app_users'],
   ['app_user_login_addresses_user_email_fkey', 'public.app_users'],
   ['app_login_email_changes_user_email_fkey', 'public.app_users'],
   ['app_user_google_login_bindings_user_email_fkey', 'public.app_users'],
@@ -70,6 +80,9 @@ const NEW_REFERENCE_CONSTRAINTS = new Map([
   ['app_user_google_login_bindings_linked_organization_id_fkey', 'public.workspace_organizations'],
   ['workspace_organization_web_preferences_organization_id_fkey', 'public.workspace_organizations'],
 ])
+
+assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  'clawpilot-production-rebind-target-schema-attestation-v9')
 
 for (const image of images) {
   assert.match(
@@ -163,23 +176,21 @@ async function expectFailure(pool, expectedCode, label, mutate) {
   await attestProductionRebindHistorySchema(pool)
 }
 
-async function expectLedgerFailure(pool, filename) {
+async function expectLedgerFailure(pool, filename, missing = false) {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    await client.query(
-      `UPDATE public.schema_migrations
-       SET checksum = repeat('0', 64)
-       WHERE filename = $1`,
-      [filename],
-    )
+    await client.query(missing
+      ? 'DELETE FROM public.schema_migrations WHERE filename = $1'
+      : `UPDATE public.schema_migrations SET checksum = repeat('0', 64) WHERE filename = $1`,
+    [filename])
     await assert.rejects(
       attestProductionRebindHistorySchema(client),
       (error) => (
         error instanceof ProductionRebindHistorySchemaAttestationError
         && error.code === 'migration_checksum_mismatch'
       ),
-      `${filename} ledger drift fails closed`,
+      `${filename} ${missing ? 'missing ledger row' : 'ledger drift'} fails closed`,
     )
     await client.query('ROLLBACK')
   } catch (error) {
@@ -189,6 +200,65 @@ async function expectLedgerFailure(pool, filename) {
     client.release()
   }
   await attestProductionRebindHistorySchema(pool)
+}
+
+async function verifyReviewedCompanyReferenceTriggers(pool, catalog) {
+  const result = await pool.query(
+    `SELECT constraint_row.conname AS name, constraint_row.contype::text AS type,
+       source_namespace.nspname || '.' || source_relation.relname AS source_relation,
+       ARRAY(SELECT attribute.attname::text
+         FROM unnest(constraint_row.conkey) WITH ORDINALITY selected(attnum, position)
+         JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = constraint_row.conrelid
+           AND attribute.attnum = selected.attnum ORDER BY selected.position) AS source_columns,
+       target_namespace.nspname || '.' || target_relation.relname AS target_relation,
+       ARRAY(SELECT attribute.attname::text
+         FROM unnest(constraint_row.confkey) WITH ORDINALITY selected(attnum, position)
+         JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = constraint_row.confrelid
+           AND attribute.attnum = selected.attnum ORDER BY selected.position) AS target_columns,
+       constraint_row.convalidated AS validated,
+       constraint_row.condeferrable AS deferrable, constraint_row.condeferred AS deferred,
+       constraint_row.confupdtype::text AS update_action, constraint_row.confdeltype::text AS delete_action,
+       constraint_row.confmatchtype::text AS match_type,
+       constraint_row.confdelsetcols IS NULL AS default_delete_columns,
+       COALESCE((pg_catalog.to_jsonb(constraint_row)->>'conenforced')::boolean, true) AS enforced,
+       constraint_row.conparentid = 0 AS no_parent,
+       constraint_row.conislocal AS local, constraint_row.coninhcount::integer AS inheritance_count
+     FROM pg_catalog.pg_constraint constraint_row
+     JOIN pg_catalog.pg_class source_relation ON source_relation.oid = constraint_row.conrelid
+     JOIN pg_catalog.pg_namespace source_namespace ON source_namespace.oid = source_relation.relnamespace
+     JOIN pg_catalog.pg_class target_relation ON target_relation.oid = constraint_row.confrelid
+     JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.oid = target_relation.relnamespace
+     WHERE constraint_row.conrelid = 'public.crm_interaction_organizations'::regclass
+       AND constraint_row.conname = $1`,
+    [REVIEWED_COMPANY_REFERENCE_CONSTRAINT],
+  )
+  assert.equal(result.rowCount, 1, '0374 has exactly the reviewed created_by FK descriptor')
+  assert.deepEqual(result.rows[0], {
+    name: REVIEWED_COMPANY_REFERENCE_CONSTRAINT, type: 'f',
+    source_relation: 'public.crm_interaction_organizations', source_columns: ['created_by'],
+    target_relation: 'public.app_users', target_columns: ['email'],
+    validated: true, deferrable: false, deferred: false,
+    update_action: 'a', delete_action: 'n', match_type: 's', default_delete_columns: true, enforced: true,
+    no_parent: true, local: true, inheritance_count: 0,
+  }, '0374 FK identity, columns, validation, action and deferral semantics are exact')
+  const triggers = catalog.triggers.filter((trigger) => trigger.constraint === REVIEWED_COMPANY_REFERENCE_CONSTRAINT)
+  assert.equal(triggers.length, 2, '0374 adds exactly two action triggers to the critical catalog')
+  assert.equal(new Set(triggers.map((trigger) => trigger.name)).size, 2)
+  for (const trigger of triggers) {
+    assert.match(trigger.name, /^RI_ConstraintTrigger_a_[1-9][0-9]*$/u)
+    const { name, definition, ...semantics } = trigger
+    assert.ok(typeof definition === 'string' && definition.includes(name), '0374 trigger definition names its exact action trigger')
+    assert.deepEqual(semantics, {
+      relation: 'public.app_users', enabled: 'O', internal: true,
+      typeMask: trigger.typeMask, argumentCount: 0, argumentsHex: '', when: null,
+      function: trigger.typeMask === 9 ? 'pg_catalog."RI_FKey_setnull_del"()' : 'pg_catalog."RI_FKey_noaction_upd"()',
+      constraint: REVIEWED_COMPANY_REFERENCE_CONSTRAINT,
+      constraintRelation: 'public.crm_interaction_organizations',
+      deferrable: false, initiallyDeferred: false, parentTrigger: null, comment: null,
+    }, '0374 referenced-table action trigger semantics are exact')
+  }
+  assert.deepEqual(triggers.map((trigger) => trigger.typeMask).sort((a, b) => a - b), [9, 17])
+  return triggers
 }
 
 async function exerciseImage(image) {
@@ -213,7 +283,7 @@ async function exerciseImage(image) {
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0373
+    // 0370 through 0374
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -242,6 +312,16 @@ async function exerciseImage(image) {
     assert.ok(applied.rows.every((row) => row.has_applied_at === true))
 
     const baseline = await inspectProductionRebindHistorySchema(pool)
+    const reviewedCompanyTriggers = await verifyReviewedCompanyReferenceTriggers(pool, baseline.catalog)
+    // This projection is test evidence only. Runtime attestation always hashes
+    // and accepts the complete, unmodified catalog for its enrolled PG major.
+    const v8Catalog = {
+      ...baseline.catalog,
+      triggers: baseline.catalog.triggers.filter((trigger) => !reviewedCompanyTriggers.includes(trigger)),
+    }
+    assert.equal(productionRebindHistorySchemaDigest(v8Catalog),
+      PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
+      'only the exact verified 0374 FK pair explains the change from attestation v8')
     for (const [constraint, relation] of NEW_REFERENCE_CONSTRAINTS) {
       const triggers = baseline.catalog.triggers.filter((trigger) => (
         trigger.constraint === constraint && trigger.relation === relation
@@ -266,7 +346,7 @@ async function exerciseImage(image) {
       NEW_REFERENCE_CONSTRAINTS.has(trigger.constraint)
       || trigger.name === 'app_users_guard_login_address'
     ))
-    assert.equal(addedTriggers.length, 37, 'only the eighteen reviewed FK pairs and login guard are new')
+    assert.equal(addedTriggers.length, 39, 'only the nineteen reviewed FK pairs and login guard are new')
     const addedFunctions = baseline.catalog.functions.filter((fn) => (
       fn.schema === 'public' && fn.name === 'guard_clawpilot_login_address'
     ))
@@ -282,16 +362,16 @@ async function exerciseImage(image) {
     assert.equal(calendarTriggers.length, 8, '0373 adds exactly four referenced-table FK pairs')
     assert.equal(
       productionRebindHistorySchemaDigest({
-        ...baseline.catalog,
-        triggers: baseline.catalog.triggers.filter((trigger) => !calendarTriggers.includes(trigger)),
+        ...v8Catalog,
+        triggers: v8Catalog.triggers.filter((trigger) => !calendarTriggers.includes(trigger)),
       }),
       PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
       'only the reviewed 0373 foreign-key guards explain the change from attestation v7',
     )
     assert.equal(
       productionRebindHistorySchemaDigest({
-        ...baseline.catalog,
-        triggers: baseline.catalog.triggers.filter((trigger) => (
+        ...v8Catalog,
+        triggers: v8Catalog.triggers.filter((trigger) => (
           !gatewayTriggers.includes(trigger) && !calendarTriggers.includes(trigger)
         )),
       }),
@@ -306,7 +386,7 @@ async function exerciseImage(image) {
     assert.equal(
       productionRebindHistorySchemaDigest(projectedPriorCatalog),
       PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
-      'the reviewed 0370 through 0373 trigger and function additions alone explain the digest change',
+      'the reviewed 0370 through 0374 trigger and function additions alone explain the digest change',
     )
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
@@ -417,7 +497,7 @@ async function exerciseImage(image) {
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} target schema digest ${baseline.schemaDigest}`)
+    console.log(`${image} candidate v9 raw target schema digest ${baseline.schemaDigest} (diagnostic only; exact FK and v8/v7/v6/prior projections verified)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
@@ -425,6 +505,35 @@ async function exerciseImage(image) {
     for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
       await expectLedgerFailure(pool, expected.filename)
     }
+    await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
+
+    await expectFailure(pool, 'schema_catalog_mismatch', '0374 missing created_by FK',
+      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
+        DROP CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT}`))
+    for (const [label, actions] of [
+      ['DELETE CASCADE', 'ON DELETE CASCADE'],
+      ['UPDATE CASCADE', 'ON UPDATE CASCADE ON DELETE SET NULL'],
+    ]) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 altered FK ${label}`,
+        (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
+          DROP CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT},
+          ADD CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT}
+            FOREIGN KEY (created_by) REFERENCES public.app_users(email) ${actions}`))
+    }
+    await expectFailure(pool, 'schema_catalog_mismatch', '0374 deferred FK without replacing trigger identities',
+      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
+        ALTER CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT} DEFERRABLE INITIALLY DEFERRED`))
+    for (const trigger of reviewedCompanyTriggers) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 disabled action trigger ${trigger.typeMask}`,
+        (client) => client.query(`ALTER TABLE public.app_users DISABLE TRIGGER "${trigger.name}"`))
+    }
+    await expectFailure(pool, 'schema_catalog_mismatch', '0374 renamed FK',
+      (client) => client.query(`ALTER TABLE public.crm_interaction_organizations
+        RENAME CONSTRAINT ${REVIEWED_COMPANY_REFERENCE_CONSTRAINT} TO unreviewed_created_by_fkey`))
+    await expectFailure(pool, 'schema_catalog_mismatch', 'unreviewed additional referenced-table FK pair',
+      (client) => client.query(`CREATE TABLE public.rebind_unreviewed_fk_fixture (
+        owner_email text REFERENCES public.app_users(email)
+      )`))
 
     for (const [constraint] of GATEWAY_REFERENCE_CONSTRAINTS) {
       const referencedGuard = gatewayTriggers.find((trigger) => trigger.constraint === constraint)

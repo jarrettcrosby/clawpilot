@@ -11,6 +11,7 @@ import {
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
+import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
 import { suiteCrmOpportunitySalesStage } from '@/lib/crm/suiteCrmOpportunityStage'
 import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
 import {
@@ -265,6 +266,7 @@ export type StageInteractionInput = CommonStageInput & {
   entity: 'interactions'
   fields: {
     organizationId?: string | null
+    organizationIds?: string[]
     contactId?: string | null
     contactIds?: string[]
     contactSuiteCrmId?: string | null
@@ -602,7 +604,11 @@ async function suiteCrmRelationships(
                organization.suitecrm_id AS related_bean_id, 0 AS sort_order
              FROM crm_organizations organization
              WHERE organization.pipeline_id = $1::uuid
-               AND organization.id = $3::uuid
+               AND (organization.id = $3::uuid OR EXISTS (
+                 SELECT 1 FROM crm_interaction_organizations related
+                 WHERE related.pipeline_id = organization.pipeline_id
+                   AND related.interaction_id = $2::uuid AND related.organization_id = organization.id
+               ))
                AND organization.suitecrm_id IS NOT NULL
              UNION ALL
              SELECT 'contacts', 'Contacts', contact.suitecrm_id, 10 + selected.sort_order
@@ -1639,6 +1645,24 @@ async function stageInteraction(client: PoolClient, input: StageInteractionInput
     ],
   )
   const row = result.rows[0]
+  const organizationIds = fields.organizationIds || (fields.organizationId ? [fields.organizationId] : [])
+  await client.query(
+    `DELETE FROM crm_interaction_organizations WHERE pipeline_id = $1::uuid AND interaction_id = $2::uuid
+       AND NOT (organization_id = ANY($3::uuid[]))`,
+    [input.pipelineId, row.id, organizationIds],
+  )
+  for (const [index, organizationId] of organizationIds.entries()) {
+    await client.query(
+      `INSERT INTO crm_interaction_organizations (
+         pipeline_id, interaction_id, organization_id, is_primary, sort_order, created_by
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6)
+       ON CONFLICT (interaction_id, organization_id) DO UPDATE SET
+         is_primary = EXCLUDED.is_primary, sort_order = EXCLUDED.sort_order, updated_at = now()
+       WHERE (crm_interaction_organizations.is_primary, crm_interaction_organizations.sort_order)
+         IS DISTINCT FROM (EXCLUDED.is_primary, EXCLUDED.sort_order)`,
+      [input.pipelineId, row.id, organizationId, index === 0, index, input.actorEmail],
+    )
+  }
   const contactSelectionWasProvided = fields.contactIds !== undefined || fields.contactId !== undefined
   if (contactSelectionWasProvided) {
     const selectedContactIds = fields.contactIds !== undefined
@@ -2105,9 +2129,13 @@ async function persistContactStageAliases(
   }
 }
 
+const REVIEWED_GMAIL_RELATIONSHIPS = Symbol('reviewed-gmail-relationships')
+type CrmStageOptions = { preserveInteractionAgent?: boolean; reviewedGmailRelationships?: symbol }
+
 async function normalizeStageCrmRecordInput(
   client: PoolClient,
   input: StageCrmRecordInput,
+  options?: CrmStageOptions,
 ): Promise<StageCrmRecordInput> {
   if (input.entity === 'contacts' && input.createOnly && input.localId) {
     throw new Error('Create-only CRM contact persistence cannot target an existing record')
@@ -2192,7 +2220,78 @@ async function normalizeStageCrmRecordInput(
     }
   }
   if (input.entity === 'interactions') {
-    const fields = input.fields
+    let fields = input.fields
+    const trustedReview = options?.reviewedGmailRelationships === REVIEWED_GMAIL_RELATIONSHIPS
+    const retained = await client.query<Record<string, unknown> & { organization_id: string | null; organization_ids: string[]; contact_ids: string[] }>(
+      `SELECT interaction.*, interaction.occurred_at::text AS retained_occurred_at,
+         ARRAY(SELECT related.organization_id::text FROM crm_interaction_organizations related
+           WHERE related.pipeline_id = interaction.pipeline_id AND related.interaction_id = interaction.id
+           ORDER BY related.sort_order, related.organization_id) AS organization_ids,
+         ARRAY(SELECT related.contact_id::text FROM crm_interaction_contacts related
+           WHERE related.pipeline_id = interaction.pipeline_id AND related.interaction_id = interaction.id
+           ORDER BY related.sort_order, related.contact_id) AS contact_ids
+       FROM crm_interactions interaction WHERE interaction.pipeline_id = $1::uuid
+         AND (($2::uuid IS NOT NULL AND interaction.id = $2::uuid)
+           OR ($2::uuid IS NULL AND interaction.source_key = $3)) FOR UPDATE`,
+      [input.pipelineId, input.localId || null, input.sourceKey],
+    )
+    const current = retained.rows[0]
+    const retainedOrganizations = current?.organization_ids || []
+    const retainedContacts = current?.contact_ids || []
+    if (retainedOrganizations.length > 1 && !trustedReview) {
+      if (current.interaction_type !== 'email' || current.suitecrm_module !== 'Emails') {
+        throw new Error('Reviewed multi-company activity requires an existing native Email')
+      }
+      if (input.sourceKey !== current.source_key) throw new Error('Reviewed interaction source identity must be preserved')
+      if (fields.organizationId !== undefined && fields.organizationId !== current.organization_id) {
+        throw new Error('Reviewed interaction primary organization cannot be changed')
+      }
+      fields = { ...fields, organizationId: current.organization_id,
+        contactIds: fields.contactIds ?? retainedContacts,
+        metadata: { ...(current.metadata as Record<string, unknown>), ...fields.metadata },
+        description: fields.description ?? String(current.description ?? ''),
+        occurredAt: fields.occurredAt === undefined ? nullable(current.retained_occurred_at) : fields.occurredAt,
+        direction: fields.direction ?? current.direction as CrmInteraction['direction'],
+        deliveryStatus: fields.deliveryStatus ?? String(current.delivery_status ?? ''),
+      }
+      if ((fields.agentEmail !== undefined && nullable(fields.agentEmail) !== nullable(current.agent_email))
+        || (fields.agentName !== undefined && fields.agentName !== (current.agent_name || ''))) {
+        throw new Error('Reviewed email historic agent assignment must be preserved')
+      }
+      fields = { ...fields, agentEmail: nullable(current.agent_email), agentName: String(current.agent_name ?? '') }
+      input = { ...input, sourcePayload: current.source_payload as Record<string, unknown>,
+        sourceSheetId: nullable(current.source_sheet_id), sourceRowNumber: current.source_row_number == null ? null : Number(current.source_row_number) }
+      if (fields.contactIds!.join() !== retainedContacts.join()
+        || (fields.contactId !== undefined && fields.contactId !== current.contact_id)) {
+        throw new Error('Reviewed interaction contacts must be preserved')
+      }
+      for (const [field, column] of [
+        ['leadId', 'lead_id'], ['opportunityId', 'opportunity_id'], ['meetingId', 'meeting_id'], ['campaignId', 'campaign_id'],
+        ['providerMessageId', 'provider_message_id'], ['providerThreadId', 'provider_thread_id'],
+      ] as const) {
+        if (fields[field] !== undefined && (fields[field] || null) !== (current[column] || null)) {
+          throw new Error('Reviewed interaction provider identity and parent context must be preserved')
+        }
+        fields = { ...fields, [field]: current[column] || null }
+      }
+      if ((fields.interactionType !== undefined && fields.interactionType !== 'email')
+        || (fields.suiteCrmModule !== undefined && fields.suiteCrmModule !== 'Emails')) {
+        throw new Error('Reviewed multi-company email cannot change activity type')
+      }
+      fields = { ...fields, interactionType: 'email', suiteCrmModule: 'Emails' }
+    }
+    const requestedOrganizations = fields.organizationIds === undefined ? undefined : uniqueUuidList(fields.organizationIds)
+    if (requestedOrganizations && requestedOrganizations.length !== fields.organizationIds?.length) {
+      throw new Error('Interaction organization selection is invalid')
+    }
+    if (!trustedReview && requestedOrganizations && requestedOrganizations.some((id) => (
+      id !== fields.organizationId && !retainedOrganizations.includes(id)
+    ))) throw new Error('Additional interaction organizations require reviewed Gmail recovery')
+    if (!trustedReview && retainedOrganizations.length > 1 && requestedOrganizations
+      && (requestedOrganizations.length !== retainedOrganizations.length
+        || requestedOrganizations.some((id, index) => id !== retainedOrganizations[index]))) {
+      throw new Error('Reviewed interaction organizations must be preserved')
+    }
     const contactIds = fields.contactIds !== undefined
       ? uniqueUuidList(fields.contactIds)
       : uniqueUuidList(fields.contactId ? [fields.contactId] : [])
@@ -2207,7 +2306,8 @@ async function normalizeStageCrmRecordInput(
     const primaryContactId = contactIds[0] || null
     const agentEmail = clean(fields.agentEmail).toLowerCase()
     const agentLookup = agentEmail || clean(fields.agentName)
-    const agent = agentLookup
+    const preserveAgent = options?.preserveInteractionAgent === true || retainedOrganizations.length > 1
+    const agent = !preserveAgent && agentLookup
       ? await client.query<{ email: string; display_name: string | null; suitecrm_user_id: string | null }>(
           `SELECT app_user.email, app_user.display_name, app_user.suitecrm_user_id
            FROM app_users app_user
@@ -2226,7 +2326,7 @@ async function normalizeStageCrmRecordInput(
         )
       : null
     if ((agent?.rows.length || 0) > 1) throw new Error('Interaction agent mapping is ambiguous')
-    if (agentEmail && !agent?.rows[0]) {
+    if (!preserveAgent && agentEmail && !agent?.rows[0]) {
       throw new Error('Interaction agent must be an active ClawPilot user with pipeline access')
     }
     const relationship = await client.query<{
@@ -2275,6 +2375,12 @@ async function normalizeStageCrmRecordInput(
       ],
     )
     const organization = relationship.rows[0]
+    const organizationIds = trustedReview ? requestedOrganizations || []
+      : retainedOrganizations.length > 1 ? retainedOrganizations
+        : organization?.organization_id ? [organization.organization_id] : []
+    if (trustedReview && (!organizationIds.length || organizationIds[0] !== organization?.organization_id)) {
+      throw new Error('Reviewed interaction primary organization is invalid')
+    }
     if (contactIds.length > 0) {
       const selectedContacts = await client.query<{ id: string; organization_id: string | null }>(
         `SELECT id::text, organization_id::text
@@ -2288,7 +2394,9 @@ async function normalizeStageCrmRecordInput(
       }
       if (
         organization?.organization_id
-        && selectedContacts.rows.some((contact) => contact.organization_id !== organization.organization_id)
+        && selectedContacts.rows.some((contact) => contact.organization_id !== organization.organization_id
+          && !(organizationIds.includes(contact.organization_id || '')
+            && (trustedReview || retainedContacts.includes(contact.id))))
       ) {
         throw new Error('Interaction contacts must belong to the selected organization')
       }
@@ -2326,12 +2434,15 @@ async function normalizeStageCrmRecordInput(
           : fields.direction,
         contactId: primaryContactId,
         contactIds: fields.contactIds === undefined ? undefined : contactIds,
-        agentEmail: agent?.rows[0]?.email || null,
-        agentName: agent?.rows[0]
+        agentEmail: preserveAgent ? fields.agentEmail ?? null : agent?.rows[0]?.email || null,
+        agentName: preserveAgent ? fields.agentName : agent?.rows[0]
           ? clean(agent.rows[0].display_name) || agent.rows[0].email
           : fields.agentName,
-        agentSuiteCrmUserId: agent?.rows[0]?.suitecrm_user_id || null,
+        // Participant-only enrichment must neither resolve a historic name to
+        // a new agent nor emit an assignment change to the provider.
+        agentSuiteCrmUserId: preserveAgent ? null : agent?.rows[0]?.suitecrm_user_id || null,
         organizationId: organization?.organization_id || null,
+        organizationIds,
         contactSuiteCrmId: organization?.contact_suitecrm_id || null,
         parentSuiteCrmId,
         parentSuiteCrmType,
@@ -2352,13 +2463,16 @@ type StagedCrmRecord<SuiteCrmId = string> = {
 export function stageCrmRecordWithClient(
   client: PoolClient,
   rawInput: Exclude<StageCrmRecordInput, StageInteractionInput>,
+  options?: CrmStageOptions,
 ): Promise<StagedCrmRecord>
 export function stageCrmRecordWithClient(
   client: PoolClient,
   rawInput: StageCrmRecordInput,
+  options?: CrmStageOptions,
 ): Promise<StagedCrmRecord<string | null>>
-export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
-  let input = await normalizeStageCrmRecordInput(client, rawInput)
+export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput,
+  options?: CrmStageOptions) {
+  let input = await normalizeStageCrmRecordInput(client, rawInput, options)
   let contactAliases: ContactStageResolution['aliases'] = []
   if (input.entity === 'contacts' && !input.createOnly) {
     const contactResolution = await resolveContactStageIdentity(client, input)
@@ -2406,9 +2520,10 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       reference_code: string
       source_hash: string
       source_payload: Record<string, unknown> | null
+      metadata: Record<string, unknown> | null
       suitecrm_module: SuiteCrmInteractionModule | null
     }>(
-      `SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module
+      `SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module, metadata
        FROM crm_interactions
        WHERE pipeline_id = $1::uuid
          AND (
@@ -2420,6 +2535,16 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       [input.pipelineId, input.localId || null, sourceKey],
     )
     const existing = previous.rows[0]
+    if (options?.reviewedGmailRelationships !== REVIEWED_GMAIL_RELATIONSHIPS) {
+      const receipt = input.fields.metadata?.reviewedGmailRecovery
+      if (receipt !== undefined && crmSourceHash(receipt) !== crmSourceHash(existing?.metadata?.reviewedGmailRecovery ?? null)) {
+        throw new Error('Reviewed Gmail recovery metadata cannot be supplied by a generic CRM write')
+      }
+      if (existing?.metadata?.reviewedGmailRecovery !== undefined) {
+        input = { ...input, fields: { ...input.fields,
+          metadata: { ...input.fields.metadata, reviewedGmailRecovery: existing.metadata.reviewedGmailRecovery } } }
+      }
+    }
     if (existing) {
       previousSuiteCrmModule = existing.suitecrm_module
       // A sync snapshot may predate an archive. Check the locked row, matching
@@ -2548,6 +2673,394 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
     })
   }
   return staged
+}
+
+/** Add positively identified participants to one existing email, without
+ * re-importing its content or changing any established customer relationship.
+ * Preview and apply share the same locked validation; only apply may stage. */
+export async function enrichCrmEmailInteractionParticipantsInPostgres(input: {
+  pipelineId: string
+  interactionId: string
+  ownerEmail: string
+  providerMessageId: string
+  providerThreadId: string | null
+  targets: Array<{
+    id: string
+    entity: 'contacts' | 'leads'
+    referenceCode: string
+    organizationId: string | null
+    email: string
+  }>
+  apply?: boolean
+}): Promise<{ enriched: boolean }> {
+  return withTransaction(async (client) => {
+    const unavailable = () => new Error('Existing Gmail interaction has conflicting CRM participant evidence')
+    // Lock ownership/membership as well as the email. A formerly owned or
+    // archived record is not permission to resurrect an activity on replay.
+    const selected = await client.query<Record<string, unknown>>(
+      `SELECT interaction.*, interaction.occurred_at::text AS retained_occurred_at FROM crm_interactions interaction
+       JOIN pipeline_spaces pipeline ON pipeline.id = interaction.pipeline_id
+       JOIN app_user_organization_memberships membership
+         ON membership.organization_id = pipeline.workspace_organization_id
+         AND membership.user_email = pipeline.owner_email AND membership.status = 'active'
+       JOIN app_users owner_user ON owner_user.email = pipeline.owner_email AND owner_user.status = 'active'
+       WHERE interaction.id = $1::uuid AND interaction.pipeline_id = $2::uuid
+         AND pipeline.owner_email = $3 AND pipeline.reference_access_disabled = false
+       FOR UPDATE OF interaction FOR SHARE OF pipeline, membership, owner_user`,
+      [input.interactionId, input.pipelineId, input.ownerEmail],
+    )
+    const current = selected.rows[0]
+    const sourcePayload = current?.source_payload as Record<string, unknown> | undefined
+    if (!current || current.interaction_type !== 'email'
+      || current.provider_message_id !== input.providerMessageId
+      || (current.provider_thread_id != null && current.provider_thread_id !== input.providerThreadId)
+      || ['true', '1', 'yes'].includes(String(sourcePayload?.archived ?? '').toLowerCase())
+      || !input.targets.length) throw unavailable()
+    const mapping = await client.query<{ contact_id: string; is_primary: boolean; sort_order: number }>(
+      `SELECT contact_id::text, is_primary, sort_order FROM crm_interaction_contacts
+       WHERE pipeline_id = $1::uuid AND interaction_id = $2::uuid
+       ORDER BY sort_order, contact_id FOR UPDATE`,
+      [input.pipelineId, input.interactionId],
+    )
+    const existingContacts = Array.from(new Set([
+      ...(current.contact_id ? [String(current.contact_id)] : []),
+      ...mapping.rows.map((row) => row.contact_id),
+    ]))
+    const targetContacts = input.targets.filter((target) => target.entity === 'contacts')
+    const contactIds = Array.from(new Set([...existingContacts, ...targetContacts.map((target) => target.id)]))
+    const targetLeads = input.targets.filter((target) => target.entity === 'leads')
+    const leadIds = Array.from(new Set([
+      ...(current.lead_id ? [String(current.lead_id)] : []), ...targetLeads.map((target) => target.id),
+    ]))
+    type Participant = { id: string; organization_id: string | null; reference_code: string; email: string; active: boolean }
+    const contacts = await client.query<Participant>(
+      `SELECT id::text, organization_id::text, reference_code, lower(btrim(email)) AS email, ${activeCrmRecordSql('contact')} AS active
+       FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND id = ANY($2::uuid[]) FOR SHARE`,
+      [input.pipelineId, contactIds],
+    )
+    const leads = await client.query<Participant>(
+      `SELECT id::text, organization_id::text, reference_code, lower(btrim(email)) AS email, ${activeCrmRecordSql('lead')} AS active
+       FROM crm_leads lead WHERE pipeline_id = $1::uuid AND id = ANY($2::uuid[]) FOR SHARE`,
+      [input.pipelineId, leadIds],
+    )
+    if (contacts.rows.length !== contactIds.length || leads.rows.length !== leadIds.length
+      || [...contacts.rows, ...leads.rows].some((row) => !row.active)) throw unavailable()
+    // Recheck the exact reviewed target identity/account under the same locks
+    // used for staging, not just the earlier participant-query snapshot.
+    for (const target of input.targets) {
+      const row = (target.entity === 'contacts' ? contacts : leads).rows.find((row) => row.id === target.id)
+      if (!row || row.reference_code !== target.referenceCode
+        || row.organization_id !== target.organizationId
+        || row.email !== target.email.trim().toLowerCase()) throw unavailable()
+    }
+    const accountKeys = new Set(input.targets.map((target) => target.organizationId || target.id))
+    if (accountKeys.size !== 1) throw unavailable()
+    const organizationId = input.targets[0].organizationId
+    if (current.organization_id && current.organization_id !== organizationId) throw unavailable()
+    if ([...contacts.rows, ...leads.rows].some((row) => (
+      organizationId ? row.organization_id !== organizationId : !input.targets.some((target) => target.id === row.id)
+    ))) throw unavailable()
+    // Other established parent relationships are retained, and may not smuggle
+    // an unrelated customer into an otherwise matching contact selection.
+    for (const [table, parentId] of [
+      ['crm_opportunities', current.opportunity_id], ['crm_meetings', current.meeting_id],
+    ] as const) {
+      if (!parentId) continue
+      const parents = await client.query<{ organization_id: string | null }>(
+        `SELECT organization_id::text FROM ${table} WHERE pipeline_id = $1::uuid AND id = $2::uuid FOR SHARE`,
+        [input.pipelineId, parentId],
+      )
+      if (parents.rows.length !== 1 || parents.rows[0].organization_id !== organizationId) throw unavailable()
+    }
+    if (organizationId) {
+      const organization = await client.query<{ id: string }>(
+        `SELECT id::text FROM crm_organizations organization
+         WHERE pipeline_id = $1::uuid AND id = $2::uuid AND ${activeCrmRecordSql('organization')} FOR SHARE`,
+        [input.pipelineId, organizationId],
+      )
+      if (organization.rows.length !== 1) throw unavailable()
+    }
+    const leadId = current.lead_id ? String(current.lead_id) : targetLeads.length === 1 ? targetLeads[0].id : null
+    const unchanged = (current.organization_id || null) === organizationId
+      && (current.contact_id || null) === (contactIds[0] || null)
+      && (current.lead_id || null) === leadId
+      && mapping.rows.length === contactIds.length
+      && mapping.rows.every((row, index) => row.contact_id === contactIds[index] && row.is_primary === (index === 0))
+    if (!input.apply || unchanged) return { enriched: false }
+    // Copy the locked persisted snapshot, including source identity and authored
+    // content. Normal staging updates native relationships and durable projection.
+    await stageCrmRecordWithClient(client, {
+      entity: 'interactions', pipelineId: input.pipelineId, localId: String(current.id),
+      sourceKey: String(current.source_key), sourceSheetId: nullable(current.source_sheet_id),
+      sourceRowNumber: current.source_row_number == null ? null : Number(current.source_row_number),
+      sourcePayload: sourcePayload || {}, actorEmail: input.ownerEmail,
+      fields: {
+        organizationId, contactId: contactIds[0] || null, contactIds, leadId,
+        opportunityId: nullable(current.opportunity_id), meetingId: nullable(current.meeting_id),
+        campaignId: nullable(current.campaign_id), interactionType: String(current.interaction_type),
+        suiteCrmModule: current.suitecrm_module as SuiteCrmInteractionModule | null,
+        activityStatus: current.activity_status as CrmActivityStatus | null,
+        durationMinutes: current.duration_minutes == null ? null : Number(current.duration_minutes),
+        subject: String(current.subject ?? ''), description: String(current.description ?? ''),
+        agentEmail: nullable(current.agent_email), agentName: String(current.agent_name ?? ''),
+        occurredAt: isoTimestamp(current.retained_occurred_at ?? current.occurred_at), direction: current.direction as CrmInteraction['direction'],
+        deliveryStatus: String(current.delivery_status ?? ''),
+        providerMessageId: String(current.provider_message_id), providerThreadId: nullable(current.provider_thread_id),
+        metadata: current.metadata as Record<string, unknown> || {},
+      },
+    }, { preserveInteractionAgent: true })
+    return { enriched: true }
+  })
+}
+
+export type ReviewedGmailInteractionInput = {
+  ownerEmail: string
+  pipelineId: string
+  connectionId: string
+  providerMessageId: string
+  providerThreadId: string | null
+  participantEmails: string[]
+  primaryOrganization: { id: string; referenceCode: string }
+  contactTargets: Array<{ id: string; referenceCode: string; email: string; organizationId: string }>
+  interaction: StageInteractionInput
+  expectedExistingInteractionId?: string | null
+  expectedTargetFingerprint?: string
+  apply?: boolean
+}
+
+function reviewedGmailContentFingerprint(row: Record<string, unknown> | null): string {
+  if (!row) return crmSourceHash(null)
+  const metadata = { ...(row.metadata as Record<string, unknown> || {}) }
+  delete metadata.reviewedGmailRecovery
+  return crmSourceHash({
+    identity: [row.id, row.pipeline_id, row.suitecrm_id, row.reference_code, row.source_key,
+      row.source_sheet_id, row.source_row_number, row.source_hash],
+    content: [row.subject, row.description, row.retained_occurred_at, row.interaction_type,
+      row.suitecrm_module, row.activity_status, row.duration_minutes, row.direction, row.delivery_status],
+    provider: [row.provider_message_id, row.provider_thread_id],
+    assignment: [row.agent_email, row.agent_name],
+    context: [row.organization_id, row.contact_id, row.lead_id, row.opportunity_id, row.meeting_id, row.campaign_id],
+    source: row.source_payload, metadata, contacts: row.contact_ids, organizations: row.organization_ids,
+  })
+}
+
+async function readReviewedGmailInteractionWithClient(client: PoolClient, pipelineId: string, messageId: string) {
+  return client.query<Record<string, unknown>>(
+    `SELECT interaction.*, interaction.occurred_at::text AS retained_occurred_at,
+       ARRAY(SELECT related.contact_id::text FROM crm_interaction_contacts related
+         WHERE related.pipeline_id = interaction.pipeline_id AND related.interaction_id = interaction.id
+         ORDER BY related.sort_order, related.contact_id) AS contact_ids,
+       ARRAY(SELECT related.organization_id::text FROM crm_interaction_organizations related
+         WHERE related.pipeline_id = interaction.pipeline_id AND related.interaction_id = interaction.id
+         ORDER BY related.sort_order, related.organization_id) AS organization_ids
+     FROM crm_interactions interaction WHERE interaction.pipeline_id = $1::uuid
+       AND interaction.provider_message_id = $2 ORDER BY interaction.id LIMIT 2 FOR UPDATE`,
+    [pipelineId, messageId],
+  )
+}
+
+async function prepareReviewedGmailInteractionWithClient(client: PoolClient, input: ReviewedGmailInteractionInput) {
+  const refuse = () => new Error('Reviewed Gmail recovery evidence changed or conflicts with existing CRM relationships')
+  if (!input.contactTargets.length || input.contactTargets.length > 25
+    || input.interaction.entity !== 'interactions' || input.interaction.pipelineId !== input.pipelineId
+    || input.interaction.actorEmail !== input.ownerEmail || input.interaction.fields.interactionType !== 'email'
+    || input.interaction.fields.providerMessageId !== input.providerMessageId
+    || (input.interaction.fields.providerThreadId || null) !== input.providerThreadId) throw refuse()
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',
+    [`crm-reviewed-gmail:${input.pipelineId}:${input.providerMessageId}`])
+  const scope = await client.query<Record<string, unknown>>(
+    `SELECT pipeline.id::text, pipeline.workspace_organization_id::text, pipeline.owner_email,
+       connection.connection_id, connection.account_email
+     FROM pipeline_spaces pipeline
+     JOIN app_users owner_user ON owner_user.email = pipeline.owner_email AND owner_user.status = 'active'
+     JOIN app_user_organization_memberships membership
+       ON membership.organization_id = pipeline.workspace_organization_id
+       AND membership.user_email = pipeline.owner_email AND membership.status = 'active'
+     JOIN user_maton_connections connection ON connection.owner_email = pipeline.owner_email
+       AND connection.app = 'google-mail' AND connection.source = 'maton'
+       AND connection.status = 'ACTIVE' AND connection.is_selected AND connection.connection_id = $3
+     WHERE pipeline.id = $1::uuid AND pipeline.owner_email = $2 AND NOT pipeline.reference_access_disabled
+     FOR SHARE OF pipeline, owner_user, membership, connection`,
+    [input.pipelineId, input.ownerEmail, input.connectionId],
+  )
+  if (scope.rows.length !== 1) throw refuse()
+  const cache = await client.query<Record<string, unknown>>(
+    `SELECT message.* FROM crm_inbound_messages message
+     JOIN pipeline_spaces source_pipeline ON source_pipeline.id = message.pipeline_id
+       AND source_pipeline.owner_email = message.owner_email
+     WHERE message.owner_email = $1 AND message.external_message_id = $2
+       AND message.external_thread_id IS NOT DISTINCT FROM $3::text
+       AND message.raw_metadata->>'provider' = 'gmail'
+     FOR UPDATE OF message FOR SHARE OF source_pipeline`,
+    [input.ownerEmail, input.providerMessageId, input.providerThreadId],
+  )
+  if (cache.rows.length !== 1) throw refuse()
+  const cached = cache.rows[0]
+  const raw = cached.raw_metadata as Record<string, unknown> || {}
+  const headers = raw.emailAddressHeaders as Record<string, Array<{ address?: string }>> || {}
+  if (!Array.isArray(headers.from) || headers.from.length !== 1
+    || (raw.labelIds as string[] || []).some((label) => ['DRAFT', 'SPAM', 'TRASH'].includes(label))) throw refuse()
+  const headerEmails = new Set(['from', 'to', 'cc', 'bcc'].flatMap((kind) => (
+    Array.isArray(headers[kind]) ? headers[kind].map((mailbox) => clean(mailbox.address).toLowerCase()) : []
+  )))
+  const participantEmails = new Set(input.participantEmails.map((email) => clean(email).toLowerCase()))
+  const contactIds = uniqueUuidList(input.contactTargets.map((target) => target.id))
+  if (contactIds.length !== input.contactTargets.length) throw refuse()
+  const contacts = await client.query<{ id: string; reference_code: string; email: string; organization_id: string | null; active: boolean }>(
+    `SELECT id::text, reference_code, lower(btrim(email)) AS email, organization_id::text,
+       ${activeCrmRecordSql('contact')} AS active
+     FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND id = ANY($2::uuid[]) FOR SHARE`,
+    [input.pipelineId, contactIds],
+  )
+  if (contacts.rows.length !== contactIds.length) throw refuse()
+  const eligible = await client.query<{ id: string }>(
+    `SELECT pipeline.id::text FROM pipeline_spaces pipeline
+     JOIN app_user_organization_memberships membership ON membership.organization_id = pipeline.workspace_organization_id
+       AND membership.user_email = pipeline.owner_email AND membership.status = 'active'
+     WHERE pipeline.owner_email = $1 AND NOT pipeline.reference_access_disabled
+     ORDER BY pipeline.id FOR SHARE OF pipeline, membership`, [input.ownerEmail])
+  const candidates = await client.query<{ id: string; pipeline_id: string; entity: string; reference_code: string; email: string }>(
+    crmParticipantEmailCandidatesSql(), [eligible.rows.map((row) => row.id), input.contactTargets.map((target) => clean(target.email).toLowerCase())])
+  if (candidates.rows.length !== contactIds.length || candidates.rows.some((row) => row.pipeline_id !== input.pipelineId
+    || row.entity !== 'contacts' || !contactIds.includes(row.id))) throw refuse()
+  for (const target of input.contactTargets) {
+    const row = contacts.rows.find((row) => row.id === target.id)
+    const email = clean(target.email).toLowerCase()
+    if (!row?.active || row.reference_code !== target.referenceCode || row.email !== email
+      || row.organization_id !== target.organizationId || !headerEmails.has(email) || !participantEmails.has(email)) throw refuse()
+  }
+  const organizationIds = [input.primaryOrganization.id, ...Array.from(new Set(input.contactTargets.map((target) => target.organizationId)))
+    .filter((id) => id !== input.primaryOrganization.id).sort()]
+  if (!input.contactTargets.some((target) => target.organizationId === input.primaryOrganization.id)) throw refuse()
+  const organizations = await client.query<{ id: string; reference_code: string; active: boolean }>(
+    `SELECT id::text, reference_code, ${activeCrmRecordSql('organization')} AS active
+     FROM crm_organizations organization WHERE pipeline_id = $1::uuid AND id = ANY($2::uuid[]) ORDER BY id FOR SHARE`,
+    [input.pipelineId, organizationIds],
+  )
+  if (organizations.rows.length !== organizationIds.length || organizations.rows.some((row) => !row.active)
+    || !organizations.rows.some((row) => row.id === input.primaryOrganization.id && row.reference_code === input.primaryOrganization.referenceCode)) throw refuse()
+  const selected = await readReviewedGmailInteractionWithClient(client, input.pipelineId, input.providerMessageId)
+  if (selected.rows.length > 1) throw refuse()
+  const current = selected.rows[0] || null
+  if (current && (current.interaction_type !== 'email' || current.suitecrm_module !== 'Emails'
+    || ['true', '1', 'yes'].includes(String((current.source_payload as Record<string, unknown>)?.archived ?? '').toLowerCase())
+    || (current.provider_thread_id != null && current.provider_thread_id !== input.providerThreadId)
+    || (current.organization_id != null && current.organization_id !== input.primaryOrganization.id)
+    || ((current.contact_ids as string[] || []).some((id) => !contactIds.includes(id)))
+    || (current.contact_id && !contactIds.includes(String(current.contact_id)))
+    || ((current.organization_ids as string[] || []).some((id) => !organizationIds.includes(id))))) throw refuse()
+  for (const [table, id] of [['crm_leads', current?.lead_id], ['crm_opportunities', current?.opportunity_id], ['crm_meetings', current?.meeting_id]] as const) {
+    if (!id) continue
+    const related = await client.query<{ organization_id: string | null }>(
+      `SELECT organization_id::text FROM ${table} WHERE pipeline_id = $1::uuid AND id = $2::uuid FOR SHARE`, [input.pipelineId, id])
+    if (related.rows.length !== 1 || related.rows[0].organization_id !== input.primaryOrganization.id) throw refuse()
+  }
+  const links = await client.query<{ reference_code: string; interaction_id: string | null; pipeline_id: string | null }>(
+    `SELECT link.reference_code, link.interaction_id::text, interaction.pipeline_id::text
+     FROM crm_inbound_message_links link LEFT JOIN crm_interactions interaction ON interaction.id = link.interaction_id
+     WHERE link.inbound_message_id = $1::uuid ORDER BY link.reference_code FOR UPDATE OF link`, [cached.id])
+  const references = new Set([...input.contactTargets.map((target) => target.referenceCode), ...organizations.rows.map((row) => row.reference_code)])
+  if (links.rows.some((link) => !references.has(link.reference_code) || (link.interaction_id
+    && (link.interaction_id !== current?.id || link.pipeline_id !== input.pipelineId)))
+    || (cached.interaction_id && cached.interaction_id !== current?.id)
+    || (cached.organization_id && cached.organization_id !== input.primaryOrganization.id)
+    || (cached.contact_id && !contactIds.includes(String(cached.contact_id)))
+    || (cached.lead_id && cached.lead_id !== current?.lead_id)) throw refuse()
+  const orderedContactIds = Array.from(new Set([
+    ...(current?.contact_id ? [String(current.contact_id)] : []), ...(current?.contact_ids as string[] || []),
+    ...input.contactTargets.filter((target) => target.organizationId === input.primaryOrganization.id).map((target) => target.id),
+    ...contactIds,
+  ]))
+  const metadata = current?.metadata as Record<string, unknown> || {}
+  const receipt = metadata.reviewedGmailRecovery as { targetFingerprint?: string; contentFingerprint?: string; evidenceFingerprint?: string } | undefined
+  const alreadyLinked = Boolean(current && (current.organization_ids as string[] || []).join() === organizationIds.join()
+    && (current.contact_ids as string[] || []).join() === orderedContactIds.join()
+    && current.organization_id === input.primaryOrganization.id)
+  const stableCache = { ...cached }
+  delete stableCache.interaction_id; delete stableCache.organization_id; delete stableCache.contact_id; delete stableCache.lead_id
+  const evidenceFingerprint = crmSourceHash({ scope: scope.rows[0], cache: stableCache,
+    primary: input.primaryOrganization, targets: [...input.contactTargets].sort((a, b) => a.id.localeCompare(b.id)), organizations: organizations.rows,
+    generated: { ...input.interaction, fields: { ...input.interaction.fields,
+      metadata: { ...input.interaction.fields.metadata, inboundMessageId: cached.id } } } })
+  const receiptValid = alreadyLinked && receipt?.contentFingerprint === reviewedGmailContentFingerprint(current)
+    && receipt.evidenceFingerprint === evidenceFingerprint && typeof receipt.targetFingerprint === 'string'
+  const targetFingerprint = receiptValid ? receipt!.targetFingerprint! : crmSourceHash({ version: 1, scope: scope.rows[0],
+    provider: [input.providerMessageId, input.providerThreadId], cache: stableCache,
+    primary: input.primaryOrganization, targets: [...input.contactTargets].sort((a, b) => a.id.localeCompare(b.id)),
+    current: reviewedGmailContentFingerprint(current), links: links.rows,
+    generated: { ...input.interaction, fields: { ...input.interaction.fields,
+      metadata: { ...input.interaction.fields.metadata, inboundMessageId: cached.id } } } })
+  if (input.apply && (input.expectedTargetFingerprint !== targetFingerprint
+    || (input.expectedExistingInteractionId !== (current?.id || null)
+      && !(input.expectedExistingInteractionId === null && receiptValid && receipt?.targetFingerprint === input.expectedTargetFingerprint)))) throw refuse()
+  return { input, current, cached, organizationIds, contactIds: orderedContactIds, targetFingerprint, alreadyLinked, receiptValid, evidenceFingerprint }
+}
+
+async function applyReviewedGmailInteractionWithClient(client: PoolClient,
+  plan: Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>) {
+  const { input, current, cached, organizationIds, contactIds, targetFingerprint } = plan
+  if (!input.apply || plan.receiptValid) return { interactionId: current ? String(current.id) : null,
+    inboundMessageId: String(cached.id), applied: false, alreadyLinked: plan.alreadyLinked, targetFingerprint }
+  const metadata = { ...(current?.metadata as Record<string, unknown> || input.interaction.fields.metadata),
+    inboundMessageId: String(cached.id), reviewedGmailRecovery: { targetFingerprint } }
+  const fields: StageInteractionInput['fields'] = current ? {
+    organizationId: input.primaryOrganization.id, organizationIds, contactIds, contactId: contactIds[0] || null,
+    leadId: nullable(current.lead_id), opportunityId: nullable(current.opportunity_id), meetingId: nullable(current.meeting_id),
+    campaignId: nullable(current.campaign_id), interactionType: 'email', suiteCrmModule: current.suitecrm_module as SuiteCrmInteractionModule,
+    activityStatus: current.activity_status as CrmActivityStatus | null, durationMinutes: current.duration_minutes == null ? null : Number(current.duration_minutes),
+    subject: String(current.subject ?? ''), description: String(current.description ?? ''),
+    agentEmail: nullable(current.agent_email), agentName: String(current.agent_name ?? ''),
+    occurredAt: isoTimestamp(current.retained_occurred_at), direction: current.direction as CrmInteraction['direction'],
+    deliveryStatus: String(current.delivery_status ?? ''), providerMessageId: String(current.provider_message_id),
+    providerThreadId: nullable(current.provider_thread_id), metadata,
+  } : { ...input.interaction.fields, organizationId: input.primaryOrganization.id, organizationIds, contactIds,
+    contactId: contactIds[0] || null, metadata }
+  const staged = await stageCrmRecordWithClient(client, {
+    ...input.interaction, localId: current ? String(current.id) : null,
+    sourceKey: current ? String(current.source_key) : `gmail:reviewed:${crmSourceHash([input.ownerEmail, input.connectionId, input.providerMessageId])}`,
+    sourceSheetId: current ? nullable(current.source_sheet_id) : input.interaction.sourceSheetId,
+    sourceRowNumber: current ? current.source_row_number == null ? null : Number(current.source_row_number) : input.interaction.sourceRowNumber,
+    sourcePayload: current ? current.source_payload as Record<string, unknown> : input.interaction.sourcePayload,
+    fields,
+  }, { preserveInteractionAgent: Boolean(current), reviewedGmailRelationships: REVIEWED_GMAIL_RELATIONSHIPS })
+  const [saved] = (await readReviewedGmailInteractionWithClient(client, input.pipelineId, input.providerMessageId)).rows
+  if (!saved || saved.id !== staged.id) throw new Error('Reviewed Gmail provider identity changed while staging')
+  await client.query(`UPDATE crm_interactions SET metadata = metadata || $2::jsonb WHERE id = $1::uuid`,
+    [staged.id, JSON.stringify({ reviewedGmailRecovery: { targetFingerprint, contentFingerprint: reviewedGmailContentFingerprint(saved),
+      evidenceFingerprint: plan.evidenceFingerprint } })])
+  return { interactionId: staged.id, inboundMessageId: String(cached.id), applied: true, alreadyLinked: true, targetFingerprint }
+}
+
+/** Explicit reviewed recovery only; generic CRM field/metadata values cannot
+ * obtain the private multi-company staging capability. Cached Gmail evidence is
+ * required, and every message in a batch is validated before the first write. */
+export async function stageReviewedGmailInteractionsInPostgres(input: {
+  messages: ReviewedGmailInteractionInput[]
+  apply?: boolean
+}) {
+  if (!input.messages.length || input.messages.length > 25
+    || new Set(input.messages.map((message) => `${message.pipelineId}:${message.providerMessageId}`)).size !== input.messages.length) {
+    throw new Error('A bounded unique reviewed Gmail recovery batch is required')
+  }
+  return withTransaction(async (client) => {
+    // A short, explicit recovery batch has no provider calls inside this TX.
+    // Fail immediately if ordinary contact/lead writes are active; otherwise
+    // prevent duplicate-email insertion phantoms until validation/staging ends.
+    try { await client.query('LOCK TABLE crm_contacts, crm_leads IN SHARE MODE NOWAIT') }
+    catch { throw new Error('Reviewed Gmail recovery is busy; retry a fresh preview') }
+    const plans = new Map<ReviewedGmailInteractionInput, Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>>()
+    for (const message of [...input.messages].sort((a, b) => `${a.pipelineId}:${a.providerMessageId}`.localeCompare(`${b.pipelineId}:${b.providerMessageId}`))) {
+      plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }))
+    }
+    const results = []
+    for (const message of input.messages) results.push(await applyReviewedGmailInteractionWithClient(client, plans.get(message)!))
+    return results
+  })
+}
+
+export async function stageReviewedGmailInteractionInPostgres(input: ReviewedGmailInteractionInput) {
+  const [result] = await stageReviewedGmailInteractionsInPostgres({ messages: [input], apply: input.apply })
+  return result
 }
 
 async function lockCrmMutation(client: PoolClient, key: string) {
@@ -3757,6 +4270,7 @@ function hydrateOpportunityRowsWithPool(rows: Record<string, unknown>[], pipelin
 function interactionFromRow(
   row: Record<string, unknown>,
   contacts: CrmInteraction['contacts'] = [],
+  organizations: NonNullable<CrmInteraction['organizations']> = [],
 ): CrmInteraction {
   const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
     ? row.metadata as Record<string, unknown>
@@ -3774,9 +4288,16 @@ function interactionFromRow(
   }] : []
   const relatedContacts = contacts.length > 0 ? contacts : fallbackContact
   const primaryContact = relatedContacts.find((contact) => contact.isPrimary) || relatedContacts[0] || null
+  const relatedOrganizations = organizations.length ? organizations : row.organization_id ? [{
+    id: String(row.organization_id), referenceCode: clean(row.organization_reference_code),
+    name: clean(row.organization_name), isPrimary: true,
+  }] : []
   return {
     id: String(row.id), referenceCode: clean(row.reference_code), shortUrl: crmReferenceShortUrl(row.reference_code),
     pipelineId: String(row.pipeline_id), organizationId: nullable(row.organization_id), organizationName: clean(row.organization_name),
+    organizationIds: relatedOrganizations.map((organization) => organization.id), organizations: relatedOrganizations,
+    companyAssociationsReviewed: Boolean(metadata.reviewedGmailRecovery
+      && typeof metadata.reviewedGmailRecovery === 'object' && !Array.isArray(metadata.reviewedGmailRecovery)),
     contactId: primaryContact?.id || nullable(row.contact_id), contactName: primaryContact?.fullName || clean(row.contact_name),
     contactIds: relatedContacts.map((contact) => contact.id), contacts: relatedContacts,
     opportunityId: nullable(row.opportunity_id), opportunityName: clean(row.opportunity_name),
@@ -3791,7 +4312,11 @@ function interactionFromRow(
       ? null
       : Number(row.duration_minutes),
     subject: clean(row.subject), agentEmail: nullable(row.agent_email), agentName: clean(row.agent_name),
-    occurredAt: row.occurred_at ? String(row.occurred_at) : null,
+    occurredAt: row.occurred_at
+      ? Object.prototype.toString.call(row.occurred_at) === '[object Date]'
+        ? (row.occurred_at as Date).toISOString()
+        : String(row.occurred_at)
+      : null,
     description: clean(row.description), direction: (row.direction || 'internal') as CrmInteraction['direction'],
     deliveryStatus: clean(row.delivery_status), providerMessageId: nullable(row.provider_message_id),
     providerThreadId: nullable(row.provider_thread_id),
@@ -3815,11 +4340,15 @@ async function hydrateInteractionRows(
   const relationshipResult = await runQuery(
     `SELECT relationship.interaction_id::text, relationship.is_primary,
        contact.id::text, contact.reference_code, contact.full_name, contact.email,
-       contact.phone_work, contact.phone_mobile, contact.job_title
+       contact.phone_work, contact.phone_mobile, contact.job_title,
+       contact.organization_id::text, company.name AS organization_name,
+       company.reference_code AS organization_reference_code
      FROM crm_interaction_contacts relationship
      JOIN crm_contacts contact
        ON contact.pipeline_id = relationship.pipeline_id
       AND contact.id = relationship.contact_id
+     LEFT JOIN crm_organizations company
+       ON company.pipeline_id = contact.pipeline_id AND company.id = contact.organization_id
      WHERE relationship.pipeline_id = $1::uuid
        AND relationship.interaction_id = ANY($2::uuid[])
      ORDER BY relationship.interaction_id, relationship.sort_order, contact.full_name, contact.id`,
@@ -3838,10 +4367,36 @@ async function hydrateInteractionRows(
       phoneMobile: clean(relationship.phone_mobile),
       jobTitle: clean(relationship.job_title),
       isPrimary: relationship.is_primary === true,
+      organizationId: nullable(relationship.organization_id),
+      organizationName: clean(relationship.organization_name),
+      organizationReferenceCode: nullable(relationship.organization_reference_code),
     })
     byInteraction.set(interactionId, contacts)
   }
-  return rows.map((row) => interactionFromRow(row, byInteraction.get(String(row.id)) || []))
+  const organizationResult = await runQuery(
+    `SELECT relationship.interaction_id::text, relationship.is_primary,
+       organization.id::text, organization.reference_code, organization.name
+     FROM crm_interaction_organizations relationship
+     JOIN crm_organizations organization
+       ON organization.pipeline_id = relationship.pipeline_id AND organization.id = relationship.organization_id
+     WHERE relationship.pipeline_id = $1::uuid
+       AND relationship.interaction_id = ANY($2::uuid[])
+       AND ${activeCrmRecordSql('organization')}
+     ORDER BY relationship.interaction_id, relationship.sort_order, organization.id`,
+    [pipelineId, interactionIds],
+  )
+  const organizationsByInteraction = new Map<string, NonNullable<CrmInteraction['organizations']>>()
+  for (const relationship of organizationResult.rows) {
+    const interactionId = String(relationship.interaction_id)
+    const organizations = organizationsByInteraction.get(interactionId) || []
+    if (!organizations.some((organization) => organization.id === String(relationship.id))) organizations.push({
+      id: String(relationship.id), referenceCode: clean(relationship.reference_code),
+      name: clean(relationship.name), isPrimary: relationship.is_primary === true,
+    })
+    organizationsByInteraction.set(interactionId, organizations)
+  }
+  return rows.map((row) => interactionFromRow(row, byInteraction.get(String(row.id)) || [],
+    organizationsByInteraction.get(String(row.id)) || []))
 }
 
 function hydrateInteractionRowsWithClient(client: PoolClient, rows: Record<string, unknown>[], pipelineId: string) {
@@ -4275,7 +4830,16 @@ export async function listCrmRecordsInPostgres(input: {
          WHEN 'organizations' THEN COALESCE(
            interaction.organization_id, contact.organization_id, lead.organization_id,
            opportunity.organization_id, meeting.organization_id
-         ) = $6::uuid
+         ) = $6::uuid OR EXISTS (
+           SELECT 1 FROM crm_interaction_organizations related_organization
+           JOIN crm_organizations related_company
+             ON related_company.pipeline_id = related_organization.pipeline_id
+            AND related_company.id = related_organization.organization_id
+           WHERE related_organization.pipeline_id = interaction.pipeline_id
+             AND related_organization.interaction_id = interaction.id
+             AND related_organization.organization_id = $6::uuid
+             AND ${activeCrmRecordSql('related_company')}
+         )
          WHEN 'contacts' THEN interaction.contact_id = $6::uuid OR EXISTS (
            SELECT 1 FROM crm_interaction_contacts relationship
            WHERE relationship.pipeline_id = interaction.pipeline_id
@@ -4292,6 +4856,17 @@ export async function listCrmRecordsInPostgres(input: {
          OR interaction.subject ILIKE '%' || $2 || '%'
          OR interaction.description ILIKE '%' || $2 || '%'
          OR organization.name ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%'
+         OR EXISTS (
+           SELECT 1 FROM crm_interaction_organizations related_organization
+           JOIN crm_organizations related_company
+             ON related_company.pipeline_id = related_organization.pipeline_id
+            AND related_company.id = related_organization.organization_id
+           WHERE related_organization.pipeline_id = interaction.pipeline_id
+             AND related_organization.interaction_id = interaction.id
+             AND ${activeCrmRecordSql('related_company')}
+             AND (related_company.name ILIKE '%' || $2 || '%'
+               OR related_company.reference_code ILIKE '%' || $2 || '%')
+         )
          OR EXISTS (
            SELECT 1
            FROM crm_interaction_contacts relationship

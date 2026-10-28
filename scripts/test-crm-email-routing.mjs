@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
 import vm from 'node:vm'
 import { decodeHtmlEntities } from '../app_src/lib/htmlEntities.mjs'
 import { globalIdFragment } from '../app_src/lib/globalIds.mjs'
@@ -53,6 +54,25 @@ const fixtureContact = (referenceCode, email, pipelineId = businessPipeline, org
 const adrian = fixtureContact('gc1234567', 'adrian@customer.example.test')
 const secondContact = fixtureContact('gc2345678', 'second@customer.example.test')
 
+function enrichmentHelper(query, stageCrmRecordWithClient) {
+  const path = 'app_src/lib/persistence/crm.ts'
+  const source = readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
+  const parsed = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
+  const declarations = ['activeCrmRecordSql', 'nullable', 'clean', 'isoTimestamp',
+    'enrichCrmEmailInteractionParticipantsInPostgres'].map(name => {
+    const declaration = parsed.statements.find(statement => ts.isFunctionDeclaration(statement)
+      && statement.name?.text === name && statement.body)
+    assert.ok(declaration, `Production enrichment declaration ${name} must exist`)
+    return declaration.getText(parsed).replace(/^export\s+/, '')
+  }).join('\n')
+  const output = ts.transpileModule(declarations, {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const context = { withTransaction: callback => callback({ query }), stageCrmRecordWithClient, Error }
+  vm.runInNewContext(`${output}\nglobalThis.enrich = enrichCrmEmailInteractionParticipantsInPostgres`, context)
+  return context.enrich
+}
+
 function rawMessage(id = 'synthetic-message', {
   from = 'colleague@partner.example.test',
   to = `${adrian.email}, ${ownerEmail}`,
@@ -72,10 +92,47 @@ function rawMessage(id = 'synthetic-message', {
   }
 }
 
-function harness({ records = [adrian], providerInteractions = [], activePipelines = ownedPipelines, polledMessages = [], onAudit } = {}) {
+function harness({ records = [adrian], organizations = [], providerInteractions = [], activePipelines = ownedPipelines,
+  selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }],
+  polledMessages = [], onAudit, beforeEnrichment, beforeReferenceRead, beforeReviewedBatch } = {}) {
   const queries = [], staged = [], providerCalls = [], audits = [], messages = new Map(), links = new Map()
-  const persistedInteractions = []
+  const initialProviderMessageIds = polledMessages.map(message => message.id)
+  const persistedInteractions = [], enrichments = []
+  const reviewedBatches = [], reviewedStages = [], reviewedInteractions = new Map()
   const result = rows => ({ rows, rowCount: rows.length })
+  const enrichmentQuery = async (sql, values = []) => {
+    queries.push({ sql, values: plain(values) })
+    const row = [...providerInteractions, ...persistedInteractions].find(row => row.id === values[0] || row.id === values[1])
+    if (sql.includes('SELECT interaction.*')) {
+      await beforeEnrichment?.(row)
+      assert.match(sql, /pipeline\.owner_email = \$3/)
+      assert.match(sql, /membership\.user_email = pipeline\.owner_email AND membership\.status = 'active'/)
+      assert.match(sql, /FOR UPDATE OF interaction FOR SHARE OF pipeline, membership, owner_user/)
+      return result(row && activePipelines.some(pipeline => pipeline.id === values[1]) && row.owner_email !== 'other@example.test'
+        ? [{ interaction_type: 'email', organization_id: null, contact_id: null, lead_id: null,
+          source_key: `existing:${row.id}`, source_payload: {}, subject: 'Retained authored subject',
+          description: 'Retained authored body', metadata: { retained: true }, direction: 'outbound',
+          ...row, provider_message_id: row.provider_message_id || 'already-sent', provider_thread_id: row.provider_thread_id ?? null }] : [])
+    }
+    if (sql.includes('FROM crm_interaction_contacts')) return result((row?.contact_ids || []).map((contact_id, index) => ({ contact_id, is_primary: index === 0, sort_order: index })))
+    if (sql.includes('FROM crm_contacts contact') || sql.includes('FROM crm_leads lead')) {
+      const entity = sql.includes('FROM crm_contacts contact') ? 'contacts' : 'leads'
+      return result(records.filter(record => record.pipelineId === values[0] && record.entity === entity && values[1].includes(record.id))
+        .map(record => ({ id: record.id, organization_id: record.organizationId, reference_code: record.referenceCode,
+          email: record.email.trim().toLowerCase(), active: !record.archived })))
+    }
+    if (sql.includes('FROM crm_opportunities')) return result([])
+    if (sql.includes('FROM crm_organizations organization')) return result([{ id: values[1] }])
+    assert.fail(`Unexpected participant enrichment SQL: ${sql}`)
+  }
+  const enrich = enrichmentHelper(enrichmentQuery, async (client, input, options) => {
+    assert.deepEqual(plain(options), { preserveInteractionAgent: true })
+    enrichments.push(plain(input))
+    const row = [...providerInteractions, ...persistedInteractions].find(row => row.id === input.localId)
+    Object.assign(row, { organization_id: input.fields.organizationId, contact_id: input.fields.contactId,
+      contact_ids: plain(input.fields.contactIds), lead_id: input.fields.leadId })
+    return { id: input.localId }
+  })
   const ingestion = loadModule(sourcePath, {
     '@/lib/crm/emailAddressHeaders': headers,
     '@/lib/crm/participantEligibility': participantEligibility,
@@ -92,7 +149,8 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
       providerCalls.push(path)
       const url = new URL(path, 'https://gateway.example.test')
       if (url.pathname.endsWith('/messages')) return Response.json({ messages: polledMessages.map(message => ({ id: message.id })) })
-      const message = polledMessages.find(candidate => candidate.id === url.pathname.split('/').at(-1))
+      const message = polledMessages.find((candidate, index) => candidate.id === url.pathname.split('/').at(-1)
+        || initialProviderMessageIds[index] === url.pathname.split('/').at(-1))
       assert.ok(message, 'Only exact fixture message IDs may be fetched')
       return Response.json(message)
     } },
@@ -102,7 +160,7 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
     } },
     '@/lib/persistence/postgres': { query: async (sql, values = []) => {
       queries.push({ sql, values: plain(values) })
-      if (sql.includes('FROM app_users app_user')) return result([{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }])
+      if (sql.includes('FROM app_users app_user')) return result(selectedMailboxes)
       if (sql.includes('SELECT cursor_value')) return result([])
       if (sql.includes('INSERT INTO crm_integration_cursors')) return result([{}])
       if (sql.includes('FROM organization_communication_bindings')) {
@@ -125,13 +183,21 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
       if (sql.includes('INSERT INTO crm_inbound_messages')) {
         const existing = messages.get(values[2])
         if (existing) return result([])
-        const row = { id: `inbound-${values[2]}`, pipeline_id: values[1] }
+        const row = { id: `inbound-${values[2]}`, pipeline_id: values[1], owner_email: values[0] }
         messages.set(values[2], row)
         return result([row])
       }
       if (sql.includes('FROM crm_inbound_messages') && !sql.includes('UPDATE')) {
         const row = messages.get(values[1])
-        return result(row ? [row] : [])
+        return result(row && (!row.owner_email || row.owner_email === values[0]) ? [row] : [])
+      }
+      if (sql.includes('SELECT id::text, reference_code FROM crm_organizations')) {
+        assert.equal(values[0], businessPipeline)
+        assert.match(sql, /id = ANY\(\$2::uuid\[\]\)/)
+        assert.match(sql, /source_payload->>'archived'/)
+        return result(organizations.filter(record => record.pipelineId === values[0]
+          && values[1].includes(record.id) && !record.archived)
+          .map(record => ({ id: record.id, reference_code: record.referenceCode })))
       }
       if (sql.includes('FROM crm_contacts')) {
         const ids = values.find(value => Array.isArray(value) && value.every(item => /^[0-9a-f-]{36}$/i.test(item))) || []
@@ -182,20 +248,58 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
         return result([...providerInteractions, ...persistedInteractions]
           .filter(row => (!row.pipeline_id || row.pipeline_id === values[0]) && (!row.provider_message_id || row.provider_message_id === values[1])
             && (values.length !== 3 || row.source_key === values[2]))
-          .map(row => ({ ...row, provider_thread_id: row.provider_thread_id ?? null })))
+          .map(row => {
+            row.provider_message_id ||= values[1]
+            row.pipeline_id ||= values[0]
+            return { ...row, provider_thread_id: row.provider_thread_id ?? null }
+          }))
       }
       assert.fail(`Unexpected SQL in email routing test: ${sql}`)
     } },
     '@/lib/persistence/crm': {
+      enrichCrmEmailInteractionParticipantsInPostgres: enrich,
+      // Only orchestration is simulated here. The PostgreSQL suite exercises
+      // production locking, target validation, and atomic multi-message staging.
+      stageReviewedGmailInteractionsInPostgres: async input => {
+        reviewedBatches.push(plain(input))
+        await beforeReviewedBatch?.(input)
+        const prepared = input.messages.map(message => {
+          const key = `${message.pipelineId}:${message.providerMessageId}`
+          const existing = reviewedInteractions.get(key)
+          const targetFingerprint = createHash('sha256').update(JSON.stringify({
+            primaryOrganization: message.primaryOrganization, contactTargets: message.contactTargets,
+          })).digest('hex')
+          if (input.apply) {
+            assert.equal(message.expectedExistingInteractionId, existing?.interactionId || null)
+            assert.equal(message.expectedTargetFingerprint, targetFingerprint)
+          }
+          return { message, key, existing, targetFingerprint }
+        })
+        return prepared.map(({ message, key, existing, targetFingerprint }) => {
+          let interactionId = existing?.interactionId || null
+          const applied = input.apply === true && !existing
+          if (applied) {
+            reviewedStages.push(plain(message.interaction))
+            interactionId = `reviewed-interaction-${reviewedStages.length}`
+            reviewedInteractions.set(key, { interactionId, targetFingerprint })
+          }
+          return { interactionId, inboundMessageId: messages.get(message.providerMessageId)?.id,
+            applied, alreadyLinked: Boolean(existing), targetFingerprint }
+        })
+      },
       readCrmRecordByReference: async ({ pipelineId, referenceCode }) => {
-        const record = records.find(candidate => candidate.pipelineId === pipelineId && candidate.referenceCode === referenceCode)
+        await beforeReferenceRead?.()
+        const record = [...records, ...organizations].find(candidate => candidate.pipelineId === pipelineId && candidate.referenceCode === referenceCode)
         if (!record) throw new Error('CRM record not found')
         return record
       },
       stageCrmRecordInPostgres: async input => {
         staged.push(plain(input))
         const id = `interaction-${staged.length}`
-        persistedInteractions.push({ id, pipeline_id: input.pipelineId, source_key: input.sourceKey, provider_message_id: input.fields.providerMessageId, provider_thread_id: input.fields.providerThreadId })
+        persistedInteractions.push({ id, pipeline_id: input.pipelineId, source_key: input.sourceKey,
+          provider_message_id: input.fields.providerMessageId, provider_thread_id: input.fields.providerThreadId,
+          organization_id: input.fields.organizationId, contact_id: input.fields.contactId || null,
+          contact_ids: input.fields.contactIds || [], lead_id: input.fields.leadId || null })
         return { id }
       },
     },
@@ -205,7 +309,8 @@ function harness({ records = [adrian], providerInteractions = [], activePipeline
     defaultPipelineId: primaryPipeline, ownedPipelines,
     message: ingestion.parseGmailMessage(raw), ...overrides,
   })
-  return { ingestion, input, queries, staged, providerCalls, audits, messages, links }
+  return { ingestion, input, queries, staged, enrichments, providerCalls, audits, messages, links, persistedInteractions,
+    reviewedBatches, reviewedStages, reviewedInteractions }
 }
 
 let passed = 0
@@ -399,6 +504,89 @@ await check('legacy exact provider-message interaction with a null thread is reu
   assert.equal(result.interactions, 0)
   assert.equal(h.staged.length, 0)
   assert.equal([...h.links.values()][0].get(adrian.referenceCode), 'legacy-no-thread')
+})
+
+await check('late same-account participants enrich native relationships once while preserving the original email', async () => {
+  const records = [adrian]
+  const h = harness({ records })
+  const raw = rawMessage('late-contact', { cc: secondContact.email })
+  await h.ingestion.processMessage(h.input(raw))
+  records.push(secondContact)
+  const result = await h.ingestion.processMessage(h.input(raw))
+  assert.equal(result.interactions, 0)
+  assert.equal(result.links, 1)
+  assert.equal(h.staged.length, 1)
+  assert.equal(h.enrichments.length, 1)
+  const enriched = h.enrichments[0]
+  assert.deepEqual(enriched.fields.contactIds, [adrian.id, secondContact.id])
+  assert.equal(enriched.localId, 'interaction-1')
+  assert.equal(enriched.sourceKey, h.staged[0].sourceKey)
+  assert.equal(enriched.fields.subject, 'Retained authored subject')
+  assert.equal(enriched.fields.description, 'Retained authored body')
+  const replay = await h.ingestion.processMessage(h.input(raw))
+  assert.equal(replay.interactions, 0)
+  assert.equal(replay.links, 0)
+  assert.equal(h.enrichments.length, 1, 'Unchanged replay must not restage or emit projection work')
+})
+
+await check('existing account, primary contact, lead, mapping, owner and archive conflicts are rejected before caching', async () => {
+  const unrelated = fixtureContact('gc8765432', 'unrelated@example.test', businessPipeline, otherOrganization)
+  const unrelatedLead = fixtureContact('gl8765432', 'lead@example.test', businessPipeline, otherOrganization, 'leads')
+  for (const evidence of [
+    { organization_id: otherOrganization }, { contact_id: unrelated.id },
+    { lead_id: unrelatedLead.id }, { contact_ids: [unrelated.id] },
+    { owner_email: 'other@example.test' }, { source_payload: { archived: true } },
+  ]) {
+    const h = harness({ records: [adrian, unrelated, unrelatedLead],
+      providerInteractions: [{ id: 'existing-conflict', provider_thread_id: null, ...evidence }] })
+    await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting CRM participant evidence/)
+    assert.equal(h.messages.size, 0)
+    assert.equal(h.links.size, 0)
+    assert.equal(h.enrichments.length, 0)
+    assert.equal(h.staged.length, 0)
+  }
+})
+
+await check('target email changes are rechecked under the enrichment lock before any CRM write', async () => {
+  const records = [{ ...adrian }]
+  const h = harness({ records, providerInteractions: [{ id: 'raced-email' }], beforeEnrichment: () => {
+    records[0].email = 'changed@example.test'
+  } })
+  await assert.rejects(h.ingestion.processMessage(h.input()), /conflicting CRM participant evidence/)
+  assert.equal(h.messages.size, 0)
+  assert.equal(h.enrichments.length, 0)
+})
+
+await check('candidate email proof cannot be replaced by a later record-reference read', async () => {
+  const records = [{ ...adrian }]
+  const h = harness({ records, beforeReferenceRead: () => { records[0].email = 'changed-before-reference-read@example.test' } })
+  const result = await h.ingestion.processMessage(h.input())
+  assert.equal(result.unmatched, true)
+  assert.equal(h.staged.length, 0)
+  assert.equal(h.links.size, 0)
+})
+
+await check('an unmatched cached message is retryable explicitly after its contact is created', async () => {
+  const records = []
+  const h = harness({ records })
+  assert.equal((await h.ingestion.processMessage(h.input())).unmatched, true)
+  records.push(adrian)
+  const retried = await h.ingestion.processMessage(h.input())
+  assert.equal(retried.inserted, false)
+  assert.equal(retried.interactions, 1)
+  assert.equal(h.messages.size, 1)
+})
+
+await check('a customer-plus-partner thread remains unlinked and cannot pass exact-message recovery preview', async () => {
+  const partner = fixtureContact('gc8765432', 'partner@example.test', businessPipeline, otherOrganization)
+  const raw = rawMessage('a1', { from: adrian.email, cc: partner.email })
+  const h = harness({ records: [adrian, partner], polledMessages: [raw] })
+  assert.equal((await h.ingestion.processMessage(h.input(raw))).unmatched, true)
+  await assert.rejects(h.ingestion.reconcileGmailMessages({ ownerEmail, connectionId: 'fixture-connection',
+    pipelineId: businessPipeline, messageIds: ['a1'] }), /ambiguous/)
+  assert.equal(h.staged.length, 0)
+  assert.equal(h.links.size, 0)
+  assert.equal(h.enrichments.length, 0)
 })
 
 await check('conflicting provider thread cannot become an apparently missing interaction', async () => {
@@ -659,6 +847,283 @@ await check('recovery preview and apply preserve all explicit multi-reference gr
   assert.equal(replay.interactions, 0)
   assert.equal(replay.links, 0)
   assert.equal(h.staged.length, 2)
+})
+
+async function reviewedFixture(options = {}) {
+  const customer = { ...adrian }
+  const partner = fixtureContact('gc8765432', 'partner@example.test', businessPipeline, otherOrganization)
+  const records = [customer, partner]
+  const organizations = [
+    { id: customerOrganization, referenceCode: 'ga1234567', pipelineId: businessPipeline, entity: 'organizations' },
+    { id: otherOrganization, referenceCode: 'ga2345678', pipelineId: businessPipeline, entity: 'organizations' },
+  ]
+  const activePipelines = ownedPipelines.map(pipeline => ({ ...pipeline }))
+  const selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }]
+  const raw = rawMessage('a1', { from: customer.email, to: ownerEmail, cc: partner.email })
+  raw.threadId = 'b1'
+  const polledMessages = [raw]
+  const h = harness({ ...options, records, organizations, activePipelines, selectedMailboxes, polledMessages })
+  const held = await h.ingestion.processMessage(h.input(raw))
+  assert.equal(held.unmatched, true, 'Unreviewed mixed-company intake must remain held')
+  assert.equal(h.staged.length, 0)
+  assert.equal(h.links.size, 0)
+  assert.equal(h.messages.get('a1').pipeline_id, primaryPipeline, 'A held owner cache may precede review in another owned pipeline')
+  // Exclude the known normal-intake cache write from reviewed-path assertions.
+  h.queries.length = 0
+  const association = { messageId: 'a1', threadId: 'b1', primaryOrganizationReference: 'ga1234567',
+    contactReferences: [customer.referenceCode, partner.referenceCode] }
+  const selection = overrides => recoverySelection({ reviewedAssociations: [association], ...overrides })
+  return { h, raw, customer, partner, records, organizations, activePipelines, selectedMailboxes, polledMessages, association, selection }
+}
+
+await check('reviewed cross-company preview keeps one exact group and leaves held cache, activity and cursor untouched', async () => {
+  const { h, customer, partner, association, selection } = await reviewedFixture()
+  const before = plain([...h.messages.entries()])
+  const preview = await h.ingestion.reconcileGmailMessages(selection())
+  assert.equal(preview.applied, false)
+  assert.match(preview.digest, /^[a-f0-9]{64}$/)
+  assert.deepEqual(plain(preview.messages), [{ messageId: 'a1', threadId: 'b1', subject: 'Synthetic routing acceptance',
+    receivedAt: '2026-09-17T12:00:00.000Z', direction: 'inbound', primaryOrganizationReference: 'ga1234567',
+    contactReferences: association.contactReferences, organizationReferences: ['ga1234567', 'ga2345678'],
+    targetReferences: ['ga1234567', 'ga2345678', customer.referenceCode, partner.referenceCode].sort(), alreadyLinked: false }])
+  assert.deepEqual(plain([...h.messages.entries()]), before)
+  assert.equal(crmWriteQueries(h).length, 0)
+  assert.equal(h.staged.length, 0)
+  assert.equal(h.reviewedStages.length, 0)
+  assert.equal(h.audits.length, 0)
+  assert.equal(h.reviewedBatches.length, 1)
+  const batch = h.reviewedBatches[0]
+  assert.equal(batch.apply, false)
+  assert.equal(batch.messages.length, 1)
+  const message = batch.messages[0]
+  assert.deepEqual(Object.keys(message).sort(), ['ownerEmail', 'pipelineId', 'connectionId', 'providerMessageId',
+    'providerThreadId', 'participantEmails', 'primaryOrganization', 'contactTargets', 'interaction'].sort())
+  assert.equal(message.ownerEmail, ownerEmail)
+  assert.equal(message.pipelineId, businessPipeline)
+  assert.equal(message.connectionId, 'fixture-connection')
+  assert.equal(message.providerMessageId, 'a1')
+  assert.equal(message.providerThreadId, 'b1')
+  assert.deepEqual(new Set(message.participantEmails), new Set([customer.email, partner.email]))
+  assert.deepEqual(message.primaryOrganization, { id: customerOrganization, referenceCode: 'ga1234567' })
+  assert.deepEqual(message.contactTargets, [customer, partner].map(record => ({ id: record.id,
+    referenceCode: record.referenceCode, email: record.email, organizationId: record.organizationId })))
+  assert.equal(message.interaction.fields.organizationId, customerOrganization)
+  assert.deepEqual(message.interaction.fields.contactIds, [customer.id, partner.id])
+  assert.equal(message.interaction.fields.description, 'A synthetic customer discussion.')
+  assert.match(message.interaction.sourceKey, /^gmail:inbound:[a-f0-9]{64}$/)
+  assert.deepEqual(h.providerCalls, ['/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+})
+
+await check('reviewed cross-company apply stages one email and repeats idempotently with the same receipt-stable digest', async () => {
+  const { h, raw, customer, partner, selection } = await reviewedFixture()
+  raw.labelIds = ['SENT']
+  raw.payload.headers.find(entry => entry.name === 'From').value = ownAlias
+  raw.payload.headers.find(entry => entry.name === 'To').value = `${customer.email}, ${ownerEmail}`
+  const preview = await h.ingestion.reconcileGmailMessages(selection())
+  const apply = selection({ apply: true, expectedDigest: preview.digest })
+  const first = await h.ingestion.reconcileGmailMessages(apply)
+  assert.equal(first.interactions, 1)
+  assert.equal(first.links, 4, 'The reviewed contacts and both verified Accounts share one activity')
+  assert.equal(h.reviewedStages.length, 1)
+  assert.equal(h.staged.length, 0, 'Reviewed recovery must use the locked batch helper, not generic independent staging')
+  assert.equal(h.reviewedStages[0].fields.direction, 'outbound')
+  assert.equal(h.reviewedStages[0].fields.deliveryStatus, 'sent')
+  const ids = [...h.links.get('inbound-a1').values()]
+  assert.equal(new Set(ids).size, 1)
+  assert.deepEqual([...h.links.get('inbound-a1').keys()].sort(), ['ga1234567', 'ga2345678', customer.referenceCode, partner.referenceCode].sort())
+  const appliedBatch = h.reviewedBatches.find(batch => batch.apply)
+  assert.equal(appliedBatch.messages[0].expectedExistingInteractionId, null)
+  assert.match(appliedBatch.messages[0].expectedTargetFingerprint, /^[a-f0-9]{64}$/)
+  const refreshed = await h.ingestion.reconcileGmailMessages(selection())
+  assert.equal(refreshed.digest, preview.digest, 'Creation of the reviewed receipt must not invalidate an otherwise unchanged approval')
+  assert.equal(refreshed.messages[0].alreadyLinked, true)
+  const second = await h.ingestion.reconcileGmailMessages(apply)
+  assert.equal(second.interactions, 0)
+  assert.equal(second.links, 0)
+  assert.equal(h.reviewedStages.length, 1)
+  assert.equal(h.reviewedInteractions.size, 1)
+  assert.equal(h.messages.size, 1)
+  assert.equal(h.audits.length, 2)
+  assert.equal(h.audits[0].eventKey, h.audits[1].eventKey)
+  assert.deepEqual(h.audits[0].payload.reviewedAssociations, plain(selection().reviewedAssociations))
+  assert.equal(h.audits[0].payload.providerWrites, 0)
+  assert.equal(h.queries.some(({ sql }) => sql.includes('INSERT INTO crm_integration_cursors')
+    || sql.includes('INSERT INTO crm_inbound_messages')), false, 'Review cannot reset polling or create a new receipt cache')
+})
+
+await check('reviewed primary Account must be represented by a selected current participant', async () => {
+  for (const change of ['primary-not-selected', 'unknown-primary', 'wrong-primary-entity']) {
+    const fixture = await reviewedFixture()
+    if (change === 'primary-not-selected') fixture.association.contactReferences = [fixture.partner.referenceCode]
+    if (change === 'unknown-primary') fixture.association.primaryOrganizationReference = 'ga9999999'
+    if (change === 'wrong-primary-entity') fixture.organizations[0].entity = 'contacts'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /unambiguous current participants/)
+    assert.equal(fixture.h.reviewedBatches.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+  }
+})
+
+await check('reviewed Contact selection needs actual top-level participants, never body, Reply-To, delivery or nested headers', async () => {
+  for (const evidence of ['body', 'reply-to', 'delivery', 'nested']) {
+    const fixture = await reviewedFixture()
+    fixture.raw.payload.headers = fixture.raw.payload.headers.filter(entry => entry.name !== 'Cc')
+    if (evidence === 'body') fixture.raw.payload.body.data = Buffer.from(`Quoted customer ${fixture.partner.email}`).toString('base64url')
+    if (evidence === 'reply-to') fixture.raw.payload.headers.push(header('Reply-To', fixture.partner.email))
+    if (evidence === 'delivery') fixture.raw.payload.headers.push(header('Delivered-To', fixture.partner.email))
+    if (evidence === 'nested') fixture.raw.payload.parts = [{ mimeType: 'message/rfc822', headers: [header('From', fixture.partner.email)] }]
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /unambiguous current participants/)
+    assert.equal(fixture.h.reviewedStages.length, 0, evidence)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, evidence)
+  }
+})
+
+await check('reviewed recovery accepts actual From, To, Cc and Bcc participants without widening the selected Contact set', async () => {
+  for (const field of ['From', 'To', 'Cc', 'Bcc']) {
+    const fixture = await reviewedFixture()
+    fixture.raw.payload.headers = [header('From', fixture.customer.email), header('To', ownerEmail), header('Subject', 'Exact reviewed participants')]
+    if (field === 'From') {
+      fixture.raw.payload.headers[0].value = fixture.partner.email
+      fixture.raw.payload.headers[1].value = `${fixture.customer.email}, ${ownerEmail}`
+    } else if (field === 'To') fixture.raw.payload.headers[1].value = `${fixture.partner.email}, ${ownerEmail}`
+    else fixture.raw.payload.headers.push(header(field, fixture.partner.email))
+    const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
+    assert.deepEqual(plain(preview.messages[0].contactReferences), fixture.association.contactReferences, field)
+    assert.equal(fixture.h.reviewedBatches[0].messages.length, 1)
+    assert.equal(crmWriteQueries(fixture.h).length, 0)
+  }
+})
+
+await check('review cannot override duplicate email, unknown, foreign-pipeline, archived or lead-only participant evidence', async () => {
+  for (const change of ['duplicate-contact', 'contact-plus-lead', 'unknown', 'foreign-owned', 'foreign-unowned', 'archived-contact', 'archived-account', 'lead-only']) {
+    const fixture = await reviewedFixture()
+    if (change === 'duplicate-contact' || change === 'contact-plus-lead') fixture.records.push(fixtureContact('gc3456789', fixture.partner.email,
+      businessPipeline, otherOrganization, change === 'contact-plus-lead' ? 'leads' : 'contacts'))
+    if (change === 'unknown') fixture.association.contactReferences = [fixture.customer.referenceCode, 'gc9999999']
+    if (change === 'foreign-owned') fixture.partner.pipelineId = primaryPipeline
+    if (change === 'foreign-unowned') fixture.partner.pipelineId = unrelatedPipeline
+    if (change === 'archived-contact') fixture.partner.archived = true
+    if (change === 'archived-account') fixture.organizations[1].archived = true
+    if (change === 'lead-only') fixture.partner.entity = 'leads'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /unambiguous current participants/)
+    assert.equal(fixture.h.reviewedStages.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+    assert.equal(fixture.h.audits.length, 0, change)
+  }
+})
+
+await check('reviewed association may reinforce selected references but refuses a conflicting explicit marker', async () => {
+  const fixture = await reviewedFixture()
+  fixture.raw.payload.body.data = Buffer.from(`Selected %gslt${fixture.customer.referenceCode} %gsltga2345678`).toString('base64url')
+  assert.equal((await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())).applied, false)
+  fixture.raw.payload.body.data = Buffer.from('Conflicting %gsltgc9999999').toString('base64url')
+  await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /Explicit message references conflict/)
+  assert.equal(fixture.h.reviewedStages.length, 0)
+  assert.equal(crmWriteQueries(fixture.h).length, 0)
+})
+
+await check('reviewed recovery requires an existing owner cache and never fetches a broad mailbox history', async () => {
+  for (const change of ['missing-cache', 'foreign-cache-owner']) {
+    const fixture = await reviewedFixture()
+    if (change === 'missing-cache') fixture.h.messages.delete('a1')
+    else fixture.h.messages.get('a1').owner_email = 'other@example.test'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /existing owned cached Gmail message/)
+    assert.equal(fixture.h.reviewedBatches.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+    assert.deepEqual(fixture.h.providerCalls, ['/google-mail/gmail/v1/users/me/messages/a1?format=full'])
+  }
+})
+
+await check('reviewed preview and apply reject mismatched provider identity, thread and ineligible message labels', async () => {
+  for (const change of ['thread', 'message-id', 'DRAFT', 'SPAM', 'TRASH', 'AUTH']) {
+    const fixture = await reviewedFixture()
+    if (change === 'thread') fixture.association.threadId = 'c1'
+    else if (change === 'message-id') fixture.raw.id = 'c1'
+    else if (change === 'AUTH') {
+      fixture.raw.payload.headers.find(entry => entry.name === 'From').value = 'stewards@eigenracing.com'
+      fixture.raw.payload.headers.find(entry => entry.name === 'Subject').value = 'Your ClawPilot sign-in code'
+      fixture.raw.payload.headers.push(header('X-ClawPilot-Message-Purpose', 'auth-magic-code'))
+    } else fixture.raw.labelIds = [change]
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection()), /participants|not eligible/)
+    assert.equal(fixture.h.reviewedStages.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+  }
+})
+
+await check('reviewed apply rechecks raw content, Contact email/account, membership and selected connection before staging', async () => {
+  for (const change of ['body', 'raw-header', 'contact-email', 'contact-account', 'account-reference', 'membership', 'connection', 'mailbox-account']) {
+    const fixture = await reviewedFixture()
+    const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
+    if (change === 'body') fixture.raw.payload.body.data = Buffer.from('Changed reviewed content').toString('base64url')
+    if (change === 'raw-header') fixture.raw.payload.headers.push(header('Reply-To', 'changed@example.test'))
+    if (change === 'contact-email') fixture.partner.email = 'changed@example.test'
+    if (change === 'contact-account') fixture.partner.organizationId = customerOrganization
+    if (change === 'account-reference') fixture.organizations[1].referenceCode = 'ga3456789'
+    if (change === 'membership') fixture.activePipelines.splice(fixture.activePipelines.findIndex(pipeline => pipeline.id === businessPipeline), 1)
+    if (change === 'connection') fixture.selectedMailboxes[0].connection_id = 'changed-connection'
+    if (change === 'mailbox-account') fixture.selectedMailboxes[0].account_email = 'renamed@example.test'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ apply: true, expectedDigest: preview.digest })),
+      /changed after preview|unambiguous current participants|unavailable|not active/, change)
+    assert.equal(fixture.h.reviewedBatches.some(batch => batch.apply), false, change)
+    assert.equal(fixture.h.reviewedStages.length, 0, change)
+    assert.equal(fixture.h.audits.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+  }
+})
+
+await check('reviewed apply rejects missing or stale approval and revalidates the exact chosen primary Account', async () => {
+  for (const change of ['missing', 'wrong', 'primary']) {
+    const fixture = await reviewedFixture()
+    const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
+    if (change === 'primary') fixture.association.primaryOrganizationReference = 'ga2345678'
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ apply: true,
+      expectedDigest: change === 'missing' ? undefined : change === 'wrong' ? '0'.repeat(64) : preview.digest })), /changed after preview/)
+    assert.equal(fixture.h.reviewedBatches.some(batch => batch.apply), false, change)
+    assert.equal(fixture.h.reviewedStages.length, 0, change)
+    assert.equal(crmWriteQueries(fixture.h).length, 0, change)
+  }
+})
+
+await check('reviewed internal contract rejects missing, extra and duplicate associations before provider reads', async () => {
+  const fixture = await reviewedFixture()
+  for (const reviewedAssociations of [[], [null], [{ ...fixture.association, ownerEmail }],
+    [{ ...fixture.association, messageId: 'c1' }],
+    [{ ...fixture.association, threadId: null }],
+    [{ ...fixture.association, contactReferences: [] }],
+    [{ ...fixture.association, contactReferences: [fixture.customer.referenceCode, fixture.customer.referenceCode.toUpperCase()] }],
+    [fixture.association, fixture.association],
+  ]) {
+    await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ reviewedAssociations })), /exact reviewed association/)
+    assert.equal(fixture.h.providerCalls.length, 0)
+    assert.equal(fixture.h.reviewedBatches.length, 0)
+  }
+})
+
+await check('reviewed apply uses one CAS batch and safely reports helper rejection before audit or linking', async () => {
+  const fixture = await reviewedFixture({ beforeReviewedBatch: input => {
+    if (input.apply) throw new Error('synthetic private provider or database detail')
+  } })
+  const second = rawMessage('c1', { from: fixture.customer.email, to: ownerEmail, cc: fixture.partner.email })
+  second.threadId = 'd1'
+  fixture.polledMessages.push(second)
+  assert.equal((await fixture.h.ingestion.processMessage(fixture.h.input(second))).unmatched, true)
+  fixture.h.queries.length = 0
+  const selection = fixture.selection({ messageIds: ['c1', 'a1'], reviewedAssociations: [
+    { ...fixture.association, messageId: 'c1', threadId: 'd1' }, fixture.association,
+  ] })
+  const preview = await fixture.h.ingestion.reconcileGmailMessages(selection)
+  await assert.rejects(fixture.h.ingestion.reconcileGmailMessages({ ...selection, apply: true, expectedDigest: preview.digest }), error => (
+    error.name === 'SafeEmailIngestionError' && /evidence changed before apply/.test(error.message)
+      && !/private|provider|database/.test(error.message)
+  ))
+  assert.equal(fixture.h.reviewedBatches.filter(batch => batch.apply).length, 1)
+  const apply = fixture.h.reviewedBatches.find(batch => batch.apply)
+  assert.deepEqual(apply.messages.map(message => message.providerMessageId), ['a1', 'c1'], 'Every message is submitted in one deterministic compare-and-swap batch')
+  assert.ok(apply.messages.every(message => message.expectedExistingInteractionId === null
+    && /^[a-f0-9]{64}$/.test(message.expectedTargetFingerprint)))
+  assert.equal(fixture.h.reviewedStages.length, 0)
+  assert.equal(fixture.h.links.size, 0)
+  assert.equal(fixture.h.audits.length, 0)
+  assert.equal(crmWriteQueries(fixture.h).length, 0)
 })
 
 console.log(`CRM email routing passed: ${passed} focused checks; no live provider or database operations`)

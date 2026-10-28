@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import test from 'node:test'
 import vm from 'node:vm'
 import * as publicOriginRouting from '../app_src/lib/publicOriginRouting.mjs'
+import * as globalIds from '../app_src/lib/globalIds.mjs'
 
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = require('typescript')
@@ -16,6 +17,10 @@ const connectionId = '00000000-0000-4000-8000-000000000003'
 const email = 'owner@example.test'
 const digest = 'a'.repeat(64)
 const command = { pipelineId, connectionId, messageIds: ['19abcdef01234567'] }
+const reviewedAssociation = {
+  messageId: command.messageIds[0], threadId: '19abcdef01234560',
+  primaryOrganizationReference: 'ga1234567', contactReferences: ['gc2345678', 'gc3456789'],
+}
 class SafeEmailIngestionError extends Error {}
 
 function load(code, mocks = {}, environment = {}) {
@@ -46,6 +51,7 @@ function harness(options = {}) {
       './publicOriginRouting.mjs': publicOriginRouting,
     }, { CLAWPILOT_ADDITIONAL_PUBLIC_ORIGINS_JSON: options.additionalOrigins }),
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.test' },
+    '@/lib/globalIds.mjs': globalIds,
     '@/lib/persistence/config': { isPostgresStorageEnabled: () => options.postgres !== false },
     '@/lib/requestUser': {
       requestSession: async () => session,
@@ -98,6 +104,122 @@ test('apply requires a reviewed digest; no-op result stays explicit', async () =
   assert.equal(result.body.recovery.applied, true)
   assert.equal(result.body.recovery.interactions, 0)
   assert.equal(result.body.recovery.links, 0)
+})
+
+test('reviewed associations are optional and forward only the exact normalized selection for preview and apply', async () => {
+  for (const apply of [false, true]) {
+    const app = harness()
+    const upper = {
+      messageId: reviewedAssociation.messageId.toUpperCase(), threadId: reviewedAssociation.threadId.toUpperCase(),
+      primaryOrganizationReference: reviewedAssociation.primaryOrganizationReference.toUpperCase(),
+      contactReferences: reviewedAssociation.contactReferences.map(reference => reference.toUpperCase()),
+    }
+    const result = await app.request({
+      ...command, messageIds: command.messageIds.map(id => id.toUpperCase()), apply,
+      reviewedAssociations: [upper], ...(apply ? { expectedDigest: digest.toUpperCase() } : {}),
+    })
+    assert.equal(result.status, 200)
+    assert.deepEqual(JSON.parse(JSON.stringify(app.calls)), [{
+      ...command, ownerEmail: email, apply, reviewedAssociations: [reviewedAssociation],
+      ...(apply ? { expectedDigest: digest } : {}),
+    }])
+    assert.equal(app.accessCalls.length, 1)
+  }
+})
+
+test('reviewed associations cover each requested message exactly once regardless of input order', async () => {
+  const app = harness()
+  const second = { ...reviewedAssociation, messageId: 'abcdef', threadId: '123abc',
+    primaryOrganizationReference: 'ga0123456789av', contactReferences: ['gc0123456789av'] }
+  const result = await app.request({ ...command, messageIds: [command.messageIds[0], second.messageId],
+    reviewedAssociations: [second, reviewedAssociation] })
+  assert.equal(result.status, 200)
+  assert.deepEqual(JSON.parse(JSON.stringify(app.calls[0].reviewedAssociations)), [second, reviewedAssociation])
+  assert.deepEqual([...app.calls[0].messageIds], [command.messageIds[0], second.messageId])
+})
+
+test('reviewed associations reject missing or extra messages, forged fields, invalid references and duplicate Contacts', async () => {
+  const missingField = { ...reviewedAssociation }; delete missingField.threadId
+  const invalidAssociations = [
+    null, {}, 'selection', [], [reviewedAssociation, reviewedAssociation], [null], [[]], ['selection'],
+    [{ ...reviewedAssociation, messageId: 'unknown' }],
+    [{ ...reviewedAssociation, messageId: 'abcdef' }],
+    [{ ...reviewedAssociation, messageId: 1 }],
+    [{ ...reviewedAssociation, messageId: 'a'.repeat(129) }],
+    [{ ...reviewedAssociation, threadId: '' }], [{ ...reviewedAssociation, threadId: null }],
+    [{ ...reviewedAssociation, threadId: 'abc/def' }], [{ ...reviewedAssociation, threadId: 'a'.repeat(129) }],
+    [missingField], [{ ...reviewedAssociation, ownerEmail: email }],
+    [{ ...reviewedAssociation, organizationId }], [{ ...reviewedAssociation, apply: true }],
+    [{ ...reviewedAssociation, primaryOrganizationReference: 'gc1234567' }],
+    [{ ...reviewedAssociation, primaryOrganizationReference: 'ga123456' }],
+    [{ ...reviewedAssociation, primaryOrganizationReference: 'ga0123456789aw' }],
+    [{ ...reviewedAssociation, primaryOrganizationReference: 'ga1234567 ' }],
+    [{ ...reviewedAssociation, primaryOrganizationReference: null }],
+    [{ ...reviewedAssociation, contactReferences: [] }],
+    [{ ...reviewedAssociation, contactReferences: ['ga1234567'] }],
+    [{ ...reviewedAssociation, contactReferences: ['gc123456'] }],
+    [{ ...reviewedAssociation, contactReferences: ['gc0123456789aw'] }],
+    [{ ...reviewedAssociation, contactReferences: ['gc1234567', 'GC1234567'] }],
+    [{ ...reviewedAssociation, contactReferences: ['gc1234567', 'gc1234567'] }],
+    [{ ...reviewedAssociation, contactReferences: ['gc1234567 '] }],
+    [{ ...reviewedAssociation, contactReferences: [null] }],
+    [{ ...reviewedAssociation, contactReferences: 'gc1234567' }],
+    [{ ...reviewedAssociation, contactReferences: Array.from({ length: 26 }, (_, i) => `gc${String(i).padStart(7, '0')}`) }],
+  ]
+  for (const reviewedAssociations of invalidAssociations) {
+    const app = harness()
+    const result = await app.request({ ...command, reviewedAssociations })
+    assert.equal(result.status, 400, JSON.stringify(reviewedAssociations))
+    assert.equal(app.calls.length, 0)
+    assert.equal(app.accessCalls.length, 0, 'Invalid reviewed scope must fail before pipeline lookup or provider work')
+  }
+  for (const reviewedAssociations of [
+    [reviewedAssociation],
+    [reviewedAssociation, { ...reviewedAssociation, messageId: reviewedAssociation.messageId.toUpperCase() }],
+    [reviewedAssociation, { ...reviewedAssociation, messageId: 'abcdef' }],
+  ]) {
+    const app = harness()
+    const result = await app.request({ ...command, messageIds: [command.messageIds[0], 'fedcba'], reviewedAssociations })
+    assert.equal(result.status, 400)
+    assert.equal(app.calls.length, 0)
+    assert.equal(app.accessCalls.length, 0)
+  }
+})
+
+test('reviewed associations accept the exact 25-message and 25-contact bounds while retaining the byte limit', async () => {
+  const contacts = Array.from({ length: 25 }, (_, i) => `gc${String(i).padStart(7, '0')}`)
+  const contactBound = harness()
+  assert.equal((await contactBound.request({ ...command,
+    reviewedAssociations: [{ ...reviewedAssociation, contactReferences: contacts }] })).status, 200)
+  assert.deepEqual([...contactBound.calls[0].reviewedAssociations[0].contactReferences], contacts)
+  const messageIds = Array.from({ length: 25 }, (_, i) => (i + 1).toString(16))
+  const reviewedAssociations = messageIds.map(messageId => ({ ...reviewedAssociation, messageId, contactReferences: ['gc2345678'] }))
+  const messageBound = harness()
+  assert.equal((await messageBound.request({ ...command, messageIds, reviewedAssociations })).status, 200)
+  assert.equal(messageBound.calls[0].reviewedAssociations.length, 25)
+  const overBytes = harness()
+  const result = await overBytes.request({ ...command, messageIds,
+    reviewedAssociations: reviewedAssociations.map(association => ({ ...association, contactReferences: contacts })) })
+  assert.equal(result.status, 413, 'Per-entry bounds cannot bypass the unchanged 8 KiB command limit')
+  assert.equal(overBytes.calls.length, 0)
+})
+
+test('reviewed associations do not bypass auth, origin, digest or workspace-owner gates', async () => {
+  const selected = { ...command, reviewedAssociations: [reviewedAssociation] }
+  for (const [options, headers, body, status] of [
+    [{ noSession: true }, {}, selected, 401],
+    [{ session: { impersonating: true } }, {}, selected, 403],
+    [{}, { origin: 'https://attacker.test' }, selected, 403],
+    [{ actor: { organizationId: null } }, {}, selected, 403],
+    [{ pipeline: { ownerEmail: 'other@example.test' } }, {}, selected, 403],
+    [{ postgres: false }, {}, selected, 503],
+    [{}, {}, { ...selected, apply: true }, 400],
+    [{}, {}, { ...selected, expectedDigest: digest }, 400],
+  ]) {
+    const app = harness(options)
+    assert.equal((await app.request(body, headers)).status, status)
+    assert.equal(app.calls.length, 0)
+  }
 })
 
 test('requires a real non-impersonating browser session and an active same-workspace owner', async () => {

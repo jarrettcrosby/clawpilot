@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { createPipelineOutboxPoll } from './lib/pipeline-outbox-poll.mjs'
+
 const secret = String(process.env.PIPELINE_OUTBOX_WORKER_SECRET || '').trim()
 if (!secret) {
   console.error('[pipeline-outbox] PIPELINE_OUTBOX_WORKER_SECRET is required')
@@ -38,31 +40,7 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function poll(name, path, limit) {
-  try {
-    const response = await fetch(`${baseUrl}${path}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${secret}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ limit }),
-    })
-    const text = await response.text()
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`)
-    const result = text ? JSON.parse(text) : {}
-    const claimed = Number(result.claimed || result.actions?.claimed || 0)
-      + Number(result.mail?.claimed || 0)
-    const ingested = Number(result.ingested || result.ingestion?.messagesStored || 0)
-    if (claimed > 0 || ingested > 0) {
-      console.log(`[${name}] ${JSON.stringify(result)}`)
-    }
-    return true
-  } catch (error) {
-    console.warn(`[${name}] poll failed: ${error instanceof Error ? error.message : String(error)}`)
-    return false
-  }
-}
+const poll = createPipelineOutboxPoll({ baseUrl, secret })
 
 async function runLoop(name, path, limit, intervalMs) {
   while (running) {
