@@ -1118,15 +1118,24 @@ assert.ok(
     && reviewedGmailApply.indexOf('await stageCrmRecordWithClient(') > reviewedGmailPreviewReturn,
   'reviewed Gmail preview must return after validation without staging a record',
 )
-assert.ok(
-  (crmAdapter.match(/FOR SHARE OF pipeline/g) || []).length >= 2,
-  'CRM short-link creation must serialize with pipeline quarantine',
-)
-assertIncludes(
-  crmAdapter,
-  'if (owner.rows[0].reference_access_disabled) return null',
-  'quarantined pipeline per-record CRM link creation guard',
-)
+const crmBulkReferenceLinks = crmFunctionSource('ensurePipelineCrmReferenceLinks', 'claimSuiteCrmOutboxInPostgres')
+const crmBulkOwnerStart = crmBulkReferenceLinks.indexOf('), owner AS (')
+const crmBulkOwnerEnd = crmBulkReferenceLinks.indexOf('), links AS (', crmBulkOwnerStart)
+assert.ok(crmBulkOwnerStart >= 0 && crmBulkOwnerEnd > crmBulkOwnerStart, 'CRM bulk-link owner query must exist')
+for (const fragment of ['AND NOT pipeline.reference_access_disabled', 'FOR SHARE OF pipeline']) {
+  assertIncludes(crmBulkReferenceLinks.slice(crmBulkOwnerStart, crmBulkOwnerEnd), fragment,
+    'CRM bulk-link owner query must independently serialize and exclude quarantined pipelines')
+}
+assertIncludes(crmBulkReferenceLinks, 'FROM links CROSS JOIN owner', 'CRM bulk-link inserts must depend on the guarded owner query')
+const crmPerRecordReferenceLink = crmFunctionSource('ensureCrmReferenceShortLink', 'currentCrmContactOwner')
+const crmPerRecordQuarantineReturn = crmPerRecordReferenceLink.indexOf('if (owner.rows[0].reference_access_disabled) return null')
+const crmPerRecordOwnerReadEnd = crmPerRecordReferenceLink.indexOf('if (!owner.rows[0])')
+assert.ok(crmPerRecordOwnerReadEnd > 0, 'CRM per-record link owner query must exist')
+assertIncludes(crmPerRecordReferenceLink.slice(0, crmPerRecordOwnerReadEnd), 'FOR SHARE OF pipeline',
+  'CRM per-record link owner query must independently serialize with quarantine')
+assert.ok(crmPerRecordQuarantineReturn > crmPerRecordOwnerReadEnd
+  && crmPerRecordReferenceLink.indexOf('INSERT INTO short_links') > crmPerRecordQuarantineReturn,
+'CRM per-record link quarantine must return before inserting or reactivating links')
 
 const crmBoardProjection = read('app_src/lib/crm/boardProjection.ts')
 assertIncludes(crmBoardProjection, 'updateCrmDescriptionWithClient', 'transactional CRM card description write-through')

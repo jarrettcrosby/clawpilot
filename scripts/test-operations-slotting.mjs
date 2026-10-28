@@ -360,21 +360,75 @@ assert.ok(
   ),
   'Cleanup must upgrade partially retired CRM fixtures idempotently',
 )
-assert.equal(
-  (crmPersistence.match(/activeCrmRecordSql\('organization'\)/g) || []).length,
-  7,
-  'CRM organization list, workbook projection count/read, summary, sync summary, and links must exclude archives',
-)
-assert.equal(
-  (crmPersistence.match(/activeCrmRecordSql\('product'\)/g) || []).length,
-  6,
-  'CRM product list, category summary, sync summary, and links must exclude archives',
-)
-assert.equal(
-  (crmPersistence.match(/activeCrmRecordSql\('customer'\)/g) || []).length,
-  1,
-  'CRM hierarchy repair must exclude archived customers',
-)
+function crmQueryScope(source, name, startMarker, endMarker) {
+  const declaration = new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, 'm').exec(source)
+  assert.ok(declaration, `CRM archive contract missing function ${name}`)
+  const bodyStart = declaration.index + declaration[0].length
+  const next = /^(?:export )?(?:async )?function \w+\(/m.exec(source.slice(bodyStart))
+  const bodyEnd = next ? bodyStart + next.index : source.length
+  const start = source.indexOf(startMarker, bodyStart)
+  assert.ok(start >= bodyStart && start < bodyEnd, `${name} missing query start ${startMarker}`)
+  const end = source.indexOf(endMarker, start + startMarker.length)
+  assert.ok(end > start && end <= bodyEnd, `${name} missing query end ${endMarker}`)
+  return { start, text: source.slice(start, end) }
+}
+
+// Pin each query independently: a guard elsewhere must never hide a missing
+// archive filter. The first seven organization sites predate reviewed recovery.
+const crmArchiveSites = [
+  ['organization list', 'listCrmRecordsInPostgres', "if (input.entity === 'organizations')", "if (input.entity === 'contacts')", 'organization', 'WHERE organization.pipeline_id = $1::uuid AND'],
+  ['workbook organization count', 'readCrmWorkbookProjectionSnapshotInPostgres', 'const countResult =', 'const countRow =', 'organization', 'WHERE organization.pipeline_id = $1::uuid AND'],
+  ['workbook organization page', 'readCrmWorkbookProjectionSnapshotInPostgres', 'const organizations =', 'const contacts =', 'organization', 'WHERE organization.pipeline_id = $1::uuid AND'],
+  ['summary organization count', 'readCrmSummaryFromPostgres', 'FROM crm_organizations organization', 'FROM crm_contacts', 'organization', 'WHERE pipeline_id = $1::uuid AND'],
+  ['pending organization summary', 'readCrmSummaryFromPostgres', 'AS campaigns,', 'AS pending_sync,', 'organization', 'FROM crm_organizations organization WHERE pipeline_id = $1::uuid AND'],
+  ['failed organization summary', 'readCrmSummaryFromPostgres', 'AS pending_sync,', 'AS failed_sync', 'organization', 'FROM crm_organizations organization WHERE pipeline_id = $1::uuid AND'],
+  ['organization reference links', 'ensurePipelineCrmReferenceLinks', 'WITH RECURSIVE records AS (', 'UNION ALL SELECT reference_code, full_name', 'organization', 'WHERE pipeline_id = $1::uuid AND'],
+  ['email enrichment organization', 'enrichCrmEmailInteractionParticipantsInPostgres', 'const organization =', 'const leadId =', 'organization', 'WHERE pipeline_id = $1::uuid AND id = $2::uuid AND'],
+  ['reviewed recovery organizations', 'prepareReviewedGmailInteractionWithClient', 'const organizations =', 'const selected =', 'organization', 'SELECT id::text, reference_code,'],
+  ['interaction organization hydration', 'hydrateInteractionRows', 'const organizationResult =', 'const organizationsByInteraction =', 'organization', 'AND relationship.interaction_id = ANY($2::uuid[]) AND'],
+  ['related-company activity history', 'listCrmRecordsInPostgres', "WHEN 'organizations' THEN COALESCE(", "WHEN 'contacts' THEN interaction.contact_id", 'related_company', 'AND related_organization.organization_id = $6::uuid AND'],
+  ['related-company activity search', 'listCrmRecordsInPostgres', "AND ($2 = '' OR interaction.reference_code", 'OR lead.full_name ILIKE', 'related_company', 'AND related_organization.interaction_id = interaction.id AND'],
+  ['product list', 'listCrmRecordsInPostgres', "if (input.entity === 'products')", "if (input.entity === 'leads')", 'product', 'WHERE product.pipeline_id = $1::uuid AND'],
+  ['product category summary', 'listCrmProductCategoriesInPostgres', 'LEFT JOIN crm_products product', 'GROUP BY tree.id', 'product', 'AND product.category_id = tree.id AND'],
+  ['summary product count', 'readCrmSummaryFromPostgres', 'FROM crm_products product', 'FROM crm_leads', 'product', 'WHERE pipeline_id = $1::uuid AND'],
+  ['pending product summary', 'readCrmSummaryFromPostgres', 'AS campaigns,', 'AS pending_sync,', 'product', 'FROM crm_products product WHERE pipeline_id = $1::uuid AND'],
+  ['failed product summary', 'readCrmSummaryFromPostgres', 'AS pending_sync,', 'AS failed_sync', 'product', 'FROM crm_products product WHERE pipeline_id = $1::uuid AND'],
+  ['product reference links', 'ensurePipelineCrmReferenceLinks', "UNION ALL SELECT reference_code, name, 'products'", "UNION ALL SELECT reference_code, full_name, 'leads'", 'product', 'WHERE pipeline_id = $1::uuid AND'],
+  ['customer hierarchy repair', 'ensurePipelineCrmHierarchy', 'const customers =', 'for (const customer of customers.rows)', 'customer', 'WHERE customer.pipeline_id = $1::uuid AND'],
+]
+
+function assertCrmArchiveContracts(source) {
+  for (const [label, name, start, end, alias, prefix] of crmArchiveSites) {
+    const { text } = crmQueryScope(source, name, start, end)
+    const guard = `\${activeCrmRecordSql('${alias}')}`
+    assert.ok(
+      text.replace(/\s+/gu, ' ').includes(`${prefix} ${guard}`),
+      `${label} must independently exclude archived CRM records`,
+    )
+    if (label === 'email enrichment organization') {
+      assert.ok(text.includes('if (organization.rows.length !== 1) throw unavailable()'),
+        'Email enrichment must reject an unavailable active organization')
+    }
+    if (label === 'reviewed recovery organizations') {
+      assert.ok(text.includes(`${guard} AS active`) && text.includes('organizations.rows.some((row) => !row.active)'),
+        'Reviewed recovery must reject organizations whose computed active predicate is false')
+    }
+  }
+}
+assertCrmArchiveContracts(crmPersistence)
+
+// Mutate only in memory, preserving the global occurrence count with an unused
+// copy. Every original/new query guard must still independently fail the test.
+for (const [label, name, start, end, alias] of crmArchiveSites) {
+  const scope = crmQueryScope(crmPersistence, name, start, end)
+  const guard = `\${activeCrmRecordSql('${alias}')}`
+  const offset = scope.start + scope.text.indexOf(guard)
+  const mutated = crmPersistence.slice(0, offset) + 'true'
+    + crmPersistence.slice(offset + guard.length) + `\n// unused ${guard}\n`
+  assert.throws(() => assertCrmArchiveContracts(mutated),
+    (error) => error.code === 'ERR_ASSERTION' && error.message.includes(label),
+    `${label} archive contract must detect removal of its own guard`)
+}
 for (const fragment of [
   'Generation is idempotent only before retirement.',
   'generation is blocked for every scenario version',
