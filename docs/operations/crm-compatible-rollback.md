@@ -126,8 +126,9 @@ module/global hooks. That profile is **unsupported by the current verifier**:
 it requires `securitysuite_inherit_creator`, `securitysuite_inherit_assigned`
 and `securitysuite_inherit_parent` to be explicitly false, and refuses the
 relevant custom/generated hook inventories. Its refusal is intentional. The
-local PHP and PostgreSQL fixtures do not establish that the installed profile
-can publish safely, even when the observed current account has no extra reader.
+local stub PHP and PostgreSQL fixtures do not establish that the installed
+profile can publish safely. Empty SecurityGroups and a hash-matched hook
+inventory do not establish an owner-only effective audience.
 
 Until separately resolved and rechecked against fresh installed evidence, hold
 production promotion, migration/activation, legacy adoption, recovery and native
@@ -147,6 +148,103 @@ None of these options authorizes broad hook deletion, access for a service
 principal, credential changes, security-group or role grants, or weakening the
 publication guard. Do not switch flags or remove generated files merely to make
 the verifier pass.
+
+### October 28 installed-policy and real-runtime findings
+
+The read-only production metadata/source observations at **2026-10-28
+16:31:39 UTC** and **16:40:09 UTC** identified SuiteCRM **8.10.1**, PHP
+**8.3.35**, and MariaDB **11.4.13**. Both database observations used read-only
+transactions and rolled back. They did not bootstrap the live application,
+authenticate as another user, or copy customer email content into a fixture.
+
+The installed policy has four nondeleted principals: an administrator, two
+active principals with explicit module-deny roles, and a blank-status principal
+without a role. That last principal has active employee status and no group or
+portal restriction. Pinned `User::isEnabled()` does not require the status to
+equal `Active`: blank status is not equivalent to disabled. This is an access
+eligibility finding, **not proof of a successful login or possession of a
+password/token**. It must not be silently excluded from the audience.
+
+The isolated real runtime reproduces the relevant policy using synthetic
+principals and no production data. With zero SecurityGroups, the unroled
+blank-status principal receives the native module defaults (`89=enabled`,
+`90=all`) and passes actual Email `ACLAccess('view'|'list'|'export')` on both an
+unsaved and saved owner-assigned bean. The two explicitly denied principals do
+not. Consequently the observed policy cannot establish the proposed
+pipeline-owner-only audience, even **before** a second company is associated.
+Changing inheritance flags alone would not repair that mismatch.
+
+Concrete native surfaces also matter: the fixture exercises V8 direct/list
+services, the UI's `ListViewData` path, and the export helper separately, rather
+than equating those paths with a bean-level ACL boolean. In the adversarial
+company-group fixture, principals denied direct Email view and UI/export still
+receive that Email through the real V8 list service. A per-record `ACLAccess`
+union is therefore not a complete audience proof for that group configuration.
+This is isolated native behavior, not a claim that such groups are currently
+configured in production (the read-only observation found none).
+
+The same real save/retrieve and V8 service test also invalidates the former
+echo-style readback assumptions:
+
+- `Email::save()` fills an empty `description_html` from the plain body, adding
+  line-break markup.
+- The V8 attribute serializer strips angle-bracket addresses from named
+  From/To/Cc/Bcc strings even though the retrieved Email bean retains them.
+- V8 serializes the database date/time as an offset-bearing ISO value rather
+  than returning the submitted database string verbatim.
+
+The existing strict client correctly refuses these differences; it must not be
+declared compatible or changed to accept arbitrary transformations. A future
+candidate needs an explicit, pinned normalization/raw-native-readback contract,
+with independent exact header/body/instant checks and tests. A separate atomic
+publication design is also needed before relaxing the current profile gate:
+two HTTP audience observations around multiple writes are not a transaction
+over native policy and publication. Neither design is implemented or accepted
+by these observations.
+
+The targeted source/config review also found Maps effectively disabled (no
+`jjwg` category settings, pinned false default) and the exact ElasticSearch hook
+switch `search.ElasticSearch.enabled` explicitly false. Those facts narrow this
+observation; they do not authorize enabling either dissemination path or
+allowlisting arbitrary hooks. Source hashes prove code identity, not reader
+authorization.
+
+Sanitized evidence is retained outside Git. The first installed observation's
+SHA-256 is `483ca2cf88d65ce6088ab8c4ed5e586bc826c8b0f48255d77773859d9f5b0653`;
+the targeted observation's is
+`9339d8619cbd449dfa939afe31802d15e7315a13e0774ed9088f0d9ae60b63ae`.
+The exact release ZIP is pinned to
+`b72da32ca7702452537cdd11e1157bc41a283accdadca66ef88f42684a571ef7`.
+Runtime receipts record immutable PHP/MariaDB image IDs and distinguish a
+partial golden observation from the complete native-behavior fixture. These
+tests are not HTTP OAuth, signed-in UI, live native ACL execution, production
+publication, concurrent-policy safety, or successful recovery evidence.
+The complete native-behavior run at **2026-10-28 16:44:58 UTC** passed its seven
+checks while explicitly retaining the audience **hold**. Its receipt SHA-256 is
+`1c485db0b6ccd14c7a8b8f8ae5705b660ac403f586f8b8dd790e36a59e917a84`.
+A successful safety-blocker reproduction is not publication acceptance.
+
+The local real-runtime fixture is deliberately opt-in:
+
+```sh
+node scripts/test-suitecrm-native-acceptance.mjs --source-zip=/ABSOLUTE/SuiteCRM-8.10.1.zip --output=/PRIVATE_OUTPUT/native-behavior.json
+```
+
+Prepare the dependency image from
+`scripts/fixtures/native-email-audience-real/Dockerfile` using exact PHP
+`8.3.35`, plus MariaDB `11.4.13`, before running. The runner verifies the ZIP,
+uses an internal network with no host ports, tmpfs-backed disposable runtime and
+database, bounded memory/CPU/logs, and the shared owner-checked database lease.
+It does not download dependencies or override the 15 GiB disk floor. Do not run
+PostgreSQL fixtures concurrently, bypass a busy lease, or broadly prune caches
+or volumes. Verify cleanup independently after a failed or interrupted run.
+
+The unresolved operator decision is therefore **targeted native-principal
+remediation or retaining the hold**, not a general sharing grant. Any approved
+remediation needs exact-target impact review and fresh audience testing. No
+native role, user status, group, hook, flag, token, or credential was changed as
+part of this local test work. Promotion, migration 0374, legacy adoption, and
+the three-message recovery remain unauthorized and unexecuted here.
 
 ## Approved-transition design; no production execution here
 
