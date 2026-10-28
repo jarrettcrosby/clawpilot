@@ -559,6 +559,7 @@ assert.equal(queued, null)
     dateTimeLocalValue: (value) => String(value || ''),
     busy: false, editorRequiredFieldsReady: true, editorMeetingReady: true,
     editorEntity: 'meetings', editorRecord: { id: MEETING }, editorMeetingIdempotencyKey: 'fixture-editor-location-save',
+    sharedEmailAssociations: false,
     editorMeetingCalendar: { source: 'organization-default' }, editorMeetingTimingReady: true, editorMeetingLocationReady: true,
     setBusy() {}, setError(value) { if (value) errors.push(value) }, setNotice() {},
     setEditorRecord() {}, setEditorMeetingIdempotencyKey() {}, setEditorHistory() {},

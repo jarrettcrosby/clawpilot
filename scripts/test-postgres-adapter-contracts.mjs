@@ -1064,10 +1064,59 @@ for (const fragment of [
     'database-enforced quarantined pipeline access isolation',
   )
 }
-assert.equal(
-  (crmAdapter.match(/AND NOT pipeline\.reference_access_disabled/g) || []).length,
-  2,
-  'quarantined pipeline CRM reference resolution and bulk-link creation guards',
+function crmFunctionSource(name, nextName) {
+  const declaration = `async function ${name}(`
+  const start = crmAdapter.indexOf(declaration)
+  assert.notEqual(start, -1, `CRM adapter missing ${name}`)
+  const end = crmAdapter.indexOf(`async function ${nextName}(`, start + declaration.length)
+  assert.ok(end > start, `CRM adapter missing ${name} scope terminator ${nextName}`)
+  return crmAdapter.slice(start, end)
+}
+
+// Each entry point must retain its own gate; guards in another recovery path
+// cannot compensate for a missing reference-resolution or link-creation guard.
+for (const [name, nextName] of [
+  ['resolveCrmReferenceRoute', 'readCrmRecordByReference'],
+  ['ensurePipelineCrmReferenceLinks', 'claimSuiteCrmOutboxInPostgres'],
+]) {
+  assert.equal(
+    (crmFunctionSource(name, nextName).match(/AND NOT pipeline\.reference_access_disabled/g) || []).length,
+    1,
+    `${name} must independently exclude quarantined pipelines`,
+  )
+}
+const reviewedGmailPrepare = crmFunctionSource(
+  'prepareReviewedGmailInteractionWithClient', 'applyReviewedGmailInteractionWithClient',
+)
+for (const fragment of [
+  'WHERE pipeline.id = $1::uuid AND pipeline.owner_email = $2 AND NOT pipeline.reference_access_disabled',
+  'FOR SHARE OF pipeline, owner_user, membership, connection',
+  'if (scope.rows.length !== 1) throw refuse()',
+  'WHERE pipeline.owner_email = $1 AND NOT pipeline.reference_access_disabled',
+  'ORDER BY pipeline.id FOR SHARE OF pipeline, membership',
+  'crmParticipantEmailCandidatesSql(), [eligible.rows.map((row) => row.id)',
+]) {
+  assertIncludes(reviewedGmailPrepare, fragment, 'locked reviewed Gmail target and candidate-pipeline quarantine gates')
+}
+const reviewedGmailBatch = crmFunctionSource(
+  'stageReviewedGmailInteractionsInPostgres', 'stageReviewedGmailInteractionInPostgres',
+)
+const reviewedGmailValidation = reviewedGmailBatch.indexOf(
+  'plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }))',
+)
+assert.ok(
+  reviewedGmailValidation >= 0
+    && reviewedGmailBatch.indexOf('results.push(await applyReviewedGmailInteractionWithClient(') > reviewedGmailValidation,
+  'reviewed Gmail preview and apply must both prepare all quarantined-pipeline gates before staging',
+)
+const reviewedGmailApply = crmFunctionSource(
+  'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',
+)
+const reviewedGmailPreviewReturn = reviewedGmailApply.indexOf('if (!input.apply || plan.receiptValid) return')
+assert.ok(
+  reviewedGmailPreviewReturn >= 0
+    && reviewedGmailApply.indexOf('await stageCrmRecordWithClient(') > reviewedGmailPreviewReturn,
+  'reviewed Gmail preview must return after validation without staging a record',
 )
 assert.ok(
   (crmAdapter.match(/FOR SHARE OF pipeline/g) || []).length >= 2,

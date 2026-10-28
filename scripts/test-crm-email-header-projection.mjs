@@ -88,6 +88,7 @@ assert.deepEqual(project({ version: 1, to: [{ address: 'a@example.test', display
 const pipelineId = '11111111-1111-4111-8111-111111111111'
 const recordId = '22222222-2222-4222-8222-222222222222'
 const inboundId = '33333333-3333-4333-8333-333333333333'
+const organizationId = '55555555-5555-4555-8555-555555555555'
 const actorEmail = 'operator@example.test'
 const providerId = 'synthetic-exact-message'
 const threadId = 'synthetic-exact-thread'
@@ -131,21 +132,39 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
   sourcePipelineId = pipelineId,
 } = {}) {
   const calls = []
+  const companyLinks = new Map()
   const baseRecord = { id: recordId, suitecrm_id: recordId, suitecrm_module: 'Emails', reference_code: referenceCode, source_payload: {}, source_hash: 'old-hash' }
   const client = { query: async (sql, params = []) => {
     calls.push({ sql, params: plain(params) })
     const result = rows => ({ rows, rowCount: rows.length })
     if (sql.includes('FROM app_users app_user')) return result([])
-    if (sql.includes('WITH resolved AS')) return result([{}])
+    if (sql.includes('WITH resolved AS')) return result([params[1]
+      ? { organization_id: params[1], organization_suitecrm_id: 'native-company' } : {}])
     if (sql.includes('pg_advisory_xact_lock')) return result([])
     if (sql.includes('FROM crm_interactions') && sql.includes('FOR UPDATE')) return result([baseRecord])
     if (sql.includes('INSERT INTO crm_interactions')) return result([{ ...baseRecord, source_hash: params[26], suitecrm_module: params[12] }])
+    if (sql.includes('DELETE FROM crm_interaction_organizations')) {
+      assert.match(sql, /pipeline_id = \$1::uuid AND interaction_id = \$2::uuid/)
+      assert.match(sql, /NOT \(organization_id = ANY\(\$3::uuid\[\]\)\)/)
+      assert.deepEqual(plain(params.slice(0, 2)), [pipelineId, recordId])
+      assert.ok(Array.isArray(params[2]))
+      for (const id of companyLinks.keys()) if (!params[2].includes(id)) companyLinks.delete(id)
+      return result([])
+    }
+    if (sql.includes('INSERT INTO crm_interaction_organizations')) {
+      assert.match(sql, /ON CONFLICT \(interaction_id, organization_id\) DO UPDATE/)
+      assert.deepEqual(plain(params), [pipelineId, recordId, organizationId, true, 0, actorEmail])
+      companyLinks.set(params[2], { id: params[2], isPrimary: params[3], sortOrder: params[4] })
+      return result([])
+    }
     if (sql.includes('DELETE FROM crm_interaction_contacts')) return result([])
     if (sql.includes('SELECT COALESCE(wo.is_demo')) return result([{ is_demo: false }])
     if (sql.includes('SET sync_status =')) return result([])
     if (sql.includes('SELECT pipeline.owner_email')) return result([{ owner_email: actorEmail, organization_id: 'organization', reference_access_disabled: false }])
     if (sql.includes('INSERT INTO short_links')) return result([{ slug: params[2] }])
-    if (sql.includes('AS link_field_name')) return result([])
+    if (sql.includes('AS link_field_name')) return result([...companyLinks.values()].map(() => ({
+      link_field_name: 'accounts', related_module_name: 'Accounts', related_bean_id: 'native-company',
+    })))
     if (sql.includes('DELETE FROM sync_outbox')) return result([])
     if (sql.includes('INSERT INTO sync_outbox')) return result([{ idempotency_key: params[3] }])
     if (sql.includes('FROM crm_inbound_messages message')) {
@@ -184,7 +203,7 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
   assert.deepEqual(input, before)
   assert.deepEqual(retained, retainedBefore)
   const outbox = calls.find(({ sql }) => sql.includes('INSERT INTO sync_outbox'))
-  return { calls, payload: JSON.parse(outbox.params[2]) }
+  return { calls, companyLinks: [...companyLinks.values()], payload: JSON.parse(outbox.params[2]) }
 }
 const staged = await stage()
 assert.deepEqual(Object.fromEntries(Object.keys(completeAttributes).map(key => [key, staged.payload.attributes[key]])), completeAttributes)
@@ -193,6 +212,11 @@ assert.equal(staged.payload.attributes.description_html, '')
 assert.equal(staged.payload.attributes.global_id_c, referenceCode)
 assert.equal(staged.payload.suiteCrmId, recordId)
 assert.equal(staged.payload.suiteCrmModule, 'Emails')
+assert.deepEqual(staged.companyLinks, [], 'Header capture must not invent a company association')
+const companyStaged = await stage({ fieldOverrides: { organizationId } })
+assert.deepEqual(companyStaged.companyLinks, [{ id: organizationId, isPrimary: true, sortOrder: 0 }])
+assert.deepEqual(companyStaged.payload.relationships, [{ linkFieldName: 'accounts', relatedModuleName: 'Accounts', relatedBeanId: 'native-company' }])
+assert.equal(companyStaged.payload.attributes.description, originalBody)
 const otherOwnedPipeline = await stage({ sourcePipelineId: '44444444-4444-4444-8444-444444444444' })
 assert.equal(otherOwnedPipeline.payload.attributes.from_addr_name, completeAttributes.from_addr_name)
 for (const ownership of [{ receiptOwner: 'other@example.test' }, { sourcePipelineOwner: 'other@example.test' }, { targetPipelineOwner: 'other@example.test' }]) {

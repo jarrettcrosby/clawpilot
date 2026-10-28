@@ -53,7 +53,14 @@ function harness(initialRecord = baseRecord) {
       if (sql.includes('pg_advisory_xact_lock')) return result([])
       if (sql.includes('FROM crm_interactions') && sql.includes('FOR UPDATE')) {
         assert.equal(params[0], pipelineId)
-        if (sql.includes('LIMIT 1')) {
+        if (sql.includes('FROM crm_interaction_organizations related')) {
+          assert.match(sql, /interaction\.pipeline_id = \$1::uuid/)
+          assert.match(sql, /\$2::uuid IS NOT NULL AND interaction\.id = \$2::uuid/)
+          assert.match(sql, /\$2::uuid IS NULL AND interaction\.source_key = \$3/)
+          assert.equal(params[2], baseRecord.source_key)
+          assert.ok(params[1] === null || params[1] === recordId)
+          return result(record ? [{ ...plain(record), organization_ids: [], contact_ids: [] }] : [])
+        } else if (sql.includes('LIMIT 1')) {
           assert.match(sql, /pipeline_id = \$1::uuid/)
           assert.match(sql, /\$2::uuid IS NOT NULL AND id = \$2::uuid/)
           assert.match(sql, /\$2::uuid IS NULL AND source_key = \$3/)
@@ -76,6 +83,11 @@ function harness(initialRecord = baseRecord) {
         return result([plain(record)])
       }
       if (sql.includes('DELETE FROM crm_interaction_contacts')) return result([])
+      if (sql.includes('DELETE FROM crm_interaction_organizations')) {
+        assert.deepEqual(plain(params), [pipelineId, recordId, []])
+        assert.match(sql, /NOT \(organization_id = ANY\(\$3::uuid\[\]\)\)/)
+        return result([])
+      }
       if (sql.includes('SELECT COALESCE(wo.is_demo')) return result([{ is_demo: false }])
       if (sql.includes('SET sync_status =')) return result([])
       if (sql.includes('SELECT pipeline.owner_email')) {
@@ -136,7 +148,13 @@ for (const emitSuiteCrmOutbox of [false, true]) {
     assert.deepEqual(plain(input), originalInput, 'Staging must not alter its caller snapshot')
     assert.equal(h.linksDisabled(), true, 'Staging must not reactivate either archived short link')
     assert.equal(h.audits.length, 0)
-    assert.equal(h.calls.filter(({ sql }) => sql.includes('FOR UPDATE')).length, 1)
+    const retainedReads = h.calls.filter(({ sql }) => sql.includes('FROM crm_interaction_organizations related') && sql.includes('FOR UPDATE'))
+    const archiveFenceReads = h.calls.filter(({ sql }) => sql.includes('SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module') && sql.includes('FOR UPDATE'))
+    assert.equal(retainedReads.length, 1, 'Association retention reads the same locked original identity')
+    assert.equal(archiveFenceReads.length, 1, 'The original locked archival fence remains mandatory')
+    assert.deepEqual(retainedReads[0].params, [pipelineId, localId || null, baseRecord.source_key])
+    assert.deepEqual(archiveFenceReads[0].params, [pipelineId, localId || null, baseRecord.source_key])
+    assert.equal(h.calls.filter(({ sql }) => sql.includes('FOR UPDATE')).length, retainedReads.length + archiveFenceReads.length)
     assert.ok(h.calls.every(({ sql }) => !/\b(?:INSERT|UPDATE|DELETE)\b/.test(sql.replace('FOR UPDATE', ''))),
       'Archived no-op must not write records, relationships, outbox jobs, or links')
   }
@@ -182,14 +200,17 @@ for (const initial of [null, baseRecord, { ...baseRecord, source_payload: { arch
   }
 }
 
-// Existing input/relationship checks still happen before the archive lookup;
-// the fence adds no new way around pipeline-user or contact validation.
+// Association retention may read the locked identity first, but invalid input
+// still cannot reach the archival early-return or bypass mapping validation.
 for (const fields of [{ agentEmail: 'unauthorized@example.test' }, { contactIds: [recordId] }]) {
   const h = harness({ ...baseRecord, source_payload: { archived: true } })
   await assert.rejects(h.crm.stageCrmRecordWithClient(h.client, staleInput({
     fields: { interactionType: 'email', subject: 'Invalid mapping', ...fields },
   })), /Interaction (agent must be an active ClawPilot user with pipeline access|contact selection is invalid)/)
-  assert.ok(h.calls.every(({ sql }) => !sql.includes('FOR UPDATE')))
+  const lockedReads = h.calls.filter(({ sql }) => sql.includes('FOR UPDATE'))
+  assert.equal(lockedReads.length, 1)
+  assert.ok(lockedReads[0].sql.includes('FROM crm_interaction_organizations related'))
+  assert.ok(h.calls.every(({ sql }) => !/\b(?:INSERT|UPDATE|DELETE)\b/.test(sql.replace('FOR UPDATE', ''))))
 }
 
 console.log('crm interaction archive fence tests passed (locked stale-update no-op, active paths, mapping guards)')
