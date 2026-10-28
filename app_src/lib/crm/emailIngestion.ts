@@ -5,8 +5,11 @@ import { captureEmailAddressHeaders, type EmailAddressHeaders } from '@/lib/crm/
 import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
 import { matonFetch } from '@/lib/maton'
 import {
+  enrichCrmEmailInteractionParticipantsInPostgres,
   readCrmRecordByReference,
   stageCrmRecordInPostgres,
+  stageReviewedGmailInteractionsInPostgres,
+  type StageInteractionInput,
 } from '@/lib/persistence/crm'
 import { query } from '@/lib/persistence/postgres'
 import { resolvePipelineSpaceAccess } from '@/lib/tenancy'
@@ -100,6 +103,13 @@ type OwnedPipeline = {
   is_default: boolean
 }
 
+export type ReviewedGmailAssociation = {
+  messageId: string
+  threadId: string
+  primaryOrganizationReference: string
+  contactReferences: string[]
+}
+
 type CursorRow = {
   cursor_value: string | null
   last_polled_at: string | Date | null
@@ -122,6 +132,7 @@ type ReferenceTarget = {
   record: CrmReferenceRecord
   pipelineId: string
   matchedBy: 'marker' | 'sender-email' | 'archive-email' | 'participant-email'
+  matchedEmail?: string
 }
 
 type MessageProcessResult = {
@@ -646,10 +657,13 @@ async function participantEmailTargets(input: MessageRoutingInput): Promise<Refe
   }
   const targets: ReferenceTarget[] = []
   for (const row of matches.rows) {
+    const record = await readCrmRecordByReference({ pipelineId: row.pipeline_id, referenceCode: row.reference_code })
+    if (!emails.includes(row.email) || record.email?.trim().toLowerCase() !== row.email) return []
     targets.push({
-      record: await readCrmRecordByReference({ pipelineId: row.pipeline_id, referenceCode: row.reference_code }),
+      record,
       pipelineId: row.pipeline_id,
       matchedBy: 'participant-email',
+      matchedEmail: row.email,
     })
   }
   // A conversation spanning unrelated customer accounts needs explicit markers
@@ -939,7 +953,35 @@ async function existingProviderInteraction(input: {
     && candidate.provider_thread_id !== input.message.externalThreadId) {
     throw new SafeEmailIngestionError('Gmail message has a conflicting CRM thread identity')
   }
+  if (candidate) await enrichExistingParticipantInteraction({ ...input, interactionId: candidate.id, apply: false })
   return candidate?.id
+}
+
+async function enrichExistingParticipantInteraction(input: {
+  group: ReferenceTargetGroup
+  message: ParsedGmailMessage
+  ownerEmail: string
+  interactionId: string
+  apply: boolean
+}): Promise<void> {
+  if (!input.group.targets.every((target) => target.matchedBy === 'participant-email')) return
+  const targets = input.group.targets.map((target) => {
+    if (target.record.entity !== 'contacts' && target.record.entity !== 'leads') {
+      throw new SafeEmailIngestionError('Existing Gmail interaction has conflicting CRM participant evidence')
+    }
+    return { id: target.record.id, entity: target.record.entity,
+      referenceCode: target.record.referenceCode, organizationId: target.record.organizationId,
+      email: target.matchedEmail || target.record.email }
+  })
+  try {
+    await enrichCrmEmailInteractionParticipantsInPostgres({
+      pipelineId: input.group.primary.pipelineId, interactionId: input.interactionId,
+      ownerEmail: input.ownerEmail, providerMessageId: input.message.externalMessageId,
+      providerThreadId: input.message.externalThreadId, targets, apply: input.apply,
+    })
+  } catch {
+    throw new SafeEmailIngestionError('Existing Gmail interaction has conflicting CRM participant evidence')
+  }
 }
 
 async function stageInboundInteraction(input: {
@@ -1033,7 +1075,12 @@ async function updateInboundMessagePrimary(input: {
        organization_id = COALESCE(organization_id, $3::uuid),
        contact_id = COALESCE(contact_id, $4::uuid),
        lead_id = COALESCE(lead_id, $5::uuid)
-     WHERE id = $1::uuid`,
+     WHERE id = $1::uuid AND (
+       interaction_id, organization_id, contact_id, lead_id
+     ) IS DISTINCT FROM (
+       COALESCE(interaction_id, $2::uuid), COALESCE(organization_id, $3::uuid),
+       COALESCE(contact_id, $4::uuid), COALESCE(lead_id, $5::uuid)
+     )`,
     [
       input.inboundMessageId,
       input.interactionId,
@@ -1074,6 +1121,17 @@ async function processMessage(
     || routingFingerprint(resolved.targets) !== reviewedRouting)) {
     throw new SafeEmailIngestionError('Message routing changed after review; preview recovery again')
   }
+  const groups = groupReferenceTargets(resolved.targets)
+  const planned = []
+  for (const group of groups) {
+    // Validate an existing email's customer/mapping evidence before caching or
+    // creating links. Apply rechecks under locks before native enrichment.
+    const existingInteractionId = await existingProviderInteraction({
+      group, message: input.message, ownerEmail: input.ownerEmail,
+      scopeToSourceKey: groups.filter((candidate) => candidate.primary.pipelineId === group.primary.pipelineId).length > 1,
+    })
+    planned.push({ group, existingInteractionId })
+  }
   const inboundMessage = await storeInboundMessage({
     ownerEmail: input.ownerEmail,
     pipelineId: input.defaultPipelineId,
@@ -1083,21 +1141,20 @@ async function processMessage(
   let interactions = 0
   let links = 0
 
-  const groups = groupReferenceTargets(resolved.targets)
-  for (const group of groups) {
+  for (const { group, existingInteractionId } of planned) {
     const relatedReferences = group.targets.map((target) => target.record.referenceCode)
     const linkedInteractionIds = relatedReferences
       .map((referenceCode) => existingLinks.get(referenceCode))
       .filter((interactionId): interactionId is string => Boolean(interactionId))
-    const existingInteractionId = await existingProviderInteraction({
-      group, message: input.message, ownerEmail: input.ownerEmail,
-      scopeToSourceKey: groups.filter((candidate) => candidate.primary.pipelineId === group.primary.pipelineId).length > 1,
-    })
     // A previous link is evidence to validate, not permission to redirect the
     // current message to an unrelated interaction or another pipeline.
     if (linkedInteractionIds.some((interactionId) => interactionId !== existingInteractionId)) {
       throw new SafeEmailIngestionError('Gmail message has conflicting existing CRM links')
     }
+    if (existingInteractionId) await enrichExistingParticipantInteraction({
+      group, message: input.message, ownerEmail: input.ownerEmail,
+      interactionId: existingInteractionId, apply: true,
+    })
     const interactionId = existingInteractionId || await stageInboundInteraction({
       ownerEmail: input.ownerEmail,
       inboundMessage,
@@ -1153,6 +1210,218 @@ async function ownedPipelines(ownerEmail: string, defaultPipelineId: string): Pr
   return result.rows
 }
 
+function reviewedAssociationSelection(value: unknown, messageIds: string[]): ReviewedGmailAssociation[] | undefined {
+  if (value === undefined) return undefined
+  const invalid = () => new SafeEmailIngestionError('An exact reviewed association is required for every selected message')
+  if (!Array.isArray(value) || value.length !== messageIds.length) throw invalid()
+  const associations = value.map((entry) => {
+    const record = asRecord(entry)
+    if (!record || Object.keys(record).sort().join(',') !== 'contactReferences,messageId,primaryOrganizationReference,threadId'
+      || typeof record.messageId !== 'string' || !/^[a-f0-9]{1,128}$/i.test(record.messageId)
+      || typeof record.threadId !== 'string' || !/^[a-f0-9]{1,128}$/i.test(record.threadId)
+      || typeof record.primaryOrganizationReference !== 'string'
+      || !/^ga(?:[0-9]{7}|[0-9a-v]{12})$/i.test(record.primaryOrganizationReference)
+      || !Array.isArray(record.contactReferences) || !record.contactReferences.length || record.contactReferences.length > 25
+      || record.contactReferences.some((reference) => typeof reference !== 'string'
+        || !/^gc(?:[0-9]{7}|[0-9a-v]{12})$/i.test(reference))) throw invalid()
+    const contactReferences = (record.contactReferences as string[]).map((reference) => reference.toLowerCase()).sort()
+    if (new Set(contactReferences).size !== contactReferences.length) throw invalid()
+    return {
+      messageId: record.messageId.toLowerCase(), threadId: record.threadId.toLowerCase(),
+      primaryOrganizationReference: record.primaryOrganizationReference.toLowerCase(), contactReferences,
+    }
+  }).sort((left, right) => left.messageId.localeCompare(right.messageId))
+  const selected = messageIds.map((id) => id.toLowerCase()).sort()
+  if (new Set(associations.map((association) => association.messageId)).size !== selected.length
+    || associations.some((association, index) => association.messageId !== selected[index])) throw invalid()
+  return associations
+}
+
+function stableEvidence(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableEvidence)
+  const record = asRecord(value)
+  return record
+    ? Object.fromEntries(Object.keys(record).sort().map((key) => [key, stableEvidence(record[key])]))
+    : value
+}
+
+async function reviewedParticipantTargets(routing: MessageRoutingInput, association: ReviewedGmailAssociation) {
+  const unavailable = () => new SafeEmailIngestionError('Reviewed contacts must be unambiguous current participants in the owned pipeline')
+  if (routing.message.externalThreadId !== association.threadId) throw unavailable()
+  const participantEmails = ordinaryParticipantAddresses(routing)
+  if (!participantEmails.length) throw unavailable()
+  // Use the same accounting-mirror and archived-candidate policy as normal
+  // intake. Review selects a bounded subset, never overrides email ambiguity.
+  const candidates = await query<{ pipeline_id: string; reference_code: string; email: string }>(
+    crmParticipantEmailCandidatesSql(),
+    [routing.ownedPipelines.map((pipeline) => pipeline.id), participantEmails],
+  )
+  if (candidates.rows.length > 100 || candidates.rows.some((candidate) => candidate.pipeline_id !== routing.defaultPipelineId)) throw unavailable()
+  for (const email of participantEmails) {
+    if (new Set(candidates.rows.filter((candidate) => candidate.email === email)
+      .map((candidate) => `${candidate.pipeline_id}:${candidate.reference_code}`)).size > 1) throw unavailable()
+  }
+  const targets: ReferenceTarget[] = []
+  for (const referenceCode of association.contactReferences) {
+    const candidate = candidates.rows.find((row) => row.reference_code === referenceCode)
+    if (!candidate || !participantEmails.includes(candidate.email)) throw unavailable()
+    const record = await readCrmRecordByReference({ pipelineId: routing.defaultPipelineId, referenceCode })
+      .catch(() => { throw unavailable() })
+    if (record.entity !== 'contacts' || record.referenceCode !== referenceCode || !record.organizationId
+      || record.email?.trim().toLowerCase() !== candidate.email) throw unavailable()
+    targets.push({ record, pipelineId: routing.defaultPipelineId, matchedBy: 'participant-email', matchedEmail: candidate.email })
+  }
+  const primary = await readCrmRecordByReference({
+    pipelineId: routing.defaultPipelineId, referenceCode: association.primaryOrganizationReference,
+  }).catch(() => { throw unavailable() })
+  if (primary.entity !== 'organizations' || primary.referenceCode !== association.primaryOrganizationReference
+    || !targets.some((target) => target.record.organizationId === primary.id)) throw unavailable()
+  const organizations = await query<{ id: string; reference_code: string }>(
+    `SELECT id::text, reference_code FROM crm_organizations
+     WHERE pipeline_id = $1::uuid AND id = ANY($2::uuid[])
+       AND COALESCE(lower(source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')`,
+    [routing.defaultPipelineId, [...new Set(targets.map((target) => target.record.organizationId))]],
+  )
+  if (organizations.rows.length !== new Set(targets.map((target) => target.record.organizationId)).size) throw unavailable()
+  const companyTargets: ReferenceTarget[] = []
+  for (const organization of [...organizations.rows].sort((left, right) => left.reference_code.localeCompare(right.reference_code))) {
+    const record = await readCrmRecordByReference({ pipelineId: routing.defaultPipelineId, referenceCode: organization.reference_code })
+      .catch(() => { throw unavailable() })
+    if (record.entity !== 'organizations' || record.id !== organization.id
+      || record.referenceCode !== organization.reference_code) throw unavailable()
+    companyTargets.push({ record, pipelineId: routing.defaultPipelineId, matchedBy: 'participant-email' })
+  }
+  const allowedReferences = new Set([
+    ...association.contactReferences, ...organizations.rows.map((organization) => organization.reference_code),
+  ])
+  // An explicit reference may reinforce the review, but a conflicting marker
+  // must not be silently discarded in favor of the operator's selection.
+  if (routing.message.markerReferences.some((reference) => !allowedReferences.has(reference))) {
+    throw new SafeEmailIngestionError('Explicit message references conflict with the reviewed association')
+  }
+  return { primary, targets, companyTargets, participantEmails,
+    organizationReferences: organizations.rows.map((organization) => organization.reference_code).sort() }
+}
+
+async function reconcileReviewedGmailMessages(input: {
+  ownerEmail: string
+  connectionId: string
+  pipelineId: string
+  apply?: boolean
+  expectedDigest?: string
+  associations: ReviewedGmailAssociation[]
+  mailbox: SelectedMailbox
+  pipelines: OwnedPipeline[]
+  selfAddresses: string[]
+}) {
+  const planned = []
+  for (const association of input.associations) {
+    const raw = await getGmailMessage(input.mailbox, association.messageId)
+    const message = parseGmailMessage(raw)
+    if (message.externalMessageId !== association.messageId || isClawPilotAuthEmail(raw)
+      || message.labelIds.some((label) => ['DRAFT', 'SPAM', 'TRASH'].includes(label))) {
+      throw new SafeEmailIngestionError('The selected message is not eligible for CRM recovery')
+    }
+    const routing = { ownerEmail: input.ownerEmail, mailboxEmail: input.mailbox.account_email,
+      selfAddresses: input.selfAddresses, defaultPipelineId: input.pipelineId, ownedPipelines: input.pipelines, message }
+    const resolved = await reviewedParticipantTargets(routing, association)
+    const cached = await query<{ id: string; pipeline_id: string }>(
+      `SELECT id::text, pipeline_id::text FROM crm_inbound_messages
+       WHERE owner_email = $1 AND external_message_id = $2`,
+      [input.ownerEmail, message.externalMessageId],
+    )
+    if (cached.rows.length !== 1) throw new SafeEmailIngestionError('Reviewed cross-company recovery requires an existing owned cached Gmail message')
+    const relatedReferences = [...association.contactReferences, ...resolved.organizationReferences].sort()
+    const interaction: StageInteractionInput = {
+      entity: 'interactions', pipelineId: input.pipelineId, actorEmail: input.ownerEmail,
+      sourceKey: interactionSourceKey(input.ownerEmail, message.externalMessageId, resolved.primary.referenceCode),
+      sourcePayload: { source: 'gmail-inbound', matchedBy: 'reviewed-participants',
+        referenceCode: resolved.primary.referenceCode, relatedReferences },
+      fields: {
+        organizationId: resolved.primary.id, contactIds: resolved.targets.map((target) => target.record.id),
+        interactionType: 'email', subject: message.subject || 'Inbound email',
+        agentEmail: input.ownerEmail, agentName: input.ownerEmail, occurredAt: message.receivedAt,
+        description: (message.bodyText || message.snippet || 'Inbound email received.').slice(0, MAX_INTERACTION_DESCRIPTION_CHARS),
+        direction: message.labelIds.includes('SENT') ? 'outbound' : 'inbound',
+        deliveryStatus: message.labelIds.includes('SENT') ? 'sent' : 'received',
+        providerMessageId: message.externalMessageId, providerThreadId: message.externalThreadId,
+        metadata: { source: 'gmail-inbound', matchedBy: 'reviewed-participants',
+          referenceCode: resolved.primary.referenceCode, relatedReferences },
+      },
+    }
+    const persistence = {
+      ownerEmail: input.ownerEmail, pipelineId: input.pipelineId, connectionId: input.connectionId,
+      providerMessageId: message.externalMessageId, providerThreadId: message.externalThreadId,
+      participantEmails: resolved.participantEmails,
+      primaryOrganization: { id: resolved.primary.id, referenceCode: resolved.primary.referenceCode },
+      contactTargets: resolved.targets.map((target) => ({ id: target.record.id,
+        referenceCode: target.record.referenceCode, email: target.matchedEmail!, organizationId: target.record.organizationId! })),
+      interaction,
+    }
+    planned.push({ association, raw, routing, resolved, cached: cached.rows[0], persistence })
+  }
+  const snapshots = await stageReviewedGmailInteractionsInPostgres({ messages: planned.map((plan) => plan.persistence), apply: false })
+    .catch(() => { throw new SafeEmailIngestionError('Reviewed Gmail association evidence is unavailable or has changed') })
+  const digest = crypto.createHash('sha256').update(JSON.stringify(stableEvidence({
+    version: 2, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
+    pipelineId: input.pipelineId, mailboxEmail: input.mailbox.account_email,
+    selfAddresses: [...input.selfAddresses].sort(),
+    messages: planned.map((plan, index) => ({ association: plan.association, raw: plan.raw,
+      targets: plan.resolved.targets.map((target) => ({ id: target.record.id,
+        reference: target.record.referenceCode, email: target.matchedEmail, organization: target.record.organizationId })),
+      organizationReferences: plan.resolved.organizationReferences, targetFingerprint: snapshots[index].targetFingerprint,
+    })),
+  }))).digest('hex')
+  const messages = planned.map((plan, index) => ({
+    messageId: plan.routing.message.externalMessageId, threadId: plan.routing.message.externalThreadId,
+    subject: plan.routing.message.subject, receivedAt: plan.routing.message.receivedAt,
+    direction: plan.routing.message.labelIds.includes('SENT') ? 'outbound' : 'inbound',
+    primaryOrganizationReference: plan.association.primaryOrganizationReference,
+    contactReferences: plan.association.contactReferences, organizationReferences: plan.resolved.organizationReferences,
+    targetReferences: [...plan.association.contactReferences, ...plan.resolved.organizationReferences].sort(),
+    alreadyLinked: snapshots[index].alreadyLinked,
+  }))
+  if (!input.apply) return { applied: false, digest, pipelineId: input.pipelineId, messages }
+  if (!input.expectedDigest || input.expectedDigest !== digest) {
+    throw new SafeEmailIngestionError('Gmail recovery changed after preview; review a fresh preview before applying')
+  }
+  // The persistence batch locks and validates every message/target fingerprint
+  // before its first stage; no earlier message can be partially applied when a
+  // later reviewed message has changed concurrently.
+  const results = await stageReviewedGmailInteractionsInPostgres({
+    messages: planned.map((plan, index) => ({ ...plan.persistence,
+      expectedExistingInteractionId: snapshots[index].interactionId,
+      expectedTargetFingerprint: snapshots[index].targetFingerprint })),
+    apply: true,
+  }).catch(() => { throw new SafeEmailIngestionError('Reviewed Gmail association evidence changed before apply; preview recovery again') })
+  await recordAuditEvent({ actor: input.ownerEmail, eventType: 'crm.email_recovery.requested',
+    aggregateType: 'pipeline_space', aggregateId: input.pipelineId,
+    eventKey: `crm-email-recovery:${input.ownerEmail}:${input.pipelineId}:${digest}`,
+    payload: { digest, messageIds: input.associations.map((association) => association.messageId),
+      reviewedAssociations: input.associations, providerWrites: 0 } })
+  let interactions = 0, links = 0
+  for (const [index, plan] of planned.entries()) {
+    const interactionId = results[index].interactionId
+    if (!interactionId) throw new SafeEmailIngestionError('Reviewed Gmail recovery did not return an interaction')
+    if (!snapshots[index].interactionId && results[index].applied) interactions += 1
+    const inboundMessageId = results[index].inboundMessageId
+    if (!inboundMessageId || inboundMessageId !== plan.cached.id) {
+      throw new SafeEmailIngestionError('Reviewed Gmail cache identity changed before linking')
+    }
+    const primaryTarget: ReferenceTarget = { record: plan.resolved.primary,
+      pipelineId: input.pipelineId, matchedBy: 'participant-email' }
+    await updateInboundMessagePrimary({ inboundMessageId, interactionId, target: primaryTarget })
+    const existingLinks = await completedLinks(inboundMessageId)
+    for (const target of [...plan.resolved.targets, ...plan.resolved.companyTargets]) {
+      const previous = existingLinks.get(target.record.referenceCode)
+      if (previous && previous !== interactionId) throw new SafeEmailIngestionError('Gmail message has conflicting existing CRM links')
+      if (previous) continue
+      links += await linkInboundTarget({ inboundMessageId, interactionId, target })
+    }
+  }
+  return { applied: true, digest, pipelineId: input.pipelineId, messages, interactions, links }
+}
+
 /** Explicit operator recovery of reviewed messages, never a cursor reset or a
  * mailbox-wide replay. Preview is read-only; apply refetches and verifies the
  * content/routing digest before creating any CRM activity. */
@@ -1161,6 +1430,7 @@ export async function reconcileGmailMessages(input: {
   connectionId: string
   pipelineId: string
   messageIds: string[]
+  reviewedAssociations?: ReviewedGmailAssociation[]
   apply?: boolean
   expectedDigest?: string
 }) {
@@ -1173,12 +1443,18 @@ export async function reconcileGmailMessages(input: {
     || (input.apply !== undefined && typeof input.apply !== 'boolean')) {
     throw new SafeEmailIngestionError('A bounded, exact Gmail recovery selection is required')
   }
+  const reviewedAssociations = reviewedAssociationSelection(input.reviewedAssociations, input.messageIds)
   const mailbox = (await selectedMailboxes()).find((entry) => (
     entry.owner_email === ownerEmail && entry.connection_id === input.connectionId
   ))
   if (!mailbox) throw new SafeEmailIngestionError('The selected Gmail connection is not active for this owner')
   const pipelines = await ownedPipelines(ownerEmail, input.pipelineId)
   const selfAddresses = await configuredMailboxAddresses(mailbox)
+  if (reviewedAssociations) return reconcileReviewedGmailMessages({
+    ownerEmail, connectionId: input.connectionId, pipelineId: input.pipelineId,
+    apply: input.apply, expectedDigest: input.expectedDigest, associations: reviewedAssociations,
+    mailbox, pipelines, selfAddresses,
+  })
   const planned: Array<{ routing: MessageRoutingInput; targets: ReferenceTarget[] }> = []
   const messages: Array<{
     messageId: string; subject: string; receivedAt: string; direction: string;

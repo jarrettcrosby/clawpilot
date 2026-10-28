@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import { reconcileGmailMessages, SafeEmailIngestionError } from '@/lib/crm/emailIngestion'
+import { globalIdPattern } from '@/lib/globalIds.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
@@ -15,6 +16,15 @@ const IDENTIFIER = /^[A-Za-z0-9_-]{1,200}$/
 const PIPELINE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const GMAIL_ID = /^[a-f0-9]{1,128}$/i
 const DIGEST = /^[a-f0-9]{64}$/i
+const ORGANIZATION_REFERENCE = globalIdPattern('ga', 'i')
+const CONTACT_REFERENCE = globalIdPattern('gc', 'i')
+
+type ReviewedEmailAssociation = {
+  messageId: string
+  threadId: string
+  primaryOrganizationReference: string
+  contactReferences: string[]
+}
 
 class RecoveryCommandError extends Error {
   constructor(message: string, readonly status = 400) { super(message) }
@@ -63,6 +73,46 @@ async function boundedJson(req: NextRequest): Promise<Record<string, unknown>> {
   return body as Record<string, unknown>
 }
 
+function parseReviewedAssociations(value: unknown, messageIds: string[]): ReviewedEmailAssociation[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length !== messageIds.length) {
+    throw new RecoveryCommandError('Provide exactly one reviewed association for each selected Gmail message')
+  }
+  const allowed = ['messageId', 'threadId', 'primaryOrganizationReference', 'contactReferences']
+  const selectedIds = new Set(messageIds)
+  const reviewedIds = new Set<string>()
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new RecoveryCommandError('A reviewed Gmail association must be an object')
+    }
+    const association = entry as Record<string, unknown>
+    if (Object.keys(association).length !== allowed.length
+      || Object.keys(association).some((key) => !allowed.includes(key))
+      || typeof association.messageId !== 'string' || !GMAIL_ID.test(association.messageId)
+      || typeof association.threadId !== 'string' || !GMAIL_ID.test(association.threadId)
+      || typeof association.primaryOrganizationReference !== 'string'
+      || !ORGANIZATION_REFERENCE.test(association.primaryOrganizationReference)
+      || !Array.isArray(association.contactReferences)
+      || association.contactReferences.length < 1 || association.contactReferences.length > 25
+      || association.contactReferences.some((reference) => typeof reference !== 'string' || !CONTACT_REFERENCE.test(reference))) {
+      throw new RecoveryCommandError('Provide a Gmail message and thread, a primary Account reference, and 1–25 unique Contact references')
+    }
+    const messageId = association.messageId.toLowerCase()
+    const contactReferences = (association.contactReferences as string[]).map((reference) => reference.toLowerCase())
+    if (!selectedIds.has(messageId) || reviewedIds.has(messageId)
+      || new Set(contactReferences).size !== contactReferences.length) {
+      throw new RecoveryCommandError('Reviewed message and Contact references must be unique and match the selected messages')
+    }
+    reviewedIds.add(messageId)
+    return {
+      messageId,
+      threadId: association.threadId.toLowerCase(),
+      primaryOrganizationReference: association.primaryOrganizationReference.toLowerCase(),
+      contactReferences,
+    }
+  })
+}
+
 export async function POST(req: NextRequest) {
   try {
     if (!isBrowserSameOriginRequest({ headers: req.headers,
@@ -87,7 +137,7 @@ export async function POST(req: NextRequest) {
       throw new RecoveryCommandError('Email recovery requires Postgres storage', 503)
     }
     const body = await boundedJson(req)
-    const allowed = ['pipelineId', 'connectionId', 'messageIds', 'apply', 'expectedDigest']
+    const allowed = ['pipelineId', 'connectionId', 'messageIds', 'apply', 'expectedDigest', 'reviewedAssociations']
     if (Object.keys(body).some((key) => !allowed.includes(key))
       || typeof body.pipelineId !== 'string' || !PIPELINE_ID.test(body.pipelineId)
       || typeof body.connectionId !== 'string' || !IDENTIFIER.test(body.connectionId)
@@ -100,6 +150,7 @@ export async function POST(req: NextRequest) {
     if (new Set(messageIds).size !== messageIds.length) {
       throw new RecoveryCommandError('Gmail message IDs must be unique')
     }
+    const reviewedAssociations = parseReviewedAssociations(body.reviewedAssociations, messageIds)
     const apply = body.apply === true
     if ((apply && (typeof body.expectedDigest !== 'string' || !DIGEST.test(body.expectedDigest)))
       || (!apply && Object.hasOwn(body, 'expectedDigest'))) {
@@ -114,6 +165,7 @@ export async function POST(req: NextRequest) {
     const recovery = await reconcileGmailMessages({
       ownerEmail: actor.email, connectionId: body.connectionId, pipelineId: pipeline.id,
       messageIds, apply,
+      ...(reviewedAssociations ? { reviewedAssociations } : {}),
       ...(apply ? { expectedDigest: (body.expectedDigest as string).toLowerCase() } : {}),
     })
     return json({ ok: true, recovery })

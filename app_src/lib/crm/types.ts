@@ -203,6 +203,16 @@ export type CrmOpportunityContact = {
   phoneMobile: string
   jobTitle: string
   isPrimary: boolean
+  organizationId?: string | null
+  organizationName?: string
+  organizationReferenceCode?: string | null
+}
+
+export type CrmInteractionOrganization = {
+  id: string
+  referenceCode: string
+  name: string
+  isPrimary: boolean
 }
 
 export type CrmOpportunity = {
@@ -244,6 +254,9 @@ export type CrmInteraction = {
   pipelineId: string
   organizationId: string | null
   organizationName: string
+  organizationIds?: string[]
+  organizations?: CrmInteractionOrganization[]
+  companyAssociationsReviewed?: boolean
   contactId: string | null
   contactName: string
   contactIds: string[]
