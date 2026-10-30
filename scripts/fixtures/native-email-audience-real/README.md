@@ -64,6 +64,15 @@ the same cookie and token immediately lose foreign access without another login.
 The Email candidate refreshes native ACL actions once per user per HTTP request;
 this is not a long-lived worker or mid-request revocation guarantee.
 
+Before the server starts, the runner also exercises the shared offline installer
+against private copies of the five pinned stock files. Read-only checking must
+leave no state; actual installation requires process quiescence, fully staged
+and linted output, and protected originals plus an exact restore journal outside
+the application tree. Interrupted replacement and operator drift must hold;
+restoration requires the exact installation ID. The fixture and offline package
+share the same transform and assert byte-identical accepted outputs. Nothing
+hooks this installer into the service image or startup process.
+
 The following frozen-policy lifecycle rehearsal exercises actual native saves
 and group relationships in real MariaDB transactions. An independent connection
 must see no partially committed Email/group state. Existing history is repaired
@@ -81,6 +90,23 @@ scope; edit/delete default to owner-only. It must not grant edit/delete merely
 because a new viewer belongs to a read group. Existing explicit role overrides
 and administrator privileges remain native; unexpected broad roles or changed
 default rows remain release blockers, not automatic permissions to repair.
+
+The final native-policy fence stage uses the uninstalled
+`NativeEmailTransaction.php` primitive and independent PHP/mysqli observers.
+Full reviewed policy-index ranges, including empty ranges and insertion gaps,
+are locked in one checked REPEATABLE READ transaction. Concurrent attempts to
+add users, grant roles/groups, change defaults, or edit configuration must receive
+an actual lock timeout, then succeed only after commit/rollback; the observers
+roll back every attempt. A private savepoint sentinel detects a silently ended
+and restarted transaction. The helper also bounds row/byte/statement/wall time,
+restores session settings, and refuses changes to its policy snapshot.
+
+This primitive is deliberately **immutable-policy only**: it locks and includes
+`securitygroups_records` in that snapshot, so it cannot yet wrap a publisher that
+adds an Email group link. It proves native database contention handling, not the
+future endpoint's allowed grant delta, application-membership sequencing,
+filesystem policy fencing, cross-database atomicity, or live session revocation.
+No runtime route, install step or existing publisher calls the primitive.
 
 ```sh
 node scripts/test-suitecrm-native-acceptance.mjs \

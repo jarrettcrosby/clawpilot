@@ -12,6 +12,11 @@ php -d memory_limit=384M bin/console suitecrm:app:install --no-interaction \
   }
 php -d memory_limit=384M /fixture/acceptance.php
 if [ "${CLAWPILOT_NATIVE_FIXTURE_REMEDIATION:-0}" = "1" ]; then
+  # Exercise the actual offline installer against private copies before any PHP
+  # server starts; process quiescence must not be bypassed by the fixture.
+  php -l /source/install-native-email-scope.php
+  php -l /fixture-scope-installer.php
+  CLAWPILOT_NATIVE_SCOPE_INSTALLER_TEST=1 php -d memory_limit=384M /fixture-scope-installer.php /source/suitecrm
   php -d memory_limit=384M /fixture/prepare-remediation.php
   php -d memory_limit=384M /fixture/remediation-acceptance.php
   php -l /fixture/http-router.php
@@ -27,4 +32,7 @@ if [ "${CLAWPILOT_NATIVE_FIXTURE_REMEDIATION:-0}" = "1" ]; then
   php -d memory_limit=384M /fixture/managed-email-lifecycle.php
   php -l /fixture/future-email-defaults.php
   php -d memory_limit=384M /fixture/future-email-defaults.php
+  php -l /source/email-audience/NativeEmailTransaction.php
+  php -l /fixture/native-policy-fence.php
+  php -d memory_limit=384M /fixture/native-policy-fence.php
 fi

@@ -63,8 +63,19 @@ const lease = createDisposablePostgresRuntime({ environment: localEnvironment })
 let admitted = false, networkStarted = false, appStarted = false, cleaning = false
 const fixture = resolve('scripts/fixtures/native-email-audience-real')
 const verifier = resolve('services/suitecrm/email-audience')
+const scopePackage = resolve('services/suitecrm/native-email-scope')
+const scopeInstaller = resolve('services/suitecrm/install-native-email-scope.php')
+const scopeInstallerFixture = resolve('scripts/fixtures/native-email-scope-installer.php')
 const fixtureHashes = Object.fromEntries(readdirSync(fixture).filter(path => /\.(php|sh)$/.test(path)).sort().map(path =>
   [path, createHash('sha256').update(readFileSync(join(fixture, path))).digest('hex')]))
+// Bind acceptance to production-source candidates too, not just test adapters.
+const candidateFiles = [
+  ...readdirSync(verifier).filter(path => path.endsWith('.php')).sort().map(path => join(verifier, path)),
+  ...(options['remediation-candidate'] ? [scopeInstaller, scopeInstallerFixture,
+    ...readdirSync(scopePackage).filter(path => path.endsWith('.php')).sort().map(path => join(scopePackage, path))] : []),
+]
+const candidateHashes = Object.fromEntries(candidateFiles.map(path =>
+  [path, createHash('sha256').update(readFileSync(path)).digest('hex')]))
 const inspectContainer = candidate => {
   try { return JSON.parse(execute('docker', ['container', 'inspect', candidate]))[0] }
   catch (error) { if (/No such (?:object|container)/i.test(String(error.stderr))) return null; throw error }
@@ -150,6 +161,11 @@ try {
     '--tmpfs', '/app:rw,nosuid,size=640m', '--tmpfs', '/tmp:rw,nosuid,size=32m',
     '--mount', `type=bind,source=${join(root, 'suitecrm')},target=/source/suitecrm,readonly`,
     '--mount', `type=bind,source=${fixture},target=/fixture,readonly`, '--mount', `type=bind,source=${verifier},target=/source/email-audience,readonly`,
+    ...(options['remediation-candidate'] ? [
+      '--mount', `type=bind,source=${scopePackage},target=/source/native-email-scope,readonly`,
+      '--mount', `type=bind,source=${scopeInstaller},target=/source/install-native-email-scope.php,readonly`,
+      '--mount', `type=bind,source=${scopeInstallerFixture},target=/fixture-scope-installer.php,readonly`,
+    ] : []),
     ...(options['golden-only'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_GOLDEN_ONLY=1'] : []),
     ...(options['remediation-candidate'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_REMEDIATION=1'] : []),
     '--entrypoint', '/bin/sh', appImage.id, '/fixture/bootstrap.sh']); appStarted = true
@@ -159,17 +175,23 @@ try {
   assert.match(output, /CLAWPILOT_NATIVE_EMAIL_GOLDEN=/, 'Actual native save/readback golden must execute')
   if (!options['golden-only']) assert.match(output, /REAL_SUITECRM_ACCEPTANCE_PASSED=/, 'No mocked or partial run counts as native acceptance')
   if (options['remediation-candidate']) {
+    assert.match(output, /NATIVE_SCOPE_INSTALLER_TEST_PASSED=/, 'Candidate needs offline installation and exact recovery acceptance')
     assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
     assert.match(output, /NATIVE_HTTP_ACCEPTANCE_PASSED=/, 'Candidate needs actual authenticated HTTP acceptance, not just service calls')
     assert.match(output, /NATIVE_MANAGED_EMAIL_LIFECYCLE_PASSED=/, 'Candidate needs actual native historical and future lifecycle acceptance')
     assert.match(output, /NATIVE_FUTURE_EMAIL_DEFAULTS_PASSED=/, 'Candidate must test safe defaults for future native users')
+    assert.match(output, /NATIVE_POLICY_FENCE_PASSED=/, 'Candidate needs independent native policy-writer contention acceptance')
   }
   // Bind the receipt to the executed fixture too, not only the upstream release.
   for (const [path, hash] of Object.entries(fixtureHashes)) {
     assert.equal(createHash('sha256').update(readFileSync(join(fixture, path))).digest('hex'), hash,
       'Fixture changed during acceptance; do not certify a mixed candidate')
   }
-  const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes, fixtureHashes,
+  for (const [path, hash] of Object.entries(candidateHashes)) {
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), hash,
+      'Runtime candidate changed during acceptance; do not certify mixed source')
+  }
+  const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes, fixtureHashes, candidateHashes,
     runtimeImage: appImage.id, databaseImage: dbImage.id, phpVersion: appImage.phpVersion, databaseVersion: dbVersion,
     isolatedNetwork: true, hostPorts: 0, mode: options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
     capturedAt: new Date().toISOString(), output }

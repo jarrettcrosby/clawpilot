@@ -448,6 +448,46 @@ Historical access correction and exact-message Gmail recovery are distinct
 operations; passing the access rehearsal does not mean missing BPO messages
 have been recovered.
 
+#### Offline installation and native-policy contention follow-up
+
+At **2026-10-30 09:28:12 America/New_York**, the combined isolated run passed
+**65 native checks**: the previous 50 plus seven offline-installer and eight
+native-policy fence checks. The latter include **26 independent contention
+probes** (13 native edits tested across commit and rollback releases). Receipt:
+`native-offline-policy-fence-2026-10-30-r1.json`, SHA-256
+`f91ee9babca04e7b44d24d25ebe9b61883744d62dd8a4009304c5deebecbc598`.
+It records eleven fixture-file and seven runtime-candidate/test-source hashes.
+Test containers, private network and shared database lease were removed.
+
+The opt-in offline installer and fixture now share the exact five-file transform
+and accepted output pins. The installer defaults to read-only, refuses running
+native PHP/web/background workers, stages and lints every output, preserves
+exact originals outside the application tree, and journals/syncs replacements.
+Interrupted installation, input drift, symlinks and later operator edits hold;
+exact restoration needs separate installation-specific approval. No image/startup
+hook enables this installer. Restoring stock files would reintroduce the native
+read bypasses and is not a safe automatic production rollback.
+
+`NativeEmailTransaction.php` is an uninstalled/unrouted **immutable native-policy
+primitive**, not the new publisher. It locks full reviewed policy index ranges
+under REPEATABLE READ, including empty ranges and new-principal/default insertion
+gaps. Independent observers prove real lock-timeout refusal, successful edits
+only after release, and unchanged committed rows/readers; every observer edit is
+rolled back. Tests also cover partial-acquisition failure, session restoration,
+commit/restart detection, same-connection policy changes and an expired commit
+deadline. A savepoint sentinel detects a caller's unexpected transaction end; it
+cannot reverse changes that caller already committed outside the API.
+
+The immutable snapshot includes `securitygroups_records`. A group-adding
+publisher therefore cannot directly call this v1 helper: the next implementation
+must validate only its explicitly admitted Email-group delta, preserve all other
+policy rows, and prove complete native content/header/date/link readback in that
+same transaction. Application membership generation/revocation, durable remote
+commit reconciliation and drain of legacy writers remain separate requirements.
+No current application publisher, permission default, production data or deployed
+service was changed. The expanded live permission/default correction remains
+subject to an exact fresh proposal and separate operator approval.
+
 ## Approved-transition design; no production execution here
 
 The scalar bridge is a drain-time compatibility measure, not permission to keep
