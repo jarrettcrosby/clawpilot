@@ -83,6 +83,35 @@ function fixtureUi(CurlHandle $client, string $action, array $parameters = []): 
         'ieId' => '', 'sugarEmail' => 'true', 'composeType' => 'reply',
     ], $parameters));
 }
+function fixtureAuthenticate(CurlHandle $client, string $username, string $password, string $clientId, string $clientSecret, string $label): string
+{
+    $grant = fixtureDocument(fixtureHttp($client, '/Api/access_token', [
+        'grant_type' => 'password', 'client_id' => $clientId, 'client_secret' => $clientSecret,
+        'username' => $username, 'password' => $password,
+    ]), $label.' real OAuth password grant');
+    must(is_string($grant['access_token'] ?? null) && $grant['access_token'] !== '', 'Native password grant must issue a token');
+    $login = fixtureHttp($client, '/index.php?module=Users&action=Authenticate', [
+        'module' => 'Users', 'action' => 'Authenticate', 'user_name' => $username,
+        'username_password' => $password, 'login_language' => 'en_us',
+    ]);
+    must(in_array($login['status'], [302, 303], true) && is_string($login['location'])
+        && !preg_match('/action=(Login|ChangePassword)/i', $login['location']), $label.' real native session login must succeed');
+    return $grant['access_token'];
+}
+function fixtureSessionFingerprint(CurlHandle $client): string
+{
+    // Inspect only the local curl cookie jar; never inspect, alter or clear the
+    // server session. The identity stays in memory and is never printed.
+    $cookies = curl_getinfo($client, CURLINFO_COOKIELIST);
+    must(is_array($cookies), 'Native HTTP cookie jar must be available');
+    foreach ($cookies as $cookie) {
+        $fields = explode("\t", $cookie);
+        if (count($fields) === 7 && $fields[5] === session_name() && $fields[6] !== '') {
+            return hash('sha256', $fields[6]);
+        }
+    }
+    throw new RuntimeException('Authenticated native session cookie is required');
+}
 function fixtureMessageFingerprint(): string
 {
     $tables = ['emails' => 'id', 'emails_text' => 'email_id', 'emails_cstm' => 'id_c',
@@ -165,20 +194,110 @@ try {
     $folderId = (string) $folder->id;
     $fingerprint = fixtureMessageFingerprint();
     $clients = []; $tokens = [];
+    check('HTTP existing default-all session loses foreign Email access immediately after the permission correction without another login', static function () use (&$clients, &$tokens, $users, $labels, $passwords, $oauth, $clientSecret, $emails, $markers, $folderId, $fingerprint): void {
+        $targetId = (string) $users['target']->id;
+        $roleRows = rows("SELECT id FROM acl_roles WHERE name='Fixture scoped native Email permissions' AND deleted=0");
+        $groupRows = rows("SELECT id FROM securitygroups WHERE name='Fixture authorized Suburbia workspace' AND deleted=0");
+        must(count($roleRows) === 1 && count($groupRows) === 1, 'Exact synthetic correction role and group are required');
+        $roleId = $roleRows[0]['id']; $groupId = $groupRows[0]['id'];
+        $memberships = static function () use ($targetId): array {
+            return [
+                rows("SELECT role_id FROM acl_roles_users WHERE user_id='".quote($targetId)."' AND deleted=0 ORDER BY role_id"),
+                rows("SELECT securitygroup_id FROM securitygroups_users WHERE user_id='".quote($targetId)."' AND deleted=0 ORDER BY securitygroup_id"),
+            ];
+        };
+        $before = $memberships();
+        must($before === [[['role_id' => $roleId]], [['securitygroup_id' => $groupId]]],
+            'Historical correction fixture must have only its exact two reviewed memberships');
+        selectUser($users['admin']);
+        try {
+            $role = fresh('ACLRoles', $roleId); $group = fresh('SecurityGroups', $groupId);
+            must($role->load_relationship('users') && $group->load_relationship('users'), 'Native correction membership links must load');
+            $role->users->delete($roleId, $targetId); $group->users->delete($groupId, $targetId);
+            must($memberships() === [[], []], 'Only the synthetic target must return to its pre-correction unroled state');
+            $clients['target'] = fixtureHttpClient();
+            $tokens['target'] = fixtureAuthenticate($clients['target'], $labels['target'], $passwords['target'],
+                (string) $oauth->id, $clientSecret, 'Existing unroled target');
+            foreach ($emails as $scope => $email) {
+                $direct = fixtureHttp($clients['target'], '/Api/V8/module/Emails/'.rawurlencode((string) $email->id), null, $tokens['target']);
+                $document = fixtureDocument($direct, 'Pre-correction default-all '.$scope.' V8 read');
+                must(($document['data']['id'] ?? '') === $email->id && str_contains($direct['body'], $markers[$scope][2]),
+                    'Pre-correction token must actually read both exact Email bodies');
+                $preview = fixtureUi($clients['target'], 'getSingleMessageFromSugar', ['uid' => (string) $email->id]);
+                fixtureDocument($preview, 'Pre-correction default-all '.$scope.' legacy preview');
+                must(str_contains($preview['body'], $markers[$scope][2]), 'Pre-correction session must actually read both Email bodies');
+            }
+            $search = fixtureUi($clients['target'], 'searchAdvanced', ['name' => 'Synthetic ', 'start' => '0', 'limit' => '20']);
+            $document = fixtureDocument($search, 'Pre-correction default-all imported search');
+            must((int) ($document['TotalCount'] ?? -1) === 2 && count($document['Email'] ?? []) === 2,
+                'Pre-correction session must actually list and count both Emails');
+            foreach ($emails as $email) must(str_contains($search['body'], (string) $email->id), 'Pre-correction search must contain both exact Email IDs');
+            $existingSession = fixtureSessionFingerprint($clients['target']);
+        } finally {
+            // Restore only the exact native memberships even if priming fails.
+            // This CLI principal reset cannot refresh the HTTP session's ACL.
+            selectUser($users['admin']);
+            linkBeans(fresh('ACLRoles', $roleId), 'users', [$targetId]);
+            linkBeans(fresh('SecurityGroups', $groupId), 'users', [$targetId]);
+            must($memberships() === $before, 'Historical correction must restore the exact original memberships');
+        }
+        // No Authenticate request, cookie reset, session-file edit or token
+        // refresh is permitted after the native role/group correction.
+        // Check legacy FIRST: an intervening OAuth/V8 request must not be able
+        // to incidentally refresh stale legacy ACL state and mask this defect.
+        $firstAfterCorrection = fixtureUi($clients['target'], 'getSingleMessageFromSugar', ['uid' => (string) $emails['foreign']->id]);
+        fixtureNoDisclosure($firstAfterCorrection, array_slice($markers['foreign'], 1), 'First existing-session request after correction');
+        $firstDenial = json_decode($firstAfterCorrection['body'], true);
+        must($firstAfterCorrection['status'] === 403 && is_array($firstDenial) && ($firstDenial['error'] ?? null) === 'Access denied',
+            'The first request in the existing native session must immediately deny the foreign Email');
+        must(hash_equals($existingSession, fixtureSessionFingerprint($clients['target'])), 'First corrected request must retain the exact pre-correction native session');
+        foreach ($emails as $scope => $email) {
+            $direct = fixtureHttp($clients['target'], '/Api/V8/module/Emails/'.rawurlencode((string) $email->id), null, $tokens['target']);
+            if ($scope === 'own') {
+                $document = fixtureDocument($direct, 'Corrected existing-token authorized V8 read');
+                must(($document['data']['id'] ?? '') === $email->id && str_contains($direct['body'], $markers['own'][2]),
+                    'Corrected existing token must retain its authorized Email body');
+            } else {
+                fixtureNoDisclosure($direct, array_slice($markers['foreign'], 1), 'Corrected existing-token foreign V8 read');
+                fixtureV8Denied($direct, 'Corrected existing-token foreign V8 read');
+            }
+            foreach (['getSingleMessageFromSugar', 'getMultipleMessagesFromSugar', 'composeEmail', 'getQuickCreateForm', 'getRelateForm', 'getEmail2DetailView'] as $action) {
+                if ($scope === 'own' && $action === 'getEmail2DetailView') continue; // Pinned stock null DetailView defect, not permission proof.
+                $uid = $action === 'getRelateForm' ? json_encode([$email->id], JSON_THROW_ON_ERROR) : (string) $email->id;
+                $response = fixtureUi($clients['target'], $action, ['uid' => $uid, 'qc_module' => 'Tasks']);
+                if ($scope === 'own') {
+                    $document = fixtureDocument($response, 'Corrected existing-session own '.$action);
+                    if ($action === 'getRelateForm') must(is_string($document['html'] ?? null) && strlen($document['html']) > 100,
+                        'Corrected existing session must retain its authorized native relate form');
+                    else must(str_contains($response['body'], $markers['own'][2]), 'Corrected existing session must retain its authorized Email body');
+                } else {
+                    fixtureNoDisclosure($response, array_slice($markers['foreign'], 1), 'Corrected existing-session foreign '.$action);
+                    $denial = json_decode($response['body'], true);
+                    must($response['status'] === 403 && is_array($denial) && ($denial['error'] ?? null) === 'Access denied',
+                        'Corrected existing session must explicitly deny the foreign Email before rendering');
+                }
+            }
+        }
+        foreach (['searchAdvanced' => ['name' => 'Synthetic ', 'start' => '0', 'limit' => '20'],
+            'getMessageListSugarFolders' => ['ieId' => $folderId, 'start' => '0', 'limit' => '20']] as $action => $parameters) {
+            $response = fixtureUi($clients['target'], $action, $parameters);
+            $document = fixtureDocument($response, 'Corrected existing-session '.$action);
+            must((int) ($document['TotalCount'] ?? -1) === 1 && count($document['Email'] ?? []) === 1,
+                'Corrected existing-session search/folder totals must immediately exclude the foreign Email');
+            must(str_contains($response['body'], (string) $emails['own']->id), 'Corrected existing-session search/folder must retain its authorized Email');
+            fixtureNoDisclosure($response, $markers['foreign'], 'Corrected existing-session '.$action);
+            if ($action === 'getMessageListSugarFolders') must((int) ($document['UnreadCount'] ?? -1) === 0, 'Corrected existing-session unread count must exclude hidden rows');
+        }
+        must(hash_equals($existingSession, fixtureSessionFingerprint($clients['target'])), 'Permission correction must take effect in the same unchanged native login session');
+        must(hash_equals($fingerprint, fixtureMessageFingerprint()), 'Existing-session permission correction must not rewrite Email data or record security groups');
+    });
     foreach ($users as $label => $user) {
+        // The target deliberately keeps its pre-correction login and token for
+        // every remaining matrix check, including V8 list/related pagination.
+        if (isset($clients[$label], $tokens[$label])) continue;
         $clients[$label] = fixtureHttpClient();
-        $grant = fixtureDocument(fixtureHttp($clients[$label], '/Api/access_token', [
-            'grant_type' => 'password', 'client_id' => (string) $oauth->id, 'client_secret' => $clientSecret,
-            'username' => $labels[$label], 'password' => $passwords[$label],
-        ]), $label.' real OAuth password grant');
-        must(is_string($grant['access_token'] ?? null) && $grant['access_token'] !== '', 'Native password grant must issue a token');
-        $tokens[$label] = $grant['access_token']; unset($grant);
-        $login = fixtureHttp($clients[$label], '/index.php?module=Users&action=Authenticate', [
-            'module' => 'Users', 'action' => 'Authenticate', 'user_name' => $labels[$label],
-            'username_password' => $passwords[$label], 'login_language' => 'en_us',
-        ]);
-        must(in_array($login['status'], [302, 303], true) && is_string($login['location'])
-            && !preg_match('/action=(Login|ChangePassword)/i', $login['location']), $label.' real native session login must succeed');
+        $tokens[$label] = fixtureAuthenticate($clients[$label], $labels[$label], $passwords[$label],
+            (string) $oauth->id, $clientSecret, $label);
     }
     check('HTTP uses real password grants and real legacy cookie logins for unchanged principal classes', static function (): void {});
     foreach ($users as $label => $user) {

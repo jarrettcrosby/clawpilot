@@ -22,4 +22,9 @@ if [ "${CLAWPILOT_NATIVE_FIXTURE_REMEDIATION:-0}" = "1" ]; then
   http_pid=$!
   trap 'kill "$http_pid" 2>/dev/null || true' EXIT INT TERM
   php -d memory_limit=384M /fixture/http-acceptance.php
+  php -l /fixture/managed-email-lifecycle-helper.php
+  php -l /fixture/managed-email-lifecycle.php
+  php -d memory_limit=384M /fixture/managed-email-lifecycle.php
+  php -l /fixture/future-email-defaults.php
+  php -d memory_limit=384M /fixture/future-email-defaults.php
 fi

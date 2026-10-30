@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { createDisposablePostgresRuntime, DISPOSABLE_POSTGRES_LABEL, DISPOSABLE_POSTGRES_OWNER_LABEL } from './lib/disposable-postgres-docker.mjs'
@@ -63,6 +63,8 @@ const lease = createDisposablePostgresRuntime({ environment: localEnvironment })
 let admitted = false, networkStarted = false, appStarted = false, cleaning = false
 const fixture = resolve('scripts/fixtures/native-email-audience-real')
 const verifier = resolve('services/suitecrm/email-audience')
+const fixtureHashes = Object.fromEntries(readdirSync(fixture).filter(path => /\.(php|sh)$/.test(path)).sort().map(path =>
+  [path, createHash('sha256').update(readFileSync(join(fixture, path))).digest('hex')]))
 const inspectContainer = candidate => {
   try { return JSON.parse(execute('docker', ['container', 'inspect', candidate]))[0] }
   catch (error) { if (/No such (?:object|container)/i.test(String(error.stderr))) return null; throw error }
@@ -113,6 +115,8 @@ try {
   const sourceHashes = Object.fromEntries([
     'public/legacy/modules/Emails/Email.php', 'public/legacy/data/SugarBean.php',
     'public/legacy/modules/SecurityGroups/SecurityGroup.php', 'public/legacy/modules/ACLActions/ACLAction.php',
+    'public/legacy/Api/V8/Service/ModuleService.php', 'public/legacy/Api/V8/Service/RelationshipService.php',
+    'public/legacy/modules/Emails/EmailUIAjax.php', 'public/legacy/include/SugarFolders/SugarFolders.php',
   ].map(path => [path, createHash('sha256').update(readFileSync(join(root, 'suitecrm', path))).digest('hex')]))
   execute('docker', ['network', 'create', '--internal', '--label', `${LABEL}.owner=${token}`, network]); networkStarted = true
   execute('docker', ['run', '--rm', '--detach', '--pull=never', '--name', dbName,
@@ -157,8 +161,15 @@ try {
   if (options['remediation-candidate']) {
     assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
     assert.match(output, /NATIVE_HTTP_ACCEPTANCE_PASSED=/, 'Candidate needs actual authenticated HTTP acceptance, not just service calls')
+    assert.match(output, /NATIVE_MANAGED_EMAIL_LIFECYCLE_PASSED=/, 'Candidate needs actual native historical and future lifecycle acceptance')
+    assert.match(output, /NATIVE_FUTURE_EMAIL_DEFAULTS_PASSED=/, 'Candidate must test safe defaults for future native users')
   }
-  const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes,
+  // Bind the receipt to the executed fixture too, not only the upstream release.
+  for (const [path, hash] of Object.entries(fixtureHashes)) {
+    assert.equal(createHash('sha256').update(readFileSync(join(fixture, path))).digest('hex'), hash,
+      'Fixture changed during acceptance; do not certify a mixed candidate')
+  }
+  const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes, fixtureHashes,
     runtimeImage: appImage.id, databaseImage: dbImage.id, phpVersion: appImage.phpVersion, databaseVersion: dbVersion,
     isolatedNetwork: true, hostPorts: 0, mode: options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
     capturedAt: new Date().toISOString(), output }

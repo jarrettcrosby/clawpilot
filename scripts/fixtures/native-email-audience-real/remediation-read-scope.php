@@ -2,6 +2,23 @@
 declare(strict_types=1);
 // Experimental native-read correction. Only installed into the disposable
 // acceptance container; no production installer or verifier allow-list uses it.
+/** Old authenticated sessions must not retain a former default-all Email role. */
+function clawpilot_candidate_refresh_email_acl(): void
+{
+    $user = $GLOBALS['current_user'] ?? null;
+    if (!$user instanceof User || !is_string($user->id) || $user->id === '') {
+        throw new SuiteCRM\Exception\AccessDeniedException();
+    }
+    // PHP request lifetime only, never a persistent/session cache. Refresh all
+    // actions through native code so group-role precedence stays native too.
+    static $refreshed = [];
+    if (!isset($refreshed[$user->id])) {
+        require_once 'modules/ACLActions/ACLAction.php';
+        ACLAction::getUserActions($user->id, true);
+        $refreshed[$user->id] = true;
+    }
+}
+
 function clawpilot_candidate_email_where(SugarBean $bean, string $where): string
 {
     if ($bean->module_name !== 'Emails') return $where;

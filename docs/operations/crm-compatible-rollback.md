@@ -402,6 +402,52 @@ No production credential, role, group, hook, inheritance flag, Email row,
 deployment or recovery was changed by this work. Approval to prepare and test,
 and requests to resume that work, are not approval for this expanded live change.
 
+#### Historical and ongoing access rehearsal
+
+At **2026-10-29 23:00:31 America/New_York**, the combined disposable run passed
+**50 native checks**: seven baseline, eight permission-candidate, eighteen
+authenticated HTTP, eleven historical/future lifecycle and six future-user
+default checks. Receipt: `native-future-history-2026-10-30-r2.json`, SHA-256
+`200dcb463987d0411cd5780dc1c91e48ed2b2595df87968dfdc5a7470114d2e6`.
+The receipt records ten fixture-file hashes and the pinned native inputs.
+Containers, network and shared test-database lease were removed after the run.
+
+- An existing authenticated cookie and OAuth token lose foreign Email access
+  after the synthetic correction, without another login. The first request
+  after correction is a legacy preview, before a V8 call can refresh ACL state.
+  Request-local refresh does not prove mid-request or long-running worker
+  revocation.
+- Real checked MariaDB transactions and an independent connection prove no
+  partial Email/group visibility and rollback after an injected native write
+  failure. Existing history retains its exact native/Global IDs, content,
+  headers, ownership, relationships and application archive metadata. A repair
+  does not save the existing Email bean or recreate absent native history.
+- Ongoing synthetic publication uses the same exact pipeline group. Idempotent
+  retries recheck identities and current effective readers; stale policy,
+  missing/duplicate identities and unexpected readers hold the whole batch.
+  Versioned membership removal affects both historical and new records.
+- The future-user experiment uses group scope for Email view/list/export and
+  owner-only edit/delete defaults. A pipeline reader must not automatically
+  become an editor. Explicit broad roles, changed default rows, and role-action
+  recreation remain blockers. This expanded default policy is **not approved
+  for production**; the experiment rolls back all its changes.
+
+The separate pure application planner passes **18 checks** and is included in
+`test:suitecrm-interactions`. It emits a non-executable review manifest only,
+requires fresh complete inventory and drained writers, and never changes roles,
+ownership, content or lifecycle. Its group-binding contract is not yet wired to
+the native fixture or publisher. A corrected-policy snapshot must come from an
+isolated rehearsal or fenced cutover, not an unfenced live permission change.
+
+These results prove local behavior under frozen synthetic policy, not concurrent
+production policy fencing, cross-database atomicity, complete production
+body/header/date fidelity or live deployment. The native transactional endpoint,
+durable binding/reconciliation path, safe persistent-volume installer, fresh
+live inventory and separately approved coordinated cutover remain required.
+Historical access correction and exact-message Gmail recovery are distinct
+operations; passing the access rehearsal does not mean missing BPO messages
+have been recovered.
+
 ## Approved-transition design; no production execution here
 
 The scalar bridge is a drain-time compatibility measure, not permission to keep

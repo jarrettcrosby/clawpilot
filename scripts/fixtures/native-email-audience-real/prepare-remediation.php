@@ -44,6 +44,23 @@ PHP);
     } elseif ($file === 'modules/Emails/Email.php') {
         $source = replaceExactlyOnce($source, "require_once __DIR__ . '/EmailFromValidator.php';",
             "require_once __DIR__ . '/EmailFromValidator.php';\nrequire_once __DIR__ . '/../../custom/ClawPilotNativeEmailScope.php';");
+        $source = replaceExactlyOnce($source, "class Email extends Basic\n{", <<<'PHP'
+class Email extends Basic
+{
+    // Refresh request-local native actions before any Email ACL or query path;
+    // an existing cookie must not retain pre-correction default-all authority.
+    public function ACLAccess($view, $is_owner = 'not_set', $in_group = 'not_set')
+    {
+        clawpilot_candidate_refresh_email_acl();
+        return parent::ACLAccess($view, $is_owner, $in_group);
+    }
+
+    public function buildAccessWhere($view, $user = null)
+    {
+        clawpilot_candidate_refresh_email_acl();
+        return parent::buildAccessWhere($view, $user);
+    }
+PHP);
         $source = replaceExactlyOnce($source, '        $additionalWhereClause = $this->_generateSearchImportWhereClause();',
             '        $additionalWhereClause = clawpilot_candidate_email_where(BeanFactory::newBean(\'Emails\'), $this->_generateSearchImportWhereClause());');
         $source = replaceExactlyOnce($source, <<<'PHP'
@@ -128,5 +145,12 @@ PHP);
 // Validate every input before changing any. All destinations are disposable.
 copy('/fixture/remediation-read-scope.php', '/app/public/legacy/custom/ClawPilotNativeEmailScope.php');
 foreach ($prepared as $path => $source) file_put_contents($path, $source);
-fwrite(STDOUT, 'CLAWPILOT_NATIVE_REMEDIATION_PATCH='.json_encode(array_map(
-    static fn (string $source): string => hash('sha256', $source), $prepared), JSON_THROW_ON_ERROR)."\n");
+$patchHashes = array_map(static fn (string $source): string => hash('sha256', $source), $prepared);
+foreach ($patchHashes as $path => $hash) {
+    if (!hash_equals($hash, hash_file('sha256', $path))) throw new RuntimeException('Disposable patch readback mismatch');
+}
+$manifest = json_encode($patchHashes, JSON_THROW_ON_ERROR)."\n";
+if (file_put_contents('/app/native-remediation-patch-hashes.json', $manifest, LOCK_EX) !== strlen($manifest)) {
+    throw new RuntimeException('Cannot record disposable patch hashes');
+}
+fwrite(STDOUT, 'CLAWPILOT_NATIVE_REMEDIATION_PATCH='.trim($manifest)."\n");

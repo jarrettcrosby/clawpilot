@@ -52,12 +52,35 @@ the two synthetic memberships tests rollback; message/owner rows stay intact.
 The candidate then starts a loopback-only PHP server **inside** the isolated
 container. Actual V8 OAuth password grants and legacy cookie logins exercise
 four synthetic principal classes: administrator, scoped user, and two denied
-services. Seventeen HTTP checks cover allowed and forbidden content, pagination,
+services. Eighteen HTTP checks cover allowed and forbidden content, pagination,
 five allowed legacy UID-render paths, forbidden detail access, mixed-UID
 requests, imported search, mixed folders/counts, and denied relationship and
 quick-create changes. Email body/header/ownership/relationship fingerprints and
 target Task rows must remain unchanged after reads and denied writes. Tokens,
 cookies and generated authentication material never enter the result receipt.
+The existing-session check signs in and reads both fixture Emails under the
+original default-all policy, applies the synthetic correction, and proves that
+the same cookie and token immediately lose foreign access without another login.
+The Email candidate refreshes native ACL actions once per user per HTTP request;
+this is not a long-lived worker or mid-request revocation guarantee.
+
+The following frozen-policy lifecycle rehearsal exercises actual native saves
+and group relationships in real MariaDB transactions. An independent connection
+must see no partially committed Email/group state. Existing history is repaired
+without saving its Email bean or changing content, links, ownership or archive
+metadata; retries revalidate exact identity and current readers. New messages use
+the same exact pipeline group. Injected failures roll back real native writes;
+versioned membership revocation applies to both old and new Emails. This requires
+transactional tables, a pinned runtime and known hooks, disabled sending and
+workflows, and a frozen policy. It is **not** a production publisher or a proof
+that unrelated native administrators/application database writers are fenced.
+
+The final defaults rehearsal evaluates a separate, unapproved-for-production
+policy for future unroled users: Email view/list/export defaults use group/owner
+scope; edit/delete default to owner-only. It must not grant edit/delete merely
+because a new viewer belongs to a read group. Existing explicit role overrides
+and administrator privileges remain native; unexpected broad roles or changed
+default rows remain release blockers, not automatic permissions to repair.
 
 ```sh
 node scripts/test-suitecrm-native-acceptance.mjs \
@@ -95,7 +118,8 @@ images and the explicitly supplied archive are retained, never pruned.
 The default baseline uses direct V8 service calls; the separately opted-in
 candidate additionally authenticates actual local HTTP requests. Neither mode
 proves current production policy, changes live native permissions, or proves
-atomic publication, concurrency or policy-row locking. Export and UI-list evidence are labeled
+production atomicity, cross-database concurrency or complete native-policy
+fencing. Export and UI-list evidence are labeled
 by the actual native call path rather than treating a raw SQL builder or an
 ACL Boolean as a complete controller proof. The profile-hold check invokes
 the real installed ClawPilot verifier; it does not make that profile safe.
@@ -110,3 +134,12 @@ future legitimate pipeline access: the current publisher writes no verified
 SecurityGroup links. Ongoing exact-audience assignment/revocation and atomic
 publication must be implemented and proven before restricting a live user.
 The candidate does not add runtime hooks or relax the production verifier.
+
+`npm run test:native-email-access-repair` separately tests the pure application
+review planner. It is included in the interaction test gate. Its manifests are
+always non-executable: they require fresh complete inventories, preserved
+local/native/Global IDs, exact verified pipeline bindings, record/policy/writer
+fingerprints, and a drained legacy writer. Missing native history, duplicates,
+unknown sharing, stale/revoked membership and incomplete inventories hold the
+whole plan. Missing-email recovery is a separate reviewed workflow; this planner
+never recreates a historical Email or unarchives a record.
