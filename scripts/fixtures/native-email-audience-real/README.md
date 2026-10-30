@@ -34,15 +34,30 @@ The output is created exclusively (an existing receipt is never overwritten).
 
 `--remediation-candidate` is a separately opted-in experiment, approved for local
 preparation/testing on 2026-10-29. It first runs the complete unchanged baseline,
-then starts a fresh PHP process after checksum-verifying and patching only the
-two stock V8 service files inside `/app` tmpfs. The candidate adds native Email
-view/list SQL restrictions before module-list and related-list pagination, plus
-a final per-record check on module-list serialization. It scopes one synthetic
+then starts a fresh PHP process after checksum-verifying all five stock inputs
+before patching the two V8 services, `EmailUIAjax.php`, `Email.php`, and
+`SugarFolders.php` inside `/app` tmpfs. The candidate adds native Email
+view/list SQL restrictions before module-list, related-list, imported-search
+and folder pagination/counts, plus fresh per-record checks before serialization.
+Legacy native-Email previews authorize every requested ID before rendering;
+native relationship changes and quick-create authorize source Email access
+before any side effect. V8 unlink checks the exact requested related Email,
+not an arbitrary allowed sibling. It scopes one synthetic
 previously unroled principal's Email actions to native group/owner permissions
 and explicitly grants only the synthetic own-workspace Email group. Other
 module action levels, user status, service denials and administrator access are
 checked unchanged. Related-list totals must exclude the hidden Email. Removing
 the two synthetic memberships tests rollback; message/owner rows stay intact.
+
+The candidate then starts a loopback-only PHP server **inside** the isolated
+container. Actual V8 OAuth password grants and legacy cookie logins exercise
+four synthetic principal classes: administrator, scoped user, and two denied
+services. Seventeen HTTP checks cover allowed and forbidden content, pagination,
+five allowed legacy UID-render paths, forbidden detail access, mixed-UID
+requests, imported search, mixed folders/counts, and denied relationship and
+quick-create changes. Email body/header/ownership/relationship fingerprints and
+target Task rows must remain unchanged after reads and denied writes. Tokens,
+cookies and generated authentication material never enter the result receipt.
 
 ```sh
 node scripts/test-suitecrm-native-acceptance.mjs \
@@ -53,7 +68,7 @@ node scripts/test-suitecrm-native-acceptance.mjs \
 
 This is not a production installer or an approved native profile. The live
 publisher, native audience verifier and deployment files are unchanged. A pass
-does not establish current live record ownership, HTTP/session behavior,
+does not establish current live record ownership or production HTTP/session behavior,
 atomic publication, intersection audiences, native serialization readback,
 or permission to migrate/recover/publish. Both `--golden-only` and the candidate
 flag together are rejected so a partial baseline cannot masquerade as a full
@@ -77,10 +92,21 @@ attempts every exact owner-checked container, network, lease and extracted
 source directory and reports all cleanup failures. Cached public dependency
 images and the explicitly supplied archive are retained, never pruned.
 
-This fixture does not authenticate an HTTP OAuth request, prove current
-production policy, change native permissions, or prove atomic publication,
-concurrency or policy-row locking. V8 service calls exercise the real native
-service/serialization layer directly. Export and UI-list evidence are labeled
+The default baseline uses direct V8 service calls; the separately opted-in
+candidate additionally authenticates actual local HTTP requests. Neither mode
+proves current production policy, changes live native permissions, or proves
+atomic publication, concurrency or policy-row locking. Export and UI-list evidence are labeled
 by the actual native call path rather than treating a raw SQL builder or an
 ACL Boolean as a complete controller proof. The profile-hold check invokes
 the real installed ClawPilot verifier; it does not make that profile safe.
+
+Allowed `getEmail2DetailView` rendering is explicitly excluded: the pinned stock
+implementation dereferences a null `DetailView` before initialization. Forbidden
+requests must still return denial before that renderer. No browser layout,
+SMTP/IMAP delivery, or exhaustive native write-route acceptance is claimed.
+
+**Live release remains held.** Static groups for existing Emails do not ensure
+future legitimate pipeline access: the current publisher writes no verified
+SecurityGroup links. Ongoing exact-audience assignment/revocation and atomic
+publication must be implemented and proven before restricting a live user.
+The candidate does not add runtime hooks or relax the production verifier.

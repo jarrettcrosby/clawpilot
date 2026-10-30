@@ -328,12 +328,79 @@ script. Production rollback also needs a separate exposure review: removing
 the new memberships alone reproduces the original foreign-email exposure and
 must not be copied from the synthetic rollback test into production.
 
-Still required: HTTP/session-level acceptance, pinned native profile support
-without relaxing unknown-hook/workflow holds, faithful native body/header/time
-readback, atomic publication/policy-change protection, writer drain and exact
-live approval. The actual publisher and `EmailAudience.php` verifier are
-unchanged and remain held. No production credential, role, group, hook,
-inheritance flag, Email row, deployment or recovery was changed by this work.
+#### Authenticated candidate follow-up; live proposal remains held
+
+The initial two-file proposal above is **not sufficient for execution**. A
+follow-up review found legacy preview/search/folder paths and relationship
+mutations that needed the same record-level enforcement. The candidate now
+requires exact stock hashes for five files, checks all inputs before patching,
+and changes only the isolated fixture:
+
+- V8 `ModuleService.php` and `RelationshipService.php`: view/list filtering
+  before counts/pagination; exact requested related Email authorization before
+  unlink, rather than authorization of an arbitrary allowed sibling.
+- `modules/Emails/EmailUIAjax.php`: authorize every native Email ID before
+  preview/batch rendering, `relateEmails`, or `saveQuickCreate`. Quick-create
+  denial occurs before even creating its related Task or other target record.
+- `modules/Emails/Email.php` and `include/SugarFolders/SugarFolders.php`: native
+  view/list scope before imported-search and folder row/count queries, with
+  fresh row checks before serialization.
+
+At **2026-10-29 22:26:55 America/New_York**, the complete isolated run passed
+**32 checks**: seven unchanged baseline checks, eight native permission-candidate
+checks, and seventeen actual HTTP checks. The HTTP stage uses real V8 OAuth
+password grants and real legacy cookie sessions for four synthetic principal
+classes, not mocked authentication or injected sessions. Private receipt:
+`native-http-candidate-2026-10-30-r2.json`, SHA-256
+`4a574d80a3bb87c0b248d6453cf525ccd2546c56ed07526f3705f3bf43a80bb8`.
+No fixture containers, network or shared database lease remained after cleanup.
+
+Allowed legacy `getEmail2DetailView` rendering is excluded because the pinned
+stock implementation dereferences a null `DetailView`; forbidden detail calls
+still must deny before rendering. Five other permitted legacy UID-render paths,
+forbidden/mixed-ID paths, imported-search and folder contents/counts, and denied
+relationship/quick-create writes passed. The denied quick-create test confirms
+unchanged target Task rows (including deleted rows) as well as unchanged Email
+body/header/ownership/relationship fingerprints. This is not exhaustive native
+write-route, browser-layout, current-production or email-delivery proof.
+
+**New release blocker: preserving future legitimate access.** The 27-message
+allowlist preserves current Suburbia records only. The current publisher writes
+no verified SecurityGroup links. Restricting the user now would hide subsequent
+administrator-created Suburbia Emails; the strict replacement publisher would
+hold those writes rather than supply the missing authorization. Do not apply
+the role/group correction while that writer remains active.
+
+The minimum compatible follow-up must:
+
+1. Bind an app-managed Email group to the exact workspace, pipeline, audience
+   fingerprint and generation. Members must be the exact eligible pipeline
+   readers, not all organization members or users sharing a domain. Reject
+   ambiguous mappings and unknown inherited/default/unmanaged grants.
+2. Validate policy, attach the managed group, save Email content/relationships,
+   prove native readback and effective audience, and commit in one native
+   transaction. A write-then-grant sequence or separated before/after checks
+   does not prove atomicity. Do not bypass the existing verifier to obtain a pass.
+3. Fence membership and native policy changes against publication, including
+   new default-all principals. App-side PostgreSQL locks alone do not lock
+   SuiteCRM's MariaDB policy. Drain all legacy writers before coordinated cutover.
+4. Test a new authorized Suburbia Email, a hidden BPO Email, a hidden different
+   pipeline within the same workspace, idempotent retry, revocation/addition,
+   mid-write rollback, stale/missing identities and concurrent policy changes.
+   Repeat the authenticated read/edit matrix after those transitions.
+
+Also still required: fresh hashes for all five live inputs, a hash-gated
+persistent-volume installer with a fail-closed recovery plan, verified search
+backend reachability (Basic versus unscoped Elastic), pinned native profile
+support without relaxing unknown-hook/workflow holds, faithful native
+body/header/time readback, writer drain and exact live approval. A service image
+rollback alone does not restore patched persistent-volume PHP or native roles.
+Do not remove the restrictive role as a shortcut: that restores foreign access.
+
+The actual publisher and `EmailAudience.php` verifier remain unchanged and held.
+No production credential, role, group, hook, inheritance flag, Email row,
+deployment or recovery was changed by this work. Approval to prepare and test,
+and requests to resume that work, are not approval for this expanded live change.
 
 ## Approved-transition design; no production execution here
 

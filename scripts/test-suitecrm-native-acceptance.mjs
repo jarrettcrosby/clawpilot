@@ -154,7 +154,10 @@ try {
   process.stdout.write(output)
   assert.match(output, /CLAWPILOT_NATIVE_EMAIL_GOLDEN=/, 'Actual native save/readback golden must execute')
   if (!options['golden-only']) assert.match(output, /REAL_SUITECRM_ACCEPTANCE_PASSED=/, 'No mocked or partial run counts as native acceptance')
-  if (options['remediation-candidate']) assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
+  if (options['remediation-candidate']) {
+    assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
+    assert.match(output, /NATIVE_HTTP_ACCEPTANCE_PASSED=/, 'Candidate needs actual authenticated HTTP acceptance, not just service calls')
+  }
   const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes,
     runtimeImage: appImage.id, databaseImage: dbImage.id, phpVersion: appImage.phpVersion, databaseVersion: dbVersion,
     isolatedNetwork: true, hostPorts: 0, mode: options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
