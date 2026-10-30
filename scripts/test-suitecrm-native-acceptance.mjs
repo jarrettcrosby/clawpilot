@@ -19,8 +19,10 @@ const options = Object.fromEntries(process.argv.slice(2).map(argument => {
   const match = argument.match(/^--(source-zip|output)=(.+)$/)
   if (match) return [match[1], match[2]]
   if (argument === '--golden-only') return ['golden-only', true]
-  throw new Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip [--output=/absolute/result.json] [--golden-only]')
+  if (argument === '--remediation-candidate') return ['remediation-candidate', true]
+  throw new Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip [--output=/absolute/result.json] [--golden-only | --remediation-candidate]')
 }))
+assert.ok(!(options['golden-only'] && options['remediation-candidate']), 'Remediation requires the complete unchanged baseline first')
 assert.ok(isAbsolute(options['source-zip'] || ''), 'An explicit downloaded pinned release ZIP is required; this runner never downloads')
 const archive = realpathSync(options['source-zip'])
 const archiveStat = lstatSync(archive)
@@ -145,15 +147,17 @@ try {
     '--mount', `type=bind,source=${join(root, 'suitecrm')},target=/source/suitecrm,readonly`,
     '--mount', `type=bind,source=${fixture},target=/fixture,readonly`, '--mount', `type=bind,source=${verifier},target=/source/email-audience,readonly`,
     ...(options['golden-only'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_GOLDEN_ONLY=1'] : []),
+    ...(options['remediation-candidate'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_REMEDIATION=1'] : []),
     '--entrypoint', '/bin/sh', appImage.id, '/fixture/bootstrap.sh']); appStarted = true
   try { output = execute('docker', ['start', '--attach', appName], { timeout: 240_000 }) }
   catch (error) { output = `${error.stdout || ''}\n${error.stderr || ''}`; throw new Error(`Real SuiteCRM acceptance failed:\n${output.slice(-16_000)}`) }
   process.stdout.write(output)
   assert.match(output, /CLAWPILOT_NATIVE_EMAIL_GOLDEN=/, 'Actual native save/readback golden must execute')
   if (!options['golden-only']) assert.match(output, /REAL_SUITECRM_ACCEPTANCE_PASSED=/, 'No mocked or partial run counts as native acceptance')
+  if (options['remediation-candidate']) assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
   const receipt = { version: 1, sourceVersion: VERSION, sourceZipSha256: ZIP_SHA, sourceHashes,
     runtimeImage: appImage.id, databaseImage: dbImage.id, phpVersion: appImage.phpVersion, databaseVersion: dbVersion,
-    isolatedNetwork: true, hostPorts: 0, mode: options['golden-only'] ? 'golden-only' : 'acceptance',
+    isolatedNetwork: true, hostPorts: 0, mode: options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
     capturedAt: new Date().toISOString(), output }
   if (options.output) writeFileSync(options.output, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
   console.log(`Real SuiteCRM ${VERSION} ${receipt.mode} completed; exact images/source recorded, no production access`)

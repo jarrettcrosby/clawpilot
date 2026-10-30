@@ -187,6 +187,8 @@ function userFixture(string $label, string $status = 'Active')
     return $user;
 }
 
+if (defined('CLAWPILOT_NATIVE_HELPERS_ONLY') && CLAWPILOT_NATIVE_HELPERS_ONLY === true) return;
+
 try {
     $db = DBManagerFactory::getInstance();
     must($db->dbType === 'mysql', 'Real MySQL/MariaDB manager is required');

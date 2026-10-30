@@ -246,6 +246,95 @@ native role, user status, group, hook, flag, token, or credential was changed as
 part of this local test work. Promotion, migration 0374, legacy adoption, and
 the three-message recovery remain unauthorized and unexecuted here.
 
+### October 29 approved local remediation candidate
+
+The operator explicitly approved **preparing and testing a targeted permission
+correction**, preserving users' legitimate organization access and presenting
+the exact live change separately. This is not approval to apply production
+roles/groups, change user status, migrate 0374, adopt messages, or publish email.
+
+The isolated pinned SuiteCRM/PHP/MariaDB runner now offers
+`--remediation-candidate`. It runs the unchanged seven-check baseline, then
+tests a fresh-process candidate with eight additional passing checks. The run
+at **2026-10-29 21:42:25 America/New_York** produced private receipt
+`native-remediation-candidate-2026-10-29-r1.json`, SHA-256
+`eb39ae4bb406a8f8e0fbeff4d701f26582d0de5f25fcd55e093ff1936e32061c`.
+All temporary containers/network/DB lease were absent after cleanup.
+
+The candidate's exact kinds of changes are:
+
+1. Add native Email view/list restrictions **before** V8 module-list queries and
+   counts, and recheck each returned Email before serialization. Apply the same
+   restriction to related-Email queries before pagination/counts. Other modules
+   keep their existing paths. The patcher requires exact stock checksums for
+   `Api/V8/Service/ModuleService.php` and `RelationshipService.php`; it writes
+   only the disposable fixture's `/app` directory, not repository runtime or
+   production files.
+2. For the synthetic counterpart of the previously unroled principal, attach
+   one Email-only role: access enabled; view/list/export/edit/delete restricted
+   to native group/owner scope. Attach one group containing only the explicitly
+   authorized own-workspace Email. Do not disable the person, elevate them,
+   change other module actions, alter service denials, or add them to BPO.
+3. Verify own-workspace read/edit/export, denial of BPO direct/UI/V8-list/export
+   reads and edits, related-list filtered counts, unchanged administrator and
+   denied-service behavior, unchanged other-module action levels and user
+   status, and reversible removal of the two candidate memberships. Message
+   data, assignment and lifecycle are unchanged.
+
+This identifies a viable **local canary**, not a production-ready publisher or
+general multi-company permission-intersection proof. A production role alone
+is insufficient: the unchanged baseline reproduces the V8 list bypass. Native
+group/owner rules may also admit an assigned/created-by user, so exact live
+ownership and existing/default/inherited groups must be reviewed, not inferred
+from account names or principal status.
+
+Before presenting an executable production change for approval, capture fresh
+read-only inventory identifying the exact target principal, existing roles,
+groups, native Email IDs/Global IDs and owning ClawPilot workspace. Build the
+own-workspace allowlist from verified mappings; hold ambiguous/unmapped rows.
+Preserve all existing legitimate own-workspace access, with a before/after
+matrix and exact membership rollback record. The initial historical target
+was Olivia Kiraly's native principal, not a new user or a service account; this
+must be reverified rather than applied from this dated note.
+
+The fresh read-only inventory at **2026-10-29 21:53–21:55 America/New_York**
+reverified that target and its active Suburbia membership, editor membership in
+one pipeline and ownership/readership in another. The two installed V8 service
+hashes exactly match the candidate's stock inputs. All **311** active native
+Emails have matching Global IDs and resolve to exactly one ClawPilot pipeline;
+all are assigned to and created by the administrator, with no native group
+links. The prepared private proposal
+`native-permission-proposal-2026-10-29-r1.json` (SHA-256
+`49fb2651574d1b23743ec63b2a3a2da766d2a138ce5aa19698a3999d15c4822a`)
+contains the exact native IDs, Global IDs and pipeline/workspace bindings:
+
+- Preserve access to **27** Emails in the verified authorized Suburbia
+  pipeline, including **six** already app-archived historical rows. Do not
+  restore, unarchive, reassign or rewrite those rows.
+- Restrict this non-member's access to **108 BPO** Emails and **176** Emails in
+  another pipeline. Administrator and explicitly denied service access remain
+  unchanged. Do not grant access based only on a workspace name.
+- Add one Email-only group-scoped role to this target and one new group for
+  that exact authorized pipeline, containing only the target and those 27
+  native Email links. Apply the tested V8 list/related-list correction; a role
+  alone leaves the reproduced API bypass open.
+
+The native and application inventories used read-only transactions and
+rolled back. The 90 application Email mappings without an active native Email
+were not classified as missing messages or repaired: historical/deleted native
+records require separate lifecycle review. Revalidate the exact inventory and
+policy immediately before any approved execution; this is not an apply
+script. Production rollback also needs a separate exposure review: removing
+the new memberships alone reproduces the original foreign-email exposure and
+must not be copied from the synthetic rollback test into production.
+
+Still required: HTTP/session-level acceptance, pinned native profile support
+without relaxing unknown-hook/workflow holds, faithful native body/header/time
+readback, atomic publication/policy-change protection, writer drain and exact
+live approval. The actual publisher and `EmailAudience.php` verifier are
+unchanged and remain held. No production credential, role, group, hook,
+inheritance flag, Email row, deployment or recovery was changed by this work.
+
 ## Approved-transition design; no production execution here
 
 The scalar bridge is a drain-time compatibility measure, not permission to keep

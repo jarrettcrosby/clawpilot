@@ -32,6 +32,33 @@ node scripts/test-suitecrm-native-acceptance.mjs \
 save/readback goldens. It is a partial proof, not the complete acceptance run.
 The output is created exclusively (an existing receipt is never overwritten).
 
+`--remediation-candidate` is a separately opted-in experiment, approved for local
+preparation/testing on 2026-10-29. It first runs the complete unchanged baseline,
+then starts a fresh PHP process after checksum-verifying and patching only the
+two stock V8 service files inside `/app` tmpfs. The candidate adds native Email
+view/list SQL restrictions before module-list and related-list pagination, plus
+a final per-record check on module-list serialization. It scopes one synthetic
+previously unroled principal's Email actions to native group/owner permissions
+and explicitly grants only the synthetic own-workspace Email group. Other
+module action levels, user status, service denials and administrator access are
+checked unchanged. Related-list totals must exclude the hidden Email. Removing
+the two synthetic memberships tests rollback; message/owner rows stay intact.
+
+```sh
+node scripts/test-suitecrm-native-acceptance.mjs \
+  --source-zip=/absolute/owned/SuiteCRM-8.10.1.zip \
+  --output=/absolute/owned/native-remediation-candidate.json \
+  --remediation-candidate
+```
+
+This is not a production installer or an approved native profile. The live
+publisher, native audience verifier and deployment files are unchanged. A pass
+does not establish current live record ownership, HTTP/session behavior,
+atomic publication, intersection audiences, native serialization readback,
+or permission to migrate/recover/publish. Both `--golden-only` and the candidate
+flag together are rejected so a partial baseline cannot masquerade as a full
+remediation check.
+
 The synthetic installed-profile clone intentionally includes an unroled user
 whose native status is blank, two Active direct deny-all users, and an Active
 administrator. These are role/status classes, not copied production users.

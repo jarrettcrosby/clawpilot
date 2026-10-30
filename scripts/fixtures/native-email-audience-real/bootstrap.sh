@@ -10,4 +10,8 @@ php -d memory_limit=384M bin/console suitecrm:app:install --no-interaction \
     tail -n 70 /tmp/native-install.log
     exit 1
   }
-exec php -d memory_limit=384M /fixture/acceptance.php
+php -d memory_limit=384M /fixture/acceptance.php
+if [ "${CLAWPILOT_NATIVE_FIXTURE_REMEDIATION:-0}" = "1" ]; then
+  php -d memory_limit=384M /fixture/prepare-remediation.php
+  php -d memory_limit=384M /fixture/remediation-acceptance.php
+fi
