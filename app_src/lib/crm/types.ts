@@ -361,6 +361,8 @@ export type CrmMeeting = {
   joinUrl: string | null
   calendarDeliveryStatus: 'not-configured' | 'queued' | 'sent' | 'failed' | 'cancelled' | null
   calendarDeliveryError: string | null
+  calendarImported?: boolean
+  recurringEventId?: string | null
   calendarOwnerEmail: string | null
   calendarConnectionId: string | null
   calendarOrganizerEmail: string | null

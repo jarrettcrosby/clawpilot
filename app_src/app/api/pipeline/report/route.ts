@@ -64,6 +64,10 @@ export async function GET(req: NextRequest) {
       )
     }
 
+    const interactionScope = req.nextUrl.searchParams.get('interactionScope') ?? 'sales'
+    if (interactionScope !== 'sales' && interactionScope !== 'all') {
+      return NextResponse.json({ ok: false, error: 'Choose sales activity or all activity' }, { status: 400 })
+    }
     const period = normalizePipelineReportingPeriod({
       preset: req.nextUrl.searchParams.get('preset'),
       startDate: req.nextUrl.searchParams.get('startDate'),
@@ -77,6 +81,7 @@ export async function GET(req: NextRequest) {
       endAtExclusive: period.endAtExclusive,
       timeZone: period.timeZone,
       snapshotDate: period.snapshotDate,
+      interactionScope,
     })
     const { snapshot, ...activity } = report
 
@@ -91,7 +96,7 @@ export async function GET(req: NextRequest) {
         timeZone: period.timeZone,
       },
       snapshot,
-      activity,
+      activity: { ...activity, interactionScope },
     }, {
       headers: { 'Cache-Control': 'private, no-store' },
     })

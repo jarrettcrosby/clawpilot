@@ -68,6 +68,7 @@ import ContextHelp from '@/components/ContextHelp'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
+import { meetingCalendarPresentation, meetingDisplayRows } from '@/lib/crm/meetingPresentation'
 import { interactionCompanyDisplay, interactionParticipantOptions, interactionRelatedCompanies } from '@/lib/crm/interactionCompanies.mjs'
 import { crmRecordNavigationPath } from '@/lib/crm/recordNavigation.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
@@ -461,28 +462,8 @@ function meetingCalendarChoiceLabel(choice: MeetingCalendarChoice) {
   return `${calendarName}${organizer}${linkedAccount}`
 }
 
-function meetingCalendarStatusLabel(value: unknown) {
-  const status = String(value || '').trim().toLowerCase()
-  if (status === 'sent' || status === 'scheduled') return 'Delivered'
-  if (status === 'queued') return 'Pending'
-  if (status === 'failed') return 'Failed'
-  if (status === 'not-configured') return 'Not configured'
-  if (status === 'planned') return 'Not sent'
-  if (status === 'completed') return 'Completed'
-  if (status === 'cancelled') return 'Cancelled'
-  return 'Unknown'
-}
-
-function meetingCalendarStatusColor(value: unknown): 'default' | 'success' | 'warning' | 'error' {
-  const status = String(value || '').trim().toLowerCase()
-  if (status === 'sent' || status === 'scheduled' || status === 'completed') return 'success'
-  if (status === 'queued') return 'warning'
-  if (status === 'failed') return 'error'
-  return 'default'
-}
-
-function meetingCalendarDeliveryValue(record: RecordValue) {
-  return textValue(record, 'calendarDeliveryStatus')
+const ORGANIZATION_ROLE_LABELS: Record<string, string> = {
+  workspace_root: 'Workspace root', workspace_member: 'Workspace member', customer: 'External organization',
 }
 
 function suiteCrmSyncStatusLabel(value: unknown) {
@@ -740,7 +721,7 @@ function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId
 
 function columns(entity: CrmEntity) {
   if (entity === 'organizations') return [
-    ['referenceCode', 'ID'], ['name', 'Organization'], ['parentOrganizationName', 'Parent'], ['relationshipType', 'Relationship'],
+    ['referenceCode', 'ID'], ['name', 'Organization'], ['parentOrganizationName', 'Parent'], ['accountType', 'Type'], ['relationshipType', 'Organization role'],
     ['accountManager', 'Owner'], ['phone', 'Phone'],
   ] as const
   if (entity === 'contacts') return [
@@ -950,6 +931,7 @@ export default function CrmSection() {
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
   const [records, setRecords] = useState<RecordValue[]>([])
+  const [groupRecurringMeetings, setGroupRecurringMeetings] = useState(true)
   const [summary, setSummary] = useState<CrmSummary>(EMPTY_SUMMARY)
   const [pipeline, setPipeline] = useState<PipelineInfo | null>(null)
   const [query, setQuery] = useState('')
@@ -1694,6 +1676,9 @@ export default function CrmSection() {
   const interactionEditorContacts: RecordValue[] = sharedEmailAssociations
     ? interactionParticipantOptions(editorRecord, contacts) : contacts
   const tableColumns = useMemo(() => columns(entity), [entity])
+  const displayRows = entity === 'meetings'
+    ? meetingDisplayRows(records, groupRecurringMeetings, Date.now())
+    : records.map(record => ({ record, occurrenceCount: 1 }))
   const relatedContacts = useMemo(() => {
     const organizationId = editorEntity === 'organizations' && editorRecord
       ? textValue(editorRecord, 'id')
@@ -2469,7 +2454,7 @@ export default function CrmSection() {
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.opportunities} opportunities`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.products} products`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.meetings} meetings`} />
-          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} interactions`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} all interactions`} />
           {summary.needsReviewInteractions > 0 && (
             <Chip
               size={shortLandscape ? 'small' : 'medium'}
@@ -2616,6 +2601,15 @@ export default function CrmSection() {
               sx={{ alignSelf: 'flex-start', mt: shortLandscape ? 0 : 1.25, flexShrink: 0 }}
             />
           )}
+          {entity === 'meetings' && <Stack direction="row" gap={1} alignItems="center" flexWrap="wrap" sx={{ mt: 1 }}>
+            <Button size="small" variant="outlined" aria-pressed={groupRecurringMeetings}
+              onClick={() => setGroupRecurringMeetings(value => !value)}>
+              {groupRecurringMeetings ? 'Show every occurrence' : 'Group recurring meetings'}
+            </Button>
+            <Typography variant="caption" color="text.secondary">
+              {groupRecurringMeetings ? 'Grouped within loaded results; next occurrence shown. Open a row to edit only that occurrence.' : 'Every loaded occurrence is shown separately.'}
+            </Typography>
+          </Stack>}
           <TextField
             value={query}
             onChange={(event) => setQuery(event.target.value)}
@@ -2664,7 +2658,7 @@ export default function CrmSection() {
               </TableRow>
             </TableHead>
             <TableBody>
-              {records.map((record) => (
+              {displayRows.map(({ record, occurrenceCount }) => (
                 <TableRow
                   key={textValue(record, 'id')}
                   hover
@@ -2723,11 +2717,15 @@ export default function CrmSection() {
                           ? (
                             <Chip
                               size="small"
-                              label={meetingCalendarStatusLabel(meetingCalendarDeliveryValue(record))}
-                              color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(record))}
+                              label={meetingCalendarPresentation(record).label}
+                              color={meetingCalendarPresentation(record).color}
                               variant="outlined"
                             />
                           )
+                        : entity === 'meetings' && key === 'subject' && occurrenceCount > 1
+                          ? <Stack gap={0.5}>{displayValue(record, key, dateTimeSettings)}<Chip size="small" variant="outlined" label={`${occurrenceCount} loaded occurrences`} /></Stack>
+                        : entity === 'organizations' && key === 'relationshipType'
+                          ? (ORGANIZATION_ROLE_LABELS[textValue(record, key)] || 'Not specified')
                         : entity === 'interactions' && key === 'crmRecord'
                           ? interactionCrmRecordLabel(record)
                         : displayValue(record, key, dateTimeSettings)}
@@ -3810,8 +3808,8 @@ export default function CrmSection() {
                 <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap>
                   <Chip
                     size="small"
-                    label={`Calendar: ${meetingCalendarStatusLabel(meetingCalendarDeliveryValue(editorRecord))}`}
-                    color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(editorRecord))}
+                    label={`Calendar: ${meetingCalendarPresentation(editorRecord).label}`}
+                    color={meetingCalendarPresentation(editorRecord).color}
                     variant="outlined"
                   />
                   <Chip

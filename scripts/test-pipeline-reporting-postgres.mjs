@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -121,8 +121,11 @@ async function installReportingSchema(pool) {
 
     CREATE TABLE pipeline_spaces (
       id uuid PRIMARY KEY,
-      workspace_organization_id uuid NOT NULL
+      workspace_organization_id uuid NOT NULL,
+      owner_email text
     );
+
+    CREATE TABLE crm_inbound_messages (id uuid PRIMARY KEY);
 
     CREATE TABLE crm_organizations (
       id uuid PRIMARY KEY,
@@ -130,6 +133,8 @@ async function installReportingSchema(pool) {
       parent_organization_id uuid,
       name text,
       reference_code text,
+      account_type text,
+      relationship_type text NOT NULL DEFAULT 'customer',
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced'
     );
@@ -160,6 +165,7 @@ async function installReportingSchema(pool) {
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
       organization_id uuid,
       full_name text,
+      email text,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced'
     );
@@ -236,12 +242,13 @@ async function insertTimedRows(pool, table, pipelineId, timestamps) {
 }
 
 async function insertInteraction(pool, input) {
+  const id = randomUUID()
   await pool.query(
     `INSERT INTO crm_interactions (
        id, pipeline_id, interaction_type, occurred_at, source_payload, created_at
      ) VALUES ($1::uuid, $2::uuid, $3, $4::timestamptz, $5::jsonb, $6::timestamptz)`,
     [
-      randomUUID(),
+      id,
       input.pipelineId,
       input.type,
       input.occurredAt,
@@ -249,6 +256,7 @@ async function insertInteraction(pool, input) {
       input.createdAt || input.occurredAt,
     ],
   )
+  return id
 }
 
 async function insertOpportunity(pool, input) {
@@ -272,6 +280,84 @@ async function insertOpportunity(pool, input) {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value))
+}
+
+// Fixture setup only: exercise the actual shared-row guard rather than dropping
+// it. The compatible-writer flag is restricted to this one local transaction.
+async function insertSharedFixtureLinks(pool, pipelineId, interactionId, companyIds) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query("SET LOCAL clawpilot.crm_shared_write_v1 = 'on'")
+    for (const [index, companyId] of companyIds.entries()) {
+      await client.query(`INSERT INTO crm_interaction_organizations (pipeline_id,interaction_id,organization_id,is_primary,sort_order)
+        VALUES ($1,$2,$3,false,$4) ON CONFLICT (interaction_id,organization_id) DO NOTHING`,
+      [pipelineId, interactionId, companyId, index + 1])
+    }
+    await client.query('COMMIT')
+  } catch (error) { await client.query('ROLLBACK'); throw error }
+  finally { client.release() }
+}
+
+async function salesScopeAcceptance(pool, persistence) {
+  const pipelineId = randomUUID(), organizationId = randomUUID(), foreignPipeline = randomUUID()
+  await pool.query('INSERT INTO pipeline_spaces (id,workspace_organization_id) VALUES ($1,$2),($3,$4)', [pipelineId, organizationId, foreignPipeline, randomUUID()])
+  const companies = {}
+  for (const [name, type, role, archived, foreign] of [
+    ['customer', ' Customer ', 'customer'], ['prospect', 'PROSPECT', 'customer'],
+    ['supplier', 'Supplier', 'customer'], ['unclassified', null, 'customer'],
+    ['archived', 'Customer', 'customer', true], ['root', 'Customer', 'workspace_root'],
+    ['foreign', 'Customer', 'customer', false, true],
+  ]) {
+    companies[name] = randomUUID()
+    await pool.query(`INSERT INTO crm_organizations (id,pipeline_id,name,account_type,relationship_type,source_payload)
+      VALUES ($1,$2,'Same company name',$3,$4,$5::jsonb)`,
+    [companies[name], foreign ? foreignPipeline : pipelineId, type, role, JSON.stringify({ archived: Boolean(archived) })])
+  }
+  const add = async (primary, secondary = [], extra = {}) => {
+    const id = await insertInteraction(pool, { pipelineId, type: 'Email', occurredAt: '2026-08-04T14:00:00Z', ...extra })
+    if (primary) await pool.query('UPDATE crm_interactions SET organization_id=$2 WHERE id=$1', [id, companies[primary]])
+    await insertSharedFixtureLinks(pool, pipelineId, id, secondary.map(name => companies[name]))
+    return id
+  }
+  await add('customer')
+  await add('prospect')
+  await add('supplier', ['customer'])
+  await add('customer', ['customer', 'prospect']) // still exactly one interaction
+  for (const name of ['supplier', 'unclassified', 'archived', 'root', null]) await add(name)
+  const foreignCompanyInteraction = await add(null)
+  await assert.rejects(pool.query('UPDATE crm_interactions SET organization_id=$2 WHERE id=$1',
+    [foreignCompanyInteraction, companies.foreign]), /foreign key constraint/, 'actual migration prevents foreign-company placement')
+  await add('supplier', ['archived'])
+  await add('customer', [], { sourcePayload: { archived: true } })
+  await add('customer', [], { occurredAt: '2026-09-01T04:00:00Z' })
+  // Resolve legacy contact/lead/opportunity/meeting-only records with the same
+  // tenant-scoped primary precedence used by the CRM and workbook readers.
+  for (const [table, column] of [
+    ['crm_contacts', 'contact_id'], ['crm_leads', 'lead_id'],
+    ['crm_opportunities', 'opportunity_id'], ['crm_meetings', 'meeting_id'],
+  ]) {
+    const relatedId = randomUUID(), interactionId = await add(null)
+    await pool.query(`INSERT INTO ${table} (id,pipeline_id,organization_id${['crm_contacts', 'crm_opportunities'].includes(table) ? ',created_at' : ''})
+      VALUES ($1,$2,$3${['crm_contacts', 'crm_opportunities'].includes(table) ? ',now()' : ''})`, [relatedId, pipelineId, companies.customer])
+    await pool.query(`UPDATE crm_interactions SET ${column}=$2 WHERE id=$1`, [interactionId, relatedId])
+  }
+  const foreignContact = randomUUID(), foreignInteraction = await add(null)
+  await pool.query('INSERT INTO crm_contacts (id,pipeline_id,organization_id,created_at) VALUES ($1,$2,$3,now())',
+    [foreignContact, foreignPipeline, companies.customer])
+  await pool.query('UPDATE crm_interactions SET contact_id=$2 WHERE id=$1', [foreignInteraction, foreignContact])
+  const input = { pipelineId, organizationId, startAt: '2026-08-01T04:00:00Z', endAtExclusive: '2026-09-01T04:00:00Z',
+    timeZone: 'America/New_York', snapshotDate: '2026-08-28' }
+  const sales = plain(await persistence.readCrmPipelineActivityReportFromPostgres(input))
+  assert.equal(sales.interactions, 8, 'Default sales includes only eligible primary/fallback/secondary customers and prospects, counting each interaction once')
+  assert.equal(sales.interactionsByMonth[0].total, 8)
+  assert.equal(sales.interactionsByMonth[0].types.email, 8)
+  const all = plain(await persistence.readCrmPipelineActivityReportFromPostgres({ ...input, interactionScope: 'all' }))
+  assert.equal(all.interactions, 16, 'All activity retains supplier, unclassified and unlinked activity but not archived or out-of-range interactions')
+  assert.deepEqual(all.snapshot, sales.snapshot, 'Interaction scope must not alter revenue or current opportunity totals')
+  assert.equal(all.contactsAdded, sales.contactsAdded)
+  await assert.rejects(persistence.readCrmPipelineActivityReportFromPostgres({ ...input, interactionScope: 'invalid' }), /Invalid pipeline interaction scope/)
+  console.log('PASS default sales/all scope, shared-company uniqueness, legacy associations, archive/time boundaries and tenant isolation')
 }
 
 async function acceptance(databaseUrl) {
@@ -396,6 +482,7 @@ async function acceptance(databaseUrl) {
 
     const persistence = loadCrmPersistence(pool)
     const reportA = plain(await persistence.readCrmPipelineActivityReportFromPostgres({
+      interactionScope: 'all',
       pipelineId: pipelineA,
       organizationId: organizationA,
       startAt,
@@ -539,6 +626,7 @@ async function acceptance(databaseUrl) {
     assert.equal(homeSummaryA.openPipelineValue, homeSummaryA.activePipelineValue, 'legacy open-value alias must remain compatible')
 
     const reportB = plain(await persistence.readCrmPipelineActivityReportFromPostgres({
+      interactionScope: 'all',
       pipelineId: pipelineB,
       organizationId: organizationB,
       startAt,
@@ -658,10 +746,7 @@ async function acceptance(databaseUrl) {
     const secondaryOrganizationId = '20000000-0000-4000-8000-000000000003'
     await pool.query(`INSERT INTO crm_organizations (id,pipeline_id,name,reference_code,source_payload)
       VALUES ($1,$2,'Projected partner','ga1000002','{}'::jsonb)`, [secondaryOrganizationId, pipelineC])
-    await pool.query(`INSERT INTO crm_interaction_organizations
-      (pipeline_id,interaction_id,organization_id,is_primary,sort_order)
-      VALUES ($1,$2,$3,true,0),($1,$2,$4,false,1)`,
-    [pipelineC, projectedInteractionId, projectedOrganizationId, secondaryOrganizationId])
+    await insertSharedFixtureLinks(pool, pipelineC, projectedInteractionId, [secondaryOrganizationId])
     const sharedWorkbookSnapshot = plain(await persistence.readCrmWorkbookProjectionSnapshotInPostgres({ pipelineId: pipelineC }))
     assert.deepEqual(sharedWorkbookSnapshot.counts, { ...workbookSnapshot.counts, organizations: 2 })
     assert.deepEqual(sharedWorkbookSnapshot.interactions.map(record => record.id), workbookSnapshot.interactions.map(record => record.id),
@@ -675,10 +760,12 @@ async function acceptance(databaseUrl) {
       { id: secondaryOrganizationId, referenceCode: 'ga1000002', name: 'Projected partner', isPrimary: false },
     ])
     const unchangedReportA = plain(await persistence.readCrmPipelineActivityReportFromPostgres({
+      interactionScope: 'all',
       pipelineId: pipelineA, organizationId: organizationA, startAt, endAtExclusive,
       timeZone: 'America/New_York', snapshotDate: '2026-08-28',
     }))
     assert.deepEqual(unchangedReportA, reportA, 'Adding a workbook company association must not change reporting totals')
+    await salesScopeAcceptance(pool, persistence)
 
     await assert.rejects(
       persistence.readCrmPipelineActivityReportFromPostgres({
@@ -737,7 +824,7 @@ try {
     timeout: 180_000,
   })
 } finally {
-  spawnSync('docker', ['stop', '-t', '1', container], {
+  spawnSync('docker', disposablePostgresDockerCleanupArgs(container), {
     stdio: 'ignore',
     timeout: 20_000,
   })

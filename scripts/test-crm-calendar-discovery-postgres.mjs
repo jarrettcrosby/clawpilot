@@ -160,10 +160,18 @@ try {
     location: '', attendeeEmails: [calendar, 'adrian@client.example.invalid', 'joe@client.example.invalid'],
     matchingAttendeeEmails: ['adrian@client.example.invalid', 'joe@client.example.invalid'], organizerEmail: calendar,
     externalEventUrl: 'https://calendar.google.com/event?eid=fixture', joinUrl: 'https://meet.google.com/aaa-bbbb-ccc',
-    recurringEventId: null, originalStartTime: null, clawpilotMeetingReference: null, allowCreate: true }
+    recurringEventId: 'business-series', originalStartTime: null, clawpilotMeetingReference: null, allowCreate: true }
   check((await reconcile(source, event)).status === 'created', 'matching attendees create native CRM meeting')
   const meeting = (await query('SELECT * FROM crm_meetings WHERE pipeline_id=$1 AND external_event_id=$2', [pipeline, event.externalEventId])).rows[0]
   check(meeting.organization_id === account.id, 'meeting maps to the matched customer account')
+  const readImported = async () => (await crm.listCrmRecordsInPostgres({ pipelineId: pipeline, entity: 'meetings' })).find(row => row.id === meeting.id)
+  let importedView = await readImported()
+  check(importedView.calendarImported === true && importedView.recurringEventId === 'business-series', 'verified import provenance reaches the meeting presentation')
+  check(importedView.calendarDeliveryStatus === null, 'import does not fabricate an outgoing delivery receipt')
+  await query(`UPDATE crm_meetings SET source_payload=jsonb_set(source_payload,'{calendarDiscovery,eventId}','"different-event"'::jsonb) WHERE id=$1`, [meeting.id])
+  importedView = await readImported()
+  check(importedView.calendarImported === false, 'mismatched provider event identity cannot claim verified import')
+  await query('UPDATE crm_meetings SET source_payload=$2::jsonb WHERE id=$1', [meeting.id, JSON.stringify(meeting.source_payload)])
   check((await query('SELECT count(*) FROM crm_meetings WHERE pipeline_id=$1', [otherPipeline])).rows[0].count === '0', 'same-email foreign CRM contact never receives the imported meeting')
   const relations = (await query('SELECT contact_id::text FROM crm_meeting_contacts WHERE meeting_id=$1 ORDER BY contact_id', [meeting.id])).rows
   assert.deepEqual(relations.map(row => row.contact_id), [adrian.id, joe.id].sort()); checks++

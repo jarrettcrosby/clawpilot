@@ -128,6 +128,10 @@ Previously missed messages are not recovered by resetting a mailbox cursor. The 
 
 ## Workbook Contract
 
+The in-app Pipeline report defaults its interaction metric/chart to **Customers and prospects**. It uses the current CRM Account `account_type`, not the structural `relationship_type` value. Supplier-only, unclassified and unlinked activity remains available under **All activity**. An interaction linked to several companies counts once when any active, same-pipeline customer/prospect qualifies; legacy Contact/Lead/Opportunity/Meeting-only primary associations follow the normal CRM resolution order. Archived interactions and archived companies do not qualify for the sales metric. Changing this selector does not change opportunity revenue or contact totals. The CRM header explicitly labels its unfiltered total **all interactions**; the generated workbook remains an all-activity projection, not a copy of this per-view selector.
+
+The CRM organization table separates **Type** (Customer, Supplier, etc.) from **Organization role** (workspace root, workspace member, external organization). The internal `relationship_type=customer` hierarchy value is displayed as **External organization**, so a Supplier is not misleadingly labeled a customer.
+
 The managed workbook requires `Start Here`, `Organizations`, `Contacts`, `Opportunities`, `Interactions`, `Calculations`, `Dashboard`, and `Dropdowns`. Headers begin on row 4. Column A carries a hidden, protected ClawPilot record identity for CRM entity tabs.
 
 Google protected ranges permit user edits only in `Opportunities!B5:M`. All other tabs, the opportunity headers, and record identifiers are generated and protected. `Calculations` and `Dashboard` derive reporting values from the projected CRM data.
@@ -162,6 +166,8 @@ Native SuiteCRM Call polling uses the same full-first-scan and resumable-overlap
 All persisted timestamps remain UTC ISO values. ClawPilot renders dates, activity, releases, agent messages, CRM interactions, pipeline sync times, integration status, and link updates in the signed-in user's profile timezone and locale. Changing the profile timezone updates the active UI without rewriting historical data.
 
 Meeting time synchronization is bidirectional among the ClawPilot CRM surface, native SuiteCRM, and the original organizer's selected Google Calendar. Saving a meeting queues an idempotent Calendar create, update, or cancellation. Google Meet conferences are requested only for Google Meet meetings; in-person locations and custom meeting links retain their selected mode.
+
+The Calendar badge distinguishes **Imported from Google Calendar** from an outgoing invitation's **Delivered** receipt. Import provenance must match the saved provider event identity; historical scheduled status alone is **Not verified**. Failed, pending and cancelled delivery states remain visible. Recurring imported meetings may be grouped for presentation only, within the currently loaded/search-filtered rows and exact pipeline/owner/connection/calendar/series identity. Each group opens its next loaded occurrence (or latest past occurrence); it does not edit the series. **Show every occurrence** restores the individual rows. Grouping never merges or deletes database records, and failures/cancellations remain separate.
 
 The delivered event's account, connection, calendar and organizer are retained with the meeting and its successful action. Native SuiteCRM edits preserve that identity and meeting mode instead of adopting today's default calendar. The current organization membership, pipeline editing access and connection authorization are checked again before synchronization and delivery. Missing or revoked authority requires review rather than moving the event to a different calendar. A source-revision check prevents a delayed CRM edit from overwriting newly saved meeting details, and the CRM update and outbound Calendar action are staged atomically.
 

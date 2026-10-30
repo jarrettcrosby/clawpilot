@@ -4788,6 +4788,8 @@ function meetingFromRow(
     ? row.source_payload as Record<string, unknown>
     : {}
   const rawCalendarDeliveryStatus = clean(sourcePayload.calendarDeliveryStatus)
+  const discovery = sourcePayload.calendarDiscovery && typeof sourcePayload.calendarDiscovery === 'object'
+    && !Array.isArray(sourcePayload.calendarDiscovery) ? sourcePayload.calendarDiscovery as Record<string, unknown> : {}
   const calendarDeliveryStatus = ['not-configured', 'queued', 'sent', 'failed', 'cancelled'].includes(rawCalendarDeliveryStatus)
     ? rawCalendarDeliveryStatus as CrmMeeting['calendarDeliveryStatus']
     : null
@@ -4815,6 +4817,10 @@ function meetingFromRow(
     status: row.status as CrmMeeting['status'], provider: clean(row.provider), externalEventId: nullable(row.external_event_id),
     externalEventUrl: nullable(row.external_event_url), joinUrl: nullable(row.join_url),
     calendarDeliveryStatus, calendarDeliveryError: nullable(sourcePayload.calendarDeliveryError),
+    calendarImported: sourcePayload.source === 'google_calendar_discovery'
+      && row.provider === 'google-calendar' && Boolean(clean(discovery.sourceId))
+      && Boolean(clean(row.external_event_id)) && discovery.eventId === row.external_event_id,
+    recurringEventId: nullable(discovery.recurringEventId),
     calendarOwnerEmail: nullable(sourcePayload.calendarOwnerEmail),
     calendarConnectionId: nullable(sourcePayload.calendarConnectionId),
     calendarOrganizerEmail: nullable(sourcePayload.calendarOrganizerEmail), calendarId: nullable(sourcePayload.calendarId), meetingMode,
@@ -6346,7 +6352,10 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
   endAtExclusive: string
   timeZone: string
   snapshotDate: string
+  interactionScope?: 'sales' | 'all'
 }): Promise<CrmPipelineActivityReport> {
+  const interactionScope = input.interactionScope ?? 'sales'
+  if (!['sales', 'all'].includes(interactionScope)) throw new Error('Invalid pipeline interaction scope')
   type ReportRow = {
     contacts_added: string
     interactions: string
@@ -6551,10 +6560,28 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
          )) AS interaction_type
        FROM crm_interactions interaction
        JOIN scope ON scope.id = interaction.pipeline_id
+       LEFT JOIN crm_contacts contact ON contact.pipeline_id = interaction.pipeline_id AND contact.id = interaction.contact_id
+       LEFT JOIN crm_leads lead ON lead.pipeline_id = interaction.pipeline_id AND lead.id = interaction.lead_id
+       LEFT JOIN crm_opportunities opportunity ON opportunity.pipeline_id = interaction.pipeline_id AND opportunity.id = interaction.opportunity_id
+       LEFT JOIN crm_meetings meeting ON meeting.pipeline_id = interaction.pipeline_id AND meeting.id = interaction.meeting_id
        CROSS JOIN bounds
        WHERE COALESCE(interaction.occurred_at, interaction.created_at) >= bounds.start_at
          AND COALESCE(interaction.occurred_at, interaction.created_at) < bounds.end_at
          AND ${activeCrmRecordSql('interaction')}
+         AND ($7::text = 'all' OR EXISTS (
+           SELECT 1 FROM crm_organizations company
+           WHERE company.pipeline_id = interaction.pipeline_id
+             AND company.relationship_type = 'customer'
+             AND lower(btrim(COALESCE(company.account_type, ''))) IN ('customer', 'prospect')
+             AND ${activeCrmRecordSql('company')}
+             AND (company.id = COALESCE(interaction.organization_id, contact.organization_id,
+               lead.organization_id, opportunity.organization_id, meeting.organization_id) OR EXISTS (
+               SELECT 1 FROM crm_interaction_organizations company_link
+               WHERE company_link.pipeline_id = interaction.pipeline_id
+                 AND company_link.interaction_id = interaction.id
+                 AND company_link.organization_id = company.id
+             ))
+         ))
      ),
      categorized_interactions AS (
        SELECT
@@ -6705,7 +6732,7 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
      CROSS JOIN months
      LEFT JOIN interaction_months ON interaction_months.month_start = months.month_start
      ORDER BY months.month_start`,
-      [input.pipelineId, input.organizationId, input.startAt, input.endAtExclusive, input.timeZone, input.snapshotDate],
+      [input.pipelineId, input.organizationId, input.startAt, input.endAtExclusive, input.timeZone, input.snapshotDate, interactionScope],
     )
     if (!result.rows.length) throw new Error('Pipeline reporting scope was not found')
     const valueSnapshot = await readCrmPipelineValueSnapshotWithClient(client, input)

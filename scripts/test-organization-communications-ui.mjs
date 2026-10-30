@@ -127,9 +127,11 @@ for (const fragment of [
   'label="Custom duration (minutes)"',
   'label="Ends"',
   'InputProps={{ readOnly: true }}',
-  "if (status === 'sent' || status === 'scheduled') return 'Delivered'",
-  "if (status === 'not-configured') return 'Not configured'",
-  "return textValue(record, 'calendarDeliveryStatus')",
+  'meetingCalendarPresentation(record).label',
+  'meetingDisplayRows(records, groupRecurringMeetings, Date.now())',
+  'Show every occurrence',
+  'Group recurring meetings',
+  'Grouped within loaded results; next occurrence shown.',
   "{entity === 'meetings' ? 'SuiteCRM' : 'Sync'}",
   'aria-label="Meeting delivery status"',
   'label="Meeting status"',
@@ -216,7 +218,7 @@ assert.ok(
   'Meeting delivery must stay disabled until a provider-verified writable Calendar is selected',
 )
 assert.ok(
-  crm.includes("label={`Calendar: ${meetingCalendarStatusLabel(meetingCalendarDeliveryValue(editorRecord))}`}")
+  crm.includes("label={`Calendar: ${meetingCalendarPresentation(editorRecord).label}`}")
     && crm.includes("label={`SuiteCRM: ${suiteCrmSyncStatusLabel(editorRecord.syncStatus)}`}"),
   'Meeting details must render Calendar delivery and SuiteCRM sync independently',
 )
