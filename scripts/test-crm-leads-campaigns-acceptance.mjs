@@ -393,6 +393,8 @@ async function apiJson(baseUrl, token, pathname, init = {}) {
     headers: {
       Accept: 'application/json',
       Cookie: `clawpilot_session=${token}`,
+      Origin: new URL(baseUrl).origin,
+      'Sec-Fetch-Site': 'same-origin',
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
       ...init.headers,
     },
@@ -843,6 +845,11 @@ async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
       name: 'clawpilot_session', value: token, url: baseUrl, httpOnly: true, sameSite: 'Lax',
     }])
     const page = await context.newPage()
+    const browserErrors = []
+    page.on('pageerror', (error) => browserErrors.push(String(error).slice(0, 2_000)))
+    page.on('console', (message) => {
+      if (message.type() === 'error') browserErrors.push(message.text().slice(0, 2_000))
+    })
     const pageResponse = await page.goto(`${baseUrl}/#crm`, { waitUntil: 'domcontentloaded' })
     assert.ok(
       pageResponse?.ok(),
@@ -852,7 +859,7 @@ async function runMobileAcceptance(baseUrl, token, records, serverLogs) {
       await page.locator('h5').filter({ hasText: /^CRM$/ }).waitFor()
     } catch (error) {
       const body = await page.locator('body').innerText().catch(() => '')
-      throw new Error(`CRM mobile page did not render at ${page.url()}: ${body.slice(0, 1_000)}`, { cause: error })
+      throw new Error(`CRM mobile page did not render at ${page.url()}: ${body.slice(0, 1_000)}\n${browserErrors.slice(-5).join('\n')}\n${serverLogs().slice(-4_000)}`, { cause: error })
     }
     await page.getByRole('tab', { name: 'Leads' }).click()
     const leadSearch = page.getByPlaceholder('Search leads')
