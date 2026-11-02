@@ -66,6 +66,13 @@ audits, native IDs and queued outcomes. Do not restore archived rows, remove
 native tombstones, or clear cursors to simulate a code rollback. The native
 route can remain installed but disabled.
 
+After the first tombstone is written, keep this release's visibility and
+stale-import guards even with the feature disabled. An older application
+binary without those guards is not a compatible rollback: it may republish
+archived project cards or overwrite archive markers during an import.
+Rollback is flag-only unless a separately validated compatible binary retains
+these guards. No whole-database restoration is authorized by this runbook.
+
 ## Validation and proof boundaries
 
 The focused candidate passed lint (three existing navigation warnings), the
