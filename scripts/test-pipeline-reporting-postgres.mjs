@@ -141,6 +141,7 @@ async function installReportingSchema(pool) {
       phone_work text,
       phone_mobile text,
       job_title text,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced',
       created_at timestamptz NOT NULL
     );
@@ -581,6 +582,13 @@ async function acceptance(databaseUrl) {
       [projectedContactId, pipelineC, projectedOrganizationId],
     )
     await pool.query(
+      `INSERT INTO crm_contacts (
+         id, pipeline_id, organization_id, reference_code, full_name, source_payload, sync_status, created_at
+       ) VALUES ('30000000-0000-4000-8000-000000000002'::uuid, $1::uuid, $2::uuid,
+         'archived-contact', 'Archived contact', '{"archived":true}'::jsonb, 'dead', now())`,
+      [pipelineC, projectedOrganizationId],
+    )
+    await pool.query(
       `INSERT INTO crm_leads (id, pipeline_id, organization_id, full_name)
        VALUES ($1::uuid, $2::uuid, $3::uuid, 'Projected lead')`,
       [projectedLeadId, pipelineC, projectedOrganizationId],
@@ -622,6 +630,9 @@ async function acceptance(databaseUrl) {
     })
     assert.equal(workbookSnapshot.organizations[0].id, projectedOrganizationId)
     assert.equal(workbookSnapshot.contacts[0].id, projectedContactId)
+    assert.equal(workbookSnapshot.contacts.length, 1, 'Archived contacts must not reappear in the writable workbook')
+    assert.equal((await persistence.readCrmSummaryFromPostgres(pipelineC)).contacts, 1,
+      'Archived contacts must not inflate the active CRM summary')
     assert.equal(workbookSnapshot.interactions[0].id, projectedInteractionId)
     const projectedInteractionsById = new Map(
       workbookSnapshot.interactions.map((interaction) => [interaction.id, interaction]),

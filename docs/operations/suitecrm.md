@@ -11,6 +11,9 @@ app_visible: false
 
 # SuiteCRM Railway Runbook
 
+See [CRM record deletion synchronization](crm-record-deletion.md) for scoped
+Account/Contact Trash actions, native deletion inspection, and activation.
+
 ## Topology
 
 The sole Railway production environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot production service reaches the V8 API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. SuiteCRM 8 native media is not exposed by V8, so the optional native Product-image projection uses a separate least-privilege SuiteCRM user and the same cookie-session plus CSRF flow used by SuiteCRM's own UI. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin. Local, remote-local, and Vercel preview runtimes must not receive these credentials or act as SuiteCRM workers.
