@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import type { PoolClient } from 'pg'
 import type { Task, CrmTaskContext } from '@/lib/types'
 import { normalizeCrmBoardCard } from '@/lib/crm/boardCard.mjs'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
@@ -212,19 +213,23 @@ export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardB
 async function readCrmBoardRecords(
   pipelineId: string,
   workspaceOrganizationId: string,
+  client?: PoolClient,
 ): Promise<CrmBoardRecord[]> {
-  const result = await query<CrmBoardRecord>(
+  const execute = client ? client.query.bind(client) : query
+  const result = await execute<CrmBoardRecord>(
     `WITH RECURSIVE visible_organizations AS (
        SELECT organization.*, ARRAY[organization.id] AS graph_path
        FROM crm_organizations organization
        WHERE organization.pipeline_id = $1::uuid
          AND organization.workspace_organization_id = $2::uuid
+         AND COALESCE(lower(organization.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
        UNION ALL
        SELECT child.*, parent.graph_path || child.id
        FROM crm_organizations child
        JOIN visible_organizations parent ON child.parent_organization_id = parent.id
        WHERE child.pipeline_id = $1::uuid
          AND NOT child.id = ANY(parent.graph_path)
+         AND COALESCE(lower(child.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
      )
      SELECT 'organizations'::text AS entity_type, organization.id::text AS entity_id,
        organization.pipeline_id::text, organization.reference_code,
@@ -241,6 +246,7 @@ async function readCrmBoardRecords(
      FROM crm_contacts contact
      JOIN visible_organizations organization ON organization.id = contact.organization_id
      WHERE contact.pipeline_id = $1::uuid
+       AND COALESCE(lower(contact.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
      ORDER BY entity_type, record_name, reference_code`,
     [pipelineId, workspaceOrganizationId],
   )
@@ -251,8 +257,9 @@ async function readCrmBoardRecords(
   }))
 }
 
-async function readCrmBoardCards(boardId: string): Promise<CrmBoardCardRow[]> {
-  const result = await query<CrmBoardCardRow>(
+async function readCrmBoardCards(boardId: string, client?: PoolClient): Promise<CrmBoardCardRow[]> {
+  const execute = client ? client.query.bind(client) : query
+  const result = await execute<CrmBoardCardRow>(
     `SELECT card.board_id::text, card.card_id, card.pipeline_id::text, card.entity_type,
        card.entity_id::text, card.reference_code, card.last_synced_description,
        card.last_common_hash, card.card_description_hash, card.crm_description_hash,
@@ -338,37 +345,36 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
   const binding = await resolveCrmBoardBinding(input.boardId)
   if (!binding) return { projected: false, pipelineId: null, cards: 0, conflicts: 0 }
   await ensurePipelineCrmReferenceLinks(binding.pipeline_id)
-  const [records, existingCards] = await Promise.all([
-    readCrmBoardRecords(binding.pipeline_id, binding.workspace_organization_id),
-    readCrmBoardCards(binding.board_id),
-  ])
-  const cardsByRecord = new Map(existingCards.map((card) => [`${card.entity_type}:${card.entity_id}`, card]))
-  const now = new Date().toISOString()
-  const prepared: PreparedCard[] = []
-
-  for (const record of records) {
-    const existing = cardsByRecord.get(`${record.entity_type}:${record.entity_id}`)
-    if (existing) {
-      prepared.push(await prepareExistingCard(binding, record, existing, now))
-      continue
+  const projected = await withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`crm-record-lifecycle:${binding.pipeline_id}`])
+    const currentBinding = await client.query(`SELECT projection.board_id FROM crm_board_projections projection
+      JOIN project_boards board ON board.id=projection.board_id
+      WHERE projection.board_id=$1::uuid AND projection.pipeline_id=$2::uuid
+        AND projection.workspace_organization_id=$3::uuid AND board.workspace_organization_id=$3::uuid
+        AND board.owner_email=$4 AND lower(btrim(board.name))='crm board'
+      FOR SHARE OF projection, board`, [binding.board_id, binding.pipeline_id, binding.workspace_organization_id, binding.owner_email])
+    if (currentBinding.rows.length !== 1) throw new Error('CRM board binding changed during projection')
+    // Read both the full live ancestor graph and current card payloads after
+    // the lifecycle lock. An old prepared snapshot must never reinsert cards
+    // beneath an archived/reparented account or overwrite newer card history.
+    const records = await readCrmBoardRecords(binding.pipeline_id, binding.workspace_organization_id, client)
+    const existingCards = await readCrmBoardCards(binding.board_id, client)
+    const cardsByRecord = new Map(existingCards.map((card) => [`${card.entity_type}:${card.entity_id}`, card]))
+    const now = new Date().toISOString()
+    const prepared: PreparedCard[] = []
+    for (const record of records) {
+      const existing = cardsByRecord.get(`${record.entity_type}:${record.entity_id}`)
+      if (existing) {
+        prepared.push(await prepareExistingCard(binding, record, existing, now))
+        continue
+      }
+      const task = newCrmCard(binding.board_id, record, now)
+      const hash = descriptionHash(task.desc)
+      prepared.push({ record, task, commonDescription: task.desc, commonHash: hash,
+        cardHash: hash, crmHash: hash, syncStatus: 'synced' })
     }
-    const task = newCrmCard(binding.board_id, record, now)
-    const hash = descriptionHash(task.desc)
-    prepared.push({
-      record,
-      task,
-      commonDescription: task.desc,
-      commonHash: hash,
-      cardHash: hash,
-      crmHash: hash,
-      syncStatus: 'synced',
-    })
-  }
-
-  const visibleRecordKeys = new Set(records.map((record) => `${record.entity_type}:${record.entity_id}`))
-  const hiddenCards = existingCards.filter((card) => !visibleRecordKeys.has(`${card.entity_type}:${card.entity_id}`))
-
-  await withTransaction(async (client) => {
+    const visibleRecordKeys = new Set(records.map((record) => `${record.entity_type}:${record.entity_id}`))
+    const hiddenCards = existingCards.filter((card) => !visibleRecordKeys.has(`${card.entity_type}:${card.entity_id}`))
     for (const card of hiddenCards) {
       await client.query(
         'DELETE FROM crm_board_cards WHERE card_id = $1 AND board_id = $2::uuid',
@@ -427,13 +433,13 @@ export async function reconcileCrmBoardProjection(input: { boardId: string }): P
         ],
       )
     }
+    return { cards: prepared.length, conflicts: prepared.filter((card) => card.syncStatus === 'conflict').length }
   })
 
   return {
     projected: true,
     pipelineId: binding.pipeline_id,
-    cards: prepared.length,
-    conflicts: prepared.filter((card) => card.syncStatus === 'conflict').length,
+    ...projected,
   }
 }
 
@@ -476,15 +482,35 @@ export async function updateCrmBoardTaskDescription(input: {
   const description = normalizeCrmDescription(input.description)
 
   return withTransaction(async (client) => {
+    // Match stage/archive order before taking either card or CRM row locks.
+    // The first read only discovers the lifecycle key; the locked read below
+    // must still match the exact card and board binding observed here.
+    const discovered = await client.query<{
+      pipeline_id: string; workspace_organization_id: string; entity_type: string;
+      entity_id: string; reference_code: string
+    }>(`SELECT card.pipeline_id::text, projection.workspace_organization_id::text,
+      card.entity_type, card.entity_id::text, card.reference_code
+      FROM crm_board_cards card
+      JOIN crm_board_projections projection ON projection.board_id=card.board_id AND projection.pipeline_id=card.pipeline_id
+      JOIN project_boards board ON board.id=card.board_id AND board.workspace_organization_id=projection.workspace_organization_id
+      WHERE card.board_id=$1::uuid AND card.card_id=$2`, [input.boardId, input.taskId])
+    const binding = discovered.rows[0]
+    if (discovered.rows.length !== 1 || !binding) throw new Error('CRM board card was not found')
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`crm-record-lifecycle:${binding.pipeline_id}`])
     const selected = await client.query<CrmBoardCardRow>(
       `SELECT card.board_id::text, card.card_id, card.pipeline_id::text, card.entity_type,
          card.entity_id::text, card.reference_code, card.last_synced_description,
          card.last_common_hash, card.card_description_hash, card.crm_description_hash,
          card.sync_status, card.payload
        FROM crm_board_cards card
+       JOIN crm_board_projections projection ON projection.board_id=card.board_id AND projection.pipeline_id=card.pipeline_id
+       JOIN project_boards board ON board.id=card.board_id AND board.workspace_organization_id=projection.workspace_organization_id
        WHERE card.board_id = $1::uuid AND card.card_id = $2
+         AND card.pipeline_id=$3::uuid AND projection.workspace_organization_id=$4::uuid
+         AND card.entity_type=$5 AND card.entity_id=$6::uuid AND card.reference_code=$7
        FOR UPDATE OF card`,
-      [input.boardId, input.taskId],
+      [input.boardId, input.taskId, binding.pipeline_id, binding.workspace_organization_id,
+        binding.entity_type, binding.entity_id, binding.reference_code],
     )
     const card = selected.rows[0]
     if (!card) throw new Error('CRM board card was not found')
@@ -493,6 +519,7 @@ export async function updateCrmBoardTaskDescription(input: {
     const current = await client.query<{ description: string | null }>(
       `SELECT description FROM ${table}
        WHERE id = $1::uuid AND pipeline_id = $2::uuid
+         AND COALESCE(lower(source_payload->>'archived'),'false') NOT IN ('true','1','yes')
        FOR UPDATE`,
       [card.entity_id, card.pipeline_id],
     )

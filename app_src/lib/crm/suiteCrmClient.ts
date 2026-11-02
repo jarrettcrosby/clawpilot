@@ -659,3 +659,9 @@ export async function deleteSuiteCrmRecord(
     true,
   )
 }
+
+export async function requestSuiteCrmNativeRecordLifecycle(command: unknown, fetchImpl: typeof fetch = fetch): Promise<unknown> {
+  return request('/Api/V8/custom/clawpilot-record-lifecycle/inspect', {
+    method: 'POST', body: JSON.stringify(command),
+  }, fetchImpl, false)
+}

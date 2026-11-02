@@ -2349,6 +2349,32 @@ type StagedCrmRecord<SuiteCrmId = string> = {
   sourceHash: string
 }
 
+async function retainedCrmIdentityTombstone(client: PoolClient, input: StageCrmRecordInput) {
+  if (input.entity !== 'organizations' && input.entity !== 'contacts') return null
+  const table = ENTITY_TABLE[input.entity]
+  const identity = input.entity === 'organizations'
+    ? clean(input.identityKeyOverride) || organizationIdentityKey(input.fields)
+    : contactIdentityKey(input.fields)
+  const keys = [...new Set([identity, clean(input.sourceKey)].filter(Boolean))]
+  const selected = await client.query<{
+    id: string; suitecrm_id: string | null; reference_code: string; source_hash: string
+    source_payload: Record<string, unknown> | null
+  }>(`SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload
+    FROM ${table}
+    WHERE pipeline_id=$1::uuid AND (
+      ($2::uuid IS NOT NULL AND id=$2::uuid)
+      OR ($2::uuid IS NULL AND (identity_key=ANY($3::text[]) OR source_key=ANY($3::text[])
+        ${input.entity === 'contacts' ? `OR id IN (SELECT contact_id FROM crm_contact_source_aliases
+          WHERE pipeline_id=$1::uuid AND source_key=ANY($3::text[]))` : ''}))
+    ) ORDER BY id FOR UPDATE`, [input.pipelineId, input.localId || null, keys])
+  const archived = selected.rows.filter(row => ['true', '1', 'yes'].includes(String(row.source_payload?.archived ?? '').toLowerCase()))
+  if (!archived.length) return null
+  if (selected.rows.length !== 1 || input.createOnly) throw new Error('CRM identity is deleted; it cannot be recreated by an import')
+  const row = archived[0]
+  if (!row.suitecrm_id) throw new Error('Deleted CRM identity has no native binding')
+  return { id: row.id, suiteCrmId: row.suitecrm_id, referenceCode: row.reference_code, sourceHash: row.source_hash, shortUrl: null }
+}
+
 export function stageCrmRecordWithClient(
   client: PoolClient,
   rawInput: Exclude<StageCrmRecordInput, StageInteractionInput>,
@@ -2358,12 +2384,19 @@ export function stageCrmRecordWithClient(
   rawInput: StageCrmRecordInput,
 ): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput) {
+  if (rawInput.entity === 'organizations' || rawInput.entity === 'contacts') {
+    await lockCrmMutation(client, `crm-record-lifecycle:${rawInput.pipelineId}`)
+    const retained = await retainedCrmIdentityTombstone(client, rawInput)
+    if (retained) return retained
+  }
   let input = await normalizeStageCrmRecordInput(client, rawInput)
   let contactAliases: ContactStageResolution['aliases'] = []
   if (input.entity === 'contacts' && !input.createOnly) {
     const contactResolution = await resolveContactStageIdentity(client, input)
     input = contactResolution.input
     contactAliases = contactResolution.aliases
+    const retained = await retainedCrmIdentityTombstone(client, input)
+    if (retained) return retained
   }
   const identityKey = input.entity === 'organizations'
     ? clean(input.identityKeyOverride)
@@ -2556,14 +2589,18 @@ async function lockCrmMutation(client: PoolClient, key: string) {
 
 export async function archiveCrmRecordInPostgres(input: {
   pipelineId: string
-  entity: 'leads' | 'interactions' | 'campaigns'
+  entity: 'organizations' | 'contacts' | 'leads' | 'interactions' | 'campaigns'
   id: string
   actorEmail: string
   emitSuiteCrmOutbox?: boolean
   archiveSource?: 'clawpilot' | 'suitecrm'
+  expectedSuiteCrmIdentity?: { nativeId: string; globalId: string }
 }) {
   return withTransaction(async (client) => {
+    await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     const table = ENTITY_TABLE[input.entity]
+    const identityEntity = input.entity === 'organizations' || input.entity === 'contacts'
+    if (identityEntity) await lockCrmMutation(client, `crm-record-lifecycle:${input.pipelineId}`)
     await lockCrmMutation(client, `crm-archive:${input.pipelineId}:${input.entity}:${input.id}`)
     const selected = await client.query<{
       id: string
@@ -2571,10 +2608,14 @@ export async function archiveCrmRecordInPostgres(input: {
       suitecrm_id: string | null
       suitecrm_module: SuiteCrmInteractionModule | null
       source_payload: Record<string, unknown> | null
+      managed_identity: boolean
     }>(
       `SELECT id::text, reference_code, suitecrm_id,
          ${input.entity === 'interactions' ? 'suitecrm_module' : 'NULL::text AS suitecrm_module'},
-         source_payload
+         source_payload,
+         ${input.entity === 'organizations'
+    ? "(workspace_organization_id IS NOT NULL OR relationship_type IN ('workspace_root','workspace_member'))"
+    : input.entity === 'contacts' ? "(app_user_email IS NOT NULL OR pipeline_user = true OR contact_type = 'pipeline_user')" : 'false'} AS managed_identity
        FROM ${table}
        WHERE pipeline_id = $1::uuid AND id = $2::uuid
        FOR UPDATE`,
@@ -2582,11 +2623,26 @@ export async function archiveCrmRecordInPostgres(input: {
     )
     const record = selected.rows[0]
     if (!record) throw new Error('CRM record not found')
+    if (record.managed_identity) throw new Error('Workspace and login identities must be managed in Settings, not deleted from CRM')
+    if (identityEntity && input.archiveSource === 'suitecrm' && !input.expectedSuiteCrmIdentity) {
+      throw new Error('Confirmed native deletion identity is required')
+    }
+    if (input.expectedSuiteCrmIdentity) {
+      const expected = input.expectedSuiteCrmIdentity
+      if (record.suitecrm_id !== expected.nativeId || record.reference_code !== expected.globalId) {
+        throw new Error('CRM deletion binding changed')
+      }
+    }
+    if (identityEntity && record.suitecrm_id) {
+      const bindings = await client.query<{ id: string }>(`SELECT id::text FROM ${table}
+        WHERE lower(suitecrm_id)=lower($1) OR lower(reference_code)=lower($2) ORDER BY id FOR SHARE`, [record.suitecrm_id, record.reference_code])
+      if (bindings.rows.length !== 1 || bindings.rows[0].id !== record.id) throw new Error('CRM deletion binding is ambiguous')
+    }
     const sourcePayload = record.source_payload && typeof record.source_payload === 'object'
       ? record.source_payload
       : {}
-    if (sourcePayload.archived === true) {
-      return { archived: true, changed: false, referenceCode: record.reference_code }
+    if (['true', '1', 'yes'].includes(String(sourcePayload.archived ?? '').toLowerCase())) {
+      return { archived: true, changed: false, referenceCode: record.reference_code, suiteCrmDeleteQueued: false }
     }
 
     const archivedAt = new Date().toISOString()
@@ -2612,7 +2668,7 @@ export async function archiveCrmRecordInPostgres(input: {
        WHERE target_system = 'suitecrm'
          AND aggregate_type = $1
          AND aggregate_id = $2
-         AND operation = 'upsert_record'
+         AND operation IN ('upsert_record', 'reproject_record')
          AND status <> 'processing'`,
       [`crm_${input.entity}`, input.id],
     )
@@ -2643,7 +2699,7 @@ export async function archiveCrmRecordInPostgres(input: {
             localId: input.id,
             suiteCrmId: record.suitecrm_id,
             ...(record.suitecrm_module ? { suiteCrmModule: record.suitecrm_module } : {}),
-            attributes: {},
+            attributes: identityEntity ? { global_id_c: record.reference_code } : {},
           }),
           `crm-archive:${input.entity}:${input.id}`,
         ],
@@ -2672,7 +2728,8 @@ export async function archiveCrmRecordInPostgres(input: {
         message: `${record.reference_code} archived`,
       },
     }, client)
-    return { archived: true, changed: true, referenceCode: record.reference_code }
+    return { archived: true, changed: true, referenceCode: record.reference_code,
+      suiteCrmDeleteQueued: Boolean(record.suitecrm_id && input.emitSuiteCrmOutbox !== false) }
   })
 }
 
@@ -3619,6 +3676,7 @@ function contactFromRow(row: Record<string, unknown>): CrmContact {
     city: clean(row.primary_address_city), state: clean(row.primary_address_state), postalCode: clean(row.primary_address_postal_code),
     country: clean(row.primary_address_country), description: clean(row.description), emailOptOut: row.email_opt_out === true,
     pipelineUser: row.pipeline_user === true,
+    managedIdentity: row.pipeline_user === true || row.contact_type === 'pipeline_user' || Boolean(row.app_user_email),
     syncStatus: row.sync_status as CrmContact['syncStatus'],
     syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
   }
@@ -4120,7 +4178,8 @@ export async function listCrmRecordsInPostgres(input: {
     const result = await query<Record<string, unknown>>(
       `SELECT contact.*, organization.name AS organization_name
        FROM crm_contacts contact LEFT JOIN crm_organizations organization ON organization.id = contact.organization_id
-       WHERE contact.pipeline_id = $1::uuid AND ($2 = '' OR contact.reference_code ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR contact.email ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
+       WHERE contact.pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
+         AND ($2 = '' OR contact.reference_code ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR contact.email ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
        ORDER BY contact.full_name, contact.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
@@ -5302,6 +5361,7 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
           ON organization.pipeline_id = contact.pipeline_id
          AND organization.id = contact.organization_id
         WHERE contact.pipeline_id = $1::uuid
+          AND ${activeCrmRecordSql('contact')}
           AND ($2::uuid IS NULL OR contact.id > $2::uuid)
         ORDER BY contact.id
         LIMIT $3`,
@@ -5944,7 +6004,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM crm_organizations organization
          WHERE pipeline_id = $1::uuid
            AND ${activeCrmRecordSql('organization')})::text AS organizations,
-        (SELECT count(*) FROM crm_contacts WHERE pipeline_id = $1::uuid)::text AS contacts,
+        (SELECT count(*) FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')})::text AS contacts,
         (SELECT count(*) FROM crm_products product
          WHERE pipeline_id = $1::uuid
            AND ${activeCrmRecordSql('product')})::text AS products,
@@ -5967,7 +6027,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations organization
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-          UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
           UNION ALL SELECT sync_status FROM crm_products product
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
@@ -5979,7 +6039,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations organization
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-          UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
           UNION ALL SELECT sync_status FROM crm_products product
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
@@ -6213,12 +6273,14 @@ export async function readCrmRecordByReference(input: {
 export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
   const origin = appPublicUrl()
   if (!origin.startsWith('https://')) return 0
-  const result = await query(
+  const result = await withTransaction(async client => {
+    await lockCrmMutation(client, `crm-record-lifecycle:${pipelineId}`)
+    return client.query(
     `WITH RECURSIVE records AS (
        SELECT reference_code, name AS title, 'organizations'::text AS entity, email
          FROM crm_organizations organization
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-       UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
        UNION ALL SELECT reference_code, name, 'products', NULL::text
          FROM crm_products product
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
@@ -6272,6 +6334,7 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
          IS DISTINCT FROM (EXCLUDED.destination_url, EXCLUDED.title, EXCLUDED.tags, NULL, NULL)`,
     [pipelineId, origin],
   )
+  })
   return result.rowCount || 0
 }
 
@@ -6327,6 +6390,44 @@ function tableForAggregate(aggregateType: string) {
   return ENTITY_TABLE[entity] || null
 }
 
+export async function withVerifiedSuiteCrmRecordLifecycle<T>(item: CrmOutboxItem, publish: () => Promise<T>): Promise<T> {
+  if (item.operation === 'upsert_user_identity') throw new Error('CRM record lifecycle payload is invalid')
+  const payload = item.payload
+  if (payload.entity !== 'organizations' && payload.entity !== 'contacts') return publish()
+  if (item.aggregateType !== `crm_${payload.entity}` || item.aggregateId !== payload.localId) {
+    throw new Error('CRM record lifecycle identity changed')
+  }
+  return withTransaction(async client => {
+    await lockCrmMutation(client, `crm-record-lifecycle:${payload.pipelineId}`)
+    const table = ENTITY_TABLE[payload.entity]
+    const current = await client.query<{ source_hash: string; reference_code: string; archived: boolean }>(`SELECT record.source_hash, record.reference_code,
+      NOT (${activeCrmRecordSql('record')}) AS archived
+      FROM ${table} record JOIN sync_outbox outbox
+        ON outbox.id=$4::uuid AND outbox.aggregate_id=record.id::text
+        AND outbox.aggregate_type=$5 AND outbox.status='processing'
+        AND outbox.lock_token=$6 AND outbox.payload=$7::jsonb
+      WHERE record.id=$1::uuid AND record.pipeline_id=$2::uuid AND record.suitecrm_id=$3`,
+    [item.aggregateId, payload.pipelineId, payload.suiteCrmId, item.id, item.aggregateType, item.lockToken, JSON.stringify(payload)])
+    const record = current.rows[0]
+    if (!record || (item.operation === 'delete_record' ? !record.archived : record.archived)) {
+      throw new Error('CRM record was deleted or its synchronization identity changed')
+    }
+    if (payload.attributes.global_id_c !== record.reference_code) throw new Error('CRM record global identity changed')
+    // Managed workspace/login identities deliberately have shared projections.
+    // Their ordinary upserts remain supported; deletion must be unambiguous.
+    if (item.operation === 'delete_record') {
+      const bindings = await client.query<{ id: string }>(`SELECT id::text FROM ${table}
+        WHERE lower(suitecrm_id)=lower($1) OR lower(reference_code)=lower($2) ORDER BY id`,
+      [payload.suiteCrmId, record.reference_code])
+      if (bindings.rows.length !== 1 || bindings.rows[0].id !== item.aggregateId) throw new Error('CRM record synchronization identity is ambiguous')
+    }
+    if (item.operation !== 'delete_record' && !item.idempotencyKey?.endsWith(`:${record.source_hash}`)) {
+      throw new Error('CRM record synchronization revision changed')
+    }
+    return publish()
+  })
+}
+
 export async function completeSuiteCrmOutboxInPostgres(
   item: CrmOutboxItem,
   completion: {
@@ -6378,11 +6479,11 @@ export async function completeSuiteCrmOutboxInPostgres(
        WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
          AND (NOT $3::boolean OR (
            target_system = 'suitecrm' AND aggregate_type = $4 AND aggregate_id = $5
-           AND operation = 'upsert_record' AND idempotency_key = $6 AND payload = $7::jsonb
+           AND operation = $8 AND idempotency_key = $6 AND payload = $7::jsonb
          ))
        RETURNING aggregate_type, aggregate_id`,
-      [item.id, item.lockToken, isMeetingProjection, item.aggregateType, item.aggregateId,
-        item.idempotencyKey, JSON.stringify(item.payload)],
+      [item.id, item.lockToken, isMeetingProjection || (item.operation !== 'upsert_user_identity' && ['organizations','contacts'].includes(item.payload.entity)), item.aggregateType, item.aggregateId,
+        item.idempotencyKey, JSON.stringify(item.payload), item.operation],
     )
     if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease or projection identity was lost')
     if (meetingReceipt) {
@@ -6448,8 +6549,12 @@ export async function completeSuiteCrmOutboxInPostgres(
     if (table && (item.operation === 'upsert_record' || item.operation === 'reproject_record')
       && (item.payload.entity !== 'meetings' || meetingProjectionCurrent)) {
       await client.query(
-        `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
-        [item.aggregateId],
+        `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid
+          AND ${activeCrmRecordSql(table)}
+          ${item.payload.entity === 'organizations' || item.payload.entity === 'contacts'
+    ? 'AND pipeline_id=$2::uuid AND suitecrm_id=$3 AND $4 = concat(\'crm:\', $5::text, \':v4:\', id::text, \':default:\', source_hash)' : ''}`,
+        item.payload.entity === 'organizations' || item.payload.entity === 'contacts'
+          ? [item.aggregateId,item.payload.pipelineId,item.payload.suiteCrmId,item.idempotencyKey,item.payload.entity] : [item.aggregateId],
       )
       await client.query(
         `UPDATE pipeline_spaces SET crm_last_synced_at = now(), updated_at = now()

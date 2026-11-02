@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { GLOBAL_ID_MAX_LENGTH } from '@/lib/globalIds.mjs'
+import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import {
   CRM_ENTITIES,
   type CrmActivityStatus,
@@ -839,9 +840,15 @@ export async function PATCH(req: NextRequest) {
     const id = uuidValue(body?.id, 'CRM record')
 
     if (action === 'archive') {
+      if (!isBrowserSameOriginRequest({ headers: req.headers, requestOrigin: req.nextUrl.origin })) {
+        return NextResponse.json({ ok: false, error: 'CRM archive requires a same-origin request' }, { status: 403 })
+      }
       const entity = entityValue(body?.entity)
-      if (entity !== 'leads' && entity !== 'interactions' && entity !== 'campaigns') {
-        throw new Error('Only leads, interactions, and campaigns can be archived from this workflow')
+      if (entity !== 'organizations' && entity !== 'contacts' && entity !== 'leads' && entity !== 'interactions' && entity !== 'campaigns') {
+        throw new Error('Only organizations, contacts, leads, interactions, and campaigns can be archived from this workflow')
+      }
+      if ((entity === 'organizations' || entity === 'contacts') && process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED !== '1') {
+        return NextResponse.json({ ok: false, error: 'CRM deletion synchronization is not enabled yet. No records were removed.' }, { status: 409 })
       }
       const result = await archiveCrmRecordInPostgres({
         pipelineId: pipeline.id,
