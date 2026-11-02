@@ -11,7 +11,7 @@ app_visible: false
 
 # SuiteCRM Railway Runbook
 
-See [[crm-record-deletion|CRM record deletion synchronization]] for scoped
+See [CRM record deletion synchronization](crm-record-deletion.md) for scoped
 Account/Contact Trash actions, native deletion inspection, and activation.
 
 ## Topology
