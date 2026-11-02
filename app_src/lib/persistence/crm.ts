@@ -2597,7 +2597,6 @@ export async function archiveCrmRecordInPostgres(input: {
   expectedSuiteCrmIdentity?: { nativeId: string; globalId: string }
 }) {
   return withTransaction(async (client) => {
-    await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     const table = ENTITY_TABLE[input.entity]
     const identityEntity = input.entity === 'organizations' || input.entity === 'contacts'
     if (identityEntity) await lockCrmMutation(client, `crm-record-lifecycle:${input.pipelineId}`)

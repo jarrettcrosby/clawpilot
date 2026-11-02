@@ -119,7 +119,7 @@ await check('exact account/contact archive preserves other pipeline and all acti
     assert.deepEqual(h.foreign, untouched)
     assert.deepEqual(h.outbox, [{ entity, pipelineId, localId: recordId, suiteCrmId: h.target.suitecrm_id, attributes: { global_id_c: h.target.reference_code } }])
     assert.equal(h.links.has(h.target.reference_code), false); assert.equal(h.links.has(h.foreign.reference_code), true)
-    assert.equal(h.calls[0].sql, contextSql)
+    assert.equal(h.calls[0].params[0], `crm-record-lifecycle:${pipelineId}`)
     assert.deepEqual(h.calls.filter(call => call.sql.includes('pg_advisory_xact_lock')).map(call => call.params[0]),
       [`crm-record-lifecycle:${pipelineId}`, `crm-archive:${pipelineId}:${entity}:${recordId}`])
     assert.ok(writeCalls(h.calls).every(({ sql }) => !/\bcrm_(?:interactions|meetings|opportunities)\b/.test(sql)), 'No activity cascade')
