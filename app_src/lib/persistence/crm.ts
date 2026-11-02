@@ -5316,7 +5316,8 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
           WHERE organization.pipeline_id = $1::uuid
             AND ${activeCrmRecordSql('organization')})::text AS organizations,
          (SELECT count(*) FROM crm_contacts contact
-          WHERE contact.pipeline_id = $1::uuid)::text AS contacts,
+          WHERE contact.pipeline_id = $1::uuid
+            AND ${activeCrmRecordSql('contact')})::text AS contacts,
          (SELECT count(*) FROM crm_opportunities opportunity
           WHERE opportunity.pipeline_id = $1::uuid)::text AS opportunities,
          (SELECT count(*) FROM crm_interactions interaction
