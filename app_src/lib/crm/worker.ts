@@ -1,3 +1,4 @@
+import { deleteSuiteCrmAccountContactVerified } from '@/lib/crm/suiteCrmRecordLifecycleClient'
 import {
   deleteSuiteCrmRecord,
   upsertSuiteCrmRecordWithResult,
@@ -14,6 +15,7 @@ import {
   readCrmWorkbookProjectionContext,
   readCrmWorkbookProjectionReadiness,
   writeSuiteCrmWorkerHeartbeat,
+  withVerifiedSuiteCrmRecordLifecycle,
 } from '@/lib/persistence/crm'
 import { enqueuePipelineSyncOutboxInPostgres } from '@/lib/persistence/pipeline'
 
@@ -29,13 +31,17 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       let productImageProjection: SuiteCrmNativeProductImageResult | null = null
       let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
       if (item.operation === 'upsert_user_identity') await upsertSuiteCrmUserIdentity(item.payload)
-      else if (item.operation === 'delete_record') await deleteSuiteCrmRecord(item.payload)
+      else if (item.operation === 'delete_record') {
+        const payload = item.payload
+        await withVerifiedSuiteCrmRecordLifecycle(item, () => payload.entity === 'organizations' || payload.entity === 'contacts'
+          ? deleteSuiteCrmAccountContactVerified(payload) : deleteSuiteCrmRecord(payload))
+      }
       else if (item.operation === 'reproject_record') {
         // Create the target record before removing the legacy projection. A
         // provider-schema or validation failure must never erase the last
         // visible SuiteCRM copy of a durable ClawPilot interaction.
         if (item.payload.suiteCrmModule) {
-          const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+          const projection = await withVerifiedSuiteCrmRecordLifecycle(item, () => upsertSuiteCrmRecordWithResult(item.payload))
           productImageProjection = projection.productImageProjection
           meetingProjection = projection.meetingProjection || null
         }
@@ -50,7 +56,7 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         }
       }
       else {
-        const projection = await upsertSuiteCrmRecordWithResult(item.payload)
+        const projection = await withVerifiedSuiteCrmRecordLifecycle(item, () => upsertSuiteCrmRecordWithResult(item.payload))
         productImageProjection = projection.productImageProjection
         meetingProjection = projection.meetingProjection || null
       }

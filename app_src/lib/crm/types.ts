@@ -78,6 +78,7 @@ export type CrmContact = {
   description: string
   emailOptOut: boolean
   pipelineUser: boolean
+  managedIdentity?: boolean
   syncStatus: CrmSyncStatus
   syncError: string | null
   updatedAt: string

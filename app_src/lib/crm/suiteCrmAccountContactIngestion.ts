@@ -11,6 +11,8 @@ import {
   type StageOrganizationInput,
 } from '@/lib/persistence/crm'
 import { query } from '@/lib/persistence/postgres'
+import { processSuiteCrmAccountContactLifecycle, reconcileSuiteCrmAccountContactTombstone,
+  type SuiteCrmAccountContactLifecycleCounts } from '@/lib/crm/suiteCrmAccountContactLifecycle'
 
 const CURSOR_KEY = 'crm.suitecrm.account_contact_ingestion.cursor'
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000
@@ -105,6 +107,9 @@ export type SuiteCrmAccountContactIngestionCounts = {
   contactsMatched: number
   accountsStaged: number
   contactsStaged: number
+  accountsArchived: number
+  contactsArchived: number
+  deletionRecordsHeld: number
   unchangedRecords: number
   unmatchedRecords: number
   deletedRecordsIgnored: number
@@ -112,6 +117,7 @@ export type SuiteCrmAccountContactIngestionCounts = {
   pipelineProjectionRuns: number
   pending: boolean
   errors: number
+  lifecycle: SuiteCrmAccountContactLifecycleCounts
 }
 
 class SafeSuiteCrmAccountContactIngestionError extends Error {
@@ -292,8 +298,9 @@ async function localOrganizations(snapshot: SuiteCrmRecordSnapshot): Promise<Org
        ON parent.id = organization.parent_organization_id
        AND parent.pipeline_id = organization.pipeline_id
      LEFT JOIN workspace_organizations workspace ON workspace.id = organization.workspace_organization_id
-     WHERE organization.suitecrm_id = $1
-       OR ($2 <> '' AND organization.reference_code = $2)
+     WHERE (organization.suitecrm_id = $1
+       OR ($2 <> '' AND organization.reference_code = $2))
+       AND COALESCE(lower(organization.source_payload->>'archived'), 'false') NOT IN ('true','1','yes')
      ORDER BY organization.pipeline_id, organization.id`,
     [snapshot.id, globalId(snapshot, 'Accounts') || ''],
   )
@@ -319,8 +326,9 @@ async function localContacts(snapshot: SuiteCrmRecordSnapshot): Promise<ContactR
        ON organization.id = contact.organization_id
        AND organization.pipeline_id = contact.pipeline_id
      LEFT JOIN app_users app_user ON app_user.email = contact.app_user_email
-     WHERE contact.suitecrm_id = $1
-       OR ($2 <> '' AND contact.reference_code = $2)
+     WHERE (contact.suitecrm_id = $1
+       OR ($2 <> '' AND contact.reference_code = $2))
+       AND COALESCE(lower(contact.source_payload->>'archived'), 'false') NOT IN ('true','1','yes')
      ORDER BY contact.pipeline_id, contact.id`,
     [snapshot.id, globalId(snapshot, 'Contacts') || ''],
   )
@@ -691,6 +699,9 @@ export function sanitizeSuiteCrmAccountContactIngestionError(error: unknown): st
 }
 
 export async function processSuiteCrmAccountContactIngestion(): Promise<SuiteCrmAccountContactIngestionCounts> {
+  // Native deletion markers can disappear from normal modified-time feeds.
+  // This independent, opt-in bounded pass never advances that feed's cursor.
+  const lifecycle = await processSuiteCrmAccountContactLifecycle()
   const counts: SuiteCrmAccountContactIngestionCounts = {
     pagesPolled: 0,
     accountsListed: 0,
@@ -699,13 +710,17 @@ export async function processSuiteCrmAccountContactIngestion(): Promise<SuiteCrm
     contactsMatched: 0,
     accountsStaged: 0,
     contactsStaged: 0,
+    accountsArchived: 0,
+    contactsArchived: 0,
+    deletionRecordsHeld: 0,
     unchangedRecords: 0,
     unmatchedRecords: 0,
     deletedRecordsIgnored: 0,
     boundPipelines: 0,
     pipelineProjectionRuns: 0,
     pending: false,
-    errors: 0,
+    errors: lifecycle.errors,
+    lifecycle,
   }
   const now = new Date()
   const cursor = await readCursor()
@@ -721,6 +736,7 @@ export async function processSuiteCrmAccountContactIngestion(): Promise<SuiteCrm
   }
   const projectionPipelineIds = new Set(await boundCrmBoardPipelineIds())
   counts.boundPipelines = projectionPipelineIds.size
+  for (const pipelineId of lifecycle.pipelineIds) projectionPipelineIds.add(pipelineId)
 
   try {
     await writeCursor({ state, lastPolledAt: now.toISOString(), lastError: null })
@@ -736,7 +752,17 @@ export async function processSuiteCrmAccountContactIngestion(): Promise<SuiteCrm
 
       for (const snapshot of page.records) {
         if (suiteCrmSnapshotIsDeleted(snapshot)) {
-          counts.deletedRecordsIgnored += 1
+          const result = await reconcileSuiteCrmAccountContactTombstone(state.module, snapshot)
+          if (state.module === 'Accounts') {
+            counts.accountsMatched += result.matched
+            counts.accountsArchived += result.archived
+          } else {
+            counts.contactsMatched += result.matched
+            counts.contactsArchived += result.archived
+          }
+          counts.deletionRecordsHeld += result.held + result.protected
+          if (!result.archived) counts.deletedRecordsIgnored += 1
+          for (const pipelineId of result.pipelineIds) projectionPipelineIds.add(pipelineId)
           continue
         }
         const result = state.module === 'Accounts'
