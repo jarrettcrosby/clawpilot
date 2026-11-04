@@ -57,6 +57,13 @@ jobs:
             app_src/package-lock.json
             shopify/package-lock.json
 
+      - name: Preload pinned offline PHP contract runtime
+        # Contract fixtures deliberately use --pull=never and --network=none.
+        # Provision their unchanged runtime before the isolated tests begin.
+        run: |
+          docker pull php:8.3.35-cli-alpine
+          docker image inspect php:8.3.35-cli-alpine --format '{{json .RepoDigests}}'
+
       - name: Install pinned Caddy contract dependency
         env:
           CADDY_VERSION: 2.11.4
