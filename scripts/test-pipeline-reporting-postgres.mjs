@@ -150,7 +150,8 @@ async function installReportingSchema(pool) {
       phone_mobile text,
       job_title text,
       sync_status text NOT NULL DEFAULT 'synced',
-      created_at timestamptz NOT NULL
+      created_at timestamptz NOT NULL,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE crm_products (
@@ -183,7 +184,8 @@ async function installReportingSchema(pool) {
       probability numeric(5,2) NOT NULL DEFAULT 0,
       expected_close date,
       sync_status text NOT NULL DEFAULT 'synced',
-      created_at timestamptz NOT NULL
+      created_at timestamptz NOT NULL,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE crm_meetings (
@@ -191,7 +193,8 @@ async function installReportingSchema(pool) {
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
       organization_id uuid,
       subject text,
-      sync_status text NOT NULL DEFAULT 'synced'
+      sync_status text NOT NULL DEFAULT 'synced',
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE crm_interactions (
@@ -675,6 +678,15 @@ async function acceptance(databaseUrl) {
        ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'contact-1', 'Projected contact', 'projection@example.test', now())`,
       [projectedContactId, pipelineC, projectedOrganizationId],
     )
+    // Retain the production deletion release's regression: an archived
+    // Contact must not consume workbook capacity or active CRM counts.
+    await pool.query(
+      `INSERT INTO crm_contacts (
+         id, pipeline_id, organization_id, reference_code, full_name, source_payload, sync_status, created_at
+       ) VALUES ('30000000-0000-4000-8000-000000000002'::uuid, $1::uuid, $2::uuid,
+         'archived-contact', 'Archived contact', '{"archived":true}'::jsonb, 'dead', now())`,
+      [pipelineC, projectedOrganizationId],
+    )
     await pool.query(
       `INSERT INTO crm_leads (id, pipeline_id, organization_id, full_name)
        VALUES ($1::uuid, $2::uuid, $3::uuid, 'Projected lead')`,
@@ -717,6 +729,9 @@ async function acceptance(databaseUrl) {
     })
     assert.equal(workbookSnapshot.organizations[0].id, projectedOrganizationId)
     assert.equal(workbookSnapshot.contacts[0].id, projectedContactId)
+    assert.equal(workbookSnapshot.contacts.length, 1, 'Archived contacts must not reappear in the writable workbook')
+    assert.equal((await persistence.readCrmSummaryFromPostgres(pipelineC)).contacts, 1,
+      'Archived contacts must not inflate the active CRM summary')
     assert.equal(workbookSnapshot.interactions[0].id, projectedInteractionId)
     const projectedInteractionsById = new Map(
       workbookSnapshot.interactions.map((interaction) => [interaction.id, interaction]),

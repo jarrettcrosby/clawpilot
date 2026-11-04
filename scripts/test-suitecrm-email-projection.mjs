@@ -229,9 +229,20 @@ await check('worker refuses missing proof and cannot delete prior projection or 
   for (const operation of ['upsert_record', 'reproject_record']) {
     const worker = load('app_src/lib/crm/worker.ts', {
       '@/lib/crm/suiteCrmNativeEmailProjection': helper,
-      '@/lib/crm/suiteCrmClient': { upsertSuiteCrmRecordWithResult: async () => ({ suiteCrmId: emailId, productImageProjection: null }), deleteSuiteCrmRecord: async () => { deleted++ } },
+      '@/lib/crm/suiteCrmRecordLifecycleClient': { deleteSuiteCrmAccountContactVerified: async () => assert.fail('Email projection must not delete Account/Contact records') },
+      '@/lib/crm/suiteCrmClient': { upsertSuiteCrmRecordWithResult: async () => ({ suiteCrmId: emailId, productImageProjection: null }), deleteSuiteCrmRecord: async () => { deleted++ },
+        createSuiteCrmNativeEmailPublicationClient: () => ({}) },
+      // This remains a legacy/default-off worker regression. The dedicated
+      // native worker gate exercises the actual enabled coordinator separately.
+      '@/lib/crm/nativeEmailPublicationWorker': {
+        touchesNativeEmail: () => true,
+        createNativeEmailPublicationWorker: () => ({ resume: async () => ({ enabled: false, blocked: false }),
+          process: async () => ({ handled: false }) }),
+      },
+      '@/lib/persistence/crmNativeEmailPublication': { createPostgresNativeEmailWorkerPersistence: () => ({}) },
       '@/lib/persistence/crm': { claimSuiteCrmOutboxInPostgres: async () => [{ id: 'outbox', operation, aggregateId: emailId, payload: { ...payload, previousSuiteCrmModule: 'Notes' } }],
         withVerifiedSuiteCrmEmailPublication: async (_item, publish) => publish(),
+        withVerifiedSuiteCrmRecordLifecycle: async () => assert.fail('Email projection requires its Email-specific guard'),
         completeSuiteCrmOutboxInPostgres: async (_item, receipt) => { completed++; forwarded = receipt }, failSuiteCrmOutboxInPostgres: async input => { failed++; assert.match(input.error, /held/); return 'failed' },
         writeSuiteCrmWorkerHeartbeat: async () => undefined },
     })

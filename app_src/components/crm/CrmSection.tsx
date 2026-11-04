@@ -214,6 +214,7 @@ type CrmLifecyclePayload = {
   error?: string
   result?: {
     archived?: boolean
+    suiteCrmDeleteQueued?: boolean
     created?: boolean
     accountReferenceCode?: string
     contactReferenceCode?: string
@@ -222,6 +223,7 @@ type CrmLifecyclePayload = {
 }
 type LifecycleDialog = {
   type: 'archive' | 'convert-lead'
+  entity: CrmEntity
   record: RecordValue
 }
 type EditorHistoryItem = {
@@ -522,6 +524,16 @@ const EMPTY_SUMMARY: CrmSummary = {
 
 function textValue(record: RecordValue, key: string) {
   return String(record[key] ?? '')
+}
+
+function canArchiveCrmRecord(entity: CrmEntity, record: RecordValue | null | undefined, editable: boolean) {
+  if (!editable || !record?.id) return false
+  if (entity === 'organizations') {
+    return !record.workspaceOrganizationId
+      && !['workspace_root', 'workspace_member'].includes(textValue(record, 'relationshipType'))
+  }
+  if (entity === 'contacts') return !record.managedIdentity && !record.appUserEmail && !record.pipelineUser
+  return entity === 'leads' || entity === 'interactions' || entity === 'campaigns'
 }
 
 function idList(value: unknown) {
@@ -1944,6 +1956,7 @@ export default function CrmSection() {
   }
 
   function openLifecycleDialog(type: LifecycleDialog['type'], record: RecordValue) {
+    if (busy || !recordEditable || (type === 'archive' && !canArchiveCrmRecord(editorEntity, record, recordEditable))) return
     setError('')
     setNotice('')
     if (type === 'convert-lead') {
@@ -1957,11 +1970,13 @@ export default function CrmSection() {
     } else {
       setLifecycleFields({})
     }
-    setLifecycleDialog({ type, record })
+    setLifecycleDialog({ type, entity: editorEntity, record })
   }
 
   async function submitLifecycleAction() {
     if (!lifecycleDialog || busy) return
+    if (!recordEditable || lifecycleDialog.entity !== editorEntity || lifecycleDialog.record.id !== editorRecord?.id
+      || (lifecycleDialog.type === 'archive' && !canArchiveCrmRecord(lifecycleDialog.entity, lifecycleDialog.record, recordEditable))) return
     setBusy(true)
     setError('')
     setNotice('')
@@ -1971,7 +1986,7 @@ export default function CrmSection() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: lifecycleDialog.type,
-          entity: editorEntity,
+          entity: lifecycleDialog.entity,
           id: lifecycleDialog.record.id,
           ...(lifecycleDialog.type === 'convert-lead' ? {
             fields: {
@@ -1985,13 +2000,18 @@ export default function CrmSection() {
       const payload = await response.json().catch(() => ({})) as CrmLifecyclePayload
       if (!response.ok || !payload.ok) throw new Error(payload.error || 'CRM lifecycle action failed')
       const wasConversion = lifecycleDialog.type === 'convert-lead'
+      const trashedCustomer = lifecycleDialog.entity === 'organizations' || lifecycleDialog.entity === 'contacts'
       setLifecycleDialog(null)
       setEditorRecord(undefined)
       setUseOrganizationAddress(false)
       setEditorHistory([])
       setNotice(wasConversion
         ? `Lead converted to ${payload.result?.accountReferenceCode}, ${payload.result?.contactReferenceCode}, and ${payload.result?.opportunityReferenceCode}`
-        : `${ENTITY_SINGULAR_LABELS[editorEntity]} archived`)
+        : trashedCustomer
+          ? payload.result?.suiteCrmDeleteQueued
+            ? `${ENTITY_SINGULAR_LABELS[editorEntity]} moved to Trash in ClawPilot; SuiteCRM deletion queued. Activity history is preserved.`
+            : `${ENTITY_SINGULAR_LABELS[editorEntity]} removed from active CRM records. Activity history is preserved.`
+          : `${ENTITY_SINGULAR_LABELS[editorEntity]} archived`)
       await load(entity, query, needsReviewOnly)
     } catch (lifecycleError) {
       setError(lifecycleError instanceof Error ? lifecycleError.message : 'CRM lifecycle action failed')
@@ -3114,7 +3134,8 @@ export default function CrmSection() {
         maxWidth="xs"
         aria-labelledby="crm-lifecycle-title"
       >
-        <DialogTitle id="crm-lifecycle-title">{lifecycleDialog?.type === 'convert-lead' ? 'Convert lead' : 'Archive record'}</DialogTitle>
+        <DialogTitle id="crm-lifecycle-title">{lifecycleDialog?.type === 'convert-lead' ? 'Convert lead'
+          : lifecycleDialog?.entity === 'organizations' || lifecycleDialog?.entity === 'contacts' ? 'Move CRM record to Trash?' : 'Archive record'}</DialogTitle>
         {lifecycleDialog && error && <Alert severity="error" sx={{ mx: 3, mb: 1 }} onClose={() => setError('')}>{error}</Alert>}
         <DialogContent>
           {lifecycleDialog?.type === 'convert-lead' ? (
@@ -3140,11 +3161,19 @@ export default function CrmSection() {
               />
             </Stack>
           ) : (
-            <Typography mt={0.5}>
-              Archive {textValue(lifecycleDialog?.record || {}, 'fullName')
-                || textValue(lifecycleDialog?.record || {}, 'name')
-                || textValue(lifecycleDialog?.record || {}, 'referenceCode')}?
-            </Typography>
+            <Stack spacing={1} mt={0.5}>
+              <Typography fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+                {textValue(lifecycleDialog?.record || {}, 'fullName')
+                  || textValue(lifecycleDialog?.record || {}, 'name')
+                  || textValue(lifecycleDialog?.record || {}, 'subject')}
+              </Typography>
+              <Typography variant="body2">Global ID: {textValue(lifecycleDialog?.record || {}, 'referenceCode') || 'Not assigned'}</Typography>
+              <Typography>
+                {lifecycleDialog?.entity === 'organizations' || lifecycleDialog?.entity === 'contacts'
+                  ? `Move only this ${ENTITY_SINGULAR_LABELS[lifecycleDialog.entity].toLowerCase()} to Trash in ClawPilot and queue deletion of its linked SuiteCRM record? Activity history is kept. Other organizations, contacts, and their records will not be deleted.`
+                  : 'Archive this record?'}
+              </Typography>
+            </Stack>
           )}
         </DialogContent>
         <DialogActions sx={{ flexWrap: 'wrap' }}>
@@ -3156,7 +3185,8 @@ export default function CrmSection() {
             disabled={busy || (lifecycleDialog?.type === 'convert-lead'
               && (!lifecycleFields.accountName?.trim() || !lifecycleFields.opportunityName?.trim()))}
           >
-            {busy ? 'Working…' : lifecycleDialog?.type === 'convert-lead' ? 'Convert' : 'Archive'}
+            {busy ? 'Working…' : lifecycleDialog?.type === 'convert-lead' ? 'Convert'
+              : lifecycleDialog?.entity === 'organizations' || lifecycleDialog?.entity === 'contacts' ? 'Move to Trash' : 'Archive'}
           </Button>
         </DialogActions>
       </Dialog>
@@ -3296,7 +3326,13 @@ export default function CrmSection() {
                   Convert
                 </Button>
               )}
-              {(editorEntity === 'leads' || editorEntity === 'interactions' || editorEntity === 'campaigns') && (
+              {(editorEntity === 'organizations' || editorEntity === 'contacts') && canArchiveCrmRecord(editorEntity, editorRecord, recordEditable) && (
+                <Button color="error" variant="outlined" startIcon={<ArchiveRounded />} disabled={busy}
+                  onClick={() => openLifecycleDialog('archive', editorRecord)}>
+                  Move to Trash
+                </Button>
+              )}
+              {(editorEntity === 'leads' || editorEntity === 'interactions' || editorEntity === 'campaigns') && canArchiveCrmRecord(editorEntity, editorRecord, recordEditable) && (
                 <Tooltip title={`Archive ${ENTITY_SINGULAR_LABELS[editorEntity].toLowerCase()}`}>
                   <IconButton
                     aria-label={`Archive ${ENTITY_SINGULAR_LABELS[editorEntity].toLowerCase()}`}

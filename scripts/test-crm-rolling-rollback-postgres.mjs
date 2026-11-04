@@ -161,6 +161,12 @@ try {
   checks.push('legacy_shared_companies_denied')
 
   const current = fixture.loadCrmPersistence(query, transaction)
+  // The current writer acquires the real native-admission control even with
+  // publication disabled. Keep the legacy-0374 checks above on their original
+  // schema; then retain the actual later schema required by the current writer.
+  // A fake singleton or a mocked lock would not test compatible rollback.
+  await transaction(client => client.query(read('db/migrations/0375_crm_native_email_publication_admission.sql')))
+  assert.equal((await query('SELECT enabled FROM crm_native_email_publication_control WHERE singleton')).rows[0].enabled, false)
   const edit = subject => ({ entity: 'interactions', pipelineId: PIPELINE, localId: first.id,
     sourceKey: shared.interaction.source_key, actorEmail: OWNER, fields: { subject } })
   await current.stageCrmRecordInPostgres(edit('Current compatible writer edit'))

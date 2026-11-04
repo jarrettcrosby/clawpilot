@@ -1,12 +1,15 @@
 import crypto from 'node:crypto'
 import type {PoolClient} from 'pg'
 import {query,withTransaction} from '@/lib/persistence/postgres'
-import {stageCrmRecordWithClient} from '@/lib/persistence/crm'
+import {stageCrmRecordWithClient,updateCrmDescriptionWithClient} from '@/lib/persistence/crm'
+import {lockCrmNativeEmailAuthorityWithClient} from '@/lib/persistence/crmNativeEmailAuthority'
 import type {StageOrganizationInput,StageContactInput} from '@/lib/persistence/crm'
 import {FractionalCrmGatewayError} from '@/lib/fractionalCrmGatewayAuth'
 import type {FractionalCrmPrincipal,FractionalCrmCredential} from '@/lib/fractionalCrmGatewayAuth'
 import {canonicalHash,exactKeys,gatewayGlobalId,gatewayObject,gatewayUuid,gatewayVersion,mapGatewayFields,normalizedEmail,normalizedName,parseGatewayFields} from '@/lib/crm/fractionalGatewayModel'
 import type {GatewayEntity,GatewayFields,GatewayRecord} from '@/lib/crm/fractionalGatewayModel'
+import {fractionalFolderUrl,fractionalFolderState,mergeFractionalCustomerFolder} from '@/lib/crm/fractionalCustomerFolder'
+import type {FractionalCrmFolderPatch} from '@/lib/fractionalCrmGatewayHttp'
 
 type Row=Record<string,unknown>
 type Context={principal:FractionalCrmPrincipal;root:Row;actorEmail:string}
@@ -31,8 +34,9 @@ async function context(client:PoolClient,supplied:FractionalCrmPrincipal,capabil
  if(!p.capabilities.includes(capability))fail(403,'CAPABILITY_DENIED')
  const bound=(await client.query(`SELECT ps.id FROM pipeline_spaces ps JOIN workspace_organizations wo ON wo.id=ps.workspace_organization_id
   JOIN app_user_organization_memberships m ON m.organization_id=wo.id AND m.user_email=$3 JOIN app_users u ON u.email=m.user_email
-  WHERE ps.id=$1::uuid AND wo.id=$2::uuid AND wo.parent_id IS NULL AND NOT ps.reference_access_disabled
-    AND m.status='active' AND m.role IN ('owner','admin') AND u.status='active' FOR SHARE OF ps,wo,m,u`,[p.pipelineId,p.workspaceOrganizationId,p.actorEmail])).rows[0]
+  WHERE ps.id=$1::uuid AND wo.id=$2::uuid AND wo.parent_id IS NULL AND NOT wo.is_demo AND NOT ps.reference_access_disabled
+    AND m.status='active' AND m.trashed_at IS NULL AND m.role IN ('owner','admin') AND u.status='active'
+    AND (m.role='owner' OR COALESCE((m.permissions->>'viewCrm')::boolean,true)) FOR SHARE OF ps,wo,m,u`,[p.pipelineId,p.workspaceOrganizationId,p.actorEmail])).rows[0]
  if(!bound)fail(404,'RECORD_NOT_FOUND')
  if(lockRecords){await client.query("SET LOCAL lock_timeout='3s'");await client.query('LOCK TABLE crm_organizations,crm_contacts IN EXCLUSIVE MODE')}
  const root=(await client.query('SELECT * FROM crm_organizations WHERE pipeline_id=$1::uuid AND reference_code=$2 FOR SHARE',[p.pipelineId,p.rootCompanyGlobalId])).rows[0]
@@ -121,7 +125,7 @@ function originalContact(row:Row,parent:Row):StageContactInput['fields']{return 
 async function stageFieldsUnsafe(client:PoolClient,ctx:Context,entity:GatewayEntity,row:Row|undefined,parent:Row,fields:GatewayFields,actor:unknown,createKey?:string){
  const meta={...gatewayObject(row?.source_payload??{}),fractionalGateway:{credentialId:ctx.principal.credentialId,assertedActor:actor}}
  if(entity==='company'){
- const base=row?originalCompany(row):{name:fields.companyName!,parentOrganizationId:str(parent,'id'),relationshipType:'customer' as const}
+ const base=row?originalCompany(row):{name:fields.companyName!,parentOrganizationId:str(parent,'id'),relationshipType:'customer' as const,accountType:'Customer'}
  const map:Record<string,keyof StageOrganizationInput['fields']>={companyName:'name',website:'website',email:'email',phone:'phone',city:'city',region:'state',postalCode:'postalCode',countryCode:'country'}
  for(const [key,target] of Object.entries(map))if(Object.hasOwn(fields,key))Object.assign(base,{[target]:fields[key]??''})
  if(Object.hasOwn(fields,'addressLine1')||Object.hasOwn(fields,'addressLine2')){
@@ -160,6 +164,70 @@ async function update(p:FractionalCrmPrincipal,entity:GatewayEntity,ga:string,gc
  })}
 export const updateFractionalCrmCompany=(p:FractionalCrmPrincipal,ga:string,input:WriteInput)=>update(p,'company',ga,undefined,input)
 export const updateFractionalCrmContact=(p:FractionalCrmPrincipal,ga:string,gc:string,input:WriteInput)=>update(p,'contact',ga,gc,input)
+
+type FolderBinding={last_published_url:string|null;source_instance_id:string;fractional_deployment_id:string;fractional_organization_id:string;customer_id:string}
+function folderParse<T>(fn:()=>T):T{try{return fn()}catch(error){
+ const code=error instanceof Error?error.message:''
+ return fail(code==='FOLDER_DESCRIPTION_REPAIR_REQUIRED'||code==='FOLDER_MANUAL_REVIEW_REQUIRED'?409:422,
+  ['FOLDER_DESCRIPTION_REPAIR_REQUIRED','FOLDER_MANUAL_REVIEW_REQUIRED'].includes(code)?code:'INVALID_FOLDER_URL')
+}}
+async function folderMapping(client:PoolClient,ctx:Context,row:Row,customerId:string){
+ if(!customerId||customerId.length>200||/[\u0000-\u001f\u007f]/u.test(customerId))fail(422,'INVALID_ACTOR')
+ if(row.workspace_organization_id||str(row,'account_type').trim().toLowerCase()!=='customer')fail(403,'MANAGED_RECORD')
+ const p=ctx.principal,mapping=(await client.query(`SELECT * FROM fractional_crm_source_mappings
+  WHERE source_instance_id=$1::uuid AND fractional_deployment_id=$2::uuid AND fractional_organization_id=$3
+   AND customer_id=$4 AND entity='company' AND local_id=$4 FOR SHARE`,
+ [p.sourceInstanceId,p.fractionalDeploymentId,p.fractionalOrganizationId,customerId])).rows[0]
+ if(!mapping||mapping.record_id!==row.id||mapping.global_id!==row.reference_code||mapping.company_global_id!==row.reference_code
+  ||mapping.pipeline_id!==p.pipelineId||mapping.workspace_organization_id!==p.workspaceOrganizationId||mapping.root_company_global_id!==p.rootCompanyGlobalId)fail(404,'RECORD_NOT_FOUND')
+ const binding=(await client.query<FolderBinding>('SELECT * FROM crm_fractional_customer_folders WHERE account_id=$1::uuid FOR SHARE',[row.id])).rows[0]??null
+ if(binding&&(binding.source_instance_id!==p.sourceInstanceId||binding.fractional_deployment_id!==p.fractionalDeploymentId
+  ||binding.fractional_organization_id!==p.fractionalOrganizationId||binding.customer_id!==customerId))fail(409,'FOLDER_BINDING_CONFLICT')
+ return binding
+}
+function folderEnvelope(ctx:Context,row:Row,customerId:string,binding:FolderBinding|null){
+ const state=folderParse(()=>fractionalFolderState(str(row,'description'),binding?{lastPublishedUrl:binding.last_published_url}:null))
+ const record={schemaVersion:1 as const,entity:'customer-folder' as const,sourceInstanceId:ctx.principal.sourceInstanceId,
+  scope:scope(ctx),recordId:str(row,'id'),globalId:str(row,'reference_code'),customerId,...state}
+ // The exact current description participates in CAS so unrelated notes or
+ // administrator edits cannot be overwritten by an old source snapshot.
+ return {...record,version:canonicalHash({record,description:str(row,'description'),binding})}
+}
+export async function readFractionalCrmCustomerFolder(p:FractionalCrmPrincipal,ga:string,customerId:string){return withTransaction(async client=>{
+ const ctx=await context(client,p,'crm.company.read'),row=await companyRow(client,ctx,ga)
+ if(row.reference_code!==ga)fail(409,'IDENTITY_CONFLICT')
+ const binding=await folderMapping(client,ctx,row,customerId)
+ return folderEnvelope(ctx,row,customerId,binding)
+})}
+export async function updateFractionalCrmCustomerFolder(p:FractionalCrmPrincipal,ga:string,input:FractionalCrmFolderPatch){return withTransaction(async client=>{
+ await lockCrmNativeEmailAuthorityWithClient(client)
+ await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`crm-record-lifecycle:${p.pipelineId}`])
+ const ctx=await context(client,p,'crm.company.write',true),actor=parse(()=>gatewayObject(input.assertedFractionalActor))
+ parse(()=>exactKeys(actor,['userId','organizationId','customerId']))
+ if(input.schemaVersion!==1||actor.organizationId!==ctx.principal.fractionalOrganizationId
+  ||Object.values(actor).length!==3||Object.values(actor).some(v=>typeof v!=='string'||!v||v.length>200||/[\u0000-\u001f\u007f]/u.test(v)))fail(422,'INVALID_ACTOR')
+ const customerId=String(actor.customerId),folderUrl=folderParse(()=>fractionalFolderUrl(input.folderUrl))
+ const row=await companyRow(client,ctx,ga,true)
+ if(row.reference_code!==ga)fail(409,'IDENTITY_CONFLICT')
+ const binding=await folderMapping(client,ctx,row,customerId),before=folderEnvelope(ctx,row,customerId,binding)
+ // Authorization, live source mapping and immutable account binding are
+ // checked before a historical receipt can be replayed.
+ return operation(client,ctx,input.idempotencyKey,'update-customer-folder',{ga,ifMatch:input.ifMatch,folderUrl,actor},async()=>{
+  if(input.ifMatch!==before.version)fail(412,'VERSION_CONFLICT')
+  const description=folderParse(()=>mergeFractionalCustomerFolder({description:str(row,'description'),folderUrl,
+   previous:binding?{lastPublishedUrl:binding.last_published_url}:null}))
+  if(description!==str(row,'description')){
+   const staged=await updateCrmDescriptionWithClient(client,{entity:'organizations',pipelineId:p.pipelineId,id:str(row,'id'),description,actorEmail:ctx.actorEmail})
+   if(staged.id!==row.id||staged.referenceCode!==ga)fail(409,'CANONICAL_WRITE_MISMATCH')
+  }
+  await client.query(`INSERT INTO crm_fractional_customer_folders(account_id,source_instance_id,fractional_deployment_id,
+   fractional_organization_id,customer_id,local_id,last_published_url) VALUES($1,$2,$3,$4,$5,$5,$6)
+   ON CONFLICT(account_id) DO UPDATE SET last_published_url=EXCLUDED.last_published_url,updated_at=now()`,
+  [row.id,p.sourceInstanceId,p.fractionalDeploymentId,p.fractionalOrganizationId,customerId,folderUrl])
+  const after=await companyRow(client,ctx,ga,true),saved=await folderMapping(client,ctx,after,customerId)
+  return folderEnvelope(ctx,after,customerId,saved)
+ })
+})}
 
 type OnboardingInput={schemaVersion:1;sourceInstanceId:string;origin:{deploymentId:string;organizationId:string;customerId:string;contactId?:string;onboardingId:string};
  company:{globalId:string|null;verifiedIdentifiers:{scheme:string;value:string;evidenceId:string}[];fields:GatewayFields};contact?:{globalId:string|null;fields:GatewayFields};
@@ -253,6 +321,29 @@ export async function resolveOrCreateFractionalCrmOnboarding(p:FractionalCrmPrin
  const companyRecord=envelope(ctx,'company',chosenCompany!,chosenCompany!,input.company.globalId??str(chosenCompany!,'reference_code'))
  if(companyCreated&&Object.entries(input.company.fields).some(([k,v])=>companyRecord.unavailableFields.includes(k)||companyRecord.fields[k]!==v))fail(409,'CANONICAL_WRITE_MISMATCH')
  await mapSource(client,ctx,input,'company',chosenCompany!,chosenCompany!,operationId)
+ // A newly created Fractional customer still needs its independent BPO folder.
+ // Queue only this exact, newly staged and source-bound Account, under an
+ // already enabled administrator-approved BPO configuration. Reuse, replay,
+ // ordinary profile edits and later Fractional URL publication never enroll
+ // historical customers or restart provisioning. The worker independently
+ // rechecks configuration, account lifecycle and editor authority.
+ if(companyCreated)await client.query(`INSERT INTO crm_customer_folder_jobs(
+   account_id,pipeline_id,workspace_id,account_global_id,actor_email,config_revision)
+  SELECT o.id,p.id,w.id,o.reference_code,$3,s.revision
+  FROM crm_organizations o JOIN pipeline_spaces p ON p.id=o.pipeline_id
+  JOIN workspace_organizations w ON w.id=p.workspace_organization_id
+  JOIN crm_customer_folder_settings s ON s.workspace_id=w.id AND s.enabled
+  JOIN fractional_crm_source_mappings mapping ON mapping.record_id=o.id AND mapping.entity='company'
+    AND mapping.global_id=o.reference_code AND mapping.company_global_id=o.reference_code
+    AND mapping.pipeline_id=p.id AND mapping.workspace_organization_id=w.id
+  WHERE o.id=$1::uuid AND p.id=$2::uuid AND w.id=$4::uuid
+    AND mapping.source_instance_id=$5::uuid AND mapping.fractional_deployment_id=$6::uuid
+    AND mapping.fractional_organization_id=$7 AND mapping.customer_id=$8 AND mapping.local_id=$8
+    AND mapping.root_company_global_id=$9 AND NOT p.reference_access_disabled AND NOT w.is_demo
+    AND o.workspace_organization_id IS NULL AND lower(btrim(o.account_type))='customer'
+    AND COALESCE(lower(o.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
+  ON CONFLICT(account_id) DO NOTHING`,[chosenCompany!.id,p.pipelineId,ctx.actorEmail,p.workspaceOrganizationId,
+   p.sourceInstanceId,p.fractionalDeploymentId,p.fractionalOrganizationId,input.origin.customerId,p.rootCompanyGlobalId])
  let contactResult:Row|undefined
  if(input.contact&&chosenContact){const record=envelope(ctx,'contact',chosenContact,chosenCompany!,input.contact.globalId??str(chosenContact,'reference_code'))
  if(contactCreated&&Object.entries(input.contact.fields).some(([k,v])=>record.unavailableFields.includes(k)||record.fields[k]!==v))fail(409,'CANONICAL_WRITE_MISMATCH')

@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import { createDisposablePostgresRuntime, disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
 
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import {
   actorEmail,
@@ -20,7 +19,6 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const { Pool } = requireFromApp('pg')
-const root = process.cwd()
 const disposablePostgresImage = String(
   process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
 ).trim()
@@ -39,6 +37,17 @@ const topics = [
   'orders/paid',
   'orders/fulfilled',
   'orders/partially_fulfilled',
+]
+
+const laterNativeMembershipPhases = [
+  { migration: '0393_crm_root_employee_read_context.sql', previous: '0383_crm_native_email_user_eligibility.sql',
+    triggers: ['crm_root_membership_sessions', 'crm_root_membership_changed_sessions'] },
+  { migration: '0394_crm_native_root_source_fences.sql', previous: '0393_crm_root_employee_read_context.sql',
+    triggers: ['crm_native_root_membership_source'] },
+  { migration: '0397_crm_native_root_registry_changes.sql', previous: '0394_crm_native_root_source_fences.sql',
+    triggers: ['crm_native_root_registry_member_snapshot'] },
+  { migration: '0398_crm_native_email_initial_enrollment.sql', previous: '0397_crm_native_root_registry_changes.sql',
+    triggers: ['crm_native_initial_source_fence', 'crm_native_initial_source_update_fence'] },
 ]
 const includeFields = ['admin_graphql_api_id', 'updated_at']
 
@@ -124,8 +133,24 @@ async function expectHealthChecksumFallthroughRejected(
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    // This fixture reconstructs a pre-0375 trigger phase inside a rolled-back
+    // transaction. Later CRM guards/journal rows cannot remain installed while
+    // claiming that the old complete catalog has been restored.
+    await client.query(`
+      DROP TRIGGER crm_native_email_workspace_member_authority ON public.app_user_organization_memberships;
+      DROP TRIGGER crm_native_email_workspace_member_statement ON public.app_user_organization_memberships;
+      DROP TRIGGER crm_native_email_workspace_member_update_statement ON public.app_user_organization_memberships;
+      DROP TRIGGER crm_native_email_workspace_trash_metadata_statement ON public.app_user_organization_memberships
+    `)
+    // Reconstruct the exact older catalog, not an old ledger label over new
+    // triggers. Every change is rolled back before normal safety exercises.
+    for (const phase of laterNativeMembershipPhases) for (const trigger of phase.triggers) {
+      await client.query(`DROP TRIGGER ${trigger} ON public.app_user_organization_memberships`)
+    }
     await client.query(prepareOlderPhaseSql)
-    for (const filename of hiddenMigrations) {
+    for (const filename of [...hiddenMigrations,
+      '0375_crm_native_email_publication_admission.sql', '0383_crm_native_email_user_eligibility.sql',
+      ...laterNativeMembershipPhases.map(phase => phase.migration)]) {
       await client.query(
         `UPDATE public.schema_migrations
          SET filename = $2
@@ -294,6 +319,17 @@ async function exercise(pool) {
        AS applied`,
   )
   assert.equal(healthyMigration.rows[0].applied, true)
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `DROP TRIGGER protect_shopify_order_webhook_command_write
+       ON public.operations_shopify_order_webhook_commands;
+     CREATE TRIGGER protect_shopify_order_webhook_command_write BEFORE UPDATE
+       ON public.operations_shopify_order_webhook_commands FOR EACH ROW
+       WHEN (OLD.id IS DISTINCT FROM NEW.id)
+       EXECUTE FUNCTION public.protect_shopify_order_webhook_command()`,
+    'changed required trigger with OLD/NEW qualification must return false, not a deparser error',
+  )
   await expectHealthTamper(
     pool,
     health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
@@ -1091,6 +1127,7 @@ async function main() {
   const container = (
     `clawpilot-order-webhook-0303-${process.pid}-${randomUUID().slice(0, 8)}`
   )
+  const runtime = createDisposablePostgresRuntime()
   try {
     command('docker', disposablePostgresDockerArgs([
       'run', '--rm', '-d', '--name', container,
@@ -1098,7 +1135,7 @@ async function main() {
       '-e', 'POSTGRES_DB=order_webhook_0303',
       '-p', '127.0.0.1::5432',
       disposablePostgresImage,
-    ]), { timeout: 180_000 })
+    ], { runtime }), { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
@@ -1147,6 +1184,68 @@ async function main() {
             true,
             `Shopify webhook reconciliation health changed after ${file}`,
           )
+          if (file === '0375_crm_native_email_publication_admission.sql') {
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              'ALTER TABLE public.app_user_organization_memberships DISABLE TRIGGER crm_native_email_workspace_member_authority',
+              'disabled native membership authority trigger')
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              "UPDATE public.schema_migrations SET checksum=repeat('0',64) WHERE filename='0375_crm_native_email_publication_admission.sql'",
+              'forged native admission migration checksum')
+          }
+          if (file === '0383_crm_native_email_user_eligibility.sql') {
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              'DROP TRIGGER crm_native_email_workspace_trash_metadata_statement ON public.app_user_organization_memberships',
+              'missing native trash metadata guard')
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              "UPDATE public.schema_migrations SET checksum=repeat('0',64) WHERE filename='0383_crm_native_email_user_eligibility.sql'",
+              'forged native eligibility migration checksum')
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              "DELETE FROM public.schema_migrations WHERE filename='0375_crm_native_email_publication_admission.sql'",
+              'missing native admission prerequisite after eligibility migration')
+          }
+          const laterPhase = laterNativeMembershipPhases.find(phase => phase.migration === file)
+          if (laterPhase) {
+            if (file === '0393_crm_root_employee_read_context.sql') {
+              await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+                `DROP TRIGGER crm_root_membership_changed_sessions ON public.app_user_organization_memberships;
+                 CREATE TRIGGER crm_root_membership_changed_sessions AFTER UPDATE
+                   ON public.app_user_organization_memberships FOR EACH ROW
+                   WHEN (OLD.user_email IS DISTINCT FROM NEW.user_email)
+                   EXECUTE FUNCTION public.clawpilot_crm_root_revoke_ineligible_sessions()`,
+                'changed only OLD/NEW qualification of exact native membership trigger')
+            }
+            for (const trigger of laterPhase.triggers) {
+              await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+                `ALTER TABLE public.app_user_organization_memberships DISABLE TRIGGER ${trigger}`,
+                `disabled exact ${file} trigger ${trigger}`)
+              await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+                `DROP TRIGGER ${trigger} ON public.app_user_organization_memberships`,
+                `missing exact ${file} trigger ${trigger}`)
+              await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+                `ALTER TABLE public.app_user_organization_memberships ENABLE ALWAYS TRIGGER ${trigger}`,
+                `changed replica execution mode for ${file} trigger ${trigger}`)
+            }
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              `UPDATE public.schema_migrations SET checksum=repeat('0',64) WHERE filename='${file}'`,
+              `forged exact native phase checksum ${file}`)
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              `DELETE FROM public.schema_migrations WHERE filename='${file}'`,
+              `missing current exact native phase ledger ${file}`)
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              `DELETE FROM public.schema_migrations WHERE filename='${laterPhase.previous}'`,
+              `missing exact native phase prerequisite ${laterPhase.previous} after ${file}`)
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              `CREATE TRIGGER zzz_unreviewed_membership_catalog_trigger BEFORE INSERT
+                 ON public.app_user_organization_memberships FOR EACH STATEMENT
+                 EXECUTE FUNCTION public.clawpilot_native_email_transition_lock()`,
+              `unreviewed extra membership trigger after ${file}`)
+            const first = laterPhase.triggers[0]
+            await expectHealthTamper(pool, health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+              `DROP TRIGGER ${first} ON public.app_user_organization_memberships;
+               CREATE TRIGGER ${first} BEFORE INSERT ON public.app_user_organization_memberships
+                 FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_native_email_transition_lock()`,
+              `rebound or changed event for exact membership trigger after ${file}`)
+          }
         }
       } finally {
         client.release()
@@ -1156,11 +1255,8 @@ async function main() {
       await pool.end()
     }
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 20_000,
-    })
+    assert.equal(runtime.cleanup(), true,
+      'Exact guarded webhook database and lease cleanup must finish before the next fixture')
   }
   console.log('Shopify order webhook reconciliation PostgreSQL safety tests passed')
 }

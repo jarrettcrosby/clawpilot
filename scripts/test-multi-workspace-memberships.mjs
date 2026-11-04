@@ -100,7 +100,8 @@ const sessions = read('app_src/lib/authSessions.ts')
 for (const fragment of [
   'activeWorkspaceOrganizationId',
   'activeWorkspacePermissions',
-  'session.active_workspace_organization_id::text',
+  'COALESCE(session.crm_view_workspace_organization_id,session.active_workspace_organization_id)::text AS active_workspace_organization_id',
+  'root_access.source_workspace_id=session.active_workspace_organization_id',
   'JOIN app_user_organization_memberships active_membership',
   'active_membership.organization_id = session.active_workspace_organization_id',
   'organizationId?: string | null',

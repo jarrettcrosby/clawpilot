@@ -1,0 +1,1158 @@
+{
+    "version": 1,
+    "purpose": "clawpilot-native-email-initial-install-profile",
+    "profile": "suitecrm-8.10.1-mariadb-11.4.13-v1",
+    "sqlSources": {
+        "publication-schema.sql": "85cef2bc9478b306661e972ee444c03d1fd5c095c327518a774e247527b9bcd3",
+        "authority-transition-schema.sql": "7603d19bd25fefb2a837e50be5d90ec6d11837dd0a2bdf563b2c5509d119c9c3",
+        "initial-enrollment-schema.sql": "2158ec43bbbcbfc521e8f35743fd6c5c0f7929b9f7aff279b0b22df378a7f8e0"
+    },
+    "environment": {
+        "server": {
+            "serverVersion": "11.4.13-MariaDB-ubu2404",
+            "sqlMode": "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION",
+            "characterSetConnection": "utf8mb4",
+            "collationConnection": "utf8mb4_uca1400_ai_ci",
+            "lowerCaseTableNames": 0,
+            "foreignKeyChecks": 1,
+            "uniqueChecks": 1
+        },
+        "databaseDefaults": {
+            "characterSet": "utf8mb3",
+            "collation": "utf8mb3_general_ci"
+        }
+    },
+    "verificationEnvironment": {
+        "server": {
+            "serverVersion": "11.4.13-MariaDB-ubu2404",
+            "sqlMode": "ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION",
+            "characterSetConnection": "utf8mb3",
+            "collationConnection": "utf8mb3_general_ci",
+            "lowerCaseTableNames": 0,
+            "foreignKeyChecks": 1,
+            "uniqueChecks": 1
+        },
+        "databaseDefaults": {
+            "characterSet": "utf8mb3",
+            "collation": "utf8mb3_general_ci"
+        }
+    },
+    "tables": {
+        "clawpilot_email_bindings": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_bindings` (\n  `pipeline_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `workspace_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `group_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `generation` bigint(20) unsigned NOT NULL,\n  `owner_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `readers_json` text NOT NULL,\n  `audience_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `policy_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `runtime_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `capability_policy_json` mediumtext DEFAULT NULL,\n  `capability_policy_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,\n  `enabled` tinyint(4) NOT NULL DEFAULT 0,\n  PRIMARY KEY (`pipeline_id`),\n  UNIQUE KEY `group_id` (`group_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "workspace_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "group_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "generation",
+                    "COLUMN_TYPE": "bigint(20) unsigned",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "owner_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "readers_json",
+                    "COLUMN_TYPE": "text",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 65535,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "audience_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 8,
+                    "COLUMN_NAME": "policy_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 9,
+                    "COLUMN_NAME": "runtime_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 10,
+                    "COLUMN_NAME": "capability_policy_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 11,
+                    "COLUMN_NAME": "capability_policy_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 12,
+                    "COLUMN_NAME": "enabled",
+                    "COLUMN_TYPE": "tinyint(4)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": "0",
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "group_id",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "group_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                },
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "group_id",
+                    "CONSTRAINT_TYPE": "UNIQUE"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_identities": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_identities` (\n  `email_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `global_id` varchar(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `local_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `pipeline_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `workspace_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `app_archived` tinyint(4) NOT NULL,\n  `capabilities_json` mediumtext DEFAULT NULL,\n  PRIMARY KEY (`email_id`),\n  UNIQUE KEY `global_id` (`global_id`),\n  UNIQUE KEY `local_id` (`local_id`),\n  KEY `cp_email_pipeline` (`pipeline_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "email_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "global_id",
+                    "COLUMN_TYPE": "varchar(32)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 32,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "local_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "workspace_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "app_archived",
+                    "COLUMN_TYPE": "tinyint(4)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "capabilities_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "cp_email_pipeline",
+                    "NON_UNIQUE": 1,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                },
+                {
+                    "INDEX_NAME": "global_id",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "global_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                },
+                {
+                    "INDEX_NAME": "local_id",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "local_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                },
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "email_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "global_id",
+                    "CONSTRAINT_TYPE": "UNIQUE"
+                },
+                {
+                    "CONSTRAINT_NAME": "local_id",
+                    "CONSTRAINT_TYPE": "UNIQUE"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_operations": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_operations` (\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `command_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `pipeline_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `email_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `state` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `result_json` mediumtext DEFAULT NULL,\n  `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),\n  PRIMARY KEY (`operation_id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`state` in ('committed','cancelled'))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "command_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "email_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "state",
+                    "COLUMN_TYPE": "varchar(16)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "result_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "created_at",
+                    "COLUMN_TYPE": "datetime(6)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": "current_timestamp(6)",
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_1",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_authority_approvals": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_authority_approvals` (\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `transition_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `command_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `desired_app_change_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `phase` varchar(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `service_user_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `oauth_client_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `app_commit_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,\n  `proof_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `proof_json` text NOT NULL,\n  `proof_signature` varchar(512) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `expires_at` datetime(6) NOT NULL,\n  `revoked` tinyint(4) NOT NULL DEFAULT 0,\n  PRIMARY KEY (`operation_id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`phase` in ('revoke','grant')),\n  CONSTRAINT `CONSTRAINT_2` CHECK (`phase` <> 'grant' or `app_commit_fingerprint` is not null)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "transition_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "command_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "desired_app_change_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "phase",
+                    "COLUMN_TYPE": "varchar(8)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 8,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "service_user_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "oauth_client_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 8,
+                    "COLUMN_NAME": "app_commit_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 9,
+                    "COLUMN_NAME": "proof_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 10,
+                    "COLUMN_NAME": "proof_json",
+                    "COLUMN_TYPE": "text",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 65535,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 11,
+                    "COLUMN_NAME": "proof_signature",
+                    "COLUMN_TYPE": "varchar(512)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 512,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 12,
+                    "COLUMN_NAME": "expires_at",
+                    "COLUMN_TYPE": "datetime(6)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 13,
+                    "COLUMN_NAME": "revoked",
+                    "COLUMN_TYPE": "tinyint(4)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": "0",
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_1",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_2",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_authority_operations": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_authority_operations` (\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `transition_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `command_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `phase` varchar(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `state` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `result_json` mediumtext DEFAULT NULL,\n  `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),\n  PRIMARY KEY (`operation_id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`phase` in ('revoke','grant')),\n  CONSTRAINT `CONSTRAINT_2` CHECK (`state` in ('committed','cancelled')),\n  CONSTRAINT `CONSTRAINT_3` CHECK (`state` = 'committed' = (`result_json` is not null))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "transition_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "command_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "phase",
+                    "COLUMN_TYPE": "varchar(8)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 8,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "state",
+                    "COLUMN_TYPE": "varchar(16)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "result_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "YES",
+                    "COLUMN_DEFAULT": "NULL",
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "created_at",
+                    "COLUMN_TYPE": "datetime(6)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": "current_timestamp(6)",
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_1",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_2",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_3",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_write_scopes": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_write_scopes` (\n  `pipeline_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `command_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  PRIMARY KEY (`pipeline_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "command_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_write_permissions": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_write_permissions` (\n  `email_id` char(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `pipeline_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `capabilities_json` mediumtext NOT NULL,\n  `source_kind` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `command_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  PRIMARY KEY (`email_id`),\n  KEY `cp_email_write_pipeline` (`pipeline_id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`source_kind` in ('authority','publication'))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "email_id",
+                    "COLUMN_TYPE": "char(36)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 36,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLUMN_TYPE": "varchar(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "capabilities_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "source_kind",
+                    "COLUMN_TYPE": "varchar(16)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "command_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "cp_email_write_pipeline",
+                    "NON_UNIQUE": 1,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "pipeline_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                },
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "email_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_1",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        },
+        "clawpilot_email_initial_enrollments": {
+            "table": {
+                "ENGINE": "InnoDB",
+                "TABLE_TYPE": "BASE TABLE",
+                "ROW_FORMAT": "Dynamic",
+                "TABLE_COLLATION": "utf8mb3_general_ci",
+                "CREATE_OPTIONS": ""
+            },
+            "create": "CREATE TABLE `clawpilot_email_initial_enrollments` (\n  `operation_id` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `plan_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `delta_fingerprint` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `approval_hash` char(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `approval_json` mediumtext NOT NULL,\n  `receipt_json` mediumtext NOT NULL,\n  `state` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,\n  `created_at` datetime(6) NOT NULL DEFAULT current_timestamp(6),\n  PRIMARY KEY (`operation_id`),\n  CONSTRAINT `CONSTRAINT_1` CHECK (`state` in ('committed','cancelled'))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci",
+            "columns": [
+                {
+                    "ORDINAL_POSITION": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 2,
+                    "COLUMN_NAME": "plan_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 3,
+                    "COLUMN_NAME": "delta_fingerprint",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 4,
+                    "COLUMN_NAME": "approval_hash",
+                    "COLUMN_TYPE": "char(64)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 64,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 5,
+                    "COLUMN_NAME": "approval_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 6,
+                    "COLUMN_NAME": "receipt_json",
+                    "COLUMN_TYPE": "mediumtext",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16777215,
+                    "CHARACTER_SET_NAME": "utf8mb3",
+                    "COLLATION_NAME": "utf8mb3_general_ci",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 7,
+                    "COLUMN_NAME": "state",
+                    "COLUMN_TYPE": "varchar(16)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": null,
+                    "CHARACTER_MAXIMUM_LENGTH": 16,
+                    "CHARACTER_SET_NAME": "ascii",
+                    "COLLATION_NAME": "ascii_bin",
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                },
+                {
+                    "ORDINAL_POSITION": 8,
+                    "COLUMN_NAME": "created_at",
+                    "COLUMN_TYPE": "datetime(6)",
+                    "IS_NULLABLE": "NO",
+                    "COLUMN_DEFAULT": "current_timestamp(6)",
+                    "CHARACTER_MAXIMUM_LENGTH": null,
+                    "CHARACTER_SET_NAME": null,
+                    "COLLATION_NAME": null,
+                    "EXTRA": "",
+                    "GENERATION_EXPRESSION": null
+                }
+            ],
+            "indexes": [
+                {
+                    "INDEX_NAME": "PRIMARY",
+                    "NON_UNIQUE": 0,
+                    "SEQ_IN_INDEX": 1,
+                    "COLUMN_NAME": "operation_id",
+                    "COLLATION": "A",
+                    "SUB_PART": null,
+                    "NULLABLE": "",
+                    "INDEX_TYPE": "BTREE",
+                    "INDEX_COMMENT": "",
+                    "IGNORED": "NO"
+                }
+            ],
+            "constraints": [
+                {
+                    "CONSTRAINT_NAME": "CONSTRAINT_1",
+                    "CONSTRAINT_TYPE": "CHECK"
+                },
+                {
+                    "CONSTRAINT_NAME": "PRIMARY",
+                    "CONSTRAINT_TYPE": "PRIMARY KEY"
+                }
+            ]
+        }
+    }
+}

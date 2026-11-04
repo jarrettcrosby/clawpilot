@@ -43,6 +43,7 @@ export class GoogleWorkspaceClientError extends Error {
     readonly status = 502,
     readonly code = 'GOOGLE_WORKSPACE_UPSTREAM_FAILED',
     readonly retryable = false,
+    readonly upstreamStatus?: number,
   ) {
     super(message)
     this.name = 'GoogleWorkspaceClientError'
@@ -168,6 +169,7 @@ function upstreamError(status: number, details: GoogleUpstreamErrorDetails = { r
       `Google rejected the integration request${reason}${detail}`,
       422,
       'GOOGLE_REQUEST_REJECTED',
+      false, status,
     )
   }
   if (status === 401 || status === 403) {
@@ -175,6 +177,7 @@ function upstreamError(status: number, details: GoogleUpstreamErrorDetails = { r
       `Google denied access for the configured service account${reason}${detail}`,
       422,
       'GOOGLE_ACCESS_DENIED',
+      false, status,
     )
   }
   if (status === 404) {
@@ -182,6 +185,7 @@ function upstreamError(status: number, details: GoogleUpstreamErrorDetails = { r
       'The managed Google Workspace resource was not found',
       409,
       'GOOGLE_RESOURCE_NOT_FOUND',
+      false, status,
     )
   }
   return new GoogleWorkspaceClientError(
@@ -189,6 +193,7 @@ function upstreamError(status: number, details: GoogleUpstreamErrorDetails = { r
     502,
     'GOOGLE_WORKSPACE_UPSTREAM_FAILED',
     RETRYABLE_STATUSES.has(status),
+    status,
   )
 }
 

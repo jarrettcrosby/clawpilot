@@ -26,12 +26,22 @@ function lifecycleDigest(array $value): string { return hash('sha256', json_enco
 function lifecycleRuntimeDigest(): string
 {
     $manifest = json_decode((string) file_get_contents('/app/native-remediation-patch-hashes.json'), true, 32, JSON_THROW_ON_ERROR);
-    $expected = ['Api/V8/Service/ModuleService.php','Api/V8/Service/RelationshipService.php',
-        'modules/Emails/EmailUIAjax.php','modules/Emails/Email.php','include/SugarFolders/SugarFolders.php'];
-    $paths = array_map(static fn ($path) => '/app/public/legacy/'.$path, $expected);
+    $expected = [
+        'Api/V8/Service/ModuleService.php'=>'d782d797c21cc5d481d71b8293caa3c7533e25243568c89fae06e11b52bfca41',
+        'Api/V8/Service/RelationshipService.php'=>'090e532de833e4c6c8d18b83901665b79e39141506a217923b7c4f4228ae3587',
+        'modules/Emails/EmailUIAjax.php'=>'fc4ae1c13879933904f1cc6885d2867daab2002cf9fc81cad69217f8e352e70d',
+        'modules/Emails/Email.php'=>'ecf478158789089a3c9eefc81ec715a4195915a9444d0f7b17db78ac2d32f766',
+        'include/SugarFolders/SugarFolders.php'=>'1a382a05b92b6a1dbba0a48a27f72c731cb16a3153f743c4756f8693a5e086d6',
+        'modules/SecurityGroups/SecurityGroup.php'=>'da20649972446f5810ae293fc3434649df7086796917e4f9684ec9e3140aad65',
+    ];
+    $paths = array_map(static fn ($path) => '/app/public/legacy/'.$path, array_keys($expected));
     sort($paths, SORT_STRING); $actual = array_keys($manifest); sort($actual, SORT_STRING);
-    must($actual === $paths, 'Exactly the five prepared candidate files must be attested');
-    foreach ($manifest as $path => $hash) must(hash_equals($hash, hash_file('sha256', $path)), 'Prepared native file drift');
+    must($actual === $paths, 'Exactly the six prepared candidate files must be attested');
+    foreach ($expected as $relative => $hash) {
+        $path='/app/public/legacy/'.$relative;
+        must(is_string($manifest[$path]) && hash_equals($hash,$manifest[$path])
+            && is_file($path) && !is_link($path) && hash_equals($hash,hash_file('sha256',$path)), 'Prepared native file drift');
+    }
     return lifecycleDigest([$manifest, hash_file('sha256', '/fixture/remediation-read-scope.php')]);
 }
 
@@ -50,7 +60,7 @@ function lifecycleProfile(): void
     }
     $pins = [
         'data/SugarBean.php' => '5edf1050ee0ad01c1de57f235ebae55bab2e5476f58d979ebfc8eb14fc155547',
-        'modules/SecurityGroups/SecurityGroup.php' => '00d612b04975cabce25ad7f441af0d6529a04bfe854bea1efbd42b916083ff76',
+        'modules/SecurityGroups/SecurityGroup.php' => 'da20649972446f5810ae293fc3434649df7086796917e4f9684ec9e3140aad65',
         'modules/ACLActions/ACLAction.php' => 'eee9139f7b88d3a3719754f835f2bb5e48af85cbcc51274c94a8bad3dcb67fbd',
         'modules/SecurityGroups/AssignGroups.php' => '6612368834eacd66a011b2b032645d86d5d269791c1b8d4985dc71ddc7767af6',
         'modules/AOW_WorkFlow/AOW_WorkFlow.php' => '4c7848085db5153a7a337aca7acfc63c198a5eb3da60421da045f510da2e4010',

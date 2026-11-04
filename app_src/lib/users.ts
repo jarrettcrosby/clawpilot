@@ -1,6 +1,11 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
+import { changeWorkspaceUserWithNativeAuthority, linkExistingUserWithNativeAuthority,
+  resumePendingExistingUserIdentityWithNativeAuthority } from '@/lib/crm/nativeEmailWorkspaceUserRuntime'
 import { recordAuditEvent } from '@/lib/auditWriter'
-import { findSuiteCrmUser } from '@/lib/crm/suiteCrmClient'
+import { removeWorkspaceFromPendingInvitationsWithClient } from '@/lib/invitationWorkspaceScope'
+import { findSuiteCrmUser, inspectSuiteCrmUserIdentity } from '@/lib/crm/suiteCrmClient'
+import type { PoolClient } from 'pg'
 import { DEMO_WORKSPACE_ID } from '@/lib/demoMode'
 
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
@@ -20,6 +25,17 @@ export class AppUserNotFoundError extends Error {
   constructor(message = 'User was not found') {
     super(message)
     this.name = 'AppUserNotFoundError'
+  }
+}
+
+export class AppUserIdentitySyncConflictError extends Error {
+  readonly status = 409
+  readonly code = 'CRM_IDENTITY_SYNC_CONFLICT'
+  constructor(protectedIdentity = false) {
+    super(protectedIdentity
+      ? 'This CRM identity needs a permission-verified change. No identity change was queued. Existing access is unchanged.'
+      : 'User access or CRM identity changed during verification. Reload the user and try again. No identity change was queued.')
+    this.name = 'AppUserIdentitySyncConflictError'
   }
 }
 
@@ -136,6 +152,9 @@ export type AppUser = {
   organizationName: string | null
   organizationRole: AppUserRole | null
   organizationPermissions: AppUserPermissions | null
+  /** Server-derived only; computed CRM reads must not activate stale shares or
+   * incidental resource provisioning in an otherwise unjoined workspace. */
+  organizationAccessOrigin?: 'membership' | 'root_crm'
   suiteCrmUserId: string | null
   suiteCrmUsername: string | null
   timezone: string
@@ -157,11 +176,13 @@ export type InviteAppUserResult = {
   membershipCreated: boolean
   previousMembership: AppUserMembershipSnapshot | null
   previousMemberships: AppUserInvitedOrganizationMembership[]
+  producedUserRowJson: string | null
 }
 
 export type AppUserInvitedOrganizationMembership = {
   organizationId: string
   previousMembership: AppUserMembershipSnapshot | null
+  producedMembershipRowJson: string | null
 }
 
 export type AppUserMembershipSnapshot = {
@@ -212,6 +233,41 @@ export async function addAppUserOrganizationMemberships(input: {
   }
 
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    // Recheck the live actor after the control lock, not only the request's
+    // earlier AppUser snapshot. Hierarchy and membership writes use this same
+    // lock, so a queued access addition cannot outlive an administrator revoke.
+    const liveActor = await client.query<{ role: AppUserRole }>(
+      `SELECT membership.role FROM app_users app_user
+       JOIN app_user_organization_memberships membership ON membership.user_email=app_user.email
+       JOIN workspace_organizations organization ON organization.id=membership.organization_id
+       WHERE app_user.email=$1 AND membership.organization_id=$2::uuid
+         AND app_user.status='active' AND membership.status='active' AND membership.trashed_at IS NULL
+         AND NOT organization.is_demo
+         AND (membership.role='owner' OR (membership.role='admin'
+           AND membership.permissions->'inviteUsers'='true'::jsonb
+           AND membership.permissions->'manageUserAccess'='true'::jsonb))
+       FOR SHARE OF app_user, membership`,
+      [actor.email, actor.organizationId],
+    )
+    if (!liveActor.rows[0]) throw new AppUserAuthorizationError('User access management is no longer available')
+    for (const organizationId of organizationIds) {
+      const scoped = await client.query<{ allowed: boolean }>(
+        `WITH RECURSIVE ancestors AS (
+           SELECT id,parent_id,ARRAY[id] AS path FROM workspace_organizations WHERE id=$2::uuid AND NOT is_demo
+           UNION ALL SELECT parent.id,parent.parent_id,child.path||parent.id
+           FROM workspace_organizations parent JOIN ancestors child ON child.parent_id=parent.id
+           WHERE NOT parent.is_demo AND NOT parent.id=ANY(child.path)
+         ) SELECT EXISTS(SELECT 1 FROM ancestors ancestor
+           JOIN app_user_organization_memberships membership ON membership.organization_id=ancestor.id
+           WHERE membership.user_email=$1 AND membership.status='active' AND membership.trashed_at IS NULL
+             AND (membership.role='owner' OR (membership.role='admin'
+               AND membership.permissions->'inviteUsers'='true'::jsonb
+               AND membership.permissions->'manageUserAccess'='true'::jsonb))) AS allowed`,
+        [actor.email, organizationId],
+      )
+      if (!scoped.rows[0]?.allowed) throw new AppUserAuthorizationError('Organization access is outside your managed account graph')
+    }
     const targetResult = await client.query<AppUserRow>(
       'SELECT * FROM app_users WHERE email = $1 FOR UPDATE',
       [email],
@@ -234,7 +290,7 @@ export async function addAppUserOrganizationMemberships(input: {
     )
     if (!targetMemberships.rows.length) throw new AppUserNotFoundError()
     if (
-      effectiveAuthorizationRole(actor) !== 'owner'
+      liveActor.rows[0].role !== 'owner'
       && targetMemberships.rows.some((membership) => membership.role !== 'member')
     ) {
       throw new AppUserAuthorizationError('Only the owner can manage administrators')
@@ -478,11 +534,11 @@ export async function appUserHasDemoAccess(emailValue: unknown): Promise<boolean
   return result.rows[0]?.allowed === true
 }
 
-async function requireOrganizationInActorScope(actor: AppUser, organizationId: string | null) {
+async function requireOrganizationInActorScope(actor: AppUser, organizationId: string | null, reader: typeof query = query) {
   if (!actor.organizationId || !organizationId) {
     throw new AppUserAuthorizationError('User organization is outside your managed account graph')
   }
-  const result = await query<{ allowed: boolean }>(
+  const result = await reader<{ allowed: boolean }>(
     `WITH RECURSIVE managed AS (
        SELECT id FROM workspace_organizations WHERE id = $1::uuid
        UNION ALL
@@ -601,8 +657,8 @@ function overlayIdentityOnMembership(identity: AppUser, membership: AppUser): Ap
   }
 }
 
-async function getScopedAppUser(email: string, organizationId: string): Promise<AppUser | null> {
-  const result = await query<ScopedAppUserRow>(
+async function getScopedAppUser(email: string, organizationId: string, reader: typeof query = query): Promise<AppUser | null> {
+  const result = await reader<ScopedAppUserRow>(
     `SELECT app_user.*,
        membership.organization_id::text AS membership_organization_id,
        organization.name AS membership_organization_name,
@@ -749,11 +805,17 @@ export async function inviteAppUser(input: {
       membershipCreated: false,
       previousMembership: null,
       previousMemberships: [],
+      producedUserRowJson: null,
     }
   }
 
   return withTransaction(async (client) => {
     if (!actor.organizationId) throw new AppUserAuthorizationError('Your organization is not configured')
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    // Invitation creation and its compensating rollback use the same order.
+    // A later delivery failure must not race a user-management mutation.
+    const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
+    const current = existing.rows[0]
     const organizationDetails = [] as Array<{ id: string; name: string }>
     const existingMemberships = new Map<string, {
       role: AppUserRole
@@ -796,8 +858,6 @@ export async function inviteAppUser(input: {
     const primaryOrganization = organizationDetails.find((organization) => organization.id === primaryOrganizationId)
     if (!primaryOrganization) throw new Error('Invitation organization was not found')
 
-    const existing = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
-    const current = existing.rows[0]
     if (current?.status === 'disabled') {
       if (!canManageUserAccess(actor)) {
         throw new AppUserAuthorizationError('You do not have permission to restore disabled users')
@@ -805,10 +865,11 @@ export async function inviteAppUser(input: {
       throw new AppUserAuthorizationError('Restore the disabled user before sending a new invitation')
     }
 
-    const previousMemberships = organizationIds.map((organizationId) => {
+    const previousMemberships: AppUserInvitedOrganizationMembership[] = organizationIds.map((organizationId) => {
       const existingMembership = existingMemberships.get(organizationId)
       return {
         organizationId,
+        producedMembershipRowJson: null,
         previousMembership: existingMembership
           ? {
             role: existingMembership.role,
@@ -828,7 +889,7 @@ export async function inviteAppUser(input: {
     }
     const invitedCrmUserEnabled = current ? current.crm_user_enabled : crmUserEnabled
 
-    const result = await client.query<AppUserRow>(
+    const result = await client.query<AppUserRow & { produced_row_json: string }>(
       `
         INSERT INTO app_users (
           email, reference_code, contact_reference_code, crm_user_enabled,
@@ -855,7 +916,7 @@ export async function inviteAppUser(input: {
             ELSE app_users.organization_name
           END,
           updated_at = now()
-        RETURNING *
+        RETURNING *, to_jsonb(app_users)::text AS produced_row_json
       `,
       [
         email,
@@ -879,6 +940,7 @@ export async function inviteAppUser(input: {
         permissions: unknown
         status: AppUserStatus
         is_default: boolean
+        produced_row_json: string
       }>(
         `INSERT INTO app_user_organization_memberships (
            user_email, organization_id, role, permissions, status, is_default,
@@ -901,7 +963,8 @@ export async function inviteAppUser(input: {
            status = 'invited',
            updated_by = EXCLUDED.updated_by,
            updated_at = now()
-         RETURNING role, permissions, status, is_default`,
+         RETURNING role, permissions, status, is_default,
+           to_jsonb(app_user_organization_memberships)::text AS produced_row_json`,
         [
           email,
           organizationId,
@@ -910,6 +973,8 @@ export async function inviteAppUser(input: {
           actor.email,
         ],
       )
+      previousMemberships.find((previous) => previous.organizationId === organizationId)!.producedMembershipRowJson
+        = membership.rows[0]?.produced_row_json ?? null
       if (organizationId === primaryOrganizationId) {
         invitedMembership = membership.rows[0]
       }
@@ -950,6 +1015,7 @@ export async function inviteAppUser(input: {
       membershipCreated: previousMemberships.some((membership) => !membership.previousMembership),
       previousMembership: previousMemberships[0]?.previousMembership || null,
       previousMemberships,
+      producedUserRowJson: result.rows[0]?.produced_row_json ?? null,
     }
   })
 }
@@ -959,13 +1025,17 @@ export async function restoreInvitedUserAssignment(input: {
   organizationId: string
   invitedBy: string | null
   previousMembership: AppUserMembershipSnapshot | null
+  producedMembershipRowJson?: string | null
+  producedUserRowJson?: string | null
 }): Promise<void> {
   await restoreInvitedUserAssignments({
     email: input.email,
     invitedBy: input.invitedBy,
+    producedUserRowJson: input.producedUserRowJson,
     memberships: [{
       organizationId: input.organizationId,
       previousMembership: input.previousMembership,
+      producedMembershipRowJson: input.producedMembershipRowJson ?? null,
     }],
   })
 }
@@ -974,19 +1044,30 @@ export async function restoreInvitedUserAssignments(input: {
   email: unknown
   memberships: AppUserInvitedOrganizationMembership[]
   invitedBy: string | null
+  producedUserRowJson?: string | null
 }): Promise<void> {
   const email = normalizeUserEmail(input.email)
   await withTransaction(async (client) => {
-    for (const membership of input.memberships) {
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [email])
+    const memberships = [...input.memberships].sort((a, b) => a.organizationId.localeCompare(b.organizationId))
+    await client.query(`SELECT organization_id FROM app_user_organization_memberships
+      WHERE user_email = $1 AND organization_id = ANY($2::uuid[]) ORDER BY organization_id FOR UPDATE`,
+    [email, memberships.map((membership) => membership.organizationId)])
+    for (const membership of memberships) {
+      // Missing evidence is not permission to overwrite. Full row equality,
+      // including updated_at/trash metadata, detects all intervening changes.
+      if (!membership.producedMembershipRowJson) continue
       if (membership.previousMembership) {
         await client.query(
-          `UPDATE app_user_organization_memberships
+          `UPDATE app_user_organization_memberships AS membership
            SET role = $3,
                permissions = $4::jsonb,
                status = $5,
                is_default = $6,
                updated_at = now()
-           WHERE user_email = $1 AND organization_id = $2::uuid`,
+           WHERE user_email = $1 AND organization_id = $2::uuid
+             AND to_jsonb(membership) = $7::jsonb`,
           [
             email,
             membership.organizationId,
@@ -994,22 +1075,24 @@ export async function restoreInvitedUserAssignments(input: {
             JSON.stringify(membership.previousMembership.permissions),
             membership.previousMembership.status,
             membership.previousMembership.isDefault,
+            membership.producedMembershipRowJson,
           ],
         )
       } else {
         await client.query(
-          `DELETE FROM app_user_organization_memberships
-           WHERE user_email = $1 AND organization_id = $2::uuid`,
-          [email, membership.organizationId],
+          `DELETE FROM app_user_organization_memberships AS membership
+           WHERE user_email = $1 AND organization_id = $2::uuid
+             AND to_jsonb(membership) = $3::jsonb`,
+          [email, membership.organizationId, membership.producedMembershipRowJson],
         )
       }
     }
-    await client.query(
-      `UPDATE app_users
+    if (input.producedUserRowJson) await client.query(
+      `UPDATE app_users AS app_user
        SET invited_by = $2,
            updated_at = now()
-       WHERE email = $1`,
-      [email, input.invitedBy],
+       WHERE email = $1 AND to_jsonb(app_user) = $3::jsonb`,
+      [email, input.invitedBy, input.producedUserRowJson],
     )
   })
 }
@@ -1026,7 +1109,15 @@ export async function setAppUserTrashed(input: {
   if (email === actor.email) throw new AppUserAuthorizationError('You cannot remove your own account')
   const organizationId = String(input.organizationId || actor.organizationId || '').trim()
   await requireOrganizationInActorScope(actor, organizationId)
+  if (await changeWorkspaceUserWithNativeAuthority(actor.email, {
+    workspaceId: organizationId, userEmail: email, action: { kind: 'trash', trashed: input.trashed },
+  }, actor.organizationId)) {
+    const updated = await getScopedAppUser(email, organizationId)
+    if (!updated) throw new AppUserNotFoundError()
+    return updated
+  }
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [email])
     const locked = await client.query<{
       role: AppUserRole; status: AppUserStatus; trashed_at: string | null; pre_trash_status: AppUserStatus | null
@@ -1048,12 +1139,11 @@ export async function setAppUserTrashed(input: {
           pre_trash_status = CASE WHEN $4 THEN status ELSE NULL END,
           updated_by = $5, updated_at = now()
       WHERE user_email = $1 AND organization_id = $2::uuid`, [email, organizationId, status, input.trashed, actor.email])
+    let invitationChanges: Awaited<ReturnType<typeof removeWorkspaceFromPendingInvitationsWithClient>> | null = null
     if (input.trashed) {
       await client.query(`UPDATE app_sessions SET revoked_at = COALESCE(revoked_at, now()), revoked_reason = 'workspace_user_trashed'
         WHERE effective_user_email = $1 AND active_workspace_organization_id = $2::uuid AND revoked_at IS NULL`, [email, organizationId])
-      await client.query(`UPDATE app_user_invitations SET revoked_at = now()
-        WHERE email = $1 AND accepted_at IS NULL AND revoked_at IS NULL
-          AND (workspace_organization_id = $2::uuid OR $2::uuid = ANY(workspace_organization_ids))`, [email, organizationId])
+      invitationChanges = await removeWorkspaceFromPendingInvitationsWithClient(client, { email, organizationId })
       // Demo access is derived from active real-workspace grants, not a lasting independent grant.
       const demo = await client.query<{ allowed: boolean }>(`SELECT EXISTS (
         SELECT 1 FROM app_user_organization_memberships m JOIN workspace_organizations o ON o.id = m.organization_id
@@ -1070,7 +1160,7 @@ export async function setAppUserTrashed(input: {
         ELSE 'disabled' END, updated_at = now() WHERE email = $1`, [email])
     await recordAuditEvent({ actor: actor.email, eventType: input.trashed ? 'user.trashed' : 'user.restored',
       aggregateType: 'app_user', aggregateId: email, subject: email, organizationId,
-      payload: { organizationId, previousStatus: target.status, status } }, client)
+      payload: { organizationId, previousStatus: target.status, status, ...(invitationChanges ? { invitationChanges } : {}) } }, client)
   })
   const updated = await getScopedAppUser(email, organizationId)
   if (!updated) throw new AppUserNotFoundError()
@@ -1102,7 +1192,15 @@ export async function setAppUserStatus(input: {
     throw new AppUserAuthorizationError('Invited users must accept their welcome link before activation')
   }
 
+  if (await changeWorkspaceUserWithNativeAuthority(actor.email, {
+    workspaceId: organizationId, userEmail: email, action: { kind: 'status', status: input.status },
+  }, actor.organizationId)) {
+    const updated = await getScopedAppUser(email, organizationId)
+    if (!updated) throw new AppUserNotFoundError()
+    return updated
+  }
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const result = await client.query(
       `UPDATE app_user_organization_memberships
        SET status = $3,
@@ -1203,11 +1301,44 @@ export async function updateAppUserCrmEmployee(input: {
   }
 
   return withTransaction(async (client) => {
-    const locked = await client.query<AppUserRow>('SELECT * FROM app_users WHERE email = $1 FOR UPDATE', [email])
-    const current = locked.rows[0]
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    // Re-authorize from locked current rows, not a pre-transaction session DTO.
+    // Native authority and ordinary employee eligibility share control-first
+    // lock ordering; a concurrent access removal cannot authorize this toggle.
+    const lockedUsers = await client.query<AppUserRow>(
+      'SELECT * FROM app_users WHERE email = ANY($1::text[]) ORDER BY email FOR UPDATE',
+      [[...new Set([actor.email, email])].sort()],
+    )
+    const currentActor = lockedUsers.rows.find((row) => row.email === actor.email)
+    if (!currentActor || currentActor.status !== 'active' || !actor.organizationId) {
+      throw new AppUserAuthorizationError('User access is not active')
+    }
+    await client.query(
+      `SELECT user_email FROM app_user_organization_memberships
+       WHERE (user_email = $1 AND organization_id = $2::uuid)
+          OR (user_email = $3 AND organization_id = $4::uuid)
+       ORDER BY user_email, organization_id FOR UPDATE`,
+      [actor.email, actor.organizationId, email, organizationId],
+    )
+    const currentActorScope = await getScopedAppUser(actor.email, actor.organizationId, client.query.bind(client))
+    const currentTarget = await getScopedAppUser(email, organizationId, client.query.bind(client))
+    if (!currentActorScope || currentActorScope.status !== 'active' || currentActorScope.trashedAt
+      || !canManageUserAccess(currentActorScope)) {
+      throw new AppUserAuthorizationError('You do not have permission to manage CRM employees')
+    }
+    await requireOrganizationInActorScope(currentActorScope, organizationId, client.query.bind(client))
+    if (!currentTarget) throw new AppUserNotFoundError()
+    if (currentTarget.role === 'owner' && !enabled) {
+      throw new AppUserAuthorizationError('The owner must remain a CRM employee')
+    }
+    if (effectiveAuthorizationRole(currentActorScope) !== 'owner'
+      && currentTarget.role !== 'member' && currentTarget.email !== currentActorScope.email) {
+      throw new AppUserAuthorizationError('Only the owner can manage another administrator as a CRM employee')
+    }
+    const current = lockedUsers.rows.find((row) => row.email === email)
     if (!current) throw new AppUserNotFoundError()
     if (current.crm_user_enabled === enabled) {
-      return overlayIdentityOnMembership(toAppUser(current), target)
+      return overlayIdentityOnMembership(toAppUser(current), currentTarget)
     }
 
     let updated: AppUserRow | undefined
@@ -1236,26 +1367,15 @@ export async function updateAppUserCrmEmployee(input: {
       const result = await client.query<AppUserRow>(
         `UPDATE app_users
          SET crm_user_enabled = false,
-             reference_code = NULL,
-             suitecrm_user_id = NULL,
-             suitecrm_username = NULL,
              updated_at = now()
          WHERE email = $1
          RETURNING *`,
         [email],
       )
       updated = result.rows[0]
-      if (current.reference_code) {
-        await client.query(
-          `UPDATE crm_reference_registry
-           SET status = 'retired', retired_at = COALESCE(retired_at, now())
-           WHERE reference_code = $1 AND status = 'active'`,
-          [current.reference_code],
-        )
-      }
     }
     if (!updated) throw new AppUserNotFoundError()
-    const user = overlayIdentityOnMembership(toAppUser(updated), target)
+    const user = overlayIdentityOnMembership(toAppUser(updated), currentTarget)
     await recordAuditEvent({
       actor: actor.email,
       eventType: 'user.crm_employee.updated',
@@ -1267,7 +1387,8 @@ export async function updateAppUserCrmEmployee(input: {
         enabled,
         previousReferenceCode: current.reference_code,
         referenceCode: user.referenceCode,
-        suiteCrmMappingCleared: !enabled && Boolean(current.suitecrm_user_id),
+        suiteCrmMappingCleared: false,
+        permanentIdentityRetained: current.reference_code !== null,
       },
     }, client)
     return user
@@ -1278,7 +1399,7 @@ export async function syncAppUserSuiteCrmIdentity(input: {
   actorEmail: unknown
   email: unknown
   organizationId?: unknown
-}): Promise<AppUser> {
+}): Promise<{ user: AppUser; identitySync: 'verified' | 'queued' }> {
   const actor = await resolveAppUserActor(input.actorEmail)
   if (!canManageUserAccess(actor)) {
     throw new AppUserAuthorizationError('You do not have permission to manage CRM user mappings')
@@ -1286,17 +1407,58 @@ export async function syncAppUserSuiteCrmIdentity(input: {
   const email = normalizeUserEmail(input.email)
   const organizationId = String(input.organizationId || actor.organizationId || '').trim()
   if (!organizationId) throw new AppUserAuthorizationError('Active workspace is not configured')
-  await requireOrganizationInActorScope(actor, organizationId)
-  const target = await getScopedAppUser(email, organizationId)
-  if (!target) throw new AppUserNotFoundError()
-  if (!target.crmUserEnabled || !target.referenceCode) {
-    throw new Error('Configure this user as a CRM employee before matching a SuiteCRM user')
+  // Recheck both before and after provider I/O. Never hold database locks over
+  // an OAuth/network request, or trust the original session DTO after it.
+  const lockContext = async (client: PoolClient) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    const locked = await client.query<AppUserRow>(
+      'SELECT * FROM app_users WHERE email = ANY($1::text[]) ORDER BY email FOR UPDATE',
+      [[...new Set([actor.email, email])].sort()],
+    )
+    const actorRow = locked.rows.find((row) => row.email === actor.email)
+    if (!actorRow || actorRow.status !== 'active' || !actor.organizationId) {
+      throw new AppUserAuthorizationError('User access is not active')
+    }
+    await client.query(
+      `SELECT user_email FROM app_user_organization_memberships
+       WHERE (user_email = $1 AND organization_id = $2::uuid)
+          OR (user_email = $3 AND organization_id = $4::uuid)
+       ORDER BY user_email, organization_id FOR UPDATE`,
+      [actor.email, actor.organizationId, email, organizationId],
+    )
+    const currentActor = await getScopedAppUser(actor.email, actor.organizationId, client.query.bind(client))
+    if (!currentActor || currentActor.status !== 'active' || currentActor.trashedAt || !canManageUserAccess(currentActor)) {
+      throw new AppUserAuthorizationError('You do not have permission to manage CRM user mappings')
+    }
+    await requireOrganizationInActorScope(currentActor, organizationId, client.query.bind(client))
+    const target = await getScopedAppUser(email, organizationId, client.query.bind(client))
+    if (!target || target.trashedAt) throw new AppUserNotFoundError()
+    if (!target.crmUserEnabled || !target.referenceCode) {
+      throw new Error('Configure this user as a CRM employee before matching a SuiteCRM user')
+    }
+    if (target.role === 'owner' && target.email !== currentActor.email) {
+      throw new AppUserAuthorizationError('Only the owner can update the owner CRM mapping')
+    }
+    if (effectiveAuthorizationRole(currentActor) !== 'owner' && target.role === 'admin' && target.email !== currentActor.email) {
+      throw new AppUserAuthorizationError('Only the owner can update another administrator CRM mapping')
+    }
+    const mode = await client.query<{ enabled: boolean; active_transition_id: string | null }>(
+      'SELECT enabled,active_transition_id FROM crm_native_email_publication_control WHERE singleton',
+    )
+    if (mode.rows.length !== 1 || typeof mode.rows[0].enabled !== 'boolean') throw new Error('Native Email authority control is inconsistent')
+    return { target, enabled: mode.rows[0].enabled, activeTransitionId: mode.rows[0].active_transition_id }
   }
-  if (target.role === 'owner' && target.email !== actor.email) {
-    throw new AppUserAuthorizationError('Only the owner can update the owner CRM mapping')
-  }
-  if (effectiveAuthorizationRole(actor) !== 'owner' && target.role === 'admin' && target.email !== actor.email) {
-    throw new AppUserAuthorizationError('Only the owner can update another administrator CRM mapping')
+  const initial = await withTransaction(lockContext)
+  const target = initial.target
+  if (!target.referenceCode) throw new Error('CRM employee Global ID was not persisted')
+  if(initial.enabled&&initial.activeTransitionId!==null){
+    await resumePendingExistingUserIdentityWithNativeAuthority(actor.email,organizationId,email,initial.activeTransitionId,actor.organizationId)
+    return withTransaction(async client=>{
+      const current=await lockContext(client)
+      if(!current.enabled||current.activeTransitionId!==null||current.target.referenceCode!==target.referenceCode
+        ||!current.target.suiteCrmUserId||current.target.suiteCrmUsername!==current.target.referenceCode)throw new AppUserIdentitySyncConflictError()
+      return {user:current.target,identitySync:'verified' as const}
+    })
   }
   const referenceCode = target.referenceCode.toLowerCase()
   let suiteCrmUserId = String(target.suiteCrmUserId || '').trim().toLowerCase()
@@ -1316,8 +1478,38 @@ export async function syncAppUserSuiteCrmIdentity(input: {
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(suiteCrmUserId)) {
     throw new Error('SuiteCRM user ID is invalid')
   }
+  const inspection = await inspectSuiteCrmUserIdentity({
+    localId: email, suiteCrmUserId, referenceCode, username: referenceCode,
+  })
+  if(initial.enabled&&!target.suiteCrmUserId){
+    // No native account creation or rename while policy is enabled. A first
+    // link requires the account's canonical metadata to be correct already.
+    if(!inspection.verified)throw new AppUserIdentitySyncConflictError(true)
+    const linked=await linkExistingUserWithNativeAuthority(actor.email,{workspaceId:organizationId,userEmail:email,
+      nativeIdentity:{userId:suiteCrmUserId,globalId:referenceCode,username:referenceCode}},actor.organizationId)
+    if(!linked)throw new AppUserIdentitySyncConflictError(true)
+    return withTransaction(async client=>{
+      const current=await lockContext(client)
+      if(!current.enabled||current.activeTransitionId!==null||current.target.referenceCode!==target.referenceCode
+        ||current.target.suiteCrmUserId!==suiteCrmUserId||current.target.suiteCrmUsername!==referenceCode)
+        throw new AppUserIdentitySyncConflictError()
+      return {user:current.target,identitySync:'verified' as const}
+    })
+  }
   return withTransaction(async (client) => {
-    const result = await client.query<AppUserRow>(
+    const current = await lockContext(client)
+    if (current.target.referenceCode !== target.referenceCode
+      || current.target.suiteCrmUserId !== target.suiteCrmUserId
+      || current.target.suiteCrmUsername !== target.suiteCrmUsername) {
+      throw new AppUserIdentitySyncConflictError()
+    }
+    const mappingMatches = current.target.suiteCrmUserId === suiteCrmUserId
+      && current.target.suiteCrmUsername === referenceCode
+    // Enabled legacy identity jobs cannot dispatch. Do not report a queued
+    // success for a native write or principal enrollment that would be held.
+    if (current.enabled && (!mappingMatches || !inspection.verified)) throw new AppUserIdentitySyncConflictError(true)
+    if (mappingMatches && inspection.verified) return { user: current.target, identitySync: 'verified' as const }
+    const result = mappingMatches ? null : await client.query<AppUserRow>(
       `UPDATE app_users
        SET suitecrm_user_id = $2,
            suitecrm_username = $3,
@@ -1326,8 +1518,8 @@ export async function syncAppUserSuiteCrmIdentity(input: {
        RETURNING *`,
       [email, suiteCrmUserId, referenceCode],
     )
-    if (!result.rows[0]) throw new AppUserNotFoundError()
-    const user = overlayIdentityOnMembership(toAppUser(result.rows[0]), target)
+    if (result && !result.rows[0]) throw new AppUserNotFoundError()
+    const user = result ? overlayIdentityOnMembership(toAppUser(result.rows[0]), current.target) : current.target
     if (!user.suiteCrmUserId) throw new Error('SuiteCRM user mapping was not persisted')
     if (!user.referenceCode) throw new Error('CRM employee Global ID was not persisted')
     const payload = {
@@ -1336,7 +1528,7 @@ export async function syncAppUserSuiteCrmIdentity(input: {
       referenceCode: user.referenceCode,
       username: user.referenceCode,
     }
-    await client.query(
+    if (!inspection.verified) await client.query(
       `INSERT INTO sync_outbox (
          aggregate_type, aggregate_id, operation, target_system, payload,
          status, attempts, idempotency_key, created_at, available_at, updated_at
@@ -1366,10 +1558,10 @@ export async function syncAppUserSuiteCrmIdentity(input: {
         suiteCrmUsername: referenceCode,
         referenceCode: user.referenceCode,
         matchedBy,
-        identitySync: 'queued',
+        identitySync: inspection.verified ? 'verified' : 'queued',
       },
     }, client)
-    return user
+    return { user, identitySync: inspection.verified ? 'verified' as const : 'queued' as const }
   })
 }
 
@@ -1539,7 +1731,16 @@ export async function updateAppUserAccess(input: {
     : target.permissions
   const requested = input.permissions && typeof input.permissions === 'object' ? input.permissions : {}
   const permissions = permissionsForRole(role, { ...base, ...requested })
+  if (await changeWorkspaceUserWithNativeAuthority(actor.email, {
+    workspaceId: organizationId, userEmail: email, action: { kind: 'access', role: role as 'admin' | 'member',
+      permissions: Object.fromEntries(Object.entries(permissions).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean')) },
+  }, actor.organizationId)) {
+    const updated = await getScopedAppUser(email, organizationId)
+    if (!updated) throw new AppUserNotFoundError()
+    return updated
+  }
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const result = await client.query(
       `UPDATE app_user_organization_memberships
        SET role = $2,

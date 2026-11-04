@@ -10,6 +10,8 @@ import {
   projectSuiteCrmNativeEmail,
   type SuiteCrmEmailProjectionReadback,
 } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import { nativeEmailPublicationBridge, verifyNativeEmailPreparation } from '@/lib/crm/nativeEmailPublicationTransport'
+import type { NativeEmailCommand } from '@/lib/crm/nativeEmailPublication'
 
 type SuiteCrmRecordModule =
   | 'Accounts'
@@ -191,6 +193,26 @@ async function request(
 export async function testSuiteCrmConnection(fetchImpl: typeof fetch = fetch) {
   const response = await request('/Api/V8/meta/modules', { method: 'GET' }, fetchImpl)
   return Boolean(response)
+}
+
+/** Fixed read-only lifecycle route; never reinterpret an HTTP error as deletion. */
+export async function requestSuiteCrmNativeRecordLifecycle(command: unknown, fetchImpl: typeof fetch = fetch): Promise<unknown> {
+  return request('/Api/V8/custom/clawpilot-record-lifecycle/inspect', {
+    method: 'POST', body: JSON.stringify(command),
+  }, fetchImpl, false)
+}
+
+/** Prepared transport only; creating this client does not activate native
+ * publication or replace the worker. All calls use the configured native origin
+ * and service OAuth identity. In particular, 400/404/409 are NOT noncommit proof.
+ * The durable coordinator must retain unknown outcomes until resolve returns a
+ * verified terminal receipt. No arbitrary paths or credentials are exposed. */
+export function createSuiteCrmNativeEmailPublicationClient(fetchImpl: typeof fetch = fetch) {
+  const authenticated = (path: string, init: RequestInit) => request(path, init, fetchImpl, false)
+  return {
+    ...nativeEmailPublicationBridge(authenticated),
+    prepare: (command: NativeEmailCommand) => verifyNativeEmailPreparation(command, authenticated),
+  }
 }
 
 export async function resolveSuiteCrmCurrencyId(
@@ -583,7 +605,9 @@ export async function upsertSuiteCrmRecord(
   return (await upsertSuiteCrmRecordWithResult(record, fetchImpl)).suiteCrmId
 }
 
-export async function upsertSuiteCrmUserIdentity(
+/** Read-only identity metadata inspection. This does not prove native account
+ * eligibility or Email permissions, and must not enroll or repair a principal. */
+export async function inspectSuiteCrmUserIdentity(
   record: SuiteCrmUserIdentityOutboxRecord,
   fetchImpl: typeof fetch = fetch,
 ) {
@@ -606,7 +630,14 @@ export async function upsertSuiteCrmUserIdentity(
     fetchImpl,
   ) as JsonApiResponse
   const existingId = String(existing?.data?.id || '').trim().toLowerCase()
-  const existingGlobalId = String(existing?.data?.attributes?.global_id_c || '').trim().toLowerCase()
+  const attributes = existing?.data?.attributes
+  if (!attributes || !Object.hasOwn(attributes, 'global_id_c')
+    || (attributes.global_id_c !== null && typeof attributes.global_id_c !== 'string')
+    || typeof attributes.user_name !== 'string'
+    || (existing.data?.type && !['Users', 'User'].includes(existing.data.type))) {
+    throw new Error('SuiteCRM returned incomplete user identity metadata')
+  }
+  const existingGlobalId = String(attributes.global_id_c || '').trim().toLowerCase()
   if (existingId !== suiteCrmUserId) throw new Error('SuiteCRM returned an unexpected user record')
   if (existingGlobalId && existingGlobalId !== referenceCode) {
     throw new Error('SuiteCRM user already has a different permanent ClawPilot Global ID')
@@ -623,7 +654,7 @@ export async function upsertSuiteCrmUserIdentity(
     { method: 'GET' },
     fetchImpl,
   ) as { data?: Array<{ id?: unknown }> }
-  if (!Array.isArray(matches.data)) throw new Error('SuiteCRM returned an invalid user Global ID lookup')
+  if (!Array.isArray(matches.data) || matches.data.length > 1) throw new Error('SuiteCRM returned an invalid user Global ID lookup')
   if (matches.data.some((entry) => String(entry?.id || '').trim().toLowerCase() !== suiteCrmUserId)) {
     throw new Error('ClawPilot user Global ID is already assigned to another SuiteCRM user')
   }
@@ -639,10 +670,26 @@ export async function upsertSuiteCrmUserIdentity(
     { method: 'GET' },
     fetchImpl,
   ) as { data?: Array<{ id?: unknown }> }
-  if (!Array.isArray(usernameMatches.data)) throw new Error('SuiteCRM returned an invalid username lookup')
+  if (!Array.isArray(usernameMatches.data) || usernameMatches.data.length > 1) throw new Error('SuiteCRM returned an invalid username lookup')
   if (usernameMatches.data.some((entry) => String(entry?.id || '').trim().toLowerCase() !== suiteCrmUserId)) {
     throw new Error('ClawPilot user Global ID is already used as another SuiteCRM username')
   }
+
+  const verified = attributes.global_id_c === referenceCode && attributes.user_name === username
+  if (verified && (matches.data.length !== 1 || usernameMatches.data.length !== 1)) {
+    throw new Error('SuiteCRM returned inconsistent user identity lookups')
+  }
+  return { suiteCrmUserId, referenceCode, username, verified }
+}
+
+export async function upsertSuiteCrmUserIdentity(
+  record: SuiteCrmUserIdentityOutboxRecord,
+  fetchImpl: typeof fetch = fetch,
+) {
+  const { suiteCrmUserId, referenceCode, username, verified } = await inspectSuiteCrmUserIdentity(record, fetchImpl)
+  // Do not resave an already canonical native User: a resave changes policy
+  // metadata even when these two identity fields are unchanged.
+  if (verified) return suiteCrmUserId
 
   const response = await request('/Api/V8/module', {
     method: 'PATCH',

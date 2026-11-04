@@ -77,7 +77,8 @@ function loadCrmPersistence(query, withTransaction) {
   const names = [
     'ENTITY_TABLE', 'activeCrmRecordSql', 'clean', 'nullable', 'isoTimestamp',
     'normalizedInteractionType', 'interactionSuiteCrmModule', 'interactionActivityStatus',
-    'interactionDurationMinutes', 'uniqueUuidList', 'normalizeStageCrmRecordInput',
+    'interactionDurationMinutes', 'uniqueUuidList', 'normalizeStageCrmRecordInput', 'stagedCrmSourceHash',
+    'nativeEmailOutboxUnresolvedGuardSql', 'lockNativeEmailPublicationModeWithClient', 'nativeEmailOutboxTouchesEmail',
     'suiteCrmDateTime', 'suiteCrmAttributes', 'suiteCrmRelationships', 'enqueueSuiteCrmRecord',
     'claimSuiteCrmOutboxInPostgres', 'tableForAggregate', 'withVerifiedSuiteCrmEmailPublication',
     'completeSuiteCrmOutboxInPostgres', 'failSuiteCrmOutboxInPostgres',
@@ -118,6 +119,7 @@ function loadCrmPersistence(query, withTransaction) {
   const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
   const context = {
     query, withTransaction, ...stableId, ...emailIdentity, ...emailReconciliation, ...mailboxPersistence, ...audit,
+    ...loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     crypto: nodeRequire('node:crypto'), Buffer,
     suiteCrmEmailAddressAttributes: loadModule('app_src/lib/crm/emailAddressHeaders.ts').suiteCrmEmailAddressAttributes,
     suiteCrmEmailAudienceFingerprint: nativeEmail.suiteCrmEmailAudienceFingerprint, URL, Error,
@@ -180,7 +182,8 @@ const fixtureSchema = `
   CREATE TABLE workspace_organizations (id uuid PRIMARY KEY, is_demo boolean NOT NULL);
   CREATE TABLE app_users (
     email text PRIMARY KEY, status text NOT NULL, display_name text,
-    suitecrm_user_id text, crm_user_enabled boolean, reference_code text
+    suitecrm_user_id text, crm_user_enabled boolean, reference_code text,
+    role text NOT NULL DEFAULT 'member', permissions jsonb NOT NULL DEFAULT '{}'::jsonb, organization_id uuid
   );
   CREATE TABLE pipeline_spaces (
     id uuid PRIMARY KEY, owner_email text NOT NULL REFERENCES app_users(email),
@@ -190,7 +193,8 @@ const fixtureSchema = `
   );
   CREATE TABLE app_user_organization_memberships (
     organization_id uuid REFERENCES workspace_organizations(id), user_email text REFERENCES app_users(email),
-    status text NOT NULL, PRIMARY KEY (organization_id,user_email)
+    status text NOT NULL, role text NOT NULL DEFAULT 'member', permissions jsonb NOT NULL DEFAULT '{}'::jsonb,
+    trashed_at timestamptz, PRIMARY KEY (organization_id,user_email)
   );
   CREATE TABLE pipeline_space_members (pipeline_id uuid, user_email text,
     access_role text NOT NULL DEFAULT 'viewer' CHECK (access_role IN ('viewer','editor')));
@@ -324,7 +328,8 @@ async function run(pool) {
 
   await query(fixtureSchema)
   await query(read('db/migrations/0374_crm_interaction_organizations.sql'))
-  await query(`INSERT INTO app_users VALUES ($1,'active','Synthetic Operator','native-fixture-owner',true,'gu1234567'),
+  await query(read('db/migrations/0375_crm_native_email_publication_admission.sql'))
+  await query(`INSERT INTO app_users (email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code) VALUES ($1,'active','Synthetic Operator','native-fixture-owner',true,'gu1234567'),
     ($2,'active','Synthetic Other',NULL,true,'gu7654321')`, [OWNER, OTHER_OWNER])
   for (const [index, pipeline] of [PRIMARY, BUSINESS, FOREIGN, DISABLED_MEMBERSHIP, DISABLED_REFERENCES].entries()) {
     const workspace = id(11 + index)
@@ -332,7 +337,7 @@ async function run(pool) {
     await query('INSERT INTO workspace_organizations VALUES ($1,true)', [workspace])
     await query(`INSERT INTO pipeline_spaces (id,owner_email,workspace_organization_id,is_default,reference_access_disabled)
       VALUES ($1,$2,$3,$4,$5)`, [pipeline, owner, workspace, pipeline === PRIMARY, pipeline === DISABLED_REFERENCES])
-    await query('INSERT INTO app_user_organization_memberships VALUES ($1,$2,$3)',
+    await query('INSERT INTO app_user_organization_memberships (organization_id,user_email,status) VALUES ($1,$2,$3)',
       [workspace, owner, pipeline === DISABLED_MEMBERSHIP ? 'disabled' : 'active'])
   }
   await query(`INSERT INTO user_maton_connections VALUES ($1,$2,$3,'google-mail','ACTIVE','maton',true)`,

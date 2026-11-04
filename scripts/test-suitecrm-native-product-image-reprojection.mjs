@@ -155,6 +155,7 @@ vm.runInNewContext(workerOutput, {
   require(specifier) {
     if (specifier === '@/lib/crm/suiteCrmClient') {
       return {
+        createSuiteCrmNativeEmailPublicationClient: () => ({}),
         deleteSuiteCrmRecord: async () => undefined,
         upsertSuiteCrmRecordWithResult: async () => ({
           suiteCrmId: item.payload.suiteCrmId,
@@ -163,9 +164,30 @@ vm.runInNewContext(workerOutput, {
         upsertSuiteCrmUserIdentity: async () => undefined,
       }
     }
+    // Product regression keeps the Email coordinator explicitly disabled;
+    // enabled Email publication has its own acceptance gate.
+    if (specifier === '@/lib/crm/nativeEmailPublicationWorker') return {
+      touchesNativeEmail: () => false,
+      createNativeEmailPublicationWorker: () => ({ resume: async () => ({ enabled: false, blocked: false }),
+        process: async () => ({ handled: false }) }),
+    }
+    if (specifier === '@/lib/persistence/crmNativeEmailPublication') return {
+      createPostgresNativeEmailWorkerPersistence: () => ({}),
+    }
+    if (specifier === '@/lib/crm/suiteCrmNativeEmailProjection') return {
+      SuiteCrmEmailProjectionHeldError: class extends Error {},
+    }
+    if (specifier === '@/lib/crm/suiteCrmRecordLifecycleClient') return {
+      deleteSuiteCrmAccountContactVerified: async () => assert.fail('Product image projection must not delete Account/Contact records'),
+    }
     if (specifier === '@/lib/persistence/crm') {
       return {
         claimSuiteCrmOutboxInPostgres: async () => [item],
+        withVerifiedSuiteCrmRecordLifecycle: async (selected, publish) => {
+          assert.equal(selected, item)
+          assert.equal(selected.payload.entity, 'products')
+          return publish()
+        },
         completeSuiteCrmOutboxInPostgres: async (...args) => {
           completed.push(args)
         },

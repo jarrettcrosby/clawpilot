@@ -87,12 +87,25 @@ try {
     finally { client.release() }
   }
   await query(fixtureContext.fixture.fixtureSchema)
+  // The real member table has these full-row fields; migration 0377 fences
+  // their preimages during an active authority transition as well as its IDs.
+  await query(`ALTER TABLE pipeline_space_members ADD COLUMN shared_by text,
+    ADD COLUMN created_at timestamptz DEFAULT now(), ADD COLUMN updated_at timestamptz DEFAULT now()`)
   const outboxTable = read('db/migrations/0001_initial_railway_postgres.sql')
     .match(/CREATE TABLE IF NOT EXISTS sync_outbox \([\s\S]*?\n\);/u)?.[0]
   assert.ok(outboxTable, 'Use the real outbox table definition, not a permissive mock')
   await query(outboxTable)
   await query(read('db/migrations/0002_pipeline_outbox_worker.sql'))
   await query(read('db/migrations/0374_crm_interaction_organizations.sql'))
+  // Exercise the real default-off publication controls, not a missing-schema
+  // fallback. These migrations do not activate native publishing or permissions.
+  await query(read('db/migrations/0375_crm_native_email_publication_admission.sql'))
+  await query(read('db/migrations/0376_crm_native_email_publication_work_context.sql'))
+  await query(read('db/migrations/0377_crm_native_email_authority_transitions.sql'))
+  await query(read('db/migrations/0378_crm_native_email_capability_policies.sql'))
+  await query(read('db/migrations/0379_crm_native_email_app_only_lifecycle.sql'))
+  await query(read('db/migrations/0380_crm_native_email_grant_attempts.sql'))
+  await query(read('db/migrations/0381_crm_native_email_identity_quiescence.sql'))
   await query(`ALTER TABLE crm_contacts ADD COLUMN phone_work text, ADD COLUMN phone_mobile text, ADD COLUMN job_title text;
     ALTER TABLE crm_leads ADD COLUMN phone_work text, ADD COLUMN phone_mobile text, ADD COLUMN job_title text;
     ALTER TABLE crm_opportunities ADD COLUMN name text, ADD COLUMN reference_code text;
@@ -105,11 +118,11 @@ try {
   const OWNER = 'operator@example.test', CONNECTION = 'reviewed-fixture-mailbox', MAILBOX = 'mailbox@example.test'
   const PIPELINE = id(1), CACHE_PIPELINE = id(2), FOREIGN_PIPELINE = id(3), WORKSPACE = id(4)
   const GLOBUS = id(10), AIRSPACE = id(11), OTHER = id(12), GC = id(20), AC = id(21)
-  await query(`INSERT INTO app_users VALUES ($1,'active','Operator','native-fixture-owner',true,'gu1234567');`, [OWNER])
+  await query(`INSERT INTO app_users (email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code) VALUES ($1,'active','Operator','native-fixture-owner',true,'gu1234567');`, [OWNER])
   await query('INSERT INTO workspace_organizations VALUES ($1,true)', [WORKSPACE])
   for (const pipeline of [PIPELINE, CACHE_PIPELINE, FOREIGN_PIPELINE]) await query(`INSERT INTO pipeline_spaces
     (id,owner_email,workspace_organization_id,is_default) VALUES ($1,$2,$3,$4)`, [pipeline, OWNER, WORKSPACE, pipeline === CACHE_PIPELINE])
-  await query(`INSERT INTO app_user_organization_memberships VALUES ($1,$2,'active')`, [WORKSPACE, OWNER])
+  await query(`INSERT INTO app_user_organization_memberships (organization_id,user_email,status) VALUES ($1,$2,'active')`, [WORKSPACE, OWNER])
   await query(`INSERT INTO user_maton_connections VALUES ($1,$2,'mailbox@example.test','google-mail','ACTIVE','maton',true)`, [OWNER, CONNECTION])
   // Synthetic already-verified subject enters only at the trusted durable
   // binder boundary. This fixture performs no JWT verification or provider call.
@@ -253,6 +266,7 @@ try {
       '@/lib/currency': unavailable, '@/lib/crm/productImagePublic': unavailable,
       '@/lib/crm/suiteCrmNativeProductImageClient': unavailable, '@/lib/publicUrl': unavailable,
       '@/lib/crm/suiteCrmNativeEmailProjection': nativeProjection,
+      '@/lib/crm/nativeEmailPublicationTransport': unavailable,
     })
     let calls = 0
     await assert.rejects(transport.upsertSuiteCrmRecordWithResult({ entity: 'interactions', pipelineId: PIPELINE,
@@ -551,8 +565,8 @@ try {
   await check('actor-owned sent source needs current editor authority and publication fences reader-grant revocation', async () => {
     const EDITOR = 'shared-editor@example.test', EDITOR_MAILBOX = 'editor-mailbox@example.test'
     const editorConnection = 'synthetic-editor-mailbox', editorIntakePipeline = id(80)
-    await query("INSERT INTO app_users VALUES($1,'active','Synthetic Editor','native-fixture-editor',true,'gu2345678')", [EDITOR])
-    await query("INSERT INTO app_user_organization_memberships VALUES($1,$2,'active')", [WORKSPACE, EDITOR])
+    await query("INSERT INTO app_users (email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code) VALUES($1,'active','Synthetic Editor','native-fixture-editor',true,'gu2345678')", [EDITOR])
+    await query("INSERT INTO app_user_organization_memberships (organization_id,user_email,status) VALUES($1,$2,'active')", [WORKSPACE, EDITOR])
     await query('INSERT INTO pipeline_spaces(id,owner_email,workspace_organization_id,is_default) VALUES($1,$2,$3,true)',
       [editorIntakePipeline, EDITOR, WORKSPACE])
     await query("INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'editor')", [PIPELINE, EDITOR])

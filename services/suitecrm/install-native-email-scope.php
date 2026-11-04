@@ -6,7 +6,7 @@ declare(strict_types=1);
 require_once __DIR__.'/native-email-scope/Patch.php';
 const CP_SCOPE_PACKAGE = 'native-email-scope-8.10.1-v1';
 const CP_SCOPE_HELPER = 'custom/ClawPilotNativeEmailScope.php';
-const CP_SCOPE_HELPER_HASH = '3274728e9836a32ce518c849db01d90e66a9af7fdcecc92e143d455eba13270b';
+const CP_SCOPE_HELPER_HASH = 'ba26057190771c47cf18c829cf5fef09f93d6dde071b4856c62ca943704059a7';
 
 function cp_scope_require(bool $condition, string $message): void
 {

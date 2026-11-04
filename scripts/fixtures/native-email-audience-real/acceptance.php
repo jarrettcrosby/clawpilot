@@ -3,10 +3,18 @@ declare(strict_types=1);
 
 // Real installed SuiteCRM 8.10.1 + its MariaDB schema only. No native class,
 // method, DB manager, ACL controller or relationship implementation is mocked.
-if (PHP_SAPI !== 'cli' || trim((string) file_get_contents('/app/VERSION')) !== '8.10.1') {
+$fixtureAppRoot='/app';
+if (defined('CLAWPILOT_NATIVE_INITIAL_APP_ROOT')) {
+    if (getenv('CLAWPILOT_NATIVE_INITIAL_FIXTURE')!=='1'
+        || CLAWPILOT_NATIVE_INITIAL_APP_ROOT!=='/var/lib/suitecrm/app') {
+        throw new RuntimeException('Only the named isolated initial-enrollment volume root is supported');
+    }
+    $fixtureAppRoot=CLAWPILOT_NATIVE_INITIAL_APP_ROOT;
+}
+if (PHP_SAPI !== 'cli' || trim((string) file_get_contents($fixtureAppRoot.'/VERSION')) !== '8.10.1') {
     throw new RuntimeException('The pinned installed SuiteCRM 8.10.1 fixture is required');
 }
-if (!chdir('/app/public/legacy') || !is_file('config.php')) {
+if (!chdir($fixtureAppRoot.'/public/legacy') || !is_file('config.php')) {
     throw new RuntimeException('An installed disposable SuiteCRM legacy runtime is required');
 }
 define('sugarEntry', true);

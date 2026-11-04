@@ -87,6 +87,7 @@ export function createDisposablePostgresRuntime({
   pid = process.pid,
   token = randomUUID(),
   checkHeadroom = localHeadroom,
+  pause = (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds),
   isProcessAlive = (candidate) => {
     try { process.kill(candidate, 0); return true } catch (error) {
       if (error.code === 'ESRCH') return false
@@ -109,15 +110,16 @@ export function createDisposablePostgresRuntime({
     try {
       const output = execute('docker', [
         'container', 'inspect', '--format',
-        '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}', name,
+        '{"id":{{json .Id}},"labels":{{json .Config.Labels}},"status":{{json .State.Status}}}', name,
       ], commandOptions)
       const container = JSON.parse(String(output))
       if (!/^[a-f0-9]{64}$/u.test(container?.id ?? '')
+        || !['created', 'restarting', 'running', 'removing', 'paused', 'exited', 'dead'].includes(container.status)
         || (container.labels !== null
           && (typeof container.labels !== 'object' || Array.isArray(container.labels)))) {
         throw new Error('Invalid Docker ownership response')
       }
-      return { id: container.id, labels: container.labels ?? {} }
+      return { id: container.id, labels: container.labels ?? {}, status: container.status }
     } catch (error) {
       if (/No such (?:object|container):/i.test(String(error.stderr ?? ''))) return null
       throw new Error(`Cannot verify disposable Docker container ${name}; admission/cleanup stopped`)
@@ -174,6 +176,22 @@ export function createDisposablePostgresRuntime({
     fs.writeFileSync(ownerPath, JSON.stringify({ pid, token, name }), { flag: 'wx', mode: 0o600 })
   }
 
+  function confirmRemoval(id, name) {
+    const deadline = Date.now() + 3_000
+    for (let attempt = 0; ; attempt++) {
+      const remaining = inspect(id)
+      if (remaining === null) return
+      if (remaining.labels[DISPOSABLE_POSTGRES_LABEL] !== 'true'
+        || remaining.labels[DISPOSABLE_POSTGRES_OWNER_LABEL] !== token) {
+        throw new Error(`Ownership changed during cleanup of ${name}; lease retained`)
+      }
+      if (attempt >= 29 || Date.now() >= deadline) throw new Error(`Container ${name} still exists after cleanup`)
+      // Observe only the verified immutable ID. Neither a stop acknowledgement
+      // nor a daemon's removal-in-progress response proves absence.
+      pause(100)
+    }
+  }
+
   function cleanup() {
     let complete = true
     for (const [name, record] of tracked) {
@@ -187,14 +205,11 @@ export function createDisposablePostgresRuntime({
           }
           // Names can be reused after --rm. Remove only the immutable ID whose
           // ownership was verified, never a replacement using the same name.
-          try {
-            execute('docker', disposablePostgresDockerCleanupArgs(id), commandOptions)
-          } catch {
-            // --rm may already have removed this exact ID. Only confirmed
-            // absence makes that race successful; daemon errors stay closed.
-            if (inspect(id) !== null) throw new Error(`Unable to remove owned container ${name}`)
+          try { execute('docker', disposablePostgresDockerCleanupArgs(id), commandOptions) } catch {
+            // An overlapping --rm may report removal already in progress.
+            // That is not completion: confirm absence below before releasing.
           }
-          if (inspect(id) !== null) throw new Error(`Container ${name} still exists after cleanup`)
+          confirmRemoval(id, name)
         }
         if (record.leased) removeLease(token)
         tracked.delete(name)
@@ -228,7 +243,17 @@ export function createDisposablePostgresRuntime({
       // A process may run sequential fixtures. Release only a previous fixture
       // that the caller already stopped; do not stop it to admit another one.
       for (const [previous, record] of tracked) {
-        if (inspect(previous) !== null) throw new Error(`Disposable PostgreSQL ${previous} is still present`)
+        const previousContainer = inspect(previous)
+        if (previousContainer !== null) {
+          if (previousContainer.labels[DISPOSABLE_POSTGRES_LABEL] !== 'true'
+            || previousContainer.labels[DISPOSABLE_POSTGRES_OWNER_LABEL] !== token
+            || !['removing', 'exited', 'dead'].includes(previousContainer.status)) {
+            throw new Error(`Disposable PostgreSQL ${previous} is still present`)
+          }
+          // The same caller already stopped its fixture. Wait for Docker's
+          // asynchronous --rm to finish; do not stop/remove it to admit another.
+          confirmRemoval(previousContainer.id, previous)
+        }
         if (record.leased) removeLease(token)
         tracked.delete(previous)
       }

@@ -52,6 +52,7 @@ import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_
 import { displayCategory } from '@/lib/format'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
 import CustomerFolderLinksEditor, { CustomerFolderDescription } from './CustomerFolderLinksEditor'
+import CustomerFolderAutomation from './CustomerFolderAutomation'
 
 type Props = {
   task: Task | null
@@ -607,6 +608,8 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             disabled={saving || editingDesc} onSave={async (description, capturedHash) => Boolean(await patch({
               crmDescription: description, crmDescriptionHash: capturedHash,
             }))} />}
+          {task.crm?.entity === 'organizations' && <CustomerFolderAutomation key={`folders-${task.id}`}
+            pipelineId={task.crm.pipelineId} accountId={task.crm.entityId} readOnly={readOnly} disabled={saving || editingDesc} />}
           {editingDesc ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <TextField multiline minRows={3} maxRows={8} fullWidth value={descVal} onChange={e => setDescVal(e.target.value)}

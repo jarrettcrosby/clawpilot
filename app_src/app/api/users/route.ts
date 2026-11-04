@@ -8,9 +8,12 @@ import {
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { requireRequestUser } from '@/lib/requestUser'
+import { NativeEmailAccessPendingError } from '@/lib/crm/nativeEmailAuthorityRuntime'
+import { getPendingWorkspaceUserAuthorityChange, resumeWorkspaceUserAuthorityChange } from '@/lib/crm/nativeEmailWorkspaceUserRecovery'
 import {
   AppUserAuthorizationError,
   AppUserNotFoundError,
+  AppUserIdentitySyncConflictError,
   addAppUserOrganizationMemberships,
   canInviteUsers,
   canManageUserAccess,
@@ -31,6 +34,26 @@ function userMutationErrorStatus(error: unknown): number {
   return 400
 }
 
+function userMutationErrorResponse(error: unknown, fallback: string) {
+  if (error instanceof AppUserIdentitySyncConflictError) return NextResponse.json({
+    ok: false, error: error.message, code: error.code,
+  }, { status: error.status })
+  if (error instanceof NativeEmailAccessPendingError) return NextResponse.json({
+    ok: false, error: error.message, code: error.code, transitionId: error.transitionId,
+  }, { status: error.status })
+  // Database fences are the last line of defence, not browser diagnostics.
+  // An unsupported identity/enrollment request must not expose SQL or suggest
+  // that its user mutation succeeded while the native change was held.
+  if (error instanceof Error && 'code' in error && error.code === '55000'
+    && /native (?:email |authority |transition |member |user )/i.test(error.message)) {
+    const pending = new NativeEmailAccessPendingError()
+    return NextResponse.json({ ok: false, error: pending.message, code: pending.code,
+      transitionId: null }, { status: pending.status })
+  }
+  return NextResponse.json({ ok: false, error: error instanceof Error ? error.message : fallback },
+    { status: userMutationErrorStatus(error) })
+}
+
 export async function GET(req: NextRequest) {
   try {
     const requestActor = await requireRequestUser(req)
@@ -42,6 +65,8 @@ export async function GET(req: NextRequest) {
     const { actor, users } = await listAppUsers(requestActor, req.nextUrl.searchParams.get('view') === 'trash' ? 'trash' : 'active')
     const workspaceOrganizations = await listWorkspaceOrganizationHierarchy(requestActor)
     const organizationRole = effectiveAuthorizationRole(actor)
+    const pendingAccessChange = canManageUserAccess(actor) && actor.organizationId
+      ? await getPendingWorkspaceUserAuthorityChange(actor.email, actor.organizationId) : null
     return NextResponse.json({
       ok: true,
       currentUser: actor,
@@ -49,6 +74,7 @@ export async function GET(req: NextRequest) {
       isAdmin: organizationRole === 'owner' || organizationRole === 'admin',
       canInvite: canInviteUsers(actor),
       canManageUserAccess: canManageUserAccess(actor),
+      pendingAccessChange,
       users,
       workspaceOrganizations,
     })
@@ -80,8 +106,7 @@ export async function POST(req: NextRequest) {
       expiresAt: invitation.expiresAt,
     })
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unable to invite user'
-    return NextResponse.json({ ok: false, error: message }, { status: userMutationErrorStatus(error) })
+    return userMutationErrorResponse(error, 'Unable to invite user')
   }
 }
 
@@ -89,6 +114,13 @@ export async function PATCH(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
     const body = await req.json()
+    if (body?.action === 'resume-access-change') {
+      if (!canManageUserAccess(actor) || !actor.organizationId) {
+        throw new AppUserAuthorizationError('Manage access permission is required to resume this change')
+      }
+      await resumeWorkspaceUserAuthorityChange(actor.email, actor.organizationId, body.transitionId)
+      return NextResponse.json({ ok: true })
+    }
     if (body?.action === 'trash-user' || body?.action === 'restore-user') {
       const user = await setAppUserTrashed({ actorEmail: actor, email: body.email,
         organizationId: body.organizationId, trashed: body.action === 'trash-user' })
@@ -110,15 +142,19 @@ export async function PATCH(req: NextRequest) {
         enabled: body.enabled === true,
       })
       let warning: string | undefined
-      let crmIdentitySync: 'queued' | 'not-mapped' = 'not-mapped'
-      if (body.enabled === true) {
+      let crmIdentitySync: 'queued' | 'verified' | 'not-mapped' | 'retained' = user.suiteCrmUserId ? 'retained' : 'not-mapped'
+      // Re-enabling assignment eligibility must not rewrite an identity that
+      // this operation deliberately retained or queue a native user resave.
+      // Explicit identity repair remains the separate crm-user-sync action.
+      if (body.enabled === true && !user.suiteCrmUserId) {
         try {
-          user = await syncAppUserSuiteCrmIdentity({
+          const synced = await syncAppUserSuiteCrmIdentity({
             actorEmail: actor,
             email: body.email,
             organizationId: body.organizationId,
           })
-          crmIdentitySync = 'queued'
+          user = synced.user
+          crmIdentitySync = synced.identitySync
         } catch (error) {
           warning = error instanceof Error ? error.message : 'SuiteCRM identity sync is pending'
         }
@@ -126,12 +162,12 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ ok: true, user, crmIdentitySync, warning })
     }
     if (body?.action === 'crm-user-sync') {
-      const user = await syncAppUserSuiteCrmIdentity({
+      const synced = await syncAppUserSuiteCrmIdentity({
         actorEmail: actor,
         email: body.email,
         organizationId: body.organizationId,
       })
-      return NextResponse.json({ ok: true, user, crmIdentitySync: 'queued' })
+      return NextResponse.json({ ok: true, user: synced.user, crmIdentitySync: synced.identitySync })
     }
     if (body?.action === 'profile') {
       await ensureDefaultResourcesForUser(actor)
@@ -188,7 +224,6 @@ export async function PATCH(req: NextRequest) {
     }
     return NextResponse.json({ ok: true, user })
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unable to update user'
-    return NextResponse.json({ ok: false, error: message }, { status: userMutationErrorStatus(error) })
+    return userMutationErrorResponse(error, 'Unable to update user')
   }
 }

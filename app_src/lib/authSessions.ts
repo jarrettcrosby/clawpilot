@@ -5,6 +5,8 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { observedRequestIpAddress } from '@/lib/requestIpAddress'
 import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
+import { rootEmployeeCrmReadPermissions } from '@/lib/crm/rootEmployeeCrmPermissions'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 
 const ABSOLUTE_TTL_SECONDS = 24 * 60 * 60
 const ADMIN_IDLE_TTL_SECONDS = 60 * 60
@@ -28,6 +30,7 @@ type SessionRow = {
   active_workspace_reference_code: string
   active_workspace_role: SessionRole
   active_workspace_permissions: unknown
+  active_workspace_access_origin?: 'membership' | 'root_crm'
   active_membership_status: string
   active_workspace_switched_at: string
   auth_method: SessionAuthMethod
@@ -137,7 +140,9 @@ function fromRow(row: SessionRow): BrowserSession {
     activeWorkspaceName: row.active_workspace_name,
     activeWorkspaceReferenceCode: row.active_workspace_reference_code,
     activeWorkspaceRole: row.active_workspace_role,
-    activeWorkspacePermissions: row.active_workspace_permissions && typeof row.active_workspace_permissions === 'object'
+    activeWorkspacePermissions: row.active_workspace_access_origin === 'root_crm'
+      ? rootEmployeeCrmReadPermissions(row.active_workspace_permissions)
+      : row.active_workspace_permissions && typeof row.active_workspace_permissions === 'object'
       ? row.active_workspace_permissions as Record<string, boolean>
       : null,
     activeWorkspaceSwitchedAt: row.active_workspace_switched_at,
@@ -162,12 +167,15 @@ const SESSION_SELECT = `SELECT session.id::text, session.authenticated_user_emai
   session.effective_user_email, authenticated.role AS authenticated_role,
   effective.role AS effective_role, authenticated.status AS authenticated_status,
   effective.status AS effective_status,
-  session.active_workspace_organization_id::text,
+  COALESCE(session.crm_view_workspace_organization_id,session.active_workspace_organization_id)::text AS active_workspace_organization_id,
   active_workspace.name AS active_workspace_name,
   active_workspace.reference_code AS active_workspace_reference_code,
-  active_membership.role AS active_workspace_role,
-  active_membership.permissions AS active_workspace_permissions,
-  active_membership.status AS active_membership_status,
+  CASE WHEN session.crm_view_workspace_organization_id IS NULL THEN active_membership.role ELSE 'member' END AS active_workspace_role,
+  CASE WHEN session.crm_view_workspace_organization_id IS NULL THEN active_membership.permissions
+    ELSE jsonb_build_object('viewCrm',true,'viewProjects',root_access.projects_allowed) END AS active_workspace_permissions,
+  CASE WHEN session.crm_view_workspace_organization_id IS NULL THEN 'membership' ELSE 'root_crm' END AS active_workspace_access_origin,
+  CASE WHEN session.crm_view_workspace_organization_id IS NOT NULL AND root_access.workspace_id IS NULL
+    THEN 'disabled' ELSE active_membership.status END AS active_membership_status,
   session.active_workspace_switched_at::text,
   session.auth_method, session.device_label,
   session.user_agent, host(session.initial_ip_address) AS initial_ip_address,
@@ -184,8 +192,11 @@ const SESSION_SELECT = `SELECT session.id::text, session.authenticated_user_emai
   JOIN app_user_organization_memberships active_membership
     ON active_membership.user_email = session.effective_user_email
    AND active_membership.organization_id = session.active_workspace_organization_id
+  LEFT JOIN LATERAL clawpilot_crm_root_read_workspaces(session.effective_user_email) root_access
+    ON root_access.workspace_id=session.crm_view_workspace_organization_id
+   AND root_access.source_workspace_id=session.active_workspace_organization_id
   JOIN workspace_organizations active_workspace
-    ON active_workspace.id = session.active_workspace_organization_id`
+    ON active_workspace.id = COALESCE(session.crm_view_workspace_organization_id,session.active_workspace_organization_id)`
 
 function idleTtl(role: SessionRole): number {
   return role === 'owner' || role === 'admin' ? ADMIN_IDLE_TTL_SECONDS : MEMBER_IDLE_TTL_SECONDS
@@ -205,6 +216,7 @@ export async function createBrowserSession(input: {
     throw new Error('Active workspace is invalid')
   }
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     // Email changes and credential-based session issuance serialize on the durable user.
     await client.query('SELECT email FROM app_users WHERE email = $1 FOR SHARE', [email])
     if (input.verifiedLoginEmail && await resolveLoginAccountEmail(input.verifiedLoginEmail, client) !== email) throw new Error('Login address changed; sign in again')
@@ -222,12 +234,15 @@ export async function createBrowserSession(input: {
       status: string
       organization_id: string
       membership_role: SessionRole
+      source_workspace_id: string
+      access_origin: 'membership' | 'root_crm'
     }>(
-      `SELECT app_user.role, app_user.status, membership.organization_id::text, membership.role AS membership_role
+      `SELECT app_user.role, app_user.status, membership.organization_id::text, membership.role AS membership_role,
+         membership.source_workspace_id::text,membership.access_origin
        FROM app_users app_user
        JOIN LATERAL (
-         SELECT organization_id, role
-         FROM app_user_organization_memberships
+         SELECT organization_id, role, source_workspace_id, access_origin
+         FROM clawpilot_effective_workspace_memberships(app_user.email)
          WHERE user_email = app_user.email
            AND status = 'active'
            AND ($2::uuid IS NULL OR organization_id = $2::uuid)
@@ -248,11 +263,11 @@ export async function createBrowserSession(input: {
            token_hash, authenticated_user_email, effective_user_email, auth_method,
            device_label, user_agent, initial_network_fingerprint, last_network_fingerprint,
            initial_ip_address, last_ip_address, idle_timeout_seconds,
-           idle_expires_at, absolute_expires_at, active_workspace_organization_id
+           idle_expires_at, absolute_expires_at, active_workspace_organization_id, crm_view_workspace_organization_id
          ) VALUES (
            $1, $2, $2, $3, $4, $5, $6, $6, $7::inet, $7::inet, $8,
            now() + ($8::integer * interval '1 second'),
-           now() + ($9::integer * interval '1 second'), $10::uuid
+           now() + ($9::integer * interval '1 second'), $10::uuid, $11::uuid
          ) RETURNING *
        )
        ${SESSION_SELECT.replace('FROM app_sessions session', 'FROM inserted session')}`,
@@ -266,7 +281,8 @@ export async function createBrowserSession(input: {
         ipAddress,
         idleSeconds,
         ABSOLUTE_TTL_SECONDS,
-        user.rows[0].organization_id,
+        user.rows[0].source_workspace_id,
+        user.rows[0].access_origin === 'root_crm' ? user.rows[0].organization_id : null,
       ],
     )
     const session = fromRow(result.rows[0])
@@ -321,6 +337,7 @@ async function endExpiredImpersonation(row: SessionRow): Promise<SessionRow> {
   const target = row.effective_user_email
   await query(
     `UPDATE app_sessions SET effective_user_email = authenticated_user_email,
+       crm_view_workspace_organization_id = NULL,
        active_workspace_organization_id = (
          SELECT organization_id
          FROM app_user_organization_memberships
@@ -462,7 +479,8 @@ export async function touchBrowserSessionActivity(session: BrowserSession, heade
        AND session.absolute_expires_at > now() AND session.idle_expires_at > now()`,
     [session.id],
   )
-  if (!result.rows[0]) return null
+  if (!result.rows[0] || result.rows[0].authenticated_status !== 'active'
+    || result.rows[0].effective_status !== 'active' || result.rows[0].active_membership_status !== 'active') return null
   await query(
     `UPDATE app_sessions SET last_seen_at = now(), last_user_activity_at = now(),
        last_network_fingerprint = $2, last_ip_address = $3::inet,
@@ -471,7 +489,9 @@ export async function touchBrowserSessionActivity(session: BrowserSession, heade
     [session.id, networkFingerprint(headers), observedRequestIpAddress(headers)],
   )
   const refreshed = await query<SessionRow>(`${SESSION_SELECT} WHERE session.id = $1::uuid`, [session.id])
-  return refreshed.rows[0] ? fromRow(refreshed.rows[0]) : null
+  const current = refreshed.rows[0]
+  return current && !current.revoked_at && current.authenticated_status === 'active'
+    && current.effective_status === 'active' && current.active_membership_status === 'active' ? fromRow(current) : null
 }
 
 export async function listBrowserSessions(authenticatedUser: string): Promise<BrowserSession[]> {
@@ -592,7 +612,7 @@ export async function revokeBrowserSessionsForUserWorkspace(input: {
     `UPDATE app_sessions
      SET revoked_at = now(), revoked_reason = $3
      WHERE (authenticated_user_email = $1 OR effective_user_email = $1)
-       AND active_workspace_organization_id = $2::uuid
+       AND (active_workspace_organization_id = $2::uuid OR crm_view_workspace_organization_id = $2::uuid)
        AND revoked_at IS NULL
      RETURNING id::text`,
     [input.userEmail.toLowerCase(), input.organizationId, input.reason],
@@ -654,6 +674,7 @@ export async function startImpersonation(input: {
   if (!targetEmail || targetEmail === owner) throw new Error('Select an active non-owner user')
   const token = newToken()
   const row = await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const target = await client.query<{
       email: string
       role: SessionRole
@@ -679,6 +700,7 @@ export async function startImpersonation(input: {
     const updated = await client.query<SessionRow>(
       `WITH changed AS (
          UPDATE app_sessions SET token_hash = $2, effective_user_email = $3,
+           crm_view_workspace_organization_id = NULL,
            active_workspace_organization_id = $5::uuid,
            active_workspace_switched_at = now(),
            impersonation_started_at = now(),
@@ -718,6 +740,7 @@ export async function stopImpersonation(session: BrowserSession): Promise<Issued
   const result = await query<SessionRow>(
     `WITH changed AS (
        UPDATE app_sessions SET token_hash = $2,
+         crm_view_workspace_organization_id = NULL,
          effective_user_email = authenticated_user_email,
          active_workspace_organization_id = (
            SELECT organization_id
@@ -768,22 +791,25 @@ export async function switchBrowserSessionWorkspace(input: {
   const token = newToken()
   const previousOrganizationId = input.session.activeWorkspaceOrganizationId
   const row = await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const membership = await client.query<{
       organization_id: string
       organization_name: string
       organization_reference_code: string
       role: SessionRole
+      source_workspace_id: string
+      access_origin: 'membership' | 'root_crm'
     }>(
       `SELECT membership.organization_id::text,
          organization.name AS organization_name,
          organization.reference_code AS organization_reference_code,
-         membership.role
-       FROM app_user_organization_memberships membership
+         membership.role,membership.source_workspace_id::text,membership.access_origin
+       FROM clawpilot_effective_workspace_memberships($1) membership
        JOIN workspace_organizations organization ON organization.id = membership.organization_id
        WHERE membership.user_email = $1
          AND membership.organization_id = $2::uuid
          AND membership.status = 'active'
-       FOR SHARE OF membership, organization`,
+       FOR SHARE OF organization`,
       [input.session.effectiveUser, organizationId],
     )
     if (!membership.rows[0]) throw new Error('Business access is not available')
@@ -792,6 +818,7 @@ export async function switchBrowserSessionWorkspace(input: {
          UPDATE app_sessions
          SET token_hash = $2,
              active_workspace_organization_id = $3::uuid,
+             crm_view_workspace_organization_id = $6::uuid,
              active_workspace_switched_at = now(),
              idle_timeout_seconds = $5,
              idle_expires_at = LEAST(
@@ -809,9 +836,10 @@ export async function switchBrowserSessionWorkspace(input: {
       [
         input.session.id,
         hashToken(token),
-        organizationId,
+        membership.rows[0].source_workspace_id,
         input.session.effectiveUser,
         idleTtl(membership.rows[0].role),
+        membership.rows[0].access_origin === 'root_crm' ? organizationId : null,
       ],
     )
     if (!updated.rows[0]) throw new Error('Session is no longer active')

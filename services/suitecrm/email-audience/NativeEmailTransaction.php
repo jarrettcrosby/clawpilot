@@ -1,18 +1,57 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__.'/NativeEmailAuthorityDelta.php';
+require_once __DIR__.'/NativeEmailInitialPolicyDelta.php';
 
 // Not autoloaded, installed, routed, or enabled by this file. This primitive
 // fences the reviewed native *database* policy tables, not application-DB
 // membership, files/hooks/config.php, existing session caches, or Email content
 // and ownership rows. A future caller must attest those and lock its records.
-// This version makes policy IMMUTABLE through commit, including group-record
-// links. It is not yet the publication API that permits a reviewed link delta.
+// Policy is immutable by default. One pre-admitted, exact new Email group link
+// may be allowed; this is not pipeline authorization or a publication endpoint.
 final class ClawPilotNativeEmailTransactionRefused extends RuntimeException
 {
-    public function __construct(public readonly string $holdCode)
+    // Internal diagnostic is never serialized by a public route. Keep the
+    // stable hold code/message separate from operator-only runtime evidence.
+    public function __construct(public readonly string $holdCode, public readonly ?string $diagnostic = null)
     {
         parent::__construct('Native Email transaction refused: '.$holdCode);
     }
+}
+
+/** The publisher must first authenticate the exact pipeline/group binding and
+ * reader set. This value object authorizes no audience by itself. It describes
+ * only one new native row, never an update, delete, resurrection, or adoption. */
+final class ClawPilotNativeEmailGroupRecordInsert
+{
+    public function __construct(
+        public readonly string $linkId,
+        public readonly string $emailId,
+        public readonly string $globalId,
+        public readonly string $groupId,
+        public readonly string $dateModified,
+        public readonly string $expectedAssignedUserId,
+        public readonly string $expectedCreatedById,
+    ) {
+        foreach ([$linkId,$emailId,$groupId,$expectedAssignedUserId,$expectedCreatedById] as $id) {
+            if (!preg_match('/^[a-z0-9][a-z0-9-]{0,35}$/iD',$id)) $this->invalid();
+        }
+        if (!preg_match('/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iD',$linkId)
+            || !preg_match('/^gi(?:[0-9]{7}|[0-9a-v]{12})$/D',$globalId)
+            || !preg_match('/^[1-9][0-9]{3}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/D',$dateModified)) $this->invalid();
+        $date = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s',$dateModified,new DateTimeZone('UTC'));
+        if (!$date || $date->format('Y-m-d H:i:s') !== $dateModified) $this->invalid();
+    }
+
+    /** Exact stock eight-column readback. The native six-column INSERT leaves
+     * both nullable audit fields NULL; those are pinned, never ignored. */
+    public function nativeRow(): array
+    {
+        return ['id'=>$this->linkId,'securitygroup_id'=>$this->groupId,'record_id'=>$this->emailId,
+            'module'=>'Emails','date_modified'=>$this->dateModified,
+            'modified_user_id'=>null,'created_by'=>null,'deleted'=>'0'];
+    }
+    private function invalid(): never { throw new ClawPilotNativeEmailTransactionRefused('invalid_email_group_delta'); }
 }
 
 final class ClawPilotNativeEmailTransaction
@@ -36,8 +75,13 @@ final class ClawPilotNativeEmailTransaction
     private int $connectionId = 0;
     private array $original = [];
     private string $fingerprint = '';
+    private string $immutableFingerprint = '';
+    private ?ClawPilotNativeEmailGroupRecordInsert $emailGroupInsert = null;
+    private ?ClawPilotNativeEmailAuthorityDelta $authorityMembershipDelta = null;
+    private ?ClawPilotNativeEmailInitialPolicyDelta $initialPolicyDelta = null;
     private ?string $sentinel = null;
     private int $startedAt;
+    private array $stageMilliseconds=[];
 
     private function __construct(private mysqli $db, private string $database) { $this->startedAt = hrtime(true); }
 
@@ -72,12 +116,15 @@ final class ClawPilotNativeEmailTransaction
             $fence->active = true;
             $fence->installSentinel();
             $fence->assertActive();
-            $fence->fingerprint = $fence->lockAndHashPolicy();
+            $digests = $fence->lockAndHashPolicy();
+            $fence->fingerprint = $digests['full'];
+            $fence->immutableFingerprint = $digests['immutable'];
             // The locking reads now retain metadata locks on policy tables;
             // check the engines/indexes again, without assuming the preflight
             // fenced an intervening DDL change. Filesystem DDL remains excluded.
             $fence->validateSchema();
             $fence->assertActive();
+            $fence->markStage('policy_fence');
             return $fence;
         } catch (Throwable $error) {
             $fence->abortAfterFailure();
@@ -88,7 +135,176 @@ final class ClawPilotNativeEmailTransaction
 
     /** Captured only after the whole reviewed policy set is locked; no raw data. */
     public function policyFingerprint(): string { $this->assertActive(); return $this->fingerprint; }
+    /** Binding pin: all admitted policy tables EXCEPT securitygroups_records.
+     * Does not authorize arbitrary record grants; exact links and effective
+     * readers must also be checked on each publication. Never auto-evolve it. */
+    public function immutablePolicyFingerprint(): string { $this->assertActive(); return $this->immutableFingerprint; }
     public static function policyTables(): array { return array_keys(self::TABLES); }
+    /** Bounded internal timings only: no IDs, records, policy bytes or secrets.
+     * This never changes the deadline, lock coverage or admission decisions. */
+    public function markStage(string $stage): void
+    {
+        if(!in_array($stage,['policy_fence','approval','runtime_before','identities','acl_before',
+            'memberships','permission_rows','acl_after','runtime_after','receipt','commit_recheck'],true))
+            $this->refuse('unknown_timing_stage');
+        $this->stageMilliseconds[$stage]=round((hrtime(true)-$this->startedAt)/1_000_000,3);
+    }
+    public function assertConnection(mysqli $db): void
+    {
+        if ($db !== $this->db) {
+            $this->abortAfterFailure();
+            $this->refuse('transaction_connection_mismatch');
+        }
+        $this->assertActive();
+    }
+
+    /** Call after saving/locking the exact Email but BEFORE any link write.
+     * No policy mutation can be retrospectively admitted, even a correct link.
+     * The method performs only reads/locks; the caller owns the exact INSERT. */
+    public function admitEmailGroupRecordInsert(ClawPilotNativeEmailGroupRecordInsert $delta): void
+    {
+        try {
+            $this->assertActive();
+            if ($this->emailGroupInsert !== null || $this->authorityMembershipDelta !== null || $this->initialPolicyDelta !== null) $this->refuse('email_group_delta_already_admitted');
+            if (!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full'])) $this->refuse('policy_changed_before_delta_admission');
+            $this->assertDeltaIdentity($delta);
+            if ($this->rows('SELECT id FROM securitygroups_records WHERE id='.$this->quoted($delta->linkId).' FOR UPDATE')
+                || $this->rows('SELECT id FROM securitygroups_records WHERE record_id='.$this->quoted($delta->emailId).' FOR UPDATE')) {
+                $this->refuse('email_group_link_not_new');
+            }
+            $count = $this->one('SELECT COUNT(*) AS row_count FROM securitygroups_records');
+            if ((int)$count['row_count'] >= self::TABLES['securitygroups_records']) $this->refuse('policy_row_limit');
+            $this->emailGroupInsert = $delta;
+            $this->assertActive();
+        } catch (Throwable $error) { $this->deltaFailure($error); }
+    }
+
+    /** Optional early readback; commit always repeats this check independently. */
+    public function assertEmailGroupRecordInsert(): void
+    {
+        try {
+            $this->assertActive();
+            $delta = $this->emailGroupInsert;
+            if ($delta === null) $this->refuse('email_group_delta_not_admitted');
+            $this->assertDeltaIdentity($delta);
+            // Include deleted rows and every module. No duplicate, foreign,
+            // wrongly typed, or historical soft-deleted link may be adopted.
+            $links = $this->rows('SELECT * FROM securitygroups_records WHERE record_id='.$this->quoted($delta->emailId).' ORDER BY id FOR UPDATE');
+            if (count($links) !== 1) $this->refuse('email_group_link_readback_mismatch');
+            $this->assertExactDeltaRow($links[0],$delta);
+        } catch (Throwable $error) { $this->deltaFailure($error); }
+    }
+
+    /** Narrow authority-transition integration; never an arbitrary policy-write
+     * bypass. The separately authenticated executor prevalidates every binding
+     * and capability. Commit substitutes ONLY these exact membership postimages
+     * back to their old values and requires the original full-policy digest. */
+    public function admitAuthorityMembershipDelta(ClawPilotNativeEmailAuthorityDelta $delta): void
+    {
+        try {
+            $this->assertActive();
+            if($this->emailGroupInsert!==null || $this->authorityMembershipDelta!==null || $this->initialPolicyDelta!==null) $this->refuse('authority_delta_already_admitted');
+            if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full'])) $this->refuse('policy_changed_before_delta_admission');
+            $delta->assertBefore($this->rows('SELECT * FROM securitygroups_users FORCE INDEX (PRIMARY) ORDER BY id FOR UPDATE'));
+            $this->authorityMembershipDelta=$delta;
+        } catch(Throwable $error) { $this->deltaFailure($error); }
+    }
+
+    public function authorityPostPolicyFingerprint(): string
+    {
+        $this->assertActive();
+        if($this->authorityMembershipDelta===null) $this->refuse('authority_delta_not_admitted');
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy(null,$this->authorityMembershipDelta)['full']))
+            $this->refuse('policy_changed_inside_fence');
+        return $this->lockAndHashPolicy()['immutable'];
+    }
+
+    /** Initial enrollment only. The separately signed, offline executor must
+     * derive and authenticate every typed row before admission. No ordinary
+     * publisher/authority path can mix this with its own policy exception. */
+    public function admitInitialPolicyDelta(ClawPilotNativeEmailInitialPolicyDelta $delta): void
+    {
+        try {
+            $this->assertActive();
+            if($this->emailGroupInsert!==null || $this->authorityMembershipDelta!==null || $this->initialPolicyDelta!==null)
+                $this->refuse('initial_delta_already_admitted');
+            if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full']))$this->refuse('policy_changed_before_delta_admission');
+            // Pure full-scan projection proves every absent/existing preimage.
+            $this->lockAndHashPolicy(null,null,[],null,$delta);
+            $this->initialPolicyDelta=$delta;
+        }catch(Throwable $error){$this->deltaFailure($error);}
+    }
+    public function projectInitialPolicyDelta(ClawPilotNativeEmailInitialPolicyDelta $delta): array
+    {
+        $this->assertActive();
+        if($this->emailGroupInsert!==null || $this->authorityMembershipDelta!==null || $this->initialPolicyDelta!==null)
+            $this->refuse('initial_projection_state');
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full']))$this->refuse('policy_changed_before_projection');
+        $projected=$this->lockAndHashPolicy(null,null,[],null,$delta);
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full']))$this->refuse('policy_changed_during_projection');
+        return $projected;
+    }
+    public function initialPostPolicyFingerprint(): string
+    {
+        $this->assertActive();
+        if($this->initialPolicyDelta===null)$this->refuse('initial_delta_not_admitted');
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy(null,null,[],$this->initialPolicyDelta)['full']))
+            $this->refuse('policy_changed_inside_fence');
+        return $this->lockAndHashPolicy()['immutable'];
+    }
+
+    /** Provisional fingerprints for a server-built two-phase membership plan.
+     * Raw policy rows never leave this process. No native writes or admitted
+     * deltas occur: both stages are pure substitutions in the bounded scan.
+     * Execution still requires independent approval and exact live preimages. */
+    public function projectAuthorityMembershipPolicies(ClawPilotNativeEmailAuthorityDelta $revoke,
+        ClawPilotNativeEmailAuthorityDelta $grant): array
+    {
+        $this->assertActive();
+            if($this->emailGroupInsert!==null || $this->authorityMembershipDelta!==null || $this->initialPolicyDelta!==null
+            || $revoke->phase!=='revoke' || $grant->phase!=='grant')$this->refuse('authority_projection_state');
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full']))$this->refuse('policy_changed_before_projection');
+        $revoked=$this->lockAndHashPolicy(null,null,[$revoke]);
+        $granted=$this->lockAndHashPolicy(null,null,[$revoke,$grant]);
+        if(!hash_equals($this->fingerprint,$this->lockAndHashPolicy()['full']))$this->refuse('policy_changed_during_projection');
+        return ['beforePolicyFingerprint'=>$this->immutableFingerprint,
+            'revokePolicyFingerprint'=>$revoked['immutable'],'grantPolicyFingerprint'=>$granted['immutable']];
+    }
+
+    private function assertDeltaIdentity(ClawPilotNativeEmailGroupRecordInsert $delta): void
+    {
+        $groups = $this->rows('SELECT id,deleted,noninheritable FROM securitygroups WHERE id='.$this->quoted($delta->groupId).' FOR UPDATE');
+        if (count($groups) !== 1 || $groups[0]['id'] !== $delta->groupId || (string)$groups[0]['deleted'] !== '0'
+            || (string)$groups[0]['noninheritable'] !== '1') $this->refuse('email_group_binding_mismatch');
+        $emails = $this->rows('SELECT id,assigned_user_id,created_by,deleted FROM emails WHERE id='.$this->quoted($delta->emailId).' FOR UPDATE');
+        $identities = $this->rows('SELECT id_c,global_id_c FROM emails_cstm WHERE global_id_c='.$this->quoted($delta->globalId).' ORDER BY id_c LIMIT 2 FOR UPDATE');
+        $engines = $this->rows("SELECT TABLE_NAME,ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=".$this->quoted($this->database).
+            " AND TABLE_NAME IN ('emails','emails_cstm') ORDER BY TABLE_NAME");
+        if (count($engines) !== 2) $this->refuse('email_identity_schema_mismatch');
+        foreach ($engines as $table) if ($table['ENGINE'] !== 'InnoDB' || $table['TABLE_TYPE'] !== 'BASE TABLE') $this->refuse('email_identity_schema_mismatch');
+        if (count($emails) !== 1 || $emails[0]['id'] !== $delta->emailId || (string)$emails[0]['deleted'] !== '0'
+            || $emails[0]['assigned_user_id'] !== $delta->expectedAssignedUserId || $emails[0]['created_by'] !== $delta->expectedCreatedById
+            || count($identities) !== 1 || $identities[0]['id_c'] !== $delta->emailId || $identities[0]['global_id_c'] !== $delta->globalId) {
+            $this->refuse('email_identity_mismatch');
+        }
+    }
+    private function assertExactDeltaRow(array $row,ClawPilotNativeEmailGroupRecordInsert $delta): void
+    {
+        $expected = $delta->nativeRow();
+        if (count($row) !== count($expected) || array_diff_key($row,$expected)) $this->refuse('email_group_link_readback_mismatch');
+        foreach ($expected as $key => $value) {
+            if ($value === null) {
+                if ($row[$key] !== null) $this->refuse('email_group_link_readback_mismatch');
+            } elseif (!is_scalar($row[$key]) || (string)$row[$key] !== $value) $this->refuse('email_group_link_readback_mismatch');
+        }
+    }
+    private function deltaFailure(Throwable $error): never
+    {
+        $this->abortAfterFailure();
+        if ($error instanceof ClawPilotNativeEmailTransactionRefused) throw $error;
+        throw new ClawPilotNativeEmailTransactionRefused('email_group_delta_unproven');
+    }
+    private function quoted(string $value): string { return "'".$this->db->real_escape_string($value)."'"; }
 
     public function assertActive(): void
     {
@@ -129,11 +345,16 @@ final class ClawPilotNativeEmailTransaction
     {
         try {
             $this->assertActive();
-            if ($commit && !hash_equals($this->fingerprint, $this->lockAndHashPolicy())) $this->refuse('policy_changed_inside_fence');
+            if ($commit && $this->emailGroupInsert !== null) $this->assertEmailGroupRecordInsert();
+            if ($commit && !hash_equals($this->fingerprint, $this->lockAndHashPolicy($this->emailGroupInsert,$this->authorityMembershipDelta,[],$this->initialPolicyDelta)['full'])) $this->refuse('policy_changed_inside_fence');
             $this->assertActive();
             // This rejects an overdue commit; it is not a promise that PHP can
             // preempt arbitrary caller code and release locks at this instant.
-            if ($commit && hrtime(true) - $this->startedAt > self::COMMIT_DEADLINE_SECONDS * 1_000_000_000) $this->refuse('commit_deadline_exceeded');
+            if ($commit && hrtime(true) - $this->startedAt > self::COMMIT_DEADLINE_SECONDS * 1_000_000_000) {
+                $this->markStage('commit_recheck');
+                error_log('CLAWPILOT_NATIVE_DEADLINE_PROFILE='.json_encode($this->stageMilliseconds,JSON_THROW_ON_ERROR));
+                $this->refuse('commit_deadline_exceeded');
+            }
             $this->execute($commit ? 'COMMIT' : 'ROLLBACK');
             $this->active = false;
             $this->sentinel = null;
@@ -171,9 +392,11 @@ final class ClawPilotNativeEmailTransaction
         }
     }
 
-    private function lockAndHashPolicy(): string
+    private function lockAndHashPolicy(?ClawPilotNativeEmailGroupRecordInsert $excludedInsert = null,
+        ?ClawPilotNativeEmailAuthorityDelta $authorityDelta = null,array $forwardDeltas=[],
+        ?ClawPilotNativeEmailInitialPolicyDelta $initialDelta=null,?ClawPilotNativeEmailInitialPolicyDelta $forwardInitial=null): array
     {
-        $hash = hash_init('sha256'); $totalBytes = 0;
+        $hash = hash_init('sha256'); $immutable = hash_init('sha256'); $totalBytes = 0;
         foreach (self::TABLES as $table => $cap) {
             // config has no PK in the pinned schema. Its complete nonunique
             // category-index range also covers NULLs and insertion gaps.
@@ -181,8 +404,37 @@ final class ClawPilotNativeEmailTransaction
             $order = $table === 'config' ? '`category`,`name`,`value`' : '`id`';
             $result = $this->query('SELECT * FROM `'.$table.'` FORCE INDEX (`'.$index.'`) ORDER BY '.$order.' FOR UPDATE', MYSQLI_USE_RESULT);
             if (!$result instanceof mysqli_result) $this->refuse('policy_result_missing');
-            hash_update($hash, $table."\n"); $count = 0;
+            hash_update($hash, $table."\n"); $count = 0; $hashedCount = 0;
+            if ($table !== 'securitygroups_records') hash_update($immutable,$table."\n");
             try {
+                // Only the membership table needs bounded buffering for an
+                // exact old-scan reconstruction. The ordinary publisher path
+                // remains byte-for-byte on the existing streaming algorithm.
+                if(($table==='securitygroups_users' && ($authorityDelta!==null || $forwardDeltas!==[]))
+                    || ($initialDelta!==null && in_array($table,$initialDelta->tables(),true))
+                    || ($forwardInitial!==null && in_array($table,$forwardInitial->tables(),true))) {
+                    $rows=[];$membershipBytes=0;$columns=array_map(static fn($field)=>$field->name,$result->fetch_fields());
+                    while($row=$result->fetch_assoc()) {
+                        if(++$count>$cap) $this->refuse('policy_row_limit');
+                        $size=strlen(json_encode($row,JSON_THROW_ON_ERROR));$totalBytes+=$size;$membershipBytes+=$size;
+                        if($size>self::MAX_ROW_BYTES || $totalBytes>self::MAX_POLICY_BYTES)$this->refuse('policy_byte_limit');
+                        $rows[]=$row;
+                    }
+                    if($this->db->errno!==0)$this->refuse('policy_scan_failed');
+                    if($initialDelta!==null)$rows=$initialDelta->restoreBefore($table,$rows);
+                    elseif($forwardInitial!==null)$rows=$forwardInitial->projectAfter($table,$rows,$columns);
+                    elseif($authorityDelta!==null)$rows=$authorityDelta->restoreBefore($rows);
+                    else foreach($forwardDeltas as $delta)$rows=$delta->projectAfter($rows,$columns);
+                    $count=count($rows);if($count>$cap)$this->refuse('policy_row_limit');
+                    $totalBytes-=$membershipBytes;
+                    foreach($rows as $row) {
+                        $encoded=json_encode($row,JSON_THROW_ON_ERROR);$size=strlen($encoded);$hashedCount++;
+                        $totalBytes+=$size;
+                        if($size>self::MAX_ROW_BYTES || $totalBytes>self::MAX_POLICY_BYTES)$this->refuse('policy_byte_limit');
+                        hash_update($hash,$size.':'.$encoded."\n");
+                        if($table!=='securitygroups_records')hash_update($immutable,$size.':'.$encoded."\n");
+                    }
+                } else {
                 while ($row = $result->fetch_assoc()) {
                     if (++$count > $cap) $this->refuse('policy_row_limit');
                     // Raw user/config values exist only in this local variable;
@@ -190,13 +442,21 @@ final class ClawPilotNativeEmailTransaction
                     $encoded = json_encode($row, JSON_THROW_ON_ERROR);
                     $size = strlen($encoded); $totalBytes += $size;
                     if ($size > self::MAX_ROW_BYTES || $totalBytes > self::MAX_POLICY_BYTES) $this->refuse('policy_byte_limit');
+                    if ($table === 'securitygroups_records' && $excludedInsert !== null && ($row['id'] ?? null) === $excludedInsert->linkId) {
+                        $this->assertExactDeltaRow($row,$excludedInsert);
+                        continue;
+                    }
+                    $hashedCount++;
                     hash_update($hash, $size.':'.$encoded."\n");
+                    if ($table !== 'securitygroups_records') hash_update($immutable,$size.':'.$encoded."\n");
                 }
                 if ($this->db->errno !== 0) $this->refuse('policy_scan_failed');
+                }
             } finally { $result->free(); }
-            hash_update($hash, 'rows:'.$count."\n");
+            hash_update($hash, 'rows:'.$hashedCount."\n");
+            if ($table !== 'securitygroups_records') hash_update($immutable,'rows:'.$count."\n");
         }
-        return hash_final($hash);
+        return ['full'=>hash_final($hash),'immutable'=>hash_final($immutable)];
     }
 
     private function state(): array

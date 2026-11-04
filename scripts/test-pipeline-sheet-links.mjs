@@ -42,6 +42,7 @@ const shortlinks = loadModule('app_src/lib/shortlinks.ts', {
 let rows = []
 let reads = 0
 const tenancy = loadModule('app_src/lib/tenancy.ts', {
+  '@/lib/persistence/crmNativeEmailAuthority': { lockCrmNativeEmailAuthorityWithClient: noIo },
   '@/lib/persistence/postgres': {
     query: async (sql, params) => {
       reads += 1

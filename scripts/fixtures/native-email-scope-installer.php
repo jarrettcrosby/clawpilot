@@ -45,7 +45,7 @@ try {
         finally { fwrite($pipes[0], "exit\n"); fclose($pipes[0]); fclose($pipes[1]); fclose($pipes[2]); proc_close($process); }
         cp_scope_require(!file_exists($context['stateRoot']), 'Quiescence refusal must precede state creation');
     });
-    installer_check('six-file installation preserves originals and metadata and is exactly idempotent', function () use ($context,$before): void {
+    installer_check('complete pinned installation preserves originals and metadata and is exactly idempotent', function () use ($context,$before): void {
         cp_scope_require(cp_scope_apply($context,true)['status'] === 'applied', 'Offline apply must complete');
         $manifest = cp_scope_load($context); $after = [];
         foreach ($manifest['files'] as $path=>$file) {

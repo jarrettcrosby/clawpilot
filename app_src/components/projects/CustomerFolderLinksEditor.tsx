@@ -84,7 +84,7 @@ export default function CustomerFolderLinksEditor({ description, descriptionHash
           </Typography>
           <TextField label="BPO Supply Chain Drive" type="url" fullWidth value={values.bpoDriveUrl} disabled={saving}
             onChange={event => setValues(current => ({ ...current, bpoDriveUrl: event.target.value }))}
-            helperText="Paste the existing folder link you created manually. ClawPilot never creates this folder."
+            helperText="Paste or edit this customer's BPO link. Folder creation and connection are managed separately in BPO folder setup & status."
             slotProps={{ htmlInput: { maxLength: 2048 } }} />
           <TextField label="Fractional Customer Folder" type="url" fullWidth value={values.fractionalCustomerFolderUrl} disabled={saving}
             onChange={event => setValues(current => ({ ...current, fractionalCustomerFolderUrl: event.target.value }))}

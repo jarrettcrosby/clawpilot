@@ -145,6 +145,9 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
   const client = { query: async (sql, params = []) => {
     calls.push({ sql, params: plain(params) })
     const result = rows => ({ rows, rowCount: rows.length })
+    if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
+      return result([{ singleton: true }])
+    }
     if (sql.includes('FROM app_users app_user')) return result([])
     if (sql.includes('set_config(')) return result([])
     if (sql === 'SELECT user_email,access_role FROM pipeline_space_members WHERE pipeline_id=$1::uuid FOR SHARE') return result([])
@@ -198,6 +201,7 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
     throw new Error(`Unexpected SQL: ${sql}`)
   } }
   const crm = loadModule('app_src/lib/persistence/crm.ts', {
+    '@/lib/persistence/crmNativeEmailAuthority': loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     '@/lib/crm/stableId': stable,
     '@/lib/crm/emailAddressHeaders': headers,
     '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,

@@ -32,6 +32,31 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
   database/configuration assignments leave that retirement unaccepted until the
   environment runbook's gated cleanup and re-audit pass.
 
+## Company-wide CRM access (release candidate)
+
+The root organization's actual owner can use **Settings → People → Company-wide
+CRM access** to select the businesses in an explicit operator CRM scope, save
+that scope, and select existing employees who may view its CRM pipelines and
+managed account cards. Only currently owned, non-demo businesses may be added.
+An email domain, personal default organization, or global role never creates a
+business binding. A child-organization administrator cannot configure it.
+
+Employee enrollment remains an explicit owner choice; inviting a person alone
+does not grant company-wide access. The person's active membership, CRM module
+permission and explicit business-level denials still apply. Private boards and
+independent editor/admin permissions are not widened. Turning an enrollment or
+business scope off preserves its identity and history rather than deleting it.
+Linking an existing SuiteCRM login remains a separate user-card action; app-only
+employees do not need a native login.
+
+With native email permissions enabled, these controls use the same exact
+native-first transition as user access changes. A pending or interrupted save
+is discovered again on reload and resumed using its saved identity, never by
+replaying draft form values. An unknown write followed by an unavailable read
+locks mutations until **Reload CRM access** can confirm the current state.
+This describes the local release candidate, not confirmation of production
+permission activation or a deployed owner workflow.
+
 ## Entity Mapping
 
 | ClawPilot | SuiteCRM | Workbook |

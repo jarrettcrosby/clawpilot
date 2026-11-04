@@ -74,7 +74,8 @@ function enrichmentHelper(query, stageCrmRecordWithClient) {
   const output = ts.transpileModule(declarations, {
     compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
   }).outputText
-  const context = { withTransaction: callback => callback({ query }), stageCrmRecordWithClient, Error }
+  const context = { withTransaction: callback => callback({ query }), stageCrmRecordWithClient, Error,
+    ...loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts') }
   vm.runInNewContext(`${output}\nglobalThis.enrich = enrichCrmEmailInteractionParticipantsInPostgres`, context)
   return context.enrich
 }
@@ -120,6 +121,9 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
   const result = rows => ({ rows, rowCount: rows.length })
   const enrichmentQuery = async (sql, values = []) => {
     queries.push({ sql, values: plain(values) })
+    if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
+      return result([{ singleton: true }])
+    }
     const row = [...providerInteractions, ...persistedInteractions].find(row => row.id === values[0] || row.id === values[1])
     if (sql.includes('SELECT interaction.*')) {
       await beforeEnrichment?.(row)

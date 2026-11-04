@@ -14,6 +14,8 @@ const owner = 'owner@example.test'
 const member = 'member@example.test'
 const orgA = '11111111-1111-4111-8111-111111111111'
 const orgB = '22222222-2222-4222-8222-222222222222'
+const nativeEnabled = process.argv.includes('--native-enabled')
+assert.deepEqual(process.argv.slice(2), nativeEnabled ? ['--native-enabled'] : [])
 const runtime = { env: { ...process.env, APP_LOGIN_EMAIL: owner, APP_LOGIN_EMAIL_ALIASES: 'owner-alias@example.test', APP_SESSION_SECRET: 'test-session-secret-of-at-least-32-characters', CLAWPILOT_LOGIN_EMAIL_CHANGE_ENABLED: '1' } }
 const command = (args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 180_000 })
 const read = (path) => readFileSync(path, 'utf8')
@@ -75,7 +77,9 @@ const container = `clawpilot-user-lifecycle-${process.pid}-${randomUUID().slice(
 let started = false
 let pool
 try {
-  command(disposablePostgresDockerArgs(['run', '--rm', '-d', '--name', container, '-e', 'POSTGRES_PASSWORD=lifecycle_test', '-e', 'POSTGRES_DB=lifecycle_test', '-p', '127.0.0.1::5432', 'postgres:18']))
+  // Same PostgreSQL major as this acceptance profile; use the shared test image
+  // and fail promptly if absent instead of hanging on an implicit registry pull.
+  command(disposablePostgresDockerArgs(['run', '--rm', '-d', '--pull', 'never', '--name', container, '-e', 'POSTGRES_PASSWORD=lifecycle_test', '-e', 'POSTGRES_DB=lifecycle_test', '-p', '127.0.0.1::5432', 'pgvector/pgvector:pg18']))
   started = true
   const port = Number(command(['port', container, '5432/tcp']).match(/:(\d+)\s*$/)?.[1])
   pool = new Pool({ connectionString: `postgresql://postgres:lifecycle_test@127.0.0.1:${port}/lifecycle_test`, max: 4 })
@@ -83,11 +87,21 @@ try {
     try { await pool.query('SELECT 1'); break } catch (error) { if (attempt > 100) throw error; await new Promise((done) => setTimeout(done, 200)) }
   }
   await pool.query(`
-    CREATE TABLE workspace_organizations (id uuid PRIMARY KEY, name text, parent_id uuid, is_demo boolean DEFAULT false);
-    CREATE TABLE app_users (email text PRIMARY KEY, role text DEFAULT 'member', status text DEFAULT 'active', permissions jsonb DEFAULT '{}', activated_at timestamptz, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now());
-    CREATE TABLE app_user_organization_memberships (user_email text REFERENCES app_users(email), organization_id uuid REFERENCES workspace_organizations(id), role text DEFAULT 'member', status text DEFAULT 'active', permissions jsonb DEFAULT '{}', is_default boolean DEFAULT false, updated_by text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), PRIMARY KEY (user_email, organization_id));
+    CREATE TABLE workspace_organizations (id uuid PRIMARY KEY, name text, parent_id uuid, is_demo boolean DEFAULT false, organization_type text DEFAULT 'root');
+    CREATE TABLE app_users (email text PRIMARY KEY, role text DEFAULT 'member', status text DEFAULT 'active', permissions jsonb DEFAULT '{}', suitecrm_user_id text, organization_id uuid, activated_at timestamptz, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(),
+      reference_code text,contact_reference_code text,crm_user_enabled boolean DEFAULT false,organization_name text,invited_by text,invited_at timestamptz);
+    CREATE FUNCTION allocate_crm_reference(prefix text) RETURNS text LANGUAGE sql AS $$ SELECT prefix || '1234567' $$;
+    CREATE TABLE pipeline_spaces (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), owner_email text, workspace_organization_id uuid, reference_access_disabled boolean DEFAULT false,
+      name text,is_default boolean DEFAULT false,provisioning_status text DEFAULT 'not_requested',sheet_id text,short_link_id uuid,sync_enabled boolean DEFAULT false,created_at timestamptz DEFAULT now());
+    CREATE TABLE pipeline_space_members (pipeline_id uuid, user_email text, access_role text,shared_by text,created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now());
+    CREATE TABLE app_user_organization_memberships (user_email text REFERENCES app_users(email), organization_id uuid REFERENCES workspace_organizations(id), role text DEFAULT 'member', status text DEFAULT 'active', permissions jsonb DEFAULT '{}', is_default boolean DEFAULT false, created_by text,updated_by text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now(), PRIMARY KEY (user_email, organization_id));
+    CREATE TABLE crm_interactions(id uuid PRIMARY KEY,pipeline_id uuid,suitecrm_id text,reference_code text,suitecrm_module text,suitecrm_synced_at timestamptz);
+    CREATE TABLE project_boards(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),name text,owner_email text,workspace_organization_id uuid,is_default boolean DEFAULT false,created_at timestamptz DEFAULT now());
+    CREATE UNIQUE INDEX project_boards_default_fixture ON project_boards(owner_email,workspace_organization_id) WHERE is_default;
+    CREATE TABLE crm_board_projections(board_id uuid,pipeline_id uuid,workspace_organization_id uuid);
     CREATE TABLE app_sessions (id uuid DEFAULT gen_random_uuid(), authenticated_user_email text, effective_user_email text, active_workspace_organization_id uuid, revoked_at timestamptz, revoked_reason text);
-    CREATE TABLE app_user_invitations (email text, workspace_organization_id uuid, workspace_organization_ids uuid[], accepted_at timestamptz, revoked_at timestamptz);
+    CREATE TABLE app_user_invitations (id uuid PRIMARY KEY DEFAULT gen_random_uuid(),email text, workspace_organization_id uuid, workspace_organization_ids uuid[], accepted_at timestamptz, revoked_at timestamptz,
+      expires_at timestamptz DEFAULT now()+interval '7 days',delivery_pending_at timestamptz,updated_at timestamptz DEFAULT now());
     CREATE TABLE auth_magic_codes (email text PRIMARY KEY);
   `)
   await pool.query(read('db/migrations/0265_google_identity_linking.sql'))
@@ -96,6 +110,11 @@ try {
   await pool.query("INSERT INTO app_users(email, role) VALUES ($1, 'owner'), ($2, 'member'), ('other@example.test', 'member')", [owner, member])
   await pool.query("INSERT INTO app_user_organization_memberships(user_email, organization_id, role) VALUES ($1, $3, 'owner'), ($2, $3, 'member'), ($2, $4, 'member')", [owner, member, orgA, orgB])
   await verifyMigrationWriterFence(pool)
+  await pool.query(read('db/migrations/0375_crm_native_email_publication_admission.sql'))
+  for (const file of ['0376_crm_native_email_publication_work_context.sql','0377_crm_native_email_authority_transitions.sql',
+    '0378_crm_native_email_capability_policies.sql','0379_crm_native_email_app_only_lifecycle.sql',
+    '0392_crm_root_employee_access_registry.sql','0393_crm_root_employee_read_context.sql'])
+    await pool.query(read(`db/migrations/${file}`))
   assert.equal((await pool.query("SELECT user_email FROM app_google_subject_owners WHERE provider_subject = 'old-subject'")).rows[0].user_email, member, 'Migration backfills immutable ownership for existing Google links')
   await pool.query('INSERT INTO app_sessions(authenticated_user_email, effective_user_email, active_workspace_organization_id) VALUES ($1, $1, $2), ($1, $1, $3)', [member, orgA, orgB])
   const audit = []
@@ -110,9 +129,64 @@ try {
       finally { client.release() }
     },
   }
-  const mocks = { '@/lib/persistence/postgres': persistence, '@/lib/auditWriter': { recordAuditEvent: async (event) => audit.push(event) }, '@/lib/crm/suiteCrmClient': {}, '@/lib/demoMode': { DEMO_WORKSPACE_ID: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' } }
+  const mocks = { '@/lib/persistence/postgres': persistence,
+    '@/lib/crm/rootEmployeeCrmPermissions': load('app_src/lib/crm/rootEmployeeCrmPermissions.ts', {}),
+    '@/lib/persistence/crmNativeEmailAuthority': load('app_src/lib/persistence/crmNativeEmailAuthority.ts', {}),
+    '@/lib/invitationWorkspaceScope': load('app_src/lib/invitationWorkspaceScope.ts', {
+      './persistence/crmNativeEmailAuthority': load('app_src/lib/persistence/crmNativeEmailAuthority.ts', {}),
+    }),
+    // This gate exercises the disabled/app-only legacy branch. Mapped-native
+    // runtime, real SQL transitions and native execution have separate gates.
+    '@/lib/crm/nativeEmailWorkspaceUserRuntime': { changeWorkspaceUserWithNativeAuthority: async (_actor, request) => {
+      const control=(await pool.query('SELECT enabled FROM crm_native_email_publication_control WHERE singleton')).rows[0]
+      if(control.enabled){
+        const target=(await pool.query('SELECT suitecrm_user_id FROM app_users WHERE email=$1',[request.userEmail])).rows[0]
+        assert.equal(target?.suitecrm_user_id,null,'This fixture must not bypass a mapped native lifecycle')
+      }
+      return false
+    } },
+    '@/lib/auditWriter': { recordAuditEvent: async (event) => audit.push(event) }, '@/lib/crm/suiteCrmClient': {}, '@/lib/demoMode': { DEMO_WORKSPACE_ID: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' } }
   const users = load('app_src/lib/users.ts', mocks)
   const actor = { email: owner, role: 'owner', status: 'active', permissions: users.OWNER_PERMISSIONS, organizationId: orgA }
+  if (nativeEnabled) {
+    await users.ensureOwnerUser()
+    await pool.query(`INSERT INTO app_users(email,status,organization_id) VALUES('viewer@example.test','active',$1)`,[orgA])
+    await pool.query(`INSERT INTO app_user_organization_memberships(user_email,organization_id)
+      VALUES('viewer@example.test',$1)`,[orgA])
+    await pool.query(`INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,is_default)
+      VALUES('33333333-3333-4333-8333-333333333333','Existing pipeline',$1,$2,true)`,[owner,orgA])
+    await pool.query(`INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role,shared_by)
+      VALUES('33333333-3333-4333-8333-333333333333','viewer@example.test','viewer',$1)`,[owner])
+    await pool.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
+      native_policy_fingerprint=$1,activation_receipt_hash=$2`, ['1'.repeat(64),'2'.repeat(64)])
+    const invitation = await users.inviteAppUser({ actorEmail: actor, email: 'new-user@example.test', organizationIds: [orgA] })
+    assert.equal(invitation.created, true)
+    assert.equal(invitation.user.status, 'invited')
+    await users.updateAppUserAccess({ actorEmail: actor, email: member, organizationId: orgA, permissions: { viewCrm: false } })
+    assert.equal((await pool.query('SELECT permissions FROM app_user_organization_memberships WHERE user_email=$1 AND organization_id=$2',[member,orgA])).rows[0].permissions.viewCrm,false)
+    await users.updateAppUserAccess({ actorEmail: actor, email: member, organizationId: orgA, permissions: { viewCrm: true } })
+    await users.setAppUserStatus({ actorEmail: actor, email: member, organizationId: orgA, status: 'disabled' })
+    assert.equal((await pool.query('SELECT status FROM app_users WHERE email=$1',[member])).rows[0].status,'active','Other active organization keeps the app account active')
+    await users.setAppUserStatus({ actorEmail: actor, email: member, organizationId: orgA, status: 'active' })
+    console.log('PASS: actual app-only invite, access settings and status functions under enabled native fence')
+  }
+  // Actual SQL compensation must restore only this invitation's exact version,
+  // never an intervening administrator removal or permission edit.
+  const compensate = invited => users.restoreInvitedUserAssignments({ email: member,
+    memberships: invited.previousMemberships, invitedBy: invited.previousInvitedBy,
+    producedUserRowJson: invited.producedUserRowJson })
+  await pool.query("UPDATE app_user_organization_memberships SET status='disabled' WHERE user_email=$1 AND organization_id=$2",[member,orgA])
+  const exactInvitation = await users.inviteAppUser({ actorEmail: actor, email: member, organizationIds: [orgA] })
+  await compensate(exactInvitation)
+  assert.equal((await pool.query('SELECT status FROM app_user_organization_memberships WHERE user_email=$1 AND organization_id=$2',[member,orgA])).rows[0].status,'disabled')
+  const supersededInvitation = await users.inviteAppUser({ actorEmail: actor, email: member, organizationIds: [orgA] })
+  await users.setAppUserTrashed({ actorEmail: actor, email: member, organizationId: orgA, trashed: true })
+  await compensate(supersededInvitation)
+  const preservedRemoval=(await pool.query('SELECT status,trashed_at FROM app_user_organization_memberships WHERE user_email=$1 AND organization_id=$2',[member,orgA])).rows[0]
+  assert.equal(preservedRemoval.status,'disabled');assert.ok(preservedRemoval.trashed_at)
+  await users.setAppUserTrashed({ actorEmail: actor, email: member, organizationId: orgA, trashed: false })
+  await pool.query("UPDATE app_user_organization_memberships SET status='active' WHERE user_email=$1 AND organization_id=$2",[member,orgA])
+  console.log('PASS: actual invitation assignment rollback restores exact postimage and preserves intervening Trash')
   const mutate = (trashed, extra = {}) => users.setAppUserTrashed({ actorEmail: actor, email: member, organizationId: orgA, trashed, ...extra })
   await assert.rejects(mutate(true, { email: owner }), /own account/)
   await assert.rejects(mutate(true, { organizationId: orgB }), /outside/)
@@ -261,6 +335,28 @@ try {
   assert.equal((await google.resolveLinkedGoogleIdentity({ subject: 'third-subject', email: 'third@example.test' })).email, member)
   assert.ok(audit.some((event) => event.eventType === 'user.trashed'))
   assert.ok(audit.some((event) => event.eventType === 'auth.login_email.changed'))
+  if (nativeEnabled) {
+    const tenancy = load('app_src/lib/tenancy.ts', { ...mocks, '@/lib/users': users,
+      '@/lib/persistence/pipeline': {}, '@/lib/shortlinks': {}, '@/lib/organizations': {}, '@/lib/pipeline/baseTemplate.mjs': {},
+      '@/lib/workspaceMemberships': { requireWorkspaceAppUser: async (email, organizationId) => {
+        assert.ok([member,'viewer@example.test'].includes(email)); assert.equal(organizationId, orgA)
+        return { ...memberActor,email,organizationName: 'Org A' }
+      } }, '@/lib/demoMode': { ...mocks['@/lib/demoMode'], isDemoWorkspaceId: () => false },
+    })
+    const resources = await tenancy.ensureDefaultResourcesForUser(memberActor)
+    assert.equal(resources.pipelineId,null,'App-only login requires explicit later pipeline sharing, not an implicit audience grant')
+    assert.equal(resources.pipelineProvisioningRequired,false)
+    assert.ok(resources.boardId)
+    assert.equal((await pool.query('SELECT count(*) FROM project_boards WHERE owner_email=$1',[member])).rows[0].count,'1')
+    assert.equal((await pool.query('SELECT count(*) FROM pipeline_spaces WHERE owner_email=$1',[member])).rows[0].count,'0')
+    assert.equal((await pool.query('SELECT count(*) FROM pipeline_space_members WHERE user_email=$1',[member])).rows[0].count,'0')
+    const viewerResources = await tenancy.ensureDefaultResourcesForUser({...memberActor,email:'viewer@example.test'})
+    assert.equal(viewerResources.pipelineId,'33333333-3333-4333-8333-333333333333')
+    assert.equal(viewerResources.pipelineProvisioningRequired,false)
+    assert.equal((await pool.query("SELECT access_role FROM pipeline_space_members WHERE user_email='viewer@example.test'")).rows[0].access_role,'viewer')
+    assert.equal((await pool.query("SELECT count(*) FROM pipeline_spaces WHERE owner_email='viewer@example.test'")).rows[0].count,'0')
+    console.log('PASS: actual login resource bootstrap preserves viewer access and creates no pipeline or implicit CRM membership')
+  }
   console.log('PASS: user Trash/Restore isolation, access states, sessions; default-off login-change gate, API/no-write/no-mail checks, verification, rate limits, collisions, identity preservation, old login revocation')
 } finally {
   await pool?.end()

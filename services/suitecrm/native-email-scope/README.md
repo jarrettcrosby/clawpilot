@@ -1,11 +1,14 @@
 # Offline native Email scope patch
 
-This package is **not enabled, copied into the service image, or called at startup**.
+This package is **not enabled or applied at startup**. Its source and offline
+tools are now included in the prepared service image; image presence is not
+installation or activation. Startup reads any retained installation journals
+before normal bootstrap writes and holds on incomplete or unverified state.
 It installs files only: no SuiteCRM bootstrap, database connection, role/group
 changes, user status changes, publication, or historical repair. The existing
 audience verifier and publication holds remain unchanged.
 
-`Patch.php` is the shared exact five-file transform. Its output hashes are pinned
+`Patch.php` is the shared exact six-file transform. Its output hashes are pinned
 to `native-future-history-2026-10-30-r2.json`. `Scope.php` deliberately retains the
 fixture's original bytes and internal candidate function names. The fixture
 patcher checks byte parity with its frozen helper copy before using this package.
@@ -45,6 +48,54 @@ An interrupted `prepared`, `applying` or `restoring` journal reports
 metadata or missing/changed backups refuse recovery. Failure before the first
 manifest leaves only protected staging/backups and no native modifications;
 that unjournaled state requires manual review, never automatic cleanup/adoption.
+
+## Separate native runtime file package
+
+`../install-native-email-runtime.php` installs the prepared publication and
+authority PHP dependencies, their explicitly gated OAuth routes and inert SQL
+source files. It never executes SQL, bootstraps SuiteCRM, changes configuration,
+sets feature flags, creates keys, alters permissions or activates publication.
+Its default `check` creates no directories, locks, temporary files or receipts.
+The package hash binds every source/target byte and the retained lifecycle-route
+choice. `apply --quiescent --approve-package=<independently reviewed hash>` is
+an explicit root/offline operation. The protected state defaults to
+`/var/lib/suitecrm/clawpilot-native-email-runtime-v1`, outside the application.
+
+Every helper is staged and syntax-checked before publication. The aggregate
+router is replaced last; the original audience route and existing record
+lifecycle include are retained. Native `Patch.php` is installed in the sibling
+include location required by the runtime, not silently omitted. Exact ordinary
+preimages, absence, metadata and root-protected originals are journaled. Unknown
+helpers, unjournaled prior runtime routes and operator/symlink/backup/staged-file
+drift hold. Individual replacements are durable, not one atomic filesystem
+transaction. A partial package requires explicit forward recovery with both the
+same package hash and retained install ID; no automatic restore or broad prune
+is offered. Interruption before the first manifest is a distinct safe hold:
+only protected staging/originals may exist, with no native target replacement.
+There is no install ID yet, so normal apply/recover deliberately refuses that
+state. An operator must separately reconcile every live target with the
+independently retained approved preflight metadata, inspect the exact protected
+directory and its ownership, then quarantine that one directory recoverably
+before retrying. Missing preflight evidence or any target drift requires further
+review; do not infer an empty/unchanged installation merely from a missing
+manifest, delete the directory, or prune a broader parent. This manual phase is
+not covered by the automatic post-manifest forward-recovery claim.
+
+`../native-email-startup-check.php` observes these journals before the service's
+URL/config, OAuth, global-ID or cache bootstrap. A verified installed runtime
+prevents the legacy installers from overwriting its aggregate router. Initial
+enrollment state and activation flags remain held until the separate trusted
+PostgreSQL/native settlement and startup-release verifier are implemented.
+An elapsed timeout, omitted flag or self-asserted ready JSON does not release a
+hold. This startup-release integration is still a release requirement; the file
+package and its filesystem tests do not prove it.
+
+Run `node scripts/test-native-email-runtime-installer.mjs` from the repository
+root with the cached PHP 8.3.36 test image. Six isolated Linux/root filesystem
+groups exercise no-write checking, real other-PHP-process refusal, package
+apply/idempotency/router ordering, exact interrupted recovery, drift and startup
+holds. Package contents in that fixture are synthetic; it is not native API,
+database, real service-image startup, permission or production proof.
 
 `restore --quiescent --approve-restore=<exact-installId>` is a separate explicit
 operation. The installation ID is returned by `check`. Restore verifies the

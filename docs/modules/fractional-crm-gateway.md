@@ -11,6 +11,8 @@ app_visible: false
 
 # Fractional CRM gateway
 
+November 2 local sender checkpoint: Fractional now has a separately gated durable publication worker and customer-facing status/recheck path for its **existing verified Fractional Shared Drive root**. It does not provision a substitute folder or overwrite the separate BPO link. Current sender TypeScript, 15 provider/transport tests, three consecutive PostgreSQL runs and mocked React/MUI mobile light/dark checks pass; evidence is retained as `fractional-folder-*-20261102-r64` through `r67` in `output/local-validation`. These separate sender/receiver tests are not combined real machine HTTP/card proof, live Drive verification, activation or deployment. Historical BPO-parent folders are not automatically treated as Fractional-drive roots. Current-source isolated build and remaining release gates stay open.
+
 This gateway lets the independent Fractional application reuse ClawPilot's canonical company (`ga`) and contact (`gc`) records. PostgreSQL remains authoritative. Existing ClawPilot staging creates its normal SuiteCRM projection outbox; a gateway response does not attest to later native SuiteCRM delivery. Fractional retains its own organization/customer authorization, login accounts, local UUIDs, and shipping data. A Global ID identifies a record; it does not grant access.
 
 The user approved the scoped gateway implementation and documentation. Source validation is local; this note does not claim a deployed gateway, registered production credential, cloud migration, successful hosted connector call, or a sent invitation. Enablement remains off until the reviewed release and credential configuration are applied.
@@ -40,6 +42,8 @@ All paths start with `/api/integrations/fractional-crm/v1`. Each request require
 | `GET /companies/{ga}/contacts/{gc}` | Pure contact read with exact parent validation. |
 | `PATCH /companies/{ga}` | Conditional allowlisted company-field update. |
 | `PATCH /companies/{ga}/contacts/{gc}` | Conditional contact-field update without reparenting. |
+| `GET /companies/{ga}/customer-folder?customerId={id}` | Read the exact mapped Fractional customer's folder-reference state and opaque version. |
+| `PATCH /companies/{ga}/customer-folder?customerId={id}` | Conditional, idempotent publication of that customer's authoritative Fractional folder reference; no folder provisioning. |
 | `POST /onboarding/resolve-or-create` | Atomic company/contact resolution and optional creation under the registered source scope. |
 
 Bodies are limited to 64 KiB and a ten-second read deadline. PATCH requires a strong quoted `If-Match` version and `Idempotency-Key`; the key is 8–160 ASCII letters, digits, underscores, or hyphens. Envelopes echo schema/source/scope, canonical and requested IDs, immutable record UUID, parent company, opaque content version, management, and `canPush`. Workspace-managed companies and app-user-managed contacts remain read-only. An alias can be read with explicit canonical resolution; PATCH requires the canonical ID.
@@ -47,6 +51,30 @@ Bodies are limited to 64 KiB and a ten-second read deadline. PATCH requires a st
 Company fields are `companyName`, `website`, `email`, `phone`, `addressLine1`, `addressLine2`, `city`, `region`, `postalCode`, and `countryCode`. Contact fields are `displayName`, `email`, `phone`, and `jobTitle`. Only work phone is mapped; mobile, notes, opt-outs, ownership, and unrelated native fields remain unchanged. A structured first/last name cannot be silently reconstructed from a changed display name. Emails normalize only case and surrounding whitespace during matching; writes require canonical input. No plus-address or dot rewriting occurs.
 
 Raw canonical PostgreSQL text is retained, including apostrophes and literal entities. Missing data is `null`; an address that cannot map losslessly to at most two lines or a non-ISO stored country is explicitly unavailable with retained source text. Unavailable fields must not clear known Fractional fields. Requested fields must match the committed canonical readback exactly or the transaction rolls back.
+
+### Fractional customer-folder reference
+
+This is a separate schema-version-1 subresource; the existing company/contact field allowlists and response shapes are unchanged. Its query requires the four normal scope parameters plus exactly one `customerId`. GET uses `crm.company.read`; PATCH uses `crm.company.write`. Both require the exact canonical Account Global ID and an existing immutable `fractional_crm_source_mappings` company mapping for this source instance, deployment, organization and customer. A company allowlist entry alone, a company-name match, a contact grant or an alias does not authorize folder publication. The mapped Account must be an active, non-workspace Customer. Current credential, ancestry, actor membership/module access and source mapping are rechecked before even a historical command receipt can replay.
+
+PATCH requires `If-Match` from this subresource (not the company envelope), a stable `Idempotency-Key`, and exactly:
+
+```json
+{
+  "schemaVersion": 1,
+  "folderUrl": "https://app.bposupplychain.com/s/d_example",
+  "assertedFractionalActor": {
+    "userId": "fractional-user-id",
+    "organizationId": "credential-bound-fractional-organization",
+    "customerId": "query-customer-id"
+  }
+}
+```
+
+`folderUrl` is the authoritative existing HTTPS reference, or `null` for an explicit clear. It is validated as data and never fetched. No Drive folder, sharing permission, customer or human login is created. The response contains schema/source/scope, entity `customer-folder`, Account UUID and Global ID, Fractional customer ID, `folderUrl`, `status` (`unlinked`, `published`, `manual_override`) and opaque `version`; no service-account or credential details are returned.
+
+Prepared migration `0390_crm_fractional_customer_folders.sql` creates an empty one-Account/one-source-customer reference binding. The binding identity is immutable. Publication locks the current Account description and uses the existing CRM staging/outbox/audit transaction, preserving notes and the BPO link. The version includes the current description, so an old request cannot discard an intervening note. Matching pre-existing references may be adopted; different manually entered references, later replacements/removals, or malformed/duplicate labels require explicit review. Retries do not reinsert a removed link. Card reconciliation runs after commit and repeats on an exact command retry if its earlier response failed; it cannot claim card success before that step finishes. `published` proves local publication, not downstream SuiteCRM delivery or destination access.
+
+The November 3 read-only source review found Fractional's separate sender in `app/src/server/customer-folder-publication.ts`, its exact folder gateway client, and worker wiring in the canonical Fractional checkout. The sender retains an immutable publication intent, verifies the existing ready Drive folder, uses conditional PATCH plus independent GET readback, and holds manual conflicts without recreating the folder. Those source files were still untracked at inspection; their presence is not a release, test receipt, enabled connector, or provider proof. Coordinate that source's release evidence rather than implementing a duplicate sender. This ClawPilot receiver is not verified automatic cross-application synchronization until both releases and the signed-in/provider flow are confirmed. No hosted schema or connector is activated by these source changes.
 
 ## Onboarding and durable evidence
 
@@ -67,6 +95,8 @@ Onboarding uses a three-second bounded exclusive CRM-table lock to fence existin
 - Credential provisioning/rotation UI, hosted acceptance, external connector activation, and native projection delivery are separate release checks. Login email and user permissions are never inferred from a matched contact.
 
 ## Verification and source map
+
+November 2 local candidate: 25 HTTP/auth/route/merge checks and 68 actual PostgreSQL assertions passed on Node 24.22.1. The PostgreSQL fixture applies all migrations and uses actual native-control locking, CRM staging/outbox/audit, immutable source mappings and folder binding. Its folder flow runs actual authenticated machine HTTP → actual PostgreSQL publication → actual Project-card reconciliation; the card retains its identity and comments. Shortlink upkeep is excluded. Added cases cover commit rollback, lost successful response, stale description CAS, source-customer/account/alias mismatch, manual removal, changed grants/module access and immutable binding. New Fractional-created companies are explicitly typed Customer; existing company classifications are preserved. Separate HTTP tests use synthetic persistence to inject post-commit card-reconciliation failure/retry. None of these tests is real Fractional sender, signed-in browser, native delivery or hosted acceptance.
 
 On Node 24.21.0, focused model/HTTP tests passed 20/20; the actual PostgreSQL fixture passed 36 assertions with all repository migrations and production CRM staging/outbox code. Coverage includes tenant/parent denial, pure reads, conditional writes, stable receipt replay, private-field preservation, aliases, retired ancestry, null email clearing, parallel exact retry, atomic pair review, immutable attribution, token-identity immutability, and permission revocation. The concurrency fixture observes a native ancestor archive waiting on the gateway transaction's lock, then verifies later descendant access is denied. No provider network calls occur. Owned disposable PostgreSQL cleanup completed. Existing CRM contact-identity regression and focused ESLint passed. Production build and CI receipts belong to the release record; they are not implied by these targeted results.
 

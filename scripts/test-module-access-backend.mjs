@@ -19,6 +19,9 @@ function load(file, mocks = {}) {
 }
 const noIo = () => { throw new Error('Unexpected I/O') }
 const users = load('app_src/lib/users.ts', {
+  '@/lib/persistence/crmNativeEmailAuthority': { lockCrmNativeEmailAuthorityWithClient: noIo },
+  '@/lib/invitationWorkspaceScope': { removeWorkspaceFromPendingInvitationsWithClient: noIo },
+  '@/lib/crm/nativeEmailWorkspaceUserRuntime': { changeWorkspaceUserWithNativeAuthority: noIo },
   '@/lib/persistence/postgres': { query: noIo, withTransaction: noIo }, '@/lib/auditWriter': {}, '@/lib/crm/suiteCrmClient': {}, '@/lib/demoMode': {},
 })
 const registry = load('app_src/lib/moduleAccess.ts')
@@ -159,6 +162,8 @@ scoped = actor(permissions('viewCrm'))
 let writes = 0
 const workspaces = load('app_src/app/api/workspaces/route.ts', { 'next/server': { NextResponse }, '@/lib/requestUser': { requireRequestUser: async () => scoped },
   '@/lib/dashboardWorkspace': dashboardWorkspace, '@/lib/moduleAuthorization': authorization,
+  '@/lib/crm/nativeEmailAuthorityRuntime': { NativeEmailAccessPendingError: class extends Error {} },
+  '@/lib/crm/nativeEmailSharingRecovery': { getPendingPipelineSharingChange: noIo, resumePipelineSharingChange: noIo },
   '@/lib/pipelineProvisioning': { PipelineProvisioningRequestError: class extends Error {} },
   '@/lib/tenancy': { ...tenancy, createProjectBoard: async () => { writes++; return { id: 'new' } } },
 })

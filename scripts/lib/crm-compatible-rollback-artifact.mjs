@@ -14,11 +14,47 @@ export const REQUIRED_ROLLING_CHECKS = Object.freeze([
   'compatible_shared_content_edit_preserves_identity', 'retained_schema_compatible_rollback_write',
   'private_write_context_not_leaked', 'producer_retains_all_company_relationships',
 ])
+const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
+  'db/migrations/0375_crm_native_email_publication_admission.sql',
+  'db/migrations/0376_crm_native_email_publication_work_context.sql',
+  'db/migrations/0377_crm_native_email_authority_transitions.sql',
+  'db/migrations/0378_crm_native_email_capability_policies.sql',
+  'db/migrations/0379_crm_native_email_app_only_lifecycle.sql',
+  'db/migrations/0380_crm_native_email_grant_attempts.sql',
+  'db/migrations/0381_crm_native_email_identity_quiescence.sql',
+  'db/migrations/0382_crm_native_email_mapped_settings.sql',
+  'db/migrations/0383_crm_native_email_user_eligibility.sql',
+  'db/migrations/0384_crm_native_email_member_role_changes.sql',
+  'db/migrations/0385_crm_employee_identity_retention.sql',
+  'db/migrations/0386_crm_native_email_first_access_grants.sql',
+  'db/migrations/0387_crm_native_email_shared_app_only_lifecycle.sql',
+  'db/migrations/0388_crm_customer_drive_folders.sql',
+  'db/migrations/0389_crm_customer_folder_jobs.sql',
+  'db/migrations/0390_crm_fractional_customer_folders.sql',
+  'db/migrations/0391_crm_native_email_unshared_workspace_enrollment.sql',
+  'db/migrations/0392_crm_root_employee_access_registry.sql',
+  'db/migrations/0393_crm_root_employee_read_context.sql',
+  'db/migrations/0394_crm_native_root_source_fences.sql',
+  'db/migrations/0395_crm_native_email_existing_identity_links.sql',
+  'db/migrations/0396_crm_root_native_read_receipts.sql',
+  'db/migrations/0397_crm_native_root_registry_changes.sql',
+  'db/migrations/0398_crm_native_email_initial_enrollment.sql',
+  'db/migrations/0399_crm_native_email_initial_replan_lineage.sql',
+])
 export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
+  ...ROLLBACK_CRM_AUTHORITY_MIGRATIONS,
   'app_src/app/api/crm/email-recovery/route.ts', 'app_src/app/api/crm/email-review-candidates/route.ts',
   'app_src/app/api/crm/mailbox-identity/route.ts', 'app_src/components/crm/EmailReviewDialog.tsx',
   'app_src/app/api/crm/route.ts', 'app_src/app/api/crm/actions/route.ts',
   'app_src/app/api/crm/integrations/process/route.ts', 'app_src/lib/crm/integrationActions.ts',
+  'app_src/app/api/crm/root-access/route.ts', 'app_src/lib/persistence/crmRootEmployeeSettings.ts',
+  'app_src/lib/crm/rootEmployeeCrmSettings.ts', 'app_src/lib/crm/nativeEmailRootRegistryRuntime.ts',
+  'app_src/lib/crm/nativeEmailInitialEnrollment.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentApproval.ts',
+  'app_src/lib/crm/nativeEmailInitialInstallationLineage.ts',
+  'app_src/lib/crm/nativeEmailInitialEnrollmentPostgres.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentCoordinator.ts',
+  'app_src/lib/crm/nativeEmailInitialEnrollmentOperator.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentCliTransport.ts',
+  'app_src/lib/crm/nativeEmailInitialStartupOrigin.ts', 'app_src/ops/native-email-initial.ts',
+  'app_src/components/settings/RootCrmAccessPanel.tsx', 'app_src/components/settings/UserAccessDialog.tsx',
   'app_src/components/crm/CrmSection.tsx', 'app_src/components/settings/GoogleAuthSettingsPanel.tsx',
   'app_src/lib/browserSameOrigin.ts', 'app_src/lib/requestUser.ts', 'app_src/lib/tenancy.ts',
   'app_src/lib/googleSso.ts', 'app_src/lib/authSessions.ts', 'app_src/lib/globalIds.mjs',
@@ -36,7 +72,27 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   'services/suitecrm/bootstrap-image-principals.php',
   'services/suitecrm/email-audience/EmailAudience.php', 'services/suitecrm/email-audience/routes.php',
   'services/suitecrm/install-email-audience.php',
+  'services/suitecrm/install-native-email-scope.php', 'services/suitecrm/install-native-email-runtime.php',
+  'services/suitecrm/install-native-email-initial-state.php', 'services/suitecrm/native-email-initial-cli.php',
+  'services/suitecrm/native-email-initial-install-profile.json',
+  'services/suitecrm/native-email-initial-artifacts.php', 'services/suitecrm/native-email-enrolled-startup.php',
+  'services/suitecrm/native-email-startup-check.php', 'services/suitecrm/native-email-maintenance.py',
+  'services/suitecrm/native-email-liveness.json', 'services/suitecrm/apache-site.conf', 'services/suitecrm/apache-ports.conf', 'services/suitecrm/railway.json',
+  'services/suitecrm/native-email-scope/Patch.php', 'services/suitecrm/native-email-scope/Scope.php',
+  'services/suitecrm/email-audience/NativeEmailTransaction.php', 'services/suitecrm/email-audience/NativeEmailRuntime.php',
+  'services/suitecrm/email-audience/NativeEmailProjection.php', 'services/suitecrm/email-audience/NativeEmailPublisher.php',
+  'services/suitecrm/email-audience/NativeEmailWriteScope.php', 'services/suitecrm/email-audience/NativeEmailCapabilityContract.php',
+  'services/suitecrm/email-audience/NativeEmailAuthorityContract.php', 'services/suitecrm/email-audience/NativeEmailAuthorityDelta.php',
+  'services/suitecrm/email-audience/NativeEmailAuthorityProof.php', 'services/suitecrm/email-audience/NativeEmailAuthorityTransition.php',
+  'services/suitecrm/email-audience/NativeEmailIdentityLink.php', 'services/suitecrm/email-audience/NativeEmailInitialEnrollment.php',
+  'services/suitecrm/email-audience/NativeEmailInitialPolicyDelta.php',
+  'services/suitecrm/email-audience/NativeEmailInitialInstallationLineage.php',
+  'services/suitecrm/email-audience/NativeEmailStartupOrigin.php',
+  'services/suitecrm/email-audience/publication-routes.php', 'services/suitecrm/email-audience/authority-routes.php',
+  'services/suitecrm/email-audience/publication-schema.sql', 'services/suitecrm/email-audience/authority-transition-schema.sql',
+  'services/suitecrm/email-audience/initial-enrollment-schema.sql',
   'scripts/build-crm-compatible-rollback.mjs', 'scripts/certify-crm-rollback-build.mjs',
+  'scripts/build-native-email-initial-operator.mjs', 'scripts/test-native-email-initial-private-operator.mjs',
   'scripts/lib/crm-compatible-rollback-artifact.mjs', 'scripts/test-crm-rolling-rollback-postgres.mjs',
   'scripts/test-crm-compatible-rollback-artifact.mjs', 'scripts/test-crm-email-routing-postgres.mjs',
   'scripts/test-crm-reviewed-gmail-persistence.mjs', 'scripts/test-production-rebind-history-schema-attestation.mjs',
@@ -87,9 +143,15 @@ export function inspectRollbackSources(readSource) {
   assert.ok(files['app_src/lib/crm/suiteCrmClient.ts'].includes('record.relationships'), 'Rollback floor lacks native relationship publication')
   assert.ok(attester.includes('if (inspection.schemaDigest !== expectedDigest)'), 'Rollback floor must retain strict raw catalog acceptance')
   const format = attester.match(/PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT\s*=\s*'([^']+)'/u)?.[1]
-  assert.equal(format, 'clawpilot-production-rebind-target-schema-attestation-v9')
+  assert.equal(format, 'clawpilot-production-rebind-target-schema-attestation-v15')
   const enrolledMigration = attester.match(/filename:\s*'0374_crm_interaction_organizations\.sql',\s*checksum:\s*'([a-f0-9]{64})'/u)?.[1]
   assert.equal(enrolledMigration, sha256(migration), 'Rollback floor must attest its exact migration bytes')
+  for(const path of ROLLBACK_CRM_AUTHORITY_MIGRATIONS){
+    const filename=path.split('/').at(-1)
+    const escaped=filename.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')
+    const enrolled=attester.match(new RegExp("filename:\\s*'"+escaped+"',\\s*checksum:\\s*'([a-f0-9]{64})'"))?.[1]
+    assert.equal(enrolled,sha256(files[path]),`Rollback floor must retain and attest ${filename}`)
+  }
   const rawDigestBlock = attester.match(/const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object\.freeze\(\{([\s\S]*?)\}\)/u)?.[1]
   assert.ok(rawDigestBlock, 'Rollback floor must enroll raw catalog digests')
   const postgresDigests = Object.fromEntries([...rawDigestBlock.matchAll(/(16|18):\s*'([a-f0-9]{64})'/gu)].map(([, major, digest]) => [major, digest]))

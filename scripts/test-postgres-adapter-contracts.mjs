@@ -2507,6 +2507,22 @@ assertIncludes(tasksRoute, '_agentDispatchState', 'worker-owned dispatch state u
 assertIncludes(tasksRoute, 'CRM cards are created from CRM accounts and contacts', 'managed CRM board creation guard')
 assertIncludes(tasksRoute, 'resolvePipelineSpaceAccess', 'CRM board and pipeline access intersection')
 assertIncludes(tasksRoute, 'CrmDescriptionConflictError', 'stale CRM card update rejection')
+const crmDescriptionMutation = crmBoardProjection.slice(crmBoardProjection.indexOf('export async function updateCrmBoardTaskDescription'))
+const crmDescriptionControlLock = crmDescriptionMutation.indexOf('await lockCrmNativeEmailAuthorityWithClient(client)')
+const crmDescriptionLifecycleLock = crmDescriptionMutation.indexOf('`crm-record-lifecycle:${binding.pipeline_id}`')
+const crmDescriptionCardLock = crmDescriptionMutation.indexOf('FOR UPDATE OF card')
+assert.ok(crmDescriptionControlLock >= 0 && crmDescriptionLifecycleLock > crmDescriptionControlLock
+  && crmDescriptionCardLock > crmDescriptionLifecycleLock, 'CRM description control/lifecycle/card lock ordering')
+assertIncludes(crmDescriptionMutation, 'card.pipeline_id=$3::uuid AND projection.workspace_organization_id=$4::uuid', 'CRM card binding rechecked under lifecycle lock')
+assertIncludes(crmDescriptionMutation, 'card.entity_type=$5 AND card.entity_id=$6::uuid AND card.reference_code=$7', 'CRM card identity cannot change after discovery')
+assertIncludes(crmDescriptionMutation, "COALESCE(lower(source_payload->>'archived'),'false') NOT IN ('true','1','yes')", 'deleted CRM records cannot be edited through stale cards')
+const crmBoardReconcile = crmBoardProjection.slice(crmBoardProjection.indexOf('export async function reconcileCrmBoardProjection('), crmBoardProjection.indexOf('export async function reconcileCrmBoardProjectionsForPipeline'))
+assert.ok(crmBoardReconcile.indexOf('`crm-record-lifecycle:${binding.pipeline_id}`')
+  < crmBoardReconcile.indexOf('readCrmBoardRecords(binding.pipeline_id, binding.workspace_organization_id, client)'),
+'CRM board visibility must be read under the lifecycle lock, including ancestor tombstones')
+assertIncludes(crmBoardReconcile, 'readCrmBoardCards(binding.board_id, client)', 'preserve latest card history under lifecycle lock')
+assertIncludes(crmBoardReconcile, 'FOR SHARE OF projection, board', 'pin exact board binding during visibility projection')
+assertIncludes(crmBoardReconcile, 'const hiddenCards = existingCards.filter', 'remove newly invisible descendant cards from fresh graph')
 
 const assignmentsRoute = read('app_src/app/api/agents/assignments/route.ts')
 assertIncludes(assignmentsRoute, 'prepareAgentDispatch', 'assignment agent dispatch enqueue')

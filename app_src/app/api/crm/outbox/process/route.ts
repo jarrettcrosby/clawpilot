@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { processSuiteCrmOutbox } from '@/lib/crm/worker'
+import { processCustomerFolderJobs } from '@/lib/crm/customerFolderJobs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 
 export const runtime = 'nodejs'
@@ -19,5 +20,6 @@ export async function POST(req: NextRequest) {
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM outbox requires Postgres storage' }, { status: 409 })
   const body = await req.json().catch(() => ({})) as { limit?: number }
   const result = await processSuiteCrmOutbox({ limit: body.limit })
-  return NextResponse.json({ ok: true, ...result })
+  const customerFolders = await processCustomerFolderJobs({ limit: 1 })
+  return NextResponse.json({ ok: true, ...result, customerFolders })
 }

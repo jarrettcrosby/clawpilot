@@ -222,9 +222,10 @@ await check('existing route authorization and transactional hash conflict guards
   assert.match(projection, /expectedHash !== projectedHash \|\| expectedHash !== currentHash/u)
   assert.match(projection, /await updateCrmDescriptionWithClient\(client,/u)
 })
-await check('folder UI/helper have no autonomous folder creation, permission change, network or persisted defaults', () => {
+await check('manual folder-link editor/helper remain data-only with separate automation controls', () => {
   assert.doesNotMatch(editorSource + helperSource, /\bfetch\s*\(|XMLHttpRequest|localStorage|sessionStorage|useEffect|window\.location|process\.env|googleapis|matonClient|createFolder|permissions\.create/u)
-  assert.ok(editorSource.includes('ClawPilot never creates this folder'))
+  assert.ok(editorSource.includes('Folder creation and connection are managed separately'))
+  assert.ok(drawerSource.includes('<CustomerFolderAutomation'))
   assert.ok(editorSource.includes('Drive access permissions are unchanged'))
   assert.doesNotMatch(editorSource + helperSource, /fbjdbq3|d_dCUts2_v096LwHXOjc2OJw/u)
 })

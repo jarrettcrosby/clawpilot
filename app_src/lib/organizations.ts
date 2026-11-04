@@ -1,4 +1,5 @@
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import {
   AppUserAuthorizationError,
   canInviteUsers,
@@ -179,6 +180,7 @@ export async function ensurePrimaryWorkspaceOrganization(
   if (user.role !== 'owner' && user.invitedBy) {
     const inviterOrganization = await ensurePrimaryWorkspaceOrganization(user.invitedBy, visited)
     const organization = await withTransaction(async (client) => {
+      await lockCrmNativeEmailAuthorityWithClient(client)
       const assigned = await client.query<{ organization_id: string | null }>(
         'SELECT organization_id::text FROM app_users WHERE email = $1 FOR UPDATE',
         [email],
@@ -212,6 +214,7 @@ export async function ensurePrimaryWorkspaceOrganization(
   const organizationType = user.role === 'owner' ? 'root' : 'member'
 
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const locked = await client.query<{
       organization_id: string | null
       organization_name: string | null
@@ -372,6 +375,9 @@ export async function retireUnusedWorkspaceOrganization(organizationIdValue: unk
   const organizationId = String(organizationIdValue || '').trim()
   if (!organizationId) return
   await withTransaction(async (client) => {
+    // Parent deletion can invoke protected-table FK cascades, even when the
+    // explicit emptiness checks find no child rows.
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const organization = await client.query<{ reference_code: string; parent_id: string | null }>(
       `SELECT reference_code, parent_id::text
        FROM workspace_organizations
@@ -560,6 +566,7 @@ export async function updateWorkspaceOrganizationParent(input: {
   }
 
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const target = await client.query<{ organization_type: 'root' | 'member' }>(
       `WITH RECURSIVE managed AS (
          SELECT id FROM workspace_organizations WHERE id = $2::uuid

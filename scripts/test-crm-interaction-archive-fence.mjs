@@ -49,6 +49,9 @@ function harness(initialRecord = baseRecord) {
     async query(sql, params = []) {
       calls.push({ sql, params: plain(params) })
       const result = (rows) => ({ rows, rowCount: rows.length })
+      if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
+        return result([{ singleton: true }])
+      }
       if (sql.includes('set_config(')) {
         assert.equal(sql, sharedWriteContextSql, 'Only the exact transaction-local authorized compatibility context is supported')
         assert.deepEqual(plain(params), [], 'The compatibility context has no caller-supplied authority parameters')
@@ -135,6 +138,7 @@ function harness(initialRecord = baseRecord) {
     },
   }
   const crm = loadModule('app_src/lib/persistence/crm.ts', {
+    '@/lib/persistence/crmNativeEmailAuthority': loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     '@/lib/crm/stableId': stable,
     '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,
     '@/lib/persistence/postgres': { withTransaction: (callback) => callback(client) },
@@ -167,7 +171,9 @@ for (const emitSuiteCrmOutbox of [false, true]) {
     })
     const archiveContext = h.calls.filter(({ sql }) => sql === sharedWriteContextSql)
     assert.equal(archiveContext.length, 1, 'The real archive transaction explicitly enables its compatible writer context')
-    assert.ok(h.calls.indexOf(archiveContext[0]) < h.calls.findIndex(({ sql }) => sql.includes('FOR UPDATE')),
+    assert.equal(h.calls[0].sql, 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE',
+      'Control is acquired before source and outbox locks')
+    assert.ok(h.calls.indexOf(archiveContext[0]) < h.calls.findIndex(({ sql }) => sql.includes('FROM crm_interactions') && sql.includes('FOR UPDATE')),
       'The archive context is established before the locked mutation')
     const archived = h.record()
     assert.equal(archived.source_payload.archived, true)
@@ -193,7 +199,10 @@ for (const emitSuiteCrmOutbox of [false, true]) {
     assert.equal(archiveFenceReads.length, 1, 'The original locked archival fence remains mandatory')
     assert.deepEqual(retainedReads[0].params, [pipelineId, localId || null, baseRecord.source_key])
     assert.deepEqual(archiveFenceReads[0].params, [pipelineId, localId || null, baseRecord.source_key])
-    assert.equal(h.calls.filter(({ sql }) => sql.includes('FOR UPDATE')).length, retainedReads.length + archiveFenceReads.length)
+    const controlReads = h.calls.filter(({ sql }) => sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+    assert.equal(controlReads.length, 1)
+    assert.equal(h.calls[0], controlReads[0], 'The inventory fence precedes source row locks')
+    assert.equal(h.calls.filter(({ sql }) => sql.includes('FOR UPDATE')).length, retainedReads.length + archiveFenceReads.length + controlReads.length)
     assert.ok(h.calls.every(({ sql }) => !/\b(?:INSERT|UPDATE|DELETE)\b/.test(sql.replace('FOR UPDATE', ''))),
       'Archived no-op must not write records, relationships, outbox jobs, or links')
   }
@@ -233,7 +242,7 @@ for (const initial of [null, baseRecord, { ...baseRecord, source_payload: { arch
     assert.equal(returned.shortUrl, `https://example.test/s/${baseRecord.reference_code}`)
     assert.equal(h.linksDisabled(), false)
     assert.ok(h.calls.some(({ sql }) => sql.includes('INSERT INTO sync_outbox')))
-    const lockIndex = h.calls.findIndex(({ sql }) => sql.includes('FOR UPDATE'))
+    const lockIndex = h.calls.findIndex(({ sql }) => sql.includes('FROM crm_interactions') && sql.includes('FOR UPDATE'))
     const writeIndex = h.calls.findIndex(({ sql }) => sql.includes('INSERT INTO crm_interactions'))
     const activeContexts = h.calls.filter(({ sql }) => sql === sharedWriteContextSql)
     assert.equal(activeContexts.length, 1, 'Active staging explicitly enters its transaction-local compatible writer context')
@@ -251,7 +260,8 @@ for (const fields of [{ agentEmail: 'unauthorized@example.test' }, { contactIds:
   await assert.rejects(h.crm.stageCrmRecordWithClient(h.client, staleInput({
     fields: { interactionType: 'email', subject: 'Invalid mapping', ...fields },
   })), /Interaction (agent must be an active ClawPilot user with pipeline access|contact selection is invalid)/)
-  const lockedReads = h.calls.filter(({ sql }) => sql.includes('FOR UPDATE'))
+  assert.equal(h.calls[0].sql, 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+  const lockedReads = h.calls.filter(({ sql }) => sql.includes('FROM crm_interactions') && sql.includes('FOR UPDATE'))
   assert.equal(lockedReads.length, 1)
   assert.ok(lockedReads[0].sql.includes('FROM crm_interaction_organizations related'))
   assert.ok(h.calls.every(({ sql }) => !/\b(?:INSERT|UPDATE|DELETE)\b/.test(sql.replace('FOR UPDATE', ''))))

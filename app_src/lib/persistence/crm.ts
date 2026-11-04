@@ -16,6 +16,8 @@ import { suiteCrmOpportunitySalesStage } from '@/lib/crm/suiteCrmOpportunityStag
 import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
 import type { SuiteCrmEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import { suiteCrmEmailAudienceFingerprint } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import { nativeEmailPrincipalIsEligible, nativeEmailEffectivePipelinePrincipals } from '@/lib/crm/nativeEmailEligibility'
+import { collectNativeEmailRootSourcesWithClient, projectNativeEmailRootReaders } from '@/lib/crm/nativeEmailRootReaders'
 import { assertSameRetainedGmailEvidence, retainedGmailMessageEvidence, gmailMessageSourceKey,
   type VerifiedGmailMailboxIdentity, type GmailMessageEvidence } from '@/lib/crm/emailIdentity'
 import { prepareBoundedLegacyGmailAdoption, type GmailLegacyAdoption } from '@/lib/crm/emailReconciliation'
@@ -58,6 +60,7 @@ import {
 import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
 import { normalizePipelineReportingSnapshot } from '@/lib/pipeline/reportingSnapshot.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { shortLinkUrl } from '@/lib/shortlinks'
 import {
@@ -309,6 +312,28 @@ export type StageCrmRecordInput =
   | StageMeetingInput
   | StageInteractionInput
   | StageCampaignInput
+
+/** Native publication evidence is server-owned state, not authored/source
+ * content. Retain it on the stored interaction, but never let a new receipt or
+ * capture timestamp manufacture another content revision on identical staging.
+ * Empty metadata and receipt-only metadata have the same source identity.
+ * Existing stored hashes/outbox keys are not rewritten: their next authorized
+ * restaging may enqueue one new revision. Completion must still compare the
+ * exact persisted source hash, so an older job cannot mark that revision synced.
+ */
+function stagedCrmSourceHash(input: StageCrmRecordInput): string {
+  if (input.entity !== 'interactions') {
+    return crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
+  }
+  const fields = { ...input.fields }
+  if (fields.metadata !== undefined) {
+    const metadata = { ...fields.metadata }
+    delete metadata.suiteCrmEmailProjection
+    if (Object.keys(metadata).length) fields.metadata = metadata
+    else delete fields.metadata
+  }
+  return crmSourceHash({ fields, sourcePayload: input.sourcePayload || {} })
+}
 
 type CrmOutboxItemBase = {
   id: string
@@ -741,6 +766,21 @@ async function suiteCrmRelationships(
   }))
 }
 
+/** Enqueue already holds the interaction row; claim/failure take control first.
+ * Publication admission locks control -> interaction -> outbox/context, so
+ * those callers cannot race a newly admitted operation. Do not acquire control
+ * inside enqueue: interaction -> control would invert admission's lock order. */
+function nativeEmailOutboxUnresolvedGuardSql(): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM crm_native_email_publication_work native_work
+    JOIN crm_native_email_publication_admissions native_admission
+      ON native_admission.operation_id = native_work.operation_id
+    WHERE native_work.work_kind = 'outbox'
+      AND native_work.context->>'outboxId' = sync_outbox.id::text
+      AND native_admission.state IN ('admitted', 'dispatched', 'unknown')
+  )`
+}
+
 async function enqueueSuiteCrmRecord(
   client: PoolClient,
   input: StageCrmRecordInput,
@@ -763,7 +803,8 @@ async function enqueueSuiteCrmRecord(
          AND aggregate_type = $1
          AND aggregate_id = $2
          AND operation IN ('upsert_record', 'reproject_record')
-         AND status IN ('queued', 'failed', 'dead')`,
+         AND status IN ('queued', 'failed', 'dead')
+         AND ${nativeEmailOutboxUnresolvedGuardSql()}`,
       [`crm_${input.entity}`, localId],
     )
   }
@@ -797,6 +838,7 @@ async function enqueueSuiteCrmRecord(
          lock_token = NULL,
          updated_at = now()
        WHERE sync_outbox.status IN ('succeeded', 'dead')
+         AND ${nativeEmailOutboxUnresolvedGuardSql()}
        RETURNING idempotency_key`,
       [`crm_${input.entity}`, localId, JSON.stringify(deletePayload), deleteKey],
     )
@@ -901,6 +943,7 @@ async function enqueueSuiteCrmRecord(
         lock_token = NULL,
         updated_at = now()
       WHERE sync_outbox.status IN ('succeeded', 'dead')
+        AND ${nativeEmailOutboxUnresolvedGuardSql()}
       RETURNING idempotency_key
     `,
     [
@@ -1916,7 +1959,8 @@ async function activeCrmContactOwners(
            )
          )
        )
-     ORDER BY CASE WHEN app_user.email = $3 THEN 0 ELSE 1 END, app_user.email`,
+     ORDER BY CASE WHEN app_user.email = $3 THEN 0 ELSE 1 END, app_user.email
+     FOR SHARE OF app_user`,
     [input.pipelineId, referenceCode, legacyOwner],
   )
   return result.rows.map((row) => ({
@@ -2570,6 +2614,34 @@ type StagedCrmRecord<SuiteCrmId = string> = {
   sourceHash: string
 }
 
+/** Tombstones are durable identities, not rows which a stale workbook may
+ * recreate. This lookup deliberately includes archived rows and source aliases. */
+async function retainedCrmIdentityTombstone(client: PoolClient, input: StageCrmRecordInput) {
+  if (input.entity !== 'organizations' && input.entity !== 'contacts') return null
+  const table = ENTITY_TABLE[input.entity]
+  const identity = input.entity === 'organizations'
+    ? clean(input.identityKeyOverride) || organizationIdentityKey(input.fields)
+    : contactIdentityKey(input.fields)
+  const keys = [...new Set([identity, clean(input.sourceKey)].filter(Boolean))]
+  const selected = await client.query<{
+    id: string; suitecrm_id: string | null; reference_code: string; source_hash: string
+    source_payload: Record<string, unknown> | null
+  }>(`SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload
+    FROM ${table}
+    WHERE pipeline_id=$1::uuid AND (
+      ($2::uuid IS NOT NULL AND id=$2::uuid)
+      OR ($2::uuid IS NULL AND (identity_key=ANY($3::text[]) OR source_key=ANY($3::text[])
+        ${input.entity === 'contacts' ? `OR id IN (SELECT contact_id FROM crm_contact_source_aliases
+          WHERE pipeline_id=$1::uuid AND source_key=ANY($3::text[]))` : ''}))
+    ) ORDER BY id FOR UPDATE`, [input.pipelineId, input.localId || null, keys])
+  const archived = selected.rows.filter(row => ['true', '1', 'yes'].includes(String(row.source_payload?.archived ?? '').toLowerCase()))
+  if (!archived.length) return null
+  if (selected.rows.length !== 1 || input.createOnly) throw new Error('CRM identity is deleted; it cannot be recreated by an import')
+  const row = archived[0]
+  if (!row.suitecrm_id) throw new Error('Deleted CRM identity has no native binding')
+  return { id: row.id, suiteCrmId: row.suitecrm_id, referenceCode: row.reference_code, sourceHash: row.source_hash, shortUrl: null }
+}
+
 export function stageCrmRecordWithClient(
   client: PoolClient,
   rawInput: Exclude<StageCrmRecordInput, StageInteractionInput>,
@@ -2582,12 +2654,24 @@ export function stageCrmRecordWithClient(
 ): Promise<StagedCrmRecord<string | null>>
 export async function stageCrmRecordWithClient(client: PoolClient, rawInput: StageCrmRecordInput,
   options?: CrmStageOptions) {
+  // Interaction upserts mention native identity/inventory columns even when
+  // only content changes. Take control before normalization takes source or
+  // authority locks; callers that already lock rows must do this at entry too.
+  // The DB guard compares actual inventory changes, so content edits stay live.
+  if (['interactions', 'organizations', 'contacts'].includes(rawInput.entity)) await lockCrmNativeEmailAuthorityWithClient(client)
+  if (rawInput.entity === 'organizations' || rawInput.entity === 'contacts') {
+    await lockCrmMutation(client, `crm-record-lifecycle:${rawInput.pipelineId}`)
+    const retained = await retainedCrmIdentityTombstone(client, rawInput)
+    if (retained) return retained
+  }
   let input = await normalizeStageCrmRecordInput(client, rawInput, options)
   let contactAliases: ContactStageResolution['aliases'] = []
   if (input.entity === 'contacts' && !input.createOnly) {
     const contactResolution = await resolveContactStageIdentity(client, input)
     input = contactResolution.input
     contactAliases = contactResolution.aliases
+    const retained = await retainedCrmIdentityTombstone(client, input)
+    if (retained) return retained
   }
   const identityKey = input.entity === 'organizations'
     ? clean(input.identityKeyOverride)
@@ -2684,7 +2768,7 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       }
     }
   }
-  const sourceHash = crmSourceHash({ fields: input.fields, sourcePayload: input.sourcePayload || {} })
+  const sourceHash = stagedCrmSourceHash(input)
   let row: { id: string; suitecrm_id: string; reference_code: string }
   switch (input.entity) {
     case 'organizations':
@@ -2819,6 +2903,7 @@ export async function enrichCrmEmailInteractionParticipantsInPostgres(input: {
   apply?: boolean
 }): Promise<{ enriched: boolean }> {
   return withTransaction(async (client) => {
+    if (input.apply === true) await lockCrmNativeEmailAuthorityWithClient(client)
     const unavailable = () => new Error('Existing Gmail interaction has conflicting CRM participant evidence')
     // Lock ownership/membership as well as the email. A formerly owned or
     // archived record is not permission to resurrect an activity on replay.
@@ -2989,6 +3074,69 @@ async function reviewedEmailAudienceWithClient(client: PoolClient, pipelineId: s
   const audience = { policy: 'pipeline-internal' as const, ownerSuiteCrmId: scope.rows[0].owner_native_id,
     allowedSuiteCrmUserIds: [...new Set(readers.rows.map(row => row.suitecrm_user_id!))].sort(),
     workspaceId: scope.rows[0].workspace_id, pipelineId, fingerprint: '' }
+  audience.fingerprint = suiteCrmEmailAudienceFingerprint(audience)
+  return audience
+}
+
+/** Native-only authority read. Caller MUST already hold the publication control
+ * singleton FOR UPDATE in this transaction; its authority triggers fence changes.
+ * Keep these reads lock-free to preserve control -> interaction -> outbox order.
+ * Match the canonical organization viewCrm permission and explicit pipeline
+ * membership/owner checks. Explicit inactive/denied members retain intent but
+ * are not effective readers. Explicit NULL/zero-match app-only members remain
+ * in the complete app scope but cannot become native readers. Missing or
+ * ambiguous identity/membership data still holds. */
+export async function reviewedEmailAudienceUnderNativeControlWithClient(client: PoolClient, pipelineId: string) {
+  const refuse = () => new Error('Native Email audience requires unambiguous active CRM readers and native identities')
+  const scope = await client.query<{ workspace_id: string; owner_email: string; owner_native_id: string; is_demo: boolean }>(
+    `SELECT pipeline.workspace_organization_id::text AS workspace_id, pipeline.owner_email,
+       owner_user.suitecrm_user_id AS owner_native_id, workspace.is_demo
+     FROM pipeline_spaces pipeline
+     JOIN workspace_organizations workspace ON workspace.id = pipeline.workspace_organization_id
+     JOIN app_users owner_user ON owner_user.email = pipeline.owner_email
+     WHERE pipeline.id = $1::uuid AND NOT pipeline.reference_access_disabled`, [pipelineId],
+  )
+  if (scope.rows.length !== 1 || !scope.rows[0].workspace_id || scope.rows[0].is_demo !== false) throw refuse()
+  const readers = await client.query<{
+    email: string; status: string; membership_status: string; suitecrm_user_id: string | null; membership_role: string; membership_permissions: unknown;
+    membership_trashed_at: string | null; access_role: string | null; native_identity_count: number;
+    workspace_id: string | null;
+  }>(`SELECT intended.email, app_user.status, workspace_member.status AS membership_status, app_user.suitecrm_user_id,
+       workspace_member.role AS membership_role, workspace_member.permissions AS membership_permissions,
+       workspace_member.trashed_at::text AS membership_trashed_at, member.access_role, workspace_member.organization_id::text AS workspace_id,
+       (SELECT count(*)::int FROM app_users identity_user
+         WHERE identity_user.suitecrm_user_id = app_user.suitecrm_user_id) AS native_identity_count
+     FROM pipeline_spaces pipeline
+     JOIN LATERAL (SELECT pipeline.owner_email AS email UNION
+       SELECT user_email FROM pipeline_space_members WHERE pipeline_id=pipeline.id) intended ON true
+     LEFT JOIN app_users app_user ON app_user.email=intended.email
+     LEFT JOIN app_user_organization_memberships workspace_member ON workspace_member.user_email = intended.email
+       AND workspace_member.organization_id = pipeline.workspace_organization_id
+     LEFT JOIN pipeline_space_members member ON member.pipeline_id = pipeline.id AND member.user_email = app_user.email
+     WHERE pipeline.id = $1::uuid ORDER BY intended.email LIMIT 501`, [pipelineId])
+  if (!readers.rows.length || readers.rows.length > 500) throw refuse()
+  const emails = new Set<string>(), nativeIds = new Set<string>(), effectiveReaders: typeof readers.rows = []
+  for (const reader of readers.rows) {
+    let eligible: boolean
+    try { eligible = nativeEmailPrincipalIsEligible(reader,false,true) } catch { throw refuse() }
+    if (emails.has(reader.email) || (reader.suitecrm_user_id !== null && nativeIds.has(reader.suitecrm_user_id))
+      || (reader.email !== scope.rows[0].owner_email && !['viewer', 'editor'].includes(reader.access_role || ''))) throw refuse()
+    emails.add(reader.email)
+    if (reader.suitecrm_user_id !== null) nativeIds.add(reader.suitecrm_user_id)
+    if (eligible) effectiveReaders.push(reader)
+  }
+  const owner = effectiveReaders.find(reader => reader.email === scope.rows[0].owner_email)
+  if (!owner || owner.suitecrm_user_id !== scope.rows[0].owner_native_id) throw refuse()
+  const rootSources = await collectNativeEmailRootSourcesWithClient(client,[pipelineId])
+  const rootReaders = projectNativeEmailRootReaders({sources:rootSources,pipelineId,workspaceId:scope.rows[0].workspace_id,stage:'before'})
+  const combined = nativeEmailEffectivePipelinePrincipals({
+    pipeline:{id:pipelineId,workspace_organization_id:scope.rows[0].workspace_id,owner_email:scope.rows[0].owner_email},
+    members:readers.rows.filter(reader=>reader.email!==scope.rows[0].owner_email)
+      .map(reader=>({user_email:reader.email,access_role:reader.access_role!})),
+    principals:readers.rows,rootReaders,
+  },false)
+  const audience = { policy: 'pipeline-internal' as const, ownerSuiteCrmId: scope.rows[0].owner_native_id,
+    allowedSuiteCrmUserIds: combined.map(row => String(row.suitecrm_user_id)).sort(), workspaceId: scope.rows[0].workspace_id, pipelineId, fingerprint: '' }
   audience.fingerprint = suiteCrmEmailAudienceFingerprint(audience)
   return audience
 }
@@ -3290,6 +3438,7 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     throw new Error('Historical adoption is limited to the three selected messages')
   }
   return withTransaction(async (client) => {
+    if (input.apply === true) await lockCrmNativeEmailAuthorityWithClient(client)
     // Deterministic per-owner/email fences are also acquired by the DB contact
     // and lead triggers, including imports. Unrelated identities remain writable.
     const identityKeys = [...new Set(input.messages.flatMap(message => message.participantEmails.map(email =>
@@ -3316,15 +3465,19 @@ async function lockCrmMutation(client: PoolClient, key: string) {
 
 export async function archiveCrmRecordInPostgres(input: {
   pipelineId: string
-  entity: 'leads' | 'interactions' | 'campaigns'
+  entity: 'organizations' | 'contacts' | 'leads' | 'interactions' | 'campaigns'
   id: string
   actorEmail: string
   emitSuiteCrmOutbox?: boolean
   archiveSource?: 'clawpilot' | 'suitecrm'
+  expectedSuiteCrmIdentity?: { nativeId: string; globalId: string }
 }) {
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     const table = ENTITY_TABLE[input.entity]
+    const identityEntity = input.entity === 'organizations' || input.entity === 'contacts'
+    if (identityEntity) await lockCrmMutation(client, `crm-record-lifecycle:${input.pipelineId}`)
     await lockCrmMutation(client, `crm-archive:${input.pipelineId}:${input.entity}:${input.id}`)
     const selected = await client.query<{
       id: string
@@ -3332,10 +3485,14 @@ export async function archiveCrmRecordInPostgres(input: {
       suitecrm_id: string | null
       suitecrm_module: SuiteCrmInteractionModule | null
       source_payload: Record<string, unknown> | null
+      managed_identity: boolean
     }>(
       `SELECT id::text, reference_code, suitecrm_id,
          ${input.entity === 'interactions' ? 'suitecrm_module' : 'NULL::text AS suitecrm_module'},
-         source_payload
+         source_payload,
+         ${input.entity === 'organizations'
+    ? "(workspace_organization_id IS NOT NULL OR relationship_type IN ('workspace_root','workspace_member'))"
+    : input.entity === 'contacts' ? "(app_user_email IS NOT NULL OR pipeline_user = true OR contact_type = 'pipeline_user')" : 'false'} AS managed_identity
        FROM ${table}
        WHERE pipeline_id = $1::uuid AND id = $2::uuid
        FOR UPDATE`,
@@ -3343,11 +3500,26 @@ export async function archiveCrmRecordInPostgres(input: {
     )
     const record = selected.rows[0]
     if (!record) throw new Error('CRM record not found')
+    if (record.managed_identity) throw new Error('Workspace and login identities must be managed in Settings, not deleted from CRM')
+    if (identityEntity && input.archiveSource === 'suitecrm' && !input.expectedSuiteCrmIdentity) {
+      throw new Error('Confirmed native deletion identity is required')
+    }
+    if (input.expectedSuiteCrmIdentity) {
+      const expected = input.expectedSuiteCrmIdentity
+      if (record.suitecrm_id !== expected.nativeId || record.reference_code !== expected.globalId) {
+        throw new Error('CRM deletion binding changed')
+      }
+    }
+    if (identityEntity && record.suitecrm_id) {
+      const bindings = await client.query<{ id: string }>(`SELECT id::text FROM ${table}
+        WHERE lower(suitecrm_id)=lower($1) OR lower(reference_code)=lower($2) ORDER BY id FOR SHARE`, [record.suitecrm_id, record.reference_code])
+      if (bindings.rows.length !== 1 || bindings.rows[0].id !== record.id) throw new Error('CRM deletion binding is ambiguous')
+    }
     const sourcePayload = record.source_payload && typeof record.source_payload === 'object'
       ? record.source_payload
       : {}
-    if (sourcePayload.archived === true) {
-      return { archived: true, changed: false, referenceCode: record.reference_code }
+    if (['true', '1', 'yes'].includes(String(sourcePayload.archived ?? '').toLowerCase())) {
+      return { archived: true, changed: false, referenceCode: record.reference_code, suiteCrmDeleteQueued: false }
     }
 
     const archivedAt = new Date().toISOString()
@@ -3373,7 +3545,7 @@ export async function archiveCrmRecordInPostgres(input: {
        WHERE target_system = 'suitecrm'
          AND aggregate_type = $1
          AND aggregate_id = $2
-         AND operation = 'upsert_record'
+         AND operation IN ('upsert_record', 'reproject_record')
          AND status <> 'processing'`,
       [`crm_${input.entity}`, input.id],
     )
@@ -3404,7 +3576,7 @@ export async function archiveCrmRecordInPostgres(input: {
             localId: input.id,
             suiteCrmId: record.suitecrm_id,
             ...(record.suitecrm_module ? { suiteCrmModule: record.suitecrm_module } : {}),
-            attributes: {},
+            attributes: identityEntity ? { global_id_c: record.reference_code } : {},
           }),
           `crm-archive:${input.entity}:${input.id}`,
         ],
@@ -3433,7 +3605,8 @@ export async function archiveCrmRecordInPostgres(input: {
         message: `${record.reference_code} archived`,
       },
     }, client)
-    return { archived: true, changed: true, referenceCode: record.reference_code }
+    return { archived: true, changed: true, referenceCode: record.reference_code,
+      suiteCrmDeleteQueued: Boolean(record.suitecrm_id && input.emitSuiteCrmOutbox !== false) }
   })
 }
 
@@ -3448,6 +3621,9 @@ export async function convertCrmLeadInPostgres(input: {
   opportunityValue?: number
 }) {
   return withTransaction(async (client) => {
+    // Conversion also stages a Notes interaction; its INSERT takes the same
+    // inventory statement fence even though it is not a native Email.
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await lockCrmMutation(client, `crm-lead-convert:${input.pipelineId}:${input.leadId}`)
     const selected = await client.query<Record<string, unknown>>(
       `SELECT lead.*, organization.name AS organization_name,
@@ -4380,6 +4556,7 @@ function contactFromRow(row: Record<string, unknown>): CrmContact {
     city: clean(row.primary_address_city), state: clean(row.primary_address_state), postalCode: clean(row.primary_address_postal_code),
     country: clean(row.primary_address_country), description: clean(row.description), emailOptOut: row.email_opt_out === true,
     pipelineUser: row.pipeline_user === true,
+    managedIdentity: row.pipeline_user === true || row.contact_type === 'pipeline_user' || Boolean(row.app_user_email),
     syncStatus: row.sync_status as CrmContact['syncStatus'],
     syncError: nullable(row.sync_error), updatedAt: String(row.updated_at),
   }
@@ -4930,7 +5107,8 @@ export async function listCrmRecordsInPostgres(input: {
     const result = await query<Record<string, unknown>>(
       `SELECT contact.*, organization.name AS organization_name
        FROM crm_contacts contact LEFT JOIN crm_organizations organization ON organization.id = contact.organization_id
-       WHERE contact.pipeline_id = $1::uuid AND ($2 = '' OR contact.reference_code ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR contact.email ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
+       WHERE contact.pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
+         AND ($2 = '' OR contact.reference_code ILIKE '%' || $2 || '%' OR contact.full_name ILIKE '%' || $2 || '%' OR contact.email ILIKE '%' || $2 || '%' OR organization.name ILIKE '%' || $2 || '%')
        ORDER BY contact.full_name, contact.id LIMIT $3`,
       [input.pipelineId, search, limit],
     )
@@ -5208,6 +5386,7 @@ export async function appendCrmOpportunityCommentInPostgres(input: {
   commentLine: string
 }): Promise<{ opportunity: CrmOpportunity; created: boolean; conflict: boolean }> {
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const requestFingerprint = crmSourceHash({
       expectedUpdatedAt: input.expectedUpdatedAt,
       comment: input.comment,
@@ -6088,7 +6267,7 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
           WHERE organization.pipeline_id = $1::uuid
             AND ${activeCrmRecordSql('organization')})::text AS organizations,
          (SELECT count(*) FROM crm_contacts contact
-          WHERE contact.pipeline_id = $1::uuid)::text AS contacts,
+          WHERE contact.pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')})::text AS contacts,
          (SELECT count(*) FROM crm_opportunities opportunity
           WHERE opportunity.pipeline_id = $1::uuid)::text AS opportunities,
          (SELECT count(*) FROM crm_interactions interaction
@@ -6132,6 +6311,7 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
           ON organization.pipeline_id = contact.pipeline_id
          AND organization.id = contact.organization_id
         WHERE contact.pipeline_id = $1::uuid
+          AND ${activeCrmRecordSql('contact')}
           AND ($2::uuid IS NULL OR contact.id > $2::uuid)
         ORDER BY contact.id
         LIMIT $3`,
@@ -6795,7 +6975,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM crm_organizations organization
          WHERE pipeline_id = $1::uuid
            AND ${activeCrmRecordSql('organization')})::text AS organizations,
-        (SELECT count(*) FROM crm_contacts WHERE pipeline_id = $1::uuid)::text AS contacts,
+        (SELECT count(*) FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')})::text AS contacts,
         (SELECT count(*) FROM crm_products product
          WHERE pipeline_id = $1::uuid
            AND ${activeCrmRecordSql('product')})::text AS products,
@@ -6818,7 +6998,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations organization
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-          UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
           UNION ALL SELECT sync_status FROM crm_products product
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
@@ -6830,7 +7010,7 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations organization
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-          UNION ALL SELECT sync_status FROM crm_contacts WHERE pipeline_id = $1::uuid
+          UNION ALL SELECT sync_status FROM crm_contacts contact WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
           UNION ALL SELECT sync_status FROM crm_products product
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
           UNION ALL SELECT sync_status FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')}
@@ -7064,12 +7244,15 @@ export async function readCrmRecordByReference(input: {
 export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
   const origin = appPublicUrl()
   if (!origin.startsWith('https://')) return 0
-  const result = await query(
+  const result = await withTransaction(async client => {
+    await lockCrmMutation(client, `crm-record-lifecycle:${pipelineId}`)
+    return client.query(
     `WITH RECURSIVE records AS (
        SELECT reference_code, name AS title, 'organizations'::text AS entity, email
          FROM crm_organizations organization
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
-       UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts WHERE pipeline_id = $1::uuid
+       UNION ALL SELECT reference_code, full_name, 'contacts', email FROM crm_contacts contact
+         WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('contact')}
        UNION ALL SELECT reference_code, name, 'products', NULL::text
          FROM crm_products product
          WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('product')}
@@ -7123,7 +7306,34 @@ export async function ensurePipelineCrmReferenceLinks(pipelineId: string) {
          IS DISTINCT FROM (EXCLUDED.destination_url, EXCLUDED.title, EXCLUDED.tags, NULL, NULL)`,
     [pipelineId, origin],
   )
+  })
   return result.rowCount || 0
+}
+
+/** Serialize claim/failure decisions with admission before taking outbox locks.
+ * Migrations 0375-0377 must exist even while native publication is disabled;
+ * missing or contradictory control state must never enable legacy fallback. */
+async function lockNativeEmailPublicationModeWithClient(client: PoolClient) {
+  const result = await client.query<{ enabled: boolean; active_operation_id: string | null; active_transition_id: string | null }>(
+    'SELECT enabled, active_operation_id, active_transition_id FROM crm_native_email_publication_control WHERE singleton FOR UPDATE',
+  )
+  const control = result.rows[0]
+  if (result.rows.length !== 1 || typeof control.enabled !== 'boolean'
+    || (control.active_operation_id !== null && (typeof control.active_operation_id !== 'string'
+      || !/^[a-f0-9]{64}(?![\s\S])/.test(control.active_operation_id)))
+    || (control.active_transition_id !== null && (typeof control.active_transition_id !== 'string'
+      || !/^[a-f0-9]{64}(?![\s\S])/.test(control.active_transition_id)))
+    || (!control.enabled && (control.active_operation_id !== null || control.active_transition_id !== null))
+    || (control.active_operation_id !== null && control.active_transition_id !== null)) {
+    throw new Error('Native Email publication control is missing or inconsistent')
+  }
+  return { enabled: control.enabled, activeOperationId: control.active_operation_id, activeTransitionId: control.active_transition_id }
+}
+
+function nativeEmailOutboxTouchesEmail(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false
+  const record = payload as Record<string, unknown>
+  return record.suiteCrmModule === 'Emails' || record.previousSuiteCrmModule === 'Emails'
 }
 
 export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; maxAttempts?: number; leaseSeconds?: number } = {}) {
@@ -7132,11 +7342,13 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
   const leaseSeconds = Math.max(60, Math.min(Math.trunc(Number(input.leaseSeconds) || 300), 1800))
   const lockToken = crypto.randomUUID()
   return withTransaction(async (client) => {
+    const nativeEmailMode = await lockNativeEmailPublicationModeWithClient(client)
     await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     await client.query(
       `UPDATE sync_outbox SET status = 'failed', last_error = COALESCE(last_error, 'SuiteCRM worker lease expired'),
        available_at = now(), locked_at = NULL, lock_token = NULL, updated_at = now()
        WHERE target_system = 'suitecrm' AND status = 'processing'
+       AND ${nativeEmailOutboxUnresolvedGuardSql()}
        AND (locked_at IS NULL OR locked_at < now() - ($1::text || ' seconds')::interval)`,
       [leaseSeconds],
     )
@@ -7145,6 +7357,10 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
          SELECT id FROM sync_outbox
          WHERE target_system = 'suitecrm' AND operation IN ('upsert_record', 'delete_record', 'reproject_record', 'upsert_user_identity')
            AND status IN ('queued', 'failed') AND attempts < $1 AND available_at <= now()
+           AND ${nativeEmailOutboxUnresolvedGuardSql()}
+           AND NOT ($4::boolean AND (COALESCE(payload->>'suiteCrmModule', '') = 'Emails'
+             OR COALESCE(payload->>'previousSuiteCrmModule', '') = 'Emails'))
+           AND NOT ($5::boolean AND operation = 'upsert_user_identity')
          ORDER BY available_at, created_at FOR UPDATE SKIP LOCKED LIMIT $2
        )
        UPDATE sync_outbox outbox SET status = 'processing', attempts = outbox.attempts + 1,
@@ -7153,12 +7369,16 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
        RETURNING outbox.id::text, outbox.aggregate_type, outbox.aggregate_id, outbox.operation,
          outbox.payload, outbox.idempotency_key, outbox.attempts,
          outbox.lock_token`,
-      [maxAttempts, limit, lockToken],
+      [maxAttempts, limit, lockToken, nativeEmailMode.enabled
+        && (nativeEmailMode.activeOperationId !== null || nativeEmailMode.activeTransitionId !== null), nativeEmailMode.enabled],
     )
     for (const row of result.rows) {
       const entity = String(row.aggregate_type).replace(/^crm_/, '') as CrmEntity
       const table = ENTITY_TABLE[entity]
-      if (table && (row.operation === 'upsert_record' || row.operation === 'reproject_record')) {
+      // Native coordinator owns Email state under control -> interaction ->
+      // outbox order. Do not take an interaction lock after this claim's outbox.
+      if (table && (row.operation === 'upsert_record' || row.operation === 'reproject_record')
+        && !(nativeEmailMode.enabled && nativeEmailOutboxTouchesEmail(row.payload))) {
         await client.query(
           `UPDATE ${table} SET sync_status = 'syncing', sync_error = NULL, updated_at = now() WHERE id = $1::uuid`,
           [row.aggregate_id],
@@ -7174,9 +7394,72 @@ export async function claimSuiteCrmOutboxInPostgres(input: { limit?: number; max
   })
 }
 
+/** Native policy pins include the complete native Users rows. The legacy
+ * username/Global-ID PATCH changes that policy even when reader membership is
+ * unchanged. Enabled mode leaves these jobs held; unrelated projections work.
+ * Migration 0381 separately prevents activation while legacy identity work is
+ * outstanding, closing claim-before-activation at the durable queue boundary.
+ * Never hold this transaction across provider I/O. */
+export async function mayDispatchSuiteCrmUserIdentityInPostgres(item: CrmOutboxItem): Promise<boolean> {
+  if (item.operation !== 'upsert_user_identity' || item.aggregateType !== 'app_users'
+    || item.payload?.localId !== item.aggregateId) throw new Error('SuiteCRM user identity outbox is invalid')
+  return withTransaction(async client => {
+    const mode = await lockNativeEmailPublicationModeWithClient(client)
+    if (mode.enabled) return false
+    const current = await client.query(`SELECT id FROM sync_outbox
+      WHERE id=$1::uuid AND target_system='suitecrm' AND operation='upsert_user_identity'
+        AND aggregate_type='app_users' AND aggregate_id=$2 AND status='processing'
+        AND lock_token=$3 AND payload=$4::jsonb
+      FOR SHARE`, [item.id,item.aggregateId,item.lockToken,JSON.stringify(item.payload)])
+    if (current.rows.length !== 1) throw new Error('SuiteCRM user identity claim changed')
+    return true
+  })
+}
+
 function tableForAggregate(aggregateType: string) {
   const entity = aggregateType.replace(/^crm_/, '') as CrmEntity
   return ENTITY_TABLE[entity] || null
+}
+
+/** Serialize Account/Contact provider dispatch with local trash/import. No
+ * control or outbox row lock is held over network I/O. A claimed stale payload
+ * can never publish after its local tombstone has committed. */
+export async function withVerifiedSuiteCrmRecordLifecycle<T>(item: CrmOutboxItem, publish: () => Promise<T>): Promise<T> {
+  if (item.operation === 'upsert_user_identity') throw new Error('CRM record lifecycle payload is invalid')
+  const payload = item.payload
+  if (payload.entity !== 'organizations' && payload.entity !== 'contacts') return publish()
+  if (item.aggregateType !== `crm_${payload.entity}` || item.aggregateId !== payload.localId) {
+    throw new Error('CRM record lifecycle identity changed')
+  }
+  return withTransaction(async client => {
+    await lockCrmMutation(client, `crm-record-lifecycle:${payload.pipelineId}`)
+    const table = ENTITY_TABLE[payload.entity]
+    const current = await client.query<{ source_hash: string; reference_code: string; archived: boolean }>(`SELECT record.source_hash, record.reference_code,
+      NOT (${activeCrmRecordSql('record')}) AS archived
+      FROM ${table} record JOIN sync_outbox outbox
+        ON outbox.id=$4::uuid AND outbox.aggregate_id=record.id::text
+        AND outbox.aggregate_type=$5 AND outbox.status='processing'
+        AND outbox.lock_token=$6 AND outbox.payload=$7::jsonb
+      WHERE record.id=$1::uuid AND record.pipeline_id=$2::uuid AND record.suitecrm_id=$3`,
+    [item.aggregateId, payload.pipelineId, payload.suiteCrmId, item.id, item.aggregateType, item.lockToken, JSON.stringify(payload)])
+    const record = current.rows[0]
+    if (!record || (item.operation === 'delete_record' ? !record.archived : record.archived)) {
+      throw new Error('CRM record was deleted or its synchronization identity changed')
+    }
+    if (payload.attributes.global_id_c !== record.reference_code) throw new Error('CRM record global identity changed')
+    // Managed workspace/login identities deliberately have shared projections.
+    // Their ordinary upserts remain supported; deletion must be unambiguous.
+    if (item.operation === 'delete_record') {
+      const bindings = await client.query<{ id: string }>(`SELECT id::text FROM ${table}
+        WHERE lower(suitecrm_id)=lower($1) OR lower(reference_code)=lower($2) ORDER BY id`,
+      [payload.suiteCrmId, record.reference_code])
+      if (bindings.rows.length !== 1 || bindings.rows[0].id !== item.aggregateId) throw new Error('CRM record synchronization identity is ambiguous')
+    }
+    if (item.operation !== 'delete_record' && !item.idempotencyKey?.endsWith(`:${record.source_hash}`)) {
+      throw new Error('CRM record synchronization revision changed')
+    }
+    return publish()
+  })
 }
 
 /** Serialize native publication for a canonical local Email and retain current
@@ -7215,6 +7498,13 @@ export async function completeSuiteCrmOutboxInPostgres(
   } = {},
 ) {
   return withTransaction(async (client) => {
+    // Even disabled-mode completion eventually updates pipeline_spaces, whose
+    // authority trigger locks control. Acquire it before any source/outbox row
+    // so a concurrent control-first lease recycle cannot deadlock completion.
+    const nativeEmailMode = await lockNativeEmailPublicationModeWithClient(client)
+    if (nativeEmailMode.enabled && nativeEmailOutboxTouchesEmail(item.payload)) {
+      throw new Error('Native Email completion requires the publication coordinator')
+    }
     await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     let emailProjectionCurrent = false
     if (item.operation === 'upsert_record' && item.payload.entity === 'interactions' && item.payload.suiteCrmModule === 'Emails') {
@@ -7277,13 +7567,15 @@ export async function completeSuiteCrmOutboxInPostgres(
       `UPDATE sync_outbox SET status = 'succeeded', processed_at = now(), last_error = NULL,
        locked_at = NULL, lock_token = NULL, updated_at = now()
        WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
+         AND ${nativeEmailOutboxUnresolvedGuardSql()}
          AND (NOT $3::boolean OR (
            target_system = 'suitecrm' AND aggregate_type = $4 AND aggregate_id = $5
-           AND operation = 'upsert_record' AND idempotency_key = $6 AND payload = $7::jsonb
+           AND operation = $8 AND idempotency_key = $6 AND payload = $7::jsonb
          ))
        RETURNING aggregate_type, aggregate_id`,
-      [item.id, item.lockToken, isMeetingProjection || ('emailProjection' in item.payload && Boolean(item.payload.emailProjection)), item.aggregateType, item.aggregateId,
-        item.idempotencyKey, JSON.stringify(item.payload)],
+      [item.id, item.lockToken, isMeetingProjection || ('emailProjection' in item.payload && Boolean(item.payload.emailProjection))
+        || (item.operation !== 'upsert_user_identity' && ['organizations','contacts'].includes(item.payload.entity)), item.aggregateType, item.aggregateId,
+        item.idempotencyKey, JSON.stringify(item.payload), item.operation],
     )
     if (!completed.rows[0]) throw new Error('SuiteCRM outbox lease or projection identity was lost')
     if (meetingReceipt) {
@@ -7350,8 +7642,12 @@ export async function completeSuiteCrmOutboxInPostgres(
       && (item.payload.entity !== 'meetings' || meetingProjectionCurrent)
       && (!(item.payload.entity === 'interactions' && item.payload.suiteCrmModule === 'Emails') || emailProjectionCurrent)) {
       await client.query(
-        `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid`,
-        [item.aggregateId],
+        `UPDATE ${table} SET sync_status = 'synced', sync_error = NULL, suitecrm_synced_at = now(), updated_at = now() WHERE id = $1::uuid
+          AND ${activeCrmRecordSql(table)}
+          ${item.payload.entity === 'organizations' || item.payload.entity === 'contacts'
+    ? 'AND pipeline_id=$2::uuid AND suitecrm_id=$3 AND $4 = concat(\'crm:\', $5::text, \':v4:\', id::text, \':default:\', source_hash)' : ''}`,
+        item.payload.entity === 'organizations' || item.payload.entity === 'contacts'
+          ? [item.aggregateId,item.payload.pipelineId,item.payload.suiteCrmId,item.idempotencyKey,item.payload.entity] : [item.aggregateId],
       )
       await client.query(
         `UPDATE pipeline_spaces SET crm_last_synced_at = now(), updated_at = now()
@@ -7371,6 +7667,7 @@ export async function failSuiteCrmOutboxInPostgres(input: { item: CrmOutboxItem;
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 8), 20))
   const message = clean(input.error).slice(0, 500) || 'SuiteCRM synchronization failed'
   return withTransaction(async (client) => {
+    const nativeEmailMode = await lockNativeEmailPublicationModeWithClient(client)
     await client.query("SELECT set_config('clawpilot.crm_shared_write_v1', 'on', true)")
     const dead = input.item.attempts >= maxAttempts
     const result = await client.query<{ status: 'failed' | 'dead' }>(
@@ -7378,12 +7675,14 @@ export async function failSuiteCrmOutboxInPostgres(input: { item: CrmOutboxItem;
        available_at = CASE WHEN $3 = 'failed' THEN now() + (LEAST(300, power(2, GREATEST(attempts, 1)))::text || ' seconds')::interval ELSE available_at END,
        processed_at = CASE WHEN $3 = 'dead' THEN now() ELSE NULL END,
        locked_at = NULL, lock_token = NULL, updated_at = now()
-       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2 RETURNING status`,
+       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
+         AND ${nativeEmailOutboxUnresolvedGuardSql()} RETURNING status`,
       [input.item.id, input.item.lockToken, dead ? 'dead' : 'failed', message],
     )
     if (!result.rows[0]) throw new Error('SuiteCRM outbox lease was lost')
     const table = tableForAggregate(input.item.aggregateType)
-    if (table && (input.item.operation === 'upsert_record' || input.item.operation === 'reproject_record')) {
+    if (table && (input.item.operation === 'upsert_record' || input.item.operation === 'reproject_record')
+      && !(nativeEmailMode.enabled && nativeEmailOutboxTouchesEmail(input.item.payload))) {
       await client.query(
         `UPDATE ${table}
          SET sync_status = $3, sync_error = $2, updated_at = now()
