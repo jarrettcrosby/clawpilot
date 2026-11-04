@@ -20,7 +20,8 @@ import { nativeEmailPrincipalIsEligible, nativeEmailEffectivePipelinePrincipals 
 import { collectNativeEmailRootSourcesWithClient, projectNativeEmailRootReaders } from '@/lib/crm/nativeEmailRootReaders'
 import { assertSameRetainedGmailEvidence, retainedGmailMessageEvidence, gmailMessageSourceKey,
   type VerifiedGmailMailboxIdentity, type GmailMessageEvidence } from '@/lib/crm/emailIdentity'
-import { prepareBoundedLegacyGmailAdoption, type GmailLegacyAdoption } from '@/lib/crm/emailReconciliation'
+import { assertCaseyGmailAdoption, prepareCaseyGmailAdoption, prepareBoundedLegacyGmailAdoption,
+  type GmailReviewedHistoricalAdoption } from '@/lib/crm/emailReconciliation'
 import { ensureGmailSourceWithClient, lockGmailMailboxBindingWithClient } from '@/lib/persistence/crmEmailIdentity'
 import {
   DEFAULT_WORKSPACE_CURRENCY_CODE,
@@ -3048,7 +3049,8 @@ export type ReviewedGmailInteractionInput = {
   apply?: boolean
   mailboxIdentity: VerifiedGmailMailboxIdentity
   messageEvidence: GmailMessageEvidence
-  legacyAdoption?: GmailLegacyAdoption
+  legacyAdoption?: GmailReviewedHistoricalAdoption
+  admissionScope?: 'casey-reviewed-two-v1'
   decisionKind?: 'review' | 'correction' | 'late-contact'
   correctionReason?: string
 }
@@ -3271,13 +3273,33 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   if (organizations.rows.length !== organizationIds.length || organizations.rows.some((row) => !row.active)
     || !organizations.rows.some((row) => row.id === input.primaryOrganization.id && row.reference_code === input.primaryOrganization.referenceCode)) throw refuse()
   if (input.legacyAdoption) {
-    const adoption = prepareBoundedLegacyGmailAdoption({ scope: {
+    const adoption = input.legacyAdoption.kind === 'reviewed-casey-two-adoption-v1' ? prepareCaseyGmailAdoption({ scope: {
+      ownerEmail: input.ownerEmail, connectionId: input.connectionId, inboundMessageId: String(cached.id), intakePipelineId: String(cached.pipeline_id),
+      pipelineId: input.pipelineId, messageIds: ['1a18e03ea586cd7e','1a18f01749eb87a6'],
+      threadId: input.providerThreadId || '', primaryOrganization: input.primaryOrganization,
+      organizations: organizations.rows.map(row => ({ id: row.id, referenceCode: row.reference_code })),
+    }, identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(),
+    cached: retainedGmailMessageEvidence(cached), current: input.messageEvidence }) : prepareBoundedLegacyGmailAdoption({ scope: {
       pipelineId: input.pipelineId, messageIds: ['1a17e730c78d319c','1a17f5004f29592c','1a17f5d46a224e0a'],
       threadId: input.providerThreadId || '', primaryOrganization: input.primaryOrganization,
       organizations: organizations.rows.map(row => ({ id: row.id, referenceCode: row.reference_code })),
     }, identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(),
     cached: retainedGmailMessageEvidence(cached), current: input.messageEvidence })
     if (crmSourceHash(adoption) !== crmSourceHash(input.legacyAdoption)) throw refuse()
+    if (adoption.kind === 'reviewed-casey-two-adoption-v1') {
+      if (input.admissionScope !== 'casey-reviewed-two-v1' || (input.decisionKind || 'review') !== 'review'
+        || input.correctionReason !== undefined || (cached.mailbox_id && !raw.legacyAdoption)) throw refuse()
+      if (raw.legacyAdoption) {
+        const previous = raw.legacyAdoption as typeof adoption
+        assertCaseyGmailAdoption(previous)
+        const oldPins: Partial<typeof previous> = { ...previous }; delete oldPins.accountEmail; delete oldPins.identityVerifiedAt
+        const newPins: Partial<typeof adoption> = { ...adoption }; delete newPins.accountEmail; delete newPins.identityVerifiedAt
+        // jsonb does not preserve object insertion order. Compare the same
+        // strict proof fields canonically; their values are scalars/string lists.
+        if (crmSourceHash(Object.keys(oldPins).sort().map(key => [key, oldPins[key as keyof typeof oldPins]]))
+          !== crmSourceHash(Object.keys(newPins).sort().map(key => [key, newPins[key as keyof typeof newPins]]))) throw refuse()
+      }
+    }
   }
   const selected = await readReviewedGmailInteractionWithClient(client, input.pipelineId, input.providerMessageId)
   if (selected.rows.length > 1) throw refuse()
@@ -3326,6 +3348,7 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   stableCache.raw_metadata = { ...raw }
   delete (stableCache.raw_metadata as Record<string, unknown>).legacyAdoption
   const evidenceFingerprint = crmSourceHash({ scope: scope.rows[0], cache: stableCache,
+    ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     mailboxIdentity: input.mailboxIdentity, messageEvidence: input.messageEvidence, legacyAdoption: input.legacyAdoption,
     audience: await reviewedEmailAudienceWithClient(client, input.pipelineId),
     primary: input.primaryOrganization, targets: [...input.contactTargets].sort((a, b) => a.id.localeCompare(b.id)), organizations: organizations.rows,
@@ -3334,6 +3357,7 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   const receiptValid = alreadyLinked && receipt?.contentFingerprint === reviewedGmailContentFingerprint(current)
     && receipt.evidenceFingerprint === evidenceFingerprint && typeof receipt.targetFingerprint === 'string'
   const targetFingerprint = receiptValid ? receipt!.targetFingerprint! : crmSourceHash({ version: 1, scope: scope.rows[0],
+    ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     provider: [input.providerMessageId, input.providerThreadId], cache: stableCache,
     mailboxIdentity: input.mailboxIdentity, messageEvidence: input.messageEvidence, legacyAdoption: input.legacyAdoption,
     audience: await reviewedEmailAudienceWithClient(client, input.pipelineId),
@@ -3433,7 +3457,12 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     || new Set(input.messages.map((message) => `${message.pipelineId}:${message.providerMessageId}`)).size !== input.messages.length) {
     throw new Error('A bounded unique reviewed Gmail recovery batch is required')
   }
-  if (input.messages.some(message => message.legacyAdoption)
+  const casey = input.messages.some(message => message.admissionScope !== undefined || message.legacyAdoption?.kind === 'reviewed-casey-two-adoption-v1')
+  if (casey && (input.messages.map(message => message.providerMessageId).sort().join(',') !== '1a18e03ea586cd7e,1a18f01749eb87a6'
+    || input.messages.some(message => message.admissionScope !== 'casey-reviewed-two-v1'
+      || message.legacyAdoption?.kind !== 'reviewed-casey-two-adoption-v1' || (message.decisionKind || 'review') !== 'review'
+      || message.correctionReason !== undefined))) throw new Error('Casey Gmail admission requires the exact separately reviewed two-message scope')
+  if (!casey && input.messages.some(message => message.legacyAdoption)
     && input.messages.map(message => message.providerMessageId).sort().join(',') !== '1a17e730c78d319c,1a17f5004f29592c,1a17f5d46a224e0a') {
     throw new Error('Historical adoption is limited to the three selected messages')
   }

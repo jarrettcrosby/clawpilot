@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 const require = createRequire(import.meta.url)
-const { SCOPE, audienceSnapshot, messagePlan, collect, inspectionFailure } = require('./inspect-bpo-email-recovery-readonly.cjs')
+const { SCOPE, audienceSnapshot, messagePlan, reviewedPreviewRequestDrafts, collect, inspectionFailure } = require('./inspect-bpo-email-recovery-readonly.cjs')
 const ts = createRequire(new URL('../app_src/package.json', import.meta.url))('typescript')
 let checks = 0
 async function check(label, fn) { await fn(); checks++; console.log('PASS ' + label) }
@@ -137,6 +137,27 @@ await check('foreign/duplicate mappings, wrong thread, invalid addresses, exclud
 })
 
 const collectorSource = readFileSync(new URL('./inspect-bpo-email-recovery-readonly.cjs',import.meta.url),'utf8')
+await check('five observed messages produce only separate unsigned three-plus-two preview drafts', () => {
+  const caches = ['legacy-one','legacy-two','legacy-three','756e4e17-2458-470b-b00c-129c85ee821a','78a5b2cc-ba50-4a71-a17c-adaf0c1041c2']
+  const rows = SCOPE.messageIds.map((messageId,index)=>({ messageId,threadId:SCOPE.threadId,cacheId:caches[index],
+    intakePipelineId:'0ce9d945-0b71-495b-88ef-420ddd51fd9c',holds:[],reviewedAssociationDraft:{
+      messageId,threadId:SCOPE.threadId,primaryOrganizationReference:SCOPE.primaryOrganizationReference,
+      contactReferences:['gc0000001','gc0000002'] } }))
+  const drafts = reviewedPreviewRequestDrafts(rows)
+  assert.equal(drafts.length,2)
+  assert.deepEqual(drafts[0].body.messageIds,SCOPE.messageIds.slice(0,3)); assert.equal(drafts[0].body.admissionScope,undefined)
+  assert.deepEqual(drafts[1].body.messageIds,SCOPE.messageIds.slice(3)); assert.equal(drafts[1].body.admissionScope,'casey-reviewed-two-v1')
+  for(const draft of drafts){assert.equal(draft.body.apply,false);assert.equal(draft.body.decisionKind,'review')
+    assert.equal(draft.body.expectedDigest,undefined);assert.equal(draft.body.messageIds.length,draft.body.reviewedAssociations.length)}
+  for(const changed of [rows.slice(0,4),[...rows,rows[0]],[...rows.slice(0,4),rows[0]],
+    rows.map((row,index)=>index===3?{...row,cacheId:'changed-cache'}:row),
+    rows.map((row,index)=>index===4?{...row,intakePipelineId:'changed-intake'}:row),
+    rows.map((row,index)=>index===4?{...row,reviewedAssociationDraft:{...row.reviewedAssociationDraft,messageId:rows[0].messageId}}:row),
+    rows.map((row,index)=>index===4?{...row,reviewedAssociationDraft:{...row.reviewedAssociationDraft,contactReferences:[]}}:row)]){
+    assert.deepEqual(reviewedPreviewRequestDrafts(changed),[])
+  }
+  assert.match(collectorSource,/previewRequestDraft: null, previewRequestDrafts: \[\]/)
+})
 await check('inspection retains intended principals and only the five exact reviewed messages including Casey', () => {
   const match=collectorSource.match(/const readers = await q\(`([\s\S]*?)`, \[SCOPE.pipelineId\]\)/)
   assert.ok(match)

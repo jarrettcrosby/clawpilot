@@ -152,10 +152,35 @@ function messagePlan(message, candidates, companies) {
       contactReferences: contacts.map(row => row.reference_code).sort() } }
 }
 
+// Unsigned DRY-RUN drafts only. The five-message observation is not one valid
+// legacy command: the original three and separately reviewed pair stay apart.
+function reviewedPreviewRequestDrafts(messages) {
+  const caseyCaches = { '1a18e03ea586cd7e':'756e4e17-2458-470b-b00c-129c85ee821a',
+    '1a18f01749eb87a6':'78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' }
+  if (!Array.isArray(messages) || messages.length !== 5
+    || messages.map(row=>row.messageId).sort().join() !== [...SCOPE.messageIds].sort().join()
+    || messages.some(row=>!row.reviewedAssociationDraft || row.holds?.length
+      || row.threadId!==SCOPE.threadId || row.reviewedAssociationDraft.messageId!==row.messageId
+      || row.reviewedAssociationDraft.threadId!==SCOPE.threadId
+      || row.reviewedAssociationDraft.primaryOrganizationReference!==SCOPE.primaryOrganizationReference
+      || !Array.isArray(row.reviewedAssociationDraft.contactReferences)
+      || !row.reviewedAssociationDraft.contactReferences.length || row.reviewedAssociationDraft.contactReferences.length>25
+      || new Set(row.reviewedAssociationDraft.contactReferences).size!==row.reviewedAssociationDraft.contactReferences.length
+      || row.reviewedAssociationDraft.contactReferences.some(value=>typeof value!=='string'||!/^gc(?:[0-9]{7}|[0-9a-v]{12})$/.test(value))
+      || (Object.hasOwn(caseyCaches,row.messageId) && (row.cacheId!==caseyCaches[row.messageId]
+        || row.intakePipelineId!=='0ce9d945-0b71-495b-88ef-420ddd51fd9c')))) return []
+  return [SCOPE.messageIds.slice(0,3),SCOPE.messageIds.slice(3)].map((messageIds,index)=>({
+    reviewGroup:index===0?'original-three':'reviewed-casey-pair',method:'POST',path:'/api/crm/email-recovery',
+    body:{pipelineId:SCOPE.pipelineId,connectionId:SCOPE.connectionId,messageIds,apply: false,decisionKind:'review',
+      ...(index===1?{admissionScope:'casey-reviewed-two-v1'}:{}),
+      reviewedAssociations:messageIds.map(id=>messages.find(row=>row.messageId===id).reviewedAssociationDraft)},
+  }))
+}
+
 async function collect(client) {
   const result = { kind: 'bpo-exact-email-recovery-readonly-v1', scope: SCOPE, readOnly: true, rolledBack: false,
     holds: [], proofBoundary: 'Database metadata snapshot only: not fresh Gmail content, native ACL, writer drain, a reviewed recovery digest, or approval to apply.',
-    recoveryApplyAuthorizedByThisArtifact: false, previewRequestDraft: null }
+    recoveryApplyAuthorizedByThisArtifact: false, previewRequestDraft: null, previewRequestDrafts: [] }
   let began = false
   const q = async (sql, values = [], bound = 500) => {
     if (!/^\s*(SELECT|WITH)\b/i.test(sql) || /\bFOR\s+(UPDATE|SHARE)\b|\b(INSERT|UPDATE|DELETE|TRUNCATE|ALTER|CREATE|DROP|GRANT|REVOKE|CALL|DO)\b/i.test(sql)) throw new Error('NON_READ_QUERY_REFUSED')
@@ -312,9 +337,8 @@ async function collect(client) {
     // expectedDigest or turn apply on. The endpoint revalidates all evidence.
     if (!result.audience.holds.length && result.messages.length === SCOPE.messageIds.length && result.messages.every(row => row.reviewedAssociationDraft && !row.holds.length)
       && !result.holds.some(value => /mailbox|connection|cached_messages|scope_or_lifecycle|duplicates|conflict/.test(value))) {
-      result.previewRequestDraft = { method: 'POST', path: '/api/crm/email-recovery', body: {
-        pipelineId: SCOPE.pipelineId, connectionId: SCOPE.connectionId, messageIds: [...SCOPE.messageIds], apply: false,
-        reviewedAssociations: result.messages.map(row => row.reviewedAssociationDraft) } }
+      result.previewRequestDrafts = reviewedPreviewRequestDrafts(result.messages)
+      if (result.previewRequestDrafts.length!==2) result.holds.push('reviewed_preview_batch_scope_changed')
     }
     result.holds = [...new Set(result.holds)].sort()
     return result
@@ -367,6 +391,6 @@ async function main() {
   } finally { if (client) await client.end().catch(() => {}) }
 }
 
-module.exports = { SCOPE, audienceSnapshot, messagePlan, collect, inspectionFailure,
+module.exports = { SCOPE, audienceSnapshot, messagePlan, reviewedPreviewRequestDrafts, collect, inspectionFailure,
   validateReadOnlyPostgresTrust,readOnlyDatabaseConfig,REVIEWED_POSTGRES_LEAF }
 if (!module.parent) main()

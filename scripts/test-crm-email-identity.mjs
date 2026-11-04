@@ -108,4 +108,47 @@ check('late-contact reconciliation selects only exact IDs and actual-header emai
     assert.throws(() => reconcile.selectLateContactGmailMessages({ messageIds: [messageIds[0]], participantEmail: 'person@example.test', messages, ...change }))
   }
 })
+const caseyIds = ['1a18e03ea586cd7e', '1a18f01749eb87a6']
+const caseyScope = { ...scope, ownerEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027', inboundMessageId: '756e4e17-2458-470b-b00c-129c85ee821a',
+  intakePipelineId: '0ce9d945-0b71-495b-88ef-420ddd51fd9c', messageIds: caseyIds }
+const caseyMailbox = { ...mailbox, verifiedConnectionId: caseyScope.connectionId }
+const caseyCurrent = () => ({ ...current(), messageId: caseyIds[0] })
+const caseyAdoption = changes => reconcile.prepareCaseyGmailAdoption({ scope: structuredClone(caseyScope), identity: caseyMailbox,
+  adoptedAt: '2026-10-28T09:05:00Z', cached: caseyCurrent(), current: caseyCurrent(), ...changes })
+check('Casey two-message admission is separate, strictly pinned and permanently original-unknown', () => {
+  const proof = caseyAdoption()
+  assert.equal(proof.kind, 'reviewed-casey-two-adoption-v1')
+  assert.equal(proof.originalMailboxProvenance, 'unknown')
+  assert.equal(proof.inboundMessageId, caseyScope.inboundMessageId)
+  assert.equal(proof.retainedEvidenceHash, proof.currentEvidenceHash)
+  assert.equal(JSON.stringify(caseyAdoption({ adoptedAt: '2026-10-28T10:05:00Z' })), JSON.stringify(proof))
+  reconcile.assertCaseyGmailAdoption(proof)
+  assert.throws(() => adoption({ scope: caseyScope, cached: caseyCurrent(), current: caseyCurrent() }))
+  assert.throws(() => reconcile.assertBoundedGmailLegacyAdoption(proof))
+})
+check('Casey admission rejects each scope, content, canonical binding and proof alias deviation', () => {
+  for (const change of [{ ownerEmail: 'other@example.test' }, { connectionId: 'other' },
+    { inboundMessageId: '78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' }, { intakePipelineId: scope.pipelineId },
+    { messageIds: [caseyIds[0]] }, { messageIds: [...caseyIds, messageIds[0]] },
+    { messageIds: [caseyIds[0], caseyIds[0]] }, { threadId: 'other' }, { pipelineId: 'other' },
+    { primaryOrganization: scope.organizations[1] }, { organizations: [scope.organizations[0]] }]) {
+    assert.throws(() => caseyAdoption({ scope: { ...caseyScope, ...change } }))
+  }
+  for (const change of [{ bodyText: 'changed' }, { receivedAt: '2026-10-27T12:30:40.124Z' },
+    { messageId: caseyIds[1] }, { threadId: 'other' }, { emailAddressHeaders: { version: 1 } }]) {
+    assert.throws(() => caseyAdoption({ current: { ...caseyCurrent(), ...change } }))
+  }
+  assert.throws(() => caseyAdoption({ identity: mailbox }))
+  assert.throws(() => caseyAdoption({ adoptedAt: '2026-10-27T09:05:00Z' }))
+  const valid = caseyAdoption()
+  const missing = { ...valid }; delete missing.ownerEmail
+  for (const proof of [missing, { ...valid, claimedOriginalMailbox: true }, { ...valid, kind: 'bounded-legacy-adoption' },
+    { ...valid, originalMailboxProvenance: 'verified' }, { ...valid, mailboxKey: 'gmail:wrong' },
+    { ...valid, providerAccountId: '' }, { ...valid, currentEvidenceHash: '0'.repeat(64) },
+    { ...valid, selectedMessageIds: [caseyIds.join(',')] },
+    { ...valid, relatedOrganizationReferences: ['gagmco24va588e,gajl1dq5i03jga'] }]) {
+    assert.throws(() => reconcile.assertCaseyGmailAdoption(proof))
+  }
+})
 console.log(`${passed} Gmail identity and reconciliation checks passed`)

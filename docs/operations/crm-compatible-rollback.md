@@ -45,12 +45,25 @@ is included in the organization-communications test suite.
 The historical recovery boundary is still **three plus two**, not five already
 recovered Emails. Both Casey caches lack canonical mailbox/source IDs; neither
 ordinary re-intake nor the fixed-three bridge may silently upgrade them. They
-require a separately reviewed exact-two admission with retained/current evidence
+use a separately reviewed exact-two admission with retained/current evidence
 equality, fresh verified mailbox, exact IDs/participants/companies, transaction
-CAS and explicit unknown original provenance. That additional admission is not
-implemented by the address repair. The existing fixed-three boundary remains
-unchanged. Live permissions, recovery, provider readback and deployment remain
-unperformed.
+CAS and explicit unknown original provenance. This separate local implementation
+uses `admissionScope: 'casey-reviewed-two-v1'`; it is not performed by address
+repair. Its distinct proof pins the owner, connection, intake pipeline and both
+retained cache IDs as well as the target pipeline/thread/companies. Generic
+review, correction, late-contact, partial and mixed five-message commands cannot
+obtain this admission. Replays retain the unknown-original marker and canonical
+identity instead of treating a newly assigned mailbox ID as original provenance.
+
+The historical pair passes actual candidate-GET/binding SQL and staged
+transaction tests in the existing 24-group PG16 reviewed-admission fixture,
+including pair rollback, stale CAS, both company relationships, unchanged reader
+audience and replay. That fixture has reduced synthetic base schema plus the
+reviewed 0374–0381 controls; it is not an independent full-catalog/0398 proof.
+The existing fixed-three factory/validator/constants remain unchanged. The
+metadata-only diagnostic now emits separate unsigned three-plus-two dry-run
+drafts, never a combined five-message command. Live permissions, recovery,
+provider readback and deployment remain unperformed.
 
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial

@@ -113,7 +113,11 @@ function knownProviderInteraction(id, raw = rawMessage(), overrides = {}) {
 function harness({ records = [adrian], organizations = [], providerInteractions = [], activePipelines = ownedPipelines,
   selectedMailboxes = [{ owner_email: ownerEmail, account_email: mailboxEmail, connection_id: 'fixture-connection' }],
   polledMessages = [], onAudit, beforeEnrichment, beforeReferenceRead, beforeReviewedBatch,
-  verifiedIdentity = mailboxIdentity, intakeIdentityStatus = 'verified' } = {}) {
+  verifiedIdentity = mailboxIdentity, intakeIdentityStatus = 'verified', retainCaseyHistoricalMarker = false,
+  fixtureOwnerEmail = ownerEmail, fixtureMailboxEmail = mailboxEmail, fixtureConnectionId = 'fixture-connection',
+  fixturePrimaryPipeline = primaryPipeline, fixtureBusinessPipeline = businessPipeline } = {}) {
+  const ownerEmail = fixtureOwnerEmail, mailboxEmail = fixtureMailboxEmail
+  const primaryPipeline = fixturePrimaryPipeline, businessPipeline = fixtureBusinessPipeline
   const queries = [], staged = [], providerCalls = [], audits = [], messages = new Map(), links = new Map()
   const initialProviderMessageIds = polledMessages.map(message => message.id)
   const persistedInteractions = [], enrichments = []
@@ -195,7 +199,7 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
     '@/lib/maton': { matonFetch: async (path, init, scope) => {
       assert.equal(init.method, 'GET', 'Mail ingestion must never modify Gmail')
       assert.equal(scope.ownerEmail, ownerEmail)
-      assert.equal(scope.boundConnectionId, 'fixture-connection')
+      assert.equal(scope.boundConnectionId, fixtureConnectionId)
       providerCalls.push(path)
       const url = new URL(path, 'https://gateway.example.test')
       if (url.pathname.endsWith('/users/me/profile')) return Response.json({ emailAddress: mailboxEmail })
@@ -217,7 +221,7 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
       if (sql.includes('FROM organization_communication_bindings')) {
         assert.match(sql, /credential_owner_email = \$1 AND maton_connection_id = \$2/)
         assert.match(sql, /app = 'google-mail'.*status = 'active'.*verified_at IS NOT NULL/s)
-        assert.deepEqual(plain(values), [ownerEmail, 'fixture-connection'])
+        assert.deepEqual(plain(values), [ownerEmail, fixtureConnectionId])
         return result([{ account_email: mailboxEmail, identity_email: ownAlias }])
       }
       if (sql.includes('FROM pipeline_spaces')) {
@@ -331,6 +335,8 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
           const existing = reviewedInteractions.get(key)
           const targetFingerprint = createHash('sha256').update(JSON.stringify({
             primaryOrganization: message.primaryOrganization, contactTargets: message.contactTargets,
+            ...(retainCaseyHistoricalMarker ? { admissionScope: message.admissionScope,
+              legacyAdoption: message.legacyAdoption, mailboxIdentity: message.mailboxIdentity } : {}),
           })).digest('hex')
           if (input.apply) {
             assert.equal(message.expectedExistingInteractionId, existing?.interactionId || null)
@@ -345,6 +351,12 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
             reviewedStages.push(plain(message.interaction))
             interactionId = `reviewed-interaction-${reviewedStages.length}`
             reviewedInteractions.set(key, { interactionId, targetFingerprint })
+            if (retainCaseyHistoricalMarker && message.legacyAdoption) {
+              const cached = messages.get(message.providerMessageId)
+              cached.mailbox_id = message.mailboxIdentity.mailboxId
+              cached.canonical_source_id = `synthetic-reviewed-source-${message.providerMessageId}`
+              cached.raw_metadata = { ...cached.raw_metadata, legacyAdoption: plain(message.legacyAdoption) }
+            }
             const inboundId = messages.get(message.providerMessageId)?.id
             const messageLinks = links.get(inboundId) || new Map()
             for (const reference of message.interaction.sourcePayload.relatedReferences) messageLinks.set(reference, interactionId)
@@ -389,7 +401,7 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
     ownerEmail, mailboxEmail, selfAddresses: [ownAlias],
     defaultPipelineId: primaryPipeline, ownedPipelines,
     message: parsed, mailboxIdentity: verifiedIdentity,
-    connectionId: 'fixture-connection', observedAccountEmail: mailboxEmail,
+    connectionId: fixtureConnectionId, observedAccountEmail: mailboxEmail,
     messageEvidence, ...overrides,
   } }
   return { ingestion, input, queries, staged, enrichments, providerCalls, audits, messages, links, persistedInteractions,
@@ -1362,6 +1374,143 @@ await check('later matching changes cannot clone one known canonical email into 
   assert.equal(h.messages.size, 1, 'Current provider acquisition is retained independently of the held CRM match')
   assert.equal(h.links.size + h.staged.length + h.enrichments.length, 0)
   assert.deepEqual(plain(original), before)
+})
+
+const CASEY_PRODUCER = { owner: 'jarrett@suburbiasandwichco.com', connection: 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027',
+  pipeline: '587c8746-ecf6-40ae-8c50-e456f99ad555', intake: '0ce9d945-0b71-495b-88ef-420ddd51fd9c',
+  thread: '1a179e9e2743f926', messages: [
+    { id: '1a18e03ea586cd7e', cacheId: '756e4e17-2458-470b-b00c-129c85ee821a' },
+    { id: '1a18f01749eb87a6', cacheId: '78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' },
+  ] }
+function caseyProducerFixture() {
+  const pins = CASEY_PRODUCER, account = 'synthetic-casey-mailbox@example.invalid'
+  const identity = { ...mailboxIdentity, providerAccountId: 'synthetic-casey-google-subject', accountEmail: account,
+    verifiedConnectionId: pins.connection }
+  const contacts = [fixtureContact('gc7654321', 'adrian@globus.example.invalid', pins.pipeline, customerOrganization),
+    fixtureContact('gc8765432', 'casey@airspace.example.invalid', pins.pipeline, otherOrganization)]
+  const organizations = [{ id: customerOrganization, referenceCode: 'gagmco24va588e', pipelineId: pins.pipeline, entity: 'organizations' },
+    { id: otherOrganization, referenceCode: 'gajl1dq5i03jga', pipelineId: pins.pipeline, entity: 'organizations' }]
+  const activePipelines = [{ id: pins.intake, is_default: true }, { id: pins.pipeline, is_default: false }]
+  const selectedMailboxes = [{ owner_email: pins.owner, account_email: account, connection_id: pins.connection }]
+  const raws = pins.messages.map(row => ({ ...rawMessage(row.id, { from: contacts[1].email,
+    to: `${pins.owner}, ${contacts[0].email}`, body: 'Synthetic exact-two Casey producer contents.' }), threadId: pins.thread }))
+  const h = harness({ records: contacts, organizations, activePipelines, selectedMailboxes, polledMessages: raws,
+    verifiedIdentity: identity, retainCaseyHistoricalMarker: true, fixtureOwnerEmail: pins.owner,
+    fixtureMailboxEmail: account, fixtureConnectionId: pins.connection,
+    fixturePrimaryPipeline: pins.intake, fixtureBusinessPipeline: pins.pipeline })
+  for (const [index, row] of pins.messages.entries()) {
+    const evidence = emailIdentity.normalizeGmailMessageEvidence(h.ingestion.parseGmailMessage(raws[index]))
+    h.messages.set(row.id, { id: row.cacheId, owner_email: pins.owner, pipeline_id: pins.intake,
+      mailbox_id: null, canonical_source_id: null, external_message_id: row.id, external_thread_id: pins.thread,
+      sender_email: evidence.senderEmail, recipient_emails: evidence.recipientEmails, subject: evidence.subject,
+      received_at: evidence.receivedAt, snippet: evidence.snippet, body_text: evidence.bodyText, marker_references: evidence.markerReferences,
+      raw_metadata: { provider: 'gmail', originalMailboxProvenance: 'unknown', labelIds: ['INBOX'], emailAddressHeaders: evidence.emailAddressHeaders } })
+  }
+  const associations = pins.messages.map(row => ({ messageId: row.id, threadId: pins.thread,
+    primaryOrganizationReference: 'gagmco24va588e', contactReferences: contacts.map(contact => contact.referenceCode).sort() }))
+  const selection = overrides => ({ ownerEmail: pins.owner, connectionId: pins.connection, pipelineId: pins.pipeline,
+    messageIds: pins.messages.map(row => row.id), reviewedAssociations: associations, decisionKind: 'review',
+    admissionScope: 'casey-reviewed-two-v1', ...overrides })
+  return { h, pins, identity, contacts, organizations, activePipelines, selectedMailboxes, raws, associations, selection }
+}
+
+await check('Casey exact-two producer previews/applies one bounded batch and preserves unknown marker provenance on replay', async () => {
+  const f = caseyProducerFixture(), original = plain([...f.h.messages.entries()])
+  const preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+  assert.equal(preview.applied, false); assert.equal(preview.messages.length, 2)
+  assert.deepEqual(plain([...f.h.messages.entries()]), original)
+  const produced = f.h.reviewedBatches[0].messages
+  assert.deepEqual(produced.map(row => row.providerMessageId), f.pins.messages.map(row => row.id))
+  for (const [index, row] of produced.entries()) {
+    assert.equal(row.admissionScope, 'casey-reviewed-two-v1'); assert.equal(row.decisionKind, 'review')
+    assert.equal(row.legacyAdoption.kind, 'reviewed-casey-two-adoption-v1')
+    assert.equal(row.legacyAdoption.ownerEmail, f.pins.owner); assert.equal(row.legacyAdoption.inboundMessageId, f.pins.messages[index].cacheId)
+    assert.equal(row.legacyAdoption.intakePipelineId, f.pins.intake); assert.equal(row.legacyAdoption.originalMailboxProvenance, 'unknown')
+    assert.equal(row.primaryOrganization.referenceCode, 'gagmco24va588e'); assert.equal(row.contactTargets.length, 2)
+  }
+  const command = f.selection({ apply: true, expectedDigest: preview.digest })
+  const first = await f.h.ingestion.reconcileGmailMessages(command)
+  assert.equal(first.interactions, 2); assert.equal(first.links, 8); assert.equal(f.h.reviewedStages.length, 2)
+  assert.equal(f.h.staged.length, 0, 'The producer cannot fall back to generic independent staging')
+  for (const row of f.h.messages.values()) {
+    assert.equal(row.raw_metadata.originalMailboxProvenance, 'unknown')
+    assert.equal(row.raw_metadata.legacyAdoption.kind, 'reviewed-casey-two-adoption-v1')
+  }
+  const retained = plain([...f.h.messages.entries()]), auditCount = f.h.audits.length
+  const refreshed = await f.h.ingestion.reconcileGmailMessages(f.selection())
+  assert.equal(refreshed.digest, preview.digest); assert.ok(refreshed.messages.every(row => row.alreadyLinked))
+  const replay = await f.h.ingestion.reconcileGmailMessages(command)
+  assert.equal(replay.interactions, 0); assert.equal(replay.links, 0); assert.equal(f.h.reviewedStages.length, 2)
+  assert.equal(f.h.audits.length, auditCount); assert.deepEqual(plain([...f.h.messages.entries()]), retained)
+  assert.ok(f.h.providerCalls.every(path => path.endsWith('/profile') || f.pins.messages.some(row => path.endsWith(`/messages/${row.id}?format=full`))))
+  assert.equal(f.h.queries.some(({ sql }) => /INSERT INTO crm_integration_cursors|INSERT INTO crm_inbound_messages/.test(sql)), false)
+})
+
+await check('Casey producer refuses missing/aliased scope, subsets, mixed messages, alternate decisions and owner/connection selections', async () => {
+  for (const change of ['no-scope', 'alias', 'subset', 'mixed', 'implicit-review', 'correction', 'late-contact', 'owner', 'connection', 'thread', 'primary']) {
+    const f = caseyProducerFixture(), input = f.selection()
+    if (change === 'no-scope') delete input.admissionScope
+    if (change === 'alias') input.admissionScope = 'casey-reviewed-two-v1 '
+    if (change === 'subset') { input.messageIds = input.messageIds.slice(0, 1); input.reviewedAssociations = input.reviewedAssociations.slice(0, 1) }
+    if (change === 'mixed') { input.messageIds[1] = 'a1'; input.reviewedAssociations[1] = { ...input.reviewedAssociations[1], messageId: 'a1' } }
+    if (change === 'implicit-review') delete input.decisionKind
+    if (change === 'correction') { input.decisionKind = 'correction'; input.correctionReason = 'Synthetic forbidden historical correction' }
+    if (change === 'late-contact') { input.decisionKind = 'late-contact'; input.lateContactEmail = f.contacts[1].email }
+    if (change === 'owner') input.ownerEmail = 'other-owner@example.invalid'
+    if (change === 'connection') input.connectionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    if (change === 'thread') input.reviewedAssociations[0] = { ...input.reviewedAssociations[0], threadId: 'abcdef' }
+    if (change === 'primary') input.reviewedAssociations[0] = { ...input.reviewedAssociations[0], primaryOrganizationReference: 'gajl1dq5i03jga' }
+    const before = plain([...f.h.messages.entries()])
+    await assert.rejects(f.h.ingestion.reconcileGmailMessages(input), /scope|three-message|exact|separately reviewed/)
+    assert.equal(f.h.reviewedStages.length + f.h.staged.length, 0, change)
+    assert.deepEqual(plain([...f.h.messages.entries()]), before, change)
+  }
+})
+
+await check('Casey producer binds digest to its admission scope rather than borrowing an ordinary review approval', async () => {
+  const f = caseyProducerFixture(), before = plain([...f.h.messages.entries()])
+  const scoped = await f.h.ingestion.reconcileGmailMessages(f.selection())
+  for (const row of f.h.messages.values()) { row.mailbox_id = f.identity.mailboxId; row.canonical_source_id = `synthetic-existing-${row.external_message_id}` }
+  const ordinary = await f.h.ingestion.reconcileGmailMessages(f.selection({ admissionScope: undefined }))
+  assert.notEqual(scoped.digest, ordinary.digest)
+  for (const [messageId, row] of before) f.h.messages.set(messageId, row)
+  await assert.rejects(f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: ordinary.digest })), /changed after preview/)
+  assert.equal(f.h.reviewedBatches.some(batch => batch.apply), false)
+})
+
+await check('Casey producer rechecks exact cache/intake, body/headers, membership and selected connection before applying either message', async () => {
+  for (const change of ['cache-id', 'intake', 'cache-owner', 'cache-body', 'cache-headers', 'provider-body', 'provider-headers', 'membership', 'connection', 'account']) {
+    const f = caseyProducerFixture(), preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+    const cached = f.h.messages.get(f.pins.messages[1].id)
+    if (change === 'cache-id') cached.id = f.pins.messages[0].cacheId
+    if (change === 'intake') cached.pipeline_id = f.pins.pipeline
+    if (change === 'cache-owner') cached.owner_email = 'other-owner@example.invalid'
+    if (change === 'cache-body') cached.body_text += ' changed'
+    if (change === 'cache-headers') cached.raw_metadata.emailAddressHeaders.cc = [{ address: 'changed@example.invalid' }]
+    if (change === 'provider-body') f.raws[1].payload.body.data = Buffer.from('Changed provider body').toString('base64url')
+    if (change === 'provider-headers') f.raws[1].payload.headers.push(header('Bcc', 'changed@example.invalid'))
+    if (change === 'membership') f.activePipelines.splice(f.activePipelines.findIndex(row => row.id === f.pins.pipeline), 1)
+    if (change === 'connection') f.selectedMailboxes[0].connection_id = 'changed-connection'
+    if (change === 'account') f.selectedMailboxes[0].account_email = 'changed-account@example.invalid'
+    const before = plain([...f.h.messages.entries()])
+    await assert.rejects(f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: preview.digest })),
+      /scope|owned|unavailable|not active|Retained Gmail|profile does not match|requires an existing|changed after preview/)
+    assert.equal(f.h.reviewedBatches.some(batch => batch.apply), false, change)
+    assert.equal(f.h.reviewedStages.length + f.h.staged.length, 0, change)
+    assert.deepEqual(plain([...f.h.messages.entries()]), before, change)
+  }
+})
+
+await check('Casey marker replay refuses rewritten original provenance, cache/intake/owner/subject and evidence pins', async () => {
+  for (const field of ['originalMailboxProvenance', 'inboundMessageId', 'intakePipelineId', 'ownerEmail', 'providerAccountId', 'retainedEvidenceHash']) {
+    const f = caseyProducerFixture(), preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+    await f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: preview.digest }))
+    const marker = f.h.messages.get(f.pins.messages[0].id).raw_metadata.legacyAdoption
+    marker[field] = field === 'originalMailboxProvenance' ? 'verified' : field === 'retainedEvidenceHash' ? '0'.repeat(64) : 'rewritten-synthetic-pin'
+    const stages = f.h.reviewedStages.length, audits = f.h.audits.length
+    await assert.rejects(f.h.ingestion.reconcileGmailMessages(f.selection()), /two-message scope/)
+    assert.equal(f.h.reviewedStages.length, stages); assert.equal(f.h.audits.length, audits)
+  }
 })
 
 console.log(`CRM email routing passed: ${passed} focused checks; no live provider or database operations`)

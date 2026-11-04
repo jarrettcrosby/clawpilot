@@ -660,6 +660,235 @@ try {
       revoker.release()
     }
   })
+  // A SECOND, separately named admission is exercised with synthetic contents
+  // and the exact reviewed two-message identity pins. It does not expand the
+  // original three-message helper or establish real Google/native delivery.
+  const CASEY = { owner: 'jarrett@suburbiasandwichco.com', connection: 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027',
+    pipeline: '587c8746-ecf6-40ae-8c50-e456f99ad555', intake: '0ce9d945-0b71-495b-88ef-420ddd51fd9c',
+    thread: '1a179e9e2743f926', workspace: id(700), globus: id(701), airspace: id(702), globusContact: id(703), airspaceContact: id(704),
+    messages: [
+      { message: '1a18e03ea586cd7e', cache: '756e4e17-2458-470b-b00c-129c85ee821a' },
+      { message: '1a18f01749eb87a6', cache: '78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' },
+    ] }
+  const caseyMailboxEmail = 'synthetic-casey-mailbox@example.invalid'
+  const caseyReconcile = fixtureContext.fixture.loadModule('app_src/lib/crm/emailReconciliation.ts', {
+    '@/lib/crm/emailIdentity': emailIdentity,
+  })
+  await query(`INSERT INTO app_users(email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code,role)
+    VALUES($1,'active','Synthetic Casey fixture owner','native-fixture-casey-owner',true,'gu7654321','owner')`, [CASEY.owner])
+  await query('INSERT INTO workspace_organizations VALUES($1,false)', [CASEY.workspace])
+  for (const [pipeline, isDefault] of [[CASEY.pipeline, false], [CASEY.intake, true]]) await query(`INSERT INTO pipeline_spaces
+    (id,owner_email,workspace_organization_id,is_default) VALUES($1,$2,$3,$4)`, [pipeline, CASEY.owner, CASEY.workspace, isDefault])
+  for (const [email, role] of [[CASEY.owner, 'owner'], [OWNER, 'member']]) await query(`INSERT INTO app_user_organization_memberships
+    (organization_id,user_email,status,role) VALUES($1,$2,'active',$3)`, [CASEY.workspace, email, role])
+  await query(`INSERT INTO user_maton_connections VALUES($1,$2,$3,'google-mail','ACTIVE','maton',true)`,
+    [CASEY.owner, CASEY.connection, caseyMailboxEmail])
+  await persistence.bindVerifiedGmailMailboxInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+    identity: { subject: 'synthetic-casey-google-subject', email: caseyMailboxEmail }, observedAccountEmail: caseyMailboxEmail })
+  const caseyIdentity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: CASEY.owner,
+    connectionId: CASEY.connection, accountEmail: caseyMailboxEmail })
+  assert.ok(caseyIdentity)
+  const caseyCompanies = [{ id: CASEY.globus, referenceCode: 'gagmco24va588e' }, { id: CASEY.airspace, referenceCode: 'gajl1dq5i03jga' }]
+  for (const [company, name, native] of [[caseyCompanies[0], 'Synthetic Globus', 'native-casey-globus'], [caseyCompanies[1], 'Synthetic Airspace', 'native-casey-airspace']]) {
+    await query(`INSERT INTO crm_organizations(id,pipeline_id,name,reference_code,source_key,suitecrm_id)
+      VALUES($1,$2,$3,$4,$4,$5)`, [company.id, CASEY.pipeline, name, company.referenceCode, native])
+  }
+  const caseyTargets = [
+    { id: CASEY.globusContact, referenceCode: 'gc7654321', organizationId: CASEY.globus, email: 'adrian@globus.example.invalid' },
+    { id: CASEY.airspaceContact, referenceCode: 'gc8765432', organizationId: CASEY.airspace, email: 'casey@airspace.example.invalid' },
+  ]
+  for (const target of caseyTargets) await query(`INSERT INTO crm_contacts
+    (id,pipeline_id,organization_id,full_name,email,reference_code,source_key,suitecrm_id) VALUES($1,$2,$3,$4,$5,$4,$4,$6)`,
+  [target.id, CASEY.pipeline, target.organizationId, target.referenceCode, target.email, `native-casey-contact-${target.id.slice(-1)}`])
+  const caseyEvidence = message => emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: message,
+    externalThreadId: CASEY.thread, senderEmail: caseyTargets[1].email, recipientEmails: [CASEY.owner, caseyTargets[0].email],
+    subject: `Synthetic exact-two ${message}`, receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Synthetic Casey snippet',
+    bodyText: 'Synthetic exact-two retained body', markerReferences: [], emailAddressHeaders: { version: 1,
+      from: [{ address: caseyTargets[1].email }], to: [{ address: CASEY.owner }, { address: caseyTargets[0].email }], cc: [], bcc: [] } })
+  for (const row of CASEY.messages) {
+    const current = caseyEvidence(row.message)
+    await query(`INSERT INTO crm_inbound_messages(id,owner_email,pipeline_id,external_message_id,external_thread_id,
+      sender_email,recipient_emails,subject,received_at,snippet,body_text,marker_references,raw_metadata)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)`, [row.cache, CASEY.owner, CASEY.intake, current.messageId,
+      current.threadId, current.senderEmail, current.recipientEmails, current.subject, current.receivedAt, current.snippet,
+      current.bodyText, current.markerReferences, JSON.stringify({ provider: 'gmail', originalMailboxProvenance: 'unknown',
+        labelIds: ['INBOX'], emailAddressHeaders: current.emailAddressHeaders })])
+  }
+  const caseyOriginalCache = (await query('SELECT * FROM crm_inbound_messages WHERE id=ANY($1::uuid[]) ORDER BY id', [CASEY.messages.map(row => row.cache)])).rows
+  const caseyMessages = CASEY.messages.map(row => {
+    const current = caseyEvidence(row.message)
+    const legacyAdoption = caseyReconcile.prepareCaseyGmailAdoption({ scope: {
+      ownerEmail: CASEY.owner, connectionId: CASEY.connection, inboundMessageId: row.cache, intakePipelineId: CASEY.intake,
+      pipelineId: CASEY.pipeline, messageIds: CASEY.messages.map(item => item.message), threadId: CASEY.thread,
+      primaryOrganization: caseyCompanies[0], organizations: caseyCompanies,
+    }, identity: caseyIdentity, adoptedAt: new Date().toISOString(), cached: current, current })
+    return { admissionScope: 'casey-reviewed-two-v1', ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+      pipelineId: CASEY.pipeline, mailboxIdentity: caseyIdentity, messageEvidence: current, legacyAdoption,
+      providerMessageId: current.messageId, providerThreadId: current.threadId, primaryOrganization: caseyCompanies[0],
+      contactTargets: caseyTargets, participantEmails: caseyTargets.map(target => target.email), interaction: {
+        entity: 'interactions', pipelineId: CASEY.pipeline, actorEmail: CASEY.owner, sourceKey: `synthetic-casey:${current.messageId}`,
+        sourcePayload: { source: 'gmail-inbound', syntheticCasey: true }, fields: { interactionType: 'email',
+          subject: current.subject, description: current.bodyText, occurredAt: current.receivedAt, agentEmail: CASEY.owner,
+          direction: 'inbound', deliveryStatus: 'received', providerMessageId: current.messageId,
+          providerThreadId: current.threadId, metadata: { source: 'gmail-inbound' } },
+      } }
+  })
+  const caseyCopy = value => JSON.parse(JSON.stringify(value))
+  const caseyRejectUnchanged = async messages => {
+    const before = await durableState()
+    await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ messages }))
+    assert.deepEqual(await durableState(), before)
+  }
+  await check('actual Casey candidate GET executes real binding/candidate SQL and returns only the two scoped metadata rows', async () => {
+    const origin = 'https://fixture.example.invalid'
+    const browserSameOrigin = fixtureContext.fixture.loadModule('app_src/lib/browserSameOrigin.ts', {
+      './publicOriginRouting.mjs': require('../app_src/lib/publicOriginRouting.mjs'),
+    })
+    const candidateRoute = fixtureContext.fixture.loadModule('app_src/app/api/crm/email-review-candidates/route.ts', {
+      'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
+      '@/lib/browserSameOrigin': browserSameOrigin,
+      '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/persistence/postgres': { query },
+      '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: persistence.readVerifiedGmailMailboxIdentityInPostgres },
+      '@/lib/publicUrl': { appPublicUrl: () => origin },
+      '@/lib/requestUser': { requestSession: async () => ({ authenticatedUser: CASEY.owner, effectiveUser: CASEY.owner,
+        impersonating: false, activeWorkspaceOrganizationId: CASEY.workspace }),
+      requireRequestUser: async () => ({ email: CASEY.owner, organizationId: CASEY.workspace }) },
+      '@/lib/tenancy': { resolvePipelineSpaceAccess: async input => {
+        assert.equal(input.pipelineId, CASEY.pipeline); assert.equal(input.actorEmail.email, CASEY.owner)
+        return { id: CASEY.pipeline, ownerEmail: CASEY.owner, workspaceOrganizationId: CASEY.workspace }
+      } },
+    })
+    const get = async admissionScope => {
+      const url = new URL('/api/crm/email-review-candidates', origin)
+      url.searchParams.set('pipelineId', CASEY.pipeline); url.searchParams.set('connectionId', CASEY.connection)
+      if (admissionScope !== undefined) url.searchParams.set('admissionScope', admissionScope)
+      const request = new Request(url, { headers: { Origin: origin, 'Sec-Fetch-Site': 'same-origin' } })
+      request.nextUrl = url
+      const result = await candidateRoute.GET(request)
+      return { status: result.status, body: await result.json() }
+    }
+    const before = await durableState(), scoped = await get('casey-reviewed-two-v1')
+    assert.equal(scoped.status, 200); assert.equal(scoped.body.ok, true)
+    assert.equal(scoped.body.maximum, 2); assert.equal(scoped.body.admissionScope, 'casey-reviewed-two-v1')
+    assert.equal(scoped.body.pipelineId, CASEY.pipeline); assert.equal(scoped.body.connectionId, CASEY.connection)
+    assert.equal(scoped.body.messages.length, 2)
+    assert.deepEqual(scoped.body.messages.map(row => row.messageId).sort(), CASEY.messages.map(row => row.message).sort())
+    for (const row of scoped.body.messages) {
+      assert.deepEqual(Object.keys(row).sort(), ['admissionScope', 'legacy', 'messageId', 'participantContactIds', 'participantEmails', 'receivedAt', 'subject', 'threadId'])
+      assert.equal(row.admissionScope, 'casey-reviewed-two-v1'); assert.equal(row.legacy, true); assert.equal(row.threadId, CASEY.thread)
+      assert.deepEqual(row.participantContactIds.sort(), [CASEY.globusContact, CASEY.airspaceContact].sort())
+    }
+    assert.ok(!JSON.stringify(scoped.body).includes('Synthetic exact-two retained body'))
+    const ordinary = await get()
+    assert.equal(ordinary.status, 200); assert.deepEqual(ordinary.body.messages, [])
+    assert.equal(Object.hasOwn(ordinary.body, 'admissionScope'), false)
+    assert.deepEqual(await durableState(), before, 'Candidate GET never acquires, adopts or rewrites retained mail')
+  })
+  let caseyPreviews, caseyApply
+  await check('Casey exact-two is a separately named read-only admission, never a generic or three-message alias', async () => {
+    const before = await durableState()
+    caseyPreviews = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyMessages })
+    assert.equal(caseyPreviews.length, 2)
+    assert.ok(caseyPreviews.every(row => !row.applied && row.interactionId === null))
+    assert.deepEqual(await durableState(), before)
+    for (const message of caseyMessages) assert.equal(message.legacyAdoption.kind, 'reviewed-casey-two-adoption-v1')
+    for (const messages of [[caseyMessages[0]], [caseyMessages[0], caseyMessages[0]], [caseyMessages[0], selection('d1')],
+      caseyMessages.map(message => { const copy = caseyCopy(message); delete copy.admissionScope; return copy }),
+      caseyMessages.map(message => ({ ...message, admissionScope: 'casey-reviewed-two-v1 ' })),
+      caseyMessages.map(message => ({ ...message, decisionKind: 'correction', correctionReason: 'Synthetic forbidden scope expansion' })),
+      caseyMessages.map(message => ({ ...message, decisionKind: 'late-contact' })),
+      caseyMessages.map(message => ({ ...message, legacyAdoption: { ...message.legacyAdoption, kind: 'bounded-legacy-adoption' } }))]) {
+      await caseyRejectUnchanged(messages)
+    }
+    caseyApply = caseyMessages.map((message, index) => ({ ...message, expectedExistingInteractionId: null,
+      expectedTargetFingerprint: caseyPreviews[index].targetFingerprint }))
+  })
+  await check('Casey exact-two rechecks owner/cache/intake/connection pins and both CAS values before any write', async () => {
+    const before = await durableState()
+    await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ messages: [caseyApply[0],
+      { ...caseyApply[1], expectedTargetFingerprint: '0'.repeat(64) }], apply: true }))
+    assert.deepEqual(await durableState(), before, 'A stale second message never commits the first')
+    for (const [column, value] of [['ownerEmail', OWNER], ['connectionId', CONNECTION], ['inboundMessageId', CASEY.messages[0].cache],
+      ['intakePipelineId', CASEY.pipeline]]) {
+      const messages = caseyCopy(caseyMessages); messages[1].legacyAdoption[column] = value
+      await caseyRejectUnchanged(messages)
+    }
+    for (const [change, restore] of [
+      [() => query('UPDATE crm_inbound_messages SET owner_email=$2 WHERE id=$1', [CASEY.messages[1].cache, OWNER]),
+        () => query('UPDATE crm_inbound_messages SET owner_email=$2 WHERE id=$1', [CASEY.messages[1].cache, CASEY.owner])],
+      [() => query('UPDATE crm_inbound_messages SET pipeline_id=$2 WHERE id=$1', [CASEY.messages[1].cache, CASEY.pipeline]),
+        () => query('UPDATE crm_inbound_messages SET pipeline_id=$2 WHERE id=$1', [CASEY.messages[1].cache, CASEY.intake])],
+      [() => query("UPDATE app_users SET status='disabled' WHERE email=$1", [CASEY.owner]),
+        () => query("UPDATE app_users SET status='active' WHERE email=$1", [CASEY.owner])],
+      [() => query('UPDATE user_maton_connections SET is_selected=false WHERE owner_email=$1 AND connection_id=$2', [CASEY.owner, CASEY.connection]),
+        () => query('UPDATE user_maton_connections SET is_selected=true WHERE owner_email=$1 AND connection_id=$2', [CASEY.owner, CASEY.connection])],
+      [() => query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CASEY.airspaceContact, 'changed@airspace.example.invalid']),
+        () => query('UPDATE crm_contacts SET email=$2 WHERE id=$1', [CASEY.airspaceContact, caseyTargets[1].email])],
+      [() => query("INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'viewer')", [CASEY.pipeline, OWNER]),
+        () => query('DELETE FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2', [CASEY.pipeline, OWNER])],
+    ]) {
+      await change()
+      try {
+        const changed = await durableState()
+        await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyApply, apply: true }))
+        assert.deepEqual(await durableState(), changed)
+      } finally { await restore() }
+    }
+  })
+  await check('Casey second-decision SQL failure rolls both messages, sources, links, outbox and audits back', async () => {
+    const before = await durableState()
+    await query(`CREATE FUNCTION test_deny_casey_second_review() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+      IF NEW.pipeline_id='587c8746-ecf6-40ae-8c50-e456f99ad555'::uuid AND
+        (SELECT provider_message_id FROM crm_email_sources WHERE id=NEW.source_id)='1a18f01749eb87a6' THEN
+        IF NOT EXISTS(SELECT 1 FROM crm_interactions WHERE pipeline_id=NEW.pipeline_id AND provider_message_id='1a18e03ea586cd7e')
+          THEN RAISE EXCEPTION 'Casey first message was not staged before the second decision'; END IF;
+        RAISE EXCEPTION 'Synthetic Casey second-decision failure after first stage';
+      END IF;RETURN NEW;END $$;
+      CREATE TRIGGER test_deny_casey_second_review BEFORE INSERT ON crm_email_review_decisions
+      FOR EACH ROW EXECUTE FUNCTION test_deny_casey_second_review()`)
+    try {
+      await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyApply, apply: true }), /Synthetic Casey second-decision failure after first stage/)
+      assert.deepEqual(await durableState(), before)
+    } finally { await query('DROP TRIGGER test_deny_casey_second_review ON crm_email_review_decisions;DROP FUNCTION test_deny_casey_second_review()') }
+  })
+  await check('Casey exact-two stages one Email per message, both companies, original-unknown proof and current audience', async () => {
+    const results = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyApply, apply: true })
+    assert.equal(results.length, 2); assert.ok(results.every(row => row.applied))
+    assert.equal(new Set(results.map(row => row.interactionId)).size, 2)
+    const rows = (await query('SELECT * FROM crm_interactions WHERE pipeline_id=$1 ORDER BY provider_message_id', [CASEY.pipeline])).rows
+    assert.equal(rows.length, 2)
+    for (const row of rows) {
+      assert.equal(row.organization_id, CASEY.globus); assert.equal(row.provider_thread_id, CASEY.thread)
+      assert.equal(row.suitecrm_module, 'Emails'); assert.ok(row.canonical_source_id)
+      assert.equal((await query('SELECT count(*) FROM crm_interaction_organizations WHERE interaction_id=$1', [row.id])).rows[0].count, '2')
+      assert.equal((await query('SELECT count(*) FROM crm_interaction_contacts WHERE interaction_id=$1', [row.id])).rows[0].count, '2')
+      const decision = (await query('SELECT * FROM crm_email_review_decisions WHERE interaction_id=$1', [row.id])).rows[0]
+      assert.equal(decision.kind, 'legacy-adoption'); assert.equal(decision.provenance.legacyAdoption.kind, 'reviewed-casey-two-adoption-v1')
+      assert.equal(decision.provenance.legacyAdoption.originalMailboxProvenance, 'unknown')
+      assert.deepEqual(decision.audience.allowedSuiteCrmUserIds, ['native-fixture-casey-owner'])
+      assert.equal(decision.audience.ownerSuiteCrmId, 'native-fixture-casey-owner')
+      const outbox = (await query("SELECT payload FROM sync_outbox WHERE aggregate_id=$1 AND target_system='suitecrm'", [row.id])).rows
+      assert.equal(outbox.length, 1); assert.equal(outbox[0].payload.suiteCrmModule, 'Emails')
+      assert.deepEqual(outbox[0].payload.emailProjection.accounts, ['native-casey-airspace', 'native-casey-globus'])
+      assert.deepEqual(outbox[0].payload.emailProjection.audience.allowedSuiteCrmUserIds, ['native-fixture-casey-owner'])
+    }
+    const cache = (await query('SELECT * FROM crm_inbound_messages WHERE id=ANY($1::uuid[]) ORDER BY id', [CASEY.messages.map(row => row.cache)])).rows
+    for (const row of cache) {
+      const original = caseyOriginalCache.find(item => item.id === row.id)
+      for (const field of ['id', 'owner_email', 'pipeline_id', 'external_message_id', 'external_thread_id', 'sender_email',
+        'recipient_emails', 'subject', 'received_at', 'snippet', 'body_text', 'marker_references']) assert.deepEqual(row[field], original[field])
+      assert.equal(row.raw_metadata.originalMailboxProvenance, 'unknown')
+      const { legacyAdoption, ...unchangedMetadata } = row.raw_metadata
+      assert.deepEqual(unchangedMetadata, original.raw_metadata); assert.equal(legacyAdoption.inboundMessageId, row.id)
+      assert.equal(legacyAdoption.intakePipelineId, CASEY.intake); assert.equal(legacyAdoption.ownerEmail, CASEY.owner)
+    }
+    const beforeReplay = await durableState()
+    const replay = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyApply, apply: true })
+    assert.ok(replay.every(row => !row.applied))
+    assert.deepEqual(replay.map(row => row.interactionId), results.map(row => row.interactionId))
+    assert.deepEqual(await durableState(), beforeReplay, 'Exact-two replay is write-free, including immutable historical proof')
+  })
   console.log(`PASS ${passed} reviewed Gmail persistence checks; actual SQL/readers/native payload producer; no provider writes`)
 } finally {
   try { if (pool) await pool.end() }

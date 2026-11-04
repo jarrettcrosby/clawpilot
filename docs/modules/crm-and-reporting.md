@@ -182,6 +182,20 @@ verification; the saved label is not a grant-continuity or historical proof.
 
 Previously missed messages are not recovered by resetting a mailbox cursor. The owner-only `POST /api/crm/email-recovery` accepts one active workspace pipeline, its owner's selected Gmail connection, and 1–25 exact Gmail message IDs. It requires a real, non-impersonated same-origin session. The default dry run returns a content/routing digest and proposed references without changing CRM or Gmail. An explicit apply must supply that digest; it refetches the messages, rejects changed content or routing and rechecks current pipeline membership before staging. Drafts, spam, trash, authentication codes and messages routed outside the reviewed pipeline are ineligible. Recovery is audited and idempotent, queues normal CRM synchronization, never sends mail, and does not alter polling cursors. Review each bounded selection and verify the resulting CRM/SuiteCRM activity before expanding it.
 
+The separately reviewed historical Casey pair has its own explicit action in
+the matching BPO pipeline/mailbox's review dialog. It loads only both pinned
+cache records and sends `admissionScope: 'casey-reviewed-two-v1'` with
+`decisionKind: 'review'`. The server independently pins the owner, connection,
+original intake pipeline, exact message/cache/thread identities, Globus primary
+and Airspace related, and actual selected participant Contacts. Both complete
+retained messages must equal fresh provider content. Preview, CAS, audience and
+the whole-pair transaction are rechecked before apply; failure leaves both
+unchanged. Replay retains their canonical identities and **unknown original
+mailbox provenance**. This one-off historical review is not a generic history
+import, association correction, late-contact rule or automatic future thread
+association. The original three-message bridge is unchanged, and the five
+reviewed messages must be recovered as separate three- and two-message batches.
+
 ## Workbook Contract
 
 The in-app Pipeline report defaults its interaction metric/chart to **Customers and prospects**. It uses the current CRM Account `account_type`, not the structural `relationship_type` value. Supplier-only, unclassified and unlinked activity remains available under **All activity**. An interaction linked to several companies counts once when any active, same-pipeline customer/prospect qualifies; legacy Contact/Lead/Opportunity/Meeting-only primary associations follow the normal CRM resolution order. Archived interactions and archived companies do not qualify for the sales metric. Changing this selector does not change opportunity revenue or contact totals. The CRM header explicitly labels its unfiltered total **all interactions**; the generated workbook remains an all-activity projection, not a copy of this per-view selector.

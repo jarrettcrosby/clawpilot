@@ -106,6 +106,36 @@ test('apply requires a reviewed digest; no-op result stays explicit', async () =
   assert.equal(result.body.recovery.links, 0)
 })
 
+test('Casey admission forwards only the explicit exact-two review scope and authenticated pinned owner', async () => {
+  const ownerEmail = 'jarrett@suburbiasandwichco.com'
+  const selected = { pipelineId: '587c8746-ecf6-40ae-8c50-e456f99ad555', connectionId: 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027',
+    messageIds: ['1a18e03ea586cd7e', '1a18f01749eb87a6'], decisionKind: 'review', admissionScope: 'casey-reviewed-two-v1' }
+  selected.reviewedAssociations = selected.messageIds.map(messageId => ({ messageId, threadId: '1a179e9e2743f926',
+    primaryOrganizationReference: 'gagmco24va588e', contactReferences: ['gc2345678', 'gc3456789'] }))
+  const options = { actor: { email: ownerEmail }, session: { authenticatedUser: ownerEmail, effectiveUser: ownerEmail },
+    pipeline: { id: selected.pipelineId, ownerEmail } }
+  for (const apply of [false, true]) {
+    const app = harness(options)
+    assert.equal((await app.request({ ...selected, apply, ...(apply ? { expectedDigest: digest } : {}) })).status, 200)
+    assert.deepEqual(JSON.parse(JSON.stringify(app.calls[0])), { ...selected, ownerEmail, apply, ...(apply ? { expectedDigest: digest } : {}) })
+  }
+  for (const change of [{ admissionScope: 'casey-reviewed-two-v1 ' }, { admissionScope: null }, { decisionKind: undefined },
+    { decisionKind: 'correction', correctionReason: 'Not this admission' }, { correctionReason: '' },
+    { decisionKind: 'late-contact', participantEmail: 'contact@example.test' }, { pipelineId }, { connectionId },
+    { messageIds: [selected.messageIds[0]], reviewedAssociations: [selected.reviewedAssociations[0]] },
+    { messageIds: [...selected.messageIds, '1a17e730c78d319c'], reviewedAssociations: [...selected.reviewedAssociations,
+      { ...selected.reviewedAssociations[0], messageId: '1a17e730c78d319c' }] },
+    { reviewedAssociations: undefined },
+    { reviewedAssociations: selected.reviewedAssociations.map(row => ({ ...row, primaryOrganizationReference: 'gajl1dq5i03jga' })) }]) {
+    const app = harness(options)
+    assert.equal((await app.request({ ...selected, ...change })).status, 400, JSON.stringify(change))
+    assert.equal(app.calls.length, 0); assert.equal(app.accessCalls.length, 0)
+  }
+  const wrongOwner = harness()
+  assert.equal((await wrongOwner.request(selected)).status, 400)
+  assert.equal(wrongOwner.calls.length, 0)
+})
+
 test('reviewed associations are optional and forward only the exact normalized selection for preview and apply', async () => {
   for (const apply of [false, true]) {
     const app = harness()

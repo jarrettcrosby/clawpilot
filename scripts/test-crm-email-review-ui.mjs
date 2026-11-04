@@ -60,6 +60,37 @@ check('legacy selection stays exactly three and all selections are capped at25',
   const legacy = candidates.slice(0, 3).map(message => ({ ...message, legacy: true }))
   assert.equal(api.emailReviewCommand({ ...base, candidates: legacy, selections }).messageIds.length, 3)
 })
+check('Casey history is an explicit complete pair, never the default review or a mixed legacy batch', () => {
+  const candidates = ['1a18e03ea586cd7e','1a18f01749eb87a6'].map(messageId => ({ ...candidate,
+    messageId, legacy: true, admissionScope: 'casey-reviewed-two-v1' }))
+  const selections = Object.fromEntries(candidates.map(message => [message.messageId, base.selections.abcdef]))
+  const input = { ...base, decisionKind: 'casey-history', candidates, selections }
+  const command = plain(api.emailReviewCommand(input))
+  assert.equal(command.decisionKind, 'review'); assert.equal(command.admissionScope, 'casey-reviewed-two-v1')
+  assert.deepEqual(command.messageIds, candidates.map(message => message.messageId))
+  assert.equal(command.reviewedAssociations.length, 2)
+  assert.ok(!JSON.stringify(command).includes('legacyAdoption'))
+  for (const changed of [
+    { candidates: candidates.slice(0, 1) }, { selections: { [candidates[0].messageId]: base.selections.abcdef } },
+    { candidates: [candidates[0], candidates[0]] }, { candidates: [...candidates, candidate] },
+    { candidates: [{ ...candidates[0], admissionScope: undefined }, candidates[1]] },
+    { candidates: [{ ...candidates[0], legacy: false }, candidates[1]] },
+    { decisionKind: 'review' }, { decisionKind: 'correction', correctionReason: 'Not a historical admission' },
+    { decisionKind: 'late-contact', participantEmail: 'globus@example.test' },
+  ]) assert.equal(api.emailReviewCommand({ ...input, ...changed }), null)
+  const ordinary = api.emailReviewCommand({ ...input, decisionKind: 'review',
+    candidates: candidates.map(({ admissionScope, ...message }) => ({ ...message, legacy: false })) })
+  assert.notEqual(JSON.stringify(command), JSON.stringify(ordinary), 'Scope is part of the existing reviewed input key')
+  const html = renderToStaticMarkup(React.createElement(api.EmailReviewFields,
+    { ...input, disabled: false, onSelection: () => assert.fail('Render cannot apply') }))
+  assert.ok(html.includes('Separate two-message Casey review'))
+  assert.ok(!html.includes('Fixed three-message legacy review'))
+  assert.match(source, /decisionKind === 'casey-history' \? \{ admissionScope: 'casey-reviewed-two-v1' \} : \{\}/)
+  assert.match(source, /body\.admissionScope !== 'casey-reviewed-two-v1'/)
+  assert.match(source, /body\.messages\.length !== 2/)
+  assert.match(source, /Original historical mailbox provenance remains unknown/)
+  assert.match(source, /caseyAvailable \|\| decisionKind === 'casey-history'/)
+})
 check('every material review input produces a different preview key and apply sends only the reviewed digest', () => {
   const key = JSON.stringify(api.emailReviewCommand(base))
   for (const input of [{ ...base, connectionId: 'other-mailbox' }, { ...base, pipelineId: 'other-pipeline' },

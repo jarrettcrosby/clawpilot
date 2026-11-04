@@ -9,7 +9,8 @@ import {
   GmailIdentityError,
   type GmailMessageEvidence, type VerifiedGmailMailboxIdentity,
 } from '@/lib/crm/emailIdentity'
-import { prepareBoundedLegacyGmailAdoption, selectLateContactGmailMessages, type GmailLegacyAdoption } from '@/lib/crm/emailReconciliation'
+import { assertCaseyGmailAdoption, prepareCaseyGmailAdoption, prepareBoundedLegacyGmailAdoption, selectLateContactGmailMessages,
+  type GmailReviewedHistoricalAdoption } from '@/lib/crm/emailReconciliation'
 import { matonFetch } from '@/lib/maton'
 import {
   enrichCrmEmailInteractionParticipantsInPostgres,
@@ -1469,6 +1470,7 @@ async function reconcileReviewedGmailMessages(input: {
   lateContactEmail?: string
   decisionKind?: 'review' | 'correction' | 'late-contact'
   correctionReason?: string
+  admissionScope?: 'casey-reviewed-two-v1'
 }) {
   const planned = []
   for (const association of input.associations) {
@@ -1491,12 +1493,29 @@ async function reconcileReviewedGmailMessages(input: {
     )
     if (cached.rows.length !== 1) throw new SafeEmailIngestionError('Reviewed cross-company recovery requires an existing owned cached Gmail message')
     const messageEvidence = fullGmailEvidence(raw, message)
-    let legacyAdoption: GmailLegacyAdoption | undefined
+    let legacyAdoption: GmailReviewedHistoricalAdoption | undefined
     try {
       const retainedEvidence = retainedGmailMessageEvidence(cached.rows[0])
       assertSameRetainedGmailEvidence(retainedEvidence, messageEvidence)
       const retainedMetadata = asRecord(cached.rows[0].raw_metadata)
-      legacyAdoption = cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption ? undefined : prepareBoundedLegacyGmailAdoption({
+      const scope = { pipelineId: input.pipelineId, messageIds: input.associations.map(value => value.messageId),
+        threadId: association.threadId, primaryOrganization: { id: resolved.primary.id, referenceCode: resolved.primary.referenceCode },
+        organizations: resolved.companyTargets.map(target => ({ id: target.record.id, referenceCode: target.record.referenceCode })) }
+      if (input.admissionScope === 'casey-reviewed-two-v1') {
+        legacyAdoption = prepareCaseyGmailAdoption({ scope: { ...scope, ownerEmail: input.ownerEmail,
+          connectionId: input.connectionId, inboundMessageId: cached.rows[0].id, intakePipelineId: cached.rows[0].pipeline_id },
+        identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(), cached: retainedEvidence, current: messageEvidence })
+        if (cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption) throw new Error('Historical admission proof is required')
+        if (retainedMetadata?.legacyAdoption) {
+          const previous = retainedMetadata.legacyAdoption as typeof legacyAdoption
+          assertCaseyGmailAdoption(previous)
+          // Reverification may renew the current label/time, never the original
+          // unknown provenance, immutable subject, retained evidence or placement.
+          const oldPins: Partial<typeof previous> = { ...previous }; delete oldPins.accountEmail; delete oldPins.identityVerifiedAt
+          const newPins: Partial<typeof legacyAdoption> = { ...legacyAdoption }; delete newPins.accountEmail; delete newPins.identityVerifiedAt
+          if (JSON.stringify(stableEvidence(oldPins)) !== JSON.stringify(stableEvidence(newPins))) throw new Error('Historical admission proof changed')
+        }
+      } else legacyAdoption = cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption ? undefined : prepareBoundedLegacyGmailAdoption({
         scope: { pipelineId: input.pipelineId, messageIds: input.associations.map(value => value.messageId),
           threadId: association.threadId, primaryOrganization: { id: resolved.primary.id, referenceCode: resolved.primary.referenceCode },
           organizations: resolved.companyTargets.map(target => ({ id: target.record.id, referenceCode: target.record.referenceCode })) },
@@ -1505,7 +1524,8 @@ async function reconcileReviewedGmailMessages(input: {
     } catch (error) {
       throw new SafeEmailIngestionError(error instanceof GmailIdentityError
         ? 'Retained Gmail content or identity changed; a matching complete source is required'
-        : 'Legacy Gmail adoption is outside the explicitly reviewed three-message scope')
+        : input.admissionScope ? 'Casey Gmail admission is outside the explicitly reviewed two-message scope'
+          : 'Legacy Gmail adoption is outside the explicitly reviewed three-message scope')
     }
     const relatedReferences = [...association.contactReferences, ...resolved.organizationReferences].sort()
     const interaction: StageInteractionInput = {
@@ -1531,6 +1551,7 @@ async function reconcileReviewedGmailMessages(input: {
       participantEmails: resolved.participantEmails,
       mailboxIdentity: input.mailboxIdentity, messageEvidence,
       ...(legacyAdoption ? { legacyAdoption } : {}),
+      ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
       ...(input.lateContactEmail ? { lateContactEmail: input.lateContactEmail } : {}),
       decisionKind: input.decisionKind || 'review',
       ...(input.correctionReason ? { correctionReason: input.correctionReason } : {}),
@@ -1551,6 +1572,7 @@ async function reconcileReviewedGmailMessages(input: {
     version: 3, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
     decisionKind: input.decisionKind || 'review', correctionReason: input.correctionReason || null,
     lateContactEmail: input.lateContactEmail || null,
+    ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     pipelineId: input.pipelineId, mailboxEmail: input.mailbox.account_email,
     selfAddresses: [...input.selfAddresses].sort(),
     messages: planned.map((plan, index) => ({ association: plan.association, raw: plan.raw,
@@ -1602,6 +1624,7 @@ export async function reconcileGmailMessages(input: {
   lateContactEmail?: string
   decisionKind?: 'review' | 'correction' | 'late-contact'
   correctionReason?: string
+  admissionScope?: 'casey-reviewed-two-v1'
 }) {
   const ownerEmail = String(input.ownerEmail || '').trim().toLowerCase()
   if (input.decisionKind && !['review', 'correction', 'late-contact'].includes(input.decisionKind)) {
@@ -1623,6 +1646,15 @@ export async function reconcileGmailMessages(input: {
     throw new SafeEmailIngestionError('A bounded, exact Gmail recovery selection is required')
   }
   const reviewedAssociations = reviewedAssociationSelection(input.reviewedAssociations, input.messageIds)
+  if (input.admissionScope !== undefined && (input.admissionScope !== 'casey-reviewed-two-v1'
+    || ownerEmail !== 'jarrett@suburbiasandwichco.com' || input.connectionId !== 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027'
+    || input.pipelineId !== '587c8746-ecf6-40ae-8c50-e456f99ad555' || input.decisionKind !== 'review'
+    || input.correctionReason !== undefined || input.lateContactEmail !== undefined || !reviewedAssociations
+    || [...input.messageIds].sort().join(',') !== '1a18e03ea586cd7e,1a18f01749eb87a6'
+    || reviewedAssociations.some(association => association.threadId !== '1a179e9e2743f926'
+      || association.primaryOrganizationReference !== 'gagmco24va588e'))) {
+    throw new SafeEmailIngestionError('Casey Gmail admission requires the exact separately reviewed two-message scope')
+  }
   const mailbox = (await selectedMailboxes()).find((entry) => (
     entry.owner_email === ownerEmail && entry.connection_id === input.connectionId
   ))
@@ -1637,6 +1669,7 @@ export async function reconcileGmailMessages(input: {
     mailbox, pipelines, selfAddresses, mailboxIdentity: identity.mailboxIdentity,
     observedAccountEmail: identity.observedAccountEmail, lateContactEmail: input.lateContactEmail,
     decisionKind: input.decisionKind, correctionReason: input.correctionReason?.trim(),
+    admissionScope: input.admissionScope,
   })
   if (input.lateContactEmail) throw new SafeEmailIngestionError('Late-contact reconciliation requires exact reviewed message associations')
   if (input.decisionKind === 'correction' || input.decisionKind === 'late-contact') {
