@@ -108,13 +108,15 @@ for(const arg of process.argv.slice(2)){
   else if(arg==='--replan-after-expiry'){assert.equal(options.replanAfterExpiry,undefined);options.replanAfterExpiry=true}
   else if(arg==='--with-record-lifecycle'){assert.equal(options.withRecordLifecycle,undefined);options.withRecordLifecycle=true}
   else if(arg==='--with-meeting-roundtrip'){assert.equal(options.withMeetingRoundtrip,undefined);options.withMeetingRoundtrip=true}
+  else if(arg==='--with-unmanaged-app-only'){assert.equal(options.withUnmanagedAppOnly,undefined);options.withUnmanagedAppOnly=true}
   else if(arg==='--zip-preflight-only'){assert.equal(options.zipPreflightOnly,undefined);options.zipPreflightOnly=true}
-  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip]')
+  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip] [--with-unmanaged-app-only]')
 }
 assert.ok(!(options.serviceImage&&options.zipPreflightOnly),'Archive-only preflight does not exercise the service image')
 assert.ok(!options.replanAfterExpiry||options.serviceImage,'Expiry/replan proof requires the actual service image and true container restart')
 assert.ok(!options.withRecordLifecycle||options.serviceImage,'Authenticated record lifecycle proof requires the actual service image')
 assert.ok(!options.withMeetingRoundtrip||options.withRecordLifecycle&&options.serviceImage,'Meeting roundtrip requires lifecycle OAuth and the actual service image')
+assert.ok(!options.withUnmanagedAppOnly||options.serviceImage,'Unmanaged app-only acceptance requires the actual native service image')
 if(options.withMeetingRoundtrip)assert.equal(process.env.TZ,'UTC','Launch the opt-in native meeting fixture with explicit TZ=UTC; do not rewrite native API dates')
 assert.ok(isAbsolute(options['source-zip']??'')&&isAbsolute(options.build??'')&&isAbsolute(options.output??''))
 assert.ok(options.output.endsWith('.json'),'Use one new JSON evidence artifact')
@@ -182,6 +184,7 @@ const deadline=Date.now()+600000,audits=[],checks=[],commandLog=[],storagePhases
 let pool,token,secondaryClean=false,cleanupMode=false,cleaned=false,activeTransactions=0,report,imageProof,primaryCleanupAttempted=false,replanEvidence=null
 let meetingRoundtrip=null
 let meetingFixtureSeeds=null
+let unmanagedAppOnly=null
 const meetingPrivateValues=[]
 const redactMeetingSecrets=value=>{let result=String(value??'');for(const secret of meetingPrivateValues)if(secret.length>=24)result=result.replaceAll(secret,'[private-synthetic-fixture-value]');return result}
 const recordLifecycle=options.withRecordLifecycle?{version:1,kind:'actual-joint-record-lifecycle',fixtureDataSynthetic:true,
@@ -431,6 +434,23 @@ try{
       await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',[policy.pipelineId,'Joint native pipeline',selection.actorEmail,policy.workspaceId])
       for(const person of people.filter(p=>p.role!=='owner'))await q('INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,$3)',[policy.pipelineId,person.email,'editor'])
     }
+    if(options.withUnmanagedAppOnly){
+      const workspaceId=observed.pipelines[0].policy.workspaceId,pipelineId=id()
+      const ownerEmail='joint.app-only.owner@example.invalid',targetEmail='joint.app-only.target@example.invalid'
+      for(const email of [ownerEmail,targetEmail]){
+        await q(`WITH ref AS(SELECT allocate_crm_reference('gu') AS code)
+          INSERT INTO app_users(email,role,status,organization_id,permissions,suitecrm_user_id,suitecrm_username,reference_code,crm_user_enabled)
+          SELECT $1,'member','active',$2,'{"viewCrm":true}'::jsonb,NULL,NULL,code,false FROM ref`,[email,workspaceId])
+        await q(`INSERT INTO app_user_organization_memberships(user_email,organization_id,role,status,permissions,created_by,updated_by)
+          VALUES($1,$2,'member','active','{"viewCrm":true}'::jsonb,$3,$3)`,[email,workspaceId,selection.actorEmail])
+      }
+      await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',
+        [pipelineId,'Synthetic independently app-only pipeline',ownerEmail,workspaceId])
+      assert.equal((await q('SELECT clawpilot_crm_native_unmanaged_pipeline_footprint($1::uuid) AS safe',[pipelineId])).rows[0].safe,true)
+      assert.equal((await q('SELECT clawpilot_crm_native_unmanaged_pipeline_retained($1::uuid) AS safe',[pipelineId])).rows[0].safe,false)
+      unmanagedAppOnly={fixtureOnly:true,pipelineId,workspaceId,ownerEmail,targetEmail,
+        ownerNativeIdentity:null,footprintBeforeReservation:true,retainedAuthorityBeforeActivation:false,passed:false}
+    }
     await q(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,suitecrm_synced_at,reference_code,source_payload)
       SELECT e."localId"::uuid,e."pipelineId"::uuid,'joint-native-'||e."nativeId",'Actual joint seeded native Email',
       encode(digest(e."nativeId",'sha256'),'hex'),e."nativeId",'Emails',now(),e."globalId",jsonb_build_object('archived',e.archived)
@@ -463,7 +483,13 @@ try{
     const mappingSql=`SELECT email,suitecrm_user_id,suitecrm_username,reference_code,crm_user_enabled,role,status
       FROM app_users ORDER BY email`
     const before=(await q(mappingSql)).rows,policy=observed.pipelines[0].policy
-    assert.equal(before.length,4)
+    assert.equal(before.length,4+(unmanagedAppOnly?2:0))
+    assert.deepEqual(before.filter(row=>row.suitecrm_user_id!==null).map(row=>[row.email,row.suitecrm_user_id]),
+      people.map(row=>[row.email,row.native]).sort(([a],[b])=>a.localeCompare(b)))
+    assert.deepEqual(before.filter(row=>row.suitecrm_user_id===null).map(row=>({email:row.email,
+      suitecrm_username:row.suitecrm_username,crm_user_enabled:row.crm_user_enabled,role:row.role,status:row.status})),
+    unmanagedAppOnly?[unmanagedAppOnly.ownerEmail,unmanagedAppOnly.targetEmail].sort().map(email=>({email,
+      suitecrm_username:null,crm_user_enabled:false,role:'member',status:'active'})):[])
     const beforeControl=(await q('SELECT enabled,active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0]
     assert.equal(beforeControl.enabled,false);assert.equal(beforeControl.active_initial_enrollment_id,null)
     const prepared=await meetingModule.prepareNativeJointMeetingFixture({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
@@ -473,7 +499,8 @@ try{
     assert.deepEqual((await q(mappingSql)).rows,before,'Configured-owner preparation changed a mapped native principal identity or eligibility')
     const afterControl=(await q('SELECT enabled,active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0]
     assert.equal(afterControl.enabled,false);assert.equal(afterControl.active_initial_enrollment_id,null)
-    meetingFixtureSeeds.ownerNormalization={...prepared,phase:'before-RootA-source-reservation',nativePrincipalMappingsPreserved:4}
+    meetingFixtureSeeds.ownerNormalization={...prepared,phase:'before-RootA-source-reservation',nativePrincipalMappingsPreserved:4,
+      appOnlyIdentitiesPreserved:unmanagedAppOnly?2:0}
     console.log('PASS actual configured owner normalization prepared before RootA without bypassing user or scope authorization')
   }
   const verification={publicKey,keyId,serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId}
@@ -701,6 +728,38 @@ try{
   assert.equal(control.enabled,true);assert.equal(control.active_initial_enrollment_id,null)
   const beforeResume=commandLog.length;assert.deepEqual(await coordinator.resume(activationOperationId),settled);assert.equal(commandLog.length,beforeResume)
   const execution=(await store.readExecution(activationOperationId)).execution,receipt=await native.resolve(execution);assert.equal(receipt.state,'committed')
+  if(unmanagedAppOnly)await check('actual native activation retains app-only exclusion and independent sharing/lifecycle without native changes',async()=>{
+    const p=unmanagedAppOnly,sqlState=async()=>((await q(`SELECT jsonb_build_object(
+      'control',(SELECT to_jsonb(c) FROM crm_native_email_publication_control c WHERE singleton),
+      'policies',COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY pipeline_id) FROM crm_native_email_capability_policies c),'[]'::jsonb),
+      'admissions',COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY operation_id) FROM crm_native_email_publication_admissions c),'[]'::jsonb)
+      ) AS state`)).rows[0].state)
+    const beforeNative=rawState(),beforeSql=await sqlState()
+    assert.equal((await q('SELECT clawpilot_crm_native_unmanaged_pipeline_retained($1::uuid) AS safe',[p.pipelineId])).rows[0].safe,true)
+    assert.equal(material.plan.pipelines.some(row=>row.policy.pipelineId===p.pipelineId),false)
+    assert.equal(material.plan.emails.length,329);assert.equal(material.plan.pipelines.length,3)
+    for(const email of [p.targetEmail,people[1].email]){
+      await q(`INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role,shared_by)
+        VALUES($1,$2,'viewer',$3)`,[p.pipelineId,email,p.ownerEmail])
+      await q(`UPDATE pipeline_space_members SET access_role='editor',updated_at=clock_timestamp()
+        WHERE pipeline_id=$1 AND user_email=$2`,[p.pipelineId,email])
+    }
+    await q(`UPDATE app_users SET status='disabled' WHERE email=$1`,[p.targetEmail])
+    await q('DELETE FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2',[p.pipelineId,p.targetEmail])
+    await q(`UPDATE app_users SET status='active' WHERE email=$1`,[p.targetEmail])
+    await q(`UPDATE app_users SET status='disabled' WHERE email=$1`,[p.ownerEmail])
+    await q(`UPDATE app_users SET status='active' WHERE email=$1`,[p.ownerEmail])
+    await q(`UPDATE app_users SET permissions='{"viewCrm":false}'::jsonb WHERE email=$1`,[p.ownerEmail])
+    await q(`UPDATE app_users SET permissions='{"viewCrm":true}'::jsonb WHERE email=$1`,[p.ownerEmail])
+    await q(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=clock_timestamp(),
+      trashed_by=$3,pre_trash_status='active' WHERE user_email=$1 AND organization_id=$2`,[p.ownerEmail,p.workspaceId,selection.actorEmail])
+    await q(`UPDATE app_user_organization_memberships SET status='active',trashed_at=NULL,trashed_by=NULL,pre_trash_status=NULL
+      WHERE user_email=$1 AND organization_id=$2`,[p.ownerEmail,p.workspaceId])
+    assert.deepEqual(await sqlState(),beforeSql,'Independent app-only mutations changed native SQL authority')
+    assert.deepEqual(rawState(),beforeNative,'Independent app-only mutations changed native data/files')
+    p.passed=true;p.actualActivatedNativeReceipt=true;p.activeMappedMemberRetained=true
+    p.staleUnmappedIntentRemoved=true;p.ownerDisableRestore=true;p.ownerModuleRestore=true;p.ownerTrashRestore=true
+  })
   if(verifyHistoricalRootAfterActivation)await check('delayed expired A remains cancelled and zero-mutation after C actual activation',verifyHistoricalRootAfterActivation)
   await check('actual committed SQL origin is signed after COMMIT and published as exact protected native certificate bytes',async()=>{
     assert.equal(await native.originStatus(activationOperationId),null)
@@ -1076,7 +1135,7 @@ try{
   checkBuild()
   report={version:1,kind:'actual-local-native-initial-joint-rehearsal',passed:true,postgresMajor:Number(options.major),sourceZipSha256:ZIP_SHA,resourceOwner:owner,resourceNames:names,
     sourceHashes,buildManifestSha256:sha(readFileSync(join(build,'build-manifest.json'))),checks,audits,commandLog,storagePhases,startupComponent,
-    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,
+    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,unmanagedAppOnly,
     emailCount:329,principalCount:4,pipelineCount:3,actualPgReservation:true,actualSqlAuthorityCollector:true,actualNativeCli:true,
     actualNativeForecasts:true,actualDurableRsaApproval:true,actualNativeCommit:true,actualFreshNativeResolve:true,actualPgActivation:true,
     lostActualNativeCommitResponseRecovered:true,nativeExecuteCount:nativeExecutionCount,actualSqlOriginSignedAndPublished:true,actualCurrentNativeStartupInspection:true,
@@ -1088,7 +1147,7 @@ try{
   }
 }catch(error){
   writeFileSync(options.output.replace(/\.json$/,'.failed.json'),JSON.stringify({version:1,failed:true,resourceOwner:owner,resourceNames:names,sourceHashes,checks,audits,commandLog,storagePhases,
-    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,
+    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,unmanagedAppOnly,
     error:redactMeetingSecrets(error.stack??error),stdout:redactMeetingSecrets(error.stdout),stderr:redactMeetingSecrets(error.stderr),productionTouched:false},null,2)+'\n',{flag:'wx',mode:0o600})
   if(meetingPrivateValues.length)throw Error(redactMeetingSecrets(error.stack??error));throw error
 }finally{try{if(pool)await pool.end()}finally{cleanup()}}

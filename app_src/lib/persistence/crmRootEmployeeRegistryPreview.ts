@@ -92,8 +92,14 @@ export async function collectRootEmployeeCrmRegistryPreviewWithClient(client: Na
   }
   const pipelines = (await client.query(`SELECT id::text,workspace_organization_id::text AS workspace_id,reference_access_disabled
     FROM pipeline_spaces WHERE workspace_organization_id=ANY($1::uuid[]) ORDER BY id LIMIT 101`, [workspaces])).rows
-  requireNativeEmail(pipelines.length <= 100 && pipelines.filter(row => row.reference_access_disabled === false)
-    .every(row => input.pipelineIds.includes(String(row.id))), 'root_registry_pipeline_coverage')
+  requireNativeEmail(pipelines.length <= 100, 'root_registry_pipeline_coverage')
+  const omitted = pipelines.filter(row => row.reference_access_disabled === false && !input.pipelineIds.includes(String(row.id)))
+  for (const pipeline of omitted) {
+    const proof = (await client.query('SELECT public.clawpilot_crm_native_unmanaged_pipeline_retained($1::uuid) AS unmanaged', [pipeline.id])).rows
+    requireNativeEmail(proof.length === 1 && proof[0].unmanaged === true, 'root_registry_pipeline_coverage')
+  }
+  // The complete pipeline inventory below remains in contextFingerprint; an
+  // omitted app-only scope is not erased from app/root authorization evidence.
   const grantIds = [...new Set([...before.grant, ...after.grant].map(row => String(row.id)))].sort()
   const collect = async (stage: Registry) => {
     const account = stage.account[0] ?? { ...after.account[0], enabled: false }

@@ -10,8 +10,10 @@ import {createRequire} from 'node:module'
 import {disposablePostgresDockerArgs,disposablePostgresDockerCleanupArgs} from './lib/disposable-postgres-docker.mjs'
 import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
 import {enrollRootCrmSyntheticInitial,withRootCrmSyntheticDatabase} from './lib/root-crm-synthetic-initial-enrollment.mjs'
-if(process.argv.length!==3||!['--postgres','--postgres=18'].includes(process.argv[2]))throw Error('Explicit --postgres or --postgres=18 required')
-const postgresMajor=process.argv[2]==='--postgres=18'?18:16
+const unmanagedOnly=process.argv.includes('--unmanaged-only'),requested=process.argv.slice(2).filter(arg=>arg!=='--unmanaged-only')
+if(requested.length!==1||!['--postgres','--postgres=18'].includes(requested[0])
+ ||process.argv.filter(arg=>arg==='--unmanaged-only').length>1)throw Error('Explicit --postgres or --postgres=18 [--unmanaged-only] required')
+const postgresMajor=requested[0]==='--postgres=18'?18:16
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg'),ts=require('typescript')
 const read=path=>readFileSync(new URL('../'+path,import.meta.url),'utf8')
 function load(path,deps){const module={exports:{}}
@@ -127,6 +129,13 @@ try{
   await query("INSERT INTO project_boards(id,name,owner_email,workspace_organization_id) VALUES($1,'Managed CRM fixture',$2,$3),($4,'Private fixture',$2,$3)",[board,owner,workspace,crypto.randomUUID()])
   await query('INSERT INTO crm_board_projections(board_id,pipeline_id,workspace_organization_id) VALUES($1,$2,$3)',[board,pipeline,workspace])
  }
+ if(unmanagedOnly){
+  const {runUnmanagedPipelineAcceptance}=await import('./test-native-email-unmanaged-pipelines-postgres.mjs')
+  await nativeFixture(()=>runUnmanagedPipelineAcceptance({load,query,tx,users,protocol,authority,eligibility,nativeAdapter,transition,capability,
+   rootRegistry,rootRegistryPreview,owner,employee,admin,root,peer,account,id,check}))
+  assert.equal((await query('SELECT enabled FROM crm_native_email_publication_control')).rows[0].enabled,false)
+  console.log(`PASS ${groups} actual PostgreSQL ${postgresMajor} unmanaged app-only pipeline groups; synthetic native-origin evidence, no provider/production proof`)
+ }else{
  const initialEffects=await effects()
  const {testRootRegistryPreview}=await import('./test-root-employee-crm-registry-preview-postgres.mjs')
  const registryPreviewContext={load,protocol,collector,authority,query,tx,id,root,peer,foreign,demo,account,grant,owner,employee,admin,check,effects}
@@ -567,4 +576,5 @@ try{
  await nativeFixture(()=>runRootRegistryAcceptance({load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
   query,tx,id,root,peer,child,owner,employee,check}))
  console.log(`PASS ${groups} actual PostgreSQL ${postgresMajor} root registry/session/resource groups; no native ACL/browser/production proof`)
+ }
 }finally{await pool?.end();if(started)execFileSync('docker',disposablePostgresDockerCleanupArgs(container),{stdio:'pipe',timeout:30000})}

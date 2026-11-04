@@ -72,10 +72,18 @@ export async function enrollRootCrmSyntheticInitial({query,tx,protocol,capabilit
  assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_capability_policies')).rows[0].n,0)
  const account=(await query('SELECT id::text FROM crm_operator_accounts WHERE root_workspace_id=$1 AND owner_email=$2 AND enabled',[root,owner])).rows
  assert.equal(account.length,1)
- const pipelines=(await query(`SELECT p.id::text,p.workspace_organization_id::text AS workspace_id,u.suitecrm_user_id AS owner_id
+ const candidates=(await query(`SELECT p.id::text,p.workspace_organization_id::text AS workspace_id,u.suitecrm_user_id AS owner_id
   FROM pipeline_spaces p JOIN crm_operator_workspace_bindings b ON b.workspace_id=p.workspace_organization_id
   JOIN app_users u ON u.email=p.owner_email WHERE b.operator_account_id=$1 AND b.enabled AND NOT p.reference_access_disabled ORDER BY p.id`,[account[0].id])).rows
- assert.ok(pipelines.length>0&&pipelines.length<=100)
+ assert.ok(candidates.length>0&&candidates.length<=100)
+ const pipelines=[]
+ for(const candidate of candidates){
+  if(candidate.owner_id===null){
+   assert.equal((await query('SELECT public.clawpilot_crm_native_unmanaged_pipeline_footprint($1::uuid) AS unmanaged',[candidate.id])).rows[0].unmanaged,true,
+    'Synthetic native fixture may omit only an independently SQL-proven unmanaged app-only pipeline')
+  }else pipelines.push(candidate)
+ }
+ assert.ok(pipelines.length>0)
  assert.ok(pipelines.every(row=>typeof row.owner_id==='string'))
  // The source-fence-only cases have no history yet. Seed one explicit fake
  // Email in this owned clone, rather than relaxing the protocol's inventory.

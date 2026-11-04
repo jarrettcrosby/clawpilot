@@ -42,6 +42,7 @@ const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
   'db/migrations/0399_crm_native_email_initial_replan_lineage.sql',
   'db/migrations/0400_crm_native_email_demo_quarantine.sql',
   'db/migrations/0401_crm_native_root_owner_source_fence.sql',
+  'db/migrations/0402_crm_native_unmanaged_app_only_pipelines.sql',
 ])
 export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   ...ROLLBACK_CRM_AUTHORITY_MIGRATIONS,
@@ -51,6 +52,7 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   'app_src/app/api/crm/integrations/process/route.ts', 'app_src/lib/crm/integrationActions.ts',
   'app_src/app/api/crm/root-access/route.ts', 'app_src/lib/persistence/crmRootEmployeeSettings.ts',
   'app_src/lib/crm/rootEmployeeCrmSettings.ts', 'app_src/lib/crm/nativeEmailRootRegistryRuntime.ts',
+  'app_src/lib/crm/nativeEmailAuthorityRuntime.ts', 'app_src/lib/persistence/crmRootEmployeeRegistryPreview.ts',
   'app_src/lib/crm/nativeEmailInitialEnrollment.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentApproval.ts',
   'app_src/lib/crm/nativeEmailInitialInstallationLineage.ts',
   'app_src/lib/crm/nativeEmailInitialEnrollmentPostgres.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentCoordinator.ts',
@@ -145,7 +147,7 @@ export function inspectRollbackSources(readSource) {
   assert.ok(files['app_src/lib/crm/suiteCrmClient.ts'].includes('record.relationships'), 'Rollback floor lacks native relationship publication')
   assert.ok(attester.includes('if (inspection.schemaDigest !== expectedDigest)'), 'Rollback floor must retain strict raw catalog acceptance')
   const format = attester.match(/PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT\s*=\s*'([^']+)'/u)?.[1]
-  assert.equal(format, 'clawpilot-production-rebind-target-schema-attestation-v17')
+  assert.equal(format, 'clawpilot-production-rebind-target-schema-attestation-v18')
   const enrolledMigration = attester.match(/filename:\s*'0374_crm_interaction_organizations\.sql',\s*checksum:\s*'([a-f0-9]{64})'/u)?.[1]
   assert.equal(enrolledMigration, sha256(migration), 'Rollback floor must attest its exact migration bytes')
   for(const path of ROLLBACK_CRM_AUTHORITY_MIGRATIONS){

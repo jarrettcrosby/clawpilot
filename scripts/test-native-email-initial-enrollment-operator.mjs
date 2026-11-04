@@ -82,7 +82,7 @@ function fixture(){
   nativeSource:{version:1,purpose:'clawpilot-native-email-initial-source',nativePolicyFingerprint:hash('actual-native-before-policy-fixture'),nativeRuntimeFingerprint:hash('actual-stock-runtime-fixture'),
    principalSuiteCrmUserIds:[...principals],emails:mappings.map((m,i)=>({...m,recordFingerprint:hash(['native-content',i]),capabilities:caps(principals,i===0?principals:['admin'])})),
    defaults:['delete','edit','export','list','view'].map((action,i)=>({id:id(60+i),action,aclAccess:90}))},
-  sql:[],nativeCalls:[],transactions:0,afterNative:null,modifyForecast:null,quarantineEvidence:new Map(),quarantineResult:null}
+  sql:[],nativeCalls:[],transactions:0,afterNative:null,modifyForecast:null,quarantineEvidence:new Map(),quarantineResult:null,unmanagedPipelines:new Set()}
  const principalRows=()=>[
   {email:selection.actorEmail,suitecrm_user_id:'admin',membership_role:'owner',membership_permissions:{viewCrm:false}},
   {email:'editor@example.invalid',suitecrm_user_id:'editor',membership_role:'member',membership_permissions:{viewCrm:true}},
@@ -106,6 +106,7 @@ function fixture(){
    return {rows:state.quarantineResult??values[0].map((rowId,index)=>({id:rowId,quarantined:state.quarantineEvidence.get(rowId)===values[1][index]}))}
   }
   if(sql.includes('FROM pipeline_spaces p JOIN workspace_organizations'))return {rows:copy(state.pipelines)}
+  if(sql.includes('clawpilot_crm_native_unmanaged_pipeline_footprint('))return {rows:[{unmanaged:state.unmanagedPipelines.has(values[0])}]}
   if(sql.includes('SELECT DISTINCT g.id::text'))return {rows:[]}
   if(sql.includes('FROM pipeline_space_members WHERE'))return {rows:copy(state.members)}
   if(sql.includes('FROM app_users u LEFT JOIN app_user_organization_memberships'))return {rows:principalRows().filter(row=>values[1].includes(row.email))}
@@ -318,6 +319,20 @@ await check('history never receives new readers/editors; current denied, trashed
  const g=fixture(),m=(await g.operator.prepareForReview(g.input())).material;assert.deepEqual(m.plan.emails[0].after.capabilities.view,['admin','editor','viewer'])
  for(const row of m.plan.emails)for(const surface of surfaces)assert.ok(row.after.capabilities[surface].every(id=>row.before.capabilities[surface].includes(id)))
 })
+await check('only SQL-proven unmanaged pipelines are omitted; complete immutable source and every historical mapping stay retained',async()=>{
+ const f=fixture(),personal=id(98)
+ f.state.pipelines.push({id:personal,owner_email:'app-only@example.invalid',workspace_organization_id:selection.rootWorkspaceId,reference_access_disabled:false})
+ f.state.snapshot.pipelines=copy(f.state.pipelines);f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
+ f.state.unmanagedPipelines.add(personal)
+ const before=sqlCopy(f.state.snapshot),prepared=await f.operator.prepareForReview(f.input())
+ assert.equal(prepared.material.plan.pipelines.length,3);assert.equal(prepared.material.plan.emails.length,2)
+ assert.ok(!prepared.material.plan.pipelines.some(p=>p.policy.pipelineId===personal))
+ assert.deepEqual(f.state.snapshot,before);assert.deepEqual(f.state.reservation.source_snapshot,before)
+ f.state.unmanagedPipelines.clear()
+ await assert.rejects(f.operator.collectReservedSource(op,fp),held(/authority_owner_ineligible|owner_native_identity/))
+ const unsafe=fixture();unsafe.state.unmanagedPipelines.add(pipelineIds[0])
+ await assert.rejects(unsafe.operator.collectReservedSource(op,fp),held(/unbound_email_inventory/))
+})
 await check('native requests occur outside SQL locks and SQL authority is recollected after native I/O',async()=>{
  const f=fixture();f.state.afterNative=name=>{if(name==='inspectSource')f.state.ownerAllowed=false}
  await assert.rejects(f.operator.captureSource(op,fp),held(/operator_denied/));assert.deepEqual(f.state.nativeCalls,['inspectSource'])
@@ -362,6 +377,9 @@ if(postgresMajor){
   await q(`INSERT INTO crm_operator_workspace_bindings(operator_account_id,workspace_id,owner_email,enabled,created_by,updated_by) VALUES($1,$2,$3,true,$3,$3)`,[selection.operatorAccountId,selection.rootWorkspaceId,selection.actorEmail])
   for(const pid of pipelineIds){await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',[pid,'Initial operator pipeline '+pid,selection.actorEmail,selection.rootWorkspaceId])
    for(const user of Object.keys(users).filter(v=>v!=='owner'))await q('INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,$3)',[pid,user+'@example.invalid',user==='viewer'?'viewer':'editor'])}
+  const unmanagedPipeline=id(98)
+  await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',
+   [unmanagedPipeline,'Existing app-only personal pipeline','app-only@example.invalid',selection.rootWorkspaceId])
   for(let i=0;i<2;i++)await q(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,suitecrm_synced_at,reference_code,source_payload)
    VALUES($1,$2,$3,'Synthetic native source port counterpart',$4,$5,'Emails',now(),allocate_crm_reference('gi'),$6)`,
   [id(30+i),pipelineIds[i],'operator-real-sql-'+i,hash(['sql-source',i]),id(40+i),{archived:i===0}])
@@ -453,6 +471,10 @@ if(postgresMajor){
    const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_demo_quarantine('))
    assert.equal(batches.length,1,'Actual SQL collector independently verifies both retained demo rows in one batch')
    assert.deepEqual(await retainedDemoJobs(),demoJobsBefore)
+   assert.ok(current.pipelines.some(p=>p.id===unmanagedPipeline),'Unmanaged app pipeline remains in immutable global source')
+   assert.equal((await q('SELECT clawpilot_crm_native_unmanaged_pipeline_footprint($1::uuid) AS allowed',[unmanagedPipeline])).rows[0].allowed,true)
+   assert.equal((await q('SELECT clawpilot_crm_native_unmanaged_pipeline_retained($1::uuid) AS allowed',[unmanagedPipeline])).rows[0].allowed,false,
+    'A reservation/source-selection proof cannot authorize active app sharing')
   })
   let material
   await check('REAL PG operator derives all three future policies and existing issuer independently admits exact reviewed material',async()=>{

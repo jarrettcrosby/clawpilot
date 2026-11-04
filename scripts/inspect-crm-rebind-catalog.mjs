@@ -10,6 +10,9 @@ import {applyMigration,command,migrations,waitForPostgres} from './test-commerce
 import {inspectProductionRebindHistorySchema,inspectPreCrmProductionRebindSchemaMetadata,
   inspectPreInitialEnrollmentProductionRebindSchemaMetadata,PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   inspectPreInitialReplanProductionRebindSchemaMetadata,PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
+  inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+  inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   productionRebindHistorySchemaDigest} from './production-rebind-history-schema-attestation.mjs'
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg')
 const legacyOnlyTriggerFields=['physicalRelation','attributeNumbers','oldTransitionTable','newTransitionTable','constraintIndex','foreignKey']
@@ -48,7 +51,11 @@ try{
       await applyMigration(client,file)
       if(file<'0374_')continue
       const current=await (file<'0398_' ? inspectPreInitialEnrollmentProductionRebindSchemaMetadata(client)
-        : file<'0399_' ? inspectPreInitialReplanProductionRebindSchemaMetadata(client) : inspectProductionRebindHistorySchema(client))
+        : file<'0399_' ? inspectPreInitialReplanProductionRebindSchemaMetadata(client)
+        : file<'0400_' ? inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata(client)
+        : file<'0401_' ? inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata(client)
+        : file<'0402_' ? inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(client)
+        : inspectProductionRebindHistorySchema(client))
       if(file==='0397_crm_native_root_registry_changes.sql'){
         assert.equal(current.schemaDigest,PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[current.postgresMajor],
           'The exact through-0397 catalog must preserve its frozen v13 digest before enrolling 0398')
@@ -58,6 +65,12 @@ try{
         assert.equal(current.schemaDigest,PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[current.postgresMajor],
           'The exact through-0398 catalog must preserve its frozen v14 digest before enrolling 0399')
         console.log(JSON.stringify({diagnosticOnly:true,image,pre0399V14Digest:current.schemaDigest}))
+      }
+      if(file==='0401_crm_native_root_owner_source_fence.sql'){
+        assert.equal(current.format,'clawpilot-production-rebind-v17-metadata-only')
+        assert.equal(current.schemaDigest,PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[current.postgresMajor],
+          'The exact through-0401 catalog must preserve its independently accepted v17 digest')
+        console.log(JSON.stringify({diagnosticOnly:true,image,through0401V17Digest:current.schemaDigest}))
       }
       if(file==='0396_crm_root_native_read_receipts.sql'){
         const priorCatalog={...current.catalog,relations:current.catalog.relations.filter(row=>row.expected!=='public.crm_native_email_authority_root_changes')}

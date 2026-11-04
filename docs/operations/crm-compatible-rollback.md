@@ -132,10 +132,12 @@ snapshots and receipts in these focused tests are explicitly synthetic. Owned
 database clones preserve independent-client tests and verify every baseline
 public-table fingerprint on return. No native or production acceptance is implied.
 
-The current certification contract is v17 through `0401`; v16 through `0400`
+The retained through-0401 certification contract is v17; v16 through `0400`
 remains an exact historical comparison, never a fallback for a missing owner
-fence. The final release still requires current raw-catalog acceptance, exact
-candidate build/certification, CI and the separately reviewed live cutover.
+fence. The current source candidate advances to v18 through `0402`, with its
+separate acceptance boundary recorded below. The final release still requires
+paired current raw-catalog acceptance, exact candidate build/certification, CI
+and the separately reviewed live cutover.
 
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial
@@ -2762,3 +2764,92 @@ must verify actual permanent tombstones and their original signed approvals
 without replaying the ancestor's obsolete capability/content matrix as current;
 the replacement operation then independently captures the current installed,
 unenrolled state. The complete cancelled-A-to-B recovery gate remains open.
+
+### 2026-11-04: prepared 0402 / v18 attestation scope
+
+Forward migration `0402_crm_native_unmanaged_app_only_pipelines.sql` is frozen
+at SHA-256
+`cf346831bf9c1c5d94f9a25fcd6152d27837090f3d324d8cf3584605044766a1`.
+The prepared v18 attester directly fingerprints its seven new helpers, the
+replaced app-only classifier, and every additional relation read by its
+footprint predicates. It preserves all historical v9–v17 inventories and pins,
+including a separate exact through-0401 metadata reader. In particular, the
+v16 reader no longer inherits future current-target inventory additions.
+The complete source snapshot and the exact 0400 demo-quarantine evidence are
+not filtered, rewritten or relaxed.
+
+This is a source-preparation checkpoint, not v18 catalog acceptance. Fresh
+independent PostgreSQL 16/18 catalog diagnostics must determine the current
+v18 digests before one complete raw-tamper/historical-upgrade matrix is run on
+each major. Historical v17 digests and receipts remain historical; neither a
+passing older matrix nor a metadata-only reader supplies current acceptance.
+No existing receipt or source artifact is overwritten or relabeled.
+
+The current rollback-floor inventory also protects 0402,
+`nativeEmailAuthorityRuntime.ts`, and `crmRootEmployeeRegistryPreview.ts`.
+SQL helper presence alone does not prove app-only compatibility: the matching
+sharing runtime, initial-selection producer and exact scoped DAL checks must
+be included in the source-bound acceptance. Retain previously certified
+artifacts unchanged, but do not infer compatibility with this forward runtime
+from an older source-floor certificate alone. No production enrollment,
+permission change, email recovery, provider write or deployment is authorized
+by this prepared attester update.
+
+### 2026-11-04: targeted 0402 workflow and native rehearsal
+
+The frozen 0402/runtime inputs passed 22 focused unmanaged-pipeline groups and
+the original 55 root-access regression groups on each of PostgreSQL 16 and 18.
+The emitted private operator also passed 25 contract/actual-PG checks on each
+major. The focused workflow uses the actual sharing runtime, permission-sync
+enqueue function and user DAL; its native enrollment receipts are synthetic.
+Application source type-checking passed with the production build's
+`tsconfig.build.json`, not the broader developer/test project configuration.
+
+A separate real local native rehearsal passed 23 checks, including retained
+A/B cancellation and C activation, lost native COMMIT-response resolution,
+signed SQL origin publication, two distinct enrolled container starts,
+authenticated native record lifecycle, and a controlled Calendar meeting
+import/edit/replay round trip. The deliberately app-only pipeline remained
+outside the three native bindings; sharing and owner lifecycle changes kept
+all 329 synthetic Emails, four native principals and native authority intact.
+All 557 consumed source hashes and 23 compiled sources/27 outputs were
+independently checked afterward. The private receipt SHA-256 is
+`f6dfc3b906186c3a82f9e5599779afb65ad74549193820d1b34d49858366f51b`;
+the matching log SHA-256 is
+`0540c0135b79f290f761a3f8453e5486633f5c36ba6bb12623613aa7766d8f38`.
+Earlier failed fixture/invocation receipts remain retained, not relabeled.
+
+This is source-bound local rehearsal, not a committed release certificate,
+live Google Calendar or signed-in UI proof, production permission approval,
+deployment, or email recovery. Fresh v18 raw-catalog acceptance, the final
+committed source/build/transition certificate and normal release gates remain
+separate. Completed foreign deletion jobs supply no historical-adoption or
+access authority; restored previously unmanaged native Emails retain native
+ACL behavior and are not automatically enrolled by this independent app path.
+
+### 2026-11-04: frozen implementation and current catalog gate
+
+The current v18 PostgreSQL 16 matrix passed all 427 tamper refusals, the final
+transaction-held lock, the same-inventory 0402 DDL comparison, and historical
+upgrade/OID-independence checks. Its private receipt SHA-256 is
+`43f844f18a19723fb35ff87cd224ed852b49e37bfd087d061a229526e4c67a97`.
+An independent readback matched all 401 consumed source hashes, including all
+389 migrations. The current catalog pins are
+`87612f0c87538fceb059b571b15f981f765bca69fb3bb13844be0193f6f78e3f`
+for PostgreSQL 16 and
+`8fe6418063cccbf842a777841e9876943b25f8c800aadfa64e7b1e5d9d623bcb`
+for PostgreSQL 18; the latter remains a reviewed diagnostic pin until its full
+matrix passes. The earlier PG16 run was an explicitly cancelled deadline-sizing
+attempt, not SQL failure or acceptance.
+
+The first PG18 matrix stopped after partial progress without a final receipt;
+its original process handle, host child and disposable container were no longer
+present. Its retained partial output is not acceptance, nor evidence of a SQL
+failure. Reconcile and preserve that interruption before any fresh complete run;
+do not resume at a later case or rerun the already accepted PG16 matrix.
+
+Current application lint passed with zero errors and three existing navigation
+warnings. The 14 artifact-contract checks and rolling source-only contract also
+passed; neither produced a build/runtime certificate. This checkpoint freezes
+reviewed implementation source locally, not permission activation, a final
+paired-catalog certificate, a push, deployment or the five-message recovery.

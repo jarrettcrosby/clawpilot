@@ -111,6 +111,40 @@ export async function changePipelineMemberWithNativeAuthority(selection: Selecti
           AND m.organization_id=p.workspace_organization_id JOIN app_users u ON u.email=p.owner_email
         WHERE p.id=$1::uuid AND p.workspace_organization_id=$2::uuid AND NOT p.reference_access_disabled`,
       [selection.pipelineId,selection.workspaceId])).rows[0]
+      if (owner?.owner_email === selection.actorEmail && owner.suitecrm_user_id === null && owner.native_identity_count === 0) {
+        requireNativeEmail(control.active_transition_id === null && control.active_initial_enrollment_id === null,
+          'authority_unmanaged_scope_busy')
+        const beforeValue: unknown = (await tx.query('SELECT to_jsonb(m) AS member FROM pipeline_space_members m WHERE pipeline_id=$1::uuid AND user_email=$2',
+          [selection.pipelineId,selection.userEmail])).rows[0]?.member ?? null
+        requireNativeEmail(beforeValue === null || typeof beforeValue === 'object' && !Array.isArray(beforeValue), 'authority_unmanaged_member_shape')
+        const before = beforeValue as Record<string,unknown> | null
+        const retained = (await tx.query('SELECT public.clawpilot_crm_native_unmanaged_pipeline_retained($1::uuid) AS unmanaged',
+          [selection.pipelineId])).rows
+        requireNativeEmail(retained.length === 1 && retained[0].unmanaged === true, 'authority_unmanaged_scope_unproven')
+        if ((before?.access_role ?? null) === selection.accessRole) return { disabled:false as const,unchanged:true as const }
+        const afterValue: unknown = selection.accessRole === null ? null : (await tx.query(`SELECT jsonb_build_object(
+          'pipeline_id',$1::text,'user_email',$2::text,'access_role',$3::text,'shared_by',$4::text,
+          'created_at',COALESCE($5::timestamptz,transaction_timestamp()),'updated_at',transaction_timestamp()) AS member`,
+        [selection.pipelineId,selection.userEmail,selection.accessRole,before ? before.shared_by : selection.actorEmail,before?.created_at ?? null])).rows[0].member
+        requireNativeEmail(afterValue === null || typeof afterValue === 'object' && !Array.isArray(afterValue), 'authority_unmanaged_member_shape')
+        const after = afterValue as Record<string,unknown> | null
+        const allowed = (await tx.query('SELECT public.clawpilot_crm_native_unmanaged_app_change($1,$2::jsonb,$3::jsonb) AS allowed',
+          ['pipeline_space_members',before === null ? null : JSON.stringify(before),after === null ? null : JSON.stringify(after)])).rows
+        requireNativeEmail(allowed.length === 1 && allowed[0].allowed === true, 'authority_unmanaged_change_denied')
+        if (after === null) await tx.query('DELETE FROM pipeline_space_members WHERE pipeline_id=$1::uuid AND user_email=$2',
+          [selection.pipelineId,selection.userEmail])
+        else if (before) await tx.query(`UPDATE pipeline_space_members SET access_role=$3,updated_at=$4::timestamptz
+          WHERE pipeline_id=$1::uuid AND user_email=$2`,[selection.pipelineId,selection.userEmail,selection.accessRole,after.updated_at])
+        else await tx.query(`INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role,shared_by,created_at,updated_at)
+          VALUES($1::uuid,$2,$3,$4,$5::timestamptz,$6::timestamptz)`,
+        [selection.pipelineId,selection.userEmail,selection.accessRole,after.shared_by,after.created_at,after.updated_at])
+        await enqueuePipelinePermissionSyncWithClient(tx,{pipelineId:selection.pipelineId,actor:selection.actorEmail})
+        await recordAuditEvent({actor:selection.actorEmail,eventType:after ? 'pipeline.space.shared' : 'pipeline.space.share.removed',
+          aggregateType:'pipeline_space',aggregateId:selection.pipelineId,organizationId:selection.workspaceId,
+          payload:{pipelineId:selection.pipelineId,userEmail:selection.userEmail,accessRole:selection.accessRole,
+            organizationId:selection.workspaceId,unmanagedAppOnly:true,nativeAuthority:false}},tx)
+        return {disabled:false as const,unmanaged:true as const}
+      }
       requireNativeEmail(owner?.owner_email === selection.actorEmail && nativeEmailPrincipalIsEligible({
         email:owner.owner_email,status:owner.user_status,suitecrm_user_id:owner.suitecrm_user_id,native_identity_count:owner.native_identity_count,
         membership_role:owner.role,membership_status:owner.status,membership_trashed_at:owner.trashed_at,membership_permissions:owner.permissions,
@@ -129,6 +163,7 @@ export async function changePipelineMemberWithNativeAuthority(selection: Selecti
         changes:[{ before:existing ?? null,after:next }] }) }
     })
     if (selected.disabled) return false
+    if ('unmanaged' in selected) return true
     if ('unchanged' in selected) return true
     const config = nativeEmailAuthorityConfiguration(), client = createSuiteCrmNativeEmailAuthorityClient(config)
     const store = new PostgresNativeEmailAuthorityTransitionStore(withTransaction,

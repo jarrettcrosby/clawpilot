@@ -138,6 +138,12 @@ export class NativeEmailInitialEnrollmentOperator{
       need(mappings.every(row=>pipelines.some(p=>p.id===row.pipelineId&&p.workspace_organization_id===row.workspaceId)),'unbound_email_inventory')
       const roots=await collectNativeEmailRootSourcesWithClient(tx,pipelineIds),authority:Authority[]=[]
       for(const pipeline of pipelines){const pipelineId=String(pipeline.id),workspaceId=String(pipeline.workspace_organization_id);need(UUID.test(workspaceId),'workspace_identity')
+        // Preserve the complete immutable source inventory. Only SQL-proven
+        // zero-native-footprint app-only pipelines stay outside native policy;
+        // a missing/ambiguous owner or any historical footprint still holds.
+        const unmanaged=(await tx.query('SELECT public.clawpilot_crm_native_unmanaged_pipeline_footprint($1::uuid) AS unmanaged',[pipelineId])).rows
+        need(unmanaged.length===1&&typeof unmanaged[0].unmanaged==='boolean','unmanaged_scope_proof')
+        if(unmanaged[0].unmanaged===true)continue
         const members=(await tx.query(`SELECT user_email,access_role FROM pipeline_space_members WHERE pipeline_id=$1::uuid ORDER BY user_email`,[pipelineId])).rows as Array<{user_email:string;access_role:string}>
         const emails=[...new Set([String(pipeline.owner_email),...members.map(row=>row.user_email)])].sort();need(emails.length<=500,'principal_bound')
         const principals=(await tx.query(`SELECT u.email,u.status,u.suitecrm_user_id,m.organization_id::text AS workspace_id,
@@ -154,6 +160,7 @@ export class NativeEmailInitialEnrollmentOperator{
         const writers=effective.filter(row=>row.email===pipeline.owner_email||editors.has(String(row.email))).map(row=>String(row.suitecrm_user_id)).sort()
         ids(readers);ids(writers);authority.push({pipelineId,workspaceId,ownerSuiteCrmId:owner.suitecrm_user_id,readers,writers})
       }
+      need(mappings.every(row=>authority.some(p=>p.pipelineId===row.pipelineId&&p.workspaceId===row.workspaceId)),'unbound_email_inventory')
       return copy({source:{operationId,nativeInstanceId:s.nativeInstanceId,appGeneration:generation,appSourceFingerprint:expectedSourceFingerprint,mappings},authority})
     })
   }

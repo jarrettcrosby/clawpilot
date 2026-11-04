@@ -25,6 +25,7 @@ import {
   PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
@@ -33,6 +34,7 @@ import {
   inspectPreInitialReplanProductionRebindSchemaMetadata,
   inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
   inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+  inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
   productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
@@ -77,6 +79,22 @@ const INITIAL_DEMO_QUARANTINE_MIGRATION = '0400_crm_native_email_demo_quarantine
 const INITIAL_DEMO_QUARANTINE_HELPER = 'public.clawpilot_crm_native_initial_demo_quarantine(uuid,text)'
 const ROOT_OWNER_SOURCE_FENCE_MIGRATION = '0401_crm_native_root_owner_source_fence.sql'
 const ROOT_OWNER_SOURCE_FENCE_HELPER = 'public.clawpilot_crm_root_native_membership_is_independent(jsonb,jsonb)'
+const UNMANAGED_PIPELINE_MIGRATION = '0402_crm_native_unmanaged_app_only_pipelines.sql'
+const UNMANAGED_PIPELINE_CLASSIFIER = 'public.clawpilot_native_email_app_only_change_is_independent(text,jsonb,jsonb)'
+const UNMANAGED_PIPELINE_HELPERS = new Map([
+  ['public.clawpilot_crm_native_json_has_pipeline(jsonb,uuid)',{language:'sql',volatility:'i',result:'boolean',arguments:2}],
+  ['public.clawpilot_crm_native_outbox_pipeline(text,text)',{language:'plpgsql',volatility:'s',result:'uuid',arguments:2}],
+  ['public.clawpilot_crm_native_outbox_is_non_email(text,text,text,jsonb)',{language:'sql',volatility:'s',result:'boolean',arguments:4}],
+  ['public.clawpilot_crm_native_outbox_is_foreign_terminal_delete(public.sync_outbox,uuid)',{language:'plpgsql',volatility:'s',result:'boolean',arguments:2}],
+  ['public.clawpilot_crm_native_unmanaged_pipeline_footprint(uuid)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:1}],
+  ['public.clawpilot_crm_native_unmanaged_pipeline_retained(uuid)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:1}],
+  ['public.clawpilot_crm_native_unmanaged_app_change(text,jsonb,jsonb)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:3}],
+])
+const UNMANAGED_PIPELINE_RELATIONS = [
+  'crm_campaign_recipients','crm_campaigns','crm_inbound_message_links','crm_inbound_messages',
+  'crm_integration_action_attempts','crm_integration_actions','crm_interaction_contacts','crm_leads',
+  'crm_meetings','crm_opportunities','workspace_tenant_retirement_receipts',
+].map(name=>`public.${name}`)
 const INITIAL_ENROLLMENT_RELATIONS = [
   'crm_contacts','crm_email_mailbox_bindings','crm_email_mailboxes','crm_email_review_decisions',
   'crm_email_sources','crm_interaction_organizations','crm_interactions',
@@ -174,7 +192,7 @@ export const NEW_REFERENCE_CONSTRAINTS = new Map([
 ])
 
 assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
-  'clawpilot-production-rebind-target-schema-attestation-v17')
+  'clawpilot-production-rebind-target-schema-attestation-v18')
 assert.deepEqual(PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'22808494dbdc3510bdccb57fe0a491344a1e8bc57195594d089cdf568e63842e',
   18:'f0685b9f82de44c3c1cf1c10e4ce077c43d1040992234e551e338311160f3e64',
@@ -191,8 +209,14 @@ assert.deepEqual(PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
   18:'89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
 },'Owner source fencing must never retcon the independently accepted historical v16 fingerprints')
-assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,ROOT_OWNER_SOURCE_FENCE_MIGRATION,
-  'Current acceptance requires 0401, never a historical floor')
+assert.deepEqual(PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'2b4e6f7ac81be403b31210026a04f4a98fd902c66198732c471f9cf267e6d441',
+  18:'c62a2bb05b8f9e502163a649492c0f292c30eeb2fe05d94c60d2a6e2631fc349',
+},'Historical through-0401 v17 fingerprints remain independently frozen')
+assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,UNMANAGED_PIPELINE_MIGRATION,
+  'Current acceptance requires 0402, never a historical floor')
+for(const helper of UNMANAGED_PIPELINE_HELPERS.keys())assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
+for(const relation of UNMANAGED_PIPELINE_RELATIONS)assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),relation)
 for(const helper of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
   'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER,
   ROOT_OWNER_SOURCE_FENCE_HELPER]) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
@@ -247,7 +271,8 @@ for(const [inspect,lastMigration] of [
   [inspectPreInitialReplanProductionRebindSchemaMetadata,INITIAL_ENROLLMENT_MIGRATION],
   [inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,INITIAL_REPLAN_MIGRATION],
   [inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,INITIAL_DEMO_QUARANTINE_MIGRATION],
-  [inspectProductionRebindHistorySchema,ROOT_OWNER_SOURCE_FENCE_MIGRATION],
+  [inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,ROOT_OWNER_SOURCE_FENCE_MIGRATION],
+  [inspectProductionRebindHistorySchema,UNMANAGED_PIPELINE_MIGRATION],
 ]){
   let selectedMigrations,selectedRelations,selectedFunctions
   await inspect({query:async (_sql,values)=>{
@@ -261,19 +286,29 @@ for(const [inspect,lastMigration] of [
   assert.equal(selectedMigrations.includes(INITIAL_ENROLLMENT_MIGRATION),inspect===inspectProductionRebindHistorySchema
     ||inspect===inspectPreInitialReplanProductionRebindSchemaMetadata
     ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
-    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,'Only current and exact v14/v15/v16 metadata include 0398')
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,'Only current and exact v14/v15/v16/v17 metadata include 0398')
   assert.equal(selectedMigrations.includes(INITIAL_REPLAN_MIGRATION),inspect===inspectProductionRebindHistorySchema
     ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
-    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
     'Only current and exact v15/v16 metadata enroll 0399; historical readers never provide a fallback')
   for(const currentOnly of [selectedMigrations.includes(INITIAL_DEMO_QUARANTINE_MIGRATION),
     selectedRelations.includes('public.crm_products'),selectedFunctions.includes(INITIAL_DEMO_QUARANTINE_HELPER)]){
     assert.equal(currentOnly,inspect===inspectProductionRebindHistorySchema
-      ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+      ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+      ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
       'Only current and exact v16 metadata enroll the complete 0400 migration, helper and direct Product source catalog')
   }
-  assert.equal(selectedMigrations.includes(ROOT_OWNER_SOURCE_FENCE_MIGRATION),inspect===inspectProductionRebindHistorySchema,
-    'Only current v17 requires 0401; historical metadata cannot attest missing owner-source fencing')
+  assert.equal(selectedMigrations.includes(ROOT_OWNER_SOURCE_FENCE_MIGRATION),inspect===inspectProductionRebindHistorySchema
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
+    'Current v17 and its exact metadata reader require 0401; older readers preserve their accepted ledger floor')
+  assert.equal(selectedMigrations.includes(UNMANAGED_PIPELINE_MIGRATION),inspect===inspectProductionRebindHistorySchema,
+    'Only current v18 requires 0402; historical metadata cannot become a fallback')
+  for(const helper of UNMANAGED_PIPELINE_HELPERS.keys())assert.equal(selectedFunctions.includes(helper),inspect===inspectProductionRebindHistorySchema,
+    `Only current v18 enrolls ${helper}`)
+  for(const relation of UNMANAGED_PIPELINE_RELATIONS)assert.equal(selectedRelations.includes(relation),inspect===inspectProductionRebindHistorySchema,
+    `Only current v18 directly fingerprints ${relation}`)
 }
 
 function command(executable, args, options = {}) {
@@ -610,18 +645,25 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
     assert.equal(createHash('sha256').update(retainedOwnerHelper.source).digest('hex'),
       '1453d556e6f1d460a67ec83147ffbd91dd9347c5b560b92bdf092752e6a7aa20',
       'The historical v16 owner helper retains the exact independently reviewed 0401 preimage')
-    command(process.execPath, ['scripts/db-migrate.mjs'], {
-      env: { ...process.env, DATABASE_URL:url.toString(), PGSSLMODE:'disable' }, timeout:180_000,
-    })
-    const completed = await inspectProductionRebindHistorySchema(pool)
+    const ownerSql=readFileSync(resolve(root,'db/migrations',ROOT_OWNER_SOURCE_FENCE_MIGRATION),'utf8')
+    const ownerClient=await pool.connect()
+    try{await applyMigrationSqlForTest(ownerClient,ROOT_OWNER_SOURCE_FENCE_MIGRATION,ownerSql,
+      {checksum:createHash('sha256').update(ownerSql).digest('hex')})}finally{ownerClient.release()}
+    const beforeUnmanaged=await inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeUnmanaged.format,'clawpilot-production-rebind-v17-metadata-only')
+    assert.equal(beforeUnmanaged.schemaDigest,PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeUnmanaged.postgresMajor],
+      'Exact through0401 preserves the independently accepted v17 catalog before0402')
+    assert.deepEqual(beforeUnmanaged.missingRelations,[])
+    assert.deepEqual(beforeUnmanaged.missingFunctions,[])
+    assert.ok(beforeUnmanaged.migrations.every(m=>m.rows===1&&m.matchingRows===1))
     const sourceSnapshot=catalog=>catalog.functions.find(fn=>fn.schema==='public'
       &&fn.name==='clawpilot_crm_native_initial_source_snapshot')
     assert.ok(sourceSnapshot(beforeQuarantine.catalog))
-    assert.equal(sourceSnapshot(completed.catalog)?.source,sourceSnapshot(beforeQuarantine.catalog).source,
+    assert.equal(sourceSnapshot(beforeUnmanaged.catalog)?.source,sourceSnapshot(beforeQuarantine.catalog).source,
       '0400 must preserve the complete historical source snapshot bytes, not filter demo evidence out')
-    assert.equal(sourceSnapshot(completed.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
+    assert.equal(sourceSnapshot(beforeUnmanaged.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
       '0400/0401 must not replace or weaken the historical source snapshot function')
-    const currentOwnerHelper=completed.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
+    const currentOwnerHelper=beforeUnmanaged.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
     assert.ok(currentOwnerHelper)
     assert.notEqual(currentOwnerHelper.source,retainedOwnerHelper.source,'0401 changes its one reviewed owner-source predicate')
     assert.notEqual(currentOwnerHelper.definition,retainedOwnerHelper.definition)
@@ -630,19 +672,84 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
       '0401 preserves the exact owner-helper identity, privileges and execution attributes')
     for(const key of Object.keys(beforeOwnerFence.catalog)){
       if(key==='functions'){
-        assert.deepEqual(completed.catalog.functions.map(fn=>fn===currentOwnerHelper?retainedOwnerHelper:fn),
+        assert.deepEqual(beforeUnmanaged.catalog.functions.map(fn=>fn===currentOwnerHelper?retainedOwnerHelper:fn),
           beforeOwnerFence.catalog.functions,'0401 changes no other catalog function')
-      }else assert.deepEqual(completed.catalog[key],beforeOwnerFence.catalog[key],
+      }else assert.deepEqual(beforeUnmanaged.catalog[key],beforeOwnerFence.catalog[key],
         `0401 preserves the complete historical ${key} catalog`)
     }
+    const appOnlyName=UNMANAGED_PIPELINE_CLASSIFIER.slice('public.'.length).split('(')[0]
+    const retainedAppOnlyHelper=beforeUnmanaged.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===appOnlyName)
+    assert.ok(retainedAppOnlyHelper)
+    assert.equal(createHash('sha256').update(retainedAppOnlyHelper.source).digest('hex'),
+      '5ba06eacd5fc5dfc5c87343812c023d4c634d41c11c8b8cb804f22c84c0cbf2e',
+      '0402 requires the exact independently retained app-only classifier preimage')
+    // Compare the actual 0402 DDL using one identical current inventory on
+    // both sides. The separately frozen v17 projection above proves history;
+    // expanding that projection to v18 must not masquerade as new SQL DDL.
+    const beforeUnmanagedCurrent=await inspectProductionRebindHistorySchema(pool)
+    assert.deepEqual(beforeUnmanagedCurrent.missingRelations,[])
+    assert.deepEqual([...beforeUnmanagedCurrent.missingFunctions].sort(),[...UNMANAGED_PIPELINE_HELPERS.keys()].sort(),
+      'Before 0402 the current v18 inventory lacks exactly its seven new helper identities')
+    assert.deepEqual(beforeUnmanagedCurrent.migrations.filter(m=>m.filename===UNMANAGED_PIPELINE_MIGRATION).map(m=>[m.rows,m.matchingRows]),[[0,0]])
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+      'Historical v17 metadata never attests a current v18 target lacking0402')
+    command(process.execPath, ['scripts/db-migrate.mjs'], {
+      env: { ...process.env, DATABASE_URL:url.toString(), PGSSLMODE:'disable' }, timeout:180_000,
+    })
+    const completed = await inspectProductionRebindHistorySchema(pool)
+    const afterUnmanagedHistorical=await inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(pool)
+    const changedAppOnlyHelper=afterUnmanagedHistorical.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===appOnlyName)
+    assert.ok(changedAppOnlyHelper)
+    assert.notEqual(changedAppOnlyHelper.source,retainedAppOnlyHelper.source)
+    assert.deepEqual(withoutBody(changedAppOnlyHelper),withoutBody(retainedAppOnlyHelper),
+      '0402 preserves the original app-only classifier identity, privileges and execution attributes')
+    for(const key of Object.keys(beforeUnmanaged.catalog)){
+      if(key==='functions')assert.deepEqual(afterUnmanagedHistorical.catalog.functions.map(fn=>
+        fn===changedAppOnlyHelper?retainedAppOnlyHelper:fn),beforeUnmanaged.catalog.functions,
+        '0402 changes only its reviewed classifier in the complete frozen v17 function projection')
+      else assert.deepEqual(afterUnmanagedHistorical.catalog[key],beforeUnmanaged.catalog[key],
+        `0402 preserves the complete frozen historical ${key} catalog`)
+    }
+    const functionKey=fn=>`${fn.schema}.${fn.name}(${fn.identityArguments})`
+    const beforeFunctions=new Map(beforeUnmanagedCurrent.catalog.functions.map(fn=>[functionKey(fn),fn]))
+    const afterFunctions=new Map(completed.catalog.functions.map(fn=>[functionKey(fn),fn]))
+    assert.equal(beforeFunctions.size,beforeUnmanagedCurrent.catalog.functions.length)
+    assert.equal(afterFunctions.size,completed.catalog.functions.length)
+    assert.equal(afterFunctions.size,beforeFunctions.size+UNMANAGED_PIPELINE_HELPERS.size,
+      'Actual 0402 DDL adds exactly seven functions to the same current v18 inventory')
+    for(const [identity,before] of beforeFunctions){
+      const after=afterFunctions.get(identity)
+      assert.ok(after,`0402 does not remove historical function ${identity}`)
+      if(before.schema==='public'&&before.name===appOnlyName){
+        assert.deepEqual(withoutBody(after),withoutBody(before),
+          'Actual 0402 DDL changes only its existing wrapper body, not execution metadata')
+        assert.equal(after.definition,changedAppOnlyHelper.definition)
+      }else assert.deepEqual(after,before,`0402 leaves existing function ${identity} unchanged`)
+    }
+    const addedUnmanagedFunctions=[]
+    for(const [identity,fn] of afterFunctions)if(!beforeFunctions.has(identity))addedUnmanagedFunctions.push(fn)
+    assert.deepEqual(addedUnmanagedFunctions.map(fn=>`${fn.schema}.${fn.name}`).sort(),
+      [...UNMANAGED_PIPELINE_HELPERS.keys()].map(identity=>identity.split('(')[0]).sort(),
+      'The only actual 0402 function additions are its seven exact named helpers')
+    for(const key of Object.keys(beforeUnmanagedCurrent.catalog))if(key!=='functions'){
+      assert.deepEqual(completed.catalog[key],beforeUnmanagedCurrent.catalog[key],
+        `Actual 0402 DDL leaves the identical v18 ${key} inventory unchanged`)
+    }
+    assert.deepEqual(completed.missingRelations,[])
+    assert.deepEqual(completed.missingFunctions,[])
+    console.log(`PG${completed.postgresMajor}: exact 0402 DDL delta is seven helper additions and one wrapper replacement; identical v18 relation/column/constraint/index/trigger inventories unchanged`)
+    assert.equal(sourceSnapshot(completed.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
+      '0402 preserves exact source snapshot bytes and every retained demo source row')
     assert.notDeepEqual(completed.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       currentBaseline.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       'Second database must exercise genuinely different generated trigger OIDs')
     assert.equal(completed.schemaDigest, currentBaseline.schemaDigest,
-      'Equivalent migrated databases with different OID allocation have identical v17 fingerprints')
+      'Equivalent migrated databases with different OID allocation have identical v18 fingerprints')
     await attestProductionRebindHistorySchema(pool)
     console.log(`PG${completed.postgresMajor}: second-database historical upgrade and OID-independent attestation passed`)
-    return Object.freeze({rootOwnerBeforeDefinition:retainedOwnerHelper.definition})
+    return Object.freeze({rootOwnerBeforeDefinition:retainedOwnerHelper.definition,
+      appOnlyBeforeDefinition:retainedAppOnlyHelper.definition})
   } finally {await pool.end()}
 }
 
@@ -669,7 +776,7 @@ async function exerciseImage(image) {
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0401
+    // 0370 through 0402
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -777,6 +884,28 @@ async function exerciseImage(image) {
     assert.equal(ownerHelper[0].aclIsDefault,false)
     assert.ok(!ownerHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
       '0401 does not grant PUBLIC execution of owner-source classification')
+    const unmanagedSql=readFileSync(resolve(root,'db/migrations',UNMANAGED_PIPELINE_MIGRATION),'utf8')
+    for(const [identity,expected] of UNMANAGED_PIPELINE_HELPERS){
+      const name=identity.slice('public.'.length).split('(')[0]
+      const installed=baseline.catalog.functions.filter(fn=>fn.schema==='public'&&fn.name===name)
+      assert.equal(installed.length,1,`${identity} has one exact installed identity`)
+      const fn=installed[0]
+      assert.equal(fn.result,expected.result,identity)
+      assert.equal(fn.argumentCount,expected.arguments,identity)
+      assert.equal(fn.language,expected.language,identity)
+      assert.equal(fn.volatility,expected.volatility,identity)
+      assert.equal(fn.defaultArgumentCount,0,identity)
+      assert.equal(fn.strict,false,identity)
+      assert.equal(fn.returnsSet,false,identity)
+      assert.equal(fn.securityDefiner,false,identity)
+      assert.equal(fn.aclIsDefault,false,identity)
+      assert.ok(!fn.acl.some(entry=>entry.grantee==='PUBLIC'),identity)
+      assert.equal(fn.configuration.length,1,identity)
+      assert.match(fn.configuration[0],/^search_path=pg_catalog,\s*public$/u,identity)
+      const source=unmanagedSql.match(new RegExp('CREATE FUNCTION '+name+'\\([\\s\\S]*?AS \\$\\$([\\s\\S]*?)\\$\\$;'))?.[1]
+      assert.ok(source,`${identity} source is present in frozen 0402`)
+      assert.equal(fn.source,source,`${identity} executes the exact frozen migration body`)
+    }
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
     assert.equal(
@@ -886,7 +1015,7 @@ async function exerciseImage(image) {
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} candidate v17 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
+    console.log(`${image} candidate v18 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
@@ -953,6 +1082,28 @@ async function exerciseImage(image) {
       `ALTER FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER} SECURITY DEFINER`))
     await expectFailure(pool,'schema_object_missing','0401 missing owner-source helper',tx=>tx.query(
       `DROP FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER}`))
+    await expectFailure(pool,'schema_catalog_mismatch','0402 old global app-only sharing hold restored',tx=>tx.query(
+      historical.appOnlyBeforeDefinition))
+    for(const [identity,expected] of UNMANAGED_PIPELINE_HELPERS){
+      await expectFailure(pool,'schema_object_missing',`0402 missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity}`))
+      for(const [label,alteration] of [['PUBLIC execution',null],['SECURITY DEFINER','SECURITY DEFINER'],
+        ['NULL handling','STRICT'],['search path','SET search_path=public,pg_catalog'],
+        ['volatility',expected.volatility==='v'?'STABLE':'VOLATILE']]){
+        await expectFailure(pool,'schema_catalog_mismatch',`0402 ${identity} ${label} drift`,tx=>tx.query(alteration
+          ?`ALTER FUNCTION ${identity} ${alteration}`:`GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
+      }
+    }
+    for(const relation of UNMANAGED_PIPELINE_RELATIONS){
+      await expectFailure(pool,'schema_object_missing',`0402 missing footprint relation ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
+      await expectFailure(pool,'schema_catalog_mismatch',`0402 ${relation} PUBLIC read drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
+      const column=relation==='public.workspace_tenant_retirement_receipts'?'suitecrm_records'
+        :['public.crm_inbound_message_links','public.crm_integration_action_attempts'].includes(relation)?'id':'pipeline_id'
+      const actualColumn=relation==='public.crm_inbound_message_links'?'inbound_message_id':column
+      await expectFailure(pool,'schema_catalog_mismatch',`0402 ${relation}.${actualColumn} removed`,tx=>tx.query(
+        `ALTER TABLE ${relation} DROP COLUMN ${actualColumn} CASCADE`))
+    }
+    await expectFailure(pool,'schema_catalog_mismatch','0402 inbound footprint lookup index removed',tx=>tx.query(
+      'DROP INDEX public.idx_crm_inbound_messages_pipeline_time'))
     for(const relation of ['public.crm_native_email_initial_enrollments','public.crm_native_email_initial_reservations']){
       await expectFailure(pool,'schema_object_missing',`0398 missing retained ledger ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
     }
