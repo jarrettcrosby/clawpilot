@@ -38,8 +38,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Fetch rolling-release compatibility source
-        run: git fetch --no-tags --depth=1 origin 9d67c8d097bcd475e0109c3169a61a0885fcf059
+      - name: Fetch rolling-release compatibility sources
+        # Keep both actual historical readers available in the shallow checkout.
+        # Fail here, before expensive gates, if either pinned source is absent.
+        run: |
+          git fetch --no-tags --depth=1 origin \
+            9d67c8d097bcd475e0109c3169a61a0885fcf059 \
+            b61192200b6d990adb320fd7f941a619976bc4af
+          git cat-file -e 9d67c8d097bcd475e0109c3169a61a0885fcf059:app_src/lib/persistence/shopifyOrderManagement.ts
+          git cat-file -e b61192200b6d990adb320fd7f941a619976bc4af:app_src/lib/persistence/crm.ts
 
       - name: Setup Node
         uses: actions/setup-node@v5
