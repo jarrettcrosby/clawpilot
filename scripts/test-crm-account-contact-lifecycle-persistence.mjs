@@ -55,7 +55,7 @@ function harness(entity, overrides = {}) {
       else assert.ok(sql.includes('app_user_email IS NOT NULL OR pipeline_user = true'))
       return result(records.filter(row => row.pipeline_id === params[0] && row.id === params[1]).map(row => ({ ...row,
         managed_identity: entity === 'organizations' ? Boolean(row.workspace_organization_id || ['workspace_root', 'workspace_member'].includes(row.relationship_type))
-          : Boolean(row.app_user_email !== null || row.pipeline_user === true),
+          : Boolean(row.app_user_email !== null || row.pipeline_user === true || row.contact_type === 'pipeline_user'),
       })))
     }
     if (sql.includes('WHERE lower(suitecrm_id)=lower($1) OR lower(reference_code)=lower($2)')) {
@@ -146,7 +146,7 @@ await check('local-only archives and provider-confirmed archives never falsely r
 })
 await check('managed identities, wrong scopes, absent or ambiguous native/global pairs refuse before writes', async () => {
   for (const [entity, protections] of [['organizations', [{ workspace_organization_id: pipelineId }, { relationship_type: 'workspace_root' }, { relationship_type: 'workspace_member' }]],
-    ['contacts', [{ app_user_email: actorEmail }, { pipeline_user: true }]]]) {
+    ['contacts', [{ app_user_email: actorEmail }, { pipeline_user: true }, { contact_type: 'pipeline_user' }]]]) {
     for (const fields of protections) {
       const h = harness(entity, fields)
       await assert.rejects(h.crm.archiveCrmRecordInPostgres(input(entity)), /managed in Settings/)

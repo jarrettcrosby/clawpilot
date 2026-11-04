@@ -7,6 +7,11 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 
+const args = process.argv.slice(2)
+assert.ok(args.length === 0 || (args.length === 1
+  && ['--postgres-major=16', '--postgres-major=18'].includes(args[0])),
+'Only --postgres-major=16|18 is supported; duplicate and unknown arguments are refused')
+const postgresMajor = args.length ? args[0].slice('--postgres-major='.length) : '18'
 const require = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = require('pg'), ts = require('typescript')
 const command = args => execFileSync('docker', args, { encoding: 'utf8', timeout: 180000 })
@@ -26,7 +31,7 @@ const container = `clawpilot-crm-record-lifecycle-${process.pid}-${randomUUID().
 let pool, started = false
 try {
   command(disposablePostgresDockerArgs(['run','--rm','-d','--pull','never','--name',container,
-    '-e','POSTGRES_PASSWORD=lifecycle_test','-e','POSTGRES_DB=lifecycle_test','-p','127.0.0.1::5432','pgvector/pgvector:pg18']))
+    '-e','POSTGRES_PASSWORD=lifecycle_test','-e','POSTGRES_DB=lifecycle_test','-p','127.0.0.1::5432',`pgvector/pgvector:pg${postgresMajor}`]))
   started = true
   const port = Number(command(['port',container,'5432/tcp']).match(/:(\d+)\s*$/)?.[1])
   pool = new Pool({ connectionString: `postgresql://postgres:lifecycle_test@127.0.0.1:${port}/lifecycle_test`, max: 5 })
@@ -135,6 +140,8 @@ try {
   await assert.rejects(()=>crm.archiveCrmRecordInPostgres({pipelineId:pipelineB,entity:'organizations',id:organizationB,actorEmail:base.actorEmail}),/Settings/)
   await pool.query('UPDATE crm_contacts SET pipeline_user=true WHERE id=$1',[contact])
   await assert.rejects(()=>crm.archiveCrmRecordInPostgres({...base,entity:'contacts',id:contact}),/Settings/)
+  await pool.query("UPDATE crm_contacts SET pipeline_user=false,contact_type='pipeline_user' WHERE id=$1",[contact])
+  await assert.rejects(()=>crm.archiveCrmRecordInPostgres({...base,entity:'contacts',id:contact}),/Settings/)
   console.log('PASS actual PostgreSQL managed workspace/login records protected')
   const scan=load('app_src/lib/crm/suiteCrmAccountContactLifecycle.ts',{
     '@/lib/persistence/postgres':postgres,'@/lib/persistence/crm':crm,
@@ -144,7 +151,7 @@ try {
   process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED='1'
   try { const result=await scan.processSuiteCrmAccountContactLifecycle();assert.equal(result.errors,0);assert.equal(result.archived,0);assert.equal(result.protected,1)
   } finally { if(oldFlag===undefined)delete process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED;else process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=oldFlag }
-  console.log('PASS actual PostgreSQL bounded lifecycle inventory/cursor SQL; provider evidence mocked, no production proof')
+  console.log(`PASS actual PostgreSQL ${postgresMajor} bounded lifecycle inventory/cursor SQL; provider evidence mocked, no production proof`)
 } finally {
   if(pool)await pool.end()
   if(started)command(disposablePostgresDockerCleanupArgs(container))

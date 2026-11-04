@@ -45,6 +45,9 @@ function loadTypeScriptModule(path, mocks = {}) {
     structuredClone,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/browserSameOrigin') return loadTypeScriptModule('app_src/lib/browserSameOrigin.ts', {
+        './publicOriginRouting.mjs': nodeRequire(resolve(root, 'app_src/lib/publicOriginRouting.mjs')),
+      })
       return nodeRequire(specifier)
     },
   }
