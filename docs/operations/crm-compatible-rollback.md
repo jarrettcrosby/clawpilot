@@ -65,6 +65,53 @@ metadata-only diagnostic now emits separate unsigned three-plus-two dry-run
 drafts, never a combined five-message command. Live permissions, recovery,
 provider readback and deployment remain unperformed.
 
+### Retained terminal demo quarantine
+
+The November 4 production SELECT-only observation classified all 132
+nonsucceeded native jobs: 42 Product upserts and 90 Email-from-Note
+reprojections, all in 15 disabled-reference pipelines of the fixed synthetic
+demo workspace. Every row has the existing demo-seed quarantine marker,
+`dead` state, infinite availability, a processed timestamp and no lease. Full
+row fingerprints were unchanged across the independent metadata observations;
+current aggregate/payload bindings and synthetic source markers also matched.
+These are deliberately retained demo identity evidence, not 132 active workers
+or unresolved BPO jobs. The demo seed and verifier require their retention.
+Do not replay, delete or relabel them as successful to satisfy enrollment.
+
+The forward-only local correction is migration `0400`. A private,
+security-invoker SQL helper independently verifies the complete outbox
+fingerprint, exact terminal state, fixed demo workspace/owner, disabled
+pipeline, current aggregate binding, allowed operation/module transition and
+synthetic source. Only that precise state is recognized by the original
+reserve and replan-aware admission writer checks. Ordinary dead, failed,
+processing, uncertain and User-identity work remain held.
+
+The source snapshot function and shape remain byte-for-byte unchanged: every
+retained job and full row fingerprint stays in the signed source. The private
+operator uses one exact ID/fingerprint batch lookup rather than trusting a
+caller-supplied quarantine flag. New control-first Product source fences freeze
+the classification dependencies during the bounded enrollment maintenance
+window. No native PHP, historical migration, job state or permission is changed
+by this correction. Current raw-catalog enrollment advances to v16 while
+preserving the independently accepted historical v9–v15 fingerprints.
+
+Both PostgreSQL 16 and 18 pass the complete raw-catalog gate: 336 tamper
+refusals per version, historical v9–v15 fingerprints, OID independence,
+unchanged snapshot bytes and the transaction-held schema lock. Each also
+passes 15 initial-enrollment SQL groups, including 35 strict quarantine
+near-misses and unchanged retained jobs through reservation, admission,
+cancellation, replan and activation. The actual private operator passes 22
+groups per version, including the real batch lookup and RSA issuer admission.
+Native collection, signatures beyond that synthetic issuer, forecasts and
+native execution remain fixture ports in these focused database gates.
+
+This is local acceptance, not a production migration or activation. Two early
+fixture-setup failures (a duplicate demo root and a forbidden active unmanaged
+demo pipeline) are retained separately; the corrected fixtures use the one
+canonical demo root and disabled historical pipelines without disabling guards.
+The successful metadata inspection is not a native capability forecast,
+retained production reservation, writer-drain proof or signed activation.
+
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial
 operation stays cancelled; a newly reserved operation captures fresh native

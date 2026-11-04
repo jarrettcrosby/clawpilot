@@ -306,4 +306,32 @@ await check('forward migration preserves 0398 bytes and the entire original admi
   assert.ok(!/CREATE TABLE|ADD COLUMN|set_config|current_setting/i.test(forward))
   assert.match(forward, /REVOKE ALL ON FUNCTION clawpilot_crm_native_initial_lineage_digest\(jsonb\),\s*clawpilot_crm_native_initial_replan_context\(text,text,text\) FROM PUBLIC/)
 })
+await check('demo quarantine preserves historical migrations, snapshot and every unrelated enrollment-body byte', async () => {
+  const read = name => readFileSync(new URL(`../db/migrations/${name}`, import.meta.url), 'utf8')
+  const initial = read('0398_crm_native_email_initial_enrollment.sql')
+  const replan = read('0399_crm_native_email_initial_replan_lineage.sql')
+  const quarantine = read('0400_crm_native_email_demo_quarantine.sql')
+  assert.equal(hash(initial), '00ba0afd16e90ef321199e0c497b0f75029b3efc3d6af7edee0673e0bc20afd7')
+  assert.equal(hash(replan), 'd701ad48ad8629c3ea71d3987c5eeba4a7df33b79b98ff46ca8c220de0b31a34')
+  const before = quarantine.match(/old_predicate text:=\$before\$([\s\S]*?)\$before\$/)?.[1]
+  const after = quarantine.match(/new_predicate text:=\$after\$([\s\S]*?)\$after\$/)?.[1]
+  assert.ok(before && after)
+  assert.equal(after.replace(/\n   AND NOT public\.clawpilot_crm_native_initial_demo_quarantine\(o\.id,encode\(public\.digest\(to_jsonb\(o\)::text,'sha256'\),'hex'\)\)/, ''),
+    before, 'Only the strict quarantine predicate may be added to the existing writer hold')
+  const pins = [...quarantine.matchAll(/\('public\.(clawpilot_crm_native_initial_(?:reserve|admit))\(\)','([a-f0-9]{64})'\)/g)]
+  assert.equal(pins.length, 2)
+  for (const [, name, pin] of pins) {
+    const source = name.endsWith('_reserve') ? initial : replan
+    const body = source.match(new RegExp(`FUNCTION ${name}\\(\\)[\\s\\S]*? AS \\$\\$([\\s\\S]*?)\\$\\$;`))?.[1]
+    assert.ok(body)
+    assert.equal(hash(body), pin, `${name}: the migration must check its exact current preimage`)
+    assert.equal(body.split(before).length, 2, `${name}: replace precisely one known predicate`)
+    assert.equal(body.replace(before, after).replace(after, before), body)
+  }
+  assert.match(quarantine, /updated_definition:=replace\(definition,old_predicate,new_predicate\)/)
+  assert.match(quarantine, /digest\(replace\(body,new_predicate,old_predicate\),'sha256'\)/)
+  assert.doesNotMatch(quarantine, /CREATE (?:OR REPLACE )?FUNCTION clawpilot_crm_native_initial_source_snapshot\(/)
+  assert.doesNotMatch(quarantine, /(?:UPDATE|DELETE FROM|INSERT INTO) (?:public\.)?sync_outbox\b/i)
+  assert.match(quarantine, /REVOKE ALL ON FUNCTION clawpilot_crm_native_initial_demo_quarantine\(uuid,text\) FROM PUBLIC/)
+})
 console.log(`PASS ${checks} replan DAL contract groups; real RSA and actual DAL/pure helpers, synthetic SQL evidence/context only; no database/native/installer/activation proof`)

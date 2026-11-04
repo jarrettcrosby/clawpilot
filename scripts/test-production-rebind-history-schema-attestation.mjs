@@ -23,12 +23,14 @@ import {
   PRODUCTION_REBIND_CRM_GUARD_HELPERS,
   PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
   inspectPreCrmProductionRebindSchemaMetadata,
   inspectPreInitialEnrollmentProductionRebindSchemaMetadata,
   inspectPreInitialReplanProductionRebindSchemaMetadata,
+  inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
   productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
@@ -69,6 +71,8 @@ export const PRE_NATIVE_V9_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
 const REVIEWED_COMPANY_MIGRATION = '0374_crm_interaction_organizations.sql'
 const INITIAL_ENROLLMENT_MIGRATION = '0398_crm_native_email_initial_enrollment.sql'
 const INITIAL_REPLAN_MIGRATION = '0399_crm_native_email_initial_replan_lineage.sql'
+const INITIAL_DEMO_QUARANTINE_MIGRATION = '0400_crm_native_email_demo_quarantine.sql'
+const INITIAL_DEMO_QUARANTINE_HELPER = 'public.clawpilot_crm_native_initial_demo_quarantine(uuid,text)'
 const INITIAL_ENROLLMENT_RELATIONS = [
   'crm_contacts','crm_email_mailbox_bindings','crm_email_mailboxes','crm_email_review_decisions',
   'crm_email_sources','crm_interaction_organizations','crm_interactions',
@@ -79,6 +83,7 @@ const INITIAL_SOURCE_UPDATE_COLUMNS = new Map([
   ['app_user_organization_memberships',['user_email','organization_id','status','role','permissions','trashed_at','trashed_by','pre_trash_status']],
   ['workspace_organizations',['id','parent_id','organization_type','is_demo']],
   ['pipeline_spaces',['id','owner_email','workspace_organization_id','reference_access_disabled']],
+  ['crm_products',['id','pipeline_id','suitecrm_id','source_payload']],
 ])
 const INITIAL_FULL_SOURCE_RELATIONS = [
   'pipeline_space_members','crm_operator_accounts','crm_operator_workspace_bindings','crm_root_employee_access_grants',
@@ -89,10 +94,13 @@ const INITIAL_FULL_SOURCE_RELATIONS = [
   'crm_native_email_authority_root_changes','crm_native_email_authority_grant_attempts',
 ]
 const INITIAL_ENROLLMENT_TRIGGERS = [
-  ...[...INITIAL_SOURCE_UPDATE_COLUMNS.keys()].flatMap(table=>[
-    [table,'crm_native_initial_source_fence',46,'clawpilot_crm_native_initial_source_fence'],
-    [table,'crm_native_initial_source_update_fence',18,'clawpilot_crm_native_initial_source_fence'],
-  ]),
+  ...[...INITIAL_SOURCE_UPDATE_COLUMNS.keys()].flatMap(table=>{
+    const prefix=table==='crm_products'?'crm_native_initial_demo_product_source':'crm_native_initial_source'
+    return [
+      [table,`${prefix}_fence`,46,'clawpilot_crm_native_initial_source_fence'],
+      [table,`${prefix}_update_fence`,18,'clawpilot_crm_native_initial_source_fence'],
+    ]
+  }),
   ...INITIAL_FULL_SOURCE_RELATIONS.map(table=>[table,'crm_native_initial_source_fence',62,'clawpilot_crm_native_initial_source_fence']),
   ['crm_native_email_initial_enrollments','crm_native_initial_statement',62,'clawpilot_crm_native_initial_lock'],
   ['crm_native_email_initial_reservations','crm_native_initial_reservation_statement',62,'clawpilot_crm_native_initial_lock'],
@@ -162,7 +170,7 @@ export const NEW_REFERENCE_CONSTRAINTS = new Map([
 ])
 
 assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
-  'clawpilot-production-rebind-target-schema-attestation-v15')
+  'clawpilot-production-rebind-target-schema-attestation-v16')
 assert.deepEqual(PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'22808494dbdc3510bdccb57fe0a491344a1e8bc57195594d089cdf568e63842e',
   18:'f0685b9f82de44c3c1cf1c10e4ce077c43d1040992234e551e338311160f3e64',
@@ -171,11 +179,15 @@ assert.deepEqual(PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'cc19a57dd52699a99a5b65f6b194898f03e2afca0427bb671a751156b71ade53',
   18:'5fd850649717454a790185f22e916c2be58a80cdc8cbc87317fd4e936cc0d553',
 },'Forward replan enrollment must never retcon the historical v14 fingerprints')
-assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,INITIAL_REPLAN_MIGRATION,
-  'Current acceptance requires the forward replan migration, never a historical floor')
+assert.deepEqual(PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'efbd7c05436a394e29c45522465602790f3fa8ff9cfcb9b12802cae416b8e864',
+  18:'c8da9f9b5d54395eb2527e9d472396bbf2b593b6312b2c14d4ef3ae13a3d130d',
+},'Demo quarantine must never retcon the independently accepted historical v15 fingerprints')
+assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,INITIAL_DEMO_QUARANTINE_MIGRATION,
+  'Current acceptance requires 0400, never a historical floor')
 for(const helper of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
-  'public.clawpilot_crm_native_initial_replan_context(text,text,text)']) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
-for(const relation of INITIAL_ENROLLMENT_RELATIONS) assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),
+  'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER]) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
+for(const relation of [...INITIAL_ENROLLMENT_RELATIONS,'public.crm_products']) assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),
   `${relation} must be a direct locked/fingerprinted target`)
 
 for (const image of images) {
@@ -224,19 +236,29 @@ for(const [inspect,lastMigration] of [
   [inspectPreCrmProductionRebindSchemaMetadata,'0397_crm_native_root_registry_changes.sql'],
   [inspectPreInitialEnrollmentProductionRebindSchemaMetadata,'0397_crm_native_root_registry_changes.sql'],
   [inspectPreInitialReplanProductionRebindSchemaMetadata,INITIAL_ENROLLMENT_MIGRATION],
-  [inspectProductionRebindHistorySchema,INITIAL_REPLAN_MIGRATION],
+  [inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,INITIAL_REPLAN_MIGRATION],
+  [inspectProductionRebindHistorySchema,INITIAL_DEMO_QUARANTINE_MIGRATION],
 ]){
-  let selectedMigrations
+  let selectedMigrations,selectedRelations,selectedFunctions
   await inspect({query:async (_sql,values)=>{
+    selectedRelations=values[0]
+    selectedFunctions=values[1]
     selectedMigrations=values[2]
     return {rowCount:1,rows:[{server_version_num:160000,schema:{},relations:[],columns:[],constraints:[],
       indexes:[],triggers:[],functions:[],migrations:[],missing_relations:[],missing_functions:[]}]}
   }})
   assert.equal(selectedMigrations.at(-1),lastMigration,`${inspect.name} retains its exact ledger floor`)
   assert.equal(selectedMigrations.includes(INITIAL_ENROLLMENT_MIGRATION),inspect===inspectProductionRebindHistorySchema
-    ||inspect===inspectPreInitialReplanProductionRebindSchemaMetadata,'Only current and exact v14 metadata include 0398')
-  assert.equal(selectedMigrations.includes(INITIAL_REPLAN_MIGRATION),inspect===inspectProductionRebindHistorySchema,
-    'Only current v15 enrolls 0399; historical readers never provide a fallback')
+    ||inspect===inspectPreInitialReplanProductionRebindSchemaMetadata
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,'Only current and exact v14/v15 metadata include 0398')
+  assert.equal(selectedMigrations.includes(INITIAL_REPLAN_MIGRATION),inspect===inspectProductionRebindHistorySchema
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
+    'Only current and exact v15 metadata enroll 0399; historical readers never provide a fallback')
+  for(const currentOnly of [selectedMigrations.includes(INITIAL_DEMO_QUARANTINE_MIGRATION),
+    selectedRelations.includes('public.crm_products'),selectedFunctions.includes(INITIAL_DEMO_QUARANTINE_HELPER)]){
+    assert.equal(currentOnly,inspect===inspectProductionRebindHistorySchema,
+      'Only current v16 enrolls the complete 0400 migration, helper and direct Product source catalog')
+  }
 }
 
 function command(executable, args, options = {}) {
@@ -536,16 +558,38 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
       'Exact through0398 preserves the independently enrolled v14 catalog before0399')
     await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
       error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
-    'Historical v14 metadata is not a fallback for a v15 target lacking0399')
+    'Historical v14 metadata is not a fallback for a current target lacking0399/0400')
+    const replanSql=readFileSync(resolve(root,'db/migrations',INITIAL_REPLAN_MIGRATION),'utf8')
+    const replanClient=await pool.connect()
+    try{await applyMigrationSqlForTest(replanClient,INITIAL_REPLAN_MIGRATION,replanSql,
+      {checksum:createHash('sha256').update(replanSql).digest('hex')})}finally{replanClient.release()}
+    const beforeQuarantine=await inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeQuarantine.format,'clawpilot-production-rebind-v15-metadata-only')
+    assert.equal(beforeQuarantine.schemaDigest,
+      PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeQuarantine.postgresMajor],
+      'Exact through0399 preserves the independently accepted v15 catalog before0400')
+    assert.deepEqual(beforeQuarantine.missingRelations,[])
+    assert.deepEqual(beforeQuarantine.missingFunctions,[])
+    assert.ok(beforeQuarantine.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v15 metadata is not a fallback for a current v16 target lacking0400')
     command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: { ...process.env, DATABASE_URL:url.toString(), PGSSLMODE:'disable' }, timeout:180_000,
     })
     const completed = await inspectProductionRebindHistorySchema(pool)
+    const sourceSnapshot=catalog=>catalog.functions.find(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_native_initial_source_snapshot')
+    assert.ok(sourceSnapshot(beforeQuarantine.catalog))
+    assert.equal(sourceSnapshot(completed.catalog)?.source,sourceSnapshot(beforeQuarantine.catalog).source,
+      '0400 must preserve the complete historical source snapshot bytes, not filter demo evidence out')
+    assert.equal(sourceSnapshot(completed.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
+      '0400 must not replace or weaken the historical source snapshot function')
     assert.notDeepEqual(completed.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       currentBaseline.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       'Second database must exercise genuinely different generated trigger OIDs')
     assert.equal(completed.schemaDigest, currentBaseline.schemaDigest,
-      'Equivalent migrated databases with different OID allocation have identical v15 fingerprints')
+      'Equivalent migrated databases with different OID allocation have identical v16 fingerprints')
     await attestProductionRebindHistorySchema(pool)
     console.log(`PG${completed.postgresMajor}: second-database historical upgrade and OID-independent attestation passed`)
   } finally {await pool.end()}
@@ -574,7 +618,7 @@ async function exerciseImage(image) {
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0399
+    // 0370 through 0400
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -617,7 +661,7 @@ async function exerciseImage(image) {
     await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog, CURRENT_CRM_REFERENCE_CONSTRAINTS)
     const initialTriggers=baseline.catalog.triggers.filter(t=>t.name.startsWith('crm_native_initial_'))
     assert.equal(initialTriggers.length,INITIAL_ENROLLMENT_TRIGGERS.length,
-      'Every 0398 trigger is directly fingerprinted, including all shared source/outbox fences')
+      'Every initial-enrollment trigger is directly fingerprinted, including the 0400 Product source fences')
     for(const [table,name,typeMask,fn,deferred=false] of INITIAL_ENROLLMENT_TRIGGERS){
       const installed=initialTriggers.filter(t=>t.name===name&&t.relation===`public.${table}`)
       assert.equal(installed.length,1,`${table}.${name}`)
@@ -626,10 +670,11 @@ async function exerciseImage(image) {
       assert.equal(installed[0].deferrable,deferred);assert.equal(installed[0].initiallyDeferred,deferred)
     }
     for(const [table,columns] of INITIAL_SOURCE_UPDATE_COLUMNS){
+      const name=table==='crm_products'?'crm_native_initial_demo_product_source_update_fence':'crm_native_initial_source_update_fence'
       const selected=await pool.query(`SELECT ARRAY(SELECT a.attname::text
         FROM unnest(t.tgattr::smallint[]) WITH ORDINALITY chosen(attnum,position)
         JOIN pg_catalog.pg_attribute a ON a.attrelid=t.tgrelid AND a.attnum=chosen.attnum ORDER BY chosen.position) AS columns
-        FROM pg_catalog.pg_trigger t WHERE t.tgrelid=$1::regclass AND t.tgname='crm_native_initial_source_update_fence'`,[`public.${table}`])
+        FROM pg_catalog.pg_trigger t WHERE t.tgrelid=$1::regclass AND t.tgname=$2`,[`public.${table}`,name])
       assert.deepEqual(selected.rows,[{columns}],`${table} freezes exactly its source snapshot authority keys`)
     }
     for(const [name,relation,typeMask,fn] of [
@@ -654,6 +699,19 @@ async function exerciseImage(image) {
     const functionNames=new Set(baseline.catalog.functions.filter(f=>f.schema==='public').map(f=>f.name))
     for(const f of baseline.catalog.functions)for(const [,called] of f.source.matchAll(/public\.((?:clawpilot_|global_reference_)[a-z_]+)\s*\(/g))
       assert.ok(functionNames.has(called),`Called helper ${called} must have its runtime body fingerprinted`)
+    const quarantineHelper=baseline.catalog.functions.filter(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_native_initial_demo_quarantine')
+    assert.equal(quarantineHelper.length,1,'0400 enrolls one exact quarantine helper identity')
+    assert.equal(quarantineHelper[0].result,'boolean')
+    assert.equal(quarantineHelper[0].argumentCount,2)
+    assert.equal(quarantineHelper[0].defaultArgumentCount,0)
+    assert.equal(quarantineHelper[0].returnsSet,false)
+    assert.equal(quarantineHelper[0].strict,false,'NULL source identities must return false, never SQL UNKNOWN')
+    assert.equal(quarantineHelper[0].volatility,'s','Quarantine is a stable read-only predicate')
+    assert.equal(quarantineHelper[0].securityDefiner,false,'Quarantine never elevates the attesting principal')
+    assert.equal(quarantineHelper[0].aclIsDefault,false,'Quarantine helper execution is explicitly restricted')
+    assert.ok(!quarantineHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
+      'PUBLIC must not execute the quarantine predicate')
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
     assert.equal(
@@ -763,7 +821,7 @@ async function exerciseImage(image) {
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} candidate v15 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
+    console.log(`${image} candidate v16 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
@@ -792,19 +850,36 @@ async function exerciseImage(image) {
       await expectFailure(pool,'schema_catalog_mismatch',`0398 missing ${constraint.name}`,tx=>tx.query(
         `ALTER TABLE ${constraint.relation} DROP CONSTRAINT ${constraint.name}`))
     }
-    for(const relation of INITIAL_ENROLLMENT_RELATIONS) await expectFailure(pool,'schema_catalog_mismatch',
-      `0398 ${relation} PUBLIC read privilege drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
+    for(const relation of [...INITIAL_ENROLLMENT_RELATIONS,'public.crm_products']) await expectFailure(pool,'schema_catalog_mismatch',
+      `Initial enrollment ${relation} PUBLIC read privilege drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
     for(const identity of ['public.clawpilot_crm_native_initial_source_snapshot()',
       'public.clawpilot_crm_native_initial_shape(jsonb,text[])','public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
-      'public.clawpilot_crm_native_initial_replan_context(text,text,text)',...initialFunctionIdentities]){
+      'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER,...initialFunctionIdentities]){
       await expectFailure(pool,'schema_catalog_mismatch',`0398 ${identity} PUBLIC execution drift`,tx=>tx.query(
         `GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
     }
     await expectFailure(pool,'schema_object_missing','0398 missing source snapshot helper',tx=>tx.query(
       'DROP FUNCTION public.clawpilot_crm_native_initial_source_snapshot()'))
     for(const identity of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
-      'public.clawpilot_crm_native_initial_replan_context(text,text,text)']) await expectFailure(pool,'schema_object_missing',
-      `0399 missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity}`))
+      'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER]) await expectFailure(pool,'schema_object_missing',
+      `Forward enrollment missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity}`))
+    for(const [label,alteration] of [['security definer','SECURITY DEFINER'],
+      ['NULL becomes UNKNOWN','STRICT'],['mutable predicate','VOLATILE']]) await expectFailure(pool,'schema_catalog_mismatch',
+      `0400 quarantine ${label}`,tx=>tx.query(`ALTER FUNCTION ${INITIAL_DEMO_QUARANTINE_HELPER} ${alteration}`))
+    for(const name of ['crm_native_initial_demo_product_source_fence','crm_native_initial_demo_product_source_update_fence']){
+      await expectFailure(pool,'schema_catalog_mismatch',`0400 Product missing ${name}`,tx=>tx.query(
+        `DROP TRIGGER ${name} ON public.crm_products`))
+    }
+    await expectFailure(pool,'schema_catalog_mismatch','0400 Product source INSERT/DELETE/TRUNCATE coverage reduced',async tx=>{
+      await tx.query('DROP TRIGGER crm_native_initial_demo_product_source_fence ON public.crm_products')
+      await tx.query(`CREATE TRIGGER crm_native_initial_demo_product_source_fence BEFORE INSERT OR DELETE ON public.crm_products
+        FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
+    })
+    await expectFailure(pool,'schema_catalog_mismatch','0400 Product source UPDATE authority key coverage reduced',async tx=>{
+      await tx.query('DROP TRIGGER crm_native_initial_demo_product_source_update_fence ON public.crm_products')
+      await tx.query(`CREATE TRIGGER crm_native_initial_demo_product_source_update_fence BEFORE UPDATE OF id,pipeline_id,suitecrm_id ON public.crm_products
+        FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
+    })
     for(const relation of ['public.crm_native_email_initial_enrollments','public.crm_native_email_initial_reservations']){
       await expectFailure(pool,'schema_object_missing',`0398 missing retained ledger ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
     }
@@ -825,6 +900,7 @@ async function exerciseImage(image) {
     }
     await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
     await expectLedgerFailure(pool, INITIAL_ENROLLMENT_MIGRATION, true)
+    await expectLedgerFailure(pool, INITIAL_DEMO_QUARANTINE_MIGRATION, true)
 
     for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
       await expectFailure(pool, 'schema_catalog_mismatch', `0374 missing ${constraint}`,

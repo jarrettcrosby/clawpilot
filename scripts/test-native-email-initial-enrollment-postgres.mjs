@@ -62,11 +62,11 @@ try{
    reference_code,source_payload) VALUES($1,$2,$3,'Synthetic native history',$4,$5,'Emails',now(),allocate_crm_reference('gi'),$6)`,
   [randomUUID(),pipeline,'initial-'+index,hash(['history',index]),randomUUID(),{archived:index===0}])
  }
- const demo=randomUUID()
+ const demo='10000000-0000-4000-8000-000000000001'
  await query("INSERT INTO workspace_organizations(id,name,organization_type,is_demo,created_by,updated_by) VALUES($1,'Seeded demo','root',true,$2,$2)",[demo,owner])
  for(let index=0;index<2;index++){
   const pipeline=randomUUID()
-  await query("INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)",[pipeline,'Demo '+index,owner,demo])
+  await query("INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,reference_access_disabled) VALUES($1,$2,$3,$4,true)",[pipeline,'Demo '+index,owner,demo])
   await query(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,suitecrm_synced_at,
    reference_code,source_payload) VALUES($1,$2,$3,'Seeded demo history',$4,'demo-suitecrm-interaction-1','Emails',now(),allocate_crm_reference('gi'),
    '{"source":"demo","synthetic":true}')`,[randomUUID(),pipeline,'demo-'+index,hash(['demo',index])])
@@ -74,10 +74,10 @@ try{
  const queuedId=randomUUID()
  await query(`INSERT INTO sync_outbox(id,target_system,aggregate_type,aggregate_id,operation,payload)
   VALUES($1,'suitecrm','crm_interactions',$2,'upsert_record','{"body":"PRIVATE_EMAIL_BODY_SENTINEL","amount":123}')`,[queuedId,randomUUID()])
- const snapshot=async()=>{const {rows}=await query(`SELECT s,encode(digest(s::text,'sha256'),'hex') AS fingerprint
+ const snapshot=async(queryable=pool)=>{const {rows}=await queryable.query(`SELECT s,encode(digest(s::text,'sha256'),'hex') AS fingerprint
   FROM (SELECT clawpilot_crm_native_initial_source_snapshot() AS s) q`);return rows[0]}
- const reservation=async()=>{const live=await snapshot();return {live,generation:Number(live.s.generation),operationId:hash(randomUUID()),nativeInstanceId:'synthetic-native-fixture'}}
- const reserve=async(f,actor=owner)=>query(`INSERT INTO crm_native_email_initial_reservations(operation_id,actor_email,operator_account_id,root_workspace_id,
+ const reservation=async(queryable=pool)=>{const live=await snapshot(queryable);return {live,generation:Number(live.s.generation),operationId:hash(randomUUID()),nativeInstanceId:'synthetic-native-fixture'}}
+ const reserve=async(f,actor=owner,queryable=pool)=>queryable.query(`INSERT INTO crm_native_email_initial_reservations(operation_id,actor_email,operator_account_id,root_workspace_id,
   native_instance_id,generation,source_snapshot,source_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
   [f.operationId,actor,account,root,f.nativeInstanceId,f.generation,f.live.s,f.live.fingerprint])
  async function fixture(selected=undefined,ttl=120){
@@ -148,6 +148,88 @@ try{
    await query("UPDATE sync_outbox SET status='queued',operation='upsert_record',attempts=0,locked_at=NULL,lock_token=NULL,last_error=NULL,processed_at=NULL WHERE id=$1",[queuedId])
   }
  })
+ const quarantineWorkspace=demo,quarantineOwner='demo-system@clawpilot.example'
+ const quarantinePipeline=randomUUID(),quarantineProduct=randomUUID(),quarantineInteraction=randomUUID()
+ const quarantineIds=[randomUUID(),randomUUID()].sort()
+ const quarantineMarker='Demo pipeline quarantined; immutable CRM identity evidence preserved'
+ await query("INSERT INTO app_users(email,role,status,crm_user_enabled) VALUES($1,'member','active',false)",[quarantineOwner])
+ await query('UPDATE app_users SET organization_id=$1 WHERE email=$2',[quarantineWorkspace,quarantineOwner])
+ await query(`INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,sync_enabled,reference_access_disabled)
+  VALUES($1,'Immutable demo identity evidence',$2,$3,false,true)`,[quarantinePipeline,quarantineOwner,quarantineWorkspace])
+ await query(`INSERT INTO crm_products(id,pipeline_id,source_key,name,source_hash,suitecrm_id,source_payload)
+  VALUES($1,$2,'quickbooks:item:quarantine-fixture','Synthetic retained product',$3,'demo-suitecrm-product-1',
+  '{"provider":"quickbooks","synthetic":true}')`,[quarantineProduct,quarantinePipeline,hash('quarantine-product')])
+ await query(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,source_payload)
+  VALUES($1,$2,'demo-quarantine-email','Synthetic retained interaction',$3,'demo-suitecrm-interaction-1','Emails',
+  '{"source":"demo","synthetic":true}')`,[quarantineInteraction,quarantinePipeline,hash('quarantine-interaction')])
+ for(const [index,entity,aggregateId,nativeId,operation]of [
+  [0,'products',quarantineProduct,'demo-suitecrm-product-1','upsert_record'],
+  [1,'interactions',quarantineInteraction,'demo-suitecrm-interaction-1','reproject_record'],
+ ])await query(`INSERT INTO sync_outbox(id,target_system,aggregate_type,aggregate_id,operation,payload,status,attempts,
+   last_error,available_at,processed_at,locked_at,lock_token)
+   VALUES($1,'suitecrm',$2,$3,$4,$5,'dead',$6,$7,'infinity',now(),NULL,NULL)`,
+  [quarantineIds[index],'crm_'+entity,aggregateId,operation,{entity,pipelineId:quarantinePipeline,localId:aggregateId,suiteCrmId:nativeId,
+   attributes:{name:'Synthetic retained quarantine'},...(entity==='interactions'?{suiteCrmModule:'Emails',previousSuiteCrmModule:'Notes'}:{})},index===0?1:4,quarantineMarker])
+ const quarantineRows=async(queryable=pool)=>(await queryable.query(`SELECT s.id::text,to_jsonb(s)::text AS retained,
+   encode(digest(to_jsonb(s)::text,'sha256'),'hex') AS fingerprint FROM sync_outbox s WHERE id=ANY($1::uuid[]) ORDER BY id`,[quarantineIds])).rows
+ const quarantineBefore=await quarantineRows()
+ const classifyQuarantine=async(queryable,outboxId,expectedHash=undefined)=>{
+  const fingerprint=expectedHash??(await quarantineRows(queryable)).find(row=>row.id===outboxId)?.fingerprint
+  return (await queryable.query('SELECT clawpilot_crm_native_initial_demo_quarantine($1::uuid,$2::text) AS verified',[outboxId,fingerprint])).rows[0].verified
+ }
+ await check('only the exact terminal synthetic quarantine is recognized and all original outbox evidence stays in the snapshot',async()=>{
+  for(const row of quarantineBefore){assert.equal(await classifyQuarantine(pool,row.id),true)
+   assert.equal(await classifyQuarantine(pool,row.id,hash('wrong-retained-full-row')),false)}
+  const s=await snapshot();assert.equal(s.s.pendingOutbox.length,3)
+  for(const row of quarantineBefore)assert.equal(s.s.pendingOutbox.find(p=>p.id===row.id)?.rowFingerprint,row.fingerprint)
+  assert.deepEqual(await quarantineRows(),quarantineBefore)
+ })
+ await check('quarantine marker, scope, identity, payload, synthetic status and lease near-misses still block reservation',async()=>{
+  const productJob=quarantineIds[0],interactionJob=quarantineIds[1]
+  const negatives=[
+   ['marker',"UPDATE sync_outbox SET last_error='ordinary provider outcome unknown' WHERE id=$1",[productJob],productJob],
+   ['finite availability',"UPDATE sync_outbox SET available_at=now() WHERE id=$1",[productJob],productJob],
+   ['missing terminal receipt','UPDATE sync_outbox SET processed_at=NULL WHERE id=$1',[productJob],productJob],
+   ['lock timestamp','UPDATE sync_outbox SET locked_at=now() WHERE id=$1',[productJob],productJob],
+   ['lock token',"UPDATE sync_outbox SET lock_token='unknown-lease' WHERE id=$1",[productJob],productJob],
+   ['failed status',"UPDATE sync_outbox SET status='failed' WHERE id=$1",[productJob],productJob],
+   ['processing status',"UPDATE sync_outbox SET status='processing' WHERE id=$1",[productJob],productJob],
+   ['queued retry',"UPDATE sync_outbox SET status='queued' WHERE id=$1",[productJob],productJob],
+   ['identity operation',"UPDATE sync_outbox SET operation='upsert_user_identity' WHERE id=$1",[productJob],productJob],
+   ['delete operation',"UPDATE sync_outbox SET operation='delete_record' WHERE id=$1",[productJob],productJob],
+   ['local binding',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{localId}',to_jsonb($2::text)) WHERE id=$1`,[productJob,randomUUID()],productJob],
+   ['pipeline binding',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{pipelineId}',to_jsonb($2::text)) WHERE id=$1`,[productJob,pipelines[0]],productJob],
+   ['native binding',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{suiteCrmId}','"foreign-native-id"') WHERE id=$1`,[productJob],productJob],
+   ['missing aggregate','UPDATE sync_outbox SET aggregate_id=$2 WHERE id=$1',[productJob,randomUUID()],productJob],
+   ['wrong entity',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{entity}','"organizations"') WHERE id=$1`,[productJob],productJob],
+   ['non-object attributes',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{attributes}','[]') WHERE id=$1`,[productJob],productJob],
+   ['product module',`UPDATE sync_outbox SET payload=payload||'{"suiteCrmModule":"Emails"}' WHERE id=$1`,[productJob],productJob],
+   ['product prior module',`UPDATE sync_outbox SET payload=payload||'{"previousSuiteCrmModule":"Notes"}' WHERE id=$1`,[productJob],productJob],
+   ['interaction module',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{suiteCrmModule}','"Calls"') WHERE id=$1`,[interactionJob],interactionJob],
+   ['interaction previous module',`UPDATE sync_outbox SET payload=jsonb_set(payload,'{previousSuiteCrmModule}','"Calls"') WHERE id=$1`,[interactionJob],interactionJob],
+   ['current product pipeline','UPDATE crm_products SET pipeline_id=$2 WHERE id=$1',[quarantineProduct,pipelines[0]],productJob],
+   ['current interaction pipeline','UPDATE crm_interactions SET pipeline_id=$2 WHERE id=$1',[quarantineInteraction,pipelines[0]],interactionJob],
+   ['current product native identity',"UPDATE crm_products SET suitecrm_id='changed-native-product' WHERE id=$1",[quarantineProduct],productJob],
+   ['current interaction native identity',"UPDATE crm_interactions SET suitecrm_id='changed-native-interaction' WHERE id=$1",[quarantineInteraction],interactionJob],
+   ['current interaction module',"UPDATE crm_interactions SET suitecrm_module='Notes' WHERE id=$1",[quarantineInteraction],interactionJob],
+   ['synthetic product',`UPDATE crm_products SET source_payload='{"provider":"quickbooks","synthetic":false}' WHERE id=$1`,[quarantineProduct],productJob],
+   ['synthetic interaction',`UPDATE crm_interactions SET source_payload='{"source":"demo","synthetic":false}' WHERE id=$1`,[quarantineInteraction],interactionJob],
+   ['string synthetic product',`UPDATE crm_products SET source_payload='{"provider":"quickbooks","synthetic":"true"}' WHERE id=$1`,[quarantineProduct],productJob],
+   ['string synthetic interaction',`UPDATE crm_interactions SET source_payload='{"source":"demo","synthetic":"true"}' WHERE id=$1`,[quarantineInteraction],interactionJob],
+   ['product provider',`UPDATE crm_products SET source_payload='{"provider":"unknown","synthetic":true}' WHERE id=$1`,[quarantineProduct],productJob],
+   ['interaction source',`UPDATE crm_interactions SET source_payload='{"source":"unknown","synthetic":true}' WHERE id=$1`,[quarantineInteraction],interactionJob],
+   ['pipeline owner','UPDATE pipeline_spaces SET owner_email=$2 WHERE id=$1',[quarantinePipeline,owner],productJob],
+   ['pipeline enabled','UPDATE pipeline_spaces SET reference_access_disabled=false WHERE id=$1',[quarantinePipeline],productJob],
+   ['workspace real','UPDATE workspace_organizations SET is_demo=false WHERE id=$1',[quarantineWorkspace],productJob],
+   ['wrong workspace','UPDATE pipeline_spaces SET workspace_organization_id=$2 WHERE id=$1',[quarantinePipeline,root],productJob],
+  ]
+  for(const [label,sql,params,job]of negatives){const c=await pool.connect();try{
+   await c.query('BEGIN');await c.query(sql,params)
+   assert.equal(await classifyQuarantine(c,job),false,label)
+   await assert.rejects(reserve(await reservation(c),owner,c),refusal,label+' must not be called drained')
+  }finally{await c.query('ROLLBACK');c.release()}}
+  assert.deepEqual(await quarantineRows(),quarantineBefore,'All negative cases roll back without altering retained quarantine evidence')
+ })
  const reserved=await reservation()
  await check('reservation installs the disabled durable fence before any final plan, native forecast or signature exists',async()=>{
   await reserve(reserved)
@@ -159,6 +241,13 @@ try{
   await assert.rejects(query('UPDATE crm_native_email_publication_control SET active_initial_enrollment_id=NULL'),refusal)
   await assert.rejects(query('UPDATE workspace_organizations SET is_demo=false WHERE id=$1',[demo]),refusal)
   await assert.rejects(query("UPDATE sync_outbox SET status='processing',attempts=1 WHERE id=$1",[queuedId]),refusal)
+  for(const [sql,params]of [
+   ['UPDATE crm_products SET pipeline_id=pipeline_id WHERE id=$1',[quarantineProduct]],
+   ['UPDATE crm_products SET suitecrm_id=suitecrm_id WHERE id=$1',[quarantineProduct]],
+   ['UPDATE crm_products SET source_payload=source_payload WHERE id=$1',[quarantineProduct]],
+   ['DELETE FROM crm_products WHERE id=$1',[quarantineProduct]],
+   ['TRUNCATE crm_products CASCADE',[]],
+  ])await assert.rejects(query(sql,params),refusal)
   await assert.rejects(query(`INSERT INTO crm_native_email_capability_policies(pipeline_id,generation,policy,fingerprint)
    VALUES($1,$2,'{}',$3)`,[pipelines[0],reserved.generation,hash('unbound-policy')]),refusal)
  })
@@ -178,6 +267,8 @@ try{
   assert.equal(c.enabled,false);assert.equal(c.active_initial_enrollment_id,selected.operationId)
   const e=(await query('SELECT * FROM crm_native_email_initial_enrollments')).rows[0]
   assert.equal(e.plan_hash,selected.planHash);assert.deepEqual(e.native_delta,selected.delta);assert.equal(e.native_receipt,null)
+  assert.equal(e.source_snapshot.pendingOutbox.length,3)
+  assert.deepEqual(await quarantineRows(),quarantineBefore,'Initial admission retains the original dead jobs instead of replaying or discarding them')
   await assert.rejects(insert(selected),e=>e.code==='23505')
  })
  await check('pending barrier fences sources, identity/publication jobs, all authority ledgers and native policies even while disabled',async()=>{
@@ -325,6 +416,10 @@ try{
   assert.equal((await query('SELECT count(*) FROM crm_native_email_initial_reservations')).rows[0].count,'2')
   assert.equal((await query('SELECT count(*) FROM crm_native_email_initial_enrollments')).rows[0].count,'2')
   assert.equal((await query('SELECT count(*) FROM crm_native_email_capability_policies')).rows[0].count,'2')
+  assert.deepEqual(await quarantineRows(),quarantineBefore,'Replan and activation preserve every terminal demo quarantine row byte-for-byte')
+  const retainedSources=(await query('SELECT source_snapshot FROM crm_native_email_initial_reservations ORDER BY operation_id')).rows
+  for(const source of retainedSources)for(const row of quarantineBefore)
+   assert.equal(source.source_snapshot.pendingOutbox.find(p=>p.id===row.id)?.rowFingerprint,row.fingerprint)
   await assert.rejects(query("UPDATE crm_native_email_initial_enrollments SET state='unknown',native_receipt=NULL,receipt_canonical=NULL,receipt_hash=NULL,settling_xid=NULL"),refusal)
   await assert.rejects(query('UPDATE crm_native_email_publication_control SET enabled=false'),refusal)
   await query('UPDATE crm_native_email_publication_control SET updated_at=clock_timestamp()')

@@ -82,7 +82,7 @@ function fixture(){
   nativeSource:{version:1,purpose:'clawpilot-native-email-initial-source',nativePolicyFingerprint:hash('actual-native-before-policy-fixture'),nativeRuntimeFingerprint:hash('actual-stock-runtime-fixture'),
    principalSuiteCrmUserIds:[...principals],emails:mappings.map((m,i)=>({...m,recordFingerprint:hash(['native-content',i]),capabilities:caps(principals,i===0?principals:['admin'])})),
    defaults:['delete','edit','export','list','view'].map((action,i)=>({id:id(60+i),action,aclAccess:90}))},
-  sql:[],nativeCalls:[],transactions:0,afterNative:null,modifyForecast:null}
+  sql:[],nativeCalls:[],transactions:0,afterNative:null,modifyForecast:null,quarantineEvidence:new Map(),quarantineResult:null}
  const principalRows=()=>[
   {email:selection.actorEmail,suitecrm_user_id:'admin',membership_role:'owner',membership_permissions:{viewCrm:false}},
   {email:'editor@example.invalid',suitecrm_user_id:'editor',membership_role:'member',membership_permissions:{viewCrm:true}},
@@ -98,6 +98,13 @@ function fixture(){
   if(sql.includes('FROM crm_native_email_initial_reservations r'))return {rows:[sqlCopy(state.reservation)]}
   if(sql.includes('clawpilot_crm_native_initial_source_snapshot()'))return {rows:[{snapshot:sqlCopy(state.snapshot),fingerprint:fp,
    snapshot_matches_reservation:isDeepStrictEqual(state.snapshot,state.reservation.source_snapshot)}]}
+  if(sql.includes('clawpilot_crm_native_initial_demo_quarantine(')){
+   assert.match(sql,/FROM unnest\(\$1::uuid\[\],\$2::text\[\]\)/)
+   const pending=state.snapshot.pendingOutbox.filter(row=>!(row.status==='queued'&&row.attempts===0&&row.lockedAt===null
+    &&row.lockToken===null&&row.hasError===false&&row.processedAt===null))
+   assert.deepEqual(values,[pending.map(row=>row.id),pending.map(row=>row.rowFingerprint)],'Batch lookup must use the exact retained IDs and full-row hashes')
+   return {rows:state.quarantineResult??values[0].map((rowId,index)=>({id:rowId,quarantined:state.quarantineEvidence.get(rowId)===values[1][index]}))}
+  }
   if(sql.includes('FROM pipeline_spaces p JOIN workspace_organizations'))return {rows:copy(state.pipelines)}
   if(sql.includes('SELECT DISTINCT g.id::text'))return {rows:[]}
   if(sql.includes('FROM pipeline_space_members WHERE'))return {rows:copy(state.members)}
@@ -147,6 +154,15 @@ function installedFixture(){
 let checks=0
 const check=async(name,fn)=>{await fn();checks++;console.log('PASS '+name)}
 const held=pattern=>error=>pattern.test(String(error?.code??error?.message??error))
+function retainedQuarantine(index){return {id:id(120+index),targetSystem:'suitecrm',aggregateType:index===0?'crm_products':'crm_interactions',
+ aggregateId:id(130+index),operation:index===0?'upsert_record':'reproject_record',status:'dead',attempts:index===0?1:4,
+ lockedAt:null,lockToken:null,hasError:true,processedAt:'2026-10-01T00:00:00.000Z',availableAt:'infinity',rowFingerprint:hash(['retained-demo-quarantine',index])}}
+function withQuarantine(f=fixture()){
+ f.state.snapshot.pendingOutbox=[retainedQuarantine(0),retainedQuarantine(1)]
+ f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
+ f.state.quarantineEvidence=new Map(f.state.snapshot.pendingOutbox.map(row=>[row.id,row.rowFingerprint]))
+ return f
+}
 await check('private migration metadata fingerprints sorted path-value pairs without relaxing native permission wire keys',()=>{
  const first={'/absolute/db/migrations/0398_fixture.sql':'a'.repeat(64),'/absolute/db/migrations/0001_fixture.sql':'b'.repeat(64)}
  assert.throws(()=>hash(first),held(/invalid_json_key/))
@@ -245,6 +261,52 @@ await check('global mapped inventory cannot be silently subsetted, duplicated or
  const f=fixture();f.state.snapshot.pendingOutbox=[{operation:'upsert_user_identity',status:'queued',attempts:0,lockedAt:null,lockToken:null,hasError:false,processedAt:null}];f.state.reservation.source_snapshot=copy(f.state.snapshot)
  await assert.rejects(f.operator.collectReservedSource(op,fp),held(/pending_writer/))
 })
+await check('exact terminal quarantine is independently batch-verified while all original source evidence is retained',async()=>{
+ const f=withQuarantine(),before=sqlCopy(f.state.snapshot)
+ const value=await f.operator.collectReservedSource(op,fp)
+ assert.deepEqual(value.mappings,before.emails)
+ assert.equal(f.state.sql.filter(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')).length,1,
+  'Two retained dead rows require one bounded batch, not one query per row')
+ assert.deepEqual(f.state.nativeCalls,[])
+ assert.deepEqual(f.state.snapshot,before);assert.deepEqual(f.state.reservation.source_snapshot,before)
+ const material=(await f.operator.prepareForReview(f.input())).material
+ assert.equal(material.plan.emails.length,2);assert.equal(material.plan.pipelines.length,3)
+ assert.deepEqual(f.state.snapshot.pendingOutbox,before.pendingOutbox)
+ assert.deepEqual(material.plan.rootEmployeeGrants,[])
+ const replan=withQuarantine(installedFixture()),captured=await replan.operator.captureReplanSource(op,fp,replan.context)
+ assert.equal(captured.source.mappings.length,2)
+ assert.equal((await replan.operator.prepareForReview(replan.input())).material.plan.kind,'initial_enrollment_replan_v1')
+ assert.deepEqual(replan.state.snapshot.pendingOutbox,before.pendingOutbox)
+})
+await check('unverified, missing, duplicate, substituted and nonboolean quarantine responses hold before native access',async()=>{
+ const known=[retainedQuarantine(0),retainedQuarantine(1)]
+ for(const rows of [[],[{id:known[0].id,quarantined:true}],
+  [{id:known[0].id,quarantined:true},{id:known[0].id,quarantined:true}],
+  [{id:known[0].id,quarantined:true},{id:id(999),quarantined:true}],
+  [{id:known[0].id,quarantined:true},{id:known[1].id,quarantined:false}],
+  [{id:known[0].id,quarantined:true},{id:known[1].id,quarantined:null}],
+  [{id:known[0].id,quarantined:true},{id:known[1].id,quarantined:'true'}],
+  [...known.map(row=>({id:row.id,quarantined:true})),{id:id(999),quarantined:true}],
+ ]){const f=withQuarantine();f.state.quarantineResult=rows
+  await assert.rejects(f.operator.captureSource(op,fp),held(/pending_writer/));assert.deepEqual(f.state.nativeCalls,[])}
+ for(const mutate of [f=>{f.state.snapshot.pendingOutbox[0].rowFingerprint=hash('changed-full-outbox-row')},
+  f=>{f.state.snapshot.pendingOutbox[0].id=id(999)},f=>{f.state.snapshot.pendingOutbox[0].targetSystem='other'},
+  f=>{f.state.snapshot.pendingOutbox[0].rowFingerprint='invalid'},
+  f=>{f.state.snapshot.pendingOutbox[1].id=f.state.snapshot.pendingOutbox[0].id},
+  f=>{f.state.snapshot.pendingOutbox[0].operation='upsert_user_identity'},
+ ]){const f=withQuarantine();mutate(f);f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
+  await assert.rejects(f.operator.captureSource(op,fp),held(/pending_writer|hash/));assert.deepEqual(f.state.nativeCalls,[])}
+})
+await check('ordinary dead, failed, processing and retried work cannot inherit demo classification; untouched queued work still needs no bypass',async()=>{
+ for(const status of ['dead','failed','processing','queued']){const f=withQuarantine()
+  f.state.snapshot.pendingOutbox[0].status=status;f.state.quarantineEvidence.clear()
+  f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
+  await assert.rejects(f.operator.collectReservedSource(op,fp),held(/pending_writer/));assert.deepEqual(f.state.nativeCalls,[])}
+ const f=fixture();f.state.snapshot.pendingOutbox=[{operation:'upsert_record',status:'queued',attempts:0,
+  lockedAt:null,lockToken:null,hasError:false,processedAt:null}];f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
+ assert.equal((await f.operator.collectReservedSource(op,fp)).mappings.length,2)
+ assert.equal(f.state.sql.some(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')),false)
+})
 await check('source artifact bytes and native complete inventory must match independently; no completeness JSON accepted',async()=>{
  for(const mutate of [f=>{f.state.nativeSource.emails.pop()},f=>{f.state.nativeSource.emails[0].archived=false},f=>{f.state.nativeSource.emails[0].pipelineId=id(99)},
   f=>{f.state.nativeSource.complete=true},f=>{f.state.nativeSource.principalSuiteCrmUserIds.push('viewer')}]){const f=fixture();mutate(f);await assert.rejects(f.operator.prepareForReview(f.input()),held(/native_email_inventory|native_mapping_changed|shape|principal_inventory/))}
@@ -303,10 +365,31 @@ if(postgresMajor){
   for(let i=0;i<2;i++)await q(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,suitecrm_synced_at,reference_code,source_payload)
    VALUES($1,$2,$3,'Synthetic native source port counterpart',$4,$5,'Emails',now(),allocate_crm_reference('gi'),$6)`,
   [id(30+i),pipelineIds[i],'operator-real-sql-'+i,hash(['sql-source',i]),id(40+i),{archived:i===0}])
-  await q(`INSERT INTO workspace_organizations(id,name,organization_type,is_demo,created_by,updated_by) VALUES($1,'Synthetic demo excluded','root',true,$2,$2)`,[id(90),selection.actorEmail])
-  await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',[id(91),'Demo pipeline',selection.actorEmail,id(90)])
+  const demoWorkspace='10000000-0000-4000-8000-000000000001',demoOwner='demo-system@clawpilot.example',demoPipeline=id(110)
+  await q(`INSERT INTO workspace_organizations(id,name,organization_type,is_demo,created_by,updated_by) VALUES($1,'Synthetic demo excluded','root',true,$2,$2)`,[demoWorkspace,selection.actorEmail])
+  await q('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,reference_access_disabled) VALUES($1,$2,$3,$4,true)',[id(91),'Demo pipeline',selection.actorEmail,demoWorkspace])
   for(let i=0;i<2;i++)await q(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,suitecrm_synced_at,reference_code,source_payload)
    VALUES($1,$2,$3,'Seeded demo only',$4,$5,'Emails',now(),allocate_crm_reference('gi'),$6)`,[id(92+i),id(91),'operator-demo-'+i,hash(['demo',i]),'demo-suitecrm-interaction-'+(i+1),{source:'demo',synthetic:true}])
+  const demoJobs=[id(113),id(114)],demoMarker='Demo pipeline quarantined; immutable CRM identity evidence preserved'
+  await q("INSERT INTO app_users(email,role,status,crm_user_enabled) VALUES($1,'member','active',false)",[demoOwner])
+  await q('UPDATE app_users SET organization_id=$1 WHERE email=$2',[demoWorkspace,demoOwner])
+  await q(`INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,sync_enabled,reference_access_disabled)
+   VALUES($1,'Disabled demo source',$2,$3,false,true)`,[demoPipeline,demoOwner,demoWorkspace])
+  await q(`INSERT INTO crm_products(id,pipeline_id,source_key,name,source_hash,suitecrm_id,source_payload)
+   VALUES($1,$2,'quickbooks:item:operator-quarantine','Retained synthetic product',$3,'demo-suitecrm-product-1',
+   '{"provider":"quickbooks","synthetic":true}')`,[id(111),demoPipeline,hash('operator-quarantine-product')])
+  await q(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,source_payload)
+   VALUES($1,$2,'operator-quarantine-interaction','Retained synthetic email',$3,'demo-suitecrm-interaction-1','Emails',
+   '{"source":"demo","synthetic":true}')`,[id(112),demoPipeline,hash('operator-quarantine-interaction')])
+  for(const [index,entity,recordId,nativeId,operation]of [
+   [0,'products',id(111),'demo-suitecrm-product-1','upsert_record'],
+   [1,'interactions',id(112),'demo-suitecrm-interaction-1','reproject_record'],
+  ])await q(`INSERT INTO sync_outbox(id,target_system,aggregate_type,aggregate_id,operation,payload,status,attempts,last_error,available_at,processed_at)
+    VALUES($1,'suitecrm',$2,$3,$4,$5,'dead',$6,$7,'infinity',now())`,
+   [demoJobs[index],'crm_'+entity,recordId,operation,{entity,pipelineId:demoPipeline,localId:recordId,suiteCrmId:nativeId,
+    attributes:{name:'Synthetic retained quarantine'},...(entity==='interactions'?{suiteCrmModule:'Emails',previousSuiteCrmModule:'Notes'}:{})},index===0?1:4,demoMarker])
+  const retainedDemoJobs=async()=>(await q('SELECT id::text,to_jsonb(s)::text AS retained FROM sync_outbox s WHERE id=ANY($1::uuid[]) ORDER BY id',[demoJobs])).rows
+  const demoJobsBefore=await retainedDemoJobs()
   const Store=compiledBuild?.Store??load('app_src/lib/crm/nativeEmailInitialEnrollmentPostgres.ts').PostgresNativeEmailInitialEnrollmentStore
   const createIssuer=compiledBuild?.createIssuer??load('app_src/lib/crm/nativeEmailInitialEnrollmentApproval.ts').createNativeEmailInitialApprovalIssuer
   const ActualOperator=compiledBuild?.Operator??Operator
@@ -366,6 +449,10 @@ if(postgresMajor){
    const source=await operator.collectReservedSource(op,preview.sourceFingerprint);assert.equal(source.mappings.length,2);assert.equal(source.appGeneration,preview.generation)
    assert.ok(current.memberships.some(m=>m.user_email===selection.actorEmail&&Object.keys(m.permissions).length===0),'Real source must contain the seeded legitimate empty membership permissions object')
    assert.deepEqual(source.mappings.map(m=>m.nativeId),[id(40),id(41)]);assert.ok(statements.every(queries=>queries[0].includes('crm_native_email_publication_control')&&queries[0].includes('FOR UPDATE')))
+   assert.equal(current.pendingOutbox.length,2)
+   const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_demo_quarantine('))
+   assert.equal(batches.length,1,'Actual SQL collector independently verifies both retained demo rows in one batch')
+   assert.deepEqual(await retainedDemoJobs(),demoJobsBefore)
   })
   let material
   await check('REAL PG operator derives all three future policies and existing issuer independently admits exact reviewed material',async()=>{
@@ -381,6 +468,7 @@ if(postgresMajor){
    assert.equal(row.state,'admitted');assert.equal(row.plan_hash,material.planHash)
    const control=(await q('SELECT enabled,active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0]
    assert.equal(control.enabled,false);assert.equal(control.active_initial_enrollment_id,op)
+   assert.deepEqual(await retainedDemoJobs(),demoJobsBefore,'Actual issuer admission must preserve both terminal demo outbox receipts')
   })
   await check('REAL PG barrier blocks authority drift and independently denies wrong current operator selection',async()=>{
    await assert.rejects(q("UPDATE app_user_organization_memberships SET permissions='{}'::jsonb WHERE user_email='editor@example.invalid'"),e=>e.code==='55000')
@@ -392,6 +480,7 @@ if(postgresMajor){
   verifyCompiledBuild()
   postgresProof={major:Number(postgresMajor),actualSqlCollector:true,actualAppReservation:true,actualIssuerAdmission:true,
    actualCompiledModuleExecution:!!compiledBuild,compiledCliProof,
+   terminalDemoQuarantineRows:demoJobs.length,actualQuarantineBatchLookup:true,quarantineEvidenceUnchanged:isDeepStrictEqual(await retainedDemoJobs(),demoJobsBefore),
    nativeCollectorSynthetic:true,reviewApprovalSynthetic:true,nativeDispatch:false,activation:false,migrationSourcesFingerprint:migrationInventoryFingerprint(migrationHashes)}
  }finally{
   try{if(pool)await pool.end()}finally{

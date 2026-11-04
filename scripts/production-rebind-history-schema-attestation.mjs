@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v15'
+  'clawpilot-production-rebind-target-schema-attestation-v16'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -111,10 +111,15 @@ const PRE_INITIAL_REPLAN_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({ filename: '0398_crm_native_email_initial_enrollment.sql',
     checksum: '00ba0afd16e90ef321199e0c497b0f75029b3efc3d6af7edee0673e0bc20afd7' }),
 ])
-export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+const PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_MIGRATIONS = Object.freeze([
   ...PRE_INITIAL_REPLAN_SCHEMA_MIGRATIONS,
   Object.freeze({ filename: '0399_crm_native_email_initial_replan_lineage.sql',
     checksum: 'd701ad48ad8629c3ea71d3987c5eeba4a7df33b79b98ff46ca8c220de0b31a34' }),
+])
+export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+  ...PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_MIGRATIONS,
+  Object.freeze({ filename: '0400_crm_native_email_demo_quarantine.sql',
+    checksum: '623d7428e1ceb1f699614bbda22946203d5ffd8880e9800189017adb554e482f' }),
 ])
 
 // The rebind caller can take ACCESS SHARE locks on this exact, static list
@@ -189,7 +194,7 @@ const PRE_INITIAL_ENROLLMENT_CRITICAL_RELATIONS = Object.freeze([
 // Initial enrollment also fences the full native Email source inventory and
 // the shared outbox. These are direct lock/catalog targets: an incoming FK or
 // a trigger function alone does not fingerprint their own complete guards.
-export const PRODUCTION_REBIND_CRITICAL_RELATIONS = Object.freeze([
+const PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_RELATIONS = Object.freeze([
   ...PRE_INITIAL_ENROLLMENT_CRITICAL_RELATIONS,
   'public.crm_contacts',
   'public.crm_email_mailbox_bindings',
@@ -201,6 +206,10 @@ export const PRODUCTION_REBIND_CRITICAL_RELATIONS = Object.freeze([
   'public.crm_native_email_initial_enrollments',
   'public.crm_native_email_initial_reservations',
   'public.sync_outbox',
+].sort())
+export const PRODUCTION_REBIND_CRITICAL_RELATIONS = Object.freeze([
+  ...PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_RELATIONS,
+  'public.crm_products',
 ].sort())
 
 const PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
@@ -249,10 +258,14 @@ const PRE_INITIAL_REPLAN_CRM_GUARD_HELPERS = Object.freeze([
   'public.clawpilot_crm_native_initial_source_snapshot()',
   'public.clawpilot_crm_native_initial_shape(jsonb,text[])',
 ])
-export const PRODUCTION_REBIND_CRM_GUARD_HELPERS = Object.freeze([
+const PRE_INITIAL_DEMO_QUARANTINE_CRM_GUARD_HELPERS = Object.freeze([
   ...PRE_INITIAL_REPLAN_CRM_GUARD_HELPERS,
   'public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
   'public.clawpilot_crm_native_initial_replan_context(text,text,text)',
+])
+export const PRODUCTION_REBIND_CRM_GUARD_HELPERS = Object.freeze([
+  ...PRE_INITIAL_DEMO_QUARANTINE_CRM_GUARD_HELPERS,
+  'public.clawpilot_crm_native_initial_demo_quarantine(uuid,text)',
 ])
 const PRE_INITIAL_ENROLLMENT_CRITICAL_FUNCTIONS = Object.freeze([
   ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
@@ -266,6 +279,10 @@ const PRE_INITIAL_REPLAN_CRITICAL_FUNCTIONS = Object.freeze([
   ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
   ...PRE_INITIAL_REPLAN_CRM_GUARD_HELPERS,
 ])
+const PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_FUNCTIONS = Object.freeze([
+  ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
+  ...PRE_INITIAL_DEMO_QUARANTINE_CRM_GUARD_HELPERS,
+])
 
 // PostgreSQL can render equivalent catalog objects differently across major
 // versions. Each supported major is therefore exercised against the complete
@@ -278,11 +295,17 @@ export const PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze(
   16: 'cc19a57dd52699a99a5b65f6b194898f03e2afca0427bb671a751156b71ade53',
   18: '5fd850649717454a790185f22e916c2be58a80cdc8cbc87317fd4e936cc0d553',
 })
-// Actual full-catalog PG16/18 diagnostics r467/r468; the full tamper gate must
-// independently accept these pins. Never learn a replacement from runtime.
-const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+// Independently accepted through-0399 v15 catalogs. Forward enrollment must
+// preserve these historical pins; this metadata never attests a v16 target.
+export const PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: 'efbd7c05436a394e29c45522465602790f3fa8ff9cfcb9b12802cae416b8e864',
   18: 'c8da9f9b5d54395eb2527e9d472396bbf2b593b6312b2c14d4ef3ae13a3d130d',
+})
+// Enrollment requires independent full-catalog PG16/18 diagnostics followed by
+// the complete tamper gate. Never learn replacement pins from a live runtime.
+const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
+  18: '89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -1021,13 +1044,23 @@ export async function inspectPreInitialEnrollmentProductionRebindSchemaMetadata(
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v13-metadata-only' })
 }
 
-/** Exact through-0398 v14 comparison only, never a current v15 attestation. */
+/** Exact through-0398 v14 comparison only, never a current v16 attestation. */
 export async function inspectPreInitialReplanProductionRebindSchemaMetadata(client) {
   const result = await inspectSchemaWithFunctions(client,
     PRE_INITIAL_REPLAN_CRITICAL_FUNCTIONS,
-    PRODUCTION_REBIND_CRITICAL_RELATIONS,
+    PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_RELATIONS,
     PRE_INITIAL_REPLAN_SCHEMA_MIGRATIONS)
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v14-metadata-only' })
+}
+
+/** Exact through-0399 v15 comparison only. Neither missing 0400 evidence nor
+ * a historical catalog is a fallback for current quarantine attestation. */
+export async function inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata(client) {
+  const result = await inspectSchemaWithFunctions(client,
+    PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_FUNCTIONS,
+    PRE_INITIAL_DEMO_QUARANTINE_CRITICAL_RELATIONS,
+    PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_MIGRATIONS)
+  return Object.freeze({ ...result, format:'clawpilot-production-rebind-v15-metadata-only' })
 }
 
 export async function attestProductionRebindHistorySchema(client) {
@@ -1037,7 +1070,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0399',
+      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0400',
     )
   }
   if (
