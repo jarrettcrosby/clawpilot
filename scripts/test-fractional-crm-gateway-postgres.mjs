@@ -11,10 +11,14 @@ import {decodeHtmlEntities} from '../app_src/lib/htmlEntities.mjs'
 import {isFractionalCrmGatewayPath} from '../app_src/lib/fractionalCrmGatewayPath.mjs'
 import {disposablePostgresDockerArgs,disposablePostgresDockerCleanupArgs} from './lib/disposable-postgres-docker.mjs'
 import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
+import {inspectFractionalFolderSenderSources,runFractionalCustomerFolderJoined} from './lib/fractional-customer-folder-joined.mjs'
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg'),ts=require('typescript')
+const args=process.argv.slice(2)
+assert.ok(args.length===0||(args.length===1&&args[0]==='--with-fractional-folder-sender'),'Only the explicit joined sender opt-in is supported')
+const joinedSources=args.length?inspectFractionalFolderSenderSources(ts):null
 const read=path=>readFileSync(new URL(`../${path}`,import.meta.url),'utf8')
-function load(path,deps={}){const module={exports:{}};vm.runInNewContext(ts.transpileModule(read(path),{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
- {module,exports:module.exports,Buffer,URL,URLSearchParams,Request,Response,AbortSignal,Date,Error,Set,Map,process:{env:{}},require(name){if(Object.hasOwn(deps,name))return deps[name];if(name==='node:crypto')return require(name);return new Proxy({__esModule:true},{get(target,key){if(key==='__esModule')return true;return ()=>{throw new Error(`Unexpected integration dependency ${name}:${String(key)}`)}}})}}, {filename:path});return module.exports}
+function load(path,deps={},environment={}){const module={exports:{}};vm.runInNewContext(ts.transpileModule(read(path),{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+ {module,exports:module.exports,Buffer,URL,URLSearchParams,Request,Response,AbortSignal,Date,Error,Set,Map,process:{env:environment},require(name){if(Object.hasOwn(deps,name))return deps[name];if(name==='node:crypto')return require(name);return new Proxy({__esModule:true},{get(target,key){if(key==='__esModule')return true;return ()=>{throw new Error(`Unexpected integration dependency ${name}:${String(key)}`)}}})}}, {filename:path});return module.exports}
 const container=`clawpilot-fractional-crm-test-${process.pid}-${randomUUID().slice(0,8)}`;let started=false,pool
 try{
  execFileSync('docker',disposablePostgresDockerArgs(['run','--rm','-d','--name',container,'--pull','never','-e','POSTGRES_PASSWORD=fractional_gateway_fixture','-e','POSTGRES_DB=fractional_gateway_fixture','-p','127.0.0.1::5432','pgvector/pgvector:pg16']),{timeout:60000,stdio:'pipe'});started=true
@@ -243,6 +247,9 @@ try{
  await denied(()=>gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),'RECORD_NOT_FOUND')
  await pool.query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1',[credentialId,results[0].company.record.globalId])
  principal=await gateway.readFractionalCrmCredential(credentialId)
+ if(joinedSources){const joined=await runFractionalCustomerFolderJoined({Pool,connectionOptions:{host:'127.0.0.1',port:Number(port),user:'postgres',password:'fractional_gateway_fixture',ssl:false,connectionTimeoutMillis:1000},capture:joinedSources,
+  load,query,gateway,projection,stage,onboardingRequest:request,fixture:{org,pipeline,rootGlobalId:ga,instance,deployment,credentialId,token:fixtureToken,board,auth,isGatewayPath:isFractionalCrmGatewayPath,folderContract,fractionalOrganizationId:'fractional-fixture'}})
+  assert.equal(joined.passed,true);console.log(`FRACTIONAL_FOLDER_JOINED_EVIDENCE=${JSON.stringify(joined)}`)}
  const staleReview=request('stale-review','Existing A','another@example.invalid');staleReview.reviewDecisionToken='x'.repeat(43);check((await gateway.resolveOrCreateFractionalCrmOnboarding(principal,staleReview,'gateway-bogus-review')).reasonCodes.includes('REVIEW_STALE'),'caller cannot forge review decision')
  const duplicateDifferentSource=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,request('another-new-source',"Unique O'Neil &amp; <x>",'unique-new@example.invalid'),'gateway-create-duplicate');check(duplicateDifferentSource.status==='review_required','different source ID cannot create duplicate same-company invitation')
  await pool.query("UPDATE crm_contacts SET source_payload=jsonb_set(source_payload,'{archived}','true') WHERE id=$1",[cb.id]);await denied(()=>gateway.readFractionalCrmContact(principal,b.referenceCode,cb.referenceCode),'RECORD_RETIRED')
