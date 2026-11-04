@@ -72,7 +72,8 @@ function cp_joint_lifecycle_seed(string $adminId,string $clientId,string $client
 {
     cp_joint_lifecycle_need(PHP_SAPI==='cli'&&getenv('CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED')==='1'
         &&!file_exists(CP_JOINT_LIFECYCLE_CONTROL)&&count($related)===2,'fresh_source_seed');
-    foreach(['Accounts'=>'Account','Contacts'=>'Contact'] as $module=>$object){
+    $meetingRoundtrip=getenv('CLAWPILOT_NATIVE_JOINT_MEETING_ROUNDTRIP')==='1';
+    foreach(['Accounts'=>'Account','Contacts'=>'Contact',...($meetingRoundtrip?['Meetings'=>'Meeting']:[])] as $module=>$object){
         $bean=BeanFactory::newBean($module);$dynamic=new DynamicField($module);$dynamic->setup($bean);
         cp_joint_lifecycle_need(!$dynamic->getFieldWidget($module,'global_id_c'),'fresh_global_field');
         $field=get_widget('varchar');$field->name='global_id';$field->label='LBL_GLOBAL_ID';$field->vname='LBL_GLOBAL_ID';
@@ -84,21 +85,52 @@ function cp_joint_lifecycle_seed(string $adminId,string $clientId,string $client
         $GLOBALS['reload_vardefs']=true;$bean=BeanFactory::newBean($module);unset($GLOBALS['reload_vardefs']);
         cp_joint_lifecycle_need((bool)$bean->retrieve($nativeId,false),'related_retrieve');
         cp_joint_lifecycle_need($bean instanceof SugarBean&&$bean->id===$nativeId&&isset($bean->field_defs['global_id_c']),'exact_related_bean');
-        $bean->global_id_c=$globalId;cp_joint_lifecycle_need((bool)$bean->save(false),'related_global_save');
+        $bean->global_id_c=$globalId;
+        if($meetingRoundtrip&&$module==='Contacts')$bean->email1='joint-meeting-contact@example.invalid';
+        cp_joint_lifecycle_need((bool)$bean->save(false),'related_global_save');
         $records[]=['module'=>$module,'nativeId'=>$nativeId,'globalId'=>$globalId];
     }
     $state=['version'=>1,'fixtureOnly'=>true,'clientId'=>$clientId,'clientSecret'=>$clientSecret,'adminId'=>$adminId,'records'=>$records,
-        'missing'=>['module'=>'Accounts','nativeId'=>'joint-lifecycle-never-created','globalId'=>'ga1111111']];
+        'missing'=>['module'=>'Accounts','nativeId'=>'joint-lifecycle-never-created','globalId'=>'ga1111111'],
+        ...($meetingRoundtrip?['meetingRoundtrip'=>true,'contactEmail'=>'joint-meeting-contact@example.invalid']:[])];
+    if($meetingRoundtrip){
+        // Pinned stock Meeting::save invokes this derived free/busy cache.
+        // Run the actual implementation once as explicit synthetic setup,
+        // before RootA, to warm Calendar/vCal metadata and retain its row ID.
+        require_once 'modules/vCals/vCal.php';$admin=BeanFactory::getBean('Users',$adminId);
+        cp_joint_lifecycle_need($admin instanceof User&&$admin->id===$adminId&&$admin->is_admin==1,'freebusy_actual_fixture_admin');
+        vCal::cache_sugar_vcal($admin);
+        $manager=DBManagerFactory::getInstance();$result=$manager->query("SELECT id,user_id,type,source,deleted,date_entered,content FROM vcals WHERE user_id='"
+            .$manager->quote($adminId)."' AND type='vfb' AND source='sugar' AND deleted=0",true);$freebusy=[];
+        while($row=$manager->fetchByAssoc($result,false))$freebusy[]=$row;
+        cp_joint_lifecycle_need(count($freebusy)===1&&is_string($freebusy[0]['content'])&&strlen($freebusy[0]['content'])<=65536,'exact_freebusy_cache_setup');
+        $state['stockFreeBusyWarmup']=['fixtureOnly'=>true,'beforeRootSource'=>true,'actualStockCacheMethod'=>'vCal::cache_sugar_vcal',
+            'table'=>'vcals','nativeUserId'=>$adminId,'nativeRowId'=>$freebusy[0]['id'],'type'=>'vfb','source'=>'sugar','activeRows'=>1,
+            'dateEntered'=>$freebusy[0]['date_entered'],'contentBytes'=>strlen($freebusy[0]['content']),
+            'contentSha256'=>hash('sha256',$freebusy[0]['content']),'metadataDependenciesWarmed'=>true];
+    }
     cp_joint_lifecycle_save($state,true);
     $warmup=cp_joint_lifecycle_local_server(static function(array $state): array{
         $r=cp_joint_lifecycle_request('http://127.0.0.1:8099','','/Api/access_token',null,http_build_query([
             'grant_type'=>'client_credentials','client_id'=>$state['clientId'],'client_secret'=>$state['clientSecret']]),'POST','application/x-www-form-urlencoded');
         cp_joint_lifecycle_need($r['status']===200&&is_string($r['document']['access_token']??null),'real_oauth_grant');
-        $state['accessToken']=$r['document']['access_token'];unset($state['clientSecret']);$requests=[];
+        $state['accessToken']=$r['document']['access_token'];
+        if(($state['meetingRoundtrip']??false)!==true)unset($state['clientSecret']);$requests=[];
         foreach($state['records'] as $record){$result=cp_joint_lifecycle_request('http://127.0.0.1:8099','',
             '/Api/V8/module/'.$record['module'].'/'.$record['nativeId'],$state['accessToken'],'','GET');
             cp_joint_lifecycle_need($result['status']===200,'stock_api_warmup');$requests[]=['module'=>$record['module'],'status'=>$result['status'],'bodySha256'=>$result['bodySha256']];}
-        cp_joint_lifecycle_save($state);return ['actualTokenIssuedBeforeRootSource'=>true,'stockRecordWarmup'=>$requests];
+        if(($state['meetingRoundtrip']??false)===true){
+            $GLOBALS['reload_vardefs']=true;$meeting=BeanFactory::newBean('Meetings');unset($GLOBALS['reload_vardefs']);
+            cp_joint_lifecycle_need(isset($meeting->field_defs['global_id_c']),'meeting_global_field_warmed');
+            $result=cp_joint_lifecycle_request('http://127.0.0.1:8099','','/Api/V8/module/Meetings/joint-meeting-never-created',
+                $state['accessToken'],'','GET');
+            // The existing production client documents stock V8's400 for a
+            // valid module/id lookup with no matching bean;404 is also valid.
+            cp_joint_lifecycle_need(in_array($result['status'],[400,404],true),'stock_meeting_api_warmup');
+            $requests[]=['module'=>'Meetings','status'=>$result['status'],'bodySha256'=>$result['bodySha256'],'nonexistentFixtureOnly'=>true];
+        }
+        cp_joint_lifecycle_save($state);return ['actualTokenIssuedBeforeRootSource'=>true,'stockRecordWarmup'=>$requests,
+            ...(isset($state['stockFreeBusyWarmup'])?['stockFreeBusyWarmup'=>$state['stockFreeBusyWarmup']]:[])];
     });
     $state=cp_joint_lifecycle_control();$state['warmup']=$warmup;cp_joint_lifecycle_save($state);return $warmup;
 }

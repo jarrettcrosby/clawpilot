@@ -21,6 +21,37 @@ It does not replace that runbook or approve a release.
 
 ## Current release boundary (2026-11-04)
 
+The newest local mailbox correction is a separate owner-reviewed address
+preview/confirm workflow, not historical recovery. A read-only live profile
+observation found the selected Gmail profile and saved connection label differ;
+it did not establish an immutable Google subject or modify the connection.
+The local correction requires fresh signed Google identity plus an independent
+selected profile, same existing subject, expiring HMAC review, current owner and
+credential/connection/authority CAS, and atomic label/binding/audit writes.
+Expiry and profile freshness are checked again after lock acquisition. Normal
+intake remains mismatch-strict, and remote refresh retains a verified label only
+for the same known grant revision and unchanged credentials. Unknown/changed
+grant metadata deliberately falls back to remote metadata and re-verification.
+
+The final correction passes 41 real PostgreSQL checks on each of versions 16
+and 18 through all 386 migrations, including actual refresh/key-rotation paths,
+late failure rollback, concurrent applies, retained historical evidence and the
+real initial-enrollment source barrier. Google/profile inputs are synthetic in
+those database fixtures; they prove neither real Google authentication nor
+production recovery. Run `npm run test:crm-mailbox-label-repair:postgres` with
+the supported Node 24 runtime and the normal guarded database lease. The gate
+is included in the organization-communications test suite.
+
+The historical recovery boundary is still **three plus two**, not five already
+recovered Emails. Both Casey caches lack canonical mailbox/source IDs; neither
+ordinary re-intake nor the fixed-three bridge may silently upgrade them. They
+require a separately reviewed exact-two admission with retained/current evidence
+equality, fresh verified mailbox, exact IDs/participants/companies, transaction
+CAS and explicit unknown original provenance. That additional admission is not
+implemented by the address repair. The existing fixed-three boundary remains
+unchanged. Live permissions, recovery, provider readback and deployment remain
+unperformed.
+
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial
 operation stays cancelled; a newly reserved operation captures fresh native
@@ -57,6 +88,21 @@ database lease are independently confirmed absent. Artifact SHA-256:
 `b16b2cb73c863505867b937f8b8f20b9e0bb328586d823a40a7beec9db9f9771`.
 The [combined activation order](suitecrm.md#combining-deletion-sync-with-native-email-enrollment)
 is required; running an installer during enrolled startup is not a workaround.
+
+R521 adds the actual joined meeting path to that same PG18/native enrollment
+and two-container restart: 22 groups, 554 source hashes, the prior 107 full native
+audits plus 48 individually audited OAuth/V8 meeting requests. One controlled
+Calendar event imports one local/native Meeting, ClawPilot and native scalar
+edits produce exactly two Calendar PATCHes, and replay allocates no duplicate
+identity or extra Calendar PATCH. The native Contact relationship and Global ID
+remain stable. Pinned stock free/busy updates, exact parent timestamp touches,
+and four unsent NULL-to-empty field normalizations are explicitly constrained;
+all unrelated rows and 41,313 application files remain protected. Artifact
+SHA-256: `b3fa1f5d86066cca152e2aedfc2f729c199de94eeaf3df248d416dc9d4265e8f`.
+This is synthetic local fixture data with a controlled Calendar adapter, not
+live Google Calendar, non-UTC portability, attendee/recurrence editing, signed-in
+UI or production acceptance. Earlier failed fixture-audit attempts are retained
+as failures, not counted as passes.
 
 R489/R490 also pass the Shopify reconciliation-health regressions through all
 386 migrations on PG16/18 without changing the six established catalog phases.

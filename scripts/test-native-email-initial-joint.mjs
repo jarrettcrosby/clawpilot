@@ -19,6 +19,87 @@ import {auditNativeInitialColdCache} from './lib/native-initial-cold-cache.mjs'
 
 assert.equal(process.versions.node.split('.')[0],'24','Use the supported bundled Node24 runtime')
 assert.ok(process.execArgv.includes('--conditions=react-server'),'Run emitted server modules with --conditions=react-server')
+const MEETING_SCALAR_COLUMNS=Object.freeze(['name','description','date_start','date_end','duration_hours','duration_minutes',
+  'location','status','parent_id','parent_type','date_modified','modified_user_id'])
+const MEETING_EMPTY_RELATE_IDS=Object.freeze(['assigned_user_id','repeat_parent_id'])
+const MEETING_EMPTY_CUSTOM_STRINGS=Object.freeze(['jjwg_maps_address_c','jjwg_maps_geocode_status_c'])
+function assertNativeMeetingScalarRow(before,after,{attributes={},write=false}={}){
+  assert.ok(before&&after&&typeof before==='object'&&typeof after==='object'&&!Array.isArray(before)&&!Array.isArray(after))
+  assert.deepEqual(Object.keys(after).sort(),Object.keys(before).sort(),'Native Meeting row schema/identity shape changed')
+  const comparableBefore={...before},normalized=[]
+  for(const field of MEETING_EMPTY_RELATE_IDS)if(before[field]!==after[field]){
+    // Pinned stock SugarBean::populateFromRow plus DBManager::updateSQL maps
+    // unset SQLNULL id/dbType=id fields to ''. This is NOT permission to clear
+    // a real ID, reverse the normalization, or explicitly send an ID edit.
+    assert.ok(write&&before[field]===null&&after[field]===''&&!Object.hasOwn(attributes,field),
+      'Unreviewed native empty relate-ID transition: '+field)
+    comparableBefore[field]='';normalized.push(field)
+  }
+  const withoutScalars=row=>Object.fromEntries(Object.entries(row).filter(([key])=>!MEETING_SCALAR_COLUMNS.includes(key)))
+  assert.deepEqual(withoutScalars(after),withoutScalars(comparableBefore),'Scalar edit changed an unrelated Meeting column')
+  return normalized
+}
+function assertNativeMeetingCustomRow(before,after,{attributes={},write=false}={}){
+  assert.ok(before&&after&&typeof before==='object'&&typeof after==='object'&&!Array.isArray(before)&&!Array.isArray(after))
+  assert.deepEqual(Object.keys(after).sort(),Object.keys(before).sort(),'Native Meeting custom row schema/identity shape changed')
+  const comparableBefore={...before},normalized=[]
+  for(const field of MEETING_EMPTY_CUSTOM_STRINGS)if(before[field]!==after[field]){
+    // Stock hydration maps SQLNULL to ''; DynamicField::save persists these
+    // two nullable GoogleMaps varchar fields even when absent the API request.
+    // No real content clear, reverse transition, coordinate or ID edit allowed.
+    assert.ok(write&&before[field]===null&&after[field]===''&&!Object.hasOwn(attributes,field),
+      'Unreviewed native empty custom-string transition: '+field)
+    comparableBefore[field]='';normalized.push(field)
+  }
+  assert.deepEqual(after,comparableBefore,'Scalar edit changed an unrelated Meeting custom column')
+  return normalized
+}
+if(process.argv.length===3&&process.argv[2]==='--meeting-empty-relate-id-self-test'){
+  const base={id:'selected-meeting',assigned_user_id:null,repeat_parent_id:null,created_by:'actor',name:'before',outlook_id:null}
+  const accepted=[],rejected=[]
+  for(const fields of [[],['assigned_user_id'],['repeat_parent_id'],[...MEETING_EMPTY_RELATE_IDS]]){
+    const before=structuredClone(base),after={...before,name:'after'};for(const field of fields)after[field]=''
+    assert.deepEqual(assertNativeMeetingScalarRow(before,after,{write:true,attributes:{name:'after'}}),fields)
+    assert.deepEqual(before,base,'Audit comparison mutated the original row');accepted.push(fields)
+  }
+  for(const field of MEETING_EMPTY_RELATE_IDS){
+    for(const [from,to]of [['real-id',''],['real-id','other-id'],[null,'real-id'],['',null],['','real-id'],[null,' '],[null,0],[0,'']]){
+      assert.throws(()=>assertNativeMeetingScalarRow({...base,[field]:from},{...base,[field]:to},{write:true}))
+      rejected.push({field,from,to})
+    }
+    assert.throws(()=>assertNativeMeetingScalarRow(base,{...base,[field]:''},{write:true,attributes:{[field]:''}}));rejected.push({field,explicit:true})
+    assert.throws(()=>assertNativeMeetingScalarRow(base,{...base,[field]:''},{write:false}));rejected.push({field,readOnly:true})
+  }
+  assert.throws(()=>assertNativeMeetingScalarRow(base,{...base,outlook_id:''},{write:true}));rejected.push({unrelatedNull:true})
+  assert.throws(()=>assertNativeMeetingScalarRow(base,{...base,created_by:'other'},{write:true}));rejected.push({ownership:true})
+  const absent={...base};delete absent.repeat_parent_id
+  assert.throws(()=>assertNativeMeetingScalarRow(absent,{...base,repeat_parent_id:''},{write:true}));rejected.push({missingColumn:true})
+  const customBase={id_c:'selected-meeting',global_id_c:'gm1234567',jjwg_maps_address_c:null,
+    jjwg_maps_geocode_status_c:null,jjwg_maps_lat_c:'0.00000000',jjwg_maps_lng_c:'0.00000000',unrelated_custom_c:null}
+  const customAccepted=[],customRejected=[]
+  for(const fields of [[],['jjwg_maps_address_c'],['jjwg_maps_geocode_status_c'],[...MEETING_EMPTY_CUSTOM_STRINGS]]){
+    const before=structuredClone(customBase),after={...before};for(const field of fields)after[field]=''
+    assert.deepEqual(assertNativeMeetingCustomRow(before,after,{write:true,attributes:{name:'after'}}),fields)
+    assert.deepEqual(before,customBase,'Custom audit comparison mutated the original row');customAccepted.push(fields)
+  }
+  for(const field of MEETING_EMPTY_CUSTOM_STRINGS){
+    for(const [from,to]of [['real-content',''],['real-content','changed'],[null,'real-content'],['',null],['','real-content'],[null,' '],[null,0],[0,'']]){
+      assert.throws(()=>assertNativeMeetingCustomRow({...customBase,[field]:from},{...customBase,[field]:to},{write:true}))
+      customRejected.push({field,from,to})
+    }
+    assert.throws(()=>assertNativeMeetingCustomRow(customBase,{...customBase,[field]:''},{write:true,attributes:{[field]:''}}));customRejected.push({field,explicit:true})
+    assert.throws(()=>assertNativeMeetingCustomRow(customBase,{...customBase,[field]:''},{write:false}));customRejected.push({field,readOnly:true})
+  }
+  for(const field of ['id_c','global_id_c','jjwg_maps_lat_c','jjwg_maps_lng_c','unrelated_custom_c']){
+    assert.throws(()=>assertNativeMeetingCustomRow(customBase,{...customBase,[field]:''},{write:true}));customRejected.push({protectedField:field})
+  }
+  const customAbsent={...customBase};delete customAbsent.jjwg_maps_address_c
+  assert.throws(()=>assertNativeMeetingCustomRow(customAbsent,{...customBase,jjwg_maps_address_c:''},{write:true}));customRejected.push({missingColumn:true})
+  console.log(JSON.stringify({kind:'pure-native-meeting-empty-relate-id-audit',passed:true,accepted:accepted.length,rejected:rejected.length,
+    exactFields:MEETING_EMPTY_RELATE_IDS,customStrings:{accepted:customAccepted.length,rejected:customRejected.length,exactFields:MEETING_EMPTY_CUSTOM_STRINGS},
+    directional:'SQLNULL-to-empty-only-when-not-sent',databaseCreated:false,nativeHttpExecuted:false}))
+  process.exit(0)
+}
 const options={major:'16'}
 for(const arg of process.argv.slice(2)){
   if(/^--(?:source-zip|build|output)=\//.test(arg)){const at=arg.indexOf('=');const key=arg.slice(2,at);assert.equal(options[key],undefined);options[key]=arg.slice(at+1)}
@@ -26,12 +107,15 @@ for(const arg of process.argv.slice(2)){
   else if(/^--service-image=sha256:[a-f0-9]{64}$/.test(arg)){assert.equal(options.serviceImage,undefined);options.serviceImage=arg.slice('--service-image='.length)}
   else if(arg==='--replan-after-expiry'){assert.equal(options.replanAfterExpiry,undefined);options.replanAfterExpiry=true}
   else if(arg==='--with-record-lifecycle'){assert.equal(options.withRecordLifecycle,undefined);options.withRecordLifecycle=true}
+  else if(arg==='--with-meeting-roundtrip'){assert.equal(options.withMeetingRoundtrip,undefined);options.withMeetingRoundtrip=true}
   else if(arg==='--zip-preflight-only'){assert.equal(options.zipPreflightOnly,undefined);options.zipPreflightOnly=true}
-  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle]')
+  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip]')
 }
 assert.ok(!(options.serviceImage&&options.zipPreflightOnly),'Archive-only preflight does not exercise the service image')
 assert.ok(!options.replanAfterExpiry||options.serviceImage,'Expiry/replan proof requires the actual service image and true container restart')
 assert.ok(!options.withRecordLifecycle||options.serviceImage,'Authenticated record lifecycle proof requires the actual service image')
+assert.ok(!options.withMeetingRoundtrip||options.withRecordLifecycle&&options.serviceImage,'Meeting roundtrip requires lifecycle OAuth and the actual service image')
+if(options.withMeetingRoundtrip)assert.equal(process.env.TZ,'UTC','Launch the opt-in native meeting fixture with explicit TZ=UTC; do not rewrite native API dates')
 assert.ok(isAbsolute(options['source-zip']??'')&&isAbsolute(options.build??'')&&isAbsolute(options.output??''))
 assert.ok(options.output.endsWith('.json'),'Use one new JSON evidence artifact')
 const outputParent=lstatSync(dirname(options.output));assert.ok(outputParent.isDirectory()&&!outputParent.isSymbolicLink()&&outputParent.uid===process.getuid())
@@ -60,6 +144,12 @@ const {createNativeEmailInitialApprovalIssuer:createIssuer}=fromBuild('nativeEma
 const {createNativeEmailInitialStartupOriginIssuer:createOriginIssuer}=fromBuild('nativeEmailInitialStartupOrigin')
 const {nativeEmailCanonicalJson:json}=fromBuild('nativeEmailPublication')
 const source=resolve('services/suitecrm'),fixture=resolve('scripts/fixtures/native-email-audience-real'),startupFixture=resolve('scripts/fixtures/native-email-initial-joint-startup.php')
+const meetingModule=options.withMeetingRoundtrip?await import('./lib/native-joint-meeting-roundtrip.mjs'):null
+if(meetingModule){assert.equal(typeof meetingModule.runNativeJointMeetingRoundtrip,'function')
+  assert.equal(typeof meetingModule.prepareNativeJointMeetingFixture,'function')
+  assert.ok(Array.isArray(meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS)&&meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.length>0)
+  for(const path of meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS){assert.match(path,/^(?:app_src|scripts)\/[A-Za-z0-9_./-]+$/)
+    assert.ok(path.split('/').every(part=>part!==''&&part!=='.'&&part!=='..'),'Exact repository-owned meeting source paths required')}}
 // Exact Docker COPY inputs. In service-image mode /opt/clawpilot and Apache
 // configuration MUST come from the immutable built image, never host mounts.
 const imageSourceMap={}
@@ -81,7 +171,8 @@ const candidates=[resolve('scripts/test-native-email-initial-joint.mjs'),resolve
   ...['install-native-email-runtime.php','install-native-email-scope.php','native-email-scope/Patch.php','native-email-scope/Scope.php',
     'native-email-initial-cli.php','native-email-initial-artifacts.php','native-email-enrolled-startup.php','install-native-email-initial-state.php','native-email-initial-install-profile.json'].map(p=>join(source,p)),
   ...readdirSync('db/migrations').filter(p=>/^\d+_.+\.sql$/.test(p)).sort().map(p=>resolve('db/migrations',p)),
-  ...(options.serviceImage?[join(source,'Dockerfile'),...Object.keys(imageSourceMap)]:[])]
+  ...(options.serviceImage?[join(source,'Dockerfile'),...Object.keys(imageSourceMap)]:[]),
+  ...(meetingModule?[resolve('scripts/lib/native-joint-meeting-roundtrip.mjs'),...meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.map(path=>resolve(path))]:[])]
 const sourceHashes=Object.fromEntries(candidates.map(p=>[p,sha(readFileSync(p))]))
 const root=realpathSync(mkdtempSync(join(tmpdir(),'clawpilot-initial-joint.'))),owner=id(),label='com.clawpilot.native-initial-joint'
 writeFileSync(join(root,'owner.json'),JSON.stringify({owner,pid:process.pid})+'\n',{flag:'wx',mode:0o600})
@@ -89,6 +180,10 @@ const suffix=owner.slice(0,8),names={pg:'cp-initial-joint-'+suffix+'-pg',maria:'
   net:'cp-initial-joint-'+suffix+'-native-net',pgnet:'cp-initial-joint-'+suffix+'-pg-net',...(options.serviceImage?{appdata:'cp-initial-joint-'+suffix+'-app-data'}:{})}
 const deadline=Date.now()+600000,audits=[],checks=[],commandLog=[],storagePhases=[],appDataBudgets=[],appContainerHistory=[]
 let pool,token,secondaryClean=false,cleanupMode=false,cleaned=false,activeTransactions=0,report,imageProof,primaryCleanupAttempted=false,replanEvidence=null
+let meetingRoundtrip=null
+let meetingFixtureSeeds=null
+const meetingPrivateValues=[]
+const redactMeetingSecrets=value=>{let result=String(value??'');for(const secret of meetingPrivateValues)if(secret.length>=24)result=result.replaceAll(secret,'[private-synthetic-fixture-value]');return result}
 const recordLifecycle=options.withRecordLifecycle?{version:1,kind:'actual-joint-record-lifecycle',fixtureDataSynthetic:true,
   oauthMiddlewareSynthetic:false,endpointResponsesSynthetic:false,enabledBeforeRootSource:true,setup:[],httpPhases:[]}:null
 function run(command,args,extra={}){const remaining=cleanupMode?30000:deadline-Date.now();assert.ok(remaining>0,'Joint acceptance total 600-second deadline exceeded')
@@ -271,7 +366,8 @@ try{
     '--mount','type=bind,source='+archive+',target=/official.zip,readonly',...fixtureMounts,
     ...(options.serviceImage?[]:['--mount','type=bind,source='+source+',target=/opt/clawpilot,readonly']),
     '--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE=1','--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE_EMAILS=329',
-    ...(options.withRecordLifecycle?['--env','CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1']:[]),'--entrypoint','/bin/sh',php.Id,'-c',bootstrap])
+    ...(options.withRecordLifecycle?['--env','CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1']:[]),
+    ...(options.withMeetingRoundtrip?['--env','CLAWPILOT_NATIVE_JOINT_MEETING_ROUNDTRIP=1']:[]),'--entrypoint','/bin/sh',php.Id,'-c',bootstrap])
   appContainerHistory.push({phase:'fixture-construction',id:inspect(names.app).Id})
   until=Date.now()+180000;for(;;){try{run('docker',['exec',names.app,'test','-f','/tmp/native-initial-ready'],{timeout:3000});break}catch(e){
     const alive=inspect(names.app);if(!alive?.State.Running)throw Error('Native installation failed: '+(alive?run('docker',['logs',names.app]):'owned container absent'))
@@ -309,7 +405,8 @@ try{
   const nativeEnv=['CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=1','SUITECRM_NATIVE_AUTHORITY_ISSUER_KEY_ID='+keyId,
     'SUITECRM_NATIVE_AUTHORITY_INSTANCE_ID='+selection.nativeInstanceId,'SUITECRM_NATIVE_AUTHORITY_ISSUER_PUBLIC_KEY='+publicKey,
     'SUITECRM_NATIVE_AUTHORITY_SERVICE_USER_ID='+observed.serviceUserId,'SUITECRM_NATIVE_AUTHORITY_CLIENT_ID='+observed.oauthClientId,
-    ...(options.withRecordLifecycle?['CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1','SUITECRM_CLIENT_ID='+observed.oauthClientId]:[])]
+    ...(options.withRecordLifecycle?['CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1','SUITECRM_CLIENT_ID='+observed.oauthClientId]:[]),
+    ...(options.withMeetingRoundtrip?['CLAWPILOT_NATIVE_JOINT_MEETING_ROUNDTRIP=1']:[])]
   const deniedIds=observed.source.principalSuiteCrmUserIds.filter(p=>![observed.serviceUserId,observed.viewerId].includes(p));assert.equal(deniedIds.length,2)
   const people=[{email:selection.actorEmail,native:observed.serviceUserId,role:'owner'},
     {email:'joint.viewer@example.invalid',native:observed.viewerId,role:'member'},...deniedIds.map((native,i)=>({email:'joint.denied'+i+'@example.invalid',native,role:'member'}))]
@@ -338,7 +435,47 @@ try{
       SELECT e."localId"::uuid,e."pipelineId"::uuid,'joint-native-'||e."nativeId",'Actual joint seeded native Email',
       encode(digest(e."nativeId",'sha256'),'hex'),e."nativeId",'Emails',now(),e."globalId",jsonb_build_object('archived',e.archived)
       FROM jsonb_to_recordset($1::jsonb) AS e("localId" text,"pipelineId" text,"nativeId" text,"globalId" text,archived boolean)`,[JSON.stringify(observed.source.emails)])
+    if(options.withMeetingRoundtrip){
+      // Like the329 interaction fixture rows above, these two explicit INSERTs
+      // are synthetic setup, not a production Account/Contact adoption path.
+      const [account,contact]=recordLifecycle.fixture.records,policy=observed.pipelines[0].policy
+      const accountId=id(),contactId=id(),contactEmail='joint-meeting-contact@example.invalid'
+      const payload={fixtureOnly:true,source:'joint-native-meeting-prerequisite',accountAdoptionProven:false}
+      await q(`INSERT INTO crm_organizations(id,pipeline_id,suitecrm_id,source_key,identity_key,name,account_type,relationship_type,
+        source_payload,source_hash,sync_status,suitecrm_synced_at,reference_code,created_by,updated_by)
+        VALUES($1,$2,$3,$4,$4,'Synthetic initial related first','Customer','customer',$5,$6,'synced',now(),$7,$8,$8)`,
+        [accountId,policy.pipelineId,account.nativeId,'customer:name:synthetic initial related first',payload,
+          sha('joint-meeting-native-account:'+account.nativeId),account.globalId,selection.actorEmail])
+      await q(`INSERT INTO crm_contacts(id,pipeline_id,organization_id,suitecrm_id,source_key,identity_key,full_name,last_name,email,
+        source_payload,source_hash,sync_status,suitecrm_synced_at,reference_code,created_by,updated_by)
+        VALUES($1,$2,$3,$4,$5,$5,'Initial first','Initial first',$6,$7,$8,'synced',now(),$9,$10,$10)`,
+        [contactId,policy.pipelineId,accountId,contact.nativeId,'email:'+contactEmail,contactEmail,payload,
+          sha('joint-meeting-native-contact:'+contact.nativeId),contact.globalId,selection.actorEmail])
+      meetingFixtureSeeds={fixtureOnly:true,phase:'before-RootA-source-reservation',method:'explicit-synthetic-PG-INSERT',
+        pipelineId:policy.pipelineId,account:{localId:accountId,nativeId:account.nativeId,globalId:account.globalId},
+        contact:{localId:contactId,nativeId:contact.nativeId,globalId:contact.globalId,email:contactEmail},accountContactAdoptionProven:false}
+    }
   })
+  if(meetingModule){
+    // Actual users.ensureOwnerUser normalizes configured-owner permissions.
+    // Prepare it before RootA; never bypass authorization or trigger a new
+    // global-owner authority transition after native initial activation.
+    const mappingSql=`SELECT email,suitecrm_user_id,suitecrm_username,reference_code,crm_user_enabled,role,status
+      FROM app_users ORDER BY email`
+    const before=(await q(mappingSql)).rows,policy=observed.pipelines[0].policy
+    assert.equal(before.length,4)
+    const beforeControl=(await q('SELECT enabled,active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0]
+    assert.equal(beforeControl.enabled,false);assert.equal(beforeControl.active_initial_enrollment_id,null)
+    const prepared=await meetingModule.prepareNativeJointMeetingFixture({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+      authority:{actorEmail:selection.actorEmail,pipelineId:policy.pipelineId,workspaceOrganizationId:policy.workspaceId},deadline})
+    assert.equal(prepared.passed,true);assert.equal(prepared.configuredOwnerEmail,selection.actorEmail)
+    assert.equal(prepared.actualEnsureOwnerUser,true)
+    assert.deepEqual((await q(mappingSql)).rows,before,'Configured-owner preparation changed a mapped native principal identity or eligibility')
+    const afterControl=(await q('SELECT enabled,active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0]
+    assert.equal(afterControl.enabled,false);assert.equal(afterControl.active_initial_enrollment_id,null)
+    meetingFixtureSeeds.ownerNormalization={...prepared,phase:'before-RootA-source-reservation',nativePrincipalMappingsPreserved:4}
+    console.log('PASS actual configured owner normalization prepared before RootA without bypassing user or scope authorization')
+  }
   const verification={publicKey,keyId,serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId}
   const initialStore=new Store(transaction,selection,undefined,verification),preview=await initialStore.preview(),operationId=observed.operationId
   await check('real SQL source reservation is committed before native source transport or any offline installation',async()=>{
@@ -740,11 +877,206 @@ try{
     assert.equal(replanEvidence.sqlTerminalInventory.length,3);assert.equal(replanEvidence.sqlTerminalInventory.filter(row=>row.state==='cancelled').length,2)
     assert.deepEqual(replanEvidence.sqlTerminalInventory.filter(row=>row.state==='activated').map(row=>row.operation_id),[activationOperationId])
   }
+  if(meetingModule){
+    await check('actual joined Calendar import, ClawPilot edit and native V8 edit preserve one meeting and event without replay duplicates',async()=>{
+      assert.equal(serviceStartup?.passed,true);assert.equal(recordLifecycle?.passed,true)
+      const meetingUntil=Math.min(deadline,Date.now()+120000),nativeAudits=[]
+      meetingRoundtrip={version:1,kind:'actual-joined-meeting-roundtrip',passed:false,nativeAudits,
+        bounds:{totalSeconds:120,nativeHttpRequests:60,aggregateResponseBytes:2097152,httpSeconds:6},
+        fixtureSeeding:meetingFixtureSeeds,testProcessTimezone:'UTC',nonUtcServerPortabilityProven:false,
+        nativeResponsesSynthetic:false,oauthResponsesSynthetic:false,calendarAdapterControlled:true,productionTouched:false}
+      const fixtureCall=(mode,input)=>JSON.parse(run('docker',['exec',...(input===undefined?[]:['--interactive']),names.app,
+        'php','-d','memory_limit=384M','-d','display_errors=0','/fixture/native-joint-meeting.php',mode],
+        {timeout:Math.max(1,Math.min(12000,meetingUntil-Date.now())),...(input===undefined?{}:{input:JSON.stringify(input)})}))
+      // These synthetic credentials remain only in private fixture storage and
+      // this process/pipe. Never attach them or a native OAuth body to evidence.
+      const fixtureCredentials=fixtureCall('credentials'),policy=observed.pipelines[0].policy
+      meetingPrivateValues.push(fixtureCredentials.clientSecret,fixtureCredentials.accessToken)
+      const authority={actorEmail:selection.actorEmail,pipelineId:policy.pipelineId,workspaceOrganizationId:policy.workspaceId}
+      assert.equal(fixtureCredentials.clientId,observed.oauthClientId)
+      const fileState=()=>JSON.parse(run('docker',['exec',names.app,'php','-d','memory_limit=384M','/joint-startup.php','--service-files'],{timeout:45000,maxBuffer:24000000}))
+      let nativeMeetingId=null,nativeGlobalId=null,requests=0,responseBytes=0,grants=0
+      const beforeAll=rawState(),filesBefore=fileState(),initialRows=fixtureCall('rows',{nativeMeetingId:null})
+      assert.equal(initialRows.meetings?.otherCount,0,'The meeting fixture must not adopt any existing native Meeting')
+      const allowedTables=['meetings','meetings_cstm','meetings_contacts','meetings_users','meetings_audit','oauth2tokens','vcals','accounts','contacts']
+      // Pinned stock SugarBean::update_parent_relationships queues the old
+      // parent for SugarRelationship::resaveRelatedBeans. SugarBean::save then
+      // touches these2 timestamp/actor columns; no business mutation is allowed.
+      const parentMutableFields=['date_modified','modified_user_id']
+      const parentBusinessRow=row=>Object.fromEntries(Object.entries(row).filter(([key])=>!parentMutableFields.includes(key)))
+      const parentIds={accounts:fixtureCredentials.nativeAccountId,contacts:fixtureCredentials.nativeContactId}
+      const originalParents={}
+      for(const table of Object.keys(parentIds)){assert.equal(initialRows[table]?.selected.length,1)
+        originalParents[table]=parentBusinessRow(initialRows[table].selected[0])}
+      const stableFreeBusy=row=>Object.fromEntries(Object.entries(row).filter(([key])=>!['content','date_modified'].includes(key)))
+      assert.equal(initialRows.vcals?.selected.length,1,'Actual stock free/busy cache must be prewarmed before RootA')
+      const originalFreeBusy=stableFreeBusy(initialRows.vcals.selected[0])
+      const validateRows=rows=>{
+        for(const [table,nativeId]of Object.entries(parentIds)){assert.equal(rows[table]?.selected.length,1,'Exact existing fixture parent row required')
+          const row=rows[table].selected[0];assert.equal(row.id,nativeId);assert.equal(String(row.deleted),'0')
+          assert.deepEqual(parentBusinessRow(row),originalParents[table],'A business/identity/ownership field of the fixture parent changed')
+          assert.equal(row.modified_user_id,observed.serviceUserId,'Unexpected parent timestamp actor')
+          assert.match(row.date_modified,/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/)}
+        assert.ok((rows.meetings?.selected.length??0)<=1);assert.ok((rows.meetings_cstm?.selected.length??0)<=1)
+        for(const row of rows.meetings?.selected??[]){assert.equal(row.id,nativeMeetingId);assert.equal(String(row.deleted),'0')
+          if(row.parent_id){assert.ok(['Accounts','Contacts'].includes(row.parent_type))
+            assert.equal(row.parent_id,row.parent_type==='Accounts'?fixtureCredentials.nativeAccountId:fixtureCredentials.nativeContactId)}
+          else assert.ok(!row.parent_type)
+          assert.ok(!row.assigned_user_id||row.assigned_user_id===observed.serviceUserId)}
+        for(const row of rows.meetings_cstm?.selected??[]){assert.equal(row.id_c,nativeMeetingId)
+          if(nativeGlobalId!==null)assert.equal(row.global_id_c,nativeGlobalId)}
+        for(const [table,key,expected]of [['meetings_contacts','contact_id',fixtureCredentials.nativeContactId],['meetings_users','user_id',observed.serviceUserId]]){
+          assert.ok((rows[table]?.selected.length??0)<=2,'Unexpected duplicate physical meeting relationship')
+          for(const row of rows[table]?.selected??[]){assert.equal(row.meeting_id,nativeMeetingId);assert.equal(row[key],expected)
+            assert.ok(['0','1'].includes(String(row.deleted)))}}
+        const auditFields=['name','description','date_start','date_end','duration_hours','duration_minutes','location','status','parent_id','parent_type','assigned_user_id','global_id_c']
+        for(const row of rows.meetings_audit?.selected??[]){assert.equal(row.parent_id,nativeMeetingId)
+          assert.ok(auditFields.includes(row.field_name),'Unrequested native meeting audit field changed')}
+        assert.equal(rows.vcals?.selected.length,1,'Exactly one active actor/vfb/sugar free-busy cache row required')
+        const freebusy=rows.vcals.selected[0];assert.equal(freebusy.user_id,observed.serviceUserId)
+        assert.equal(freebusy.type,'vfb');assert.equal(freebusy.source,'sugar');assert.equal(String(freebusy.deleted),'0')
+        assert.deepEqual(stableFreeBusy(freebusy),originalFreeBusy,'Derived free/busy immutable row identity changed')
+        assert.equal(typeof freebusy.content,'string');assert.ok(Buffer.byteLength(freebusy.content,'utf8')<=65536)
+        assert.ok(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(freebusy.content))
+        const normalizedLines=freebusy.content.replace(/\r\n/g,'\n');assert.ok(!normalizedLines.includes('\r'),'Bare CR in stock free/busy content')
+        const lines=normalizedLines.replace(/\n[ \t]/g,'').split('\n');assert.equal(lines.pop(),'')
+        assert.ok(lines.length>=10&&lines.length<=2048&&lines.every(line=>line.length<=1024))
+        assert.deepEqual(lines.slice(0,4),['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//SuiteCRM//SuiteCRM Calendar//EN','BEGIN:VFREEBUSY'])
+        assert.deepEqual(lines.slice(-2),['END:VFREEBUSY','END:VCALENDAR'])
+        const timestamp='(?:[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}|[0-9]{8}T[0-9]{6}Z)'
+        for(const label of ['DTSTART','DTEND','DTSTAMP'])assert.equal(lines.filter(line=>new RegExp('^'+label+':'+timestamp+'$').test(line)).length,1)
+        assert.equal(lines.filter(line=>/^ORGANIZER;CN=[^\r\n]{1,256}:VFREEBUSY$/.test(line)).length,1)
+        for(const line of lines.slice(4,-2))assert.ok(/^ORGANIZER;CN=[^\r\n]{1,256}:VFREEBUSY$/.test(line)
+          ||new RegExp('^(?:DTSTART|DTEND|DTSTAMP):'+timestamp+'$').test(line)
+          ||/^FREEBUSY:[0-9]{8}T[0-9]{6}Z\/[0-9]{8}T[0-9]{6}Z$/.test(line)
+          ||/^X-FREEBUSY-ID:[a-zA-Z0-9-]{1,64}$/.test(line)||/^X-FREEBUSY-TYPE:(?:Meeting|Call|Task)$/.test(line),
+        'Unrecognized content in derived stock VCALENDAR/VFREEBUSY cache')
+      }
+      const nativeFetch=async(resource,init={})=>{
+        assert.ok(Date.now()<meetingUntil,'Meeting helper120-second deadline exceeded')
+        assert.equal(activeTransactions,0,'Meeting native HTTP occurred inside a PostgreSQL transaction')
+        assert.ok(typeof resource==='string'||resource instanceof URL,'Only explicit native URLs admitted')
+        const url=new URL(String(resource));assert.equal(url.origin,'https://suitecrm-joint.example.invalid')
+        assert.ok(url.pathname.startsWith('/legacy/Api/'));assert.equal(url.username,'');assert.equal(url.password,'');assert.equal(url.hash,'')
+        const method=String(init.method||'GET').toUpperCase(),body=init.body===undefined||init.body===null?null:String(init.body)
+        assert.ok(['GET','POST','PATCH'].includes(method));assert.ok(++requests<=60)
+        init.signal?.throwIfAborted()
+        const grant=url.pathname==='/legacy/Api/access_token'&&method==='POST'
+        const moduleWrite=url.pathname==='/legacy/Api/V8/module'&&['POST','PATCH'].includes(method)
+        const relationshipWrite=method==='POST'&&/\/Meetings\/[^/]+\/relationships\/(?:contacts|accounts)$/.test(url.pathname)
+        const targetMatch=url.pathname.match(/^\/legacy\/Api\/V8\/module\/Meetings\/([a-f0-9-]{36})(?:\/relationships\/(?:contacts|accounts))?$/i)
+        const payload=moduleWrite?JSON.parse(body):null,targetId=payload?.data?.id??targetMatch?.[1]
+        if(targetId){assert.match(targetId,/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i)
+          if(nativeMeetingId===null)nativeMeetingId=targetId;else assert.equal(targetId,nativeMeetingId,'Native HTTP attempted a second meeting identity')}
+        if(moduleWrite){assert.equal(payload.data.type,'Meetings');const globalId=payload.data.attributes?.global_id_c
+          if(globalId!==undefined){assert.match(globalId,/^gm(?:[0-9]{7}|[0-9a-v]{12})$/)
+            if(nativeGlobalId===null)nativeGlobalId=globalId;else assert.equal(globalId,nativeGlobalId)}}
+        for(const module of ['Accounts','Contacts']){const match=url.pathname.match(new RegExp('^/legacy/Api/V8/module/'+module+'/([^/]+)$'))
+          if(match)assert.equal(match[1],module==='Accounts'?fixtureCredentials.nativeAccountId:fixtureCredentials.nativeContactId)}
+        if(grant)assert.equal(++grants,1,'Only one actual production-client OAuth grant is needed')
+        const before=rawState(),rowsBefore=fixtureCall('rows',{nativeMeetingId})
+        const wire=fixtureCall('request',{url:String(url),method,headers:[...new Headers(init.headers||{}).entries()],body})
+        if(grant){const token=JSON.parse(wire.body).access_token;if(typeof token==='string')meetingPrivateValues.push(token)}
+        const after=rawState(),rowsAfter=fixtureCall('rows',{nativeMeetingId}),changed=Object.keys(before.database).filter(table=>before.database[table]!==after.database[table])
+        assert.deepEqual(Object.keys(after.database),Object.keys(before.database),'Meeting HTTP created an unreviewed native table')
+        assert.ok(changed.every(table=>grant?table==='oauth2tokens':(moduleWrite||relationshipWrite)&&allowedTables.includes(table)&&table!=='oauth2tokens'),
+          'Meeting HTTP changed an unrelated native table: '+changed.join(','))
+        const parentColumnChanges=[]
+        for(const table of allowedTables){assert.equal(rowsAfter[table]===null,rowsBefore[table]===null)
+          if(rowsBefore[table]===null)continue
+          assert.equal(rowsAfter[table].otherSha256,rowsBefore[table].otherSha256,'Meeting HTTP changed unrelated native '+table+' rows')
+          assert.equal(rowsAfter[table].otherCount,rowsBefore[table].otherCount)
+          if(Object.hasOwn(parentIds,table)){
+            assert.equal(rowsBefore[table].selected.length,1);assert.equal(rowsAfter[table].selected.length,1)
+            const prior=rowsBefore[table].selected[0],next=rowsAfter[table].selected[0]
+            assert.deepEqual(Object.keys(next).sort(),Object.keys(prior).sort())
+            const columns=Object.keys(prior).filter(key=>prior[key]!==next[key]).sort()
+            assert.ok(columns.every(key=>parentMutableFields.includes(key)),'Relationship re-save changed an unreviewed parent column')
+            if(columns.length)parentColumnChanges.push({table,nativeId:parentIds[table],changedColumns:columns})
+          }
+          if(table==='oauth2tokens'){
+            const prior=rowsBefore[table].selected,next=rowsAfter[table].selected
+            if(!grant)assert.equal(sha(stable(next)),sha(stable(prior)),'Ordinary V8 request changed OAuth token rows')
+            else{assert.equal(next.length,prior.length+1);for(const old of prior)assert.equal(sha(stable(next.find(row=>row.id===old.id))),sha(stable(old)))
+              for(const row of next.filter(row=>!prior.some(old=>old.id===row.id))){assert.equal(row.client,observed.oauthClientId)
+                assert.equal(row.assigned_user_id,observed.serviceUserId);assert.equal(String(row.deleted),'0');assert.equal(String(row.token_is_revoked),'0')}}
+          }
+        }
+        validateRows(rowsAfter);assert.deepEqual(after.critical,before.critical,'Meeting HTTP changed protected native files')
+        const emptyRelateIdNormalizations=[]
+        for(const old of rowsBefore.meetings?.selected??[]){const next=rowsAfter.meetings.selected.find(row=>row.id===old.id)
+          assert.ok(next,'Scalar meeting flow removed its original row')
+          const fields=assertNativeMeetingScalarRow(old,next,{attributes:payload?.data?.attributes??{},write:moduleWrite||relationshipWrite})
+          if(fields.length)emptyRelateIdNormalizations.push({nativeMeetingId,fields,direction:'SQLNULL-to-empty',notPresentInRequest:true})}
+        const emptyCustomStringNormalizations=[]
+        for(const old of rowsBefore.meetings_cstm?.selected??[]){const next=rowsAfter.meetings_cstm.selected.find(row=>row.id_c===old.id_c)
+          assert.ok(next,'Scalar meeting flow removed its original custom row')
+          const fields=assertNativeMeetingCustomRow(old,next,{attributes:payload?.data?.attributes??{},write:moduleWrite||relationshipWrite})
+          if(fields.length)emptyCustomStringNormalizations.push({nativeMeetingId,fields,direction:'SQLNULL-to-empty',notPresentInRequest:true})}
+        for(const table of ['meetings_contacts','meetings_users','meetings_audit'])for(const old of rowsBefore[table]?.selected??[]){
+          const next=rowsAfter[table].selected.find(row=>(row.id??row.id_c)===(old.id??old.id_c))
+          assert.deepEqual(next,old,'Meeting flow changed or removed an existing native custom/relationship/audit row')}
+        const cache=auditNativeInitialColdCache(before.cache,after.cache,before.stockAudit,after.stockAudit)
+        responseBytes+=Buffer.byteLength(wire.body,'utf8');assert.ok(responseBytes<=2097152,'Meeting HTTP aggregate response ceiling exceeded')
+        nativeAudits.push({method,path:url.pathname,status:wire.status,tableCount:Object.keys(before.database).length,changedTables:changed,
+          exactNativeMeetingId:nativeMeetingId,unrelatedRowsUnchanged:true,criticalFilesUnchanged:true,
+          stockFreeBusy:{nativeRowId:originalFreeBusy.id,userId:observed.serviceUserId,type:'vfb',source:'sugar',
+            mutableFieldsOnly:['content','date_modified'],contentSha256:sha(rowsAfter.vcals.selected[0].content)},
+          beforeStateHash:sha(stable(before)),afterStateHash:sha(stable(after)),
+          actualOAuthGrant:grant,parentColumnChanges,emptyRelateIdNormalizations,emptyCustomStringNormalizations,
+          sentAttributeNames:moduleWrite?Object.keys(payload.data.attributes).sort():[],
+          selectedRowCounts:Object.fromEntries(allowedTables.map(table=>[table,rowsAfter[table]?.selected.length??null])),...cache})
+        init.signal?.throwIfAborted();assert.ok(Date.now()<meetingUntil,'Meeting helper120-second deadline exceeded')
+        return new Response([204,205,304].includes(wire.status)?null:wire.body,{status:wire.status,headers:wire.headers})
+      }
+      const result=await meetingModule.runNativeJointMeetingRoundtrip({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+        nativeFetch,fixture:fixtureCredentials,authority,deadline:meetingUntil})
+      assert.ok(Date.now()<=meetingUntil,'Meeting helper120-second deadline exceeded');assert.equal(result.passed,true)
+      const afterAll=rawState(),filesAfter=fileState(),rowsAfter=fixtureCall('rows',{nativeMeetingId})
+      validateRows(rowsAfter);assert.equal(rowsAfter.meetings.selected.length,1);assert.equal(rowsAfter.meetings_cstm.selected.length,1)
+      const activeContacts=rowsAfter.meetings_contacts.selected.filter(row=>String(row.deleted)==='0')
+      assert.equal(activeContacts.length,1,'Native Meeting must have exactly one durable undeleted fixture Contact relationship')
+      assert.equal(activeContacts[0].meeting_id,nativeMeetingId);assert.equal(activeContacts[0].contact_id,fixtureCredentials.nativeContactId)
+      assert.deepEqual(Object.keys(afterAll.database),Object.keys(beforeAll.database))
+      const changedTables=Object.keys(beforeAll.database).filter(table=>beforeAll.database[table]!==afterAll.database[table])
+      assert.ok(changedTables.every(table=>allowedTables.includes(table)))
+      assert.deepEqual(afterAll.critical,beforeAll.critical);assert.deepEqual(Object.keys(filesAfter),Object.keys(filesBefore))
+      const changedFiles=Object.keys(filesBefore).filter(path=>JSON.stringify(filesBefore[path])!==JSON.stringify(filesAfter[path]))
+      assert.ok(changedFiles.every(path=>['app/public/legacy/cache/modules/Audit','app/public/legacy/cache/modules/Audit/Auditvardefs.php'].includes(path)),
+        'Meeting HTTP introduced unreviewed file drift; inspect exact pre-RootA warmup: '+changedFiles.join(','))
+      for(const secret of meetingPrivateValues)assert.ok(!JSON.stringify(result).includes(secret),'Meeting evidence leaked a fixture credential')
+      meetingRoundtrip={...meetingRoundtrip,...result,nativeAudits,nativeHttpRequests:requests,aggregateNativeResponseBytes:responseBytes,
+        actualProductionClientOAuthGrants:grants,nativeMeetingId,nativeGlobalId,tableCount:Object.keys(beforeAll.database).length,
+        nativeContactAssociation:{activeRows:1,nativeMeetingId,nativeContactId:fixtureCredentials.nativeContactId},
+        derivedStockFreeBusy:{nativeRowId:originalFreeBusy.id,userId:observed.serviceUserId,type:'vfb',source:'sugar',
+          prewarmedBeforeRootA:true,immutableIdentityUnchanged:true,onlyContentAndDateModifiedMutable:true},
+        derivedStockParentTouches:{provenance:{sourceZipSha256:ZIP_SHA,
+          queue:'SugarBean::update_parent_relationships',drain:'SugarRelationship::resaveRelatedBeans',timestampWriter:'SugarBean::save'},
+          allowedColumns:parentMutableFields,exactParentIds:parentIds,businessIdentityOwnershipFieldsUnchanged:true,
+          changes:nativeAudits.flatMap(audit=>audit.parentColumnChanges.map(change=>({method:audit.method,path:audit.path,...change})))},
+        derivedStockEmptyRelateIds:{provenance:{sourceZipSha256:ZIP_SHA,
+          hydration:'SugarBean::populateFromRow',write:'DBManager::updateSQL/isNullable/emptyValue',
+          assignedUserDefinition:'include/SugarObjects/implements/assignable/vardefs.php:dbType=id',
+          repeatParentDefinition:'modules/Meetings/vardefs.php:type=id'},
+          exactFields:MEETING_EMPTY_RELATE_IDS,directional:'SQLNULL-to-empty-only-when-not-sent',
+          changes:nativeAudits.flatMap(audit=>audit.emptyRelateIdNormalizations.map(change=>({method:audit.method,path:audit.path,...change})))},
+        derivedStockEmptyCustomStrings:{provenance:{sourceZipSha256:ZIP_SHA,
+          hydration:'SugarBean::populateFromRow',save:'SugarBean::save -> DynamicField::save',
+          definitions:'install/suite_install/GoogleMaps.php:Meetings nullable varchar'},
+          exactFields:MEETING_EMPTY_CUSTOM_STRINGS,directional:'SQLNULL-to-empty-only-when-not-sent',
+          identityGlobalIdCoordinatesAndOtherColumnsUnchanged:true,
+          changes:nativeAudits.flatMap(audit=>audit.emptyCustomStringNormalizations.map(change=>({method:audit.method,path:audit.path,...change})))},
+        changedTables,changedFiles,unrelatedNativeRowsUnchanged:true,protectedNativeFilesUnchanged:true,
+        beforeStateSha256:sha(stable(beforeAll)),afterStateSha256:sha(stable(afterAll)),allAppFilesAudited:Object.keys(filesBefore).length}
+      appDataBudget('after-joined-meeting-roundtrip')
+      if(verifyAncestorPreservation)await verifyAncestorPreservation('after-C-joined-meeting-roundtrip')
+    })
+  }
   for(const [p,h]of Object.entries(sourceHashes))assert.equal(sha(readFileSync(p)),h,'Consumed source changed: '+p)
   checkBuild()
   report={version:1,kind:'actual-local-native-initial-joint-rehearsal',passed:true,postgresMajor:Number(options.major),sourceZipSha256:ZIP_SHA,resourceOwner:owner,resourceNames:names,
     sourceHashes,buildManifestSha256:sha(readFileSync(join(build,'build-manifest.json'))),checks,audits,commandLog,storagePhases,startupComponent,
-    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,
+    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,
     emailCount:329,principalCount:4,pipelineCount:3,actualPgReservation:true,actualSqlAuthorityCollector:true,actualNativeCli:true,
     actualNativeForecasts:true,actualDurableRsaApproval:true,actualNativeCommit:true,actualFreshNativeResolve:true,actualPgActivation:true,
     lostActualNativeCommitResponseRecovered:true,nativeExecuteCount:nativeExecutionCount,actualSqlOriginSignedAndPublished:true,actualCurrentNativeStartupInspection:true,
@@ -756,6 +1088,7 @@ try{
   }
 }catch(error){
   writeFileSync(options.output.replace(/\.json$/,'.failed.json'),JSON.stringify({version:1,failed:true,resourceOwner:owner,resourceNames:names,sourceHashes,checks,audits,commandLog,storagePhases,
-    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,
-    error:String(error.stack??error),stdout:String(error.stdout??''),stderr:String(error.stderr??''),productionTouched:false},null,2)+'\n',{flag:'wx',mode:0o600});throw error
+    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,
+    error:redactMeetingSecrets(error.stack??error),stdout:redactMeetingSecrets(error.stdout),stderr:redactMeetingSecrets(error.stderr),productionTouched:false},null,2)+'\n',{flag:'wx',mode:0o600})
+  if(meetingPrivateValues.length)throw Error(redactMeetingSecrets(error.stack??error));throw error
 }finally{try{if(pool)await pool.end()}finally{cleanup()}}

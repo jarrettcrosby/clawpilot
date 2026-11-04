@@ -10,12 +10,46 @@ type RecordValue = Record<string, unknown>
 export type EmailReviewCandidate = { messageId: string; threadId: string; subject: string; receivedAt: string
   legacy: boolean; participantEmails: string[]; participantContactIds: string[] }
 type Mailbox = { connectionId: string; accountEmail: string; verified: boolean }
+type MailboxLabelPreview = { required: boolean; oldAccountEmail: string; newAccountEmail: string; expectedDigest: string; expiresAt: string }
+type MailboxLabelProof = { pipelineId: string; connectionId: string; idToken: string; expectedDigest: string; expiresAt: string }
 type Selection = { contactIds: string[]; primaryOrganizationReference: string }
 type Decision = 'review' | 'correction' | 'late-contact'
 type ReviewedMessage = { messageId: string; subject: string; organizationReferences: string[]; contactReferences: string[]; alreadyLinked?: boolean }
 type Preview = { digest: string; inputKey: string; messages: ReviewedMessage[] }
 type ContactChoice = { id: string; reference: string; name: string; email: string; organizationId: string; company: string }
 type CompanyChoice = { id: string; reference: string; name: string }
+
+export function validMailboxLabelPreview(value: unknown, now = Date.now()): value is MailboxLabelPreview {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (Object.keys(value).sort().join(',') !== 'expectedDigest,expiresAt,newAccountEmail,oldAccountEmail,required') return false
+  const preview = value as MailboxLabelPreview
+  const email = (address: unknown) => typeof address === 'string' && address.length <= 254
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)
+  if (typeof preview.oldAccountEmail !== 'string' || preview.oldAccountEmail.length > 254
+    || /[\u0000-\u001f\u007f]/.test(preview.oldAccountEmail)
+    || (preview.oldAccountEmail.trim() !== '' && !email(preview.oldAccountEmail.trim()))) return false
+  if (typeof preview.expiresAt !== 'string' || preview.expiresAt.length > 32) return false
+  const expires = Date.parse(preview.expiresAt)
+  return typeof preview.required === 'boolean' && email(preview.newAccountEmail)
+    && /^[a-f0-9]{64}$/.test(preview.expectedDigest) && Number.isFinite(expires)
+    && expires > now && expires <= now + 5 * 60_000 + 30_000
+    && preview.required === (preview.oldAccountEmail.trim().toLowerCase() !== preview.newAccountEmail)
+}
+
+export function MailboxLabelRepairFields({ preview, busy, onConfirm, onCancel }: {
+  preview: MailboxLabelPreview; busy: boolean; onConfirm: () => void; onCancel: () => void
+}) {
+  return <Stack gap={1.5}>
+    <Typography variant="subtitle2">Confirm the connected Gmail address</Typography>
+    <Typography sx={{ overflowWrap: 'anywhere' }}>Saved address: {preview.oldAccountEmail.trim() || 'Not recorded'}</Typography>
+    <Typography sx={{ overflowWrap: 'anywhere' }}>Verified Google address: {preview.newAccountEmail}</Typography>
+    <Alert severity="warning">Update only this connection’s saved address and verified mailbox binding. This does not change your ClawPilot login, reconnect Google, move messages, or verify historical email records.</Alert>
+    <Stack direction="row" gap={1} sx={{ flexWrap: 'wrap' }}>
+      <Button variant="contained" disabled={busy} onClick={onConfirm}>Confirm address update</Button>
+      <Button disabled={busy} onClick={onCancel}>Cancel address review</Button>
+    </Stack>
+  </Stack>
+}
 
 export function emailReviewCommand(input: { pipelineId: string; connectionId: string; decisionKind: Decision
   correctionReason: string; participantEmail: string; candidates: EmailReviewCandidate[]; selections: Record<string, Selection>
@@ -104,6 +138,10 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
   const [correctionReason, setCorrectionReason] = useState(''), [participantEmail, setParticipantEmail] = useState('')
   const [candidates, setCandidates] = useState<EmailReviewCandidate[]>([]), [selections, setSelections] = useState<Record<string, Selection>>({})
   const [preview, setPreview] = useState<Preview | null>(null), [error, setError] = useState(''), [notice, setNotice] = useState('')
+  const [repairingMailbox, setRepairingMailbox] = useState(false), [labelPreview, setLabelPreview] = useState<MailboxLabelPreview | null>(null)
+  // Google credentials are short-lived, memory-only command proof, never UI
+  // props, rendered state, browser storage, logs, URLs or message-review input.
+  const labelProof = useRef<MailboxLabelProof | null>(null)
   const activeRequest = useRef<AbortController | null>(null), pending = useRef(false), revision = useRef(0)
   const googleButton = useRef<HTMLDivElement | null>(null)
   const mailbox = mailboxes.find(value => value.connectionId === connectionId)
@@ -113,7 +151,8 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
   const organizations = useMemo(() => companyRecords.map(company => ({ id: String(company.id || ''), reference: String(company.referenceCode || ''), name: String(company.name || '') })), [companyRecords])
   const command = emailReviewCommand({ pipelineId, connectionId, decisionKind, correctionReason, participantEmail, candidates, selections, contacts, organizations })
   const inputKey = command ? JSON.stringify(command) : ''
-  const invalidate = useCallback(() => { revision.current++; setPreview(null); setNotice('') }, [])
+  const invalidate = useCallback((clearNotice = true) => { revision.current++; setPreview(null); if (clearNotice) setNotice('') }, [])
+  const clearMailboxRepair = useCallback(() => { labelProof.current = null; setLabelPreview(null); setRepairingMailbox(false) }, [])
   const begin = useCallback(() => {
     activeRequest.current?.abort()
     const controller = new AbortController(); activeRequest.current = controller
@@ -123,11 +162,23 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
   const finish = useCallback((controller: AbortController) => {
     if (activeRequest.current === controller) { pending.current = false; setBusy(false) }
   }, [])
-  useEffect(() => () => { activeRequest.current?.abort() }, [])
+  useEffect(() => () => { activeRequest.current?.abort(); labelProof.current = null }, [])
+  useEffect(() => {
+    activeRequest.current?.abort(); pending.current = false; setBusy(false)
+    clearMailboxRepair(); invalidate(); setOpen(false)
+  }, [pipelineId, clearMailboxRepair, invalidate])
+  useEffect(() => {
+    if (!labelPreview) return
+    const timer = setTimeout(() => {
+      labelProof.current = null; setLabelPreview(null)
+      setError('The address review expired. Verify the Google account again before confirming.')
+    }, Math.max(0, Math.min(5 * 60_000, Date.parse(labelPreview.expiresAt) - Date.now())))
+    return () => clearTimeout(timer)
+  }, [labelPreview])
   useEffect(() => { invalidate() }, [contacts, organizations, invalidate])
 
   const loadCandidates = useCallback(async (selectedConnection: string, exactParticipant = '') => {
-    invalidate(); setCandidates([]); setSelections({})
+    invalidate(false); setCandidates([]); setSelections({})
     const controller = begin()
     try {
       const params = new URLSearchParams({ pipelineId, connectionId: selectedConnection,
@@ -139,7 +190,7 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
   }, [begin, finish, invalidate, pipelineId])
 
   async function show() {
-    invalidate(); setOpen(true); setCandidates([]); setSelections({}); setConnectionId(''); setMailboxes([])
+    clearMailboxRepair(); invalidate(); setOpen(true); setCandidates([]); setSelections({}); setConnectionId(''); setMailboxes([])
     setDecisionKind('review'); setCorrectionReason(''); setParticipantEmail('')
     const controller = begin()
     try {
@@ -151,11 +202,11 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
     finally { finish(controller) }
   }
   useEffect(() => {
-    if (open && connectionId && mailbox?.verified && decisionKind !== 'late-contact') void loadCandidates(connectionId)
-  }, [open, connectionId, mailbox?.verified, decisionKind, loadCandidates])
+    if (open && connectionId && mailbox?.verified && !repairingMailbox && decisionKind !== 'late-contact') void loadCandidates(connectionId)
+  }, [open, connectionId, mailbox?.verified, repairingMailbox, decisionKind, loadCandidates])
 
   useEffect(() => {
-    if (!open || !clientId || !connectionId || mailbox?.verified || !googleButton.current) return
+    if (!open || !clientId || !connectionId || (mailbox?.verified && !repairingMailbox) || labelPreview || !googleButton.current) return
     let active = true
     const button = googleButton.current
     void loadGoogleIdentityServices().then(() => {
@@ -166,20 +217,68 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
           if (!response.credential) { setError('Google did not return an identity token'); return }
           invalidate()
           const controller = begin()
-          void requestJson('/api/crm/mailbox-identity', controller, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pipelineId, connectionId, idToken: response.credential }) })
-            .then(() => {
-              if (!controller.signal.aborted) setMailboxes(values => values.map(value => value.connectionId === connectionId ? { ...value, verified: true } : value))
+          const idToken = response.credential
+          const request = repairingMailbox
+            ? { action: 'preview-label-repair', pipelineId, connectionId, idToken }
+            : { pipelineId, connectionId, idToken: response.credential }
+          void requestJson<{ ok?: boolean; error?: string; repair?: unknown; accountEmail?: string }>('/api/crm/mailbox-identity', controller,
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) })
+            .then(body => {
+              if (controller.signal.aborted || !active) return
+              if (repairingMailbox) {
+                if (!validMailboxLabelPreview(body.repair)) throw new Error('A valid address review was not returned')
+                const review = body.repair
+                if (!review.required) {
+                  clearMailboxRepair()
+                  setMailboxes(values => values.map(value => value.connectionId === connectionId ? { ...value, accountEmail: review.newAccountEmail } : value))
+                  setNotice('The saved address already matches Google. Use normal mailbox verification if it is still needed.')
+                  return
+                }
+                labelProof.current = { pipelineId, connectionId, idToken, expectedDigest: review.expectedDigest, expiresAt: review.expiresAt }
+                setLabelPreview(review)
+              } else {
+                setMailboxes(values => values.map(value => value.connectionId === connectionId
+                  ? { ...value, accountEmail: body.accountEmail || value.accountEmail, verified: true } : value))
+              }
             }).catch(cause => { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Google mailbox could not be verified') })
             .finally(() => finish(controller))
         } })
       window.google.accounts.id.renderButton(button, { type: 'standard', theme: 'outline', size: 'large', text: 'continue_with', width: 300 })
     }).catch(cause => { if (active) setError(cause instanceof Error ? cause.message : 'Google verification could not be loaded') })
     return () => { active = false; window.google?.accounts.id.cancel(); button.replaceChildren() }
-  }, [open, clientId, connectionId, mailbox?.verified, pipelineId, begin, finish, invalidate])
+  }, [open, clientId, connectionId, mailbox?.verified, repairingMailbox, labelPreview, pipelineId, begin, finish, invalidate, clearMailboxRepair])
+
+  async function applyMailboxLabelRepair() {
+    const proof = labelProof.current, reviewed = labelPreview
+    if (pending.current || !proof || !reviewed || !repairingMailbox || proof.pipelineId !== pipelineId || proof.connectionId !== connectionId
+      || proof.expectedDigest !== reviewed.expectedDigest || proof.expiresAt !== reviewed.expiresAt || Date.parse(proof.expiresAt) <= Date.now()) return
+    invalidate(); const controller = begin()
+    try {
+      const body = await requestJson<{ ok?: boolean; error?: string; accountEmail?: string; verified?: boolean; connectionLabelUpdated?: boolean }>(
+        '/api/crm/mailbox-identity', controller, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'apply-label-repair', pipelineId, connectionId, idToken: proof.idToken,
+            expectedDigest: proof.expectedDigest, expiresAt: proof.expiresAt }) })
+      // Local expiry clears retained credentials, but cannot undo an already
+      // accepted server command. Acknowledge its exact response while this
+      // request/scope is still current; navigation aborts or supersedes it.
+      if (controller.signal.aborted || activeRequest.current !== controller) return
+      if (body.accountEmail !== reviewed.newAccountEmail || body.verified !== true || body.connectionLabelUpdated !== true) {
+        throw new Error('The address update was not confirmed. Reload mailbox settings before another review.')
+      }
+      setError('')
+      clearMailboxRepair()
+      setMailboxes(values => values.map(value => value.connectionId === connectionId ? { ...value, accountEmail: body.accountEmail!, verified: true } : value))
+      setNotice('The connected Gmail address is updated. Historical messages still require their separate reviewed recovery.')
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        labelProof.current = null; setLabelPreview(null)
+        setError(cause instanceof Error ? cause.message : 'Address update was not confirmed. Review the current connection before trying again.')
+      }
+    } finally { finish(controller) }
+  }
 
   async function submit(apply: boolean) {
-    if (!command || pending.current || !mailbox?.verified || (apply && (!preview || preview.inputKey !== inputKey))) return
+    if (!command || pending.current || !mailbox?.verified || repairingMailbox || (apply && (!preview || preview.inputKey !== inputKey))) return
     const reviewed = preview, capturedRevision = revision.current, controller = begin()
     if (!apply) setPreview(null)
     try {
@@ -202,7 +301,7 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
 
   return <>
     <Button size="small" startIcon={<EmailRounded />} onClick={() => { void show() }}>Review email</Button>
-    <Dialog open={open} onClose={() => { if (!busy) { activeRequest.current?.abort(); invalidate(); setOpen(false) } }} fullWidth maxWidth="md">
+    <Dialog open={open} onClose={() => { if (!busy) { activeRequest.current?.abort(); clearMailboxRepair(); invalidate(); setOpen(false) } }} fullWidth maxWidth="md">
       <DialogTitle>Review selected Gmail messages</DialogTitle>
       <DialogContent><Stack gap={2} sx={{ pt: 1 }}>
         <Alert severity="info">One email can appear in both company histories. Contacts keep their own company. This does not add pipeline readers or make a rule for future messages in the thread.</Alert>
@@ -210,18 +309,29 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
         {error && <Alert severity="error">{error}</Alert>}{notice && <Alert severity="success">{notice}</Alert>}
         {busy && <CircularProgress size={22} aria-label="Working on selected email review" />}
         <TextField select label="Linked Google mailbox" value={connectionId} disabled={busy} onChange={event => {
-          invalidate(); setConnectionId(event.target.value); setCandidates([]); setSelections({})
+          clearMailboxRepair(); invalidate(); setConnectionId(event.target.value); setCandidates([]); setSelections({})
         }}>
           <MenuItem value="">Select a linked mailbox</MenuItem>
           {mailboxes.map(value => <MenuItem key={value.connectionId} value={value.connectionId}>{value.accountEmail} · {value.verified ? 'Verified identity' : 'Verify identity first'}</MenuItem>)}
         </TextField>
-        {mailbox && !mailbox.verified && <>
-          <Alert severity="warning">Continue with the same Google account as this mailbox. The server verifies Google’s signed token and independently checks the Gmail account. No Google subject is entered manually.</Alert>
+        {mailbox && <Stack gap={1}>
+          <Button disabled={busy || repairingMailbox} onClick={() => {
+            invalidate(); labelProof.current = null; setLabelPreview(null); setRepairingMailbox(true); setCandidates([]); setSelections({})
+          }}>Review saved mailbox address</Button>
+          <Typography variant="caption" color="text.secondary">Use this if Google’s current mailbox address differs from the saved label, including a changed primary address.</Typography>
+        </Stack>}
+        {mailbox && (!mailbox.verified || repairingMailbox) && !labelPreview && <>
+          <Alert severity="warning">{repairingMailbox
+            ? 'Verify the Google account connected to this inbox. The next step previews its saved and current addresses; nothing changes until you confirm.'
+            : 'Continue with the same Google account as this mailbox. The server verifies Google’s signed token and independently checks the Gmail account. No Google subject is entered manually.'}</Alert>
           {clientId ? <Box ref={googleButton} sx={{ minHeight: 44, pointerEvents: busy ? 'none' : 'auto' }} />
             : <Alert severity="warning">Google mailbox verification is not configured. Ask the workspace administrator to configure Google sign-in before continuing.</Alert>}
         </>}
+        {repairingMailbox && labelPreview && <MailboxLabelRepairFields preview={labelPreview} busy={busy}
+          onConfirm={() => { void applyMailboxLabelRepair() }} onCancel={() => { clearMailboxRepair(); invalidate() }} />}
+        {repairingMailbox && !labelPreview && <Button disabled={busy} onClick={() => { clearMailboxRepair(); invalidate() }}>Cancel address review</Button>}
         {!mailboxes.length && !busy && <Alert severity="warning">Select an active Google Mail connection in Settings → Integrations first.</Alert>}
-        <TextField select label="Review action" value={decisionKind} disabled={busy} onChange={event => {
+        <TextField select label="Review action" value={decisionKind} disabled={busy || repairingMailbox} onChange={event => {
           invalidate(); setDecisionKind(event.target.value as Decision); setCandidates([]); setSelections({})
         }}>
           <MenuItem value="review">Review company and contact links</MenuItem><MenuItem value="correction">Correct a reviewed decision</MenuItem>
@@ -232,11 +342,11 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
         {decisionKind === 'late-contact' && <Stack gap={1}>
           <TextField label="Exact participant email" type="email" value={participantEmail} disabled={busy} inputProps={{ maxLength: 254 }}
             onChange={event => { invalidate(); setParticipantEmail(event.target.value); setCandidates([]); setSelections({}) }} />
-          <Button disabled={busy || !mailbox?.verified || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participantEmail.trim())}
+          <Button disabled={busy || repairingMailbox || !mailbox?.verified || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participantEmail.trim())}
             onClick={() => { void loadCandidates(connectionId, participantEmail) }}>Find bounded cached participant messages</Button>
         </Stack>}
-        {mailbox?.verified && decisionKind !== 'late-contact' && <Button disabled={busy} onClick={() => { void loadCandidates(connectionId) }}>Refresh cached candidates</Button>}
-        <EmailReviewFields candidates={candidates} selections={selections} contacts={contacts} organizations={organizations} disabled={busy}
+        {mailbox?.verified && decisionKind !== 'late-contact' && <Button disabled={busy || repairingMailbox} onClick={() => { void loadCandidates(connectionId) }}>Refresh cached candidates</Button>}
+        <EmailReviewFields candidates={candidates} selections={selections} contacts={contacts} organizations={organizations} disabled={busy || repairingMailbox}
           onSelection={(messageId, selection) => { invalidate(); setSelections(current => {
             const next = { ...current }; if (selection) next[messageId] = selection; else delete next[messageId]; return next
           }) }} />
@@ -250,9 +360,9 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
         </Stack>}
       </Stack></DialogContent>
       <DialogActions sx={{ flexWrap: 'wrap' }}>
-        <Button disabled={busy} onClick={() => { activeRequest.current?.abort(); invalidate(); setOpen(false) }}>Close</Button>
-        <Button disabled={busy || !mailbox?.verified || !command} onClick={() => { void submit(false) }}>Preview selected messages</Button>
-        <Button variant="contained" disabled={busy || !mailbox?.verified || !preview || preview.inputKey !== inputKey || !command}
+        <Button disabled={busy} onClick={() => { activeRequest.current?.abort(); clearMailboxRepair(); invalidate(); setOpen(false) }}>Close</Button>
+        <Button disabled={busy || repairingMailbox || !mailbox?.verified || !command} onClick={() => { void submit(false) }}>Preview selected messages</Button>
+        <Button variant="contained" disabled={busy || repairingMailbox || !mailbox?.verified || !preview || preview.inputKey !== inputKey || !command}
           onClick={() => { void submit(true) }}>Apply reviewed selection</Button>
       </DialogActions>
     </Dialog>

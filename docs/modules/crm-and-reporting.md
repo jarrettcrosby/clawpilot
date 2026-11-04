@@ -149,6 +149,37 @@ Before applying these association rules or storing message content, CRM skips co
 6. Mail addressed to `archive@eigenracing.com` is archive intake. An explicit marker still wins. Without a marker, ClawPilot checks email addresses in the message headers and imported body against Organizations, Contacts, and Leads in pipelines owned by that mailbox user.
 7. Archive address matches are conservative: an address that maps to multiple CRM references is left unmatched. Related `gc` and `ga` references share one interaction and retain separate message links, so quoted or forwarded copies never duplicate the CRM activity.
 
+### Connected mailbox address review
+
+The mailbox's saved display address is not its immutable Google identity. Normal
+intake and ordinary verification refuse a saved-address/profile mismatch. In
+**CRM → Interactions → Review email → Review saved mailbox address**, the exact
+pipeline owner can instead request a separate, no-write address preview. It
+requires a recent non-impersonated session, a fresh verified Google ID token and
+an independent profile read from that selected active Gmail connection. The
+Google subject must match any existing canonical mailbox binding; a changed
+subject is not an address rename and remains held.
+
+The preview shows the saved and verified addresses and expires after five
+minutes. **Confirm address update** re-observes the profile and compares the
+reviewed connection, credential, membership, pipeline and binding metadata before
+updating the saved address, same canonical mailbox binding and audit together.
+Concurrent changes require another review. Credentials stay in memory only and
+are removed on expiry, cancellation or navigation. A successful in-flight reply
+is acknowledged even if the local preview timer expired while awaiting it.
+
+This operation does not change the user's login, rotate/reconnect Google, move
+messages, reset cursors, rewrite historical source evidence or run email recovery.
+Historical messages still require the separately reviewed recovery below.
+
+A connection refresh may retain this verified address only for the same selected
+active Maton Gmail connection, known unchanged provider creation/revision and
+method, matching canonical mailbox binding, and credentials unchanged since
+verification. Other provider metadata, status changes and removals still apply.
+Unknown or changed revision/creation/method, changed credentials, or changed
+status/app/source deliberately uses remote metadata and may require fresh
+verification; the saved label is not a grant-continuity or historical proof.
+
 Previously missed messages are not recovered by resetting a mailbox cursor. The owner-only `POST /api/crm/email-recovery` accepts one active workspace pipeline, its owner's selected Gmail connection, and 1–25 exact Gmail message IDs. It requires a real, non-impersonated same-origin session. The default dry run returns a content/routing digest and proposed references without changing CRM or Gmail. An explicit apply must supply that digest; it refetches the messages, rejects changed content or routing and rechecks current pipeline membership before staging. Drafts, spam, trash, authentication codes and messages routed outside the reviewed pipeline are ineligible. Recovery is audited and idempotent, queues normal CRM synchronization, never sends mail, and does not alter polling cursors. Review each bounded selection and verify the resulting CRM/SuiteCRM activity before expanding it.
 
 ## Workbook Contract

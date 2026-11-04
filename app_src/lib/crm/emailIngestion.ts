@@ -18,7 +18,8 @@ import {
   stageReviewedGmailInteractionsInPostgres,
   type StageInteractionInput,
 } from '@/lib/persistence/crm'
-import { readVerifiedGmailMailboxIdentityInPostgres, recordGmailMessageIntakeInPostgres } from '@/lib/persistence/crmEmailIdentity'
+import { readVerifiedGmailMailboxIdentityInPostgres, recordGmailMessageIntakeInPostgres,
+  readGmailMailboxLabelRepairSnapshotInPostgres, type GmailMailboxLabelRepairScope } from '@/lib/persistence/crmEmailIdentity'
 import { query } from '@/lib/persistence/postgres'
 import { resolvePipelineSpaceAccess } from '@/lib/tenancy'
 import { recordAuditEvent } from '@/lib/auditWriter'
@@ -566,6 +567,41 @@ export async function readGmailMailboxProfileForOwner(input: { ownerEmail: strin
     && row.connection_id === input.connectionId)
   if (!mailbox) throw new SafeEmailIngestionError('The selected Gmail connection is not active for this owner')
   return gmailMailboxProfile(mailbox)
+}
+
+/** Explicit owner-reviewed label repair only. This fresh observation does NOT
+ * verify a Google subject, repair a label, or authorize historical messages.
+ * Normal ingestion and the ordinary verification reader remain strict above. */
+export async function readGmailMailboxLabelRepairObservationForOwner(input: GmailMailboxLabelRepairScope) {
+  const before = await readGmailMailboxLabelRepairSnapshotInPostgres(input)
+  let accountEmail: string, observedAt: string
+  try {
+    const deadline = Date.now() + 12_000
+    const response = await matonFetch('/google-mail/gmail/v1/users/me/profile', {
+      method: 'GET', redirect: 'error', signal: AbortSignal.timeout(12_000),
+    }, { ownerEmail: input.ownerEmail, app: GMAIL_APP, boundConnectionId: input.connectionId })
+    if (!response.ok || !response.body) throw new Error()
+    const reader = response.body.getReader(), chunks: Uint8Array[] = []
+    let size = 0, timedOut = false
+    const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}) }, Math.max(1, deadline - Date.now()))
+    try {
+      while (true) {
+        const part = await reader.read()
+        if (part.done) break
+        size += part.value.byteLength
+        if (size > 8192) { await reader.cancel(); throw new Error() }
+        chunks.push(part.value)
+      }
+      if (timedOut || Date.now() >= deadline) throw new Error()
+    } finally { clearTimeout(timer); reader.releaseLock() }
+    const body = asRecord(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    accountEmail = typeof body?.emailAddress === 'string' ? body.emailAddress.trim().toLowerCase() : ''
+    if (!EMAIL_PATTERN.test(accountEmail)) throw new Error()
+    observedAt = new Date().toISOString()
+  } catch { throw new SafeEmailIngestionError('The selected Gmail profile could not be freshly observed') }
+  const after = await readGmailMailboxLabelRepairSnapshotInPostgres(input)
+  if (JSON.stringify(before) !== JSON.stringify(after)) throw new SafeEmailIngestionError('The selected Gmail connection changed during verification')
+  return { snapshot: after, accountEmail, observedAt }
 }
 
 async function verifiedMailbox(mailbox: SelectedMailbox): Promise<{

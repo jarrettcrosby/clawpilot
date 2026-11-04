@@ -76,8 +76,52 @@ check('every material review input produces a different preview key and apply se
 check('GIS reuses existing loader/types and sends signed token only, never supplied subjects', () => {
   assert.match(source, /import \{ loadGoogleIdentityServices \} from '@\/components\/settings\/GoogleAuthSettingsPanel'/)
   assert.doesNotMatch(source, /declare global|providerAccountId|googleSubject/)
-  assert.match(source, /JSON\.stringify\(\{ pipelineId, connectionId, idToken: response\.credential \}\)/)
+  assert.match(source, /: \{ pipelineId, connectionId, idToken: response\.credential \}/)
+  assert.match(source, /body: JSON\.stringify\(request\)/)
   assert.match(source, /idToken: response\.credential/)
+  assert.doesNotMatch(source, /localStorage|sessionStorage|console\./)
+})
+check('address repair previews safe exact labels, bounded expiry and no unreviewed fields', () => {
+  const now = Date.parse('2026-11-04T12:00:00.000Z')
+  const repair = { required: true, oldAccountEmail: 'operator@old.example', newAccountEmail: 'operator@new.example',
+    expectedDigest: 'a'.repeat(64), expiresAt: new Date(now + 5 * 60_000).toISOString() }
+  assert.equal(api.validMailboxLabelPreview(repair, now), true)
+  assert.equal(api.validMailboxLabelPreview({ ...repair, required: false, newAccountEmail: repair.oldAccountEmail }, now), true)
+  assert.equal(api.validMailboxLabelPreview({ ...repair, oldAccountEmail: '' }, now), true)
+  assert.equal(api.validMailboxLabelPreview({ ...repair, oldAccountEmail: ' OPERATOR@NEW.EXAMPLE ', required: false }, now), true)
+  for (const invalid of [null, [], {}, { ...repair, expectedDigest: 'not-reviewed' },
+    { ...repair, expiresAt: new Date(now).toISOString() }, { ...repair, expiresAt: new Date(now + 6 * 60_000).toISOString() },
+    { ...repair, newAccountEmail: '<script>bad</script>' }, { ...repair, required: false },
+    { ...repair, idToken: 'must-never-be-render-state' }, { ...repair, arbitraryClaim: 'unreviewed' }]) {
+    assert.equal(api.validMailboxLabelPreview(invalid, now), false)
+  }
+})
+check('real React repair confirmation distinguishes address-only update from login and historical proof', () => {
+  const preview = { required: true, oldAccountEmail: 'operator@old.example', newAccountEmail: 'operator@new.example',
+    expectedDigest: 'a'.repeat(64), expiresAt: '2026-11-04T12:05:00.000Z' }
+  const render = busy => renderToStaticMarkup(React.createElement(api.MailboxLabelRepairFields,
+    { preview, busy, onConfirm: () => assert.fail('Render cannot confirm'), onCancel: () => assert.fail('Render cannot cancel') }))
+  const html = render(false)
+  assert.ok(html.includes(preview.oldAccountEmail) && html.includes(preview.newAccountEmail))
+  assert.ok(html.includes('Confirm address update') && html.includes('Cancel address review'))
+  assert.ok(html.includes('does not change your ClawPilot login') && html.includes('verify historical email records'))
+  assert.ok(!html.includes(preview.expectedDigest) && !html.includes('idToken'))
+  assert.ok((render(true).match(/disabled=""/g) || []).length >= 2)
+})
+check('stale verified mailboxes remain reviewable but repair never auto-applies or reuses recovery preview', () => {
+  assert.match(source, /Review saved mailbox address/)
+  assert.match(source, /mailbox\?\.verified && !repairingMailbox/)
+  assert.match(source, /action: 'preview-label-repair'/)
+  assert.match(source, /action: 'apply-label-repair'[\s\S]*expectedDigest: proof\.expectedDigest, expiresAt: proof\.expiresAt/)
+  assert.match(source, /onConfirm=\{\(\) => \{ void applyMailboxLabelRepair\(\) \}\}/)
+  assert.match(source, /controller\.signal\.aborted \|\| activeRequest\.current !== controller/)
+  assert.match(source, /proof\.pipelineId !== pipelineId \|\| proof\.connectionId !== connectionId/)
+  assert.match(source, /labelProof\.current = null; setLabelPreview\(null\)/)
+  assert.match(source, /Math\.min\(5 \* 60_000, Date\.parse\(labelPreview\.expiresAt\) - Date\.now\(\)\)/)
+  assert.match(source, /clearMailboxRepair\(\); invalidate\(\); setOpen\(false\)/)
+  assert.match(source, /clearMailboxRepair\(\); invalidate\(\); setConnectionId/)
+  assert.match(source, /body\.accountEmail !== reviewed\.newAccountEmail/)
+  assert.match(source, /invalidate\(\); const controller = begin\(\)/)
   assert.doesNotMatch(source, /localStorage|sessionStorage|console\./)
 })
 check('real CRM mount is owner-only and communicates finite/no-audience-expansion scope', () => {
@@ -87,4 +131,45 @@ check('real CRM mount is owner-only and communicates finite/no-audience-expansio
   assert.ok(source.includes('does not add pipeline readers or make a rule for future messages'))
   assert.ok(source.includes('fixed three messages')); assert.ok(source.includes('Contacts keep their own company'))
 })
+{
+  const parsed = ts.createSourceFile('EmailReviewDialog.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let declaration
+  function find(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'applyMailboxLabelRepair') declaration = node
+    ts.forEachChild(node, find)
+  }
+  find(parsed); assert.ok(declaration, 'Exercise the actual nested apply function')
+  for (const outcome of ['expired-locally', 'superseded', 'aborted']) {
+    const proof = { pipelineId: 'pipeline', connectionId: 'connection', idToken: 'synthetic-in-memory-proof',
+      expectedDigest: 'a'.repeat(64), expiresAt: new Date(Date.now() + 60_000).toISOString() }
+    const controller = new AbortController(), activeRequest = { current: controller }, labelProof = { current: proof }
+    const updates = [], errors = ['Review expired while request was in flight']; let respond
+    const context = { Date, pending: { current: false }, labelProof, activeRequest,
+      labelPreview: { ...proof, newAccountEmail: 'current@example.test' }, repairingMailbox: true,
+      pipelineId: proof.pipelineId, connectionId: proof.connectionId,
+      invalidate: () => {}, begin: () => controller, finish: () => {},
+      requestJson: () => new Promise(resolve => { respond = resolve }),
+      clearMailboxRepair: () => { labelProof.current = null },
+      setMailboxes: update => updates.push(update([{ connectionId: proof.connectionId, verified: false }])),
+      setNotice: value => updates.push(value), setError: value => errors.push(value), setLabelPreview: () => {},
+    }
+    vm.runInNewContext(ts.transpileModule(`${declaration.getText(parsed)}\nglobalThis.apply = applyMailboxLabelRepair`, {
+      compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+    }).outputText, context)
+    const applying = context.apply()
+    labelProof.current = null // The real expiry callback removes retained proof.
+    if (outcome === 'superseded') activeRequest.current = new AbortController()
+    if (outcome === 'aborted') controller.abort()
+    respond({ ok: true, accountEmail: 'current@example.test', verified: true, connectionLabelUpdated: true })
+    await applying
+    if (outcome === 'expired-locally') {
+      assert.equal(updates[0][0].accountEmail, 'current@example.test')
+      assert.equal(updates[0][0].verified, true)
+      assert.match(updates[1], /address is updated/)
+      assert.equal(errors.at(-1), '')
+    } else assert.equal(updates.length, 0, 'A response from another request/scope cannot update this screen')
+    assert.equal(labelProof.current, null, 'Acknowledging a response does not retain expired credentials')
+  }
+  checks++; console.log('PASS actual apply acknowledges a confirmed in-flight command after local expiry, never a superseded scope')
+}
 console.log(`Email review UI passed ${checks} actual React/MUI and command/source checks; no live calls.`)

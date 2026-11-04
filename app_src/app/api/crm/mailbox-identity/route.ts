@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import { googleSsoClientConfiguration, GoogleSsoError, verifyGoogleIdentityToken } from '@/lib/googleSso'
-import { readGmailMailboxProfileForOwner } from '@/lib/crm/emailIngestion'
-import { bindVerifiedGmailMailboxInPostgres, readVerifiedGmailMailboxIdentityInPostgres } from '@/lib/persistence/crmEmailIdentity'
+import { readGmailMailboxProfileForOwner, readGmailMailboxLabelRepairObservationForOwner } from '@/lib/crm/emailIngestion'
+import { bindVerifiedGmailMailboxInPostgres, readVerifiedGmailMailboxIdentityInPostgres,
+  prepareGmailMailboxLabelRepairPreview, applyGmailMailboxLabelRepairInPostgres } from '@/lib/persistence/crmEmailIdentity'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query } from '@/lib/persistence/postgres'
 import { requestSession, requireRequestUser } from '@/lib/requestUser'
@@ -31,11 +32,11 @@ async function owner(req: NextRequest, pipelineId: string) {
 export async function GET(req: NextRequest) {
   try {
     const { actor } = await owner(req, req.nextUrl.searchParams.get('pipelineId') || '')
-    const connections = await query<{ connection_id: string; account_email: string }>(`SELECT connection_id,account_email
+    const connections = await query<{ connection_id: string; account_email: string | null }>(`SELECT connection_id,account_email
       FROM user_maton_connections WHERE owner_email=$1 AND app='google-mail' AND source='maton'
       AND status='ACTIVE' AND is_selected ORDER BY connection_id`, [actor.email])
     const mailboxes = await Promise.all(connections.rows.map(async row => ({ connectionId: row.connection_id,
-      accountEmail: row.account_email, verified: Boolean(await readVerifiedGmailMailboxIdentityInPostgres({
+      accountEmail: row.account_email || '', verified: Boolean(row.account_email && await readVerifiedGmailMailboxIdentityInPostgres({
         ownerEmail: actor.email, connectionId: row.connection_id, accountEmail: row.account_email })) })))
     return response({ ok: true, clientId: googleSsoClientConfiguration().clientId, mailboxes })
   } catch { return response({ ok: false, error: 'Pipeline owner access is required' }, 403) }
@@ -57,16 +58,33 @@ export async function POST(req: NextRequest) {
       }
     } finally { reader.releaseLock() }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    const repairAction = body?.action === 'preview-label-repair' || body?.action === 'apply-label-repair'
+    const expectedFields = body?.action === 'preview-label-repair' ? 'action,connectionId,idToken,pipelineId'
+      : body?.action === 'apply-label-repair' ? 'action,connectionId,expectedDigest,expiresAt,idToken,pipelineId'
+        : 'connectionId,idToken,pipelineId'
     if (!body || typeof body !== 'object' || Array.isArray(body)
-      || Object.keys(body).sort().join(',') !== 'connectionId,idToken,pipelineId'
+      || Object.keys(body).sort().join(',') !== expectedFields
       || typeof body.pipelineId !== 'string' || typeof body.connectionId !== 'string'
-      || !/^[\w-]{1,200}$/.test(body.connectionId)) return response({ ok: false, error: 'Invalid identity command' }, 400)
-    const { actor, session } = await owner(req, body.pipelineId)
+      || !/^[\w-]{1,200}$/.test(body.connectionId)
+      || body.action === 'apply-label-repair' && (typeof body.expiresAt !== 'string' || body.expiresAt.length > 40
+        || typeof body.expectedDigest !== 'string' || !/^[a-f0-9]{64}$/.test(body.expectedDigest))) return response({ ok: false, error: 'Invalid identity command' }, 400)
+    const { actor, pipeline, session } = await owner(req, body.pipelineId)
     const age = Date.now() - Date.parse(session.lastAuthenticatedAt)
     if (!Number.isFinite(age) || age < 0 || age > SESSION_POLICY.recentAuthSeconds * 1000) {
       return response({ ok: false, error: 'Sign in again before verifying a mailbox identity' }, 403)
     }
-    const identity = await verifyGoogleIdentityToken(body.idToken)
+    const identity = await verifyGoogleIdentityToken(body.idToken,
+      repairAction ? { maxAgeSeconds: Math.min(300, SESSION_POLICY.recentAuthSeconds) } : undefined)
+    if (repairAction) {
+      const observation = await readGmailMailboxLabelRepairObservationForOwner({ ownerEmail: actor.email,
+        connectionId: body.connectionId, pipelineId: pipeline.id, workspaceOrganizationId: actor.organizationId! })
+      if (body.action === 'preview-label-repair') {
+        return response({ ok: true, repair: prepareGmailMailboxLabelRepairPreview({ observation, identity }) })
+      }
+      const result = await applyGmailMailboxLabelRepairInPostgres({ observation, identity,
+        expectedDigest: body.expectedDigest, expiresAt: body.expiresAt })
+      return response({ ok: true, ...result })
+    }
     const profile = await readGmailMailboxProfileForOwner({ ownerEmail: actor.email, connectionId: body.connectionId })
     const result = await bindVerifiedGmailMailboxInPostgres({ ownerEmail: actor.email, connectionId: body.connectionId,
       identity, observedAccountEmail: profile.accountEmail })
