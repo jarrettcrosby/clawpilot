@@ -210,7 +210,7 @@ function initialFixtureState(bool $excludeTerminal=false): string
                 $all->setAction($all->id,$action['id'],$action['name']==='access'?ACL_ALLOW_ENABLED:ACL_ALLOW_ALL);
             linkBeans($all,'users',[(string)$viewer->id]);}
         $client=native('OAuth2Clients');$client->name='Synthetic initial dedicated issuer client';$client->allowed_grant_type='client_credentials';
-        $client->is_confidential=1;$client->assigned_user_id=$admin->id;$_REQUEST=['new_secret'=>'synthetic-only-'.bin2hex(random_bytes(24)),
+        $client->is_confidential=1;$client->assigned_user_id=$admin->id;$clientSecret='synthetic-only-'.bin2hex(random_bytes(24));$_REQUEST=['new_secret'=>$clientSecret,
             'duration_amount'=>1,'duration_unit'=>'hour'];try{$client->save(false);}finally{$_REQUEST=[];}
         $readers=[(string)$admin->id,(string)$viewer->id];sort($readers,SORT_STRING);$pipelines=[];
         foreach([$readers,[(string)$admin->id],[(string)$admin->id]] as $read){$pipeline=create_guid();$workspace=create_guid();$pipelines[]=['groupId'=>create_guid(),'policy'=>[
@@ -224,6 +224,11 @@ function initialFixtureState(bool $excludeTerminal=false): string
             $account->assigned_user_id=$admin->id;$account->save(false);$contact=native('Contacts');$contact->last_name='Initial '.$label;
             $contact->assigned_user_id=$admin->id;$contact->account_id=$account->id;$contact->save(false);
             $related[]=['account'=>(string)$account->id,'contact'=>(string)$contact->id];}
+        if(getenv('CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED')==='1'){
+            define('CP_JOINT_LIFECYCLE_INCLUDE_ONLY',true);require __DIR__.'/native-joint-lifecycle.php';
+            cp_joint_lifecycle_seed((string)$admin->id,(string)$client->id,$clientSecret,$related);
+        }
+        unset($clientSecret);
         $bpoCount=$count===334?131:126;
         for($index=0;$index<$count;$index++){$p=$pipelines[$index<27?0:($index<27+$bpoCount?1:2)]['policy'];$global='gi'.(9700000+$index);
             $email=emailFixture('Synthetic initial historical Email '.$index,$global,(string)$admin->id);

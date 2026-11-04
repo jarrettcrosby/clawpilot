@@ -19,7 +19,7 @@ change permissions, start maintenance/adoption mode, or contact a provider.
 This draft supplements the active [SuiteCRM Railway Runbook](suitecrm.md).
 It does not replace that runbook or approve a release.
 
-## Current release boundary (2026-11-03)
+## Current release boundary (2026-11-04)
 
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial
@@ -44,6 +44,20 @@ before and after C activation. All owned resources are cleaned. Artifact SHA-256
 `088c02665ea6583f5c1f9522121349a7a13e8239e397040b6f4db9f196757b0a`.
 This is not Railway SSH, signed-in UI, provider, or production proof.
 
+R502 extends that combined rehearsal with the lifecycle route selected before
+the first source/package approval: 21 groups, 107 full native audits, 103 actual
+commands and 475 source hashes. The stock OAuth middleware serves exact
+Account/Contact/missing inspection on both distinct enrolled Apache containers;
+unauthenticated and wrong-identity requests refuse. The disabled route also
+refuses without changing its installed package. Lifecycle calls change no native
+tables or application files; startup retains only the established Audit-cache
+exception. Ancestor source/journals and signed cancellations remain intact, and
+native execution stays exactly once. Owned containers, volume, networks and
+database lease are independently confirmed absent. Artifact SHA-256:
+`b16b2cb73c863505867b937f8b8f20b9e0bb328586d823a40a7beec9db9f9771`.
+The [combined activation order](suitecrm.md#combining-deletion-sync-with-native-email-enrollment)
+is required; running an installer during enrolled startup is not a workaround.
+
 R489/R490 also pass the Shopify reconciliation-health regressions through all
 386 migrations on PG16/18 without changing the six established catalog phases.
 R491 passes the complete predeploy command, including its fresh application build.
@@ -53,6 +67,15 @@ identity holds remain. That observation neither recovers messages nor authorizes
 permission activation. Browser access and the narrow Fractional worker publisher
 handoff remain external acceptance dependencies; no comparison-runtime pin change
 is needed for that worker-only sender.
+
+The integrated source candidate was committed as `8e4b4d5e9`; its isolated
+clean-commit build and nine-check PG18 rolling-transition receipts pass. Merge
+`4d9db8b19` incorporates current `dev` without changing that candidate's
+production files, retaining stronger legacy-contact protection tests. Its pure
+and actual PG16/18 lifecycle gates pass. Those earlier receipts are not an
+exact-commit certificate for subsequent test/documentation commits. Fractional
+sender delivery remains unproven: its migration must be appended to the owner's
+current sealed migration sequence, not collide with the existing migration 069.
 
 Still required before release completion: the remaining current candidate gates,
 the exact separately approved live permission change, five-message recovery,

@@ -25,11 +25,13 @@ for(const arg of process.argv.slice(2)){
   else if(/^--postgres-major=(16|18)$/.test(arg))options.major=arg.split('=')[1]
   else if(/^--service-image=sha256:[a-f0-9]{64}$/.test(arg)){assert.equal(options.serviceImage,undefined);options.serviceImage=arg.slice('--service-image='.length)}
   else if(arg==='--replan-after-expiry'){assert.equal(options.replanAfterExpiry,undefined);options.replanAfterExpiry=true}
+  else if(arg==='--with-record-lifecycle'){assert.equal(options.withRecordLifecycle,undefined);options.withRecordLifecycle=true}
   else if(arg==='--zip-preflight-only'){assert.equal(options.zipPreflightOnly,undefined);options.zipPreflightOnly=true}
-  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry]')
+  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle]')
 }
 assert.ok(!(options.serviceImage&&options.zipPreflightOnly),'Archive-only preflight does not exercise the service image')
 assert.ok(!options.replanAfterExpiry||options.serviceImage,'Expiry/replan proof requires the actual service image and true container restart')
+assert.ok(!options.withRecordLifecycle||options.serviceImage,'Authenticated record lifecycle proof requires the actual service image')
 assert.ok(isAbsolute(options['source-zip']??'')&&isAbsolute(options.build??'')&&isAbsolute(options.output??''))
 assert.ok(options.output.endsWith('.json'),'Use one new JSON evidence artifact')
 const outputParent=lstatSync(dirname(options.output));assert.ok(outputParent.isDirectory()&&!outputParent.isSymbolicLink()&&outputParent.uid===process.getuid())
@@ -87,6 +89,8 @@ const suffix=owner.slice(0,8),names={pg:'cp-initial-joint-'+suffix+'-pg',maria:'
   net:'cp-initial-joint-'+suffix+'-native-net',pgnet:'cp-initial-joint-'+suffix+'-pg-net',...(options.serviceImage?{appdata:'cp-initial-joint-'+suffix+'-app-data'}:{})}
 const deadline=Date.now()+600000,audits=[],checks=[],commandLog=[],storagePhases=[],appDataBudgets=[],appContainerHistory=[]
 let pool,token,secondaryClean=false,cleanupMode=false,cleaned=false,activeTransactions=0,report,imageProof,primaryCleanupAttempted=false,replanEvidence=null
+const recordLifecycle=options.withRecordLifecycle?{version:1,kind:'actual-joint-record-lifecycle',fixtureDataSynthetic:true,
+  oauthMiddlewareSynthetic:false,endpointResponsesSynthetic:false,enabledBeforeRootSource:true,setup:[],httpPhases:[]}:null
 function run(command,args,extra={}){const remaining=cleanupMode?30000:deadline-Date.now();assert.ok(remaining>0,'Joint acceptance total 600-second deadline exceeded')
   return execFileSync(command,args,{encoding:'utf8',stdio:[Object.hasOwn(extra,'input')?'pipe':'ignore','pipe','pipe'],maxBuffer:6000000,
     ...extra,timeout:Math.min(extra.timeout??30000,remaining)})}
@@ -266,7 +270,8 @@ try{
     '--cap-drop','ALL','--security-opt','no-new-privileges',...appDataMount,'--tmpfs','/tmp:rw,nosuid,size=32m',
     '--mount','type=bind,source='+archive+',target=/official.zip,readonly',...fixtureMounts,
     ...(options.serviceImage?[]:['--mount','type=bind,source='+source+',target=/opt/clawpilot,readonly']),
-    '--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE=1','--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE_EMAILS=329','--entrypoint','/bin/sh',php.Id,'-c',bootstrap])
+    '--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE=1','--env','CLAWPILOT_NATIVE_INITIAL_FIXTURE_EMAILS=329',
+    ...(options.withRecordLifecycle?['--env','CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1']:[]),'--entrypoint','/bin/sh',php.Id,'-c',bootstrap])
   appContainerHistory.push({phase:'fixture-construction',id:inspect(names.app).Id})
   until=Date.now()+180000;for(;;){try{run('docker',['exec',names.app,'test','-f','/tmp/native-initial-ready'],{timeout:3000});break}catch(e){
     const alive=inspect(names.app);if(!alive?.State.Running)throw Error('Native installation failed: '+(alive?run('docker',['logs',names.app]):'owned container absent'))
@@ -282,14 +287,29 @@ try{
   for(const name of [names.maria,names.app])assert.equal(Object.keys(inspect(name).HostConfig.PortBindings??{}).length,0)
   const stage=name=>run('docker',['exec',names.app,'php','-d','memory_limit=384M','/fixture/native-initial-enrollment.php',name,'--initial-volume-app'],{timeout:45000})
   const readNative=path=>JSON.parse(run('docker',['exec',names.app,'php','-r','fwrite(STDOUT,file_get_contents($argv[1]));',path]))
+  const lifecycleFixture=(mode,{user,timeout=45000}={})=>JSON.parse(run('docker',['exec',...(user?['--user',user]:[]),names.app,
+    'php','-d','memory_limit=384M','-d','display_errors=0','/fixture/native-joint-lifecycle.php',mode],{timeout}))
   appDataBudget('before-synthetic-source-construction')
+  if(options.withRecordLifecycle){
+    // Exact synthetic OAuth setup is fixture construction, before RootA source
+    // capture or any approved installer packet. No recursive chmod/chown or
+    // added container capability is used. Stock CryptKey admits mode0640.
+    recordLifecycle.setup.push(lifecycleFixture('prepare-directory'))
+    recordLifecycle.setup.push(lifecycleFixture('prepare-keys',{user:'33:0'}))
+    recordLifecycle.setup.push(lifecycleFixture('finalize-keys'))
+  }
   stage('source');const observed=readNative('/tmp/clawpilot-initial-source.json');appDataBudget('after-synthetic-source-construction')
+  if(options.withRecordLifecycle){recordLifecycle.fixture=lifecycleFixture('metadata')
+    assert.equal(recordLifecycle.fixture.warmup.actualTokenIssuedBeforeRootSource,true)
+    assert.equal(recordLifecycle.fixture.warmup.temporaryRouterStopped,true)
+    assert.deepEqual(recordLifecycle.fixture.records.map(row=>row.module),['Accounts','Contacts'])}
   assert.equal(observed.source.emails.length,329);assert.equal(observed.source.principalSuiteCrmUserIds.length,4)
   const selection={actorEmail:'joint.owner@example.invalid',operatorAccountId:id(),rootWorkspaceId:id(),nativeInstanceId:'native-initial-fixture'}
   const keys=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),publicKey=keys.publicKey.export({type:'spki',format:'pem'}),keyId='initial-joint-fixture-key'
   const nativeEnv=['CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=1','SUITECRM_NATIVE_AUTHORITY_ISSUER_KEY_ID='+keyId,
     'SUITECRM_NATIVE_AUTHORITY_INSTANCE_ID='+selection.nativeInstanceId,'SUITECRM_NATIVE_AUTHORITY_ISSUER_PUBLIC_KEY='+publicKey,
-    'SUITECRM_NATIVE_AUTHORITY_SERVICE_USER_ID='+observed.serviceUserId,'SUITECRM_NATIVE_AUTHORITY_CLIENT_ID='+observed.oauthClientId]
+    'SUITECRM_NATIVE_AUTHORITY_SERVICE_USER_ID='+observed.serviceUserId,'SUITECRM_NATIVE_AUTHORITY_CLIENT_ID='+observed.oauthClientId,
+    ...(options.withRecordLifecycle?['CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1','SUITECRM_CLIENT_ID='+observed.oauthClientId]:[])]
   const deniedIds=observed.source.principalSuiteCrmUserIds.filter(p=>![observed.serviceUserId,observed.viewerId].includes(p));assert.equal(deniedIds.length,2)
   const people=[{email:selection.actorEmail,native:observed.serviceUserId,role:'owner'},
     {email:'joint.viewer@example.invalid',native:observed.viewerId,role:'member'},...deniedIds.map((native,i)=>({email:'joint.denied'+i+'@example.invalid',native,role:'member'}))]
@@ -587,12 +607,51 @@ try{
     serviceStartup=await check('immutable service image completes enrolled entrypoint and a true second-container restart on the same owned app data',async()=>{
       const fileState=()=>JSON.parse(run('docker',['exec',names.app,'php','-d','memory_limit=384M','/joint-startup.php','--service-files'],{timeout:45000,maxBuffer:24000000}))
       const processState=()=>JSON.parse(run('docker',['exec',names.app,'php','/joint-startup.php','--service-processes']))
+      const lifecycleAudit=async(phase,probe)=>{
+        const before=rawState(),filesBefore=fileState(),journalBefore=readNative(nativePaths.runtime+'/manifest.json')
+        const pins=['app/public/legacy/custom/include/ClawPilot/RecordLifecycle.php',
+          'app/public/legacy/custom/include/ClawPilot/record-lifecycle-routes.php',
+          'app/public/legacy/custom/application/Ext/Api/V8/Config/routes.php',
+          'clawpilot-native-email-runtime-v1/manifest.json']
+        for(const pin of pins)assert.ok(filesBefore[pin]?.sha256,'Actual installed lifecycle file missing: '+pin)
+        assert.equal(journalBefore.packageHash,packet.packageHash)
+        const result=await probe(),after=rawState(),filesAfter=fileState(),processes=processState()
+        const changedTables=Object.keys(before.database).filter(table=>before.database[table]!==after.database[table])
+        const changedFiles=[...new Set([...Object.keys(filesBefore),...Object.keys(filesAfter)])]
+          .filter(path=>JSON.stringify(filesBefore[path])!==JSON.stringify(filesAfter[path]))
+        const cache=auditNativeInitialColdCache(before.cache,after.cache,before.stockAudit,after.stockAudit)
+        const allowedAuditPaths=['app/public/legacy/cache/modules/Audit','app/public/legacy/cache/modules/Audit/Auditvardefs.php']
+        audits.push({script:'/fixture/native-joint-lifecycle.php',action:phase,commandSucceeded:true,
+          tableCount:Object.keys(before.database).length,changedTables,changedFiles,
+          beforeStateHash:sha(stable(before)),afterStateHash:sha(stable(after)),
+          beforeFilesHash:sha(stable(filesBefore)),afterFilesHash:sha(stable(filesAfter)),
+          fileDifferences:changedFiles.map(path=>({path,before:filesBefore[path]??null,after:filesAfter[path]??null})),
+          criticalFilesUnchanged:JSON.stringify(before.critical)===JSON.stringify(after.critical),...cache})
+        assert.deepEqual(after.database,before.database,'Authenticated lifecycle inspection/denial wrote a native table')
+        assert.deepEqual(after.critical,before.critical,'Lifecycle HTTP bootstrap changed critical native files')
+        assert.deepEqual(Object.keys(filesAfter),Object.keys(filesBefore),'Lifecycle HTTP bootstrap added or removed a native path')
+        assert.ok(changedFiles.every(path=>allowedAuditPaths.includes(path)),
+          'Lifecycle HTTP bootstrap changed an unreviewed file; inspect exact warmup provenance: '+changedFiles.join(','))
+        for(const pin of pins)assert.deepEqual(filesAfter[pin],filesBefore[pin],'Installed lifecycle bytes/metadata changed: '+pin)
+        assert.deepEqual(readNative(nativePaths.runtime+'/manifest.json'),journalBefore)
+        assert.deepEqual(processes.forbidden,[],'Temporary lifecycle router must be stopped before the process inventory')
+        return{phase,...result,installedPackageHash:journalBefore.packageHash,installedFiles:Object.fromEntries(pins.map(pin=>[pin,filesBefore[pin].sha256])),
+          installedBytesAndPackageUnchanged:true,nativeTablesUnchanged:true,temporaryRouterAbsentFromProcessInventory:true,auditIndex:audits.length-1}
+      }
       const phases=[],certificateBefore=run('docker',['exec',names.app,'php','-r','fwrite(STDOUT,hash_file("sha256",$argv[1]));',nativePaths.state+'/activation-origin.json'])
       const entrypointEnvironment=nativeEnv.filter(value=>!value.startsWith('CLAWPILOT_NATIVE_INITIAL_MAINTENANCE='))
         .concat(['CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=0','CLAWPILOT_NATIVE_EMAIL_PUBLICATION_ENABLED=1','CLAWPILOT_NATIVE_EMAIL_AUTHORITY_ENABLED=1',
           'CLAWPILOT_NATIVE_INITIAL_FIXTURE=1','PORT=8080'])
       const expectedBody=readFileSync(join(source,'native-email-liveness.json'),'utf8')
       assert.deepEqual(JSON.parse(expectedBody),{service:'suitecrm',mode:'normal',live:true,ready:null})
+      if(options.withRecordLifecycle){
+        recordLifecycle.disabledProbe=await check('real OAuth protected lifecycle route refuses flag0 without changing installed bytes or package',
+          ()=>lifecycleAudit('record-lifecycle-disabled',()=>lifecycleFixture('disabled',{timeout:20000})))
+        assert.equal(recordLifecycle.disabledProbe.code,'NATIVE_RECORD_LIFECYCLE_DISABLED')
+        assert.equal(recordLifecycle.disabledProbe.temporaryRouterStopped,true)
+        recordLifecycle.httpBounds={perRequestSeconds:6,requestsPerVerifier:3,temporaryRouterStartupSeconds:3,
+          temporaryRouterShutdownSeconds:1,disabledProbeSeconds:20,eachEnrolledStartSeconds:45,entireJointRehearsalSeconds:600}
+      }
       for(const phase of ['enrolled-first-container','enrolled-second-container-restart']){
         appDataBudget('before-'+phase);const before=rawState(),filesBefore=fileState(),volumeBefore=ownedVolume()
         assert.ok(volumeBefore);observeStorage('before-'+phase)
@@ -638,17 +697,32 @@ try{
           beforeFilesHash:sha(JSON.stringify(filesBefore)),afterFilesHash:sha(JSON.stringify(filesAfter)),changedFiles,
           fileDifferences:changedFiles.map(path=>({path,before:filesBefore[path]??null,after:filesAfter[path]??null})),...cache}
         audits.push(audit);commandLog.push({script:'/usr/local/bin/entrypoint.sh',action:phase})
+        const startupAuditIndex=audits.length-1
         assert.deepEqual(after.database,before.database,'Actual enrolled startup/restart changed native tables')
         assert.deepEqual(after.critical,before.critical,'Actual enrolled startup/restart changed critical files')
         assert.deepEqual(Object.keys(filesAfter),Object.keys(filesBefore),'Actual enrolled startup/restart added or removed native paths')
         assert.ok(changedFiles.every(path=>permitted.includes(path)),'Actual enrolled startup/restart changed an unreviewed native file: '+changedFiles.join(','))
         assert.equal(run('docker',['exec',names.app,'php','-r','fwrite(STDOUT,hash_file("sha256",$argv[1]));',nativePaths.state+'/activation-origin.json']),certificateBefore)
+        if(options.withRecordLifecycle){
+          assert.ok(started.Config.Env.includes('CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1'))
+          assert.ok(started.Config.Env.includes('SUITECRM_CLIENT_ID='+observed.oauthClientId))
+          const lifecycle=await check('actual Apache stock OAuth inspects exact synthetic Account/Contact after '+phase,
+            ()=>lifecycleAudit('record-lifecycle-'+phase,()=>lifecycleFixture('http-active',{timeout:25000})))
+          assert.equal(lifecycle.status,200);assert.equal(lifecycle.unauthenticatedStatus,401);assert.equal(lifecycle.mismatchStatus,409)
+          assert.deepEqual(lifecycle.records.map(row=>row.state),['active','active','missing'])
+          assert.deepEqual(lifecycle.records.slice(0,2).map(({module,nativeId,globalId})=>({module,nativeId,globalId})),recordLifecycle.fixture.records)
+          assert.deepEqual(lifecycleFixture('metadata'),recordLifecycle.fixture,'Retained synthetic OAuth fixture changed across actual restart')
+          recordLifecycle.httpPhases.push({...lifecycle,containerId:started.Id})
+        }
         appDataBudget('after-'+phase);observeStorage('after-'+phase)
         phases.push({phase,containerId:started.Id,actualConfiguredEntrypoint:true,apachePid1:true,apacheProcesses:processes.apache,
           backgroundWorkersOff:true,httpPort:8080,httpLiveness:true,httpBody:JSON.parse(body),httpProvesAppReadiness:false,
-          actualCurrentNativeInspectionCompletedBeforeApache:true,volumeName:volumeBefore.Name,auditIndex:audits.length-1})
+          actualCurrentNativeInspectionCompletedBeforeApache:true,volumeName:volumeBefore.Name,auditIndex:startupAuditIndex})
       }
       assert.equal(phases.length,2);assert.notEqual(phases[0].containerId,phases[1].containerId)
+      if(options.withRecordLifecycle){assert.equal(recordLifecycle.httpPhases.length,2)
+        assert.notEqual(recordLifecycle.httpPhases[0].containerId,recordLifecycle.httpPhases[1].containerId)
+        recordLifecycle.passed=true;recordLifecycle.actualTwoContainerRestartsWithLifecycleEnabled=true}
       return{version:1,kind:'actual-full-service-image-enrolled-entrypoint-and-container-restart',passed:true,image:imageProof,
         restartMethod:'remove-recreate-distinct-container-retaining-exact-owned-named-volume',phases,
         actualConfiguredEntrypoint:true,apacheWrapperProven:true,fullImageProven:true,trueContainerRestartProven:true,
@@ -670,7 +744,7 @@ try{
   checkBuild()
   report={version:1,kind:'actual-local-native-initial-joint-rehearsal',passed:true,postgresMajor:Number(options.major),sourceZipSha256:ZIP_SHA,resourceOwner:owner,resourceNames:names,
     sourceHashes,buildManifestSha256:sha(readFileSync(join(build,'build-manifest.json'))),checks,audits,commandLog,storagePhases,startupComponent,
-    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,
+    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,
     emailCount:329,principalCount:4,pipelineCount:3,actualPgReservation:true,actualSqlAuthorityCollector:true,actualNativeCli:true,
     actualNativeForecasts:true,actualDurableRsaApproval:true,actualNativeCommit:true,actualFreshNativeResolve:true,actualPgActivation:true,
     lostActualNativeCommitResponseRecovered:true,nativeExecuteCount:nativeExecutionCount,actualSqlOriginSignedAndPublished:true,actualCurrentNativeStartupInspection:true,
@@ -682,6 +756,6 @@ try{
   }
 }catch(error){
   writeFileSync(options.output.replace(/\.json$/,'.failed.json'),JSON.stringify({version:1,failed:true,resourceOwner:owner,resourceNames:names,sourceHashes,checks,audits,commandLog,storagePhases,
-    imageProof,appDataBudgets,appContainerHistory,replanEvidence,
+    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,
     error:String(error.stack??error),stdout:String(error.stdout??''),stderr:String(error.stderr??''),productionTouched:false},null,2)+'\n',{flag:'wx',mode:0o600});throw error
 }finally{try{if(pool)await pool.end()}finally{cleanup()}}
