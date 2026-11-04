@@ -1,36 +1,73 @@
 // Opt-in local acceptance only. The other checkout is read and invoked, never
 // copied, edited, built, staged or pointed at its ordinary database/environment.
 import assert from 'node:assert/strict'
-import { fork } from 'node:child_process'
+import { execFileSync, fork } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const FRACTIONAL_ROOT = '/Users/agentsuburbiasandwich/Desktop/Fractional'
-const APP = `${FRACTIONAL_ROOT}/app`
-const WORKER = `${APP}/tests/fixtures/customer-folder-publication-worker.ts`
 const sha = bytes => createHash('sha256').update(bytes).digest('hex')
 const helperPath = fileURLToPath(import.meta.url)
 const CLAWPILOT_ROOT = resolve(dirname(helperPath), '../..')
+const SELECTED_MANIFEST_SHA256 = '7b20aca415a557e9b7aa7936ed83d0f13cd2c6eea4c71d919658df44dc138e6e'
+const PUBLICATION_INDEX = '161_customer_folder_publication_index.sql'
+const PUBLICATION_INDEX_SHA256 = '5a2e2a199c1586f57212450f42e1e1e73afa58fc89b5539bc40083ed8dfbcc37'
+const PROTOCOL_LEDGER_SHA256 = 'ebc7e9f2c9c5240ee0181739cd254ac3d74387b87e98282be587918b2f0e1a46'
+const MIGRATION_BOUNDARY = 'synthetic-selected119-plus-planned161-protocol-only'
 
-/** Static, read-only preflight; called before the guarded container starts. */
-export function inspectFractionalFolderSenderSources(ts) {
+function git(root, args, maxBuffer = 1024 * 1024) {
+  return execFileSync('git', ['--no-optional-locks', '-C', root, ...args], { timeout: 10_000, maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] })
+}
+
+function verifySelection(selection) {
+  assert.ok(selection && typeof selection.root === 'string' && isAbsolute(selection.root))
+  assert.equal(resolve(selection.root), selection.root)
+  assert.equal(realpathSync(selection.root), selection.root)
+  assert.match(selection.commit, /^[a-f0-9]{40}$/u, 'An explicit reviewed full Fractional commit is required')
+  assert.equal(git(selection.root, ['rev-parse', '--show-toplevel']).toString('utf8').trim(), selection.root)
+  assert.equal(git(selection.root, ['rev-parse', 'HEAD']).toString('utf8').trim(), selection.commit, 'Fractional HEAD differs from the reviewed selection')
+  assert.equal(git(selection.root, ['status', '--porcelain=v1', '--untracked-files=all']).toString('utf8'), '', 'Joined Fractional source must be committed and clean')
+  return { app: `${selection.root}/app`, worker: `${selection.root}/app/tests/fixtures/customer-folder-publication-worker.ts` }
+}
+
+function privateFractionalPaths() {
+  assert.equal(process.env.FRACTIONAL_TEST_DATABASE, '1')
+  return verifySelection({ root: process.env.CLAWPILOT_JOINED_FRACTIONAL_ROOT, commit: process.env.CLAWPILOT_JOINED_FRACTIONAL_COMMIT })
+}
+
+/** Read-only source preflight; called before the guarded container starts.
+ * The owner-approved physical120 fixture is protocol acceptance only. It does
+ * not select the separate145 readiness/Shipping rollout or activate a service. */
+export async function inspectFractionalFolderSenderSources(ts, selection) {
   assert.match(process.version, /^v24\./, 'Joined acceptance requires Node 24')
-  assert.equal(realpathSync(FRACTIONAL_ROOT), FRACTIONAL_ROOT)
+  const { app: APP, worker: WORKER } = verifySelection(selection)
   const queue = [WORKER, `${APP}/src/worker.ts`, `${APP}/scripts/migration-runner.mjs`, `${APP}/scripts/migrate.mjs`]
   const hashes = {}, consumed = new Set()
+  const tracked = new Map(git(selection.root, ['ls-tree', '-rz', selection.commit, '--', 'app'], 8 * 1024 * 1024).toString('utf8').split('\0').filter(Boolean).map(entry => {
+    const match = /^(100644|100755|120000) blob ([a-f0-9]{40})\t(.+)$/u.exec(entry)
+    assert.ok(match, 'Unexpected Fractional Git entry')
+    return [match[3], { mode: match[1], object: match[2] }]
+  }))
+  function capture(path) {
+    assert.equal(realpathSync(path), path, 'Joined source paths cannot traverse symlinks')
+    const stat = lstatSync(path)
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024, 'Expected regular bounded source')
+    const bytes = readFileSync(path)
+    const entry = tracked.get(relative(selection.root, path))
+    assert.ok(entry && ['100644', '100755'].includes(entry.mode), 'Consumed Fractional source must be a regular tracked Git file')
+    assert.equal(sha(git(selection.root, ['cat-file', 'blob', entry.object], 2 * 1024 * 1024)), sha(bytes), 'Consumed Fractional bytes differ from the reviewed commit')
+    hashes[path] = sha(bytes)
+    return bytes
+  }
   while (queue.length) {
     const path = queue.shift()
     if (consumed.has(path)) continue
     consumed.add(path)
     assert.ok(consumed.size <= 256, 'Unexpected Fractional source closure growth')
     assert.ok(path.startsWith(`${APP}/`) && !relative(APP, path).split('/').includes('..'))
-    const stat = lstatSync(path)
-    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024, 'Expected regular bounded source')
-    const bytes = readFileSync(path)
-    hashes[path] = sha(bytes)
+    const bytes = capture(path)
     // The full ordinary worker is evidence of wiring, not executed. Its other
     // independent modules are outside this bounded sender invocation.
     if (path === `${APP}/src/worker.ts`) continue
@@ -42,14 +79,23 @@ export function inspectFractionalFolderSenderSources(ts) {
       } else assert.ok(imported.fileName === 'pg' || imported.fileName.startsWith('node:'), 'Unexpected sender package dependency')
     }
   }
-  const migrations = readdirSync(`${APP}/migrations`).filter(name => /^\d+.*\.sql$/u.test(name)).sort()
-  assert.ok(migrations.includes('069_customer_folder_publication_index.sql'))
-  for (const name of migrations) {
-    const path = `${APP}/migrations/${name}`, stat = lstatSync(path)
-    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024)
-    hashes[path] = sha(readFileSync(path))
+  const manifestBytes = capture(`${APP}/scripts/release-migrations.json`)
+  assert.equal(sha(manifestBytes), SELECTED_MANIFEST_SHA256, 'The owner-reviewed selected119 manifest changed')
+  const { migrationFiles } = await import(pathToFileURL(`${APP}/scripts/migration-runner.mjs`).href)
+  const selected = await migrationFiles()
+  assert.equal(selected.length, 119, 'Only the owner-selected119 source inventory is admitted')
+  for (const migration of selected) {
+    assert.match(migration.name, /^\d{3}_[a-z0-9_]+\.sql$/u)
+    const bytes = capture(`${APP}/migrations/${migration.name}`)
+    assert.equal(bytes.toString('utf8'), migration.sql)
+    assert.equal(sha(bytes), migration.sha256)
   }
-  for (const name of ['package.json', 'package-lock.json']) if (existsSync(`${APP}/${name}`)) hashes[`${APP}/${name}`] = sha(readFileSync(`${APP}/${name}`))
+  const indexBytes = capture(`${APP}/scripts/planned-migrations/${PUBLICATION_INDEX}`)
+  assert.equal(indexBytes.length, 326)
+  assert.equal(sha(indexBytes), PUBLICATION_INDEX_SHA256)
+  const migrations = [...selected, { name: PUBLICATION_INDEX, sha256: PUBLICATION_INDEX_SHA256, sql: indexBytes.toString('utf8') }]
+  assert.equal(sha(JSON.stringify(migrations.map(({ name, sha256 }) => ({ name, sha256 })))), PROTOCOL_LEDGER_SHA256)
+  for (const name of ['package.json', 'package-lock.json']) if (existsSync(`${APP}/${name}`)) capture(`${APP}/${name}`)
   hashes[helperPath] = sha(readFileSync(helperPath))
   for (const path of ['scripts/test-fractional-crm-gateway-postgres.mjs',
     'app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts', 'app_src/lib/fractionalCrmGatewayHttp.ts',
@@ -58,19 +104,30 @@ export function inspectFractionalFolderSenderSources(ts) {
     'app_src/lib/crm/boardProjection.ts', 'app_src/lib/crm/customerFolderLinks.ts', 'app_src/lib/crm/fractionalCustomerFolder.ts']) {
     hashes[resolve(CLAWPILOT_ROOT, path)] = sha(readFileSync(resolve(CLAWPILOT_ROOT, path)))
   }
-  return Object.freeze({ root: FRACTIONAL_ROOT, hashes: Object.freeze(hashes), migrationCount: migrations.length })
+  const captureResult = Object.freeze({ root: selection.root, commit: selection.commit, app: APP, hashes: Object.freeze(hashes),
+    migrations: Object.freeze(migrations.map(row => Object.freeze({ name: row.name, sha256: row.sha256, sql: row.sql }))),
+    selectedMigrationNames: Object.freeze(selected.map(row => row.name)), migrationCount: migrations.length,
+    migrationBoundary: MIGRATION_BOUNDARY, protocolLedgerSha256: PROTOCOL_LEDGER_SHA256 })
+  unchanged(captureResult)
+  return captureResult
 }
 
 function unchanged(capture) {
-  for (const [path, digest] of Object.entries(capture.hashes)) assert.equal(sha(readFileSync(path)), digest, 'Pinned joined source changed')
-  const captured = Object.keys(capture.hashes).filter(path => path.startsWith(`${APP}/migrations/`)).sort()
-  assert.deepEqual(readdirSync(`${APP}/migrations`).filter(name => /^\d+.*\.sql$/u.test(name)).sort().map(name => `${APP}/migrations/${name}`), captured,
-    'The complete Fractional migration set must remain frozen')
+  verifySelection(capture)
+  for (const [path, digest] of Object.entries(capture.hashes)) {
+    assert.equal(realpathSync(path), path)
+    const stat = lstatSync(path)
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size <= 1024 * 1024)
+    assert.equal(sha(readFileSync(path)), digest, 'Pinned joined source changed')
+  }
+  assert.deepEqual(readdirSync(`${capture.app}/migrations`).filter(name => /^\d+.*\.sql$/u.test(name)).sort(), capture.selectedMigrationNames,
+    'The exact selected119 Fractional source inventory must remain frozen')
 }
 
 // This private child command invokes the real administrator recheck, so an
 // actual retry receipt becomes due without sleeping or rewriting ledger rows.
 async function administratorChild(mode) {
+  const { app: APP } = privateFractionalPaths()
   assert.equal(process.env.FRACTIONAL_TEST_DATABASE, '1')
   const url = new URL(process.env.FRACTIONAL_DATABASE_URL || 'invalid:')
   assert.equal(url.hostname, '127.0.0.1')
@@ -103,6 +160,7 @@ if (process.argv[1] === helperPath && process.argv[2] === '--private-sender') {
   assert.equal(process.argv.length, 3)
   assert.equal(process.env.FRACTIONAL_TEST_DATABASE, '1')
   assert.equal(typeof process.send, 'function', 'Private sender requires owned IPC')
+  const { worker: WORKER } = privateFractionalPaths()
   const originalSend = process.send.bind(process)
   // The existing read-only sender fixture forwards fetch through Node's JSON
   // IPC. Serialize Web API containers before that boundary; otherwise a real
@@ -126,6 +184,7 @@ if (process.argv[1] === helperPath && ['--private-recheck', '--private-opt-in'].
 
 export async function runFractionalCustomerFolderJoined({ Pool, connectionOptions, capture, load, query, gateway,
   projection, stage, onboardingRequest, fixture }) {
+  const APP = capture.app
   const deadline = Date.now() + 120_000
   unchanged(capture)
   assert.equal(connectionOptions.host, '127.0.0.1')
@@ -143,7 +202,7 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
   const fractionalOrg = fixture.fractionalOrganizationId, actor = 'joined-folder-administrator'
   assert.equal(fractionalOrg, 'fractional-fixture', 'Only the parent synthetic organization is admitted')
   const origin = 'https://clawpilot.example.invalid', parent = 'fractional_joined_customers', driveId = 'fractional_joined_shared_drive'
-  const account = 'fractional-drive@example.invalid', counters = { workers: 0, requests: 0, driveReads: 0, oauth: 0, crmGets: 0, crmPatches: 0, droppedAcknowledgements: 0, responseBytes: 0 }
+  const account = 'fractional-drive@example.invalid', counters = { workers: 0, senderWorkers: 0, poolOneVerified: 0, requests: 0, driveReads: 0, oauth: 0, crmGets: 0, crmPatches: 0, droppedAcknowledgements: 0, responseBytes: 0 }
   const records = [], requests = []
   const gatewayEnv = { FRACTIONAL_CRM_GATEWAY_ENABLED: '1', FRACTIONAL_CRM_GATEWAY_ORIGIN: origin, FRACTIONAL_CRM_GATEWAY_SOURCE_INSTANCE_ID: instance }
   // Default parameters close over the boundary module's own environment. Load
@@ -161,6 +220,7 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
   }, gatewayEnv)
   assert.equal(typeof route.GET, 'function'); assert.equal(typeof route.PATCH, 'function')
   const env = { PATH: process.env.PATH || '/usr/bin:/bin', TZ: 'UTC', NODE_ENV: 'test', FRACTIONAL_TEST_DATABASE: '1',
+    CLAWPILOT_JOINED_FRACTIONAL_ROOT: capture.root, CLAWPILOT_JOINED_FRACTIONAL_COMMIT: capture.commit, FRACTIONAL_TEST_FOLDER_POOL_MAX: '1',
     FRACTIONAL_DATABASE_URL: `postgresql://${encodeURIComponent(connectionOptions.user)}:${encodeURIComponent(connectionOptions.password)}@127.0.0.1:${connectionOptions.port}/${databaseName}`,
     FRACTIONAL_CRM_FOLDER_PUBLICATION_ENABLED: '1', FRACTIONAL_CUSTOMER_DRIVE_SHARED_DRIVE_ID: driveId,
     FRACTIONAL_CUSTOMER_DRIVE_ENABLED: '1', FRACTIONAL_CUSTOMER_DRIVE_ORGANIZATION_ID: fractionalOrg,
@@ -172,13 +232,16 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     FRACTIONAL_SHARED_CRM_PIPELINE_ID: pipeline, FRACTIONAL_SHARED_CRM_ROOT_COMPANY_GLOBAL_ID: rootGlobalId }
   const client = await fractional.connect()
   try {
-    const { applyMigrations, migrationFiles } = await import(pathToFileURL(`${APP}/scripts/migration-runner.mjs`).href)
-    const migrationResult = await applyMigrations(client, { migrations: await migrationFiles() })
+    const { applyMigrations } = await import(pathToFileURL(`${APP}/scripts/migration-runner.mjs`).href)
+    // Owner-approved synthetic protocol fixture ONLY: selected119 plus the
+    // index161 bytes. Do not apply the separate8/17 planned Shipping stages,
+    // invoke a cloud activator, or call this physical120 inventory readiness.
+    const migrationResult = await applyMigrations(client, { migrations: capture.migrations })
     assert.equal(migrationResult.existing, 0)
     assert.equal(migrationResult.applied.length, capture.migrationCount)
     const ledger = (await client.query('SELECT name,sha256 FROM fractional_migrations ORDER BY name')).rows
-    assert.deepEqual(ledger, Object.keys(capture.hashes).filter(path => path.startsWith(`${APP}/migrations/`)).sort()
-      .map(path => ({ name: path.slice(`${APP}/migrations/`.length), sha256: capture.hashes[path] })))
+    assert.deepEqual(ledger, capture.migrations.map(({ name, sha256 }) => ({ name, sha256 })))
+    assert.equal(sha(JSON.stringify(ledger)), capture.protocolLedgerSha256)
   } finally { client.release() }
   const bpoJobsBefore = (await query('SELECT * FROM crm_customer_folder_jobs ORDER BY account_id')).rows
   const card = async row => (await query('SELECT card_id,payload FROM crm_board_cards WHERE board_id=$1 AND entity_id=$2', [board, row.localId])).rows[0]
@@ -266,6 +329,7 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     unchanged(capture)
     assert.ok(Date.now() < deadline)
     counters.workers++
+    if (!recheck) counters.senderWorkers++
     const childEnv = recheck ? { ...env, JOINED_ORGANIZATION_ID: fractionalOrg, JOINED_ACTOR_ID: actor, JOINED_CUSTOMER_ID: recheck.customerId } : env
     const worker = fork(helperPath, [recheck ? administrativeMode : '--private-sender'], {
       execPath: process.execPath, execArgv: [], cwd: workDirectory, env: childEnv, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -278,7 +342,15 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     const timeout = setTimeout(() => { failure = new Error('Bounded sender process timed out'); worker.kill('SIGTERM') }, Math.min(30_000, deadline - Date.now()))
     let killTimer
     worker.on('message', message => {
-      if (message.type === 'result') result = message.worked
+      if (message.type === 'result') {
+        try {
+          assert.equal(recheck, null, 'Only the sender child may report a publication result')
+          assert.deepEqual(message.pool, { max: 1, poolCount: 1, connectionsCreated: 1, acquired: 1, checkedOut: 0, peakCheckedOut: 1, currentClients: 0 },
+            'Each actual sender process must release its one real database connection')
+          counters.poolOneVerified++
+          result = message.worked
+        } catch (error) { failure = error; worker.kill('SIGTERM') }
+      }
       else if (message.type === 'rechecked') result = message.passed
       else if (message.type === 'failure') failure = new Error('Sender private operation failed')
       else if (message.type === 'fetch') requestChain = requestChain.then(async () => {
@@ -393,17 +465,22 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     assert.equal(await child(), false, 'Published and held results do not loop or recreate folders')
     assert.deepEqual((await query('SELECT * FROM crm_customer_folder_jobs ORDER BY account_id')).rows, bpoJobsBefore)
     assert.equal(counters.droppedAcknowledgements, 1)
+    assert.equal(counters.poolOneVerified, counters.senderWorkers)
     unchanged(capture)
     return { passed: true, kind: 'actual-fractional-sender-clawpilot-receiver-local-joined', fixtureDataSynthetic: true,
       actualSenderProcess: true, actualReceiverNextRoute: true, actualMachineAuth: true, actualSeparateDatabases: true,
       actualProjectCardProjection: true, providerIoControlled: true, providerFolderWrites: 0, productionTouched: false,
-      migrationCount: capture.migrationCount, sourceFiles: Object.keys(capture.hashes).length, counters,
+      fractionalSourceRoot: capture.root, fractionalSourceCommit: capture.commit,
+      migrationCount: capture.migrationCount, migrationBoundary: capture.migrationBoundary,
+      protocolLedgerSha256: capture.protocolLedgerSha256, fractionalReadiness: false, ownerSchemaActivation: false,
+      sourceFiles: Object.keys(capture.hashes).length, counters,
       sourceHashes: capture.hashes, isolatedDatabaseName: databaseName,
       sourceManifestSha256: sha(JSON.stringify(Object.entries(capture.hashes).sort(([a], [b]) => a.localeCompare(b)))),
       cleanupOwner: 'Parent guarded container; helper awaits every child and closes its separate database pool',
       checks: ['actual-route-rejects-wrong-bearer-and-customer-without-write', 'same-global-id-and-card', 'independent-folder-urls', 'bpo-comments-preserved', 'lost-ack-same-command-no-second-effect',
         'fresh-receiver-readback', 'manual-override-held', 'wrong-drive-held', 'no-folder-recreation-or-bpo-job-consumption'],
       limitations: ['Synthetic local fixtures and controlled Google Drive, not live provider or deployment proof',
+        'Owner-approved selected119 plus planned161 physical120 protocol fixture only; not the separate145 readiness, Shipping rollout or schema activation gates',
         'Existing sender ready-folder receipts are seeded; folder creation/adoption is not proved here',
         'Existing projection fixture excludes ensurePipelineCrmReferenceLinks upkeep and uses synthetic shortLinkUrl; no signed-in UI or short-link delivery proof'] }
   } catch (error) {

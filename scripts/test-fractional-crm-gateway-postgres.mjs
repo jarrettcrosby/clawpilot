@@ -14,8 +14,17 @@ import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
 import {inspectFractionalFolderSenderSources,runFractionalCustomerFolderJoined} from './lib/fractional-customer-folder-joined.mjs'
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg'),ts=require('typescript')
 const args=process.argv.slice(2)
-assert.ok(args.length===0||(args.length===1&&args[0]==='--with-fractional-folder-sender'),'Only the explicit joined sender opt-in is supported')
-const joinedSources=args.length?inspectFractionalFolderSenderSources(ts):null
+let joined=false,fractionalRoot=null,fractionalCommit=null
+for(const arg of args){
+ if(arg==='--with-fractional-folder-sender'){assert.equal(joined,false);joined=true}
+ else if(arg.startsWith('--fractional-root=')){assert.equal(fractionalRoot,null);fractionalRoot=arg.slice('--fractional-root='.length)}
+ else if(arg.startsWith('--fractional-commit=')){assert.equal(fractionalCommit,null);fractionalCommit=arg.slice('--fractional-commit='.length)}
+ else throw Error('Use [--with-fractional-folder-sender --fractional-root=/absolute/reviewed/Fractional --fractional-commit=FULL40]')
+}
+assert.equal(joined,fractionalRoot!==null&&fractionalCommit!==null,'Joined sender requires an explicit root and full commit; no Desktop fallback is permitted')
+if(!joined){assert.equal(fractionalRoot,null);assert.equal(fractionalCommit,null)
+ console.log('FRACTIONAL_FOLDER_JOINED_SKIPPED=No external sender root/commit selected; this run proves the ClawPilot gateway only')}
+const joinedSources=joined?await inspectFractionalFolderSenderSources(ts,{root:fractionalRoot,commit:fractionalCommit}):null
 const read=path=>readFileSync(new URL(`../${path}`,import.meta.url),'utf8')
 function load(path,deps={},environment={}){const module={exports:{}};vm.runInNewContext(ts.transpileModule(read(path),{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
  {module,exports:module.exports,Buffer,URL,URLSearchParams,Request,Response,AbortSignal,Date,Error,Set,Map,process:{env:environment},require(name){if(Object.hasOwn(deps,name))return deps[name];if(name==='node:crypto')return require(name);return new Proxy({__esModule:true},{get(target,key){if(key==='__esModule')return true;return ()=>{throw new Error(`Unexpected integration dependency ${name}:${String(key)}`)}}})}}, {filename:path});return module.exports}
