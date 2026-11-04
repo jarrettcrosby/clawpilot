@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   DEFAULT_PIPELINE_SHEET_ID,
@@ -266,13 +267,23 @@ async function ensureBasePipelineTemplate(client: PoolClient, pipelineId: string
 }
 
 export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput): Promise<{
-  boardId: string
-  pipelineId: string
+  boardId: string | null
+  pipelineId: string | null
   crmBoardId: string | null
   pipelineProvisioningRequired: boolean
 }> {
   const user = await resolveTenantActor(emailValue)
   if (!user.organizationId) throw new Error('Active workspace is not configured')
+  const rootRead = await query(`SELECT 1 FROM clawpilot_crm_root_read_workspaces($1)
+    WHERE workspace_id=$2::uuid LIMIT 1`, [user.email, user.organizationId])
+  if (user.organizationAccessOrigin === 'root_crm' || rootRead.rows.length) {
+    // Root CRM access is not permission to create personal resources, change
+    // sharing, or enqueue Sheet/provider provisioning as a login side effect.
+    const boards = await listProjectBoards(user, { ensureDefaults: false })
+    const pipelines = await listPipelineSpaces(user, { ensureDefaults: false })
+    return { boardId: boards[0]?.id ?? null, pipelineId: pipelines[0]?.id ?? null,
+      crmBoardId: null, pipelineProvisioningRequired: false }
+  }
   const organization = { id: user.organizationId, name: user.organizationName || 'Workspace' }
   const ownerEmail = normalizeUserEmail(user.email)
   const configuredOwner = normalizeUserEmail(process.env.APP_LOGIN_EMAIL)
@@ -281,6 +292,7 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
     && compatibilityUser?.organizationId === organization.id
 
   return withTransaction(async (client) => {
+    if (!isDemoWorkspaceId(organization.id)) await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [organization.id])
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 1))', [ownerEmail])
 
@@ -341,6 +353,28 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
       [ownerEmail, organization.id],
     )
     if (!board.rows[0]) throw new Error('Unable to provision a project board')
+
+    const nativeAuthority = await client.query<{ enabled:boolean }>(
+      'SELECT enabled FROM crm_native_email_publication_control WHERE singleton',
+    )
+    if (nativeAuthority.rows[0]?.enabled) {
+      // Signing in is not authority to create a CRM scope or upgrade a viewer
+      // to editor. Native-enabled access is granted by the owner through the
+      // coordinated sharing path, never as an incidental login side effect.
+      // Accounts without a pipeline can still sign in and use other modules.
+      const existing = await client.query<{ id:string }>(`SELECT p.id::text FROM pipeline_spaces p
+        WHERE p.workspace_organization_id=$1::uuid AND NOT p.reference_access_disabled
+          AND (p.owner_email=$2 OR EXISTS(SELECT 1 FROM pipeline_space_members m WHERE m.pipeline_id=p.id AND m.user_email=$2))
+        ORDER BY (p.owner_email=$2 AND p.is_default) DESC,p.created_at,p.id LIMIT 1`,[organization.id,ownerEmail])
+      const pipelineId = existing.rows[0]?.id ?? null
+      const existingCrmBoard = pipelineId ? await client.query<{ id:string }>(`SELECT b.id::text
+        FROM project_boards b JOIN crm_board_projections p ON p.board_id=b.id
+        WHERE b.owner_email=$1 AND b.workspace_organization_id=$2::uuid
+          AND p.workspace_organization_id=$2::uuid AND p.pipeline_id=$3::uuid
+        ORDER BY b.created_at,b.id LIMIT 1`,[ownerEmail,organization.id,pipelineId]) : null
+      return { boardId:board.rows[0].id,pipelineId,crmBoardId:existingCrmBoard?.rows[0]?.id ?? null,
+        pipelineProvisioningRequired:false }
+    }
 
     type PipelineResourceRow = {
       id: string
@@ -510,6 +544,7 @@ export async function listProjectBoards(
 ): Promise<ProjectBoard[]> {
   const actor = await resolveTenantActor(actorEmailValue)
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
+  if (!effectiveUserPermissions(actor).viewProjects) return []
   if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
   const result = await query<ProjectBoardRow>(
     `
@@ -519,8 +554,9 @@ export async function listProjectBoards(
         board.owner_email,
         board.workspace_organization_id::text,
         board.is_default,
-        CASE WHEN board.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
-        CASE WHEN board.owner_email = $1 THEN COALESCE((
+        CASE WHEN $5::boolean AND board.owner_email = $1 THEN 'owner'
+          WHEN $5::boolean AND membership.user_email=$1 THEN membership.access_role ELSE 'viewer' END AS access_role,
+        CASE WHEN $5::boolean AND board.owner_email = $1 THEN COALESCE((
           SELECT jsonb_agg(jsonb_build_object(
             'email', member.user_email,
             'displayName', app_user.display_name,
@@ -539,12 +575,19 @@ export async function listProjectBoards(
        AND membership.user_email = $1
       WHERE board.workspace_organization_id = $2::uuid
         AND (NOT $3::boolean OR board.id = $4::uuid)
-        AND (board.owner_email = $1 OR membership.user_email = $1)
+        AND (($5::boolean AND (board.owner_email = $1 OR membership.user_email = $1)) OR EXISTS(
+          SELECT 1 FROM clawpilot_crm_root_read_workspaces($1) root_access
+          JOIN crm_board_projections projection ON projection.workspace_organization_id=root_access.workspace_id
+          JOIN pipeline_spaces source_pipeline ON source_pipeline.id=projection.pipeline_id
+            AND source_pipeline.workspace_organization_id=root_access.workspace_id
+          WHERE root_access.workspace_id=board.workspace_organization_id AND root_access.projects_allowed
+            AND projection.board_id=board.id AND NOT source_pipeline.reference_access_disabled))
       ORDER BY
         CASE WHEN board.owner_email = $1 AND board.is_default THEN 0 WHEN board.owner_email = $1 THEN 1 ELSE 2 END,
         board.created_at ASC
     `,
-    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_BOARD_ID],
+    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_BOARD_ID,
+      actor.organizationAccessOrigin !== 'root_crm'],
   )
   return result.rows.map(toProjectBoard)
 }
@@ -555,6 +598,7 @@ export async function listPipelineSpaces(
 ): Promise<PipelineSpace[]> {
   const actor = await resolveTenantActor(actorEmailValue)
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
+  if (!effectiveUserPermissions(actor).viewCrm) return []
   if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
   const result = await query<PipelineSpaceRow>(
     `
@@ -564,8 +608,9 @@ export async function listPipelineSpaces(
         pipeline.owner_email,
         pipeline.workspace_organization_id::text,
         pipeline.is_default,
-        CASE WHEN pipeline.owner_email = $1 THEN 'owner' ELSE membership.access_role END AS access_role,
-        CASE WHEN pipeline.owner_email = $1 THEN COALESCE((
+        CASE WHEN $5::boolean AND pipeline.owner_email = $1 THEN 'owner'
+          WHEN $5::boolean AND membership.user_email=$1 THEN membership.access_role ELSE 'viewer' END AS access_role,
+        CASE WHEN $5::boolean AND pipeline.owner_email = $1 THEN COALESCE((
           SELECT jsonb_agg(jsonb_build_object(
             'email', member.user_email,
             'displayName', app_user.display_name,
@@ -607,7 +652,9 @@ export async function listPipelineSpaces(
       WHERE pipeline.workspace_organization_id = $2::uuid
         AND pipeline.reference_access_disabled = false
         AND (NOT $3::boolean OR pipeline.owner_email = $4)
-        AND (pipeline.owner_email = $1 OR membership.user_email = $1)
+        AND (($5::boolean AND (pipeline.owner_email = $1 OR membership.user_email = $1)) OR EXISTS(
+          SELECT 1 FROM clawpilot_crm_root_read_workspaces($1) root_access
+          WHERE root_access.workspace_id=pipeline.workspace_organization_id))
       ORDER BY
         CASE
           WHEN EXISTS (
@@ -624,7 +671,8 @@ export async function listPipelineSpaces(
         END,
         pipeline.created_at ASC
     `,
-    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_SYSTEM_EMAIL],
+    [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_SYSTEM_EMAIL,
+      actor.organizationAccessOrigin !== 'root_crm'],
   )
   return result.rows.map(toPipelineSpace)
 }
@@ -870,7 +918,13 @@ export async function sharePipelineSpace(input: {
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can share it')
   const target = await validateShareTarget(actor, input.userEmail)
   const accessRole = normalizeShareRole(input.accessRole)
+  const { changePipelineMemberWithNativeAuthority } = await import('@/lib/crm/nativeEmailAuthorityRuntime')
+  if (await changePipelineMemberWithNativeAuthority({ actorEmail:actor.email,workspaceId:pipeline.workspaceOrganizationId || '',
+    pipelineId:pipeline.id,userEmail:target.email,accessRole })) {
+    return resolvePipelineSpaceAccess({ actorEmail:actor,pipelineId:pipeline.id })
+  }
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query(
       `
         INSERT INTO pipeline_space_members (pipeline_id, user_email, access_role, shared_by, updated_at)
@@ -927,7 +981,13 @@ export async function removePipelineShare(input: {
   const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: input.pipelineId })
   if (pipeline.ownerEmail !== actor.email) throw new Error('Only the pipeline owner can change sharing')
   const userEmail = normalizeUserEmail(input.userEmail)
+  const { changePipelineMemberWithNativeAuthority } = await import('@/lib/crm/nativeEmailAuthorityRuntime')
+  if (await changePipelineMemberWithNativeAuthority({ actorEmail:actor.email,workspaceId:pipeline.workspaceOrganizationId || '',
+    pipelineId:pipeline.id,userEmail,accessRole:null })) {
+    return resolvePipelineSpaceAccess({ actorEmail:actor,pipelineId:pipeline.id })
+  }
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query(
       'DELETE FROM pipeline_space_members WHERE pipeline_id = $1::uuid AND user_email = $2',
       [pipeline.id, userEmail],

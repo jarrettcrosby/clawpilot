@@ -6,6 +6,8 @@ import {
   retireUnusedWorkspaceOrganization,
 } from '@/lib/organizations'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
+import { invitationWorkspaceIds, lockInvitationUserWithClient, requireInvitedWorkspaceScopeWithClient } from '@/lib/invitationWorkspaceScope'
 import { organizationAppPublicUrl } from '@/lib/organizationWebPreferences'
 import {
   getAppUser,
@@ -14,6 +16,7 @@ import {
   resolveAppUserActor,
   restoreInvitedUserAssignments,
   type AppUser,
+  type AppUserInvitedOrganizationMembership,
   type AppUserMembershipSnapshot,
 } from '@/lib/users'
 
@@ -64,7 +67,9 @@ async function claimInvitation(input: {
   organizationIds: string[]
 }): Promise<IssuedInvitationRow> {
   return withTransaction(async (client) => {
-    await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [input.email])
+    await lockInvitationUserWithClient(client, input.email)
+    await requireInvitedWorkspaceScopeWithClient(client, input.email,
+      invitationWorkspaceIds(input.organizationId, input.organizationIds))
     const pending = await client.query<{
       id: string
       delivery_recent: boolean
@@ -136,7 +141,20 @@ async function markInvitationDelivered(input: {
   deliveryId: string | null
 }): Promise<void> {
   await withTransaction(async (client) => {
-    await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [input.email])
+    await lockInvitationUserWithClient(client, input.email)
+    const pending = await client.query<{
+      workspace_organization_id: string | null
+      workspace_organization_ids: string[] | null
+    }>(
+      `SELECT workspace_organization_id::text, workspace_organization_ids
+       FROM app_user_invitations WHERE id = $1::uuid AND email = $2
+         AND accepted_at IS NULL AND delivery_pending_at IS NOT NULL AND expires_at > now()
+       FOR UPDATE`, [input.invitationId, input.email],
+    )
+    if (pending.rows.length !== 1) throw new Error('Unable to activate the delivered invitation')
+    const scope = pending.rows[0]
+    await requireInvitedWorkspaceScopeWithClient(client, input.email,
+      invitationWorkspaceIds(scope.workspace_organization_id, scope.workspace_organization_ids))
     await client.query(
       `
         UPDATE app_user_invitations
@@ -178,8 +196,11 @@ async function rollbackInvitation(input: {
   invitation: IssuedInvitationRow | null
   email: string
   deleteUser: boolean
+  producedUserRowJson: string | null
+  producedMembershipRowJsons: Array<string | null>
 }): Promise<void> {
   await withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query('SELECT email FROM app_users WHERE email = $1 FOR UPDATE', [input.email])
     if (input.invitation) {
       await client.query(
@@ -187,18 +208,32 @@ async function rollbackInvitation(input: {
         [input.invitation.id],
       )
     }
-    if (input.deleteUser) {
+    if (input.deleteUser && input.producedUserRowJson && input.producedMembershipRowJsons.length
+      && input.producedMembershipRowJsons.every((row): row is string => typeof row === 'string')) {
+      // A failed send does not authorize deleting a user another transaction
+      // has since changed or assigned elsewhere. Lock and compare the entire
+      // exact inventory created by this invitation before any cascading delete.
+      await client.query(`SELECT organization_id FROM app_user_organization_memberships
+        WHERE user_email = $1 ORDER BY organization_id FOR UPDATE`, [input.email])
       const removed = await client.query<{ reference_code: string | null }>(
         `
           DELETE FROM app_users user_record
           WHERE user_record.email = $1
             AND user_record.status = 'invited'
+            AND to_jsonb(user_record) = $2::jsonb
+            AND (
+              SELECT COALESCE(jsonb_agg(to_jsonb(membership) ORDER BY membership.organization_id), '[]'::jsonb)
+              FROM app_user_organization_memberships membership WHERE membership.user_email = user_record.email
+            ) = (
+              SELECT jsonb_agg(row_value ORDER BY row_value->>'organization_id')
+              FROM jsonb_array_elements($3::jsonb) AS produced(row_value)
+            )
             AND NOT EXISTS (
               SELECT 1 FROM app_user_invitations invitation WHERE invitation.email = user_record.email
             )
           RETURNING reference_code
         `,
-        [input.email],
+        [input.email, input.producedUserRowJson, JSON.stringify(input.producedMembershipRowJsons.map(row => JSON.parse(row)))],
       )
       const referenceCode = removed.rows[0]?.reference_code
       if (referenceCode) {
@@ -275,6 +310,7 @@ async function invitationByToken(tokenValue: unknown): Promise<InvitationRow | n
            AND membership.organization_id = assigned_organization.organization_id
           WHERE membership.organization_id IS NULL
              OR membership.status <> 'invited'
+             OR membership.trashed_at IS NOT NULL
         )
       LIMIT 1
     `,
@@ -306,11 +342,9 @@ export async function createUserInvitation(input: {
   let user: AppUser | null = null
   let userCreated = false
   let previousInvitedBy: string | null = null
+  let producedUserRowJson: string | null = null
   let previousMembership: AppUserMembershipSnapshot | null = null
-  let previousMemberships: Array<{
-    organizationId: string
-    previousMembership: AppUserMembershipSnapshot | null
-  }> = []
+  let previousMemberships: AppUserInvitedOrganizationMembership[] = []
   let invitation: IssuedInvitationRow | null = null
   const requestedOrganizationIds = normalizeOrganizationIds(input.organizationIds)
   const organizationIds = [
@@ -331,6 +365,7 @@ export async function createUserInvitation(input: {
     user = invited.user
     userCreated = invited.created
     previousInvitedBy = invited.previousInvitedBy
+    producedUserRowJson = invited.producedUserRowJson
     previousMembership = invited.previousMembership
     previousMemberships = invited.previousMemberships
     const token = crypto.randomBytes(32).toString('base64url')
@@ -369,19 +404,22 @@ export async function createUserInvitation(input: {
       expiresAt: new Date(invitation.expires_at).toISOString(),
     }
   } catch (error) {
-    if (user) await rollbackInvitation({ invitation, email: user.email, deleteUser: userCreated })
+    if (user) await rollbackInvitation({ invitation, email: user.email, deleteUser: userCreated, producedUserRowJson,
+      producedMembershipRowJsons: previousMemberships.map(row => row.producedMembershipRowJson ?? null) })
     if (user && !userCreated) {
       const scopedPreviousMemberships = previousMemberships
       if (!scopedPreviousMemberships.length) {
         scopedPreviousMemberships.push({
           organizationId: assignment.organization.id,
           previousMembership,
+          producedMembershipRowJson: null,
         })
       }
       await restoreInvitedUserAssignments({
         email: user.email,
         memberships: scopedPreviousMemberships,
         invitedBy: previousInvitedBy,
+        producedUserRowJson,
       })
     }
     if (assignment.created) await retireUnusedWorkspaceOrganization(assignment.organization.id)

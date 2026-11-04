@@ -25,6 +25,9 @@ function loadAuthorizationModule(path, dependencies = {}) {
 const noAuthorizationIo = () => { throw new Error('Unexpected authorization I/O') }
 const users = loadAuthorizationModule('app_src/lib/users.ts', {
   '@/lib/persistence/postgres': { query: noAuthorizationIo, withTransaction: noAuthorizationIo },
+  '@/lib/persistence/crmNativeEmailAuthority': { lockCrmNativeEmailAuthorityWithClient: noAuthorizationIo },
+  '@/lib/invitationWorkspaceScope': { removeWorkspaceFromPendingInvitationsWithClient: noAuthorizationIo },
+  '@/lib/crm/nativeEmailWorkspaceUserRuntime': { changeWorkspaceUserWithNativeAuthority: noAuthorizationIo },
   '@/lib/auditWriter': {}, '@/lib/crm/suiteCrmClient': {}, '@/lib/demoMode': {},
 })
 const authorization = loadAuthorizationModule('app_src/lib/moduleAuthorization.ts', {

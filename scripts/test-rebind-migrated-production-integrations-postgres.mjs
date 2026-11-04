@@ -24,6 +24,7 @@ import {
   INTEGRATION_CREDENTIAL_KEY_ATTESTATION_VERSION,
 } from '../app_src/lib/integrations/integrationCredentialKeyAttestation.mjs'
 import {
+  PRODUCTION_REBIND_CRITICAL_RELATIONS,
   PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
   PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
 } from './production-rebind-history-schema-attestation.mjs'
@@ -458,6 +459,29 @@ CREATE TRIGGER fixture_guard_activation_update BEFORE UPDATE
 ON operations_integration_accounts
 FOR EACH ROW EXECUTE FUNCTION fixture_guard_activation();
 `
+
+async function completeTargetSchemaLockFixture(target) {
+  // This provider-transaction fixture already injects its schema attester.
+  // Unrelated CRM tables need lock identities, not invented production schema.
+  // Keep the real production lock list intact; the separate full-catalog gate
+  // proves the actual migrations, columns, guards, privileges and checksums.
+  const inspect = () => target.query(
+    `SELECT relation_name, to_regclass(relation_name) IS NOT NULL AS present
+     FROM unnest($1::text[]) WITH ORDINALITY expected(relation_name, position)
+     ORDER BY position`,
+    [PRODUCTION_REBIND_CRITICAL_RELATIONS],
+  )
+  const before = await inspect()
+  for (const { relation_name: relation, present } of before.rows) {
+    assert.match(relation, /^public\.[a-z][a-z0-9_]*$/u)
+    if (!present) {
+      await target.query(`CREATE TABLE ${relation} (id uuid PRIMARY KEY DEFAULT gen_random_uuid())`)
+    }
+  }
+  assert.deepEqual((await inspect()).rows,
+    PRODUCTION_REBIND_CRITICAL_RELATIONS.map(relation => ({ relation_name: relation, present: true })),
+    'the focused target must contain every current production schema-lock identity')
+}
 
 function fixture() {
   const sourceOrg = randomUUID()
@@ -1068,6 +1092,7 @@ async function runAcceptance(sourceUrl, targetUrl) {
   try {
     await source.query(schema)
     await target.query(schema)
+    await completeTargetSchemaLockFixture(target)
     await seedSource(source, data)
     await seedTarget(target, data, bindings)
     const artifact = artifacts(data, bindings)

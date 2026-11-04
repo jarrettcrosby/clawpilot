@@ -32,6 +32,31 @@ Use ClawPilot as the customer-work interface, SuiteCRM as the canonical CRM, Rai
   database/configuration assignments leave that retirement unaccepted until the
   environment runbook's gated cleanup and re-audit pass.
 
+## Company-wide CRM access (release candidate)
+
+The root organization's actual owner can use **Settings → People → Company-wide
+CRM access** to select the businesses in an explicit operator CRM scope, save
+that scope, and select existing employees who may view its CRM pipelines and
+managed account cards. Only currently owned, non-demo businesses may be added.
+An email domain, personal default organization, or global role never creates a
+business binding. A child-organization administrator cannot configure it.
+
+Employee enrollment remains an explicit owner choice; inviting a person alone
+does not grant company-wide access. The person's active membership, CRM module
+permission and explicit business-level denials still apply. Private boards and
+independent editor/admin permissions are not widened. Turning an enrollment or
+business scope off preserves its identity and history rather than deleting it.
+Linking an existing SuiteCRM login remains a separate user-card action; app-only
+employees do not need a native login.
+
+With native email permissions enabled, these controls use the same exact
+native-first transition as user access changes. A pending or interrupted save
+is discovered again on reload and resumed using its saved identity, never by
+replaying draft form values. An unknown write followed by an unavailable read
+locks mutations until **Reload CRM access** can confirm the current state.
+This describes the local release candidate, not confirmation of production
+permission activation or a deployed owner workflow.
+
 ## Entity Mapping
 
 | ClawPilot | SuiteCRM | Workbook |
@@ -124,9 +149,58 @@ Before applying these association rules or storing message content, CRM skips co
 6. Mail addressed to `archive@eigenracing.com` is archive intake. An explicit marker still wins. Without a marker, ClawPilot checks email addresses in the message headers and imported body against Organizations, Contacts, and Leads in pipelines owned by that mailbox user.
 7. Archive address matches are conservative: an address that maps to multiple CRM references is left unmatched. Related `gc` and `ga` references share one interaction and retain separate message links, so quoted or forwarded copies never duplicate the CRM activity.
 
+### Connected mailbox address review
+
+The mailbox's saved display address is not its immutable Google identity. Normal
+intake and ordinary verification refuse a saved-address/profile mismatch. In
+**CRM → Interactions → Review email → Review saved mailbox address**, the exact
+pipeline owner can instead request a separate, no-write address preview. It
+requires a recent non-impersonated session, a fresh verified Google ID token and
+an independent profile read from that selected active Gmail connection. The
+Google subject must match any existing canonical mailbox binding; a changed
+subject is not an address rename and remains held.
+
+The preview shows the saved and verified addresses and expires after five
+minutes. **Confirm address update** re-observes the profile and compares the
+reviewed connection, credential, membership, pipeline and binding metadata before
+updating the saved address, same canonical mailbox binding and audit together.
+Concurrent changes require another review. Credentials stay in memory only and
+are removed on expiry, cancellation or navigation. A successful in-flight reply
+is acknowledged even if the local preview timer expired while awaiting it.
+
+This operation does not change the user's login, rotate/reconnect Google, move
+messages, reset cursors, rewrite historical source evidence or run email recovery.
+Historical messages still require the separately reviewed recovery below.
+
+A connection refresh may retain this verified address only for the same selected
+active Maton Gmail connection, known unchanged provider creation/revision and
+method, matching canonical mailbox binding, and credentials unchanged since
+verification. Other provider metadata, status changes and removals still apply.
+Unknown or changed revision/creation/method, changed credentials, or changed
+status/app/source deliberately uses remote metadata and may require fresh
+verification; the saved label is not a grant-continuity or historical proof.
+
 Previously missed messages are not recovered by resetting a mailbox cursor. The owner-only `POST /api/crm/email-recovery` accepts one active workspace pipeline, its owner's selected Gmail connection, and 1–25 exact Gmail message IDs. It requires a real, non-impersonated same-origin session. The default dry run returns a content/routing digest and proposed references without changing CRM or Gmail. An explicit apply must supply that digest; it refetches the messages, rejects changed content or routing and rechecks current pipeline membership before staging. Drafts, spam, trash, authentication codes and messages routed outside the reviewed pipeline are ineligible. Recovery is audited and idempotent, queues normal CRM synchronization, never sends mail, and does not alter polling cursors. Review each bounded selection and verify the resulting CRM/SuiteCRM activity before expanding it.
 
+The separately reviewed historical Casey pair has its own explicit action in
+the matching BPO pipeline/mailbox's review dialog. It loads only both pinned
+cache records and sends `admissionScope: 'casey-reviewed-two-v1'` with
+`decisionKind: 'review'`. The server independently pins the owner, connection,
+original intake pipeline, exact message/cache/thread identities, Globus primary
+and Airspace related, and actual selected participant Contacts. Both complete
+retained messages must equal fresh provider content. Preview, CAS, audience and
+the whole-pair transaction are rechecked before apply; failure leaves both
+unchanged. Replay retains their canonical identities and **unknown original
+mailbox provenance**. This one-off historical review is not a generic history
+import, association correction, late-contact rule or automatic future thread
+association. The original three-message bridge is unchanged, and the five
+reviewed messages must be recovered as separate three- and two-message batches.
+
 ## Workbook Contract
+
+The in-app Pipeline report defaults its interaction metric/chart to **Customers and prospects**. It uses the current CRM Account `account_type`, not the structural `relationship_type` value. Supplier-only, unclassified and unlinked activity remains available under **All activity**. An interaction linked to several companies counts once when any active, same-pipeline customer/prospect qualifies; legacy Contact/Lead/Opportunity/Meeting-only primary associations follow the normal CRM resolution order. Archived interactions and archived companies do not qualify for the sales metric. Changing this selector does not change opportunity revenue or contact totals. The CRM header explicitly labels its unfiltered total **all interactions**; the generated workbook remains an all-activity projection, not a copy of this per-view selector.
+
+The CRM organization table separates **Type** (Customer, Supplier, etc.) from **Organization role** (workspace root, workspace member, external organization). The internal `relationship_type=customer` hierarchy value is displayed as **External organization**, so a Supplier is not misleadingly labeled a customer.
 
 The managed workbook requires `Start Here`, `Organizations`, `Contacts`, `Opportunities`, `Interactions`, `Calculations`, `Dashboard`, and `Dropdowns`. Headers begin on row 4. Column A carries a hidden, protected ClawPilot record identity for CRM entity tabs.
 
@@ -162,6 +236,8 @@ Native SuiteCRM Call polling uses the same full-first-scan and resumable-overlap
 All persisted timestamps remain UTC ISO values. ClawPilot renders dates, activity, releases, agent messages, CRM interactions, pipeline sync times, integration status, and link updates in the signed-in user's profile timezone and locale. Changing the profile timezone updates the active UI without rewriting historical data.
 
 Meeting time synchronization is bidirectional among the ClawPilot CRM surface, native SuiteCRM, and the original organizer's selected Google Calendar. Saving a meeting queues an idempotent Calendar create, update, or cancellation. Google Meet conferences are requested only for Google Meet meetings; in-person locations and custom meeting links retain their selected mode.
+
+The Calendar badge distinguishes **Imported from Google Calendar** from an outgoing invitation's **Delivered** receipt. Import provenance must match the saved provider event identity; historical scheduled status alone is **Not verified**. Failed, pending and cancelled delivery states remain visible. Recurring imported meetings may be grouped for presentation only, within the currently loaded/search-filtered rows and exact pipeline/owner/connection/calendar/series identity. Each group opens its next loaded occurrence (or latest past occurrence); it does not edit the series. **Show every occurrence** restores the individual rows. Grouping never merges or deletes database records, and failures/cancellations remain separate.
 
 The delivered event's account, connection, calendar and organizer are retained with the meeting and its successful action. Native SuiteCRM edits preserve that identity and meeting mode instead of adopting today's default calendar. The current organization membership, pipeline editing access and connection authorization are checked again before synchronization and delivery. Missing or revoked authority requires review rather than moving the event to a different calendar. A source-revision check prevents a delayed CRM edit from overwriting newly saved meeting details, and the CRM update and outbound Calendar action are staged atomically.
 

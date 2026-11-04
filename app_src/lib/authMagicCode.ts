@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { sendAuthMagicCodeEmail } from '@/lib/matonMail'
 import { getAppUser, normalizeUserEmail } from '@/lib/users'
 import { resolveLoginAccountEmail } from '@/lib/authLoginIdentity'
@@ -8,6 +9,7 @@ const RESEND_COOLDOWN_SECONDS = 60
 const MAX_ATTEMPTS = 5
 const DIGEST_CONTEXT = 'clawpilot-auth-magic-code:v1'
 const AUTHORIZATION_CHANGED = 'AUTHORIZATION_CHANGED'
+const AUTHORITY_PROBE_CHANGED = 'AUTHORITY_PROBE_CHANGED'
 
 export type RequestAuthMagicCodeInput = {
   email: string
@@ -285,9 +287,15 @@ export async function verifyAuthMagicCode(
 
   const submittedCode = String(input.code || '').trim().slice(0, 128)
   const submittedDigest = digestCode(requestedEmail, submittedCode)
+  // A plain probe avoids serializing normal sign-ins. The locked verification
+  // below remains authoritative; a concurrent switch to invitation rolls back
+  // the attempted consumption and retries once in control-first order.
+  const purpose = await query<{ purpose: string }>('SELECT purpose FROM auth_magic_codes WHERE email = $1', [requestedEmail])
+  let needsAuthority = purpose.rows[0]?.purpose === 'invitation'
   let row: VerificationRow | undefined
-  try {
-    row = await withTransaction(async (client) => {
+  const verifyInTransaction = () =>
+    withTransaction(async (client) => {
+      if (needsAuthority) await lockCrmNativeEmailAuthorityWithClient(client)
       const result = await client.query<VerificationRow>(`
       WITH candidate AS (
         SELECT
@@ -355,6 +363,7 @@ export async function verifyAuthMagicCode(
       const verified = result.rows[0]
       if (verified?.status !== 'verified') return verified
       if (verified.purpose === 'invitation') {
+        if (!needsAuthority) throw new Error(AUTHORITY_PROBE_CHANGED)
         if (accountEmail !== requestedEmail) throw new Error(AUTHORIZATION_CHANGED)
         const invitedUser = await client.query(
           `
@@ -499,9 +508,18 @@ export async function verifyAuthMagicCode(
       }
       return { ...verified, organization_id: null } satisfies VerificationOutcome
     })
-  } catch (error) {
-    if (error instanceof Error && error.message === AUTHORIZATION_CHANGED) return { status: 'not-authorized' }
-    throw error
+  for (let authorityAttempt = 0; authorityAttempt < 2; authorityAttempt += 1) {
+    try {
+      row = await verifyInTransaction()
+    } catch (error) {
+      if (error instanceof Error && error.message === AUTHORITY_PROBE_CHANGED && authorityAttempt === 0) {
+        needsAuthority = true
+        continue
+      }
+      if (error instanceof Error && (error.message === AUTHORIZATION_CHANGED || error.message === AUTHORITY_PROBE_CHANGED)) return { status: 'not-authorized' }
+      throw error
+    }
+    break
   }
 
   if (!row) return { status: 'not-found' }

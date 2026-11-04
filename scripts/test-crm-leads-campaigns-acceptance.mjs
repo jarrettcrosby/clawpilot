@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
@@ -307,11 +307,13 @@ async function seedTenant(pool) {
       viewSystemAudit: true,
     }
     await client.query(
-      `INSERT INTO app_users (
+      `WITH identity AS (SELECT allocate_crm_reference('gu') AS reference_code)
+       INSERT INTO app_users (
          email, role, status, display_name, organization_id, organization_name,
-         permissions, crm_user_enabled, reference_code, activated_at
-       ) VALUES ($1, 'owner', 'active', 'CRM Acceptance Operator', $2::uuid,
-         'CRM Acceptance Workspace', $3::jsonb, true, allocate_crm_reference('gu'), now())`,
+         permissions, crm_user_enabled, reference_code, activated_at, suitecrm_user_id, suitecrm_username
+       ) SELECT $1, 'owner', 'active', 'CRM Acceptance Operator', $2::uuid,
+         'CRM Acceptance Workspace', $3::jsonb, true, reference_code, now(),
+         '00000000-0000-4000-8000-000000000099', reference_code FROM identity`,
       [actorEmail, organizationId, JSON.stringify(permissions)],
     )
     await client.query(
@@ -718,6 +720,12 @@ async function runApiAcceptance(baseUrl, token, pool, organizationId) {
   assert.equal(leadActivity.records.some((record) => record.subject === `Lead converted: ${FIXTURES.lead.fullName}`), true)
   assert.equal(leadActivity.records.some((record) => record.id === interaction.id), true)
 
+  await assert.rejects(apiJson(baseUrl, token, '/api/crm', {
+    method: 'PATCH', headers: { Origin: 'https://cross-site.example.invalid', 'Sec-Fetch-Site': 'cross-site' },
+    body: JSON.stringify({ action: 'archive', entity: 'leads', id: archivedLead.id }),
+  }), /403.*same-origin/)
+  const retainedAfterCrossSiteArchive = await apiJson(baseUrl, token, `/api/crm?entity=leads&query=${archivedLead.referenceCode}&limit=20`)
+  assert.equal(retainedAfterCrossSiteArchive.records.length, 1, 'Rejected cross-site archive must retain the lead')
   await apiJson(baseUrl, token, '/api/crm', {
     method: 'PATCH', body: JSON.stringify({ action: 'archive', entity: 'leads', id: archivedLead.id }),
   })
@@ -1018,6 +1026,7 @@ async function main() {
   const container = `clawpilot-crm-acceptance-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
   let app
   let pool
+  let databaseStarted = false
   let logs = ''
   const runtimeDataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'clawpilot-crm-acceptance-'))
   try {
@@ -1028,6 +1037,7 @@ async function main() {
       '-p', '127.0.0.1::5432',
       'pgvector/pgvector:pg16',
     ]), { timeout: 180_000 })
+    databaseStarted = true
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const postgresPort = Number(portOutput.match(/:(\d+)\s*$/)?.[1])
     assert.ok(postgresPort > 0, `Unable to resolve disposable PostgreSQL port from ${portOutput}`)
@@ -1089,7 +1099,7 @@ async function main() {
   } finally {
     await stopProcess(app)
     if (pool) await pool.end().catch(() => undefined)
-    spawnSync('docker', ['stop', '-t', '1', container], { cwd: root, encoding: 'utf8', timeout: 20_000 })
+    if (databaseStarted) command('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 30_000 })
     fs.rmSync(runtimeDataRoot, { recursive: true, force: true })
   }
 }

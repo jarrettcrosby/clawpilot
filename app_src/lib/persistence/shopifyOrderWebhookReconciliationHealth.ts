@@ -44,6 +44,111 @@ const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_COMMERCE_MIGRATION_SAFETY_TRIGGER_HAS
 const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_SALES_SHIPPING_MIGRATION_SAFETY_TRIGGER_HASH =
   '7da8e6dea1e15f45734cecc02923b9416e3715aef64bd371910bb20eb6c96759'
 
+export const SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_MIGRATION =
+  '0375_crm_native_email_publication_admission.sql' as const
+export const SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_CHECKSUM =
+  '0650c82b7cf773d7dcc8ae46fbbc6d55293150c536d3efb987235bf15021805e' as const
+const SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_TRIGGER_HASH =
+  '0ff23be2b44e8ee2bc88627d3cf2d52e207479da760121b30a2866182475cf60'
+export const SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_MIGRATION =
+  '0383_crm_native_email_user_eligibility.sql' as const
+export const SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_CHECKSUM =
+  'a21175bca217e8c71acd9b7a5a2c44e8e9284c13a72bbdbd02717bf9a0f242c7' as const
+const SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_TRIGGER_HASH =
+  'd347a1790c2e126e0ad69d0543682a45d36428d73f099f289f6fea2be3e25cb5'
+
+/** Exact catalog phases independently observed after every migration on both
+ * PostgreSQL 16 and 18. Presence of a later label never excuses a forged or
+ * missing prerequisite label. Historical checksums/hashes remain unchanged. */
+export const SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_PHASES = Object.freeze([
+  Object.freeze({ migration: SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_MIGRATION,
+    checksum: SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_CHECKSUM,
+    triggerHash: SHOPIFY_ORDER_WEBHOOK_NATIVE_ADMISSION_TRIGGER_HASH }),
+  Object.freeze({ migration: SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_MIGRATION,
+    checksum: SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_CHECKSUM,
+    triggerHash: SHOPIFY_ORDER_WEBHOOK_NATIVE_USER_ELIGIBILITY_TRIGGER_HASH }),
+  Object.freeze({ migration: '0393_crm_root_employee_read_context.sql',
+    checksum: '94c333b355b1008585ebf8edb58c54977d1b772212a5a483e26491c1b5d5148c',
+    triggerHash: '4e634f3afcd87da171485fe0a427709b571ef1a9c9c2e7c8ed4484d586b4162f' }),
+  Object.freeze({ migration: '0394_crm_native_root_source_fences.sql',
+    checksum: 'c6631516843ec6a6a94e9b6dea79dc5b856012c0b25ab3b77960a8afb360ccee',
+    triggerHash: '8492249e5befd593119efbc3ccc927d5b5b4ec3584ee58f4093e5cd51ab74e21' }),
+  Object.freeze({ migration: '0397_crm_native_root_registry_changes.sql',
+    checksum: '1ec2eedefb1241cc126f51c0dd26576f1389780ec9b442c47895045bf56d4852',
+    triggerHash: '56ef8a8566930208c1431c02be44e9e87813008fabf580bece52205ba88b92b9' }),
+  Object.freeze({ migration: '0398_crm_native_email_initial_enrollment.sql',
+    checksum: '00ba0afd16e90ef321199e0c497b0f75029b3efc3d6af7edee0673e0bc20afd7',
+    triggerHash: 'd0f08b491ab58bd8c158318c9a966a2b0b390ba4e7b3f8eb4079bd2614d30788' }),
+])
+
+const SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_CHECKSUM_SQL =
+  SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_PHASES.map((phase, index, phases) => `(
+    NOT EXISTS (SELECT 1 FROM public.schema_migrations WHERE filename = '${phase.migration}')
+    OR (
+      EXISTS (SELECT 1 FROM public.schema_migrations WHERE filename = '${phase.migration}'
+        AND checksum = '${phase.checksum}')
+      ${index === 0 ? '' : `AND EXISTS (SELECT 1 FROM public.schema_migrations
+        WHERE filename = '${phases[index - 1].migration}' AND checksum = '${phases[index - 1].checksum}')`}
+    )
+  )`).join(' AND ')
+
+const SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_TRIGGER_CASE_SQL =
+  [...SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_PHASES].reverse().map(phase => `
+    WHEN EXISTS (SELECT 1 FROM public.schema_migrations WHERE filename = '${phase.migration}')
+    THEN '${phase.triggerHash}'`).join('\n')
+
+/** Exact complete trigger inventory, also used by the scratch catalog inspector.
+ * No trigger-name exclusions: added, missing, disabled or rebound guards drift.
+ * pg_get_expr cannot deparse trigger qualifications referencing OLD and NEW as
+ * one relation. The trigger-aware exact definition includes the entire WHEN
+ * expression; NULL qualifications retain the historical empty-field bytes. */
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_TRIGGER_CATALOG_SQL = String.raw`
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              complete_namespace.nspname,
+              complete_table.relname,
+              complete_trigger.tgname,
+              complete_trigger.tgenabled,
+              complete_trigger.tgtype::text,
+              complete_trigger.tgisinternal::text,
+              complete_trigger.tgparentid::text,
+              complete_trigger.tgfoid::regprocedure::text,
+              CASE WHEN complete_trigger.tgqual IS NULL THEN ''
+                ELSE pg_catalog.pg_get_triggerdef(complete_trigger.oid, false)
+              END,
+              pg_catalog.pg_get_triggerdef(complete_trigger.oid, false)
+            ),
+            chr(10) ORDER BY
+              complete_table.relname,
+              complete_trigger.tgname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_catalog.pg_trigger complete_trigger
+    JOIN pg_catalog.pg_class complete_table
+      ON complete_table.oid = complete_trigger.tgrelid
+    JOIN pg_catalog.pg_namespace complete_namespace
+      ON complete_namespace.oid = complete_table.relnamespace
+    WHERE complete_namespace.nspname = 'public'
+      AND NOT complete_trigger.tgisinternal
+      AND complete_table.relname IN (
+        'operations_shopify_order_webhook_commands',
+        'operations_shopify_order_webhook_attempts',
+        'operations_shopify_order_webhook_outcomes',
+        'operations_integration_accounts',
+        'operations_commerce_credentials',
+        'app_user_organization_memberships'
+      )
+`
+
 // This expression is shared by runtime health and disposable-PostgreSQL
 // tamper tests. Every name is public-qualified: a search_path lookalike must
 // never satisfy release health.
@@ -56,6 +161,7 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
       AND installed_migration.checksum =
         '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION_CHECKSUM}'
   )
+  AND ${SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_CHECKSUM_SQL}
   AND (
     NOT EXISTS (
       SELECT 1
@@ -394,10 +500,9 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
                 installed_trigger.tgisinternal::text,
                 installed_trigger.tgparentid::text,
                 installed_trigger.tgfoid::regprocedure::text,
-                COALESCE(pg_catalog.pg_get_expr(
-                  installed_trigger.tgqual,
-                  installed_trigger.tgrelid
-                ), ''),
+                CASE WHEN installed_trigger.tgqual IS NULL THEN ''
+                  ELSE pg_catalog.pg_get_triggerdef(installed_trigger.oid, false)
+                END,
                 pg_catalog.pg_get_triggerdef(installed_trigger.oid, false)
               ),
               chr(10) ORDER BY
@@ -422,53 +527,8 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
     LEFT JOIN pg_catalog.pg_namespace installed_namespace
       ON installed_namespace.oid = installed_table.relnamespace
   )
-  AND (
-    SELECT encode(
-      digest(
-        convert_to(
-          string_agg(
-            concat_ws(
-              '|',
-              complete_namespace.nspname,
-              complete_table.relname,
-              complete_trigger.tgname,
-              complete_trigger.tgenabled,
-              complete_trigger.tgtype::text,
-              complete_trigger.tgisinternal::text,
-              complete_trigger.tgparentid::text,
-              complete_trigger.tgfoid::regprocedure::text,
-              COALESCE(pg_catalog.pg_get_expr(
-                complete_trigger.tgqual,
-                complete_trigger.tgrelid
-              ), ''),
-              pg_catalog.pg_get_triggerdef(complete_trigger.oid, false)
-            ),
-            chr(10) ORDER BY
-              complete_table.relname,
-              complete_trigger.tgname
-          ),
-          'UTF8'
-        ),
-        'sha256'
-      ),
-      'hex'
-    )
-    FROM pg_catalog.pg_trigger complete_trigger
-    JOIN pg_catalog.pg_class complete_table
-      ON complete_table.oid = complete_trigger.tgrelid
-    JOIN pg_catalog.pg_namespace complete_namespace
-      ON complete_namespace.oid = complete_table.relnamespace
-    WHERE complete_namespace.nspname = 'public'
-      AND NOT complete_trigger.tgisinternal
-      AND complete_table.relname IN (
-        'operations_shopify_order_webhook_commands',
-        'operations_shopify_order_webhook_attempts',
-        'operations_shopify_order_webhook_outcomes',
-        'operations_integration_accounts',
-        'operations_commerce_credentials',
-        'app_user_organization_memberships'
-      )
-  ) = CASE
+  AND (${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_TRIGGER_CATALOG_SQL}) = CASE
+    ${SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_TRIGGER_CASE_SQL}
     WHEN EXISTS (
       SELECT 1
       FROM public.schema_migrations sales_shipping_migration_safety

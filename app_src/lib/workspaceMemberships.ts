@@ -1,5 +1,7 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
+import { rootEmployeeCrmReadPermissions } from '@/lib/crm/rootEmployeeCrmPermissions'
 import {
   MEMBER_PERMISSIONS,
   OWNER_PERMISSIONS,
@@ -32,6 +34,7 @@ export type WorkspaceMembership = {
   isDefault: boolean
   createdAt: string
   updatedAt: string
+  accessOrigin?: 'membership' | 'root_crm'
 }
 
 export class WorkspaceAccessError extends Error {
@@ -53,6 +56,7 @@ type WorkspaceMembershipRow = {
   is_default: boolean
   created_at: string
   updated_at: string
+  access_origin?: 'membership' | 'root_crm'
 }
 
 const MEMBERSHIP_SELECT = `SELECT membership.organization_id::text,
@@ -77,11 +81,13 @@ function toWorkspaceMembership(row: WorkspaceMembershipRow): WorkspaceMembership
     organizationType: row.organization_type,
     isDemo: row.is_demo,
     role: row.role,
-    permissions: permissionsForRole(row.role, row.permissions),
+    permissions: row.access_origin === 'root_crm'
+      ? rootEmployeeCrmReadPermissions(row.permissions) : permissionsForRole(row.role, row.permissions),
     status: row.status,
     isDefault: row.is_default,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    accessOrigin: row.access_origin || 'membership',
   }
 }
 
@@ -105,6 +111,7 @@ export async function ensureDemoWorkspaceMembership(actor: AppUser): Promise<Wor
     viewAccounting: true,
   }
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const demo = await client.query<{ id: string }>(
       `SELECT id::text FROM workspace_organizations
        WHERE id = $1::uuid AND is_demo = true
@@ -191,7 +198,8 @@ export async function listWorkspaceMemberships(emailValue: unknown): Promise<Wor
   const user = await getAppUser(email)
   if (!user || user.status === 'disabled') throw new Error('User access is not active')
   const result = await query<WorkspaceMembershipRow>(
-    `${MEMBERSHIP_SELECT}
+    `${MEMBERSHIP_SELECT.replace('membership.updated_at::text', 'membership.updated_at::text, membership.access_origin')
+      .replace('FROM app_user_organization_memberships membership', 'FROM clawpilot_effective_workspace_memberships($1) membership')}
      WHERE membership.user_email = $1
        AND membership.status = 'active'
      ORDER BY membership.is_default DESC, lower(organization.name), membership.created_at`,
@@ -209,7 +217,8 @@ export async function requireWorkspaceAppUser(
   if (!user || user.status !== 'active') throw new WorkspaceAccessError('User access is not active')
   const organizationId = String(organizationIdValue || '').trim()
   const result = await query<WorkspaceMembershipRow>(
-    `${MEMBERSHIP_SELECT}
+    `${MEMBERSHIP_SELECT.replace('membership.updated_at::text', 'membership.updated_at::text, membership.access_origin')
+      .replace('FROM app_user_organization_memberships membership', 'FROM clawpilot_effective_workspace_memberships($1) membership')}
      WHERE membership.user_email = $1
        AND membership.status = 'active'
        ${organizationId ? 'AND membership.organization_id = $2::uuid' : ''}
@@ -225,6 +234,7 @@ export async function requireWorkspaceAppUser(
     organizationName: membership.organizationName,
     organizationRole: membership.role,
     organizationPermissions: membership.permissions,
+    organizationAccessOrigin: membership.accessOrigin,
   }
 }
 
@@ -242,6 +252,7 @@ export async function createIndependentRootWorkspace(input: {
   if (!isRootAppOwner(input.actor)) throw new Error('Root administrator access required')
   const name = cleanWorkspaceName(input.name)
   return withTransaction(async (client) => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const existing = await client.query<WorkspaceMembershipRow>(
       `${MEMBERSHIP_SELECT}
        WHERE membership.user_email = $1

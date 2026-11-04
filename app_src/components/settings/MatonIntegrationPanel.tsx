@@ -406,6 +406,7 @@ function appDisplayLabel(value: string) {
 
 function statusColor(status: string): 'default' | 'success' | 'warning' | 'error' {
   const normalized = status.toLowerCase()
+  if (normalized === 'organization default') return 'success'
   if (normalized.includes('error') || normalized.includes('fail') || normalized.includes('expired')) return 'error'
   if (normalized.includes('pending') || normalized.includes('authoriz')) return 'warning'
   if (normalized.includes('not connect') || normalized.includes('disconnect') || normalized.includes('inactive')) return 'default'
@@ -742,9 +743,9 @@ export default function MatonIntegrationPanel({
         }),
       }, undefined, communication?.canManage === true)
       applyCommunicationState(next)
-      setNotice(`${appDisplayLabel(app)} connected to the active organization.`)
+      setNotice(`${appDisplayLabel(app)} organization default saved.`)
     } catch (bindError) {
-      const message = messageFrom(bindError, `Unable to connect ${appDisplayLabel(app)}`)
+      const message = messageFrom(bindError, `Unable to save ${appDisplayLabel(app)} organization default`)
       setCommunicationAttemptErrors((current) => ({ ...current, [app]: message }))
       setCommunicationError(message)
     } finally {
@@ -859,6 +860,7 @@ export default function MatonIntegrationPanel({
             </Typography>
             <Typography variant="body2" color="text.secondary">
               Choose the Gmail sender and Calendar organizer independently for the active organization.
+              {' '}Selections are not saved until you use the Save default button below.
             </Typography>
           </Box>
           <Button
@@ -905,10 +907,10 @@ export default function MatonIntegrationPanel({
                 : failed || selectedConnection?.selectionError
                   ? 'Failed'
                   : binding?.status === 'active'
-                    ? 'Active'
+                    ? 'Organization default'
                     : binding
                       ? 'Disabled'
-                      : 'Not connected'
+                      : 'No organization default'
               return (
                 <Box
                   key={app}
@@ -919,7 +921,7 @@ export default function MatonIntegrationPanel({
                     backgroundColor: 'background.default',
                   }}
                 >
-                  <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" mb={1.25}>
+                  <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between" flexWrap="wrap" useFlexGap mb={1.25}>
                     <Stack direction="row" spacing={0.75} alignItems="center">
                       {app === 'google-mail'
                         ? <EmailRounded sx={{ fontSize: 20, color: 'primary.main' }} />
@@ -1099,7 +1101,7 @@ export default function MatonIntegrationPanel({
                         }
                         sx={commandButtonSx}
                       >
-                        {binding ? `Update ${label}` : `Connect ${label}`}
+                        Save {label} default
                       </Button>
                     </Stack>
                     {failed ? <Typography variant="caption" color="error">{failed}</Typography> : null}

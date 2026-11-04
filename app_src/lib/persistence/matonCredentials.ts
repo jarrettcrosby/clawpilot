@@ -256,7 +256,38 @@ async function upsertConnections(
         END,
         status = EXCLUDED.status,
         method = EXCLUDED.method,
-        account_email = EXCLUDED.account_email,
+        -- A control-plane metadata refresh is not a fresh Gmail profile.
+        -- Preserve an explicitly verified current label only while the exact
+        -- known grant revision and credential still predate that verification.
+        -- Unknown/new revisions, changed grant fields, key changes and all
+        -- status/app/source changes retain normal remote fallback behavior.
+        account_email = CASE WHEN $4::boolean
+          AND user_maton_connections.app = 'google-mail' AND EXCLUDED.app = 'google-mail'
+          AND user_maton_connections.source = 'maton' AND EXCLUDED.source = 'maton'
+          AND user_maton_connections.status = 'ACTIVE' AND EXCLUDED.status = 'ACTIVE'
+          AND user_maton_connections.is_selected
+          AND user_maton_connections.method IS NOT DISTINCT FROM EXCLUDED.method
+          AND user_maton_connections.remote_created_at IS NOT NULL
+          AND user_maton_connections.remote_created_at = EXCLUDED.remote_created_at
+          AND user_maton_connections.remote_updated_at IS NOT NULL
+          AND user_maton_connections.remote_updated_at = EXCLUDED.remote_updated_at
+          AND EXISTS (
+            SELECT 1 FROM crm_email_mailbox_bindings binding
+            JOIN crm_email_mailboxes mailbox ON mailbox.id = binding.mailbox_id
+              AND mailbox.owner_email = binding.owner_email AND mailbox.provider = 'gmail'
+              AND mailbox.provider_account_id <> ''
+            JOIN user_maton_credentials credential ON credential.owner_email = binding.owner_email
+              AND credential.api_key_ciphertext IS NOT NULL AND credential.api_key_iv IS NOT NULL
+              AND credential.api_key_tag IS NOT NULL AND credential.key_revoked_at IS NULL
+            WHERE binding.owner_email = user_maton_connections.owner_email
+              AND binding.connection_id = user_maton_connections.connection_id
+              AND binding.account_email = user_maton_connections.account_email
+              AND mailbox.account_email = binding.account_email
+              AND user_maton_connections.remote_updated_at <= binding.verified_at
+              AND credential.key_rotated_at <= binding.verified_at
+              AND credential.updated_at <= binding.verified_at
+              AND binding.verified_at <= clock_timestamp()
+          ) THEN user_maton_connections.account_email ELSE EXCLUDED.account_email END,
         source = EXCLUDED.source,
         remote_created_at = EXCLUDED.remote_created_at,
         remote_updated_at = EXCLUDED.remote_updated_at,

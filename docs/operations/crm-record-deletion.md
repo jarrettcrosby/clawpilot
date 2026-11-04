@@ -66,6 +66,12 @@ audits, native IDs and queued outcomes. Do not restore archived rows, remove
 native tombstones, or clear cursors to simulate a code rollback. The native
 route can remain installed but disabled.
 
+For a later combined native Email enrollment, enable/include the lifecycle
+route before its first source/package approval, following the
+[combined activation order](suitecrm.md#combining-deletion-sync-with-native-email-enrollment).
+Enrolled startup must not reinstall the route. Its independent lifecycle flag
+and configured standard service OAuth client remain required.
+
 After the first tombstone is written, keep this release's visibility and
 stale-import guards even with the feature disabled. An older application
 binary without those guards is not a compatible rollback: it may republish
@@ -97,6 +103,14 @@ standalone, existing-managed-route, read-only, idempotency and owned-path tests.
 These local results do not establish production activation or recovery of the
 missing BPO emails. That separate work remains held on its permission,
 packaging and exact-publication release gates.
+
+Combined acceptance R502 additionally passes the actual stock-OAuth inspection
+route on two distinct full-image enrolled Apache starts, after repeated expired
+Email approvals and fresh replacement enrollment. Both inspections preserve all
+native tables and installed files; unauthenticated requests return 401, wrong
+Global ID pairs return 409 without partial records, and the disabled route
+returns 409 without rewriting its approved package. This is local synthetic
+fixture evidence, not a production deletion or browser check.
 
 Run the focused local and PostgreSQL gates with
 `npm run test:crm-contact-identity`. The real native gate separately requires

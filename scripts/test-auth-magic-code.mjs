@@ -318,9 +318,14 @@ try {
     '44444444-4444-4444-8444-444444444444',
   ]
   let activeInvitationAdditionalOrganizationIds = []
+  let authorityLocks = 0, stalePurposeProbe = false, rolledBackVerifications = 0
 
   const fakeClient = {
     async query(sql, values) {
+      if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
+        authorityLocks += 1
+        return { rows: [{ singleton: true }] }
+      }
       if (sql.includes('INSERT INTO auth_magic_codes')) {
         if (record && now - record.createdAt < 60_000) return { rows: [], rowCount: 0 }
         record = {
@@ -435,9 +440,16 @@ try {
 
   const persistenceMock = {
     async withTransaction(fn) {
-      return fn(fakeClient)
+      const before = record && { ...record }, membershipCount = activatedMemberships.length
+      try { return await fn(fakeClient) }
+      catch (error) { record = before; activatedMemberships.length = membershipCount; rolledBackVerifications += 1; throw error }
     },
     async query(sql, values) {
+      if (sql === 'SELECT purpose FROM auth_magic_codes WHERE email = $1') {
+        const purpose = stalePurposeProbe ? 'sign_in' : record?.purpose
+        stalePurposeProbe = false
+        return { rows: record?.email === values[0] ? [{ purpose }] : [] }
+      }
       if (sql.includes('FROM app_user_invitations invitation')) {
         return invitationValid
           ? {
@@ -506,6 +518,7 @@ try {
   })
 
   const authModule = loadTypeScriptModule('app_src/lib/authMagicCode.ts', {
+    '@/lib/persistence/crmNativeEmailAuthority': loadTypeScriptModule('app_src/lib/persistence/crmNativeEmailAuthority.ts', {}).exports,
     '@/lib/authLoginIdentity': identityModule.exports,
     '@/lib/matonMail': mailMock,
     '@/lib/persistence/postgres': persistenceMock,
@@ -609,6 +622,7 @@ try {
   process.env.APP_LOGIN_EMAIL_ALIASES = 'invited@example.com'
   assert.equal((await requestAuthMagicCode({ email: 'invited@example.com' })).status, 'not-authorized', 'An existing independent account cannot become an owner alias')
   delete process.env.APP_LOGIN_EMAIL_ALIASES
+  assert.equal(authorityLocks, 0, 'Normal sign-in, aliases and failed code attempts do not serialize on authority')
 
   now += 61_000
   const invited = await requestInvitationAuthMagicCode({
@@ -625,6 +639,17 @@ try {
     email: 'invited@example.com',
     organizationId: invitationOrganizationId,
   }])
+  activatedMemberships.length = 0
+
+  now += 61_000
+  await requestInvitationAuthMagicCode({ email: 'invited@example.com', invitationId: '10000000-0000-4000-8000-000000000001' })
+  stalePurposeProbe = true
+  const locksBefore = authorityLocks, rollbacksBefore = rolledBackVerifications
+  const switched = await verifyAuthMagicCode({ email: 'invited@example.com', code: delivered.at(-1).code })
+  assert.equal(switched.status, 'verified', 'Concurrent sign-in to invitation purpose switch retries safely')
+  assert.equal(rolledBackVerifications, rollbacksBefore + 1, 'Suspect consumption was rolled back before retry')
+  assert.equal(authorityLocks, locksBefore + 1, 'Only retry takes control before code/user/membership locks')
+  assert.equal(activatedMemberships.length, 1, 'Invitation activates exactly once after retry')
   activatedMemberships.length = 0
 
   now += 61_000

@@ -63,6 +63,9 @@ function loadPermissionModule(path, mocks = {}) {
 const noPermissionIo = () => { throw new Error("Unexpected permission database I/O"); };
 const permissionUsers = loadPermissionModule("app_src/lib/users.ts", {
   "@/lib/persistence/postgres": { query: noPermissionIo, withTransaction: noPermissionIo },
+  "@/lib/persistence/crmNativeEmailAuthority": { lockCrmNativeEmailAuthorityWithClient: noPermissionIo },
+  "@/lib/invitationWorkspaceScope": { removeWorkspaceFromPendingInvitationsWithClient: noPermissionIo },
+  "@/lib/crm/nativeEmailWorkspaceUserRuntime": { changeWorkspaceUserWithNativeAuthority: noPermissionIo },
   "@/lib/auditWriter": {},
   "@/lib/crm/suiteCrmClient": {},
   "@/lib/demoMode": {},

@@ -43,6 +43,7 @@ function serverClientId(): string {
 
 export async function verifyGoogleIdentityToken(
   rawToken: unknown,
+  options?: { maxAgeSeconds: number },
 ): Promise<VerifiedGoogleIdentity> {
   const idToken = String(rawToken || '').trim()
   if (!idToken || idToken.length > 8_192) {
@@ -85,6 +86,15 @@ export async function verifyGoogleIdentityToken(
   }
 
   const displayName = String(payload?.name || '').trim()
+  if (options !== undefined) {
+    const now = Date.now() / 1000
+    const issuedAt = payload?.iat
+    if (!Number.isSafeInteger(options.maxAgeSeconds) || options.maxAgeSeconds < 1 || options.maxAgeSeconds > 300
+      || typeof issuedAt !== 'number' || !Number.isSafeInteger(issuedAt)
+      || issuedAt > now + 30 || now - issuedAt > options.maxAgeSeconds) {
+      throw new GoogleSsoError('GOOGLE_SSO_TOKEN_NOT_RECENT', 'Continue with Google again before confirming this change', 401)
+    }
+  }
   return {
     subject,
     email,

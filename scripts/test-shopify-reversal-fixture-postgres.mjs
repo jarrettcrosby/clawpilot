@@ -88,6 +88,26 @@ async function rejectedInSavepoint(client, work, pattern, message) {
   return error
 }
 
+async function createFixtureSession(queryable, { owner, organizationId }) {
+  const session = await queryable.query(
+    `INSERT INTO app_sessions (
+       token_hash, authenticated_user_email, effective_user_email,
+       auth_method, device_label, idle_timeout_seconds,
+       idle_expires_at, absolute_expires_at,
+       active_workspace_organization_id
+     ) VALUES (
+       $1, $2, $2, 'magic_code', 'Fixture acceptance browser', 3600,
+       now() + interval '1 hour', now() + interval '8 hours', $3::uuid
+     ) RETURNING id::text`,
+    [
+      createHash('sha256').update(randomUUID()).digest('hex'),
+      owner,
+      organizationId,
+    ],
+  )
+  return session.rows[0].id
+}
+
 async function seedAuthority(pool) {
   const fixedOrganizationId = 'c6c8e6e7-fffa-4969-9526-e99da0ab2754'
   const owner = `fixture-owner-${randomUUID()}@example.test`
@@ -213,28 +233,13 @@ async function seedAuthority(pool) {
        AND integration_account_id = $2::uuid`,
     [organizationId, accountId],
   )
-  const session = await pool.query(
-    `INSERT INTO app_sessions (
-       token_hash, authenticated_user_email, effective_user_email,
-       auth_method, device_label, idle_timeout_seconds,
-       idle_expires_at, absolute_expires_at,
-       active_workspace_organization_id
-     ) VALUES (
-       $1, $2, $2, 'magic_code', 'Fixture acceptance browser', 3600,
-       now() + interval '1 hour', now() + interval '8 hours', $3::uuid
-     ) RETURNING id::text`,
-    [
-      createHash('sha256').update(randomUUID()).digest('hex'),
-      owner,
-      organizationId,
-    ],
-  )
+  const sessionId = await createFixtureSession(pool, { owner, organizationId })
   return {
     owner,
     inactiveAdmin,
     organizationId,
     accountId,
-    sessionId: session.rows[0].id,
+    sessionId,
     controlRowVersion: Number(control.rows[0].row_version),
     scopeDigest: control.rows[0].bound_granted_scope_digest,
   }
@@ -414,6 +419,7 @@ async function exercise(pool) {
     /human approval is not currently authorized/iu,
     'approval requires the exact current authenticated browser session',
   )
+  const revokedSessionId = fixture.sessionId
   await pool.query(
     `UPDATE app_sessions
      SET revoked_at = now(), revoked_reason = 'fixture-test'
@@ -425,11 +431,24 @@ async function exercise(pool) {
     /human approval is not currently authorized/iu,
     'a revoked browser session cannot approve',
   )
-  await pool.query(
-    `UPDATE app_sessions SET revoked_at = NULL, revoked_reason = NULL
-     WHERE id = $1::uuid`,
-    [fixture.sessionId],
+  await rejected(
+    () => pool.query(
+      `UPDATE app_sessions SET revoked_at = NULL, revoked_reason = NULL
+       WHERE id = $1::uuid`,
+      [revokedSessionId],
+    ),
+    /Browser session revocation is permanent/iu,
+    'a committed browser-session revocation cannot be undone',
   )
+  fixture.sessionId = await createFixtureSession(pool, fixture)
+  assert.notEqual(fixture.sessionId, revokedSessionId)
+  const retainedRevocation = await pool.query(
+    `SELECT revoked_at IS NOT NULL AS revoked, revoked_reason
+     FROM app_sessions WHERE id = $1::uuid`,
+    [revokedSessionId],
+  )
+  assert.deepEqual(retainedRevocation.rows, [{ revoked: true, revoked_reason: 'fixture-test' }],
+    'a fresh authentication must preserve the old session revocation')
   await pool.query(
     `UPDATE app_sessions SET idle_expires_at = now() - interval '1 second'
      WHERE id = $1::uuid`,
@@ -619,8 +638,8 @@ async function exercise(pool) {
   )
 
   const attemptId = attempt.rows[0].id
-  const currentClaim = async (phase, payloadHash, actor = fixture.owner) => {
-    const result = await pool.query(
+  const currentClaim = async (phase, payloadHash, actor = fixture.owner, queryable = pool) => {
+    const result = await queryable.query(
       `SELECT operations_shopify_reversal_fixture_provider_claim_is_current(
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6
        ) AS current`,
@@ -650,21 +669,46 @@ async function exercise(pool) {
     false,
     'a substituted provider payload is not authorized',
   )
-  await pool.query(
-    `UPDATE app_sessions
-     SET revoked_at = now(), revoked_reason = 'post-claim-revocation'
-     WHERE id = $1::uuid`,
-    [fixture.sessionId],
-  )
+  // This negative case must not revoke the immutable approval's session for
+  // the outcome checks below. Roll back the entire isolated transaction;
+  // never resurrect a committed session or rewrite historical approval links.
+  const revocationClient = await pool.connect()
+  try {
+    await revocationClient.query('BEGIN')
+    await revocationClient.query(
+      `UPDATE app_sessions
+       SET revoked_at = now(), revoked_reason = 'post-claim-revocation'
+       WHERE id = $1::uuid`,
+      [fixture.sessionId],
+    )
+    assert.equal(
+      await currentClaim('create_order', prepared.provider_payload_hash, fixture.owner, revocationClient),
+      false,
+      'session revocation after claim closes the final provider fence',
+    )
+    await rejectedInSavepoint(
+      revocationClient,
+      () => revocationClient.query(
+        `UPDATE app_sessions SET revoked_at = NULL, revoked_reason = NULL
+         WHERE id = $1::uuid`,
+        [fixture.sessionId],
+      ),
+      /Browser session revocation is permanent/iu,
+      'an isolated post-claim revocation is still irreversible within its transaction',
+    )
+    assert.equal(
+      await currentClaim('create_order', prepared.provider_payload_hash, fixture.owner, revocationClient),
+      false,
+      'a refused unrevocation must leave the provider fence closed',
+    )
+  } finally {
+    await revocationClient.query('ROLLBACK')
+    revocationClient.release()
+  }
   assert.equal(
     await currentClaim('create_order', prepared.provider_payload_hash),
-    false,
-    'session revocation after claim closes the final provider fence',
-  )
-  await pool.query(
-    `UPDATE app_sessions SET revoked_at = NULL, revoked_reason = NULL
-     WHERE id = $1::uuid`,
-    [fixture.sessionId],
+    true,
+    'rolling back the isolated negative preserves the original legitimate approval',
   )
   await rejected(
     () => pool.query(

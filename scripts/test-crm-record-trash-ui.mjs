@@ -25,7 +25,7 @@ try {
   const bundle = await readFile(join(output, 'fixture.js'))
   server = createServer((req, res) => {
     res.setHeader('Content-Type', req.url === '/fixture.js' ? 'text/javascript' : 'text/html')
-    res.end(req.url === '/fixture.js' ? bundle : '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script src="/fixture.js"></script>')
+    res.end(req.url === '/fixture.js' ? bundle : '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script src="/fixture.js"></script>')
   })
   await new Promise(done => server.listen(0, '127.0.0.1', done))
   const origin = `http://127.0.0.1:${server.address().port}`
@@ -35,8 +35,8 @@ try {
   const errors = [], mutations = []
   page.on('pageerror', error => errors.push(error.message))
   const pipelineId = '00000000-0000-4000-8000-000000000001'
-  const external = { id: '00000000-0000-4000-8000-000000000002', referenceCode: 'ga1111111', name: 'Suburbia example', relationshipType: 'customer', syncStatus: 'synced' }
-  const unrelated = { ...external, id: '00000000-0000-4000-8000-000000000003', referenceCode: 'ga2222222', name: 'BPO example' }
+  const external = { id: '00000000-0000-4000-8000-000000000002', referenceCode: 'ga1111111', name: 'Suburbia example', accountType: 'Supplier', relationshipType: 'customer', syncStatus: 'synced' }
+  const unrelated = { ...external, id: '00000000-0000-4000-8000-000000000003', referenceCode: 'ga2222222', name: 'BPO example', accountType: 'Customer' }
   const contact = { id: '00000000-0000-4000-8000-000000000004', referenceCode: 'gc1111111', organizationId: external.id, fullName: 'Customer contact', syncStatus: 'synced' }
   let organizations = [external, unrelated], contacts = [contact], accessRole = 'editor', failArchive = false
   await page.route('**/api/**', async route => {
@@ -70,7 +70,24 @@ try {
     await page.getByRole('tab', { name: 'Contacts', exact: true }).click()
     await page.getByText(contact.fullName, { exact: true }).click()
   }
+  for(const mode of ['light','dark']){
+    await page.goto(`${origin}/?mode=${mode}`)
+    await expect(page.getByRole('columnheader',{name:'Type',exact:true})).toBeVisible()
+    await expect(page.getByRole('columnheader',{name:'Organization role',exact:true})).toBeVisible()
+    const supplier=page.getByRole('row').filter({has:page.getByText(external.referenceCode,{exact:true})})
+    await expect(supplier.getByRole('cell',{name:'Supplier',exact:true})).toBeVisible()
+    await expect(supplier.getByRole('cell',{name:'External organization',exact:true})).toBeVisible()
+    await expect(supplier.getByRole('cell',{name:'customer',exact:true})).toHaveCount(0)
+  }
   await openOrganization()
+  // MUI includes the selected option in the combobox's accessible name.
+  try{await expect(page.getByRole('combobox',{name:'Type Supplier',exact:true})).toHaveText('Supplier')}
+  catch(error){
+    console.error('CRM_TYPE_CONTROLS='+JSON.stringify(await page.getByRole('combobox',{includeHidden:true}).evaluateAll(elements=>elements.map(element=>({
+      text:element.textContent,label:element.getAttribute('aria-label'),labelledBy:element.getAttribute('aria-labelledby'),
+      labels:(element.getAttribute('aria-labelledby')||'').split(' ').map(id=>document.getElementById(id)?.textContent||'')})))))
+    throw error
+  }
   await page.getByRole('button', { name: 'Move to Trash', exact: true }).click()
   const confirmation = page.getByRole('dialog', { name: 'Move CRM record to Trash?' })
   await expect(confirmation.getByText(external.name, { exact: true })).toBeVisible()
@@ -129,6 +146,7 @@ try {
   await expect(confirmation).toBeVisible()
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile confirmation fits viewport')
   assert.deepEqual(errors, [])
+  console.log('PASS CRM supplier Type versus internal organization role in light/dark table and drawer; HTTP mocked')
   console.log('PASS CRM Trash UI: exact confirmation, cancel/failure/retry, queued status, separate account/contact commands, protected identities, viewers, mobile; HTTP mocked')
 } finally {
   await browser?.close()

@@ -23,8 +23,11 @@ function load(path, dependencies) {
   return module.exports
 }
 const auth = load('app_src/lib/fractionalCrmGatewayAuth.ts', { 'node:crypto': crypto })
+const folderLinks = load('app_src/lib/crm/customerFolderLinks.ts', {})
+const folderContract = load('app_src/lib/crm/fractionalCustomerFolder.ts', { './customerFolderLinks': folderLinks })
 const http = load('app_src/lib/fractionalCrmGatewayHttp.ts', {
   './fractionalCrmGatewayAuth': auth, './fractionalCrmGatewayPath.mjs': { isFractionalCrmGatewayPath },
+  './crm/fractionalCustomerFolder': folderContract,
 })
 const credentialId = '00000000-0000-4000-8000-000000000001'
 const token = `fcg_${credentialId.replaceAll('-', '')}_${'A'.repeat(43)}`
@@ -49,7 +52,8 @@ function harness(options = {}) {
   let row = options.row === undefined ? fixture() : options.row
   const services = { readFractionalCrmCredential: async id => { lookups.push(id); return row } }
   for (const name of ['readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
-    'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding']) {
+    'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding',
+    'readFractionalCrmCustomerFolder', 'updateFractionalCrmCustomerFolder']) {
     services[name] = async (...args) => { calls.push({ name, args }); if (options.error) throw options.error; return options.result ?? { ok: true } }
   }
   async function request(path = `/companies/${company}`, options2 = {}) {
@@ -299,6 +303,7 @@ test('Next route exports only intended methods and all use the authenticated HTT
   const route = load('app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts', {
     '@/lib/fractionalCrmGatewayHttp': { handleFractionalCrmGateway: (request, services) => http.handleFractionalCrmGateway(request, services, env) },
     '@/lib/persistence/fractionalCrmGateway': app.services,
+    '@/lib/crm/boardProjection': { reconcileCrmBoardProjectionsForPipeline: async () => {} },
   })
   assert.equal(route.runtime, 'nodejs'); assert.equal(route.dynamic, 'force-dynamic')
   assert.equal(route.DELETE, undefined); assert.equal(route.PUT, undefined)
@@ -308,6 +313,72 @@ test('Next route exports only intended methods and all use the authenticated HTT
   assert.equal((await route.GET(new Request(url, { headers: { authorization: `Bearer ${token}` } }))).status, 200)
   assert.equal(app.calls[0].name, 'readFractionalCrmCompany')
   assert.equal(route.GET, route.PATCH); assert.equal(route.GET, route.POST)
+})
+
+test('customer folder subresource is source-customer scoped and uses company capabilities, never contact dispatch', async () => {
+  const path = `/companies/${company}/customer-folder`, query = new URLSearchParams({ ...scope, customerId: 'local-customer' }).toString()
+  const body = { schemaVersion: 1, folderUrl: 'https://app.bposupplychain.com/s/d_fixture', assertedFractionalActor: patch.assertedFractionalActor }
+  const app = harness()
+  assert.equal((await app.request(path, { query })).status, 200)
+  assert.equal(app.calls[0].name, 'readFractionalCrmCustomerFolder')
+  assert.equal(app.calls[0].args[2], 'local-customer')
+  assert.equal((await app.request(path, { query, method: 'PATCH', body, headers: writeHeaders })).status, 200)
+  assert.equal(app.calls[1].name, 'updateFractionalCrmCustomerFolder')
+  assert.equal(app.calls[1].args[2].folderUrl, body.folderUrl)
+  assert.equal(app.calls[1].args[2].ifMatch, 'opaque-version-1')
+  const denied = harness({ row: fixture({ capabilities: ['crm.contact.read', 'crm.contact.write'] }) })
+  for (const method of ['GET', 'PATCH']) assert.equal((await denied.request(path, { query, method, ...(method === 'PATCH' ? { body, headers: writeHeaders } : {}) })).status, 403)
+  assert.equal(denied.calls.length, 0)
+  for (const candidate of [undefined, null, { ...body, schemaVersion: 2 }, { ...body, folderUrl: 'javascript:alert(1)' },
+    { ...body, folderUrl: 'https://user:secret@example.test/folder' }, { ...body, fields: {} },
+    { ...body, assertedFractionalActor: { ...body.assertedFractionalActor, customerId: 'other-customer' } }]) {
+    const invalid = harness()
+    assert.notEqual((await invalid.request(path, { query, method: 'PATCH', body: candidate, headers: writeHeaders })).status, 200)
+    assert.equal(invalid.calls.length, 0)
+  }
+  for (const badQuery of [new URLSearchParams(scope).toString(), `${query}&customerId=other`, `${query}&limit=1`]) {
+    assert.equal((await harness().request(path, { query: badQuery })).status, 400)
+  }
+  assert.equal((await harness().request(path, { query, method: 'PATCH', body })).status, 428)
+  assert.equal(isFractionalCrmGatewayPath(`${base}${path}`, 'POST'), false)
+})
+
+test('Fractional folder merge preserves BPO link and notes, adopts an exact reference and respects later manual edits', () => {
+  const url = 'https://app.bposupplychain.com/s/d_fixture', next = 'https://app.bposupplychain.com/s/d_next'
+  const before = 'Notes <not HTML>\r\nBPO Supply Chain Drive: https://bposupplychain.com/s/customer\r\nTail'
+  const description = folderContract.mergeFractionalCustomerFolder({ description: before, previous: null, folderUrl: url })
+  assert.ok(description.startsWith(before)); assert.ok(description.endsWith(`Fractional Customer Folder: ${url}`))
+  assert.equal(folderContract.mergeFractionalCustomerFolder({ description, previous: null, folderUrl: url }), description)
+  for (const manuallyEdited of [before, description.replace(url, next)]) {
+    assert.throws(() => folderContract.mergeFractionalCustomerFolder({ description: manuallyEdited, previous: { lastPublishedUrl: url }, folderUrl: url }), /FOLDER_MANUAL_REVIEW_REQUIRED/)
+  }
+  assert.throws(() => folderContract.mergeFractionalCustomerFolder({ description, previous: null, folderUrl: next }), /FOLDER_MANUAL_REVIEW_REQUIRED/)
+  assert.equal(folderContract.mergeFractionalCustomerFolder({ description, previous: { lastPublishedUrl: url }, folderUrl: null }), before + '\r\n')
+  assert.throws(() => folderContract.mergeFractionalCustomerFolder({ description: description + `\nFractional Customer Folder: ${url}`, previous: null, folderUrl: url }), /FOLDER_DESCRIPTION_REPAIR_REQUIRED/)
+})
+
+test('folder route retries card reconciliation after a committed command without reporting premature success', async () => {
+  const app = harness(), reconciliations = [], applied = new Set()
+  let failCard = true
+  app.services.updateFractionalCrmCustomerFolder = async (principal, ga, input) => {
+    applied.add(input.idempotencyKey)
+    return { globalId: ga, folderUrl: input.folderUrl }
+  }
+  const route = load('app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts', {
+    '@/lib/fractionalCrmGatewayHttp': { handleFractionalCrmGateway: (request, services) => http.handleFractionalCrmGateway(request, services, env) },
+    '@/lib/persistence/fractionalCrmGateway': app.services,
+    '@/lib/crm/boardProjection': { reconcileCrmBoardProjectionsForPipeline: async input => {
+      reconciliations.push(input.pipelineId); if (failCard) throw Error('private card failure')
+    } },
+  })
+  const query = new URLSearchParams({ ...scope, customerId: 'local-customer' })
+  const request = () => new Request(`${origin}${base}/companies/${company}/customer-folder?${query}`, {
+    method: 'PATCH', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...writeHeaders },
+    body: JSON.stringify({ schemaVersion: 1, folderUrl: 'https://app.example.test/folder', assertedFractionalActor: patch.assertedFractionalActor }),
+  })
+  const failed = await route.PATCH(request()); assert.equal(failed.status, 503); assert.doesNotMatch(await failed.text(), /private card/)
+  failCard = false; assert.equal((await route.PATCH(request())).status, 200)
+  assert.deepEqual(reconciliations, [pipelineId, pipelineId]); assert.equal(applied.size, 1)
 })
 
 test('organization name read is GET-only, uses the bound principal and preserves private response headers', async () => {

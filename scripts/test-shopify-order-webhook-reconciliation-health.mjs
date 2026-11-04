@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { loadTypeScriptModule } from './test-commerce-order-revisions-postgres.mjs'
 
 const root = process.cwd()
 const migrationPath = resolve(
@@ -42,6 +43,14 @@ const salesShippingMigrationSafety = readFileSync(
   salesShippingMigrationSafetyPath,
   'utf8',
 )
+const nativePhases = [
+  '0375_crm_native_email_publication_admission.sql',
+  '0383_crm_native_email_user_eligibility.sql',
+  '0393_crm_root_employee_read_context.sql',
+  '0394_crm_native_root_source_fences.sql',
+  '0397_crm_native_root_registry_changes.sql',
+  '0398_crm_native_email_initial_enrollment.sql',
+]
 const health = readFileSync(healthPath, 'utf8')
 const orderEditingHealth = readFileSync(orderEditingHealthPath, 'utf8')
 const route = readFileSync(routePath, 'utf8')
@@ -49,6 +58,10 @@ const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'))
 const ci = readFileSync(ciPath, 'utf8')
 const predeploy = readFileSync(predeployPath, 'utf8')
 const checksum = createHash('sha256').update(migration).digest('hex')
+for (const filename of nativePhases) {
+  const expected = createHash('sha256').update(readFileSync(resolve(root, 'db/migrations', filename))).digest('hex')
+  assert.ok(health.includes(filename) && health.includes(expected), `webhook health must pin exact native phase ${filename}`)
+}
 const leaseChecksum = createHash('sha256').update(leaseMigration).digest('hex')
 const commerceMigrationSafetyChecksum = createHash('sha256')
   .update(commerceMigrationSafety)
@@ -119,6 +132,43 @@ for (const exactCatalogEvidence of [
 ))
 assert.match(migration, /ops_shopify_order_webhook_one_open_idx/u)
 assert.doesNotMatch(health, /to_regclass\(required_table\.name\)/u)
+assert.doesNotMatch(health, /complete_trigger\.tgname\s+(?:NOT\s+)?IN\s*\(/iu,
+  'Complete catalog must not exclude or selectively admit CRM trigger names')
+assert.doesNotMatch(health, /pg_get_expr\(\s*(?:complete|installed)_trigger\.tgqual/iu,
+  'Trigger OLD/NEW qualifications require trigger-aware deparsing, not one-relation expression deparsing')
+const runtime = loadTypeScriptModule(
+  'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
+  { '@/lib/persistence/operationsOrderEditingReleaseHealth': loadTypeScriptModule(
+    'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
+  ) },
+)
+const phases = runtime.SHOPIFY_ORDER_WEBHOOK_NATIVE_CATALOG_PHASES
+assert.deepEqual(Array.from(phases, phase => phase.migration), nativePhases)
+assert.equal(Object.isFrozen(phases), true)
+for (const [index, phase] of phases.entries()) {
+  assert.equal(Object.isFrozen(phase), true)
+  assert.equal(phase.checksum, createHash('sha256').update(readFileSync(resolve(root, 'db/migrations', phase.migration))).digest('hex'))
+  assert.match(phase.triggerHash, /^[a-f0-9]{64}$/u)
+  if (index > 0) {
+    const previous = phases[index - 1]
+    assert.ok(runtime.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL.replace(/\s+/gu, ' ')
+      .includes(`WHERE filename = '${previous.migration}' AND checksum = '${previous.checksum}'`),
+    `Present ${phase.migration} requires the exact prior catalog phase`)
+  }
+}
+const casesStart = runtime.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL.indexOf(
+  ') = CASE', runtime.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL.indexOf(
+    runtime.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_TRIGGER_CATALOG_SQL,
+  ),
+)
+assert.ok(casesStart > 0)
+const triggerCases = runtime.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL.slice(casesStart)
+let previousPosition = -1
+for (const phase of [...phases].reverse()) {
+  const position = triggerCases.indexOf(`THEN '${phase.triggerHash}'`)
+  assert.ok(position > previousPosition, `Exact ${phase.migration} catalog must precede every older fallback`)
+  previousPosition = position
+}
 
 assert.match(route, /SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL/u)
 assert.match(

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -13,6 +13,8 @@ import { join, resolve } from 'node:path'
 import vm from 'node:vm'
 
 const root = process.cwd()
+const nativeEnabled = process.argv.includes('--native-enabled')
+assert.deepEqual(process.argv.slice(2), nativeEnabled ? ['--native-enabled'] : [])
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
@@ -34,8 +36,9 @@ function command(file, args, options = {}) {
   })
 }
 
-function loadTypeScriptModule(path, mocks) {
-  const output = ts.transpileModule(read(path), {
+function loadTypeScriptModule(path, mocks, fixtureExports = []) {
+  const source = read(path) + (fixtureExports.length ? `\nexport { ${fixtureExports.join(',')} };` : '')
+  const output = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2022,
@@ -125,7 +128,13 @@ async function createSchema(pool) {
     CREATE TABLE app_users (
       email text PRIMARY KEY,
       display_name text,
+      reference_code text,
+      invited_by text,
+      invited_at timestamptz,
       role text NOT NULL DEFAULT 'member',
+      permissions jsonb NOT NULL DEFAULT '{}'::jsonb,
+      suitecrm_user_id text,
+      organization_id uuid,
       status text NOT NULL CHECK (status IN ('invited', 'active', 'disabled')),
       activated_at timestamptz,
       last_login_at timestamptz,
@@ -138,6 +147,7 @@ async function createSchema(pool) {
     CREATE TABLE workspace_organizations (
       id uuid PRIMARY KEY,
       name text NOT NULL,
+      is_demo boolean NOT NULL DEFAULT false,
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
     );
@@ -146,6 +156,8 @@ async function createSchema(pool) {
       user_email text NOT NULL REFERENCES app_users(email) ON DELETE CASCADE,
       organization_id uuid NOT NULL REFERENCES workspace_organizations(id),
       role text NOT NULL DEFAULT 'member',
+      permissions jsonb NOT NULL DEFAULT '{}'::jsonb,
+      trashed_at timestamptz,
       status text NOT NULL CHECK (status IN ('invited', 'active', 'disabled')),
       is_default boolean NOT NULL DEFAULT false,
       created_at timestamptz NOT NULL DEFAULT now(),
@@ -154,7 +166,7 @@ async function createSchema(pool) {
     );
 
     CREATE TABLE app_user_invitations (
-      id uuid PRIMARY KEY,
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       email text NOT NULL REFERENCES app_users(email) ON DELETE CASCADE,
       invited_by text REFERENCES app_users(email),
       workspace_organization_id uuid REFERENCES workspace_organizations(id),
@@ -165,6 +177,10 @@ async function createSchema(pool) {
       code_requested_at timestamptz,
       accepted_at timestamptz,
       revoked_at timestamptz,
+      delivery_pending_at timestamptz,
+      sent_at timestamptz,
+      delivery_id text,
+      supersedes_id uuid,
       expires_at timestamptz NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
@@ -183,7 +199,20 @@ async function createSchema(pool) {
       last_attempt_at timestamptz,
       consumed_at timestamptz
     );
+    CREATE TABLE pipeline_spaces (id uuid PRIMARY KEY, owner_email text, workspace_organization_id uuid, reference_access_disabled boolean DEFAULT false);
+    CREATE TABLE pipeline_space_members (pipeline_id uuid, user_email text, access_role text, shared_by text,
+      created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now());
+    CREATE TABLE crm_interactions(id uuid PRIMARY KEY,pipeline_id uuid,suitecrm_id text,reference_code text,
+      suitecrm_module text,suitecrm_synced_at timestamptz);
   `)
+  await pool.query(read('db/migrations/0375_crm_native_email_publication_admission.sql'))
+  if (nativeEnabled) {
+    for (const file of ['0376_crm_native_email_publication_work_context.sql','0377_crm_native_email_authority_transitions.sql',
+      '0378_crm_native_email_capability_policies.sql','0379_crm_native_email_app_only_lifecycle.sql'])
+      await pool.query(read(`db/migrations/${file}`))
+    await pool.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
+      native_policy_fingerprint=$1,activation_receipt_hash=$2`,['1'.repeat(64),'2'.repeat(64)])
+  }
 }
 
 function invitationTokenDigest(token) {
@@ -313,7 +342,12 @@ async function verifyAcceptance(databaseUrl) {
     '@/lib/users': usersMock,
     '@/lib/persistence/postgres': persistenceMock,
   })
+  const authorityLock = loadTypeScriptModule('app_src/lib/persistence/crmNativeEmailAuthority.ts', {})
+  const invitationScope = loadTypeScriptModule('app_src/lib/invitationWorkspaceScope.ts', {
+    './persistence/crmNativeEmailAuthority': authorityLock,
+  })
   const auth = loadTypeScriptModule('app_src/lib/authMagicCode.ts', {
+    '@/lib/persistence/crmNativeEmailAuthority': loadTypeScriptModule('app_src/lib/persistence/crmNativeEmailAuthority.ts', {}),
     '@/lib/authLoginIdentity': loginIdentity,
     '@/lib/matonMail': {
       async sendAuthMagicCodeEmail({ to, code }) {
@@ -325,6 +359,8 @@ async function verifyAcceptance(databaseUrl) {
     '@/lib/users': usersMock,
   })
   const invitations = loadTypeScriptModule('app_src/lib/invitations.ts', {
+    '@/lib/invitationWorkspaceScope': invitationScope,
+    '@/lib/persistence/crmNativeEmailAuthority': loadTypeScriptModule('app_src/lib/persistence/crmNativeEmailAuthority.ts', {}),
     '@/lib/authMagicCode': {
       requestInvitationAuthMagicCode: auth.requestInvitationAuthMagicCode,
     },
@@ -361,7 +397,99 @@ async function verifyAcceptance(databaseUrl) {
       },
       async restoreInvitedUserAssignments() {},
     },
+  }, ['claimInvitation', 'markInvitationDelivered', 'rollbackInvitation'])
+
+  // Execute the actual trimming SQL and token acceptance. A previously issued
+  // code retains only the original invitation's remaining organization rights.
+  const trimmed = await seedInvitation(runtimePool, organizations, 'trimmed-pending-scope@example.com')
+  await invitations.requestUserInvitationCode(trimmed.token)
+  const trimmedCode = deliveredCodes.get(trimmed.email)
+  const beforeTrim = (await runtimePool.query('SELECT token_digest,expires_at FROM app_user_invitations WHERE id=$1', [trimmed.invitationId])).rows[0]
+  await withRuntimeTransaction(async client => {
+    const result = await invitationScope.removeWorkspaceFromPendingInvitationsWithClient(client,
+      { email: trimmed.email, organizationId: organizations.primary })
+    assert.equal(result.trimmedInvitationIds[0], trimmed.invitationId)
+    await client.query(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=now()
+      WHERE user_email=$1 AND organization_id=$2`, [trimmed.email, organizations.primary])
   })
+  const afterTrim = (await runtimePool.query('SELECT token_digest,expires_at,workspace_organization_id,workspace_organization_ids FROM app_user_invitations WHERE id=$1', [trimmed.invitationId])).rows[0]
+  assert.equal(afterTrim.token_digest, beforeTrim.token_digest)
+  assert.equal(afterTrim.expires_at.getTime(), beforeTrim.expires_at.getTime())
+  assert.equal(afterTrim.workspace_organization_id, organizations.additional)
+  assert.deepEqual(afterTrim.workspace_organization_ids, [organizations.additional])
+  assert.equal((await invitations.openUserInvitation(trimmed.token)).organizationName, 'Additional workspace')
+  const acceptedTrim = await auth.verifyAuthMagicCode({ email: trimmed.email, code: trimmedCode })
+  assert.equal(acceptedTrim.status, 'verified'); assert.equal(acceptedTrim.organizationId, organizations.additional)
+  const trimmedMembers = (await runtimePool.query('SELECT organization_id,status FROM app_user_organization_memberships WHERE user_email=$1', [trimmed.email])).rows
+  assert.equal(trimmedMembers.find(row => row.organization_id === organizations.primary).status, 'disabled')
+  assert.equal(trimmedMembers.find(row => row.organization_id === organizations.additional).status, 'active')
+  assert.equal(trimmedMembers.find(row => row.organization_id === organizations.outside).status, 'disabled')
+
+  // Delivery must wait for control-first removal, then read the reduced row;
+  // the initially revoked in-flight invitation must not restore removed scope.
+  const inFlight = await seedInvitation(runtimePool, organizations, 'delivery-removal-race@example.com')
+  await runtimePool.query('UPDATE app_user_invitations SET delivery_pending_at=now(),revoked_at=now() WHERE id=$1', [inFlight.invitationId])
+  const removal = await runtimePool.connect()
+  let deliveryRace
+  try {
+    await removal.query('BEGIN')
+    await invitationScope.removeWorkspaceFromPendingInvitationsWithClient(removal,
+      { email: inFlight.email, organizationId: organizations.primary })
+    await removal.query(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=now()
+      WHERE user_email=$1 AND organization_id=$2`, [inFlight.email, organizations.primary])
+    let deliverySettled = false
+    deliveryRace = invitations.markInvitationDelivered({ email: inFlight.email, invitationId: inFlight.invitationId,
+      actorEmail: inFlight.email, deliveryId: 'synthetic-delivery' }).finally(() => { deliverySettled = true })
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 150))
+    assert.equal(deliverySettled, false, 'Delivery must wait for the removal authority lock')
+    await removal.query('COMMIT'); await deliveryRace
+  } catch (error) {
+    await removal.query('ROLLBACK').catch(() => {}); if (deliveryRace) await deliveryRace.catch(() => {})
+    throw error
+  } finally { removal.release() }
+  const deliveredScope = (await runtimePool.query('SELECT workspace_organization_ids,revoked_at,delivery_pending_at FROM app_user_invitations WHERE id=$1', [inFlight.invitationId])).rows[0]
+  assert.deepEqual(deliveredScope.workspace_organization_ids, [organizations.additional])
+  assert.equal(deliveredScope.revoked_at, null); assert.equal(deliveredScope.delivery_pending_at, null)
+
+  const emptyScope = await seedInvitation(runtimePool, organizations, 'empty-delivery-scope@example.com')
+  await runtimePool.query(`UPDATE app_user_invitations SET workspace_organization_ids=ARRAY[workspace_organization_id],
+    delivery_pending_at=now(),revoked_at=now() WHERE id=$1`, [emptyScope.invitationId])
+  await withRuntimeTransaction(client => invitationScope.removeWorkspaceFromPendingInvitationsWithClient(client,
+    { email: emptyScope.email, organizationId: organizations.primary }))
+  await assert.rejects(() => invitations.markInvitationDelivered({ email: emptyScope.email, invitationId: emptyScope.invitationId,
+    actorEmail: emptyScope.email, deliveryId: 'synthetic-empty-delivery' }), /scope is unavailable/)
+  assert.ok((await runtimePool.query('SELECT revoked_at FROM app_user_invitations WHERE id=$1', [emptyScope.invitationId])).rows[0].revoked_at)
+  await assert.rejects(() => invitations.openUserInvitation(emptyScope.token), /invalid or expired/)
+
+  const changedClaim = await seedInvitation(runtimePool, organizations, 'claim-after-removal@example.com')
+  await runtimePool.query(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=now()
+    WHERE user_email=$1 AND organization_id=$2`, [changedClaim.email, organizations.primary])
+  await assert.rejects(() => invitations.claimInvitation({ email: changedClaim.email, actorEmail: changedClaim.email,
+    digest: 'b'.repeat(64), fromAddress: 'test@example.test', organizationId: organizations.primary,
+    organizationIds: [organizations.primary, organizations.additional] }), /access changed/)
+  assert.equal((await runtimePool.query('SELECT count(*)::int AS count FROM app_user_invitations WHERE email=$1', [changedClaim.email])).rows[0].count, 1)
+
+  // Actual full-row/inventory CAS prevents failed-send cleanup from cascading
+  // intervening memberships, trash or profile changes, even for app-only users.
+  for (const fault of ['none', 'new-membership', 'trash', 'profile', 'missing-provenance']) {
+    const fixture = await seedInvitation(runtimePool, organizations, `new-user-rollback-${fault}@example.com`)
+    await runtimePool.query('UPDATE app_user_invitations SET delivery_pending_at=now(),revoked_at=now() WHERE id=$1', [fixture.invitationId])
+    const producedUserRowJson = (await runtimePool.query('SELECT to_jsonb(u)::text AS snapshot FROM app_users u WHERE email=$1', [fixture.email])).rows[0].snapshot
+    const producedMembershipRowJsons = (await runtimePool.query('SELECT to_jsonb(m)::text AS snapshot FROM app_user_organization_memberships m WHERE user_email=$1 ORDER BY organization_id', [fixture.email])).rows.map(row => row.snapshot)
+    if (fault === 'new-membership') {
+      const extra = randomUUID()
+      await runtimePool.query("INSERT INTO workspace_organizations(id,name) VALUES($1,'Additional newer scope')", [extra])
+      await runtimePool.query("INSERT INTO app_user_organization_memberships(user_email,organization_id,status) VALUES($1,$2,'invited')", [fixture.email, extra])
+    }
+    if (fault === 'trash') await runtimePool.query(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=now()
+      WHERE user_email=$1 AND organization_id=$2`, [fixture.email, organizations.primary])
+    if (fault === 'profile') await runtimePool.query("UPDATE app_users SET display_name='Updated after invite' WHERE email=$1", [fixture.email])
+    await invitations.rollbackInvitation({ email: fixture.email, invitation: { id: fixture.invitationId }, deleteUser: true,
+      producedUserRowJson: fault === 'missing-provenance' ? null : producedUserRowJson, producedMembershipRowJsons })
+    assert.equal((await runtimePool.query('SELECT email FROM app_users WHERE email=$1', [fixture.email])).rowCount, fault === 'none' ? 0 : 1)
+    assert.equal((await runtimePool.query('SELECT id FROM app_user_invitations WHERE id=$1', [fixture.invitationId])).rowCount, 0)
+  }
+  console.log('PASS actual SQL invitation scope reduction, delivery/removal serialization, and exact rollback inventory (synthetic app-only users)')
 
   const success = await seedInvitation(
     runtimePool,
@@ -656,7 +784,7 @@ async function main() {
   )
   try {
     command('docker', disposablePostgresDockerArgs([
-      'run', '--rm', '-d', '--name', container,
+      'run', '--rm', '-d', '--pull', 'never', '--name', container,
       '-e', 'POSTGRES_PASSWORD=invitation_acceptance',
       '-e', 'POSTGRES_DB=invitation_acceptance',
       '-p', '127.0.0.1::5432',
@@ -674,13 +802,13 @@ async function main() {
   } finally {
     if (runtimePool) await runtimePool.end().catch(() => {})
     runtimePool = null
-    spawnSync('docker', ['stop', '-t', '1', container], {
+    spawnSync('docker', disposablePostgresDockerCleanupArgs(container), {
       cwd: root,
       encoding: 'utf8',
       timeout: 20_000,
     })
   }
-  console.log('Invitation exact-set disposable-PostgreSQL acceptance passed')
+  console.log(`Invitation exact-set disposable-PostgreSQL acceptance passed${nativeEnabled ? ' with enabled native fence (synthetic activation, not complete login bootstrap)' : ''}`)
 }
 
 main().catch((error) => {

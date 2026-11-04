@@ -3,6 +3,7 @@ import {
   type FractionalCrmCapability, type FractionalCrmCredential, type FractionalCrmPrincipal,
 } from './fractionalCrmGatewayAuth'
 import { isFractionalCrmGatewayPath } from './fractionalCrmGatewayPath.mjs'
+import { fractionalFolderUrl } from './crm/fractionalCustomerFolder'
 
 type Fields = Record<string, unknown>
 export type FractionalCrmPatch = {
@@ -11,6 +12,7 @@ export type FractionalCrmPatch = {
   fields: Fields
   assertedFractionalActor: { userId: string; organizationId: string; customerId: string }
 }
+export type FractionalCrmFolderPatch = Omit<FractionalCrmPatch, 'fields'> & { schemaVersion: 1; folderUrl: string | null }
 export type FractionalCrmGatewayServices = {
   readFractionalCrmCredential: (id: string) => Promise<FractionalCrmCredential | null>
   readFractionalCrmOrganization: (principal: FractionalCrmPrincipal) => Promise<unknown>
@@ -20,6 +22,8 @@ export type FractionalCrmGatewayServices = {
   updateFractionalCrmCompany: (principal: FractionalCrmPrincipal, ga: string, input: FractionalCrmPatch) => Promise<unknown>
   updateFractionalCrmContact: (principal: FractionalCrmPrincipal, ga: string, gc: string, input: FractionalCrmPatch) => Promise<unknown>
   resolveOrCreateFractionalCrmOnboarding: (principal: FractionalCrmPrincipal, input: Fields, idempotencyKey: string) => Promise<unknown>
+  readFractionalCrmCustomerFolder: (principal: FractionalCrmPrincipal, ga: string, customerId: string) => Promise<unknown>
+  updateFractionalCrmCustomerFolder: (principal: FractionalCrmPrincipal, ga: string, input: FractionalCrmFolderPatch) => Promise<unknown>
 }
 const responseHeaders = {
   'Cache-Control': 'private, no-store', Vary: 'Authorization', 'X-Content-Type-Options': 'nosniff',
@@ -80,12 +84,23 @@ async function readJson(request: Request): Promise<unknown> {
   } finally { reader.releaseLock() }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown } catch { return invalid(400, 'INVALID_JSON') }
 }
-function exactScope(url: URL, principal: FractionalCrmPrincipal, list: boolean) {
-  const allowed: readonly string[] = [...scopeKeys, ...(list ? ['limit', 'cursor'] : [])]
+function exactScope(url: URL, principal: FractionalCrmPrincipal, list: boolean, folder: boolean) {
+  const allowed: readonly string[] = [...scopeKeys, ...(list ? ['limit', 'cursor'] : []), ...(folder ? ['customerId'] : [])]
   for (const key of url.searchParams.keys()) {
     if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) invalid(400, 'INVALID_SCOPE')
   }
   for (const key of scopeKeys) if (url.searchParams.get(key) !== principal[key]) invalid(403, 'SCOPE_DENIED')
+  if (folder && !boundedString(url.searchParams.get('customerId'))) invalid(400, 'INVALID_ACTOR')
+}
+function folderPatch(input: unknown, request: Request, principal: FractionalCrmPrincipal, customerId: string): FractionalCrmFolderPatch {
+  const value = object(input, ['schemaVersion', 'folderUrl', 'assertedFractionalActor'])
+  const actor = object(value.assertedFractionalActor, ['userId', 'organizationId', 'customerId'])
+  if (value.schemaVersion !== 1 || !boundedString(actor.userId) || !boundedString(actor.organizationId)
+    || actor.organizationId !== principal.fractionalOrganizationId || actor.customerId !== customerId) invalid(422, 'INVALID_ACTOR')
+  let folderUrl: string | null
+  try { folderUrl = fractionalFolderUrl(value.folderUrl) } catch { return invalid(422, 'INVALID_FOLDER_URL') }
+  return { schemaVersion: 1, folderUrl, ifMatch: conditionalVersion(request), idempotencyKey: idempotency(request),
+    assertedFractionalActor: { userId: actor.userId, organizationId: actor.organizationId, customerId } }
 }
 function patch(input: unknown, request: Request, principal: FractionalCrmPrincipal, contact: boolean): FractionalCrmPatch {
   const value = object(input, ['fields', 'assertedFractionalActor'])
@@ -119,6 +134,7 @@ const publicErrors = new Set([
   'MANAGED_RECORD', 'REVIEW_REQUIRED', 'REVIEW_STALE', 'EXCLUDED_FROM_CRM', 'DISCOVERY_LIMIT',
   'UNAUTHORIZED', 'INVALID_GLOBAL_ID', 'INVALID_PAGE', 'INVALID_IDEMPOTENCY_KEY',
   'ADDRESS_SHAPE_CONFLICT', 'CONTACT_NAME_SHAPE_CONFLICT', 'CONTACT_RELATIONSHIP_REVIEW', 'CANONICAL_WRITE_MISMATCH',
+  'INVALID_FOLDER_URL', 'FOLDER_DESCRIPTION_REPAIR_REQUIRED', 'FOLDER_MANUAL_REVIEW_REQUIRED', 'FOLDER_BINDING_CONFLICT',
 ])
 function errorResponse(error: unknown) {
   const known = error instanceof FractionalCrmGatewayError && publicErrors.has(error.code)
@@ -139,17 +155,24 @@ export async function handleFractionalCrmGateway(
     if (!isFractionalCrmGatewayPath(url.pathname, request.method)) invalid(404, 'RECORD_NOT_FOUND')
     const parts = url.pathname.slice(basePath.length).split('/')
     const isOnboarding = parts[0] === 'onboarding'
-    const isContact = parts.length >= 3
-    const isList = parts.length === 3
+    const isFolder = parts.length === 3 && parts[2] === 'customer-folder'
+    const isContact = !isFolder && parts.length >= 3
+    const isList = isContact && parts.length === 3
     const capability: FractionalCrmCapability = isOnboarding ? 'crm.onboarding.write'
       : request.method === 'PATCH' ? (isContact ? 'crm.contact.write' : 'crm.company.write')
         : isContact ? 'crm.contact.read' : 'crm.company.read'
     const principal = await authenticateFractionalCrmGateway(request, fractionalCrmGatewayConfiguration(env), services.readFractionalCrmCredential, capability)
-    exactScope(url, principal, isList)
+    exactScope(url, principal, isList, isFolder)
     let result: unknown
     if (isOnboarding) {
       const key = idempotency(request)
       result = await services.resolveOrCreateFractionalCrmOnboarding(principal, onboarding(await readJson(request), principal), key)
+    } else if (isFolder) {
+      const customerId = url.searchParams.get('customerId')!
+      if (request.method === 'PATCH') {
+        conditionalVersion(request); idempotency(request)
+        result = await services.updateFractionalCrmCustomerFolder(principal, parts[1], folderPatch(await readJson(request), request, principal, customerId))
+      } else result = await services.readFractionalCrmCustomerFolder(principal, parts[1], customerId)
     } else if (parts[0] === 'organization') {
       result = await services.readFractionalCrmOrganization(principal)
     } else if (request.method === 'PATCH') {

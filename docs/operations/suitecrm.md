@@ -14,6 +14,27 @@ app_visible: false
 See [CRM record deletion synchronization](crm-record-deletion.md) for scoped
 Account/Contact Trash actions, native deletion inspection, and activation.
 
+### Combining deletion sync with native Email enrollment
+
+Select `CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1` on SuiteCRM **before**
+capturing the first native Email source/package approval when both features
+will be used. The approved runtime package includes the lifecycle route when
+it is already installed or this exact flag is enabled. Preserve that selection
+through installation, cancellation/replan and enrolled restarts. Its standard
+`SUITECRM_CLIENT_ID` authorization remains separate from Email authority.
+
+Enrolled startup verifies the approved package and current native invariants;
+it deliberately does not rerun installers. First enabling an absent route after
+the package is approved changes the package identity and must hold for review,
+not trigger an automatic reinstall. Disabling an already packaged route only
+denies its requests; it does not remove installed files or rewrite its manifest.
+
+Local combined acceptance R502 verifies the real stock-OAuth lifecycle route
+on two distinct enrolled Apache containers, disabled-flag refusal, unchanged
+native tables/package bytes and expired-approval recovery. It is not production
+activation or signed-in UI proof. See the current boundary in
+[CRM shared-email compatibility](crm-compatible-rollback.md).
+
 ## Topology
 
 The sole Railway production environment has a `suitecrm` service, a dedicated MariaDB service, and a SuiteCRM volume mounted at `/var/lib/suitecrm`. SuiteCRM does not share ClawPilot's Postgres database. The ClawPilot production service reaches the V8 API through the private `http://suitecrm.railway.internal:<port>` base URL and OAuth2 client credentials. SuiteCRM 8 native media is not exposed by V8, so the optional native Product-image projection uses a separate least-privilege SuiteCRM user and the same cookie-session plus CSRF flow used by SuiteCRM's own UI. Owner/admin browser access uses SuiteCRM's separate public HTTPS origin. Local, remote-local, and Vercel preview runtimes must not receive these credentials or act as SuiteCRM workers.
@@ -224,5 +245,10 @@ After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and 
 The service never upgrades a persisted SuiteCRM application implicitly. A version mismatch fails closed. Take a MariaDB snapshot and SuiteCRM volume snapshot, follow the official SuiteCRM upgrade procedure, verify the API and workers, then update the version marker deliberately.
 
 ## Rollback
+
+The proposed shared-email release has a stricter retained-schema compatibility
+floor. See the draft [CRM shared-email rollback certification](crm-compatible-rollback.md)
+before treating an older ClawPilot application as a writable rollback target;
+that draft does not authorize a release or production recovery.
 
 Disable `CRM_ENABLED` or stop CRM writes in ClawPilot, retain the Postgres outbox, and restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.

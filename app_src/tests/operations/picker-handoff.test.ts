@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import test, { mock } from 'node:test'
 
@@ -21,6 +21,16 @@ registerHooks({
         new URL(appPath.endsWith('.mjs') ? appPath : `${appPath}.ts`, appSourceUrl).href,
         context,
       )
+    }
+    // Next resolves extensionless local TS imports. The real persistence
+    // dependency graph now reaches CRM eligibility helpers using that form;
+    // retain those real authorization modules rather than mocking them out.
+    if (specifier.startsWith('.') && context.parentURL?.startsWith(appSourceUrl.href)
+      && !/\.[a-z]+$/iu.test(specifier)) {
+      const candidate = new URL(`${specifier}.ts`, context.parentURL)
+      if (candidate.href.startsWith(appSourceUrl.href) && existsSync(candidate)) {
+        return nextResolve(candidate.href, context)
+      }
     }
     return nextResolve(specifier, context)
   },

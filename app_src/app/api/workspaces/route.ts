@@ -3,6 +3,8 @@ import { readDashboardWorkspace } from '@/lib/dashboardWorkspace'
 import { requireRequestUser } from '@/lib/requestUser'
 import type { AppUser } from '@/lib/users'
 import { ModuleAccessError, requireModuleAccess } from '@/lib/moduleAuthorization'
+import { NativeEmailAccessPendingError } from '@/lib/crm/nativeEmailAuthorityRuntime'
+import { getPendingPipelineSharingChange, resumePipelineSharingChange } from '@/lib/crm/nativeEmailSharingRecovery'
 import {
   PipelineProvisioningRequestError,
   queuePipelineProvisioning,
@@ -42,10 +44,13 @@ async function workspacePayload(
     requestedPipelineId,
     preferDefaults,
   })
+  const pendingSharingChange = !preferDefaults && actor.organizationId && workspace.pipelines.some(p => p.ownerEmail === actor.email)
+    ? await getPendingPipelineSharingChange(actor.email, actor.organizationId) : null
 
   return {
     ok: true,
     ...workspace,
+    pendingSharingChange,
     activeWorkspace: {
       organizationId: actor.organizationId,
       name: actor.organizationName,
@@ -55,6 +60,8 @@ async function workspacePayload(
 }
 
 function errorResponse(error: unknown) {
+  if (error instanceof NativeEmailAccessPendingError) return NextResponse.json({ ok:false,error:error.message,
+    code:error.code,transitionId:error.transitionId },{ status:error.status })
   const message = error instanceof Error ? error.message : 'Workspace request failed'
   const status = error instanceof PipelineProvisioningRequestError || error instanceof ModuleAccessError
     ? error.status
@@ -90,7 +97,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json()
     const action = String(body?.action || '')
     if (['create-board', 'select-board', 'share-board', 'remove-board-share'].includes(action)) requireModuleAccess(actor, 'projects')
-    if (['create-pipeline', 'select-pipeline', 'provision-pipeline', 'share-pipeline', 'remove-pipeline-share'].includes(action)) requireModuleAccess(actor, 'crm')
+    if (['create-pipeline', 'select-pipeline', 'provision-pipeline', 'share-pipeline', 'remove-pipeline-share', 'resume-sharing-change'].includes(action)) requireModuleAccess(actor, 'crm')
     let selectedBoardId: string | undefined
     let selectedPipelineId: string | undefined
     let actionResult: Record<string, unknown> | undefined
@@ -124,6 +131,11 @@ export async function POST(req: NextRequest) {
         userEmail: body?.email,
         accessRole: body?.accessRole,
       })
+    } else if (action === 'resume-sharing-change') {
+      if (Object.keys(body).some(key => !['action', 'transitionId'].includes(key))) {
+        return NextResponse.json({ ok: false, error: 'Resume only accepts the saved sharing change ID.' }, { status: 400 })
+      }
+      await resumePipelineSharingChange(actor.email, actor.organizationId || '', body.transitionId)
     } else if (action === 'share-pipeline') {
       await sharePipelineSpace({
         actorEmail: actor,

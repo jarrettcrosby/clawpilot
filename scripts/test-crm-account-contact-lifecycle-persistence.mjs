@@ -24,6 +24,7 @@ function load(path, mocks = {}) {
   return module.exports
 }
 const stable = load('app_src/lib/crm/stableId.ts')
+const authority = load('app_src/lib/persistence/crmNativeEmailAuthority.ts')
 const pipelineId = '11111111-1111-4111-8111-111111111111'
 const foreignPipeline = '99999999-9999-4999-8999-999999999999'
 const recordId = '22222222-2222-4222-8222-222222222222'
@@ -100,6 +101,7 @@ function harness(entity, overrides = {}) {
   } }
   const crm = load('app_src/lib/persistence/crm.ts', {
     '@/lib/crm/stableId': stable,
+    '@/lib/persistence/crmNativeEmailAuthority': authority,
     '@/lib/persistence/postgres': { withTransaction: callback => callback(client) },
     '@/lib/auditWriter': { recordAuditEvent: async event => audits.push(plain(event)) },
   })
@@ -119,7 +121,7 @@ await check('exact account/contact archive preserves other pipeline and all acti
     assert.deepEqual(h.foreign, untouched)
     assert.deepEqual(h.outbox, [{ entity, pipelineId, localId: recordId, suiteCrmId: h.target.suitecrm_id, attributes: { global_id_c: h.target.reference_code } }])
     assert.equal(h.links.has(h.target.reference_code), false); assert.equal(h.links.has(h.foreign.reference_code), true)
-    assert.equal(h.calls[0].params[0], `crm-record-lifecycle:${pipelineId}`)
+    assert.equal(h.calls[0].sql, controlSql)
     assert.deepEqual(h.calls.filter(call => call.sql.includes('pg_advisory_xact_lock')).map(call => call.params[0]),
       [`crm-record-lifecycle:${pipelineId}`, `crm-archive:${pipelineId}:${entity}:${recordId}`])
     assert.ok(writeCalls(h.calls).every(({ sql }) => !/\bcrm_(?:interactions|meetings|opportunities)\b/.test(sql)), 'No activity cascade')
@@ -190,7 +192,7 @@ await check('actual staging retains tombstones by local ID, source key, canonica
       })
       assert.deepEqual(plain(returned), { id: recordId, suiteCrmId: h.target.suitecrm_id, referenceCode: h.target.reference_code, sourceHash: h.target.source_hash, shortUrl: null })
       assert.deepEqual(h.target, before); assert.equal(writeCalls(h.calls).length, 0); assert.equal(h.outbox.length, 0)
-      assert.equal(h.calls[0].params[0], `crm-record-lifecycle:${pipelineId}`)
+      assert.equal(h.calls[0].sql, controlSql); assert.equal(h.calls[1].params[0], `crm-record-lifecycle:${pipelineId}`)
     }
   }
 })
