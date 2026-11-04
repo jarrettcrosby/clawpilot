@@ -92,7 +92,7 @@ operator uses one exact ID/fingerprint batch lookup rather than trusting a
 caller-supplied quarantine flag. New control-first Product source fences freeze
 the classification dependencies during the bounded enrollment maintenance
 window. No native PHP, historical migration, job state or permission is changed
-by this correction. Current raw-catalog enrollment advances to v16 while
+by this correction. The 0400 raw-catalog enrollment advances to v16 while
 preserving the independently accepted historical v9–v15 fingerprints.
 
 Both PostgreSQL 16 and 18 pass the complete raw-catalog gate: 336 tamper
@@ -111,6 +111,31 @@ demo pipeline) are retained separately; the corrected fixtures use the one
 canonical demo root and disabled historical pipelines without disabling guards.
 The successful metadata inspection is not a native capability forecast,
 retained production reservation, writer-drain proof or signed activation.
+
+### Operator-owner authority with app-only employees
+
+Migration `0401` closes a separate owner-source classification gap: an
+operator-account owner's root or explicitly bound workspace membership remains
+authority even when every employee is app-only. Retained disabled account and
+binding intent is included. The existing employee, state-comparison and optional
+target rules are unchanged; ordinary app-only employee edits remain independent.
+The migration requires the exact prior function body, replaces only that
+classifier and preserves its signature, invoker behavior, volatility, fixed
+search path and public-execute revocation. Historical migrations and the initial
+source snapshot are unchanged.
+
+PostgreSQL 16 and 18 each pass 55 focused access groups with the corrected
+fixtures. Owner role/status/trash/delete changes are rejected on root and bound
+workspaces, while harmless settings and normal app-only lifecycle changes pass.
+Real SQL reservation, admission and terminal guards remain enabled; native
+snapshots and receipts in these focused tests are explicitly synthetic. Owned
+database clones preserve independent-client tests and verify every baseline
+public-table fingerprint on return. No native or production acceptance is implied.
+
+The current certification contract is v17 through `0401`; v16 through `0400`
+remains an exact historical comparison, never a fallback for a missing owner
+fence. The final release still requires current raw-catalog acceptance, exact
+candidate build/certification, CI and the separately reviewed live cutover.
 
 The historical checkpoints below are retained evidence, not the current status.
 The installed-state replacement path is now implemented: a cancelled initial

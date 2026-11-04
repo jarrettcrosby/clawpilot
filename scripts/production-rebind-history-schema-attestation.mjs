@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v16'
+  'clawpilot-production-rebind-target-schema-attestation-v17'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -116,10 +116,15 @@ const PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({ filename: '0399_crm_native_email_initial_replan_lineage.sql',
     checksum: 'd701ad48ad8629c3ea71d3987c5eeba4a7df33b79b98ff46ca8c220de0b31a34' }),
 ])
-export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+const PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_MIGRATIONS = Object.freeze([
   ...PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_MIGRATIONS,
   Object.freeze({ filename: '0400_crm_native_email_demo_quarantine.sql',
     checksum: '623d7428e1ceb1f699614bbda22946203d5ffd8880e9800189017adb554e482f' }),
+])
+export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+  ...PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_MIGRATIONS,
+  Object.freeze({ filename: '0401_crm_native_root_owner_source_fence.sql',
+    checksum: 'ef6f50ef321810ce1466892e440f45bc2e9071208f1716a2f98d3045e8e6b79d' }),
 ])
 
 // The rebind caller can take ACCESS SHARE locks on this exact, static list
@@ -301,11 +306,17 @@ export const PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Objec
   16: 'efbd7c05436a394e29c45522465602790f3fa8ff9cfcb9b12802cae416b8e864',
   18: 'c8da9f9b5d54395eb2527e9d472396bbf2b593b6312b2c14d4ef3ae13a3d130d',
 })
+// Accepted through-0400 v16 catalogs remain an exact historical comparison,
+// never a fallback for an owner-source fence missing from the current target.
+export const PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
+  18: '89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
+})
 // Enrollment requires independent full-catalog PG16/18 diagnostics followed by
 // the complete tamper gate. Never learn replacement pins from a live runtime.
 const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: 'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
-  18: '89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
+  16: '2b4e6f7ac81be403b31210026a04f4a98fd902c66198732c471f9cf267e6d441',
+  18: 'c62a2bb05b8f9e502163a649492c0f292c30eeb2fe05d94c60d2a6e2631fc349',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -1044,7 +1055,7 @@ export async function inspectPreInitialEnrollmentProductionRebindSchemaMetadata(
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v13-metadata-only' })
 }
 
-/** Exact through-0398 v14 comparison only, never a current v16 attestation. */
+/** Exact through-0398 v14 comparison only, never a current v17 attestation. */
 export async function inspectPreInitialReplanProductionRebindSchemaMetadata(client) {
   const result = await inspectSchemaWithFunctions(client,
     PRE_INITIAL_REPLAN_CRITICAL_FUNCTIONS,
@@ -1063,6 +1074,17 @@ export async function inspectPreInitialDemoQuarantineProductionRebindSchemaMetad
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v15-metadata-only' })
 }
 
+/** Exact through-0400 v16 comparison only. 0401 changes one already-enrolled
+ * function body, not the object inventory. Missing forward ledger/body proof
+ * never falls back to the historical version. */
+export async function inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata(client) {
+  const result = await inspectSchemaWithFunctions(client,
+    PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
+    PRODUCTION_REBIND_CRITICAL_RELATIONS,
+    PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_MIGRATIONS)
+  return Object.freeze({ ...result, format:'clawpilot-production-rebind-v16-metadata-only' })
+}
+
 export async function attestProductionRebindHistorySchema(client) {
   const inspection = await inspectProductionRebindHistorySchema(client)
   if (inspection.migrations.some(
@@ -1070,7 +1092,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0400',
+      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0401',
     )
   }
   if (

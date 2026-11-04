@@ -10,9 +10,17 @@ export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,autho
  const rollback=Symbol('rollback settings fixture')
  async function isolated(fn){
   try{await tx(async client=>{
-   let serial=0,failAudit=false,nativeResult=true;const calls=[]
+   let serial=0,failAudit=false,nativeResult=true,nativeDispatchRead=false;const calls=[]
+   const settingsClient={query:async(sql,args)=>{
+    const result=await client.query(sql,args)
+    if(nativeDispatchRead&&sql==='SELECT enabled,active_operation_id,active_transition_id FROM crm_native_email_publication_control WHERE singleton'){
+     assert.equal(result.rows.length,1);assert.equal(result.rows[0].enabled,false)
+     return {...result,rows:[{...result.rows[0],enabled:true}]}
+    }
+    return result
+   }}
    const transaction=async callback=>{const key=`settings_${++serial}`;await client.query(`SAVEPOINT ${key}`)
-    try{const result=await callback(client);await client.query(`RELEASE SAVEPOINT ${key}`);return result}
+    try{const result=await callback(settingsClient);await client.query(`RELEASE SAVEPOINT ${key}`);return result}
     catch(error){await client.query(`ROLLBACK TO SAVEPOINT ${key}`);throw error}}
    const dal=load('app_src/lib/persistence/crmRootEmployeeSettings.ts',{
     'node:crypto':crypto,'./postgres':{withTransaction:transaction},'./crmNativeEmailAuthority':authority,
@@ -27,7 +35,8 @@ export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,autho
    const read=()=>dal.readRootEmployeeCrmSettings(owner,root)
    const configure=async(workspaceIds=[root,peer],enabled=true)=>dal.changeRootEmployeeCrmSettings(owner,root,
     {action:'configure',enabled,workspaceIds,registryVersion:(await read()).registryVersion})
-   await fn({client,dal,read,configure,calls,setFailAudit:value=>{failAudit=value},setNativeResult:value=>{nativeResult=value}})
+   await fn({client,dal,read,configure,calls,setFailAudit:value=>{failAudit=value},setNativeResult:value=>{nativeResult=value},
+    setNativeDispatchRead:value=>{nativeDispatchRead=value}})
    throw rollback
   })}catch(error){if(error!==rollback)throw error}
  }
@@ -79,17 +88,22 @@ export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,autho
   const state=await read(),row=state.employees.find(item=>item.email===employee)
   assert.equal(row.status,'disabled');assert.deepEqual(Object.keys(row).sort(),['crmAllowed','displayName','email','enabled','status'])
  }))
- await check('native-enabled settings dispatch exact server-derived intent without legacy writes or fallback',()=>isolated(async({client,read,configure,calls,setNativeResult})=>{
-  await client.query('ALTER TABLE crm_native_email_publication_control DISABLE TRIGGER crm_native_email_control_guard')
-  await client.query("UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,native_policy_fingerprint=repeat('1',64),activation_receipt_hash=repeat('2',64)")
-  await client.query('SET CONSTRAINTS ALL IMMEDIATE')
-  await client.query('ALTER TABLE crm_native_email_publication_control ENABLE TRIGGER crm_native_email_control_guard')
+ await check('native-enabled settings dispatch exact server-derived intent without legacy writes or fallback',()=>isolated(async({client,read,configure,calls,setNativeResult,setNativeDispatchRead})=>{
+  // Only the already-mocked coordinator dispatch is synthetic. Do not invent
+  // activation evidence or turn off a database guard to select this branch.
+  const before=(await client.query('SELECT * FROM crm_native_email_publication_control WHERE singleton')).rows
+  const guards=(await client.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgrelid='crm_native_email_publication_control'::regclass AND NOT tgisinternal ORDER BY tgname")).rows
+  assert.equal(before[0].enabled,false);assert.ok(guards.every(row=>row.tgenabled==='O'))
+  for(const name of ['crm_native_email_control_guard','crm_native_initial_control_guard'])assert.ok(guards.some(row=>row.tgname===name&&row.tgenabled==='O'))
+  setNativeDispatchRead(true)
   await configure();assert.equal(calls.length,1)
   const [kind,actor,workspace,change]=calls[0];assert.equal(kind,'change');assert.equal(actor,owner);assert.equal(workspace,root)
   assert.equal(change.kind,'root_registry_v1');assert.equal(change.changes.length,3)
   assert.equal((await read()).configured,false,'Mock native transport does not execute app changes')
   setNativeResult(false);await assert.rejects(configure(),error=>error instanceof coreRuntime.NativeEmailAccessPendingError)
   assert.equal((await read()).configured,false,'A policy race never falls back to an unaudited legacy write')
+  assert.deepEqual((await client.query('SELECT * FROM crm_native_email_publication_control WHERE singleton')).rows,before)
+  assert.deepEqual((await client.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgrelid='crm_native_email_publication_control'::regclass AND NOT tgisinternal ORDER BY tgname")).rows,guards)
  }))
  await check('normal Resume accepts only its saved transition and rechecks source ownership',()=>isolated(async({dal,calls})=>{
   const request={action:'resume',transitionId:'a'.repeat(64)}

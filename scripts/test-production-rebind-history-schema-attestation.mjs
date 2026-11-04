@@ -24,6 +24,7 @@ import {
   PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
@@ -31,6 +32,7 @@ import {
   inspectPreInitialEnrollmentProductionRebindSchemaMetadata,
   inspectPreInitialReplanProductionRebindSchemaMetadata,
   inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
+  inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
   productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
@@ -73,6 +75,8 @@ const INITIAL_ENROLLMENT_MIGRATION = '0398_crm_native_email_initial_enrollment.s
 const INITIAL_REPLAN_MIGRATION = '0399_crm_native_email_initial_replan_lineage.sql'
 const INITIAL_DEMO_QUARANTINE_MIGRATION = '0400_crm_native_email_demo_quarantine.sql'
 const INITIAL_DEMO_QUARANTINE_HELPER = 'public.clawpilot_crm_native_initial_demo_quarantine(uuid,text)'
+const ROOT_OWNER_SOURCE_FENCE_MIGRATION = '0401_crm_native_root_owner_source_fence.sql'
+const ROOT_OWNER_SOURCE_FENCE_HELPER = 'public.clawpilot_crm_root_native_membership_is_independent(jsonb,jsonb)'
 const INITIAL_ENROLLMENT_RELATIONS = [
   'crm_contacts','crm_email_mailbox_bindings','crm_email_mailboxes','crm_email_review_decisions',
   'crm_email_sources','crm_interaction_organizations','crm_interactions',
@@ -170,7 +174,7 @@ export const NEW_REFERENCE_CONSTRAINTS = new Map([
 ])
 
 assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
-  'clawpilot-production-rebind-target-schema-attestation-v16')
+  'clawpilot-production-rebind-target-schema-attestation-v17')
 assert.deepEqual(PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'22808494dbdc3510bdccb57fe0a491344a1e8bc57195594d089cdf568e63842e',
   18:'f0685b9f82de44c3c1cf1c10e4ce077c43d1040992234e551e338311160f3e64',
@@ -183,10 +187,15 @@ assert.deepEqual(PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'efbd7c05436a394e29c45522465602790f3fa8ff9cfcb9b12802cae416b8e864',
   18:'c8da9f9b5d54395eb2527e9d472396bbf2b593b6312b2c14d4ef3ae13a3d130d',
 },'Demo quarantine must never retcon the independently accepted historical v15 fingerprints')
-assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,INITIAL_DEMO_QUARANTINE_MIGRATION,
-  'Current acceptance requires 0400, never a historical floor')
+assert.deepEqual(PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
+  18:'89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
+},'Owner source fencing must never retcon the independently accepted historical v16 fingerprints')
+assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,ROOT_OWNER_SOURCE_FENCE_MIGRATION,
+  'Current acceptance requires 0401, never a historical floor')
 for(const helper of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
-  'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER]) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
+  'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER,
+  ROOT_OWNER_SOURCE_FENCE_HELPER]) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
 for(const relation of [...INITIAL_ENROLLMENT_RELATIONS,'public.crm_products']) assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),
   `${relation} must be a direct locked/fingerprinted target`)
 
@@ -237,7 +246,8 @@ for(const [inspect,lastMigration] of [
   [inspectPreInitialEnrollmentProductionRebindSchemaMetadata,'0397_crm_native_root_registry_changes.sql'],
   [inspectPreInitialReplanProductionRebindSchemaMetadata,INITIAL_ENROLLMENT_MIGRATION],
   [inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,INITIAL_REPLAN_MIGRATION],
-  [inspectProductionRebindHistorySchema,INITIAL_DEMO_QUARANTINE_MIGRATION],
+  [inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,INITIAL_DEMO_QUARANTINE_MIGRATION],
+  [inspectProductionRebindHistorySchema,ROOT_OWNER_SOURCE_FENCE_MIGRATION],
 ]){
   let selectedMigrations,selectedRelations,selectedFunctions
   await inspect({query:async (_sql,values)=>{
@@ -250,15 +260,20 @@ for(const [inspect,lastMigration] of [
   assert.equal(selectedMigrations.at(-1),lastMigration,`${inspect.name} retains its exact ledger floor`)
   assert.equal(selectedMigrations.includes(INITIAL_ENROLLMENT_MIGRATION),inspect===inspectProductionRebindHistorySchema
     ||inspect===inspectPreInitialReplanProductionRebindSchemaMetadata
-    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,'Only current and exact v14/v15 metadata include 0398')
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,'Only current and exact v14/v15/v16 metadata include 0398')
   assert.equal(selectedMigrations.includes(INITIAL_REPLAN_MIGRATION),inspect===inspectProductionRebindHistorySchema
-    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
-    'Only current and exact v15 metadata enroll 0399; historical readers never provide a fallback')
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+    'Only current and exact v15/v16 metadata enroll 0399; historical readers never provide a fallback')
   for(const currentOnly of [selectedMigrations.includes(INITIAL_DEMO_QUARANTINE_MIGRATION),
     selectedRelations.includes('public.crm_products'),selectedFunctions.includes(INITIAL_DEMO_QUARANTINE_HELPER)]){
-    assert.equal(currentOnly,inspect===inspectProductionRebindHistorySchema,
-      'Only current v16 enrolls the complete 0400 migration, helper and direct Product source catalog')
+    assert.equal(currentOnly,inspect===inspectProductionRebindHistorySchema
+      ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+      'Only current and exact v16 metadata enroll the complete 0400 migration, helper and direct Product source catalog')
   }
+  assert.equal(selectedMigrations.includes(ROOT_OWNER_SOURCE_FENCE_MIGRATION),inspect===inspectProductionRebindHistorySchema,
+    'Only current v17 requires 0401; historical metadata cannot attest missing owner-source fencing')
 }
 
 function command(executable, args, options = {}) {
@@ -573,7 +588,28 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
     assert.ok(beforeQuarantine.migrations.every(m=>m.rows===1&&m.matchingRows===1))
     await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
       error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
-    'Historical v15 metadata is not a fallback for a current v16 target lacking0400')
+    'Historical v15 metadata is not a fallback for a current target lacking0400/0401')
+    const quarantineSql=readFileSync(resolve(root,'db/migrations',INITIAL_DEMO_QUARANTINE_MIGRATION),'utf8')
+    const quarantineClient=await pool.connect()
+    try{await applyMigrationSqlForTest(quarantineClient,INITIAL_DEMO_QUARANTINE_MIGRATION,quarantineSql,
+      {checksum:createHash('sha256').update(quarantineSql).digest('hex')})}finally{quarantineClient.release()}
+    const beforeOwnerFence=await inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeOwnerFence.format,'clawpilot-production-rebind-v16-metadata-only')
+    assert.equal(beforeOwnerFence.schemaDigest,
+      PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeOwnerFence.postgresMajor],
+      'Exact through0400 preserves the independently accepted v16 catalog before0401')
+    assert.deepEqual(beforeOwnerFence.missingRelations,[])
+    assert.deepEqual(beforeOwnerFence.missingFunctions,[])
+    assert.ok(beforeOwnerFence.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v16 metadata is not a fallback for a current v17 target lacking0401')
+    const ownerHelperName='clawpilot_crm_root_native_membership_is_independent'
+    const retainedOwnerHelper=beforeOwnerFence.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
+    assert.ok(retainedOwnerHelper)
+    assert.equal(createHash('sha256').update(retainedOwnerHelper.source).digest('hex'),
+      '1453d556e6f1d460a67ec83147ffbd91dd9347c5b560b92bdf092752e6a7aa20',
+      'The historical v16 owner helper retains the exact independently reviewed 0401 preimage')
     command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: { ...process.env, DATABASE_URL:url.toString(), PGSSLMODE:'disable' }, timeout:180_000,
     })
@@ -584,14 +620,29 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
     assert.equal(sourceSnapshot(completed.catalog)?.source,sourceSnapshot(beforeQuarantine.catalog).source,
       '0400 must preserve the complete historical source snapshot bytes, not filter demo evidence out')
     assert.equal(sourceSnapshot(completed.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
-      '0400 must not replace or weaken the historical source snapshot function')
+      '0400/0401 must not replace or weaken the historical source snapshot function')
+    const currentOwnerHelper=completed.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
+    assert.ok(currentOwnerHelper)
+    assert.notEqual(currentOwnerHelper.source,retainedOwnerHelper.source,'0401 changes its one reviewed owner-source predicate')
+    assert.notEqual(currentOwnerHelper.definition,retainedOwnerHelper.definition)
+    const withoutBody=({source,definition,...metadata})=>metadata
+    assert.deepEqual(withoutBody(currentOwnerHelper),withoutBody(retainedOwnerHelper),
+      '0401 preserves the exact owner-helper identity, privileges and execution attributes')
+    for(const key of Object.keys(beforeOwnerFence.catalog)){
+      if(key==='functions'){
+        assert.deepEqual(completed.catalog.functions.map(fn=>fn===currentOwnerHelper?retainedOwnerHelper:fn),
+          beforeOwnerFence.catalog.functions,'0401 changes no other catalog function')
+      }else assert.deepEqual(completed.catalog[key],beforeOwnerFence.catalog[key],
+        `0401 preserves the complete historical ${key} catalog`)
+    }
     assert.notDeepEqual(completed.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       currentBaseline.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
       'Second database must exercise genuinely different generated trigger OIDs')
     assert.equal(completed.schemaDigest, currentBaseline.schemaDigest,
-      'Equivalent migrated databases with different OID allocation have identical v16 fingerprints')
+      'Equivalent migrated databases with different OID allocation have identical v17 fingerprints')
     await attestProductionRebindHistorySchema(pool)
     console.log(`PG${completed.postgresMajor}: second-database historical upgrade and OID-independent attestation passed`)
+    return Object.freeze({rootOwnerBeforeDefinition:retainedOwnerHelper.definition})
   } finally {await pool.end()}
 }
 
@@ -618,7 +669,7 @@ async function exerciseImage(image) {
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0400
+    // 0370 through 0401
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -655,7 +706,7 @@ async function exerciseImage(image) {
     // This is serial acceptance; do not retain idle catalog-heavy backends in
     // both databases inside the deliberately bounded disposable container.
     await pool.end(); pool = undefined
-    await verifyHistoricalCatalogCompatibility(databaseUrl, baseline)
+    const historical = await verifyHistoricalCatalogCompatibility(databaseUrl, baseline)
     pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
     await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog, CURRENT_CRM_REFERENCE_CONSTRAINTS)
@@ -712,6 +763,20 @@ async function exerciseImage(image) {
     assert.equal(quarantineHelper[0].aclIsDefault,false,'Quarantine helper execution is explicitly restricted')
     assert.ok(!quarantineHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
       'PUBLIC must not execute the quarantine predicate')
+    const ownerHelper=baseline.catalog.functions.filter(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_root_native_membership_is_independent')
+    assert.equal(ownerHelper.length,1,'0401 retains one exact pre-existing owner-source helper')
+    assert.equal(ownerHelper[0].result,'boolean')
+    assert.equal(ownerHelper[0].argumentCount,2)
+    assert.equal(ownerHelper[0].defaultArgumentCount,0)
+    assert.equal(ownerHelper[0].language,'plpgsql')
+    assert.equal(ownerHelper[0].volatility,'v')
+    assert.equal(ownerHelper[0].securityDefiner,false)
+    assert.equal(ownerHelper[0].strict,false)
+    assert.equal(ownerHelper[0].returnsSet,false)
+    assert.equal(ownerHelper[0].aclIsDefault,false)
+    assert.ok(!ownerHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
+      '0401 does not grant PUBLIC execution of owner-source classification')
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
     assert.equal(
@@ -821,7 +886,7 @@ async function exerciseImage(image) {
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} candidate v16 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
+    console.log(`${image} candidate v17 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
@@ -880,6 +945,14 @@ async function exerciseImage(image) {
       await tx.query(`CREATE TRIGGER crm_native_initial_demo_product_source_update_fence BEFORE UPDATE OF id,pipeline_id,suitecrm_id ON public.crm_products
         FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
     })
+    await expectFailure(pool,'schema_catalog_mismatch','0401 historical owner-source bypass restored',tx=>tx.query(
+      historical.rootOwnerBeforeDefinition))
+    await expectFailure(pool,'schema_catalog_mismatch','0401 owner-source PUBLIC execution drift',tx=>tx.query(
+      `GRANT EXECUTE ON FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER} TO PUBLIC`))
+    await expectFailure(pool,'schema_catalog_mismatch','0401 owner-source SECURITY DEFINER drift',tx=>tx.query(
+      `ALTER FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER} SECURITY DEFINER`))
+    await expectFailure(pool,'schema_object_missing','0401 missing owner-source helper',tx=>tx.query(
+      `DROP FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER}`))
     for(const relation of ['public.crm_native_email_initial_enrollments','public.crm_native_email_initial_reservations']){
       await expectFailure(pool,'schema_object_missing',`0398 missing retained ledger ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
     }
@@ -901,6 +974,7 @@ async function exerciseImage(image) {
     await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
     await expectLedgerFailure(pool, INITIAL_ENROLLMENT_MIGRATION, true)
     await expectLedgerFailure(pool, INITIAL_DEMO_QUARANTINE_MIGRATION, true)
+    await expectLedgerFailure(pool, ROOT_OWNER_SOURCE_FENCE_MIGRATION, true)
 
     for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
       await expectFailure(pool, 'schema_catalog_mismatch', `0374 missing ${constraint}`,

@@ -2,6 +2,7 @@
 // Native inspection/forecast/terminal receipts are synthetic, not provider proof.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
+import {enrollRootCrmSyntheticInitial} from './lib/root-crm-synthetic-initial-enrollment.mjs'
 
 export async function runRootRegistryAcceptance(context){
  const {load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
@@ -29,6 +30,12 @@ export async function runRootRegistryAcceptance(context){
   changes:[delta('account',{id:account,root_workspace_id:newRoot,owner_email:owner,enabled:true,revision:'1'}),
    ...[child,newRoot].sort().map(workspace=>delta('binding',{operator_account_id:account,workspace_id:workspace,owner_email:owner,enabled:true,revision:'1'})),
    delta('grant',{id:grant,operator_account_id:account,user_email:employee,source_workspace_id:newRoot,enabled:true,revision:'1'})]}
+ // Initial enrollment requires explicit current authority for every policy.
+ // Retain two bootstrap bindings, then release them native-first before the
+ // original fresh-account creation test; never bypass the initial guard.
+ const bootstrapAccount=(await query('SELECT id::text FROM crm_operator_accounts WHERE root_workspace_id=$1 AND enabled',[root])).rows[0].id
+ for(const workspace of [newRoot,child])await query(`INSERT INTO crm_operator_workspace_bindings(operator_account_id,workspace_id,owner_email,enabled,created_by,updated_by)
+  VALUES($1,$2,$3,true,$3,$3)`,[bootstrapAccount,workspace,owner])
  const rows=(await query(`SELECT suitecrm_id AS "emailId",reference_code AS "globalId",pipeline_id::text AS "pipelineId"
   FROM crm_interactions WHERE suitecrm_module='Emails' AND suitecrm_synced_at IS NOT NULL ORDER BY suitecrm_id,id`)).rows
  const generation=Number((await query('SELECT generation FROM crm_native_email_publication_control')).rows[0].generation)
@@ -46,17 +53,46 @@ export async function runRootRegistryAcceptance(context){
    audience_fingerprint:audience,policy_fingerprint:hash('root-registry-initial-native'),runtime_fingerprint:hash('root-registry-runtime'),
    enabled:'1',capability_policy_json:json(policy),capability_policy_fingerprint:checked.futurePolicyFingerprint}
  })
- const inspection={version:1,generation,nativePolicyFingerprint:bindings[0].policy_fingerprint,runtimeFingerprint:bindings[0].runtime_fingerprint,
+ let inspection={version:1,generation,nativePolicyFingerprint:bindings[0].policy_fingerprint,runtimeFingerprint:bindings[0].runtime_fingerprint,
   beforeBindingsFingerprint:hash(bindings),bindings,memberships:bindings.map((b,index)=>({id:id(610+index),securitygroup_id:b.group_id,
    user_id:nativeOwner,date_modified:'2026-11-03 20:00:00',deleted:'0',primary_group:'0',noninheritable:'1'})),
   capabilities:rows.map(row=>({...row,capabilities:caps()})),principalSuiteCrmUserIds:[nativeOwner,nativeUser]}
- await tx(async c=>{
-  for(const b of bindings)await c.query('INSERT INTO crm_native_email_capability_policies(pipeline_id,generation,policy,fingerprint) VALUES($1,$2,$3,$4)',
-   [b.pipeline_id,generation,b.capability_policy_json,b.capability_policy_fingerprint])
-  await c.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
-   native_policy_fingerprint=$1,activation_receipt_hash=$2`,[inspection.nativePolicyFingerprint,hash('synthetic-root-registry-initial')])
- })
+ await enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root,inspection})
  const identity={keyId:'root-registry-test',nativeInstanceId:'root-registry-native',serviceUserId:id(700),oauthClientId:id(701)}
+ const bootstrapRows=(await query(`SELECT clawpilot_crm_root_registry_projection('binding',to_jsonb(b)) AS row
+  FROM crm_operator_workspace_bindings b WHERE operator_account_id=$1 AND workspace_id=ANY($2::uuid[]) ORDER BY workspace_id`,[bootstrapAccount,[newRoot,child]])).rows.map(r=>r.row)
+ assert.equal(bootstrapRows.length,2)
+ const handoffRequest={kind:'root_registry_v1',workspaceId:root,operatorAccountId:bootstrapAccount,ownerEmail:owner,
+  actorScope:{workspaceId:root,ancestryJson:json([{id:root,parent_id:null,is_demo:false}])},contextFingerprint:'b'.repeat(64),
+  changes:bootstrapRows.map(before=>({table:'binding',beforeJson:json(before),afterJson:json({...before,enabled:false,revision:String(Number(before.revision)+1)})}))}
+ const handoffStore=new nativeAdapter.PostgresNativeEmailAuthorityTransitionStore(tx,{actorEmail:owner,actorWorkspaceId:root,approvalIdentity:identity})
+ const handoffApp=await handoffStore.previewRootRegistryChange(handoffRequest,pipelines)
+ const handoff=await planner.buildNativeEmailMemberTransition({app:handoffApp,inspection,transitionId:hash('synthetic-bootstrap-binding-handoff'),
+  timestamp:'2026-11-03 19:00:00',newMembershipId:()=>crypto.randomUUID(),forecast:async input=>({version:1,
+   beforePolicyFingerprint:input.beforePolicyFingerprint,revokePolicyFingerprint:hash('synthetic-handoff-revoke'),grantPolicyFingerprint:hash('synthetic-handoff-grant')})})
+ const {planHash:handoffHash,...handoffInput}=handoff,handoffKeys=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
+ const handoffIssuer=approval.createNativeEmailAuthorityApprovalIssuer(handoffStore,{...identity,privateKey:handoffKeys.privateKey,ttlSeconds:120})
+ await handoffStore.admit(handoffInput)
+ for(const phase of ['revoke','grant']){
+  const command=handoff[phase],tid=command.transitionId,envelope=await handoffIssuer.issue(tid,phase)
+  await handoffStore.recordApprovalReadback(tid,phase,{version:1,operationId:command.operationId,transitionId:tid,phase,commandHash:hash(command),
+   proofHash:hash(envelope.proof),appCommitFingerprint:envelope.proof.appCommit?hash(envelope.proof.appCommit):null,replayed:false})
+  const claimed=await handoffStore.claimPhase(tid,phase,crypto.randomUUID())
+  await handoffStore.settlePhase(tid,phase,claimed.claim,{version:2,operationId:command.operationId,transitionId:tid,phase,commandHash:hash(command),state:'committed',replayed:false,
+   result:{desiredAppChangeHash:command.desiredAppChangeHash,generationFrom:command.generationFrom,generationTo:command.generationTo,
+    beforePolicyFingerprint:command.beforePolicyFingerprint,afterPolicyFingerprint:command.afterPolicyFingerprint,beforeBindingsFingerprint:command.beforeBindingsFingerprint,
+    afterBindingsFingerprint:command.afterBindingsFingerprint,capabilitiesFingerprint:hash(command.capabilities.map(e=>({emailId:e.emailId,globalId:e.globalId,pipelineId:e.pipelineId,capabilities:e.after}))),pendingPublicationTerminalReceipt:null}})
+  if(phase==='revoke')await handoffStore.commitAppChange(tid,handoffHash)
+  assert.equal(command.membershipChanges.length,0,'Bootstrap release cannot change native reader membership')
+ }
+ assert.equal((await query('SELECT count(*)::int AS n FROM crm_operator_accounts WHERE id=$1',[account])).rows[0].n,0)
+ assert.deepEqual((await query(`SELECT clawpilot_crm_root_registry_projection('binding',to_jsonb(b)) AS row FROM crm_operator_workspace_bindings b
+  WHERE operator_account_id=$1 AND workspace_id=ANY($2::uuid[]) ORDER BY workspace_id`,[bootstrapAccount,[newRoot,child]])).rows.map(r=>r.row),
+ bootstrapRows.map(row=>({...row,enabled:false,revision:String(Number(row.revision)+1)})))
+ const currentBindings=handoff.grant.bindings.map(pair=>pair.after)
+ inspection={...inspection,generation:handoff.grant.generationTo,nativePolicyFingerprint:handoff.grant.afterPolicyFingerprint,
+  beforeBindingsFingerprint:hash(currentBindings),bindings:currentBindings}
+ console.log('PASS synthetic native-first bootstrap binding handoff preserves all four policies and fresh account creation scope')
  let failEffects=false
  await query('CREATE TABLE root_registry_effects(transition_kind text NOT NULL)')
  const store=new nativeAdapter.PostgresNativeEmailAuthorityTransitionStore(tx,{actorEmail:owner,actorWorkspaceId:newRoot,leaseSeconds:1,

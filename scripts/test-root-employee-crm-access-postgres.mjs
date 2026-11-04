@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Actual complete migrations, source collection, session and resource reads.
-// Native enablement below is a disposable synthetic flag, not an ACL proof.
+// Native enrollment uses retained synthetic receipts in isolated databases;
+// this remains PostgreSQL/SQL contract acceptance, not native ACL proof.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
 import {execFileSync} from 'node:child_process'
@@ -8,6 +9,7 @@ import {readFileSync,readdirSync} from 'node:fs'
 import {createRequire} from 'node:module'
 import {disposablePostgresDockerArgs,disposablePostgresDockerCleanupArgs} from './lib/disposable-postgres-docker.mjs'
 import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
+import {enrollRootCrmSyntheticInitial,withRootCrmSyntheticDatabase} from './lib/root-crm-synthetic-initial-enrollment.mjs'
 if(process.argv.length!==3||!['--postgres','--postgres=18'].includes(process.argv[2]))throw Error('Explicit --postgres or --postgres=18 required')
 const postgresMajor=process.argv[2]==='--postgres=18'?18:16
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg'),ts=require('typescript')
@@ -64,6 +66,7 @@ try{
  const client=await pool.connect();try{for(const file of readdirSync(new URL('../db/migrations/',import.meta.url)).filter(f=>/^\d+_.+\.sql$/u.test(f)).sort())
   await applyMigrationSqlForTest(client,file,read(`db/migrations/${file}`))}finally{client.release()}
  const query=(sql,args)=>pool.query(sql,args)
+ const nativeFixture=run=>withRootCrmSyntheticDatabase({Pool,getPool:()=>pool,setPool:value=>{pool=value}},run)
  const tx=async fn=>{const c=await pool.connect();try{await c.query('BEGIN');const result=await fn(c);await c.query('COMMIT');return result}
   catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
  const postgres={query,withTransaction:tx}
@@ -357,7 +360,14 @@ try{
   }finally{c.release()}
  })
  const {runRootAppOnlyLifecycleAcceptance}=await import('./test-root-app-only-lifecycle-postgres.mjs')
- await runRootAppOnlyLifecycleAcceptance({users,query,inspect,owner,employee,root,peer,grant,check})
+ await nativeFixture(async()=>{
+  // Only this clone's operator owns a synthetic native identity. The employee
+  // remains app-only and its lifecycle assertions must retain that distinction.
+  await query("UPDATE app_users SET reference_code=COALESCE(reference_code,allocate_crm_reference('gu')),crm_user_enabled=true WHERE email=$1",[owner])
+  await query('UPDATE app_users SET suitecrm_user_id=$2,suitecrm_username=reference_code WHERE email=$1',[owner,id(901)])
+  await runRootAppOnlyLifecycleAcceptance({users,query,inspect,owner,employee,root,peer,grant,check,
+   enrollInitial:()=>enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root})})
+ })
  await check('first existing-account preview derives the complete source without linking or granting any access',async()=>{
   await query("UPDATE app_users SET reference_code=COALESCE(reference_code,allocate_crm_reference('gu')),crm_user_enabled=true WHERE email=ANY($1::text[])",[[owner,employee]])
   await query('UPDATE app_users SET suitecrm_user_id=$2,suitecrm_username=reference_code WHERE email=$1',[owner,id(901)])
@@ -417,7 +427,7 @@ try{
   await query(`INSERT INTO app_user_organization_memberships(user_email,organization_id,role,status,permissions,created_by,updated_by)
    VALUES($1,$2,'member','active','{"viewCrm":false}',$3,$3)`,[employee,peer,owner])
  })
- await check('first existing-account link uses actual SQL phases and resumes an unknown grant without repeating its app change',async()=>{
+ await check('first existing-account link uses actual SQL phases and resumes an unknown grant without repeating its app change',()=>nativeFixture(async()=>{
   const {runExistingIdentityLinkAcceptance}=await import('./test-native-email-identity-link-postgres.mjs')
   await runExistingIdentityLinkAcceptance({load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
    nativeTransport,query,tx,id,root,peer,owner,employee,grant,
@@ -456,7 +466,7 @@ try{
      assert.equal((await query('SELECT clawpilot_crm_root_native_pipeline_read($1,$2,$3) AS allowed',[pipelines[1],peer,nativeId])).rows[0].allowed,true)
     })
    }})
- })
+ }))
  await check('actual native permission snapshots include root readers without inventing a target membership or editor role',async()=>{
   await query("UPDATE app_users SET reference_code=COALESCE(reference_code,allocate_crm_reference('gu')),crm_user_enabled=true WHERE email=ANY($1::text[])",[[owner,employee]])
   await query('UPDATE app_users SET suitecrm_user_id=CASE WHEN email=$1 THEN $3 ELSE $4 END,suitecrm_username=reference_code,organization_id=$5 WHERE email=ANY($2::text[])',
@@ -509,19 +519,10 @@ try{
   await query(`UPDATE app_user_organization_memberships SET permissions='{"viewCrm":false}' WHERE user_email=$1 AND organization_id=$2`,[employee,peer])
   // Keep the fixture's issued employee/native identities permanent too.
  })
- await check('root native source fences close unshared-target denial owner-demotion and topology bypasses without blocking independent settings',async()=>{
+ await check('root native source fences close unshared-target denial owner-demotion and topology bypasses without blocking independent settings',()=>nativeFixture(async()=>{
   await query('UPDATE crm_root_employee_access_grants SET enabled=true,revision=revision+1 WHERE id=$1',[grant])
   await query('DELETE FROM app_user_organization_memberships WHERE user_email=$1 AND organization_id=$2',[employee,peer])
-  const setMode=async enabled=>{
-   await query('ALTER TABLE crm_native_email_publication_control DISABLE TRIGGER crm_native_email_control_guard')
-   try{await query(`UPDATE crm_native_email_publication_control SET enabled=$1,
-    verified_generation=CASE WHEN $1 THEN generation ELSE NULL END,
-    native_policy_fingerprint=CASE WHEN $1 THEN repeat('1',64) ELSE NULL END,
-    activation_receipt_hash=CASE WHEN $1 THEN repeat('2',64) ELSE NULL END`,[enabled])}
-   finally{await query('ALTER TABLE crm_native_email_publication_control ENABLE TRIGGER crm_native_email_control_guard')}
-  }
-  await setMode(true)
-  try{
+  await enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root,readers:[id(901),id(902)]})
    // No manual share exists here. Migration 0391 alone would call this an
    // independent enrollment, despite revoking an inherited native reader.
    await assert.rejects(query(`INSERT INTO app_user_organization_memberships(user_email,organization_id,role,status,permissions,created_by,updated_by)
@@ -553,28 +554,17 @@ try{
     ])await assert.rejects(tx(async waiter=>{await waiter.query("SET LOCAL lock_timeout='100ms'");await waiter.query(sql,args)}),
      e=>e.code==='55P03','Source statements must wait on control before acquiring source row locks')
    }finally{await locker.query('ROLLBACK');locker.release()}
-  }finally{await setMode(false)}
-  await query('UPDATE crm_root_employee_access_grants SET enabled=false,revision=revision+1 WHERE id=$1',[grant])
-  await query(`UPDATE app_user_organization_memberships SET role='member',permissions='{"viewCrm":false}' WHERE user_email=$1 AND organization_id=$2`,[employee,peer])
- })
- await check('enabled native policy rejects every raw registry mutation without an exact native-first plan',async()=>{
-  // Synthetic activation exists only in this owned throwaway database. No
-  // native permission is installed or represented as accepted by this test.
-  await query('ALTER TABLE crm_native_email_publication_control DISABLE TRIGGER crm_native_email_control_guard')
-  try{await query("UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,native_policy_fingerprint=repeat('1',64),activation_receipt_hash=repeat('2',64)")}
-  finally{await query('ALTER TABLE crm_native_email_publication_control ENABLE TRIGGER crm_native_email_control_guard')}
+ }))
+ await check('enabled native policy rejects every raw registry mutation without an exact native-first plan',()=>nativeFixture(async()=>{
+  await enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root})
   for(const [table,key,value]of [['crm_operator_accounts','id',account],['crm_operator_workspace_bindings','operator_account_id',account],['crm_root_employee_access_grants','id',grant]])
    await assert.rejects(query(`UPDATE ${table} SET enabled=NOT enabled,revision=revision+1 WHERE ${key}=$1`,[value]),e=>e.code==='55000')
   assert.equal((await inspect()).scope.enabled,false)
   assert.deepEqual((await query('SELECT * FROM clawpilot_crm_root_read_workspaces($1)',[employee])).rows,[])
- })
- // Reset only this disposable synthetic flag before the new full-store test
- // constructs an independently pinned initial policy; no provider is touched.
- await query('ALTER TABLE crm_native_email_publication_control DISABLE TRIGGER crm_native_email_control_guard')
- try{await query('UPDATE crm_native_email_publication_control SET enabled=false,verified_generation=NULL,native_policy_fingerprint=NULL,activation_receipt_hash=NULL')}
- finally{await query('ALTER TABLE crm_native_email_publication_control ENABLE TRIGGER crm_native_email_control_guard')}
+ }))
+ assert.equal((await query('SELECT enabled FROM crm_native_email_publication_control')).rows[0].enabled,false)
  const {runRootRegistryAcceptance}=await import('./test-native-email-root-registry-postgres.mjs')
- await runRootRegistryAcceptance({load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
-  query,tx,id,root,peer,child,owner,employee,check})
+ await nativeFixture(()=>runRootRegistryAcceptance({load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
+  query,tx,id,root,peer,child,owner,employee,check}))
  console.log(`PASS ${groups} actual PostgreSQL ${postgresMajor} root registry/session/resource groups; no native ACL/browser/production proof`)
 }finally{await pool?.end();if(started)execFileSync('docker',disposablePostgresDockerCleanupArgs(container),{stdio:'pipe',timeout:30000})}

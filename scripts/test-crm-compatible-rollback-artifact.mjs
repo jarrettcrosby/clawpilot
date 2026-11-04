@@ -31,7 +31,7 @@ try {
   sources['app_src/lib/crm/emailIngestion.ts'] = 'expectedTargetFingerprint\n'
   sources['app_src/lib/crm/suiteCrmClient.ts'] = 'record.relationships\n'
   sources['scripts/production-rebind-history-schema-attestation.mjs'] = `
-    const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT = 'clawpilot-production-rebind-target-schema-attestation-v16';
+    const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT = 'clawpilot-production-rebind-target-schema-attestation-v17';
     const manifest = [${ROLLBACK_PROTECTED_PATHS.filter(path=>path.startsWith('db/migrations/')).map(path=>`{filename: '${path.split('/').at(-1)}', checksum: '${sha256(sources[path])}'}`).join(',')}];
     const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({16: '${'1'.repeat(64)}', 18: '${'2'.repeat(64)}'});
     if (inspection.schemaDigest !== expectedDigest) throw new Error('strict');
@@ -57,18 +57,18 @@ try {
     assert.deepEqual(inspectRollbackSources(path => sources[path]).protectedFiles, identity.protectedFiles)
     assert.ok(!identity.sourceTree.some(entry => entry.path.startsWith('data/') || entry.path.startsWith('.env')))
   })
-  check('historical v9/v10/v11/v12/v13/v14/v15 metadata cannot certify a current rollback floor',()=>{
-    for(const oldVersion of ['v9','v10','v11','v12','v13','v14','v15']) assert.throws(()=>inspectRollbackSources(path=>path==='scripts/production-rebind-history-schema-attestation.mjs'
-      ?sources[path].replace('schema-attestation-v16',`schema-attestation-${oldVersion}`):sources[path]))
+  check('historical v9/v10/v11/v12/v13/v14/v15/v16 metadata cannot certify a current rollback floor',()=>{
+    for(const oldVersion of ['v9','v10','v11','v12','v13','v14','v15','v16']) assert.throws(()=>inspectRollbackSources(path=>path==='scripts/production-rebind-history-schema-attestation.mjs'
+      ?sources[path].replace('schema-attestation-v17',`schema-attestation-${oldVersion}`):sources[path]))
   })
   check('later authority migration source must match the exact enrolled checksum',()=>{
-    for(const filename of ['0399_crm_native_email_initial_replan_lineage.sql','0400_crm_native_email_demo_quarantine.sql']){
+    for(const filename of ['0399_crm_native_email_initial_replan_lineage.sql','0400_crm_native_email_demo_quarantine.sql','0401_crm_native_root_owner_source_fence.sql']){
       assert.throws(()=>inspectRollbackSources(path=>path===`db/migrations/${filename}`
         ?sources[path]+'-- changed fixture migration\n':sources[path]),/retain and attest/)
     }
   })
   check('omitting later authority migration enrollment cannot certify',()=>{
-    for(const filename of ['0399_crm_native_email_initial_replan_lineage.sql','0400_crm_native_email_demo_quarantine.sql']){
+    for(const filename of ['0399_crm_native_email_initial_replan_lineage.sql','0400_crm_native_email_demo_quarantine.sql','0401_crm_native_root_owner_source_fence.sql']){
       assert.throws(()=>inspectRollbackSources(path=>path==='scripts/production-rebind-history-schema-attestation.mjs'
         ?sources[path].replace(filename,'omitted_fixture.sql'):sources[path]),/retain and attest/)
     }

@@ -2,6 +2,7 @@
 // approval readback and terminal receipts below are explicitly synthetic.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
+import {enrollRootCrmSyntheticInitial} from './lib/root-crm-synthetic-initial-enrollment.mjs'
 
 export async function runExistingIdentityLinkAcceptance(context){
  const {load,protocol,eligibility,userEligibility,nativeProjection,capability,transition,nativeAdapter,
@@ -49,12 +50,7 @@ export async function runExistingIdentityLinkAcceptance(context){
   capabilities:interactionRows.map(row=>({emailId:row.suitecrm_id,globalId:row.reference_code,pipelineId:row.pipeline_id,capabilities:allCaps()})),
   principalSuiteCrmUserIds:[nativeOwner,nativeId]}
  planner.readNativeEmailAuthorityInspection(inspection)
- await tx(async c=>{
-  for(const b of bindings)await c.query('INSERT INTO crm_native_email_capability_policies(pipeline_id,generation,policy,fingerprint) VALUES($1,$2,$3,$4)',
-   [b.pipeline_id,generation,b.capability_policy_json,b.capability_policy_fingerprint])
-  await c.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
-   native_policy_fingerprint=$1,activation_receipt_hash=$2`,[inspection.nativePolicyFingerprint,hash('synthetic-identity-initial-enrollment')])
- })
+ await enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root,inspection})
  let failEffects=false
  const keys=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),options={actorEmail:owner,actorWorkspaceId:root,leaseSeconds:1,
   approvalIdentity:{keyId:'identity-fixture-key',nativeInstanceId:'identity-fixture-native',serviceUserId:id(9000),oauthClientId:id(9001)}}
@@ -128,15 +124,11 @@ export async function runExistingIdentityLinkAcceptance(context){
  }
  console.log('PASS exact identity SQL validation, native-first mapping, rollback, retained membership intent, unknown-grant receipt resolution and idempotent effects')
  if(context.verifyRootNativeReads)await context.verifyRootNativeReads({nativeId,pipelines,transitionId:tid})
- // Only this owned throwaway fixture's synthetic mode is reset. Evidence
- // tables remain retained; no production activation or native write occurred.
- await query('ALTER TABLE crm_native_email_publication_control DISABLE TRIGGER crm_native_email_control_guard')
- try{await query('UPDATE crm_native_email_publication_control SET enabled=false,verified_generation=NULL,native_policy_fingerprint=NULL,activation_receipt_hash=NULL')}
- finally{await query('ALTER TABLE crm_native_email_publication_control ENABLE TRIGGER crm_native_email_control_guard')}
- await query('DELETE FROM crm_native_email_capability_policies WHERE pipeline_id=ANY($1::uuid[])',[pipelines])
- await query('DELETE FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2',[pipelines[0],employee])
- await query(`INSERT INTO app_user_organization_memberships(user_email,organization_id,role,status,permissions,created_by,updated_by)
-  VALUES($1,$2,'member','active','{"viewCrm":false}',$3,$3)`,[employee,peer,owner])
+ // The parent owns a disposable database clone. Keep all committed initial
+ // and identity-link evidence intact until that clone is removed; never
+ // disable native authority or erase its policies to reset a test flag.
+ assert.equal((await query('SELECT enabled FROM crm_native_email_publication_control')).rows[0].enabled,true)
+ assert.equal((await query("SELECT count(*)::int AS n FROM crm_native_email_initial_enrollments WHERE state='activated'")).rows[0].n,1)
  assert.equal((await query('SELECT enabled FROM crm_root_employee_access_grants WHERE id=$1',[grant])).rows[0].enabled,true)
  void nativeTransport
 }
