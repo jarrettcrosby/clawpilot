@@ -31,9 +31,10 @@ jobs:
 
   validate:
     runs-on: ubuntu-24.04
-    # Leave room for the full PostgreSQL and browser contract matrix on a slow
-    # hosted runner while still bounding a genuinely wedged validation job.
-    timeout-minutes: 45
+    # Hosted-runner progress projects about 32 minutes per PostgreSQL catalog
+    # matrix, in addition to the application/browser and downstream gates.
+    # Keep both complete matrices within an explicit, finite job deadline.
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v5
