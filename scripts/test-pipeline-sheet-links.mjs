@@ -41,6 +41,8 @@ const shortlinks = loadModule('app_src/lib/shortlinks.ts', {
 
 let rows = []
 let reads = 0
+let viewCrm = true
+let permissionChecks = 0
 const tenancy = loadModule('app_src/lib/tenancy.ts', {
   '@/lib/persistence/crmNativeEmailAuthority': { lockCrmNativeEmailAuthorityWithClient: noIo },
   '@/lib/persistence/postgres': {
@@ -61,7 +63,13 @@ const tenancy = loadModule('app_src/lib/tenancy.ts', {
   '@/lib/shortlinks': shortlinks,
   '@/lib/organizations': { ensurePrimaryWorkspaceOrganization: noIo },
   '@/lib/pipeline/baseTemplate.mjs': {},
-  '@/lib/users': {},
+  '@/lib/users': {
+    effectiveUserPermissions: (user) => {
+      assert.equal(user, actor, 'Pipeline access checks must use the resolved workspace actor')
+      permissionChecks += 1
+      return { viewCrm }
+    },
+  },
   '@/lib/workspaceMemberships': {
     requireWorkspaceAppUser: async (email, organizationId) => {
       assert.equal(email, actor.email)
@@ -106,9 +114,16 @@ try {
   assert.equal(local[0].shortLinkUrl, 'https://bposupplychain.com/s/bpo-pipeline')
   assert.equal(local[1].shortLinkUrl, null, 'Hosted Open Sheet links remain HTTPS-only')
   assert.equal(reads, 2)
+  assert.equal(permissionChecks, 2)
+
+  viewCrm = false
+  const denied = await tenancy.listPipelineSpaces(actor)
+  assert.equal(denied.length, 0, 'A user without CRM access must receive no pipelines')
+  assert.equal(permissionChecks, 3, 'Every pipeline listing must check the workspace permissions')
+  assert.equal(reads, 2, 'Denied access must not read pipeline or short-link data')
 } finally {
   if (originalOrigin === undefined) delete process.env.SHORTLINK_PUBLIC_ORIGIN
   else process.env.SHORTLINK_PUBLIC_ORIGIN = originalOrigin
 }
 
-console.log('Pipeline Open Sheet preserves stored short-link domain, legacy behavior, scope, and HTTPS safety')
+console.log('Pipeline Open Sheet preserves stored short-link domain, legacy behavior, workspace permissions, scope, and HTTPS safety')
