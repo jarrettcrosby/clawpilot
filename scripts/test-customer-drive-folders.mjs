@@ -107,6 +107,7 @@ await check('cross-account/pipeline/parent/runtime reservation drift is refused'
 class ClientError extends Error{constructor(status){super('synthetic provider error');this.upstreamStatus=status}}
 let requests=[],handler
 const adapter=load('app_src/lib/crm/customerDriveFolderGoogle.ts',{
+  '@/lib/integrations/googleWorkspace':{},
   './customerDriveFolders':core,'@/lib/integrations/googleWorkspaceClient':{GoogleWorkspaceClientError:ClientError,
     googleDriveJson:async(runtime,path,input)=>{requests.push({path,input});return handler(path,input)}}})
 const google=()=>adapter.customerFolderGoogleDrive({sharedDriveId:scope.sharedDriveId,serviceAccountEmail:scope.serviceAccountEmail},scope)
@@ -119,9 +120,16 @@ await check('Google adapter completes pagination and refuses incomplete/repeatin
   requests=[];handler=path=>new URL(path,'https://fixture.test').searchParams.has('pageToken')
     ?{files:[{id:'second'}]}:{files:[{id:'first'}],nextPageToken:'page-two'}
   assert.deepEqual((await google().namedChildren('parent',"O'Brien")).map(f=>f.id),['first','second'])
-  assert.ok(new URL(requests[0].path,'https://fixture.test').searchParams.get('q').includes("O\\'Brien"))
+  const parameters=new URL(requests[0].path,'https://fixture.test').searchParams
+  assert.ok(parameters.get('q').includes("O\\'Brien"))
+  assert.ok(parameters.get('q').includes("'parent' in parents"))
+  assert.equal(parameters.get('corpora'),'user');assert.equal(parameters.has('driveId'),false)
+  assert.equal(parameters.get('supportsAllDrives'),'true');assert.equal(parameters.get('includeItemsFromAllDrives'),'true')
+  for(const request of requests)assert.equal(new URL(request.path,'https://fixture.test').searchParams.get('q'),parameters.get('q'))
   handler=()=>({files:[],incompleteSearch:true});await assert.rejects(google().namedChildren('parent','name'),/search_incomplete/)
   handler=()=>({files:[],nextPageToken:'repeat'});await assert.rejects(google().namedChildren('parent','name'),/search_incomplete/)
+  requests=[];await assert.rejects(google().namedChildren('../parent','name'),/resource_invalid/)
+  assert.equal(requests.length,0)
 })
 await check('Google create retries fixed IDs only, does not grant permissions, and leaves conflict readback to coordinator',async()=>{
   requests=[];handler=()=>{throw new ClientError(409)}
@@ -133,6 +141,7 @@ await check('Google create retries fixed IDs only, does not grant permissions, a
 let fetchHandler
 const actualGoogleClient=load('app_src/lib/integrations/googleWorkspaceClient.ts',{'google-auth-library':{JWT:class{}}})
 const actualGoogle=load('app_src/lib/crm/customerDriveFolderGoogle.ts',{
+  '@/lib/integrations/googleWorkspace':{},
   './customerDriveFolders':core,'@/lib/integrations/googleWorkspaceClient':actualGoogleClient})
 await check('actual Google client maps HTTP 404/409 without confusing its app-facing status with upstream status',async()=>{
   const drive=actualGoogle.customerFolderGoogleDrive({sharedDriveId:scope.sharedDriveId,serviceAccountEmail:scope.serviceAccountEmail,

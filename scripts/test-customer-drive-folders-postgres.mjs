@@ -176,9 +176,10 @@ try{
     }}
   let failCardReconcile=false
   const provisioning=load('app_src/lib/crm/customerFolderProvisioning.ts',{'./customerDriveFolders':core,
-    '@/lib/integrations/googleWorkspace':{resolveManagedGoogleWorkspaceRuntime:async binding=>{
-      assert.deepEqual(binding,{serviceAccountEmail:scope.serviceAccountEmail,sharedDriveId:scope.sharedDriveId});return {fixture:true}}},
-    './customerDriveFolderGoogle':{customerFolderGoogleDrive:()=>drive},
+    './customerDriveFolderGoogle':{customerFolderGoogleDrive:()=>drive,
+      resolveCustomerFolderGoogleRuntime:async(parent,binding)=>{
+        assert.equal(parent,scope.customersParentId)
+        assert.deepEqual(binding,{serviceAccountEmail:scope.serviceAccountEmail,sharedDriveId:scope.sharedDriveId});return {fixture:true}}},
     '@/lib/persistence/crmCustomerFolders':storage,'./boardProjection':{reconcileCrmBoardProjectionsForPipeline:async input=>{
       if(failCardReconcile)throw Error('synthetic card reconciliation failure')
       return projections.reconcileCrmBoardProjectionsForPipeline(input)}}})

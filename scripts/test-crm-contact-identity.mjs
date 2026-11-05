@@ -23,6 +23,12 @@ assert.match(persistence, /fieldMode === 'enrich'/)
 assert.match(persistence, /Contact name is ambiguous/)
 assert.match(persistence, /crm_reference_aliases/)
 assert.match(persistence, /crm-app-user-profile:/)
+const profileReconciliation = persistence.slice(
+  persistence.indexOf('export async function syncAppUserProfileToCrm('),
+  persistence.indexOf('const RECOVERABLE_CRM_PROFILE_RECONCILIATION_ERRORS'),
+)
+assert.match(profileReconciliation, /const contact = await withTransaction\(async \(client\) => \{\s*(?:\/\/[^\n]*\n\s*)*await lockCrmNativeEmailAuthorityWithClient\(client\)\s+await lockCrmMutation\(client, `crm-record-lifecycle:\$\{input\.pipelineId\}`\)\s+await client\.query\(/,
+  'Profile reconciliation must lock native control then lifecycle before profile advisory and CRM row locks')
 assert.match(persistence, /contact\.app_user_email = \$2/)
 assert.match(persistence, /contact\.reference_code = \$3/)
 assert.match(persistence, /alias\.source_key = \$4/)
