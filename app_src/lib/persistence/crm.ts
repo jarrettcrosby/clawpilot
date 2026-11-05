@@ -790,6 +790,7 @@ async function enqueueSuiteCrmRecord(
   referenceCode: string,
   sourceHash: string,
   previousSuiteCrmModule?: SuiteCrmInteractionModule | null,
+  emailAudienceMode?: ReviewedEmailAudienceMode,
 ): Promise<string | null> {
   const suiteCrmModule = input.entity === 'interactions'
     ? interactionSuiteCrmModule(input.fields)
@@ -905,7 +906,7 @@ async function enqueueSuiteCrmRecord(
     ...(relationships.length > 0 ? { relationships } : {}),
   }
   if (input.entity === 'interactions' && suiteCrmModule === 'Emails') {
-    const audience = await reviewedEmailAudienceWithClient(client, input.pipelineId)
+    const audience = await reviewedEmailAudienceWithClient(client, input.pipelineId, emailAudienceMode)
     const accounts = relationships.filter(link => link.relatedModuleName === 'Accounts').map(link => link.relatedBeanId).sort()
     const contacts = relationships.filter(link => link.relatedModuleName === 'Contacts').map(link => link.relatedBeanId).sort()
     const bindings = await client.query<{ contact_id: string; account_id: string }>(`SELECT contact.suitecrm_id AS contact_id,
@@ -2660,6 +2661,8 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   // authority locks; callers that already lock rows must do this at entry too.
   // The DB guard compares actual inventory changes, so content edits stay live.
   if (['interactions', 'organizations', 'contacts'].includes(rawInput.entity)) await lockCrmNativeEmailAuthorityWithClient(client)
+  const emailAudienceMode = rawInput.entity === 'interactions'
+    ? await reviewedEmailAudienceModeUnderControlWithClient(client) : undefined
   if (rawInput.entity === 'organizations' || rawInput.entity === 'contacts') {
     await lockCrmMutation(client, `crm-record-lifecycle:${rawInput.pipelineId}`)
     const retained = await retainedCrmIdentityTombstone(client, rawInput)
@@ -2818,6 +2821,7 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
       row.reference_code,
       sourceHash,
       previousSuiteCrmModule,
+      emailAudienceMode,
     )
     if (input.entity === 'interactions' && !interactionSuiteCrmModule(input.fields) && !suiteCrmOutboxKey) {
       await client.query(
@@ -3055,10 +3059,33 @@ export type ReviewedGmailInteractionInput = {
   correctionReason?: string
 }
 
+type ReviewedEmailAudienceMode = 'legacy' | 'native'
+
+/** Caller already owns the control singleton before any authority/source locks.
+ * Never acquire control here: legacy publication holds row locks over provider
+ * I/O and must keep using the separate legacy audience without this dispatch. */
+async function reviewedEmailAudienceModeUnderControlWithClient(client: PoolClient): Promise<ReviewedEmailAudienceMode> {
+  const result = await client.query<{ enabled: boolean }>(
+    'SELECT enabled FROM crm_native_email_publication_control WHERE singleton',
+  )
+  if (result.rows.length !== 1 || typeof result.rows[0].enabled !== 'boolean') {
+    throw new Error('Native Email audience control mode is missing or inconsistent')
+  }
+  return result.rows[0].enabled ? 'native' : 'legacy'
+}
+
+/** Explicit mode is transaction-owned, never an API input or a fallback when
+ * native identity/reader validation fails. Both branches retain their fences. */
+async function reviewedEmailAudienceWithClient(client: PoolClient, pipelineId: string, mode: ReviewedEmailAudienceMode | undefined) {
+  if (mode === 'native') return reviewedEmailAudienceUnderNativeControlWithClient(client, pipelineId)
+  if (mode === 'legacy') return legacyReviewedEmailAudienceWithClient(client, pipelineId)
+  throw new Error('An explicit held-control Email audience mode is required')
+}
+
 /** Existing pipeline readers are the content audience. Companies and contacts
  * are discovery labels, never principals. Fail closed if a reader has no native
  * identity; native publication must independently prove the same reader set. */
-async function reviewedEmailAudienceWithClient(client: PoolClient, pipelineId: string) {
+async function legacyReviewedEmailAudienceWithClient(client: PoolClient, pipelineId: string) {
   const scope = await client.query<{ workspace_id: string; owner_native_id: string }>(`SELECT pipeline.workspace_organization_id::text AS workspace_id,
     owner_user.suitecrm_user_id AS owner_native_id FROM pipeline_spaces pipeline
     JOIN app_users owner_user ON owner_user.email=pipeline.owner_email AND owner_user.status='active'
@@ -3175,7 +3202,8 @@ async function readReviewedGmailInteractionWithClient(client: PoolClient, pipeli
   )
 }
 
-async function prepareReviewedGmailInteractionWithClient(client: PoolClient, input: ReviewedGmailInteractionInput) {
+async function prepareReviewedGmailInteractionWithClient(client: PoolClient, input: ReviewedGmailInteractionInput,
+  emailAudienceMode: ReviewedEmailAudienceMode) {
   const refuse = () => new Error('Reviewed Gmail recovery evidence changed or conflicts with existing CRM relationships')
   if (!input.contactTargets.length || input.contactTargets.length > 25
     || input.interaction.entity !== 'interactions' || input.interaction.pipelineId !== input.pipelineId
@@ -3350,7 +3378,7 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   const evidenceFingerprint = crmSourceHash({ scope: scope.rows[0], cache: stableCache,
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     mailboxIdentity: input.mailboxIdentity, messageEvidence: input.messageEvidence, legacyAdoption: input.legacyAdoption,
-    audience: await reviewedEmailAudienceWithClient(client, input.pipelineId),
+    audience: await reviewedEmailAudienceWithClient(client, input.pipelineId, emailAudienceMode),
     primary: input.primaryOrganization, targets: [...input.contactTargets].sort((a, b) => a.id.localeCompare(b.id)), organizations: organizations.rows,
     generated: { ...input.interaction, fields: { ...input.interaction.fields,
       metadata: { ...input.interaction.fields.metadata, inboundMessageId: cached.id } } } })
@@ -3360,7 +3388,7 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     provider: [input.providerMessageId, input.providerThreadId], cache: stableCache,
     mailboxIdentity: input.mailboxIdentity, messageEvidence: input.messageEvidence, legacyAdoption: input.legacyAdoption,
-    audience: await reviewedEmailAudienceWithClient(client, input.pipelineId),
+    audience: await reviewedEmailAudienceWithClient(client, input.pipelineId, emailAudienceMode),
     primary: input.primaryOrganization, targets: [...input.contactTargets].sort((a, b) => a.id.localeCompare(b.id)),
     current: reviewedGmailContentFingerprint(current), links: links.rows,
     generated: { ...input.interaction, fields: { ...input.interaction.fields,
@@ -3372,7 +3400,7 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
 }
 
 async function applyReviewedGmailInteractionWithClient(client: PoolClient,
-  plan: Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>) {
+  plan: Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>, emailAudienceMode: ReviewedEmailAudienceMode) {
   const { input, current, cached, organizationIds, contactIds, targetFingerprint } = plan
   if (!input.apply || plan.receiptValid) return { interactionId: current ? String(current.id) : null,
     inboundMessageId: String(cached.id), applied: false, alreadyLinked: plan.alreadyLinked, targetFingerprint, linksAdded: 0 }
@@ -3426,7 +3454,7 @@ async function applyReviewedGmailInteractionWithClient(client: PoolClient,
   [cached.id, link.reference, staged.id, link.contact ? 'crm_contacts' : 'crm_organizations', link.contact || link.organization])
   const previous = await client.query<{ id: string; revision: number }>(`SELECT id::text,revision FROM crm_email_review_decisions
     WHERE interaction_id=$1::uuid ORDER BY revision DESC LIMIT 1 FOR UPDATE`, [staged.id])
-  const audience = await reviewedEmailAudienceWithClient(client, input.pipelineId)
+  const audience = await reviewedEmailAudienceWithClient(client, input.pipelineId, emailAudienceMode)
   await client.query(`INSERT INTO crm_email_review_decisions(pipeline_id,interaction_id,source_id,revision,decision_hash,
     kind,actor_email,associations,audience,provenance,previous_decision_id)
     VALUES($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::uuid)`,
@@ -3467,7 +3495,11 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     throw new Error('Historical adoption is limited to the three selected messages')
   }
   return withTransaction(async (client) => {
-    if (input.apply === true) await lockCrmNativeEmailAuthorityWithClient(client)
+    // Preview also locks its authority snapshot, without changing any rows.
+    // This must precede participant/source locks: enabled audience derivation
+    // reads root and membership authority under the caller-owned control fence.
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    const emailAudienceMode = await reviewedEmailAudienceModeUnderControlWithClient(client)
     // Deterministic per-owner/email fences are also acquired by the DB contact
     // and lead triggers, including imports. Unrelated identities remain writable.
     const identityKeys = [...new Set(input.messages.flatMap(message => message.participantEmails.map(email =>
@@ -3475,10 +3507,10 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     for (const key of identityKeys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
     const plans = new Map<ReviewedGmailInteractionInput, Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>>()
     for (const message of [...input.messages].sort((a, b) => `${a.pipelineId}:${a.providerMessageId}`.localeCompare(`${b.pipelineId}:${b.providerMessageId}`))) {
-      plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }))
+      plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceMode))
     }
     const results = []
-    for (const message of input.messages) results.push(await applyReviewedGmailInteractionWithClient(client, plans.get(message)!))
+    for (const message of input.messages) results.push(await applyReviewedGmailInteractionWithClient(client, plans.get(message)!, emailAudienceMode))
     return results
   })
 }
@@ -7511,7 +7543,7 @@ export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxIte
         AND outbox.status='processing' AND outbox.lock_token=$4 AND outbox.payload=$5::jsonb
       WHERE interaction.id=$1::uuid AND interaction.pipeline_id=$2::uuid AND ${activeCrmRecordSql('interaction')}
       FOR SHARE OF interaction,outbox`, [item.aggregateId, payload.pipelineId, item.id, item.lockToken, JSON.stringify(payload)])
-    const audience = await reviewedEmailAudienceWithClient(client, payload.pipelineId)
+    const audience = await legacyReviewedEmailAudienceWithClient(client, payload.pipelineId)
     if (!payload.emailProjection || audience.fingerprint !== payload.emailProjection.audience.fingerprint
       || item.idempotencyKey !== `crm:interactions:v4:${item.aggregateId}:Emails:${current.rows[0]?.source_hash}`) {
       throw new Error('Email publication audience, lease or revision changed')
@@ -7554,7 +7586,7 @@ export async function completeSuiteCrmOutboxInPostgres(
         || crmSourceHash([...proof.audience.readerSuiteCrmUserIds].sort()) !== crmSourceHash([...expected.audience.allowedSuiteCrmUserIds].sort())) {
         throw new Error('SuiteCRM Email readback proof is missing or changed')
       }
-      const audience = await reviewedEmailAudienceWithClient(client, item.payload.pipelineId)
+      const audience = await legacyReviewedEmailAudienceWithClient(client, item.payload.pipelineId)
       if (audience.fingerprint !== expected.audience.fingerprint) throw new Error('Email audience changed before sync completion')
       const current = await client.query<{ source_hash: string }>(`SELECT source_hash FROM crm_interactions
         WHERE id=$1::uuid AND pipeline_id=$2::uuid AND suitecrm_id=$3 FOR UPDATE`,

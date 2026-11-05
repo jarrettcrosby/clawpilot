@@ -21,6 +21,7 @@ const functions = (path, names) => {
 const compiled = ts.transpileModule([
   functions('app_src/lib/persistence/crmNativeEmailAuthority.ts', ['lockCrmNativeEmailAuthorityWithClient']),
   functions('app_src/lib/persistence/crm.ts', ['stagedCrmSourceHash', 'stageCrmRecordWithClient',
+    'reviewedEmailAudienceModeUnderControlWithClient',
     'stageCrmRecordInPostgres', 'enrichCrmEmailInteractionParticipantsInPostgres',
     'stageReviewedGmailInteractionsInPostgres', 'convertCrmLeadInPostgres',
     'appendCrmOpportunityCommentInPostgres', 'lockCrmMutation']),
@@ -32,13 +33,14 @@ const input = () => ({ entity: 'interactions', pipelineId: id(1), localId: id(2)
   sourceKey: 'fixture:email', actorEmail: 'owner@example.test', sourcePayload: {},
   fields: { interactionType: 'email', subject: 'Known Email', description: 'Edited body' } })
 
-function harness({ controlRows = [{ singleton: true }], completeStage = false } = {}) {
+function harness({ controlRows = [{ singleton: true }], modeRows = [{ enabled: false }], completeStage = false } = {}) {
   const calls = []
   const row = { id: id(2), suitecrm_id: id(3), reference_code: 'gi1234567', source_hash: 'old',
     source_payload: {}, metadata: {}, suitecrm_module: 'Emails' }
   const client = { async query(sql) {
     calls.push(sql)
     if (sql === controlSql) return { rows: controlRows }
+    if (sql === 'SELECT enabled FROM crm_native_email_publication_control WHERE singleton') return { rows: modeRows }
     if (!completeStage) throw stop
     if (sql.includes('SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module, metadata')) {
       return { rows: [row] }
@@ -77,6 +79,7 @@ const entries = [
   ['generic interaction staging', h => h.api.stageCrmRecordWithClient(h.client, input())],
   ['standalone interaction transaction', h => h.api.stageCrmRecordInPostgres(input())],
   ['reviewed Gmail apply', h => h.api.stageReviewedGmailInteractionsInPostgres(reviewed(true))],
+  ['reviewed Gmail nonmutating preview', h => h.api.stageReviewedGmailInteractionsInPostgres(reviewed(false))],
   ['participant enrichment apply', h => h.api.enrichCrmEmailInteractionParticipantsInPostgres({ apply: true })],
   ['lead conversion Notes staging', h => h.api.convertCrmLeadInPostgres({ pipelineId: id(1), leadId: id(4) })],
   ['opportunity comment Notes staging', h => h.api.appendCrmOpportunityCommentInPostgres({ pipelineId: id(1), opportunityId: id(5) })],
@@ -96,13 +99,24 @@ test('every mutating entry fails closed before source locks when control is miss
   }
 })
 
-test('read-only reviewed/enrichment previews and unrelated entity staging do not gain the control lock', async () => {
-  for (const invoke of [h => h.api.stageReviewedGmailInteractionsInPostgres(reviewed(false)),
-    h => h.api.enrichCrmEmailInteractionParticipantsInPostgres({ apply: false }),
+test('unrelated enrichment previews and entity staging do not gain the control lock', async () => {
+  for (const invoke of [h => h.api.enrichCrmEmailInteractionParticipantsInPostgres({ apply: false }),
     h => h.api.stageCrmRecordWithClient(h.client, { ...input(), entity: 'products' })]) {
     const h = harness()
     await assert.rejects(invoke(h), error => error === stop)
     assert.ok(!h.calls.includes(controlSql))
+  }
+})
+
+test('reviewed preview/apply and interaction staging reject unknown mode before participant/source locks', async () => {
+  for (const modeRows of [[], [{ enabled: null }], [{ enabled: 'true' }], [{ enabled: false }, { enabled: true }]]) {
+    for (const invoke of [h => h.api.stageReviewedGmailInteractionsInPostgres(reviewed(false)),
+      h => h.api.stageReviewedGmailInteractionsInPostgres(reviewed(true)),
+      h => h.api.stageCrmRecordWithClient(h.client, input())]) {
+      const h = harness({ modeRows })
+      await assert.rejects(invoke(h), /Native Email audience control mode is missing or inconsistent/)
+      assert.deepEqual(h.calls, [controlSql, 'SELECT enabled FROM crm_native_email_publication_control WHERE singleton'])
+    }
   }
 })
 

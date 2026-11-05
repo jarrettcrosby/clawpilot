@@ -889,6 +889,77 @@ try {
     assert.deepEqual(replay.map(row => row.interactionId), results.map(row => row.interactionId))
     assert.deepEqual(await durableState(), beforeReplay, 'Exact-two replay is write-free, including immutable historical proof')
   })
+  await check('enabled reviewed SQL preview/apply keep app-only sharing and use the same native audience in decision and outbox', async () => {
+    // Install the real registry and execute its actual source collector with a
+    // synthetic inherited reader (no explicit target-pipeline membership).
+    await query("ALTER TABLE workspace_organizations ADD COLUMN parent_id uuid, ADD COLUMN organization_type text NOT NULL DEFAULT 'root'")
+    await query(read('db/migrations/0392_crm_root_employee_access_registry.sql'))
+    const messageId = 'ed1', appOnly = 'reviewed-app-only@example.invalid', rootEmployee = 'reviewed-root-reader@example.invalid'
+    const current = caseyEvidence(messageId)
+    await persistence.recordGmailMessageIntakeInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+      intakePipelineId: CASEY.intake, mailboxIdentity: caseyIdentity, observedAccountEmail: caseyMailboxEmail,
+      observedAt: new Date().toISOString(), messageEvidence: current, rawMetadata: { labelIds: ['INBOX'] } })
+    const { admissionScope: _scope, legacyAdoption: _adoption, ...canonical } = caseyMessages[0]
+    const entry = { ...canonical, providerMessageId: messageId, providerThreadId: current.threadId, messageEvidence: current,
+      interaction: { ...canonical.interaction, sourceKey: `fixture-enabled:${messageId}`,
+        fields: { ...canonical.interaction.fields, subject: current.subject, providerMessageId: messageId,
+          providerThreadId: current.threadId } } }
+    const [legacyPreview] = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: [entry] })
+    await query(`INSERT INTO app_users(email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code)
+      VALUES($1,'active','App-only fixture',NULL,false,'gu8765432')`, [appOnly])
+    await query(`INSERT INTO app_user_organization_memberships(organization_id,user_email,status,role,permissions)
+      VALUES($1,$2,'active','member','{"viewCrm":true}')`, [CASEY.workspace, appOnly])
+    await query("INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'viewer')", [CASEY.pipeline, appOnly])
+    await query(`INSERT INTO app_users(email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code)
+      VALUES($1,'active','Inherited reader fixture','native-reviewed-root-reader',true,'gu9876543')`, [rootEmployee])
+    const rootWorkspace = id(903)
+    await query("INSERT INTO workspace_organizations(id,is_demo,parent_id,organization_type) VALUES($1,false,NULL,'root')", [rootWorkspace])
+    await query(`INSERT INTO app_user_organization_memberships(organization_id,user_email,status,role,permissions)
+      VALUES($1,$2,'active','owner','{}')`, [rootWorkspace, CASEY.owner])
+    await query(`INSERT INTO app_user_organization_memberships(organization_id,user_email,status,role,permissions)
+      VALUES($1,$2,'active','member','{"viewCrm":true}')`, [rootWorkspace, rootEmployee])
+    await query(`INSERT INTO crm_operator_accounts(id,root_workspace_id,owner_email,enabled,created_by,updated_by)
+      VALUES($1,$2,$3,true,$3,$3)`, [id(901), rootWorkspace, CASEY.owner])
+    await query(`INSERT INTO crm_operator_workspace_bindings(operator_account_id,workspace_id,owner_email,enabled,created_by,updated_by)
+      VALUES($1,$2,$3,true,$3,$3)`, [id(901), CASEY.workspace, CASEY.owner])
+    await query(`INSERT INTO crm_root_employee_access_grants(id,operator_account_id,user_email,source_workspace_id,enabled,created_by,updated_by)
+      VALUES($1,$2,$3,$4,true,$5,$5)`, [id(902), id(901), rootEmployee, rootWorkspace, CASEY.owner])
+    // Synthetic already-verified policy state only. No native server, signing
+    // credential, live permission activation, or production is involved.
+    await query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
+      native_policy_fingerprint=$1,activation_receipt_hash=$2 WHERE singleton`, ['a'.repeat(64), 'b'.repeat(64)])
+    const membershipState = async () => (await query(`SELECT jsonb_build_object(
+      'user',(SELECT to_jsonb(u) FROM app_users u WHERE email=$1),
+      'membership',(SELECT to_jsonb(m) FROM app_user_organization_memberships m WHERE user_email=$1 AND organization_id=$2),
+      'share',(SELECT to_jsonb(s) FROM pipeline_space_members s WHERE user_email=$1 AND pipeline_id=$3)) AS state`,
+    [appOnly, CASEY.workspace, CASEY.pipeline])).rows[0].state
+    const membershipBefore = await membershipState(), beforePreview = await durableState()
+    const [preview] = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: [entry] })
+    assert.equal(preview.applied, false)
+    assert.deepEqual(await durableState(), beforePreview, 'Enabled preview writes no recovery rows')
+    // The native audience does not invent an account for the unmapped app user.
+    assert.deepEqual(await membershipState(), membershipBefore)
+    assert.notEqual(preview.targetFingerprint, legacyPreview.targetFingerprint, 'Inherited root reader changes the reviewed native audience')
+    await assert.rejects(persistence.stageReviewedGmailInteractionsInPostgres({ apply: true,
+      messages: [{ ...entry, expectedExistingInteractionId: null, expectedTargetFingerprint: legacyPreview.targetFingerprint }] }),
+    /evidence changed or conflicts/)
+    assert.deepEqual(await durableState(), beforePreview, 'Stale pre-authority preview cannot stage any recovery rows')
+    const [applied] = await persistence.stageReviewedGmailInteractionsInPostgres({ apply: true,
+      messages: [{ ...entry, expectedExistingInteractionId: null, expectedTargetFingerprint: preview.targetFingerprint }] })
+    assert.equal(applied.applied, true)
+    const decision = (await query('SELECT audience FROM crm_email_review_decisions WHERE interaction_id=$1', [applied.interactionId])).rows
+    const outbox = (await query("SELECT payload FROM sync_outbox WHERE aggregate_id=$1 AND target_system='suitecrm'", [applied.interactionId])).rows
+    assert.equal(decision.length, 1); assert.equal(outbox.length, 1)
+    assert.deepEqual(decision[0].audience, outbox[0].payload.emailProjection.audience)
+    assert.deepEqual(decision[0].audience.allowedSuiteCrmUserIds, ['native-fixture-casey-owner', 'native-reviewed-root-reader'])
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_organizations WHERE interaction_id=$1', [applied.interactionId])).rows[0].count, '2')
+    assert.equal((await query('SELECT count(*) FROM crm_interaction_contacts WHERE interaction_id=$1', [applied.interactionId])).rows[0].count, '2')
+    assert.deepEqual(await membershipState(), membershipBefore, 'Recovery preserves app-only identity, membership and sharing')
+    assert.equal((await query('SELECT count(*) FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2',
+      [CASEY.pipeline, rootEmployee])).rows[0].count, '0', 'Root read authority never creates an explicit pipeline or editor grant')
+    assert.equal((await query('SELECT count(*) FROM app_user_organization_memberships WHERE organization_id=$1 AND user_email=$2',
+      [CASEY.workspace, rootEmployee])).rows[0].count, '0', 'Inherited root reading never fabricates a target-workspace membership')
+  })
   console.log(`PASS ${passed} reviewed Gmail persistence checks; actual SQL/readers/native payload producer; no provider writes`)
 } finally {
   try { if (pool) await pool.end() }

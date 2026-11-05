@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import vm from 'node:vm'
+import './test-crm-reviewed-audience-mode.mjs'
 
 const ts = createRequire(new URL('../app_src/package.json', import.meta.url))('typescript')
 function declarations(path, names) {
