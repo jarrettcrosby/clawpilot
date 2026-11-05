@@ -10,6 +10,12 @@ function load(path,deps={}){const module={exports:{}},code=ts.transpileModule(re
   new Function('module','exports','require',code)(module,module.exports,name=>{assert.ok(Object.hasOwn(deps,name),name);return deps[name]})
   return module.exports}
 const contract=load('app_src/lib/crm/customerFolderControls.ts'),core=load('app_src/lib/crm/customerDriveFolders.ts')
+// Load the real error classes without constructing credentials or transports.
+const googleClient=load('app_src/lib/integrations/googleWorkspaceClient.ts',{'google-auth-library':{JWT:class{}}})
+const googleWorkspace=load('app_src/lib/integrations/googleWorkspace.ts',{
+  '@/lib/integrations/googleWorkspaceCrypto':{},'@/lib/integrations/googleWorkspaceClient':googleClient,
+  '@/lib/persistence/googleWorkspace':{},
+})
 const id=n=>`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,actor='owner@example.test'
 const base={pipelineId:id(1),accountId:id(2)},configuration={...base,action:'configure',parentId:'parent-id',enabled:true,expectedRevision:0}
 const queue={...base,action:'queue',expectedRevision:1,expectedJobVersion:0,requestKey:id(3)}
@@ -94,7 +100,8 @@ function routeHarness(){
     '@/lib/browserSameOrigin':{isBrowserSameOriginRequest:({headers,requestOrigin})=>headers.get('origin')===requestOrigin},
     '@/lib/persistence/crmCustomerFolderControls':{readCustomerFolderControls:async input=>{calls.push(['read',input]);return state}},
     '@/lib/crm/customerFolderControlService':{applyCustomerFolderCommand:async(...args)=>{calls.push(['apply',args]);if(h.applyError)throw h.applyError;return state}},
-    '@/lib/crm/customerFolderControls':contract,'@/lib/crm/customerDriveFolders':core}
+    '@/lib/crm/customerFolderControls':contract,'@/lib/crm/customerDriveFolders':core,
+    '@/lib/integrations/googleWorkspace':googleWorkspace,'@/lib/integrations/googleWorkspaceClient':googleClient}
   h.api=load('app_src/app/api/crm/customer-folders/route.ts',deps)
   h.get=()=>h.api.GET(new NextRequest(`https://fixture.test/api/crm/customer-folders?${new URLSearchParams(base)}`))
   h.post=(body=queue,headers={})=>h.api.POST(new NextRequest('https://fixture.test/api/crm/customer-folders',{
@@ -128,5 +135,48 @@ await check('actual POST uses authenticated actor and exact typed command; unexp
   assert.deepEqual(h.calls.find(([kind])=>kind==='apply')[1],[queue,actor])
   const bad=routeHarness();bad.applyError=Error('private token secret email folder SQL')
   const response=await bad.post();assert.equal(response.status,500);assert.ok(!(await response.text()).includes('private token'))
+})
+await check('real typed Google failures retain safe status/code and static guidance, never raw provider messages or logs',async()=>{
+  const secret='PRIVATE_PROVIDER_SENTINEL token@example.test folder-sensitive-id key-sensitive-value'
+  for(const [Type,status,code]of [
+    [googleWorkspace.GoogleWorkspaceRequestError,409,'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS'],
+    [googleWorkspace.GoogleWorkspaceRequestError,422,'GOOGLE_ACCESS_DENIED'],
+    [googleWorkspace.GoogleWorkspaceRequestError,503,'GOOGLE_WORKSPACE_ENCRYPTION_REQUIRED'],
+    [googleClient.GoogleWorkspaceClientError,409,'GOOGLE_RESOURCE_NOT_FOUND'],
+    [googleClient.GoogleWorkspaceClientError,422,'GOOGLE_REQUEST_REJECTED'],
+    [googleClient.GoogleWorkspaceClientError,502,'GOOGLE_SERVICE_ACCOUNT_AUTH_FAILED'],
+  ]){
+    const h=routeHarness();h.applyError=new Type(secret,status,code)
+    const logs=[],original={warn:console.warn,error:console.error,log:console.log}
+    let response,body
+    try{
+      for(const method of Object.keys(original))console[method]=(...values)=>logs.push(values)
+      response=await h.post(configuration);body=await response.json()
+    }finally{Object.assign(console,original)}
+    assert.equal(response.status,status);assert.equal(response.headers.get('cache-control'),'no-store')
+    assert.equal(body.ok,false);assert.equal(body.code,code);assert.ok(body.error.includes(code))
+    assert.match(body.error,/No success has been confirmed/);assert.match(body.error,/Refresh status before retrying/)
+    const exposed=JSON.stringify({body,logs})
+    for(const privateValue of secret.split(' '))assert.ok(!exposed.includes(privateValue))
+  }
+})
+await check('forged Google objects and real errors with invalid codes/statuses stay generic and private',async()=>{
+  const secret='PRIVATE_PROVIDER_SENTINEL token@example.test folder-sensitive-id key-sensitive-value'
+  const failures=[{status:409,code:'GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS',message:secret},
+    Object.assign(new Error(secret),{name:'GoogleWorkspaceRequestError',status:409,code:'GOOGLE_ACCESS_DENIED'})]
+  for(const code of ['', 'google_access_denied', 'GOOGLE_PRIVATE_SENTINEL', 'GOOGLE_ACCESS_DENIED\nPRIVATE_PROVIDER_SENTINEL','X'.repeat(200)]){
+    failures.push(new googleWorkspace.GoogleWorkspaceRequestError(secret,409,code))
+  }
+  for(const status of [200,302,401,403,404,418,NaN,503.5])failures.push(new googleClient.GoogleWorkspaceClientError(secret,status,'GOOGLE_ACCESS_DENIED'))
+  for(const failure of failures){
+    const h=routeHarness();h.applyError=failure
+    const logs=[],original={warn:console.warn,error:console.error,log:console.log}
+    let response,body
+    try{for(const method of Object.keys(original))console[method]=(...values)=>logs.push(values)
+      response=await h.post(configuration);body=await response.json()
+    }finally{Object.assign(console,original)}
+    assert.equal(response.status,500);assert.deepEqual(body,{ok:false,error:'Customer folder controls are unavailable. No success has been confirmed.'})
+    const exposed=JSON.stringify({body,logs});for(const privateValue of secret.split(' '))assert.ok(!exposed.includes(privateValue))
+  }
 })
 console.log(`${count} customer folder command/service/HTTP checks passed (synthetic auth, persistence and provider)`)
