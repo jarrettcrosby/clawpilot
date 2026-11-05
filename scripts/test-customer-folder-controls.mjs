@@ -41,13 +41,15 @@ function serviceHarness(){
     canEdit:true,canConfigure:true,settings:{enabled:false,revision:0,parentUrl:null},job:null,folder:null}
   const h={calls,state,folder:{id:'parent-id',name:'01 Customers',mimeType:'application/vnd.google-apps.folder',trashed:false,
     driveId:'bpo-drive',capabilities:{canAddChildren:true}},providerError:null}
+  h.runtime=load('app_src/lib/crm/customerDriveFolderGoogle.ts',{'./customerDriveFolders':core,
+    '@/lib/integrations/googleWorkspace':{resolveGoogleWorkspacePrivateFileRuntime:async()=>{calls.push(['credentials']);if(h.providerError)throw h.providerError;return {serviceAccountEmail:'fixture@project.iam.gserviceaccount.com'}}},
+    '@/lib/integrations/googleWorkspaceClient':{GoogleWorkspaceClientError:googleClient.GoogleWorkspaceClientError,
+      googleDriveJson:async(runtime,path)=>{calls.push(['provider',path]);return structuredClone(h.folder)}}})
   h.api=load('app_src/lib/crm/customerFolderControlService.ts',{'./customerDriveFolders':core,
     '@/lib/persistence/crmCustomerFolderControls':{readCustomerFolderControls:async input=>{calls.push(['read',input]);return structuredClone(state)},
       requestCustomerFolderJob:async input=>{calls.push(['queue',input])},saveVerifiedCustomerFolderSettings:async input=>{calls.push(['save',input])},
       pauseCustomerFolderSettings:async input=>{calls.push(['pause',input])}},
-    '@/lib/integrations/googleWorkspace':{resolveGoogleWorkspacePrivateFileRuntime:async()=>{calls.push(['credentials']);if(h.providerError)throw h.providerError;return {serviceAccountEmail:'fixture@project.iam.gserviceaccount.com'}},
-      resolveManagedGoogleWorkspaceRuntime:async binding=>{calls.push(['drive-binding',binding]);return {}}},
-    '@/lib/integrations/googleWorkspaceClient':{googleDriveJson:async(runtime,path)=>{calls.push(['provider',path]);return structuredClone(h.folder)}}})
+    './customerDriveFolderGoogle':h.runtime})
   return h
 }
 await check('service denies read-only/non-admin or stale setup before credentials/provider access',async()=>{
@@ -60,13 +62,33 @@ await check('service denies read-only/non-admin or stale setup before credential
     assert.ok(!h.calls.some(([kind])=>kind==='provider'||kind==='credentials'||kind==='save'))
   }
 })
-await check('setup verifies exact live Customers parent and independent shared drive before scoped persistence',async()=>{
-  const h=serviceHarness();await h.api.applyCustomerFolderCommand(configuration,actor)
+await check('setup verifies exact writable Customers parent without drive membership or sharing authority',async()=>{
+  const h=serviceHarness();h.folder.capabilities.canShare=false
+  await h.api.applyCustomerFolderCommand(configuration,actor)
   const saved=h.calls.find(([kind])=>kind==='save')[1]
   assert.equal(saved.sharedDriveId,'bpo-drive');assert.equal(saved.parentId,'parent-id');assert.equal(saved.actorEmail,actor)
-  assert.deepEqual(h.calls.find(([kind])=>kind==='drive-binding')[1],{serviceAccountEmail:'fixture@project.iam.gserviceaccount.com',sharedDriveId:'bpo-drive'})
   assert.ok(h.calls.findIndex(([kind])=>kind==='provider')<h.calls.findIndex(([kind])=>kind==='save'))
+  const provider=h.calls.filter(([kind])=>kind==='provider')
+  assert.equal(provider.length,1)
+  assert.ok(provider[0][1].startsWith('/drive/v3/files/parent-id?'))
+  assert.ok(!provider[0][1].includes('canShare'))
   assert.ok(!JSON.stringify(h.calls).includes('files?'))
+})
+await check('worker runtime binds the saved service account and drive to the exact live parent',async()=>{
+  const binding={serviceAccountEmail:'fixture@project.iam.gserviceaccount.com',sharedDriveId:'bpo-drive'}
+  const h=serviceHarness(),runtime=await h.runtime.resolveCustomerFolderGoogleRuntime('parent-id',binding)
+  assert.equal(runtime.serviceAccountEmail,binding.serviceAccountEmail)
+  assert.equal(runtime.sharedDriveId,binding.sharedDriveId);assert.equal(runtime.sharedDriveName,null)
+  const otherAccount=serviceHarness()
+  await assert.rejects(otherAccount.runtime.resolveCustomerFolderGoogleRuntime('parent-id',{
+    ...binding,serviceAccountEmail:'other@project.iam.gserviceaccount.com'}),/runtime_mismatch/)
+  assert.ok(!otherAccount.calls.some(([kind])=>kind==='provider'))
+  const otherDrive=serviceHarness();otherDrive.folder.driveId='different-drive'
+  await assert.rejects(otherDrive.runtime.resolveCustomerFolderGoogleRuntime('parent-id',binding),/runtime_mismatch/)
+  const invalid=serviceHarness()
+  await assert.rejects(invalid.runtime.resolveCustomerFolderGoogleRuntime('../parent',binding),/resource_invalid/)
+  await assert.rejects(invalid.runtime.resolveCustomerFolderGoogleRuntime('parent-id',{...binding,sharedDriveId:''}),/runtime_mismatch/)
+  assert.equal(invalid.calls.length,0)
 })
 await check('wrong parent name/type/identity/drive, trash or missing write capability prevents saving',async()=>{
   for(const edit of [{name:'Invoices'},{mimeType:'application/pdf'},{id:'other'},{driveId:''},{trashed:true},{capabilities:{canAddChildren:false}}]){
