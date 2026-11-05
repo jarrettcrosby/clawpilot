@@ -4,10 +4,11 @@ const base = '/api/integrations/fractional-crm/v1'
 const companyRecord = new RegExp(`^${base}/companies/${company}$`)
 const contactList = new RegExp(`^${base}/companies/${company}/contacts$`)
 const contactRecord = new RegExp(`^${base}/companies/${company}/contacts/${contact}$`)
+const customerFolder = new RegExp(`^${base}/companies/${company}/customer-folder$`)
 
 /** Proxy bypass only: every matched request still requires gateway machine authentication. */
 export function isFractionalCrmGatewayPath(pathname, method) {
-  return (method === 'GET' && (pathname === `${base}/organization` || companyRecord.test(pathname) || contactList.test(pathname) || contactRecord.test(pathname)))
-    || (method === 'PATCH' && (companyRecord.test(pathname) || contactRecord.test(pathname)))
+  return (method === 'GET' && (pathname === `${base}/organization` || companyRecord.test(pathname) || contactList.test(pathname) || contactRecord.test(pathname) || customerFolder.test(pathname)))
+    || (method === 'PATCH' && (companyRecord.test(pathname) || contactRecord.test(pathname) || customerFolder.test(pathname)))
     || (method === 'POST' && pathname === `${base}/onboarding/resolve-or-create`)
 }

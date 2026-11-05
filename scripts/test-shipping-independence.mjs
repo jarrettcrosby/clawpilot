@@ -31,6 +31,9 @@ function runTypeScript(path, stubs) {
 }
 
 const users = runTypeScript('app_src/lib/users.ts', {
+  '@/lib/crm/nativeEmailWorkspaceUserRuntime': { changeWorkspaceUserWithNativeAuthority: async () => { throw new Error('Unexpected native lifecycle in permission-only test') } },
+  '@/lib/persistence/crmNativeEmailAuthority': { lockCrmNativeEmailAuthorityWithClient: async () => { throw new Error('Unexpected authority write in permission-only test') } },
+  '@/lib/invitationWorkspaceScope': { removeWorkspaceFromPendingInvitationsWithClient: async () => { throw new Error('Unexpected invitation write in permission-only test') } },
   '@/lib/persistence/postgres': { query: async () => ({ rows: [] }), withTransaction: async () => {} },
   '@/lib/auditWriter': { recordAuditEvent: async () => {} },
   '@/lib/crm/suiteCrmClient': { findSuiteCrmUser: async () => null },

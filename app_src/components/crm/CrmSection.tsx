@@ -60,6 +60,7 @@ import CallMergeRounded from '@mui/icons-material/CallMergeRounded'
 import CrmDataTransferDialog from '@/components/crm/CrmDataTransferDialog'
 import CalendarImportSettings from '@/components/crm/CalendarImportSettings'
 import EmailBodyPreview from '@/components/crm/EmailBodyPreview'
+import EmailReviewDialog from '@/components/crm/EmailReviewDialog'
 import ProductIdentityDialog from '@/components/crm/ProductIdentityDialog'
 import ProductImagePanel from '@/components/crm/ProductImagePanel'
 import ProductPackProfilePanel from '@/components/crm/ProductPackProfilePanel'
@@ -67,6 +68,8 @@ import ContextHelp from '@/components/ContextHelp'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { annotateInteractionEventHistory } from '@/lib/crm/interactionHistory.mjs'
+import { meetingCalendarPresentation, meetingDisplayRows } from '@/lib/crm/meetingPresentation'
+import { interactionCompanyDisplay, interactionParticipantOptions, interactionRelatedCompanies } from '@/lib/crm/interactionCompanies.mjs'
 import { crmRecordNavigationPath } from '@/lib/crm/recordNavigation.mjs'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import type {
@@ -461,28 +464,8 @@ function meetingCalendarChoiceLabel(choice: MeetingCalendarChoice) {
   return `${calendarName}${organizer}${linkedAccount}`
 }
 
-function meetingCalendarStatusLabel(value: unknown) {
-  const status = String(value || '').trim().toLowerCase()
-  if (status === 'sent' || status === 'scheduled') return 'Delivered'
-  if (status === 'queued') return 'Pending'
-  if (status === 'failed') return 'Failed'
-  if (status === 'not-configured') return 'Not configured'
-  if (status === 'planned') return 'Not sent'
-  if (status === 'completed') return 'Completed'
-  if (status === 'cancelled') return 'Cancelled'
-  return 'Unknown'
-}
-
-function meetingCalendarStatusColor(value: unknown): 'default' | 'success' | 'warning' | 'error' {
-  const status = String(value || '').trim().toLowerCase()
-  if (status === 'sent' || status === 'scheduled' || status === 'completed') return 'success'
-  if (status === 'queued') return 'warning'
-  if (status === 'failed') return 'error'
-  return 'default'
-}
-
-function meetingCalendarDeliveryValue(record: RecordValue) {
-  return textValue(record, 'calendarDeliveryStatus')
+const ORGANIZATION_ROLE_LABELS: Record<string, string> = {
+  workspace_root: 'Workspace root', workspace_member: 'Workspace member', customer: 'External organization',
 }
 
 function suiteCrmSyncStatusLabel(value: unknown) {
@@ -583,6 +566,7 @@ function opportunityOptionLabel(record: RecordValue) {
 }
 
 function displayValue(record: RecordValue, key: string, settings: UserDateTimeSettings) {
+  if (key === 'organizationName' && Array.isArray(record.organizations)) return interactionCompanyDisplay(record)
   if (key === 'startsAt' || key === 'occurredAt') {
     return formatUserDateTime(textValue(record, key), settings, {
       year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
@@ -749,7 +733,7 @@ function hierarchyDescendants(hierarchy: WorkspaceOrganization[], organizationId
 
 function columns(entity: CrmEntity) {
   if (entity === 'organizations') return [
-    ['referenceCode', 'ID'], ['name', 'Organization'], ['parentOrganizationName', 'Parent'], ['relationshipType', 'Relationship'],
+    ['referenceCode', 'ID'], ['name', 'Organization'], ['parentOrganizationName', 'Parent'], ['accountType', 'Type'], ['relationshipType', 'Organization role'],
     ['accountManager', 'Owner'], ['phone', 'Phone'],
   ] as const
   if (entity === 'contacts') return [
@@ -959,6 +943,7 @@ export default function CrmSection() {
   const shortLandscape = useMediaQuery('(orientation: landscape) and (max-height: 500px) and (max-width: 899.95px)')
   const [entity, setEntity] = useState<CrmEntity>('organizations')
   const [records, setRecords] = useState<RecordValue[]>([])
+  const [groupRecurringMeetings, setGroupRecurringMeetings] = useState(true)
   const [summary, setSummary] = useState<CrmSummary>(EMPTY_SUMMARY)
   const [pipeline, setPipeline] = useState<PipelineInfo | null>(null)
   const [query, setQuery] = useState('')
@@ -1563,7 +1548,8 @@ export default function CrmSection() {
     let cancelled = false
     const loadEditorOptions = async () => {
       const loadingRelatedContacts = editorEntity === 'organizations' && Boolean(editorRecord)
-      const loadingRelatedActivity = Boolean(editorRecord) && (editorEntity === 'leads' || editorEntity === 'campaigns')
+      const loadingRelatedActivity = Boolean(editorRecord)
+        && ['organizations', 'contacts', 'leads', 'campaigns'].includes(editorEntity)
       setRelatedContactsLoading(loadingRelatedContacts)
       setRelatedActivityLoading(loadingRelatedActivity)
       if (loadingRelatedActivity) {
@@ -1695,7 +1681,16 @@ export default function CrmSection() {
   const recordEditable = editorEditable
     && (editorEntity === 'products' || !editorRecord?.workspaceOrganizationId)
     && !convertedLead
+  const interactionCompanies = editorEntity === 'interactions' ? interactionRelatedCompanies(editorRecord) : []
+  const sharedEmailAssociations = editorEntity === 'interactions'
+    && textValue(editorRecord || {}, 'interactionType') === 'email'
+    && (editorRecord?.canonicalEmail === true || editorRecord?.companyAssociationsReviewed === true || interactionCompanies.length > 1)
+  const interactionEditorContacts: RecordValue[] = sharedEmailAssociations
+    ? interactionParticipantOptions(editorRecord, contacts) : contacts
   const tableColumns = useMemo(() => columns(entity), [entity])
+  const displayRows = entity === 'meetings'
+    ? meetingDisplayRows(records, groupRecurringMeetings, Date.now())
+    : records.map(record => ({ record, occurrenceCount: 1 }))
   const relatedContacts = useMemo(() => {
     const organizationId = editorEntity === 'organizations' && editorRecord
       ? textValue(editorRecord, 'id')
@@ -1706,13 +1701,14 @@ export default function CrmSection() {
       .sort((left, right) => textValue(left, 'fullName').localeCompare(textValue(right, 'fullName')))
   }, [contacts, editorEntity, editorRecord])
   const interactionAgentEmail = useMemo(() => {
+    if (sharedEmailAssociations) return textValue(editorRecord || {}, 'agentEmail')
     if (fields.agentEmail) return fields.agentEmail
     const agentName = String(fields.agentName || '').trim().toLowerCase()
     if (!agentName) return ''
     return pipelineUsers.find((user) => (
       user.email.toLowerCase() === agentName || user.displayName.toLowerCase() === agentName
     ))?.email || ''
-  }, [fields.agentEmail, fields.agentName, pipelineUsers])
+  }, [sharedEmailAssociations, editorRecord, fields.agentEmail, fields.agentName, pipelineUsers])
   const contactOwnerSelection = fields.ownerUserReferenceCode
     || (editorEntity === 'contacts' && fields.accountManager ? LEGACY_CONTACT_OWNER : '')
   const organizationOwner = editorEntity === 'organizations' && fields.accountManager
@@ -2030,9 +2026,11 @@ export default function CrmSection() {
     setError('')
     setNotice('')
     try {
-      const occurredAt = editorEntity === 'interactions' && fields.occurredAt
-        ? zonedDateTimeToIso(fields.occurredAt, dateTimeSettings.timeZone)
-        : null
+      const occurredAt = sharedEmailAssociations
+        ? editorRecord?.occurredAt ?? null
+        : editorEntity === 'interactions' && fields.occurredAt
+          ? zonedDateTimeToIso(fields.occurredAt, dateTimeSettings.timeZone)
+          : null
       if (editorEntity === 'interactions' && fields.occurredAt && !occurredAt) {
         throw new Error('Interaction date is invalid in your profile timezone')
       }
@@ -2081,7 +2079,8 @@ export default function CrmSection() {
           ...fields,
           contactIds: idList(fields.contactIds),
           contactId: idList(fields.contactIds)[0] || '',
-          agentEmail: interactionAgentEmail,
+          agentEmail: sharedEmailAssociations ? editorRecord?.agentEmail ?? null : interactionAgentEmail,
+          agentName: sharedEmailAssociations ? textValue(editorRecord || {}, 'agentName') : fields.agentName,
           occurredAt,
         }
       } else if (editorEntity === 'opportunities') {
@@ -2475,7 +2474,7 @@ export default function CrmSection() {
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.opportunities} opportunities`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.products} products`} />
           <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.meetings} meetings`} />
-          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} interactions`} />
+          <Chip size={shortLandscape ? 'small' : 'medium'} label={`${summary.interactions} all interactions`} />
           {summary.needsReviewInteractions > 0 && (
             <Chip
               size={shortLandscape ? 'small' : 'medium'}
@@ -2580,6 +2579,8 @@ export default function CrmSection() {
               ) : null}
               {pipeline?.accessRole === 'owner' && (
                 <>
+                  {entity === 'interactions' && <EmailReviewDialog key={pipeline.id} pipelineId={pipeline.id}
+                    contacts={contacts} organizations={organizations} onApplied={() => { void load(entity, query, needsReviewOnly) }} />}
                   {entity === 'meetings' && <CalendarImportSettings key={pipeline.id} pipelineId={pipeline.id} />}
                   <Tooltip title="Import the connected workbook into CRM">
                     <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>
@@ -2620,6 +2621,15 @@ export default function CrmSection() {
               sx={{ alignSelf: 'flex-start', mt: shortLandscape ? 0 : 1.25, flexShrink: 0 }}
             />
           )}
+          {entity === 'meetings' && <Stack direction="row" gap={1} alignItems="center" flexWrap="wrap" sx={{ mt: 1 }}>
+            <Button size="small" variant="outlined" aria-pressed={groupRecurringMeetings}
+              onClick={() => setGroupRecurringMeetings(value => !value)}>
+              {groupRecurringMeetings ? 'Show every occurrence' : 'Group recurring meetings'}
+            </Button>
+            <Typography variant="caption" color="text.secondary">
+              {groupRecurringMeetings ? 'Grouped within loaded results; next occurrence shown. Open a row to edit only that occurrence.' : 'Every loaded occurrence is shown separately.'}
+            </Typography>
+          </Stack>}
           <TextField
             value={query}
             onChange={(event) => setQuery(event.target.value)}
@@ -2668,7 +2678,7 @@ export default function CrmSection() {
               </TableRow>
             </TableHead>
             <TableBody>
-              {records.map((record) => (
+              {displayRows.map(({ record, occurrenceCount }) => (
                 <TableRow
                   key={textValue(record, 'id')}
                   hover
@@ -2727,11 +2737,15 @@ export default function CrmSection() {
                           ? (
                             <Chip
                               size="small"
-                              label={meetingCalendarStatusLabel(meetingCalendarDeliveryValue(record))}
-                              color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(record))}
+                              label={meetingCalendarPresentation(record).label}
+                              color={meetingCalendarPresentation(record).color}
                               variant="outlined"
                             />
                           )
+                        : entity === 'meetings' && key === 'subject' && occurrenceCount > 1
+                          ? <Stack gap={0.5}>{displayValue(record, key, dateTimeSettings)}<Chip size="small" variant="outlined" label={`${occurrenceCount} loaded occurrences`} /></Stack>
+                        : entity === 'organizations' && key === 'relationshipType'
+                          ? (ORGANIZATION_ROLE_LABELS[textValue(record, key)] || 'Not specified')
                         : entity === 'interactions' && key === 'crmRecord'
                           ? interactionCrmRecordLabel(record)
                         : displayValue(record, key, dateTimeSettings)}
@@ -3830,8 +3844,8 @@ export default function CrmSection() {
                 <Stack direction="row" gap={1} flexWrap="wrap" useFlexGap>
                   <Chip
                     size="small"
-                    label={`Calendar: ${meetingCalendarStatusLabel(meetingCalendarDeliveryValue(editorRecord))}`}
-                    color={meetingCalendarStatusColor(meetingCalendarDeliveryValue(editorRecord))}
+                    label={`Calendar: ${meetingCalendarPresentation(editorRecord).label}`}
+                    color={meetingCalendarPresentation(editorRecord).color}
                     variant="outlined"
                   />
                   <Chip
@@ -4080,7 +4094,15 @@ export default function CrmSection() {
           </>}
           {editorEntity === 'interactions' && <>
             <TextField disabled={!recordEditable} label="Subject" value={fields.subject || ''} onChange={(event) => setFields({ ...fields, subject: event.target.value })} required />
-            <TextField disabled={!recordEditable} select label="Organization" value={fields.organizationId || ''} onChange={(event) => {
+            {sharedEmailAssociations && <Alert severity="info">
+              <Typography variant="body2">One email, linked to these companies. Each contact keeps their own company.</Typography>
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ my: 0.75 }}>
+                {interactionCompanies.map((company) => <Chip key={company.id} size="small"
+                  label={`${company.name || company.referenceCode || 'Company'}${company.isPrimary ? ' · Primary' : ''}`} />)}
+              </Stack>
+              <Typography variant="caption">Company and participant associations are protected. Change them through reviewed email recovery; the email content remains editable.</Typography>
+            </Alert>}
+            <TextField disabled={!recordEditable || sharedEmailAssociations} select label={sharedEmailAssociations ? 'Primary company' : 'Organization'} value={fields.organizationId || ''} onChange={(event) => {
               const organizationId = event.target.value
               const selectedContactIds = idList(fields.contactIds).filter((contactId) => {
                 const selectedContact = contacts.find((record) => textValue(record, 'id') === contactId)
@@ -4104,12 +4126,15 @@ export default function CrmSection() {
               {organizations.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
             <Autocomplete
-              disabled={!recordEditable}
+              disabled={!recordEditable || sharedEmailAssociations}
               multiple
               disableCloseOnSelect
-              options={recordsForOrganization(contacts, fields.organizationId || '')}
-              value={contacts.filter((record) => idList(fields.contactIds).includes(textValue(record, 'id')))}
-              getOptionLabel={(record) => textValue(record, 'fullName') || textValue(record, 'referenceCode')}
+              options={sharedEmailAssociations
+                ? interactionEditorContacts.filter((record) => idList(fields.contactIds).includes(textValue(record, 'id')))
+                : recordsForOrganization(contacts, fields.organizationId || '')}
+              value={interactionEditorContacts.filter((record) => idList(fields.contactIds).includes(textValue(record, 'id')))}
+              getOptionLabel={(record) => [textValue(record, 'fullName') || textValue(record, 'referenceCode'),
+                sharedEmailAssociations ? textValue(record, 'organizationName') : ''].filter(Boolean).join(' · ')}
               isOptionEqualToValue={(option, value) => textValue(option, 'id') === textValue(value, 'id')}
               onChange={(_, selectedContacts) => {
                 const contactIds = selectedContacts.map((record) => textValue(record, 'id')).filter(Boolean)
@@ -4129,12 +4154,12 @@ export default function CrmSection() {
                 <TextField {...params} label="Contacts" placeholder="Select contacts" helperText="The first contact is the primary CRM relationship." />
               )}
             />
-            <TextField disabled={!recordEditable} select label="Lead" value={fields.leadId || ''} onChange={(event) => setFields({ ...fields, leadId: event.target.value })}>
+            <TextField disabled={!recordEditable || sharedEmailAssociations} select label="Lead" value={fields.leadId || ''} onChange={(event) => setFields({ ...fields, leadId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
               {leads.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'fullName')}</MenuItem>)}
             </TextField>
             <TextField
-              disabled={!recordEditable}
+              disabled={!recordEditable || sharedEmailAssociations}
               select
               label="Pipeline opportunity"
               value={fields.opportunityId || ''}
@@ -4145,11 +4170,11 @@ export default function CrmSection() {
               {recordsForOrganization(opportunities, fields.organizationId || '')
                 .map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{opportunityOptionLabel(record)}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} select label="Campaign" value={fields.campaignId || ''} onChange={(event) => setFields({ ...fields, campaignId: event.target.value })}>
+            <TextField disabled={!recordEditable || sharedEmailAssociations} select label="Campaign" value={fields.campaignId || ''} onChange={(event) => setFields({ ...fields, campaignId: event.target.value })}>
               <MenuItem value="">None</MenuItem>
               {campaigns.map((record) => <MenuItem key={textValue(record, 'id')} value={textValue(record, 'id')}>{textValue(record, 'name')}</MenuItem>)}
             </TextField>
-            <TextField disabled={!recordEditable} select required label="Type" value={fields.interactionType || ''} onChange={(event) => {
+            <TextField disabled={!recordEditable || sharedEmailAssociations} select required label="Type" value={fields.interactionType || ''} onChange={(event) => {
               const interactionType = event.target.value
               const nativeActivity = interactionType === 'call' || interactionType === 'meeting'
               setFields({
@@ -4212,9 +4237,9 @@ export default function CrmSection() {
                 />
               </Stack>
             )}
-            <TextField disabled={!recordEditable} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
+            <TextField disabled={!recordEditable || sharedEmailAssociations} label="Date" type="datetime-local" value={fields.occurredAt || ''} onChange={(event) => setFields({ ...fields, occurredAt: event.target.value })} InputLabelProps={{ shrink: true }} />
             <TextField
-              disabled={!recordEditable}
+              disabled={!recordEditable || sharedEmailAssociations}
               select
               label="Agent"
               value={interactionAgentEmail}
@@ -4222,9 +4247,13 @@ export default function CrmSection() {
                 const selected = pipelineUsers.find((user) => user.email === event.target.value)
                 setFields({ ...fields, agentEmail: selected?.email || '', agentName: selected?.displayName || '' })
               }}
-              helperText={fields.agentName && !interactionAgentEmail ? `Unmapped legacy agent: ${fields.agentName}` : 'Active ClawPilot users with access to this pipeline'}
+              helperText={sharedEmailAssociations ? `Recorded assignment is preserved: ${fields.agentName || interactionAgentEmail || 'Unassigned'}`
+                : fields.agentName && !interactionAgentEmail ? `Unmapped legacy agent: ${fields.agentName}` : 'Active ClawPilot users with access to this pipeline'}
             >
               <MenuItem value="">Unassigned</MenuItem>
+              {sharedEmailAssociations && interactionAgentEmail && !pipelineUsers.some((user) => user.email === interactionAgentEmail) ? (
+                <MenuItem value={interactionAgentEmail}>{fields.agentName || interactionAgentEmail} (recorded)</MenuItem>
+              ) : null}
               {pipelineUsers.map((user) => (
                 <MenuItem key={user.email} value={user.email}>
                   {user.displayName} ({user.email}){user.suiteCrmMapped ? '' : ' - CRM mapping pending'}
@@ -4359,7 +4388,7 @@ export default function CrmSection() {
               )}
             </Box>
           )}
-          {(editorEntity === 'leads' || editorEntity === 'campaigns') && editorRecord && (
+          {['organizations', 'contacts', 'leads', 'campaigns'].includes(editorEntity) && editorRecord && (
             <Box component="section" aria-label="Related CRM activity" sx={{ minWidth: 0 }}>
               <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
                 <Typography variant="subtitle2" fontWeight={700}>Activity</Typography>
@@ -4383,6 +4412,7 @@ export default function CrmSection() {
                           textValue(activity, 'interactionType'),
                           displayValue(activity, 'occurredAt', dateTimeSettings),
                           textValue(activity, 'deliveryStatus'),
+                          interactionRelatedCompanies(activity).length > 1 ? interactionCompanyDisplay(activity) : '',
                           textValue(activity, 'referenceCode'),
                         ].filter((value) => value && value !== '—').join(' · ')}
                         primaryTypographyProps={{ fontWeight: 600, sx: { overflowWrap: 'anywhere' } }}

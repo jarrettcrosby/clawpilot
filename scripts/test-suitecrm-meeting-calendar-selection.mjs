@@ -227,6 +227,13 @@ const client = { query: async (sql, parameters = []) => {
   throw new Error(`Unexpected transaction query: ${sql.slice(0, 140)}`)
 } }
 const integration = load('app_src/lib/crm/integrationActions.ts', {
+  '@/lib/crm/emailIdentity': load('app_src/lib/crm/emailIdentity.ts', {}),
+  '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => {
+    assert.fail('Meeting-calendar selection cannot acquire an email mailbox identity')
+  } },
+  '@/lib/crm/emailIngestion': { captureDeliveredGmailMessage: async () => {
+    assert.fail('Meeting-calendar selection cannot capture or send email')
+  } },
   '@/lib/globalIds.mjs': globalIds,
   '@/lib/users': { normalizeUserEmail },
   '@/lib/tenancy': {
@@ -559,6 +566,7 @@ assert.equal(queued, null)
     dateTimeLocalValue: (value) => String(value || ''),
     busy: false, editorRequiredFieldsReady: true, editorMeetingReady: true,
     editorEntity: 'meetings', editorRecord: { id: MEETING }, editorMeetingIdempotencyKey: 'fixture-editor-location-save',
+    sharedEmailAssociations: false,
     editorMeetingCalendar: { source: 'organization-default' }, editorMeetingTimingReady: true, editorMeetingLocationReady: true,
     setBusy() {}, setError(value) { if (value) errors.push(value) }, setNotice() {},
     setEditorRecord() {}, setEditorMeetingIdempotencyKey() {}, setEditorHistory() {},

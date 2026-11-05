@@ -7,6 +7,9 @@ import {
 } from '@/lib/globalIds.mjs'
 import { resolveUserMatonGatewayCredential } from '@/lib/integrations/matonGatewayCredentials'
 import { matonFetch } from '@/lib/maton'
+import { captureDeliveredGmailMessage } from '@/lib/crm/emailIngestion'
+import { verifyGmailMailboxBinding, type VerifiedGmailMailboxIdentity } from '@/lib/crm/emailIdentity'
+import { readVerifiedGmailMailboxIdentityInPostgres } from '@/lib/persistence/crmEmailIdentity'
 import {
   readCrmRecordByReference,
   resolveCrmReferenceCode,
@@ -2662,6 +2665,10 @@ async function stageActionInteraction(input: {
   senderEmail?: string | null
   senderAccountEmail?: string | null
   communicationBindingSource?: OrganizationCommunicationBindingSource | null
+  occurredAt?: string
+  gmailSourceStatus?: 'captured' | 'held-unknown' | 'capture-pending'
+  gmailSourceSnapshot?: GmailSentSourceSnapshot | null
+  gmailSourceCapture?: { canonicalSourceId: string; inboundMessageId: string } | null
 }) {
   const links = interactionLinks(input.target, input.meetingId)
   const parentSuiteCrmType = suiteCrmParentType(input.target.entity)
@@ -2680,6 +2687,9 @@ async function stageActionInteraction(input: {
       senderEmail: input.senderEmail || null,
       senderAccountEmail: input.senderAccountEmail || null,
       communicationBindingSource: input.communicationBindingSource || null,
+      ...(input.gmailSourceStatus ? { gmailSourceStatus: input.gmailSourceStatus } : {}),
+      ...(input.gmailSourceSnapshot ? { gmailSourceSnapshot: input.gmailSourceSnapshot } : {}),
+      ...(input.gmailSourceCapture ? { canonicalSourceId: input.gmailSourceCapture.canonicalSourceId } : {}),
     },
     actorEmail: input.action.actorEmail,
     fields: {
@@ -2696,7 +2706,7 @@ async function stageActionInteraction(input: {
       subject: input.subject,
       agentEmail: input.action.actorEmail,
       agentName: input.action.actorEmail,
-      occurredAt: new Date().toISOString(),
+      occurredAt: input.occurredAt || new Date().toISOString(),
       description: input.description,
       direction: input.direction || 'outbound',
       deliveryStatus: input.deliveryStatus,
@@ -2709,9 +2719,45 @@ async function stageActionInteraction(input: {
         senderEmail: input.senderEmail || null,
         senderAccountEmail: input.senderAccountEmail || null,
         communicationBindingSource: input.communicationBindingSource || null,
+        ...(input.gmailSourceStatus ? { gmailSourceStatus: input.gmailSourceStatus } : {}),
+        ...(input.gmailSourceSnapshot ? { gmailSourceSnapshot: input.gmailSourceSnapshot } : {}),
+        ...(input.gmailSourceCapture ? { source: 'gmail-inbound',
+          canonicalSourceId: input.gmailSourceCapture.canonicalSourceId,
+          inboundMessageId: input.gmailSourceCapture.inboundMessageId } : {}),
       },
     },
   })
+}
+
+type GmailSentSourceSnapshot = {
+  version: 1
+  credentialOwnerEmail: string
+  connectionId: string
+  accountEmail: string
+  capturedAt: string
+  mailboxIdentity: VerifiedGmailMailboxIdentity | null
+}
+
+/** Only a snapshot persisted with the original successful delivery is usable on
+ * replay. Today's selected connection or newly verified identity is not proof
+ * of the source of a legacy successful send. */
+function recordedGmailSentSourceSnapshot(value: unknown): GmailSentSourceSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const snapshot = value as GmailSentSourceSnapshot
+  if (snapshot.version !== 1 || typeof snapshot.connectionId !== 'string'
+    || !/^[\x21-\x7e]{1,512}$/.test(snapshot.connectionId)
+    || typeof snapshot.credentialOwnerEmail !== 'string' || typeof snapshot.accountEmail !== 'string'
+    || !Number.isFinite(Date.parse(snapshot.capturedAt))) return null
+  try {
+    const credentialOwnerEmail = normalizeEmail(snapshot.credentialOwnerEmail, 'Original Gmail credential owner')
+    const accountEmail = normalizeEmail(snapshot.accountEmail, 'Original Gmail account')
+    const mailboxIdentity = snapshot.mailboxIdentity === null ? null : verifyGmailMailboxBinding({
+      identity: snapshot.mailboxIdentity, connectionId: snapshot.connectionId,
+      profileEmail: accountEmail, observedAt: snapshot.capturedAt,
+    })
+    return { version: 1, credentialOwnerEmail, connectionId: snapshot.connectionId, accountEmail,
+      capturedAt: snapshot.capturedAt, mailboxIdentity }
+  } catch { return null }
 }
 
 async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmReferenceRecord) {
@@ -2738,10 +2784,26 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
   let senderEmail = typeof action.responseSummary.senderEmail === 'string'
     ? normalizeEmail(action.responseSummary.senderEmail, 'Recorded Gmail sender')
     : null
+  let gmailSourceSnapshot = recordedGmailSentSourceSnapshot(action.responseSummary.gmailSourceSnapshot)
+  let deliverySentAt = typeof action.responseSummary.deliverySentAt === 'string'
+    && Number.isFinite(Date.parse(action.responseSummary.deliverySentAt)) ? action.responseSummary.deliverySentAt : null
   if (!messageId) {
-    const { selectedConnection, senderEmail: verifiedSenderEmail } = await verifiedGmailSelectionForAction(action)
+    const { selectedConnection, profileEmail, senderEmail: verifiedSenderEmail } = await verifiedGmailSelectionForAction(action)
     const { connectionId } = selectedConnection
     senderEmail = verifiedSenderEmail
+    // Missing stable identity must not invent provenance or change the original
+    // send authorization. Its truthful unknown snapshot is retained at delivery.
+    let mailboxIdentity: VerifiedGmailMailboxIdentity | null = null
+    const capturedAt = new Date().toISOString()
+    try {
+      const verified = await readVerifiedGmailMailboxIdentityInPostgres({
+        ownerEmail: selectedConnection.credentialOwnerEmail, connectionId, accountEmail: profileEmail,
+      })
+      mailboxIdentity = verified ? verifyGmailMailboxBinding({ identity: verified, connectionId,
+        profileEmail, observedAt: capturedAt }) : null
+    } catch { /* Unknown original source remains explicitly unknown. */ }
+    gmailSourceSnapshot = { version: 1, credentialOwnerEmail: selectedConnection.credentialOwnerEmail,
+      connectionId, accountEmail: profileEmail, capturedAt, mailboxIdentity }
     const delivered = await matonJson(
       action,
       'google-mail',
@@ -2765,6 +2827,7 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
       || cleanString(objectValue(delivered.message, 'Gmail result').id, 1000, 'Gmail message ID')
     if (!messageId) throw new Error('google-mail provider returned no message ID')
     threadId = cleanString(delivered.threadId, 1000, 'Gmail thread ID') || null
+    deliverySentAt = new Date().toISOString()
   }
   const summary = {
     messageId,
@@ -2774,9 +2837,36 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     communicationBindingSource: action.communication?.source || null,
     communicationOrganizationId: action.communication?.organizationId || null,
     markerReferences,
+    gmailSourceSnapshot,
+    gmailSourceStatus: gmailSourceSnapshot?.mailboxIdentity && deliverySentAt ? 'capture-pending' : 'held-unknown',
+    deliveryState: 'delivered',
+    deliverySentAt,
+    sourceCaptureState: gmailSourceSnapshot?.mailboxIdentity && deliverySentAt ? 'pending' : 'held-unknown',
   }
+  // Persist provider success and original identity BEFORE the first post-send
+  // read. A later capture/staging failure can never authorize another send.
   await recordAttemptSucceeded(action, messageId, summary)
-  await stageActionInteraction({
+  let gmailSourceCapture: { canonicalSourceId: string; inboundMessageId: string } | null = null
+  let capturePending = false
+  if (gmailSourceSnapshot?.mailboxIdentity && deliverySentAt) {
+    try {
+      gmailSourceCapture = await captureDeliveredGmailMessage({
+        ownerEmail: gmailSourceSnapshot.credentialOwnerEmail, connectionId: gmailSourceSnapshot.connectionId,
+        mailboxIdentity: gmailSourceSnapshot.mailboxIdentity, accountEmail: gmailSourceSnapshot.accountEmail,
+        pipelineId: action.pipelineId, messageId, threadId,
+      })
+      summary.gmailSourceStatus = 'captured'
+      summary.sourceCaptureState = 'captured'
+    } catch {
+      capturePending = true
+      summary.gmailSourceStatus = 'capture-pending'
+      summary.sourceCaptureState = 'pending'
+    }
+  }
+  const completedSummary = { ...summary, ...(gmailSourceCapture || {}) }
+  // Legacy successful actions without an original send snapshot/time cannot be
+  // assigned a new source or timestamp now. Preserve any existing CRM row.
+  if (gmailSourceSnapshot && deliverySentAt) await stageActionInteraction({
     action,
     target,
     subject,
@@ -2788,8 +2878,16 @@ async function sendEmailAction(action: LeasedCrmIntegrationAction, target: CrmRe
     senderEmail,
     senderAccountEmail: action.communication?.accountEmail || senderEmail,
     communicationBindingSource: action.communication?.source || null,
+    gmailSourceSnapshot, gmailSourceStatus: summary.gmailSourceStatus as 'captured' | 'held-unknown' | 'capture-pending',
+    gmailSourceCapture,
+    occurredAt: deliverySentAt || undefined,
   })
-  await completeAction(action, messageId, summary)
+  if (capturePending) {
+    // Keep externalId/snapshot durable and delivery attempt succeeded. Retrying
+    // this action only retries exact-source capture, never Gmail POST /send.
+    throw new Error('Email delivered; CRM source capture pending. Retry uses only the original recorded mailbox.')
+  }
+  await completeAction(action, messageId, completedSummary)
 }
 
 async function stageCalendarMeeting(

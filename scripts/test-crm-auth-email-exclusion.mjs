@@ -126,11 +126,27 @@ const storedMessageIds = []
 const stagedInteractions = []
 const cursorWrites = []
 const matchedSenders = []
+let matchedReferenceEmail = ''
 const linkedIds = []
 const fixtureMessages = new Map([...excluded, ...retained].map((entry) => [entry.id, entry]))
+const emailIdentity = loadModule('app_src/lib/crm/emailIdentity.ts', {})
+const verifiedIdentity = { version: 1, provider: 'gmail', mailboxId: '22222222-2222-4222-8222-222222222222',
+  providerAccountId: 'synthetic-google-account', accountEmail: ownerEmail, verifiedConnectionId: 'owned-mailbox',
+  verifiedAt: '2026-09-01T00:00:00.000Z' }
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': loadModule('app_src/lib/crm/emailAddressHeaders.ts', {}),
   '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts', {}),
+  '@/lib/crm/emailIdentity': emailIdentity,
+  '@/lib/crm/emailReconciliation': loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
+  '@/lib/persistence/crmEmailIdentity': {
+    readVerifiedGmailMailboxIdentityInPostgres: async () => verifiedIdentity,
+    recordGmailMessageIntakeInPostgres: async input => {
+      const id = input.messageEvidence.messageId
+      assert.ok(retained.some(entry => entry.id === id), 'Auth email must be excluded before canonical or cache persistence')
+      storedMessageIds.push(id)
+      return { id: `inbound-${id}`, pipelineId, inserted: true, identityStatus: 'verified', sourceId: `source-${id}` }
+    },
+  },
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
   '@/lib/auditWriter': { recordAuditEvent: async () => assert.fail('Normal polling must not request recovery') },
@@ -142,6 +158,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
       assert.equal(scope.boundConnectionId, 'owned-mailbox')
       providerCalls.push(path)
       const url = new URL(path, 'https://gateway.example.test')
+      if (url.pathname.endsWith('/users/me/profile')) return Response.json({ emailAddress: ownerEmail })
       if (url.pathname.endsWith('/messages')) {
         const secondPage = url.searchParams.get('pageToken') === 'page-2'
         return Response.json({
@@ -171,9 +188,16 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
       }
       if (sql.includes('FROM crm_contacts')) {
         matchedSenders.push(values[1])
+        matchedReferenceEmail = values[1][0]
         return { rows: [{ pipeline_id: pipelineId, reference_code: 'gc1234567', email: values[1][0] }] }
       }
       if (sql.includes('FROM crm_interactions')) return { rows: [] }
+      if (sql.includes('SELECT true AS placement_conflict FROM crm_email_sources source')) {
+        assert.deepEqual(Array.from(values.slice(0, 2)), [verifiedIdentity.mailboxId, ownerEmail])
+        assert.ok(retained.some(entry => entry.id === values[2]), 'Auth notifications never reach canonical placement matching')
+        assert.equal(values[3], pipelineId)
+        return { rows: [] }
+      }
       if (sql.includes('FROM crm_inbound_message_links')) return { rows: [] }
       if (sql.includes('UPDATE crm_inbound_messages SET')) return { rows: [], rowCount: 1 }
       if (sql.includes('INSERT INTO crm_inbound_message_links')) {
@@ -186,7 +210,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/persistence/crm': {
     async readCrmRecordByReference({ pipelineId: requestedPipeline }) {
       assert.equal(requestedPipeline, pipelineId)
-      return { entity: 'contacts', id: 'contact-id', referenceCode: 'gc1234567', pipelineId, organizationId: 'organization-id', suiteCrmId: null }
+      return { entity: 'contacts', id: 'contact-id', referenceCode: 'gc1234567', pipelineId, organizationId: 'organization-id', suiteCrmId: null, email: matchedReferenceEmail }
     },
     async stageCrmRecordInPostgres(input) {
       stagedInteractions.push(input)

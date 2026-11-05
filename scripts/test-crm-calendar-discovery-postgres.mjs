@@ -93,6 +93,7 @@ try {
   const postgres = { query, withTransaction, getPostgresPool: () => pool }
   const crm = load('app_src/lib/persistence/crm.ts', {
     '@/lib/persistence/postgres': postgres,
+    '@/lib/persistence/crmNativeEmailAuthority': load('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     '@/lib/crm/stableId': load('app_src/lib/crm/stableId.ts'),
     '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.invalid' },
@@ -160,10 +161,55 @@ try {
     location: '', attendeeEmails: [calendar, 'adrian@client.example.invalid', 'joe@client.example.invalid'],
     matchingAttendeeEmails: ['adrian@client.example.invalid', 'joe@client.example.invalid'], organizerEmail: calendar,
     externalEventUrl: 'https://calendar.google.com/event?eid=fixture', joinUrl: 'https://meet.google.com/aaa-bbbb-ccc',
-    recurringEventId: null, originalStartTime: null, clawpilotMeetingReference: null, allowCreate: true }
+    recurringEventId: 'business-series', originalStartTime: null, clawpilotMeetingReference: null, allowCreate: true }
+  // Pipeline ownership is not a substitute for the current organization's
+  // module permission. Keep the same real owner identity and connection while
+  // changing only its live membership, as ordinary access settings do.
+  const deniedEvent = { ...event, externalEventId: 'crm-module-denied-event' }
+  const providerCountBeforeDenial = providerCalls.length
+  const sourceBeforeDenial = (await query('SELECT * FROM crm_calendar_discovery_sources WHERE id=$1', [source.id])).rows[0]
+  const workBeforeDenial = (await query('SELECT (SELECT count(*) FROM crm_meetings)::text AS meetings, (SELECT count(*) FROM sync_outbox)::text AS outbox')).rows[0]
+  await query(`UPDATE app_user_organization_memberships SET role='member',permissions='{"viewCrm":false}'::jsonb
+    WHERE user_email=$1 AND organization_id=$2`, [owner, org])
+  check(!await store.isAuthorized(source), 'explicit CRM module denial revokes a still-owned Calendar source')
+  await assert.rejects(store.readCursor(source), /authorized/); checks++
+  await assert.rejects(store.writeCursor(source, { version: 1 }), /authorized/); checks++
+  await assert.rejects(adapter.listCalendarDiscoverySources(input), /owner/); checks++
+  await assert.rejects(adapter.configureCalendarDiscoverySource(input), /owner/); checks++
+  await assert.rejects(adapter.configureCalendarDiscoverySource({ ...input, enabled: false }), /owner/); checks++
+  check((await reconcile(source, deniedEvent)).status === 'deferred', 'explicit CRM denial prevents direct event staging')
+  let deniedProviderCalls = 0
+  const deniedDiscovery = await discovery.processCalendarDiscovery({ sources: [source], store,
+    fetch: async () => { deniedProviderCalls++; throw new Error('A denied source must not call its provider') } })
+  check(deniedDiscovery.unauthorizedSources === 1 && deniedProviderCalls === 0,
+    'denied source stops worker before its first provider request')
+  assert.deepEqual((await query('SELECT * FROM crm_calendar_discovery_sources WHERE id=$1', [source.id])).rows[0], sourceBeforeDenial); checks++
+  assert.deepEqual((await query('SELECT (SELECT count(*) FROM crm_meetings)::text AS meetings, (SELECT count(*) FROM sync_outbox)::text AS outbox')).rows[0], workBeforeDenial); checks++
+  check(providerCalls.length === providerCountBeforeDenial, 'denied settings cannot verify provider metadata or mutate source state')
+  await query(`UPDATE app_user_organization_memberships SET role='owner'
+    WHERE user_email=$1 AND organization_id=$2`, [owner, org])
+  check(await store.isAuthorized(source), 'organization owner retains the established CRM module override')
+  check((await adapter.listCalendarDiscoverySources(input)).length === 1, 'owner override can still read its exact Calendar settings')
+  check((await adapter.configureCalendarDiscoverySource(input))[0].enabled, 'owner override can still configure its exact Calendar source')
+  await query(`UPDATE app_user_organization_memberships SET status='disabled',trashed_at=now(),trashed_by=$1,pre_trash_status='active'
+    WHERE user_email=$1 AND organization_id=$2`, [owner, org])
+  check(!await store.isAuthorized(source), 'trashed organization owner cannot retain Calendar source authority')
+  check((await reconcile(source, deniedEvent)).status === 'deferred', 'trashed source cannot stage a meeting')
+  await assert.rejects(adapter.listCalendarDiscoverySources(input), /owner/); checks++
+  await query(`UPDATE app_user_organization_memberships SET status='active',trashed_at=NULL,trashed_by=NULL,pre_trash_status=NULL,
+    permissions='{}'::jsonb WHERE user_email=$1 AND organization_id=$2`, [owner, org])
+  check(await store.isAuthorized(source), 'restored owner regains exact configured source without rebinding')
   check((await reconcile(source, event)).status === 'created', 'matching attendees create native CRM meeting')
   const meeting = (await query('SELECT * FROM crm_meetings WHERE pipeline_id=$1 AND external_event_id=$2', [pipeline, event.externalEventId])).rows[0]
   check(meeting.organization_id === account.id, 'meeting maps to the matched customer account')
+  const readImported = async () => (await crm.listCrmRecordsInPostgres({ pipelineId: pipeline, entity: 'meetings' })).find(row => row.id === meeting.id)
+  let importedView = await readImported()
+  check(importedView.calendarImported === true && importedView.recurringEventId === 'business-series', 'verified import provenance reaches the meeting presentation')
+  check(importedView.calendarDeliveryStatus === null, 'import does not fabricate an outgoing delivery receipt')
+  await query(`UPDATE crm_meetings SET source_payload=jsonb_set(source_payload,'{calendarDiscovery,eventId}','"different-event"'::jsonb) WHERE id=$1`, [meeting.id])
+  importedView = await readImported()
+  check(importedView.calendarImported === false, 'mismatched provider event identity cannot claim verified import')
+  await query('UPDATE crm_meetings SET source_payload=$2::jsonb WHERE id=$1', [meeting.id, JSON.stringify(meeting.source_payload)])
   check((await query('SELECT count(*) FROM crm_meetings WHERE pipeline_id=$1', [otherPipeline])).rows[0].count === '0', 'same-email foreign CRM contact never receives the imported meeting')
   const relations = (await query('SELECT contact_id::text FROM crm_meeting_contacts WHERE meeting_id=$1 ORDER BY contact_id', [meeting.id])).rows
   assert.deepEqual(relations.map(row => row.contact_id), [adrian.id, joe.id].sort()); checks++

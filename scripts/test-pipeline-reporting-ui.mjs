@@ -2,6 +2,8 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import vm from 'node:vm'
 
 const read = (path) => readFileSync(resolve(process.cwd(), path), 'utf8')
 const dashboard = read('app_src/components/pipeline/PipelineDashboard.tsx')
@@ -15,6 +17,8 @@ const pipelineCurrency = read('app_src/lib/crm/pipelineCurrency.ts')
 
 for (const fragment of [
   "useState<ReportPreset>('last_3_calendar_months')",
+  "useState<InteractionScope>('sales')",
+  "params.set('interactionScope', interactionScope)",
   "new URLSearchParams({ preset })",
   "params.set('startDate', customStart)",
   "params.set('endDate', customEnd)",
@@ -40,7 +44,13 @@ assert.match(dashboard, /snapshot\?\.totalContacts \?\? totalContacts/)
 assert.match(dashboard, /snapshot\?\.opportunitiesByStage \|\| null/)
 assert.match(dashboard, /Contacts added · selected period/)
 assert.match(dashboard, /Total contacts · current/)
-assert.match(dashboard, /Interactions · selected period/)
+assert.match(dashboard, /Sales interactions/)
+assert.match(dashboard, /All interactions/)
+assert.match(dashboard, /label="Interaction scope"/)
+assert.match(dashboard, /value="sales">Customers and prospects/)
+assert.match(dashboard, /value="all">All activity/)
+assert.match(dashboard, /shared-company activity counts once/)
+assert.match(reportHook, /requestKey = `\$\{reportRevision\}:\$\{interactionScope\}:/)
 assert.match(dashboard, /Opportunities created · selected period/)
 assert.match(dashboard, /Lifetime win rate/)
 assert.doesNotMatch(dashboard, /MetricCard primary label="Potential value"/)
@@ -161,4 +171,40 @@ assert.match(crmPersistence, /readCrmPipelineValueSnapshotWithClient/)
 assert.match(crmPersistence, /activePipelineValue: valueSnapshot\.activePipelineValue/)
 assert.match(crmPersistence, /weightedPipelineValue: valueSnapshot\.weightedPipelineValue/)
 
-console.log('pipeline reporting UI contract tests passed')
+// Render the real component and MUI controls for both selections. This is SSR
+// output proof, not a signed-in browser click/save or deployment check.
+const requireApp = createRequire(new URL('../app_src/package.json', import.meta.url))
+const ts = requireApp('typescript'), React = requireApp('react')
+const { renderToStaticMarkup } = requireApp('react-dom/server')
+function load(source, fileName, imports) {
+  const module = { exports: {} }
+  vm.runInNewContext(ts.transpileModule(source, { fileName, compilerOptions: {
+    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
+  } }).outputText, { module, exports: module.exports, Intl, Number, Date, Map, Math,
+    require: imports, fetch: () => assert.fail('Dashboard rendering must not fetch or mutate'),
+  })
+  return module.exports
+}
+const currency = load(pipelineCurrency, 'pipelineCurrency.ts', name => assert.fail(name))
+const Dashboard = load(dashboard, 'PipelineDashboard.tsx', name => {
+  if (name === '@/lib/crm/pipelineCurrency') return currency
+  if (name === 'react/jsx-runtime' || name.startsWith('@mui/')) return requireApp(name)
+  return assert.fail(`Unexpected component import ${name}`)
+}).default
+for (const scope of ['sales', 'all']) {
+  const noAction = () => assert.fail('Rendering must not change a reporting selection')
+  const html = renderToStaticMarkup(React.createElement(Dashboard, {
+    stages: [], totalContacts: 4, lastSyncedLabel: 'Fixture', syncState: 'ok', reporting: {
+      interactionScope: scope, setInteractionScope: noAction, preset: 'last_3_calendar_months', setPreset: noAction,
+      customStart: '', customEnd: '', setCustomStart: noAction, setCustomEnd: noAction,
+      snapshot: null, activity: { interactions: 3, contactsAdded: 1, opportunitiesCreated: 0, interactionsByMonth: [] },
+      periodLabel: 'Fixture period', customPeriodIncomplete: false, customPeriodGuidance: '', reportError: '',
+      isReportPending: false, retryReport: noAction,
+    },
+  })).replace(/<style\b[^>]*>[\s\S]*?<\/style>/gu, '')
+  assert.ok(html.includes(scope === 'sales' ? 'Sales interactions' : 'All interactions'))
+  assert.ok(html.includes(scope === 'sales' ? 'Customers and prospects' : 'All activity'))
+  assert.ok(html.includes('Interaction scope') && html.includes('role="combobox"'))
+  assert.ok(html.includes(scope === 'sales' ? 'shared-company activity counts once' : 'including suppliers and unclassified accounts'))
+}
+console.log('pipeline reporting UI contracts and real React/MUI server-rendered scope controls passed')

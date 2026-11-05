@@ -8,18 +8,33 @@ import {
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { applyMigrationSqlForTest } from './lib/postgres-test-migrations.mjs'
+import './test-production-rebind-catalog-canonicalization.mjs'
 
 import {
   PRODUCTION_REBIND_CRITICAL_RELATIONS,
+  PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
   PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM,
   PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
+  PRODUCTION_REBIND_CRM_GUARD_HELPERS,
+  PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
+  inspectPreCrmProductionRebindSchemaMetadata,
+  inspectPreInitialEnrollmentProductionRebindSchemaMetadata,
+  inspectPreInitialReplanProductionRebindSchemaMetadata,
+  inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,
+  inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,
+  inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
   productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
@@ -32,19 +47,107 @@ const images = requestedImage
   ? [requestedImage]
   : ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18']
 
-const PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: 'e8e3ce7233e3c33e22064e4833f93dffff7ea6d585fdb55bfe69f602cf2665d2',
-  18: '048935a6dca7fbe7c79850f7a326cda075eb2aa1720865f6dccdb9534be66bfe',
+// Historical projections re-fingerprinted with v10's complete FK descriptors
+// and generated-name canonicalization. These are NOT old v6-v9 raw receipts.
+// The diagnostic retains an independent byte-for-byte v9 baseline assertion.
+export const PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'f5762ced311e2ffc0bb41ef7faed223e97cadecfe3eb199676eefd913aec6106',
+  18: 'c7099b117c869bc82fd4ea69d3f22fa89ab21388c198386c6f5576822347d737',
 })
-const PRE_GATEWAY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: '77741d50693a7e652606937398f7fb66507371a3ab9bfc4d4b63b684178c7aa2',
-  18: '0501ba51ff372ea79c083f4c21de8a89c8f1d98ccea962701c0dc37be671196f',
+export const PRE_GATEWAY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: '7dfd2225224f8189f6fe1114ebe48f7e49ec15b819e15d51542d416ee2a48088',
+  18: 'eb54a373cda2316718d338744027bebecd0ccd6973d066768751ab002b349729',
 })
-const PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: 'a1af2c30e5b28aec8e60d1689330b72c2fdff5666c7da382f5cfa9fbc4869615',
-  18: '73040be0231764cb9fbcfd8d9d5fd7eadab2c9debd428b3317150b5a844ba741',
+export const PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'f1a4e64c58206732f9e6188cdf6ab5b61bbd469351a1ff32a33edabc667d2838',
+  18: '19dafed72a1fd538644007c70dc4cb37815ef7f225ca183cf166968056ff720a',
 })
-const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
+// Semantic v8 projection, before the exact four 0374 dependencies on a
+// rebind-critical relation: their action-trigger pairs on public.app_users.
+export const PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: 'cdf58d34b5d8fb6202589ddd42b03099f9e4106b4c172abbbc366a2b20e0b5dc',
+  18: 'ea60f6ddbc21fec8d9e354b7fab1bc88ccab6f4bbd3971936bf1b9ff635bfa74',
+})
+export const PRE_NATIVE_V9_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16:'43767ef8dec0534ca435c48281ed9bea0f9a515bd0c083bef0eafe310deb4fc4',
+  18:'114ae8b25c5209b8b1f0ac3adfb49bffdc1cad176670d25efb7209580e10f7ab',
+})
+const REVIEWED_COMPANY_MIGRATION = '0374_crm_interaction_organizations.sql'
+const INITIAL_ENROLLMENT_MIGRATION = '0398_crm_native_email_initial_enrollment.sql'
+const INITIAL_REPLAN_MIGRATION = '0399_crm_native_email_initial_replan_lineage.sql'
+const INITIAL_DEMO_QUARANTINE_MIGRATION = '0400_crm_native_email_demo_quarantine.sql'
+const INITIAL_DEMO_QUARANTINE_HELPER = 'public.clawpilot_crm_native_initial_demo_quarantine(uuid,text)'
+const ROOT_OWNER_SOURCE_FENCE_MIGRATION = '0401_crm_native_root_owner_source_fence.sql'
+const ROOT_OWNER_SOURCE_FENCE_HELPER = 'public.clawpilot_crm_root_native_membership_is_independent(jsonb,jsonb)'
+const UNMANAGED_PIPELINE_MIGRATION = '0402_crm_native_unmanaged_app_only_pipelines.sql'
+const UNMANAGED_PIPELINE_CLASSIFIER = 'public.clawpilot_native_email_app_only_change_is_independent(text,jsonb,jsonb)'
+const UNMANAGED_PIPELINE_HELPERS = new Map([
+  ['public.clawpilot_crm_native_json_has_pipeline(jsonb,uuid)',{language:'sql',volatility:'i',result:'boolean',arguments:2}],
+  ['public.clawpilot_crm_native_outbox_pipeline(text,text)',{language:'plpgsql',volatility:'s',result:'uuid',arguments:2}],
+  ['public.clawpilot_crm_native_outbox_is_non_email(text,text,text,jsonb)',{language:'sql',volatility:'s',result:'boolean',arguments:4}],
+  ['public.clawpilot_crm_native_outbox_is_foreign_terminal_delete(public.sync_outbox,uuid)',{language:'plpgsql',volatility:'s',result:'boolean',arguments:2}],
+  ['public.clawpilot_crm_native_unmanaged_pipeline_footprint(uuid)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:1}],
+  ['public.clawpilot_crm_native_unmanaged_pipeline_retained(uuid)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:1}],
+  ['public.clawpilot_crm_native_unmanaged_app_change(text,jsonb,jsonb)',{language:'plpgsql',volatility:'v',result:'boolean',arguments:3}],
+])
+const UNMANAGED_PIPELINE_RELATIONS = [
+  'crm_campaign_recipients','crm_campaigns','crm_inbound_message_links','crm_inbound_messages',
+  'crm_integration_action_attempts','crm_integration_actions','crm_interaction_contacts','crm_leads',
+  'crm_meetings','crm_opportunities','workspace_tenant_retirement_receipts',
+].map(name=>`public.${name}`)
+const INITIAL_ENROLLMENT_RELATIONS = [
+  'crm_contacts','crm_email_mailbox_bindings','crm_email_mailboxes','crm_email_review_decisions',
+  'crm_email_sources','crm_interaction_organizations','crm_interactions',
+  'crm_native_email_initial_enrollments','crm_native_email_initial_reservations','sync_outbox',
+].map(name=>`public.${name}`)
+const INITIAL_SOURCE_UPDATE_COLUMNS = new Map([
+  ['app_users',['email','status','role','permissions','organization_id','suitecrm_user_id','reference_code','crm_user_enabled','suitecrm_username']],
+  ['app_user_organization_memberships',['user_email','organization_id','status','role','permissions','trashed_at','trashed_by','pre_trash_status']],
+  ['workspace_organizations',['id','parent_id','organization_type','is_demo']],
+  ['pipeline_spaces',['id','owner_email','workspace_organization_id','reference_access_disabled']],
+  ['crm_products',['id','pipeline_id','suitecrm_id','source_payload']],
+])
+const INITIAL_FULL_SOURCE_RELATIONS = [
+  'pipeline_space_members','crm_operator_accounts','crm_operator_workspace_bindings','crm_root_employee_access_grants',
+  'crm_interactions','crm_organizations','crm_contacts','crm_interaction_organizations','crm_email_sources',
+  'crm_email_review_decisions','crm_email_mailbox_bindings','crm_email_mailboxes','crm_native_email_publication_admissions',
+  'crm_native_email_publication_work','crm_native_email_authority_transitions','crm_native_email_authority_phases',
+  'crm_native_email_authority_member_changes','crm_native_email_authority_user_changes',
+  'crm_native_email_authority_root_changes','crm_native_email_authority_grant_attempts',
+]
+const INITIAL_ENROLLMENT_TRIGGERS = [
+  ...[...INITIAL_SOURCE_UPDATE_COLUMNS.keys()].flatMap(table=>{
+    const prefix=table==='crm_products'?'crm_native_initial_demo_product_source':'crm_native_initial_source'
+    return [
+      [table,`${prefix}_fence`,46,'clawpilot_crm_native_initial_source_fence'],
+      [table,`${prefix}_update_fence`,18,'clawpilot_crm_native_initial_source_fence'],
+    ]
+  }),
+  ...INITIAL_FULL_SOURCE_RELATIONS.map(table=>[table,'crm_native_initial_source_fence',62,'clawpilot_crm_native_initial_source_fence']),
+  ['crm_native_email_initial_enrollments','crm_native_initial_statement',62,'clawpilot_crm_native_initial_lock'],
+  ['crm_native_email_initial_reservations','crm_native_initial_reservation_statement',62,'clawpilot_crm_native_initial_lock'],
+  ['crm_native_email_initial_reservations','crm_native_initial_reserve',7,'clawpilot_crm_native_initial_reserve'],
+  ['crm_native_email_initial_reservations','crm_native_initial_barrier',5,'clawpilot_crm_native_initial_barrier'],
+  ['crm_native_email_initial_enrollments','crm_native_initial_admit',7,'clawpilot_crm_native_initial_admit'],
+  ['crm_native_email_publication_control','crm_native_initial_control_guard',19,'clawpilot_crm_native_initial_control_guard'],
+  ['crm_native_email_initial_enrollments','crm_native_initial_settle',19,'clawpilot_crm_native_initial_settle_guard'],
+  ['crm_native_email_initial_reservations','crm_native_initial_reservation_settle',19,'clawpilot_crm_native_initial_reservation_settle'],
+  ['sync_outbox','crm_native_initial_outbox_lock',62,'clawpilot_native_email_work_statement_lock'],
+  ['sync_outbox','crm_native_initial_outbox_fence',31,'clawpilot_crm_native_initial_outbox_fence'],
+  ['sync_outbox','crm_native_initial_outbox_truncate',34,'clawpilot_crm_native_initial_outbox_fence'],
+  ['crm_native_email_capability_policies','crm_native_initial_policy_fence',31,'clawpilot_crm_native_initial_policy_fence'],
+  ['crm_native_email_capability_policies','crm_native_initial_policy_truncate',34,'clawpilot_crm_native_initial_source_fence'],
+  ['crm_native_email_initial_enrollments','crm_native_initial_complete',21,'clawpilot_crm_native_initial_complete',true],
+  ['crm_native_email_initial_reservations','crm_native_initial_reservation_complete',21,'clawpilot_crm_native_initial_complete',true],
+  ['crm_native_email_publication_control','crm_native_initial_control_complete',17,'clawpilot_crm_native_initial_complete',true],
+]
+export const REVIEWED_EMAIL_REFERENCE_CONSTRAINTS = new Map([
+  ['crm_interaction_organizations_created_by_fkey', { relation: 'public.crm_interaction_organizations', column: 'created_by', deleteAction: 'n' }],
+  ['crm_email_mailboxes_owner_email_fkey', { relation: 'public.crm_email_mailboxes', column: 'owner_email', deleteAction: 'a' }],
+  ['crm_email_sources_owner_email_fkey', { relation: 'public.crm_email_sources', column: 'owner_email', deleteAction: 'a' }],
+  ['crm_email_review_decisions_actor_email_fkey', { relation: 'public.crm_email_review_decisions', column: 'actor_email', deleteAction: 'a' }],
+])
+export const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_gateway_credentials_actor_email_fkey', 'public.app_users'],
   ['fractional_crm_verified_identifiers_accepted_by_fkey', 'public.app_users'],
   ['fractional_crm_review_decisions_approved_by_fkey', 'public.app_users'],
@@ -52,15 +155,32 @@ const GATEWAY_REFERENCE_CONSTRAINTS = new Map([
   ['fractional_crm_source_mappings_workspace_organization_id_fkey', 'public.workspace_organizations'],
   ['fractional_crm_verified_identifi_workspace_organization_id_fkey', 'public.workspace_organizations'],
 ])
-const CALENDAR_REFERENCE_CONSTRAINTS = new Map([
+export const CALENDAR_REFERENCE_CONSTRAINTS = new Map([
   ['crm_calendar_discovery_sources_workspace_organization_id_fkey', 'public.workspace_organizations'],
   ['crm_calendar_discovery_sources_credential_owner_email_fkey', 'public.app_users'],
   ['crm_calendar_discovery_sources_created_by_fkey', 'public.app_users'],
   ['crm_meeting_contacts_created_by_fkey', 'public.app_users'],
 ])
-const NEW_REFERENCE_CONSTRAINTS = new Map([
+const CURRENT_CRM_REFERENCE_CONSTRAINTS = new Map([
+  ...['crm_native_email_initial_reservations','crm_native_email_initial_enrollments'].flatMap(table=>[
+    [`${table}_actor_email_fkey`,{relation:`public.${table}`,column:'actor_email',deleteAction:'r'}],
+    [`${table}_operator_account_id_fkey`,{relation:`public.${table}`,column:'operator_account_id',deleteAction:'r',targetRelation:'public.crm_operator_accounts',targetColumn:'id'}],
+    [`${table}_root_workspace_id_fkey`,{relation:`public.${table}`,column:'root_workspace_id',deleteAction:'r',targetRelation:'public.workspace_organizations',targetColumn:'id'}],
+  ]),
+  ['crm_native_email_initial_enrollments_operation_id_fkey',{relation:'public.crm_native_email_initial_enrollments',column:'operation_id',deleteAction:'r',targetRelation:'public.crm_native_email_initial_reservations',targetColumn:'operation_id'}],
+  ['crm_native_email_publication__active_initial_enrollment_id_fkey',{relation:'public.crm_native_email_publication_control',column:'active_initial_enrollment_id',deleteAction:'r',targetRelation:'public.crm_native_email_initial_reservations',targetColumn:'operation_id'}],
+  ['crm_native_email_authority_transitions_actor_email_fkey', {relation:'public.crm_native_email_authority_transitions',column:'actor_email',deleteAction:'r'}],
+  ['crm_native_email_authority_member_changes_user_email_fkey', {relation:'public.crm_native_email_authority_member_changes',column:'user_email',deleteAction:'r'}],
+  ['crm_native_email_authority_user_changes_user_email_fkey', {relation:'public.crm_native_email_authority_user_changes',column:'user_email',deleteAction:'r'}],
+  ['crm_native_email_authority_user_changes_organization_id_fkey', {relation:'public.crm_native_email_authority_user_changes',column:'organization_id',deleteAction:'r',targetRelation:'public.workspace_organizations',targetColumn:'id'}],
+  ...['crm_customer_drive_folders','crm_customer_folder_settings','crm_customer_folder_jobs'].map(table=>[
+    `${table}_workspace_id_fkey`, {relation:`public.${table}`,column:'workspace_id',deleteAction:'r',targetRelation:'public.workspace_organizations',targetColumn:'id'},
+  ]),
+])
+export const NEW_REFERENCE_CONSTRAINTS = new Map([
   ...GATEWAY_REFERENCE_CONSTRAINTS,
   ...CALENDAR_REFERENCE_CONSTRAINTS,
+  ...[...REVIEWED_EMAIL_REFERENCE_CONSTRAINTS.keys()].map(name => [name, 'public.app_users']),
   ['app_user_login_addresses_user_email_fkey', 'public.app_users'],
   ['app_login_email_changes_user_email_fkey', 'public.app_users'],
   ['app_user_google_login_bindings_user_email_fkey', 'public.app_users'],
@@ -70,6 +190,38 @@ const NEW_REFERENCE_CONSTRAINTS = new Map([
   ['app_user_google_login_bindings_linked_organization_id_fkey', 'public.workspace_organizations'],
   ['workspace_organization_web_preferences_organization_id_fkey', 'public.workspace_organizations'],
 ])
+
+assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  'clawpilot-production-rebind-target-schema-attestation-v18')
+assert.deepEqual(PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'22808494dbdc3510bdccb57fe0a491344a1e8bc57195594d089cdf568e63842e',
+  18:'f0685b9f82de44c3c1cf1c10e4ce077c43d1040992234e551e338311160f3e64',
+},'Forward enrollment must never retcon the historical v13 fingerprints')
+assert.deepEqual(PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'cc19a57dd52699a99a5b65f6b194898f03e2afca0427bb671a751156b71ade53',
+  18:'5fd850649717454a790185f22e916c2be58a80cdc8cbc87317fd4e936cc0d553',
+},'Forward replan enrollment must never retcon the historical v14 fingerprints')
+assert.deepEqual(PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'efbd7c05436a394e29c45522465602790f3fa8ff9cfcb9b12802cae416b8e864',
+  18:'c8da9f9b5d54395eb2527e9d472396bbf2b593b6312b2c14d4ef3ae13a3d130d',
+},'Demo quarantine must never retcon the independently accepted historical v15 fingerprints')
+assert.deepEqual(PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'f2ffa6e838f37c018c922b5e05dfeb565f2093e898d529efa35b23fdf46cbceb',
+  18:'89fce50872243d7848b233209e140cc03c67b21fc9c3aa16d8e2ea86819abc1c',
+},'Owner source fencing must never retcon the independently accepted historical v16 fingerprints')
+assert.deepEqual(PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'2b4e6f7ac81be403b31210026a04f4a98fd902c66198732c471f9cf267e6d441',
+  18:'c62a2bb05b8f9e502163a649492c0f292c30eeb2fe05d94c60d2a6e2631fc349',
+},'Historical through-0401 v17 fingerprints remain independently frozen')
+assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,UNMANAGED_PIPELINE_MIGRATION,
+  'Current acceptance requires 0402, never a historical floor')
+for(const helper of UNMANAGED_PIPELINE_HELPERS.keys())assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
+for(const relation of UNMANAGED_PIPELINE_RELATIONS)assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),relation)
+for(const helper of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
+  'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER,
+  ROOT_OWNER_SOURCE_FENCE_HELPER]) assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
+for(const relation of [...INITIAL_ENROLLMENT_RELATIONS,'public.crm_products']) assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),
+  `${relation} must be a direct locked/fingerprinted target`)
 
 for (const image of images) {
   assert.match(
@@ -111,6 +263,54 @@ assert.equal(
   PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM,
 )
 
+// The historical metadata helpers retain their pre-v14 ledger projection,
+// independently of the current attester's mandatory forward migration floor.
+for(const [inspect,lastMigration] of [
+  [inspectPreCrmProductionRebindSchemaMetadata,'0397_crm_native_root_registry_changes.sql'],
+  [inspectPreInitialEnrollmentProductionRebindSchemaMetadata,'0397_crm_native_root_registry_changes.sql'],
+  [inspectPreInitialReplanProductionRebindSchemaMetadata,INITIAL_ENROLLMENT_MIGRATION],
+  [inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata,INITIAL_REPLAN_MIGRATION],
+  [inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata,INITIAL_DEMO_QUARANTINE_MIGRATION],
+  [inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,ROOT_OWNER_SOURCE_FENCE_MIGRATION],
+  [inspectProductionRebindHistorySchema,UNMANAGED_PIPELINE_MIGRATION],
+]){
+  let selectedMigrations,selectedRelations,selectedFunctions
+  await inspect({query:async (_sql,values)=>{
+    selectedRelations=values[0]
+    selectedFunctions=values[1]
+    selectedMigrations=values[2]
+    return {rowCount:1,rows:[{server_version_num:160000,schema:{},relations:[],columns:[],constraints:[],
+      indexes:[],triggers:[],functions:[],migrations:[],missing_relations:[],missing_functions:[]}]}
+  }})
+  assert.equal(selectedMigrations.at(-1),lastMigration,`${inspect.name} retains its exact ledger floor`)
+  assert.equal(selectedMigrations.includes(INITIAL_ENROLLMENT_MIGRATION),inspect===inspectProductionRebindHistorySchema
+    ||inspect===inspectPreInitialReplanProductionRebindSchemaMetadata
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,'Only current and exact v14/v15/v16/v17 metadata include 0398')
+  assert.equal(selectedMigrations.includes(INITIAL_REPLAN_MIGRATION),inspect===inspectProductionRebindHistorySchema
+    ||inspect===inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata
+    ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
+    'Only current and exact v15/v16 metadata enroll 0399; historical readers never provide a fallback')
+  for(const currentOnly of [selectedMigrations.includes(INITIAL_DEMO_QUARANTINE_MIGRATION),
+    selectedRelations.includes('public.crm_products'),selectedFunctions.includes(INITIAL_DEMO_QUARANTINE_HELPER)]){
+    assert.equal(currentOnly,inspect===inspectProductionRebindHistorySchema
+      ||inspect===inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata
+      ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
+      'Only current and exact v16 metadata enroll the complete 0400 migration, helper and direct Product source catalog')
+  }
+  assert.equal(selectedMigrations.includes(ROOT_OWNER_SOURCE_FENCE_MIGRATION),inspect===inspectProductionRebindHistorySchema
+    ||inspect===inspectPreUnmanagedPipelineProductionRebindSchemaMetadata,
+    'Current v17 and its exact metadata reader require 0401; older readers preserve their accepted ledger floor')
+  assert.equal(selectedMigrations.includes(UNMANAGED_PIPELINE_MIGRATION),inspect===inspectProductionRebindHistorySchema,
+    'Only current v18 requires 0402; historical metadata cannot become a fallback')
+  for(const helper of UNMANAGED_PIPELINE_HELPERS.keys())assert.equal(selectedFunctions.includes(helper),inspect===inspectProductionRebindHistorySchema,
+    `Only current v18 enrolls ${helper}`)
+  for(const relation of UNMANAGED_PIPELINE_RELATIONS)assert.equal(selectedRelations.includes(relation),inspect===inspectProductionRebindHistorySchema,
+    `Only current v18 directly fingerprints ${relation}`)
+}
+
 function command(executable, args, options = {}) {
   return execFileSync(executable, args, {
     cwd: root,
@@ -137,6 +337,12 @@ async function waitForPostgres(databaseUrl) {
   throw new Error('Disposable PostgreSQL did not become ready')
 }
 
+let checkedTamperCases = 0
+function recordTamperCase() {
+  checkedTamperCases += 1
+  if (checkedTamperCases % 20 === 0) console.log(`Verified ${checkedTamperCases} catalog/ledger tamper refusals with clean rollback re-attestation`)
+}
+
 async function expectFailure(pool, expectedCode, label, mutate) {
   const client = await pool.connect()
   try {
@@ -161,25 +367,24 @@ async function expectFailure(pool, expectedCode, label, mutate) {
     client.release()
   }
   await attestProductionRebindHistorySchema(pool)
+  recordTamperCase()
 }
 
-async function expectLedgerFailure(pool, filename) {
+async function expectLedgerFailure(pool, filename, missing = false) {
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    await client.query(
-      `UPDATE public.schema_migrations
-       SET checksum = repeat('0', 64)
-       WHERE filename = $1`,
-      [filename],
-    )
+    await client.query(missing
+      ? 'DELETE FROM public.schema_migrations WHERE filename = $1'
+      : `UPDATE public.schema_migrations SET checksum = repeat('0', 64) WHERE filename = $1`,
+    [filename])
     await assert.rejects(
       attestProductionRebindHistorySchema(client),
       (error) => (
         error instanceof ProductionRebindHistorySchemaAttestationError
         && error.code === 'migration_checksum_mismatch'
       ),
-      `${filename} ledger drift fails closed`,
+      `${filename} ${missing ? 'missing ledger row' : 'ledger drift'} fails closed`,
     )
     await client.query('ROLLBACK')
   } catch (error) {
@@ -189,59 +394,125 @@ async function expectLedgerFailure(pool, filename) {
     client.release()
   }
   await attestProductionRebindHistorySchema(pool)
+  recordTamperCase()
 }
 
-async function exerciseImage(image) {
-  const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
-  const container = `clawpilot-target-schema-attestation-${suffix}`
-  const password = `target-schema-attestation-${suffix}`
-  let pool
-  command('docker', disposablePostgresDockerArgs([
-    'run', '--detach', '--rm', '--name', container,
-    '--env', `POSTGRES_PASSWORD=${password}`,
-    '--env', 'POSTGRES_DB=clawpilot_target_schema_attestation',
-    '--publish', '127.0.0.1::5432',
-    image,
-  ]))
+async function verifyReviewedEmailReferenceTriggers(pool, catalog, definitions=REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
+  const verified = []
+  for (const [constraint, expected] of definitions) {
+  const targetRelation=expected.targetRelation??'public.app_users',targetColumn=expected.targetColumn??'email'
+  const result = await pool.query(
+    `SELECT constraint_row.conname AS name, constraint_row.contype::text AS type,
+       source_namespace.nspname || '.' || source_relation.relname AS source_relation,
+       ARRAY(SELECT attribute.attname::text
+         FROM unnest(constraint_row.conkey) WITH ORDINALITY selected(attnum, position)
+         JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = constraint_row.conrelid
+           AND attribute.attnum = selected.attnum ORDER BY selected.position) AS source_columns,
+       target_namespace.nspname || '.' || target_relation.relname AS target_relation,
+       ARRAY(SELECT attribute.attname::text
+         FROM unnest(constraint_row.confkey) WITH ORDINALITY selected(attnum, position)
+         JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = constraint_row.confrelid
+           AND attribute.attnum = selected.attnum ORDER BY selected.position) AS target_columns,
+       constraint_row.convalidated AS validated,
+       constraint_row.condeferrable AS deferrable, constraint_row.condeferred AS deferred,
+       constraint_row.confupdtype::text AS update_action, constraint_row.confdeltype::text AS delete_action,
+       constraint_row.confmatchtype::text AS match_type,
+       constraint_row.confdelsetcols IS NULL AS default_delete_columns,
+       COALESCE((pg_catalog.to_jsonb(constraint_row)->>'conenforced')::boolean, true) AS enforced,
+       constraint_row.conparentid = 0 AS no_parent,
+       constraint_row.conislocal AS local, constraint_row.coninhcount::integer AS inheritance_count
+     FROM pg_catalog.pg_constraint constraint_row
+     JOIN pg_catalog.pg_class source_relation ON source_relation.oid = constraint_row.conrelid
+     JOIN pg_catalog.pg_namespace source_namespace ON source_namespace.oid = source_relation.relnamespace
+     JOIN pg_catalog.pg_class target_relation ON target_relation.oid = constraint_row.confrelid
+     JOIN pg_catalog.pg_namespace target_namespace ON target_namespace.oid = target_relation.relnamespace
+     WHERE constraint_row.conrelid = $2::regclass
+       AND constraint_row.conname = $1`,
+    [constraint, expected.relation],
+  )
+  assert.equal(result.rowCount, 1, `Exactly the reviewed ${constraint} descriptor exists`)
+  assert.deepEqual(result.rows[0], {
+    name: constraint, type: 'f',
+    source_relation: expected.relation, source_columns: [expected.column],
+    target_relation: targetRelation, target_columns: [targetColumn],
+    validated: true, deferrable: false, deferred: false,
+    update_action: 'a', delete_action: expected.deleteAction, match_type: 's', default_delete_columns: true, enforced: true,
+    no_parent: true, local: true, inheritance_count: 0,
+  }, 'FK identity, columns, validation, action and deferral semantics are exact')
+  const triggers = catalog.triggers.filter((trigger) => trigger.constraint === constraint && trigger.relation===targetRelation)
+  assert.equal(triggers.length, 2, `0374 adds exactly two action triggers for ${constraint}`)
+  assert.equal(new Set(triggers.map((trigger) => trigger.name)).size, 2)
+  for (const trigger of triggers) {
+    assert.match(trigger.name, /^RI_ConstraintTrigger_a_[1-9][0-9]*$/u)
+    const { name, definition, foreignKey, attributeNumbers, oldTransitionTable,
+      newTransitionTable, constraintIndex, physicalRelation, ...semantics } = trigger
+    assert.equal(physicalRelation, targetRelation.replace(/^public\./u, ''))
+    assert.equal(attributeNumbers, '')
+    assert.equal(oldTransitionTable, null)
+    assert.equal(newTransitionTable, null)
+    assert.equal(constraintIndex, foreignKey.index)
+    assert.equal(foreignKey.source, expected.relation.replace(/^public\./u, ''))
+    assert.equal(foreignKey.target, targetRelation.replace(/^public\./u, ''))
+    assert.equal(foreignKey.name, constraint)
+    assert.equal(foreignKey.deleteAction, expected.deleteAction)
+    assert.equal(foreignKey.updateAction, 'a')
+    assert.deepEqual(foreignKey.columns.map(({side,name})=>({side,name})), [
+      {side:'source',name:expected.column}, {side:'target',name:targetColumn},
+    ])
+    assert.equal(foreignKey.operators.length, 3)
+    assert.ok(typeof definition === 'string' && definition.includes(name), '0374 trigger definition names its exact action trigger')
+    assert.deepEqual(semantics, {
+      relation: targetRelation, enabled: 'O', internal: true,
+      typeMask: trigger.typeMask, argumentCount: 0, argumentsHex: '', when: null,
+      function: trigger.typeMask === 9 ? (expected.deleteAction === 'n'
+        ? 'pg_catalog."RI_FKey_setnull_del"()' : expected.deleteAction==='r'
+          ? 'pg_catalog."RI_FKey_restrict_del"()' : 'pg_catalog."RI_FKey_noaction_del"()') : 'pg_catalog."RI_FKey_noaction_upd"()',
+      constraint,
+      constraintRelation: expected.relation,
+      deferrable: false, initiallyDeferred: false, parentTrigger: null, comment: null,
+    }, '0374 referenced-table action trigger semantics are exact')
+  }
+  assert.deepEqual(triggers.map((trigger) => trigger.typeMask).sort((a, b) => a - b), [9, 17])
+  verified.push(...triggers)
+  }
+  assert.equal(verified.length,definitions.size*2,'Every individually reviewed FK has exactly two referenced-table guards')
+  return verified
+}
+
+async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline) {
+  // Historical comparison only. Current acceptance uses the production runner
+  // and complete unmodified current catalog, never this metadata-only profile.
+  const controlPool=new Pool({connectionString:currentUrl,max:1})
+  try {await controlPool.query('CREATE DATABASE clawpilot_rebind_v9_fixture')}
+  finally {await controlPool.end()}
+  const url=new URL(currentUrl);url.pathname='/clawpilot_rebind_v9_fixture'
+  const pool=new Pool({connectionString:url.toString(),max:1})
   try {
-    const portOutput = command('docker', ['port', container, '5432/tcp']).trim()
-    const port = portOutput.slice(portOutput.lastIndexOf(':') + 1)
-    assert.match(port, /^\d+$/u, 'Docker published a PostgreSQL port')
-    const databaseUrl =
-      `postgresql://postgres:${password}@127.0.0.1:${port}/clawpilot_target_schema_attestation`
-    await waitForPostgres(databaseUrl)
-
-    // Use the production migration runner against a blank database. This is
-    // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0373
-    // migrations, their prerequisites, and their real ledger rows execute.
-    const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
-      env: {
-        ...process.env,
-        DATABASE_URL: databaseUrl,
-        PGSSLMODE: 'disable',
-      },
-      timeout: 180_000,
-    })
-    for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
-      assert.ok(
-        migrationOutput.includes(`apply ${expected.filename}`),
-        `${expected.filename} executed through the real migration runner`,
-      )
+    const client=await pool.connect()
+    try {
+      const runner=readFileSync(resolve(root,'scripts/db-migrate.mjs'),'utf8')
+      const bootstrap=runner.match(/CREATE TABLE IF NOT EXISTS schema_migrations \(\s+filename text PRIMARY KEY,\s+checksum text,\s+applied_at timestamptz NOT NULL DEFAULT now\(\)\s+\)/)?.[0]
+      assert.ok(bootstrap,'Review changed production ledger bootstrap before historical comparison')
+      await client.query(bootstrap)
+      for(const file of readdirSync(resolve(root,'db/migrations')).filter(f=>/^\d+_.+\.sql$/.test(f)&&f<='0374_crm_interaction_organizations.sql').sort()){
+        const sql=readFileSync(resolve(root,'db/migrations',file),'utf8')
+        await applyMigrationSqlForTest(client,file,sql,{checksum:createHash('sha256').update(sql).digest('hex')})
+      }
+    } finally {client.release()}
+    const baseline=await inspectPreCrmProductionRebindSchemaMetadata(pool)
+    assert.equal(baseline.format,'clawpilot-production-rebind-v9-metadata-only')
+    assert.equal(baseline.schemaDigest,PRE_NATIVE_V9_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
+      'Historical fixture must equal the enrolled pre-native semantic catalog before its earlier projections')
+    const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
+    // This projection is test evidence only. Runtime attestation always hashes
+    // and accepts the complete, unmodified catalog for its enrolled PG major.
+    const v8Catalog = {
+      ...baseline.catalog,
+      triggers: baseline.catalog.triggers.filter((trigger) => !reviewedEmailTriggers.includes(trigger)),
     }
-
-    pool = new Pool({ connectionString: databaseUrl, max: 3 })
-    const applied = await pool.query(
-      `SELECT filename, checksum, applied_at IS NOT NULL AS has_applied_at
-       FROM public.schema_migrations
-       WHERE filename = ANY($1::text[])
-       ORDER BY filename`,
-      [PRODUCTION_REBIND_SCHEMA_MIGRATIONS.map(({ filename }) => filename)],
-    )
-    assert.equal(applied.rowCount, PRODUCTION_REBIND_SCHEMA_MIGRATIONS.length)
-    assert.ok(applied.rows.every((row) => row.has_applied_at === true))
-
-    const baseline = await inspectProductionRebindHistorySchema(pool)
+    assert.equal(productionRebindHistorySchemaDigest(v8Catalog),
+      PRE_REVIEWED_COMPANY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
+      'only the exact four verified 0374 FK pairs explain the change from attestation v8')
     for (const [constraint, relation] of NEW_REFERENCE_CONSTRAINTS) {
       const triggers = baseline.catalog.triggers.filter((trigger) => (
         trigger.constraint === constraint && trigger.relation === relation
@@ -266,7 +537,8 @@ async function exerciseImage(image) {
       NEW_REFERENCE_CONSTRAINTS.has(trigger.constraint)
       || trigger.name === 'app_users_guard_login_address'
     ))
-    assert.equal(addedTriggers.length, 37, 'only the eighteen reviewed FK pairs and login guard are new')
+    assert.equal(addedTriggers.length, NEW_REFERENCE_CONSTRAINTS.size * 2 + 1,
+      'only the individually reviewed FK pairs and login guard are new')
     const addedFunctions = baseline.catalog.functions.filter((fn) => (
       fn.schema === 'public' && fn.name === 'guard_clawpilot_login_address'
     ))
@@ -282,16 +554,16 @@ async function exerciseImage(image) {
     assert.equal(calendarTriggers.length, 8, '0373 adds exactly four referenced-table FK pairs')
     assert.equal(
       productionRebindHistorySchemaDigest({
-        ...baseline.catalog,
-        triggers: baseline.catalog.triggers.filter((trigger) => !calendarTriggers.includes(trigger)),
+        ...v8Catalog,
+        triggers: v8Catalog.triggers.filter((trigger) => !calendarTriggers.includes(trigger)),
       }),
       PRE_CALENDAR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
       'only the reviewed 0373 foreign-key guards explain the change from attestation v7',
     )
     assert.equal(
       productionRebindHistorySchemaDigest({
-        ...baseline.catalog,
-        triggers: baseline.catalog.triggers.filter((trigger) => (
+        ...v8Catalog,
+        triggers: v8Catalog.triggers.filter((trigger) => (
           !gatewayTriggers.includes(trigger) && !calendarTriggers.includes(trigger)
         )),
       }),
@@ -306,8 +578,334 @@ async function exerciseImage(image) {
     assert.equal(
       productionRebindHistorySchemaDigest(projectedPriorCatalog),
       PRIOR_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[baseline.postgresMajor],
-      'the reviewed 0370 through 0373 trigger and function additions alone explain the digest change',
+      'the reviewed 0370 through 0374 trigger and function additions alone explain the digest change',
     )
+    const upgrade=await pool.connect()
+    try {
+      for(const file of readdirSync(resolve(root,'db/migrations')).filter(f=>/^\d+_.+\.sql$/.test(f)
+        &&f>REVIEWED_COMPANY_MIGRATION&&f<INITIAL_ENROLLMENT_MIGRATION).sort()){
+        const sql=readFileSync(resolve(root,'db/migrations',file),'utf8')
+        await applyMigrationSqlForTest(upgrade,file,sql,{checksum:createHash('sha256').update(sql).digest('hex')})
+      }
+    } finally {upgrade.release()}
+    const beforeInitial=await inspectPreInitialEnrollmentProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeInitial.format,'clawpilot-production-rebind-v13-metadata-only')
+    assert.equal(beforeInitial.schemaDigest,PRE_INITIAL_ENROLLMENT_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeInitial.postgresMajor],
+      'Exact through-0397 schema preserves its independently enrolled v13 digest before forward migration 0398')
+    assert.deepEqual(beforeInitial.missingRelations,[])
+    assert.deepEqual(beforeInitial.missingFunctions,[])
+    assert.ok(beforeInitial.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v13 metadata is not a fallback attestation for the current target lacking forward migrations')
+    const initialSql=readFileSync(resolve(root,'db/migrations',INITIAL_ENROLLMENT_MIGRATION),'utf8')
+    const initialClient=await pool.connect()
+    try{await applyMigrationSqlForTest(initialClient,INITIAL_ENROLLMENT_MIGRATION,initialSql,
+      {checksum:createHash('sha256').update(initialSql).digest('hex')})}finally{initialClient.release()}
+    const beforeReplan=await inspectPreInitialReplanProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeReplan.format,'clawpilot-production-rebind-v14-metadata-only')
+    assert.equal(beforeReplan.schemaDigest,PRE_INITIAL_REPLAN_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeReplan.postgresMajor],
+      'Exact through0398 preserves the independently enrolled v14 catalog before0399')
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v14 metadata is not a fallback for a current target lacking0399/0400')
+    const replanSql=readFileSync(resolve(root,'db/migrations',INITIAL_REPLAN_MIGRATION),'utf8')
+    const replanClient=await pool.connect()
+    try{await applyMigrationSqlForTest(replanClient,INITIAL_REPLAN_MIGRATION,replanSql,
+      {checksum:createHash('sha256').update(replanSql).digest('hex')})}finally{replanClient.release()}
+    const beforeQuarantine=await inspectPreInitialDemoQuarantineProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeQuarantine.format,'clawpilot-production-rebind-v15-metadata-only')
+    assert.equal(beforeQuarantine.schemaDigest,
+      PRE_INITIAL_DEMO_QUARANTINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeQuarantine.postgresMajor],
+      'Exact through0399 preserves the independently accepted v15 catalog before0400')
+    assert.deepEqual(beforeQuarantine.missingRelations,[])
+    assert.deepEqual(beforeQuarantine.missingFunctions,[])
+    assert.ok(beforeQuarantine.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v15 metadata is not a fallback for a current target lacking0400/0401')
+    const quarantineSql=readFileSync(resolve(root,'db/migrations',INITIAL_DEMO_QUARANTINE_MIGRATION),'utf8')
+    const quarantineClient=await pool.connect()
+    try{await applyMigrationSqlForTest(quarantineClient,INITIAL_DEMO_QUARANTINE_MIGRATION,quarantineSql,
+      {checksum:createHash('sha256').update(quarantineSql).digest('hex')})}finally{quarantineClient.release()}
+    const beforeOwnerFence=await inspectPreRootOwnerSourceFenceProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeOwnerFence.format,'clawpilot-production-rebind-v16-metadata-only')
+    assert.equal(beforeOwnerFence.schemaDigest,
+      PRE_ROOT_OWNER_SOURCE_FENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeOwnerFence.postgresMajor],
+      'Exact through0400 preserves the independently accepted v16 catalog before0401')
+    assert.deepEqual(beforeOwnerFence.missingRelations,[])
+    assert.deepEqual(beforeOwnerFence.missingFunctions,[])
+    assert.ok(beforeOwnerFence.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+    'Historical v16 metadata is not a fallback for a current v17 target lacking0401')
+    const ownerHelperName='clawpilot_crm_root_native_membership_is_independent'
+    const retainedOwnerHelper=beforeOwnerFence.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
+    assert.ok(retainedOwnerHelper)
+    assert.equal(createHash('sha256').update(retainedOwnerHelper.source).digest('hex'),
+      '1453d556e6f1d460a67ec83147ffbd91dd9347c5b560b92bdf092752e6a7aa20',
+      'The historical v16 owner helper retains the exact independently reviewed 0401 preimage')
+    const ownerSql=readFileSync(resolve(root,'db/migrations',ROOT_OWNER_SOURCE_FENCE_MIGRATION),'utf8')
+    const ownerClient=await pool.connect()
+    try{await applyMigrationSqlForTest(ownerClient,ROOT_OWNER_SOURCE_FENCE_MIGRATION,ownerSql,
+      {checksum:createHash('sha256').update(ownerSql).digest('hex')})}finally{ownerClient.release()}
+    const beforeUnmanaged=await inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(pool)
+    assert.equal(beforeUnmanaged.format,'clawpilot-production-rebind-v17-metadata-only')
+    assert.equal(beforeUnmanaged.schemaDigest,PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[beforeUnmanaged.postgresMajor],
+      'Exact through0401 preserves the independently accepted v17 catalog before0402')
+    assert.deepEqual(beforeUnmanaged.missingRelations,[])
+    assert.deepEqual(beforeUnmanaged.missingFunctions,[])
+    assert.ok(beforeUnmanaged.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    const sourceSnapshot=catalog=>catalog.functions.find(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_native_initial_source_snapshot')
+    assert.ok(sourceSnapshot(beforeQuarantine.catalog))
+    assert.equal(sourceSnapshot(beforeUnmanaged.catalog)?.source,sourceSnapshot(beforeQuarantine.catalog).source,
+      '0400 must preserve the complete historical source snapshot bytes, not filter demo evidence out')
+    assert.equal(sourceSnapshot(beforeUnmanaged.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
+      '0400/0401 must not replace or weaken the historical source snapshot function')
+    const currentOwnerHelper=beforeUnmanaged.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===ownerHelperName)
+    assert.ok(currentOwnerHelper)
+    assert.notEqual(currentOwnerHelper.source,retainedOwnerHelper.source,'0401 changes its one reviewed owner-source predicate')
+    assert.notEqual(currentOwnerHelper.definition,retainedOwnerHelper.definition)
+    const withoutBody=({source,definition,...metadata})=>metadata
+    assert.deepEqual(withoutBody(currentOwnerHelper),withoutBody(retainedOwnerHelper),
+      '0401 preserves the exact owner-helper identity, privileges and execution attributes')
+    for(const key of Object.keys(beforeOwnerFence.catalog)){
+      if(key==='functions'){
+        assert.deepEqual(beforeUnmanaged.catalog.functions.map(fn=>fn===currentOwnerHelper?retainedOwnerHelper:fn),
+          beforeOwnerFence.catalog.functions,'0401 changes no other catalog function')
+      }else assert.deepEqual(beforeUnmanaged.catalog[key],beforeOwnerFence.catalog[key],
+        `0401 preserves the complete historical ${key} catalog`)
+    }
+    const appOnlyName=UNMANAGED_PIPELINE_CLASSIFIER.slice('public.'.length).split('(')[0]
+    const retainedAppOnlyHelper=beforeUnmanaged.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===appOnlyName)
+    assert.ok(retainedAppOnlyHelper)
+    assert.equal(createHash('sha256').update(retainedAppOnlyHelper.source).digest('hex'),
+      '5ba06eacd5fc5dfc5c87343812c023d4c634d41c11c8b8cb804f22c84c0cbf2e',
+      '0402 requires the exact independently retained app-only classifier preimage')
+    // Compare the actual 0402 DDL using one identical current inventory on
+    // both sides. The separately frozen v17 projection above proves history;
+    // expanding that projection to v18 must not masquerade as new SQL DDL.
+    const beforeUnmanagedCurrent=await inspectProductionRebindHistorySchema(pool)
+    assert.deepEqual(beforeUnmanagedCurrent.missingRelations,[])
+    assert.deepEqual([...beforeUnmanagedCurrent.missingFunctions].sort(),[...UNMANAGED_PIPELINE_HELPERS.keys()].sort(),
+      'Before 0402 the current v18 inventory lacks exactly its seven new helper identities')
+    assert.deepEqual(beforeUnmanagedCurrent.migrations.filter(m=>m.filename===UNMANAGED_PIPELINE_MIGRATION).map(m=>[m.rows,m.matchingRows]),[[0,0]])
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+      'Historical v17 metadata never attests a current v18 target lacking0402')
+    command(process.execPath, ['scripts/db-migrate.mjs'], {
+      env: { ...process.env, DATABASE_URL:url.toString(), PGSSLMODE:'disable' }, timeout:180_000,
+    })
+    const completed = await inspectProductionRebindHistorySchema(pool)
+    const afterUnmanagedHistorical=await inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(pool)
+    const changedAppOnlyHelper=afterUnmanagedHistorical.catalog.functions.find(fn=>fn.schema==='public'&&fn.name===appOnlyName)
+    assert.ok(changedAppOnlyHelper)
+    assert.notEqual(changedAppOnlyHelper.source,retainedAppOnlyHelper.source)
+    assert.deepEqual(withoutBody(changedAppOnlyHelper),withoutBody(retainedAppOnlyHelper),
+      '0402 preserves the original app-only classifier identity, privileges and execution attributes')
+    for(const key of Object.keys(beforeUnmanaged.catalog)){
+      if(key==='functions')assert.deepEqual(afterUnmanagedHistorical.catalog.functions.map(fn=>
+        fn===changedAppOnlyHelper?retainedAppOnlyHelper:fn),beforeUnmanaged.catalog.functions,
+        '0402 changes only its reviewed classifier in the complete frozen v17 function projection')
+      else assert.deepEqual(afterUnmanagedHistorical.catalog[key],beforeUnmanaged.catalog[key],
+        `0402 preserves the complete frozen historical ${key} catalog`)
+    }
+    const functionKey=fn=>`${fn.schema}.${fn.name}(${fn.identityArguments})`
+    const beforeFunctions=new Map(beforeUnmanagedCurrent.catalog.functions.map(fn=>[functionKey(fn),fn]))
+    const afterFunctions=new Map(completed.catalog.functions.map(fn=>[functionKey(fn),fn]))
+    assert.equal(beforeFunctions.size,beforeUnmanagedCurrent.catalog.functions.length)
+    assert.equal(afterFunctions.size,completed.catalog.functions.length)
+    assert.equal(afterFunctions.size,beforeFunctions.size+UNMANAGED_PIPELINE_HELPERS.size,
+      'Actual 0402 DDL adds exactly seven functions to the same current v18 inventory')
+    for(const [identity,before] of beforeFunctions){
+      const after=afterFunctions.get(identity)
+      assert.ok(after,`0402 does not remove historical function ${identity}`)
+      if(before.schema==='public'&&before.name===appOnlyName){
+        assert.deepEqual(withoutBody(after),withoutBody(before),
+          'Actual 0402 DDL changes only its existing wrapper body, not execution metadata')
+        assert.equal(after.definition,changedAppOnlyHelper.definition)
+      }else assert.deepEqual(after,before,`0402 leaves existing function ${identity} unchanged`)
+    }
+    const addedUnmanagedFunctions=[]
+    for(const [identity,fn] of afterFunctions)if(!beforeFunctions.has(identity))addedUnmanagedFunctions.push(fn)
+    assert.deepEqual(addedUnmanagedFunctions.map(fn=>`${fn.schema}.${fn.name}`).sort(),
+      [...UNMANAGED_PIPELINE_HELPERS.keys()].map(identity=>identity.split('(')[0]).sort(),
+      'The only actual 0402 function additions are its seven exact named helpers')
+    for(const key of Object.keys(beforeUnmanagedCurrent.catalog))if(key!=='functions'){
+      assert.deepEqual(completed.catalog[key],beforeUnmanagedCurrent.catalog[key],
+        `Actual 0402 DDL leaves the identical v18 ${key} inventory unchanged`)
+    }
+    assert.deepEqual(completed.missingRelations,[])
+    assert.deepEqual(completed.missingFunctions,[])
+    console.log(`PG${completed.postgresMajor}: exact 0402 DDL delta is seven helper additions and one wrapper replacement; identical v18 relation/column/constraint/index/trigger inventories unchanged`)
+    assert.equal(sourceSnapshot(completed.catalog)?.definition,sourceSnapshot(beforeQuarantine.catalog).definition,
+      '0402 preserves exact source snapshot bytes and every retained demo source row')
+    assert.notDeepEqual(completed.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
+      currentBaseline.catalog.triggers.filter(t=>t.internal).map(t=>t.name),
+      'Second database must exercise genuinely different generated trigger OIDs')
+    assert.equal(completed.schemaDigest, currentBaseline.schemaDigest,
+      'Equivalent migrated databases with different OID allocation have identical v18 fingerprints')
+    await attestProductionRebindHistorySchema(pool)
+    console.log(`PG${completed.postgresMajor}: second-database historical upgrade and OID-independent attestation passed`)
+    return Object.freeze({rootOwnerBeforeDefinition:retainedOwnerHelper.definition,
+      appOnlyBeforeDefinition:retainedAppOnlyHelper.definition})
+  } finally {await pool.end()}
+}
+
+async function exerciseImage(image) {
+  checkedTamperCases = 0
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
+  const container = `clawpilot-target-schema-attestation-${suffix}`
+  const password = `target-schema-attestation-${suffix}`
+  let pool
+  command('docker', disposablePostgresDockerArgs([
+    'run', '--detach', '--rm', '--name', container,
+    '--env', `POSTGRES_PASSWORD=${password}`,
+    '--env', 'POSTGRES_DB=clawpilot_target_schema_attestation',
+    '--publish', '127.0.0.1::5432',
+    image,
+  ]))
+  try {
+    const portOutput = command('docker', ['port', container, '5432/tcp']).trim()
+    const port = portOutput.slice(portOutput.lastIndexOf(':') + 1)
+    assert.match(port, /^\d+$/u, 'Docker published a PostgreSQL port')
+    const databaseUrl =
+      `postgresql://postgres:${password}@127.0.0.1:${port}/clawpilot_target_schema_attestation`
+    await waitForPostgres(databaseUrl)
+
+    // Use the production migration runner against a blank database. This is
+    // intentionally not a hand-built fixture: the real 0349, 0353-0359,
+    // 0370 through 0402
+    // migrations, their prerequisites, and their real ledger rows execute.
+    const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        PGSSLMODE: 'disable',
+      },
+      timeout: 180_000,
+    })
+    for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
+      assert.ok(
+        migrationOutput.includes(`apply ${expected.filename}`),
+        `${expected.filename} executed through the real migration runner`,
+      )
+    }
+
+    pool = new Pool({ connectionString: databaseUrl, max: 1 })
+    const applied = await pool.query(
+      `SELECT filename, checksum, applied_at IS NOT NULL AS has_applied_at
+       FROM public.schema_migrations
+       WHERE filename = ANY($1::text[])
+       ORDER BY filename`,
+      [PRODUCTION_REBIND_SCHEMA_MIGRATIONS.map(({ filename }) => filename)],
+    )
+    assert.equal(applied.rowCount, PRODUCTION_REBIND_SCHEMA_MIGRATIONS.length)
+    assert.ok(applied.rows.every((row) => row.has_applied_at === true))
+
+    const baseline = await inspectProductionRebindHistorySchema(pool)
+    // Both source/check and referenced/action FK triggers are now enrolled.
+    // These historical mutation probes specifically target the referenced
+    // table's action pair; never select a source trigger by array position.
+    const gatewayTriggers = baseline.catalog.triggers.filter(t=>GATEWAY_REFERENCE_CONSTRAINTS.get(t.constraint)===t.relation)
+    const calendarTriggers = baseline.catalog.triggers.filter(t=>CALENDAR_REFERENCE_CONSTRAINTS.get(t.constraint)===t.relation)
+    // This is serial acceptance; do not retain idle catalog-heavy backends in
+    // both databases inside the deliberately bounded disposable container.
+    await pool.end(); pool = undefined
+    const historical = await verifyHistoricalCatalogCompatibility(databaseUrl, baseline)
+    pool = new Pool({ connectionString: databaseUrl, max: 1 })
+    const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
+    await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog, CURRENT_CRM_REFERENCE_CONSTRAINTS)
+    const initialTriggers=baseline.catalog.triggers.filter(t=>t.name.startsWith('crm_native_initial_'))
+    assert.equal(initialTriggers.length,INITIAL_ENROLLMENT_TRIGGERS.length,
+      'Every initial-enrollment trigger is directly fingerprinted, including the 0400 Product source fences')
+    for(const [table,name,typeMask,fn,deferred=false] of INITIAL_ENROLLMENT_TRIGGERS){
+      const installed=initialTriggers.filter(t=>t.name===name&&t.relation===`public.${table}`)
+      assert.equal(installed.length,1,`${table}.${name}`)
+      assert.equal(installed[0].enabled,'O');assert.equal(installed[0].typeMask,typeMask)
+      assert.equal(installed[0].internal,false);assert.equal(installed[0].function,`public.${fn}()`)
+      assert.equal(installed[0].deferrable,deferred);assert.equal(installed[0].initiallyDeferred,deferred)
+    }
+    for(const [table,columns] of INITIAL_SOURCE_UPDATE_COLUMNS){
+      const name=table==='crm_products'?'crm_native_initial_demo_product_source_update_fence':'crm_native_initial_source_update_fence'
+      const selected=await pool.query(`SELECT ARRAY(SELECT a.attname::text
+        FROM unnest(t.tgattr::smallint[]) WITH ORDINALITY chosen(attnum,position)
+        JOIN pg_catalog.pg_attribute a ON a.attrelid=t.tgrelid AND a.attnum=chosen.attnum ORDER BY chosen.position) AS columns
+        FROM pg_catalog.pg_trigger t WHERE t.tgrelid=$1::regclass AND t.tgname=$2`,[`public.${table}`,name])
+      assert.deepEqual(selected.rows,[{columns}],`${table} freezes exactly its source snapshot authority keys`)
+    }
+    for(const [name,relation,typeMask,fn] of [
+      ['crm_native_email_user_authority','public.app_users',29,'clawpilot_native_email_authority_row_guard'],
+      ['crm_native_email_user_statement','public.app_users',46,'clawpilot_native_email_authority_statement_lock'],
+      ['crm_native_email_user_update_statement','public.app_users',18,'clawpilot_native_email_authority_statement_lock'],
+      ['crm_native_authority_workspace_snapshot','public.workspace_organizations',19,'clawpilot_native_email_transition_snapshot_guard'],
+      ['crm_native_authority_workspace_snapshot_lock','public.workspace_organizations',18,'clawpilot_native_email_transition_lock'],
+      ['crm_native_email_workspace_hierarchy_guard','public.workspace_organizations',27,'clawpilot_native_email_transition_snapshot_guard'],
+      ['crm_native_email_workspace_hierarchy_statement','public.workspace_organizations',58,'clawpilot_native_email_authority_statement_lock'],
+      ['app_users_keep_issued_employee_identity','public.app_users',19,'clawpilot_keep_issued_employee_identity'],
+      ['crm_native_identity_metadata_statement','public.app_users',18,'clawpilot_native_email_transition_lock'],
+      ['crm_native_identity_metadata_guard','public.app_users',19,'clawpilot_native_email_identity_metadata_guard'],
+      ['crm_root_session_guard','public.app_sessions',23,'clawpilot_crm_root_session_guard'],
+      ['crm_native_root_membership_source','public.app_user_organization_memberships',31,'clawpilot_crm_native_root_source_guard'],
+    ]){
+      const installed=baseline.catalog.triggers.filter(t=>t.name===name&&t.relation===relation)
+      assert.equal(installed.length,1,name)
+      assert.equal(installed[0].enabled,'O');assert.equal(installed[0].typeMask,typeMask)
+      assert.equal(installed[0].internal,false);assert.equal(installed[0].function,`public.${fn}()`)
+    }
+    const functionNames=new Set(baseline.catalog.functions.filter(f=>f.schema==='public').map(f=>f.name))
+    for(const f of baseline.catalog.functions)for(const [,called] of f.source.matchAll(/public\.((?:clawpilot_|global_reference_)[a-z_]+)\s*\(/g))
+      assert.ok(functionNames.has(called),`Called helper ${called} must have its runtime body fingerprinted`)
+    const quarantineHelper=baseline.catalog.functions.filter(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_native_initial_demo_quarantine')
+    assert.equal(quarantineHelper.length,1,'0400 enrolls one exact quarantine helper identity')
+    assert.equal(quarantineHelper[0].result,'boolean')
+    assert.equal(quarantineHelper[0].argumentCount,2)
+    assert.equal(quarantineHelper[0].defaultArgumentCount,0)
+    assert.equal(quarantineHelper[0].returnsSet,false)
+    assert.equal(quarantineHelper[0].strict,false,'NULL source identities must return false, never SQL UNKNOWN')
+    assert.equal(quarantineHelper[0].volatility,'s','Quarantine is a stable read-only predicate')
+    assert.equal(quarantineHelper[0].securityDefiner,false,'Quarantine never elevates the attesting principal')
+    assert.equal(quarantineHelper[0].aclIsDefault,false,'Quarantine helper execution is explicitly restricted')
+    assert.ok(!quarantineHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
+      'PUBLIC must not execute the quarantine predicate')
+    const ownerHelper=baseline.catalog.functions.filter(fn=>fn.schema==='public'
+      &&fn.name==='clawpilot_crm_root_native_membership_is_independent')
+    assert.equal(ownerHelper.length,1,'0401 retains one exact pre-existing owner-source helper')
+    assert.equal(ownerHelper[0].result,'boolean')
+    assert.equal(ownerHelper[0].argumentCount,2)
+    assert.equal(ownerHelper[0].defaultArgumentCount,0)
+    assert.equal(ownerHelper[0].language,'plpgsql')
+    assert.equal(ownerHelper[0].volatility,'v')
+    assert.equal(ownerHelper[0].securityDefiner,false)
+    assert.equal(ownerHelper[0].strict,false)
+    assert.equal(ownerHelper[0].returnsSet,false)
+    assert.equal(ownerHelper[0].aclIsDefault,false)
+    assert.ok(!ownerHelper[0].acl.some(entry=>entry.grantee==='PUBLIC'),
+      '0401 does not grant PUBLIC execution of owner-source classification')
+    const unmanagedSql=readFileSync(resolve(root,'db/migrations',UNMANAGED_PIPELINE_MIGRATION),'utf8')
+    for(const [identity,expected] of UNMANAGED_PIPELINE_HELPERS){
+      const name=identity.slice('public.'.length).split('(')[0]
+      const installed=baseline.catalog.functions.filter(fn=>fn.schema==='public'&&fn.name===name)
+      assert.equal(installed.length,1,`${identity} has one exact installed identity`)
+      const fn=installed[0]
+      assert.equal(fn.result,expected.result,identity)
+      assert.equal(fn.argumentCount,expected.arguments,identity)
+      assert.equal(fn.language,expected.language,identity)
+      assert.equal(fn.volatility,expected.volatility,identity)
+      assert.equal(fn.defaultArgumentCount,0,identity)
+      assert.equal(fn.strict,false,identity)
+      assert.equal(fn.returnsSet,false,identity)
+      assert.equal(fn.securityDefiner,false,identity)
+      assert.equal(fn.aclIsDefault,false,identity)
+      assert.ok(!fn.acl.some(entry=>entry.grantee==='PUBLIC'),identity)
+      assert.equal(fn.configuration.length,1,identity)
+      assert.match(fn.configuration[0],/^search_path=pg_catalog,\s*public$/u,identity)
+      const source=unmanagedSql.match(new RegExp('CREATE FUNCTION '+name+'\\([\\s\\S]*?AS \\$\\$([\\s\\S]*?)\\$\\$;'))?.[1]
+      assert.ok(source,`${identity} source is present in frozen 0402`)
+      assert.equal(fn.source,source,`${identity} executes the exact frozen migration body`)
+    }
     assert.deepEqual(baseline.missingRelations, [])
     assert.deepEqual(baseline.missingFunctions, [])
     assert.equal(
@@ -417,14 +1015,179 @@ async function exerciseImage(image) {
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} target schema digest ${baseline.schemaDigest}`)
+    console.log(`${image} candidate v18 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
 
+    const initialFunctionIdentities=[...new Set(INITIAL_ENROLLMENT_TRIGGERS.map(([, , ,fn])=>`public.${fn}()`))]
+      .filter(identity=>identity.startsWith('public.clawpilot_crm_native_initial_'))
+    for(const identity of [...PRODUCTION_REBIND_CRM_GUARD_HELPERS,...initialFunctionIdentities]){
+      const name=identity.slice('public.'.length).split('(')[0]
+      const fn=baseline.catalog.functions.find(f=>f.schema==='public'&&f.name===name)
+      assert.ok(fn,identity)
+      assert.ok(['sql','plpgsql'].includes(fn.language),identity)
+      // A raising PL/pgSQL body is valid for scalar and table-returning
+      // helpers alike. No helper runs during catalog inspection, so this
+      // tests actual body replacement without inventing its return shape.
+      const changed=fn.definition.replace(/LANGUAGE sql\b/,'LANGUAGE plpgsql')
+        .replace(/(AS \$function\$)[\s\S]*?(\$function\$)/,
+          "$1BEGIN RAISE EXCEPTION 'attestation tamper fixture'; END;$2")
+      assert.notEqual(changed,fn.definition,'Replace the actual helper body')
+      await expectFailure(pool,'schema_catalog_mismatch',`${identity} helper body tamper`,tx=>tx.query(changed))
+    }
+    for(const [table,name] of INITIAL_ENROLLMENT_TRIGGERS) await expectFailure(pool,'schema_catalog_mismatch',
+      `0398 ${table}.${name} disabled`,tx=>tx.query(`ALTER TABLE public.${table} DISABLE TRIGGER ${name}`))
+    for(const constraint of baseline.catalog.constraints.filter(c=>c.type==='c'&&(
+      ['public.crm_native_email_initial_enrollments','public.crm_native_email_initial_reservations'].includes(c.relation)
+      ||c.name==='crm_native_email_initial_exclusive'))){
+      await expectFailure(pool,'schema_catalog_mismatch',`0398 missing ${constraint.name}`,tx=>tx.query(
+        `ALTER TABLE ${constraint.relation} DROP CONSTRAINT ${constraint.name}`))
+    }
+    for(const relation of [...INITIAL_ENROLLMENT_RELATIONS,'public.crm_products']) await expectFailure(pool,'schema_catalog_mismatch',
+      `Initial enrollment ${relation} PUBLIC read privilege drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
+    for(const identity of ['public.clawpilot_crm_native_initial_source_snapshot()',
+      'public.clawpilot_crm_native_initial_shape(jsonb,text[])','public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
+      'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER,...initialFunctionIdentities]){
+      await expectFailure(pool,'schema_catalog_mismatch',`0398 ${identity} PUBLIC execution drift`,tx=>tx.query(
+        `GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
+    }
+    await expectFailure(pool,'schema_object_missing','0398 missing source snapshot helper',tx=>tx.query(
+      'DROP FUNCTION public.clawpilot_crm_native_initial_source_snapshot()'))
+    for(const identity of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
+      'public.clawpilot_crm_native_initial_replan_context(text,text,text)',INITIAL_DEMO_QUARANTINE_HELPER]) await expectFailure(pool,'schema_object_missing',
+      `Forward enrollment missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity}`))
+    for(const [label,alteration] of [['security definer','SECURITY DEFINER'],
+      ['NULL becomes UNKNOWN','STRICT'],['mutable predicate','VOLATILE']]) await expectFailure(pool,'schema_catalog_mismatch',
+      `0400 quarantine ${label}`,tx=>tx.query(`ALTER FUNCTION ${INITIAL_DEMO_QUARANTINE_HELPER} ${alteration}`))
+    for(const name of ['crm_native_initial_demo_product_source_fence','crm_native_initial_demo_product_source_update_fence']){
+      await expectFailure(pool,'schema_catalog_mismatch',`0400 Product missing ${name}`,tx=>tx.query(
+        `DROP TRIGGER ${name} ON public.crm_products`))
+    }
+    await expectFailure(pool,'schema_catalog_mismatch','0400 Product source INSERT/DELETE/TRUNCATE coverage reduced',async tx=>{
+      await tx.query('DROP TRIGGER crm_native_initial_demo_product_source_fence ON public.crm_products')
+      await tx.query(`CREATE TRIGGER crm_native_initial_demo_product_source_fence BEFORE INSERT OR DELETE ON public.crm_products
+        FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
+    })
+    await expectFailure(pool,'schema_catalog_mismatch','0400 Product source UPDATE authority key coverage reduced',async tx=>{
+      await tx.query('DROP TRIGGER crm_native_initial_demo_product_source_update_fence ON public.crm_products')
+      await tx.query(`CREATE TRIGGER crm_native_initial_demo_product_source_update_fence BEFORE UPDATE OF id,pipeline_id,suitecrm_id ON public.crm_products
+        FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
+    })
+    await expectFailure(pool,'schema_catalog_mismatch','0401 historical owner-source bypass restored',tx=>tx.query(
+      historical.rootOwnerBeforeDefinition))
+    await expectFailure(pool,'schema_catalog_mismatch','0401 owner-source PUBLIC execution drift',tx=>tx.query(
+      `GRANT EXECUTE ON FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER} TO PUBLIC`))
+    await expectFailure(pool,'schema_catalog_mismatch','0401 owner-source SECURITY DEFINER drift',tx=>tx.query(
+      `ALTER FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER} SECURITY DEFINER`))
+    await expectFailure(pool,'schema_object_missing','0401 missing owner-source helper',tx=>tx.query(
+      `DROP FUNCTION ${ROOT_OWNER_SOURCE_FENCE_HELPER}`))
+    await expectFailure(pool,'schema_catalog_mismatch','0402 old global app-only sharing hold restored',tx=>tx.query(
+      historical.appOnlyBeforeDefinition))
+    for(const [identity,expected] of UNMANAGED_PIPELINE_HELPERS){
+      await expectFailure(pool,'schema_object_missing',`0402 missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity}`))
+      for(const [label,alteration] of [['PUBLIC execution',null],['SECURITY DEFINER','SECURITY DEFINER'],
+        ['NULL handling','STRICT'],['search path','SET search_path=public,pg_catalog'],
+        ['volatility',expected.volatility==='v'?'STABLE':'VOLATILE']]){
+        await expectFailure(pool,'schema_catalog_mismatch',`0402 ${identity} ${label} drift`,tx=>tx.query(alteration
+          ?`ALTER FUNCTION ${identity} ${alteration}`:`GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
+      }
+    }
+    for(const relation of UNMANAGED_PIPELINE_RELATIONS){
+      await expectFailure(pool,'schema_object_missing',`0402 missing footprint relation ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
+      await expectFailure(pool,'schema_catalog_mismatch',`0402 ${relation} PUBLIC read drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
+      const column=relation==='public.workspace_tenant_retirement_receipts'?'suitecrm_records'
+        :['public.crm_inbound_message_links','public.crm_integration_action_attempts'].includes(relation)?'id':'pipeline_id'
+      const actualColumn=relation==='public.crm_inbound_message_links'?'inbound_message_id':column
+      await expectFailure(pool,'schema_catalog_mismatch',`0402 ${relation}.${actualColumn} removed`,tx=>tx.query(
+        `ALTER TABLE ${relation} DROP COLUMN ${actualColumn} CASCADE`))
+    }
+    await expectFailure(pool,'schema_catalog_mismatch','0402 inbound footprint lookup index removed',tx=>tx.query(
+      'DROP INDEX public.idx_crm_inbound_messages_pipeline_time'))
+    for(const relation of ['public.crm_native_email_initial_enrollments','public.crm_native_email_initial_reservations']){
+      await expectFailure(pool,'schema_object_missing',`0398 missing retained ledger ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
+    }
+    await expectFailure(pool,'schema_catalog_mismatch','0398 source UPDATE authority key coverage reduced',async tx=>{
+      await tx.query('DROP TRIGGER crm_native_initial_source_update_fence ON public.app_users')
+      await tx.query(`CREATE TRIGGER crm_native_initial_source_update_fence BEFORE UPDATE OF email ON public.app_users
+        FOR EACH STATEMENT EXECUTE FUNCTION public.clawpilot_crm_native_initial_source_fence()`)
+    })
+    await expectFailure(pool,'schema_object_missing','missing unshared-workspace helper',tx=>tx.query(
+      'DROP FUNCTION public.clawpilot_native_email_unshared_workspace_is_independent(text,jsonb,jsonb)'))
+    await expectFailure(pool,'schema_catalog_mismatch','missing committed native receipt lookup index',tx=>tx.query(
+      'DROP INDEX public.crm_native_authority_committed_receipt_lookup'))
+    await expectFailure(pool,'schema_catalog_mismatch','missing exact root registry ledger guard',tx=>tx.query(
+      'ALTER TABLE public.crm_native_email_authority_root_changes DISABLE TRIGGER crm_native_root_change_guard'))
+
     for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
       await expectLedgerFailure(pool, expected.filename)
     }
+    await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
+    await expectLedgerFailure(pool, INITIAL_ENROLLMENT_MIGRATION, true)
+    await expectLedgerFailure(pool, INITIAL_DEMO_QUARANTINE_MIGRATION, true)
+    await expectLedgerFailure(pool, ROOT_OWNER_SOURCE_FENCE_MIGRATION, true)
+
+    for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 missing ${constraint}`,
+        (client) => client.query(`ALTER TABLE ${expected.relation} DROP CONSTRAINT ${constraint}`))
+      for (const [label, actions] of [
+        ['DELETE CASCADE', 'ON DELETE CASCADE'],
+        ['UPDATE CASCADE', `ON UPDATE CASCADE ON DELETE ${expected.deleteAction === 'n' ? 'SET NULL' : 'NO ACTION'}`],
+      ]) {
+        await expectFailure(pool, 'schema_catalog_mismatch', `0374 altered ${constraint} ${label}`,
+          (client) => client.query(`ALTER TABLE ${expected.relation}
+            DROP CONSTRAINT ${constraint}, ADD CONSTRAINT ${constraint}
+              FOREIGN KEY (${expected.column}) REFERENCES public.app_users(email) ${actions}`))
+      }
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 deferred ${constraint} without replacing trigger identities`,
+        (client) => client.query(`ALTER TABLE ${expected.relation}
+          ALTER CONSTRAINT ${constraint} DEFERRABLE INITIALLY DEFERRED`))
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 renamed ${constraint}`,
+        (client) => client.query(`ALTER TABLE ${expected.relation}
+          RENAME CONSTRAINT ${constraint} TO unreviewed_email_fkey`))
+    }
+    for (const trigger of reviewedEmailTriggers) {
+      await expectFailure(pool, 'schema_catalog_mismatch', `0374 disabled ${trigger.constraint} action trigger ${trigger.typeMask}`,
+        (client) => client.query(`ALTER TABLE public.app_users DISABLE TRIGGER "${trigger.name}"`))
+    }
+    for (const [constraint, expected] of CURRENT_CRM_REFERENCE_CONSTRAINTS) {
+      const targetRelation=expected.targetRelation??'public.app_users',targetColumn=expected.targetColumn??'email'
+      await expectFailure(pool,'schema_catalog_mismatch',`CRM missing ${constraint}`,tx=>tx.query(
+        `ALTER TABLE ${expected.relation} DROP CONSTRAINT ${constraint}`))
+      await expectFailure(pool,'schema_catalog_mismatch',`CRM altered ${constraint} delete action`,tx=>tx.query(
+        `ALTER TABLE ${expected.relation} DROP CONSTRAINT ${constraint}, ADD CONSTRAINT ${constraint}
+          FOREIGN KEY (${expected.column}) REFERENCES ${targetRelation}(${targetColumn}) ON DELETE CASCADE`))
+      for(const trigger of baseline.catalog.triggers.filter(t=>t.constraint===constraint&&t.relation===targetRelation))
+        await expectFailure(pool,'schema_catalog_mismatch',`CRM disabled ${constraint} guard ${trigger.typeMask}`,tx=>tx.query(
+          `ALTER TABLE ${targetRelation} DISABLE TRIGGER "${trigger.name}"`))
+    }
+    for(const relation of PRODUCTION_REBIND_CRITICAL_RELATIONS.filter(name=>
+      name.startsWith('public.crm_native_email_')||name.startsWith('public.crm_operator_')
+      ||name==='public.crm_root_employee_access_grants'||name==='public.app_sessions')){
+      await expectFailure(pool,'schema_catalog_mismatch',`${relation} PUBLIC read privilege drift`,tx=>tx.query(
+        `GRANT SELECT ON ${relation} TO PUBLIC`))
+    }
+    for(const name of ['crm_native_identity_metadata_guard','crm_native_identity_metadata_statement',
+      'crm_root_session_guard','crm_native_root_membership_source','crm_employee_grants_guard']){
+      const trigger=baseline.catalog.triggers.find(t=>t.name===name)
+      assert.ok(trigger,`${name} is included in the complete inventory`)
+      await expectFailure(pool,'schema_catalog_mismatch',`${name} disabled`,tx=>tx.query(
+        `ALTER TABLE ${trigger.relation} DISABLE TRIGGER "${name}"`))
+    }
+    const conditional=baseline.catalog.triggers.find(t=>t.name==='crm_root_membership_changed_sessions')
+    assert.ok(conditional?.when?.includes('old.')&&conditional.when.includes('new.'),
+      'Actual OLD/NEW trigger qualification is rendered and retained completely')
+    const alteredCondition=conditional.definition.replace(/ WHEN \([\s\S]*\) EXECUTE FUNCTION /,
+      ' WHEN (false) EXECUTE FUNCTION ')
+    assert.notEqual(alteredCondition,conditional.definition,'Change only the actual WHEN predicate')
+    await expectFailure(pool,'schema_catalog_mismatch','OLD/NEW eligibility predicate replaced',async tx=>{
+      await tx.query(`DROP TRIGGER "${conditional.name}" ON ${conditional.relation}`)
+      await tx.query(alteredCondition)
+    })
+    await expectFailure(pool, 'schema_catalog_mismatch', 'unreviewed additional referenced-table FK pair',
+      (client) => client.query(`CREATE TABLE public.rebind_unreviewed_fk_fixture (
+        owner_email text REFERENCES public.app_users(email)
+      )`))
 
     for (const [constraint] of GATEWAY_REFERENCE_CONSTRAINTS) {
       const referencedGuard = gatewayTriggers.find((trigger) => trigger.constraint === constraint)
@@ -661,12 +1424,18 @@ async function exerciseImage(image) {
       client.release()
     }
     await attestProductionRebindHistorySchema(pool)
+    console.log(`${image}: ${checkedTamperCases} catalog/ledger tamper refusals passed; final transaction-lock check passed`)
+  } catch (error) {
+    try {console.error('Disposable fixture state:', command('docker', ['inspect','--format','{{json .State}}',container]).trim())}
+    catch {/* Preserve the original test error if Docker is unavailable. */}
+    throw error
   } finally {
     if (pool) await pool.end().catch(() => undefined)
     command('docker', disposablePostgresDockerCleanupArgs(container), { stdio: 'ignore' })
   }
 }
 
-for (const image of images) await exerciseImage(image)
-
-console.log(`production rebind target schema attestation passed (${images.join(', ')})`)
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  for (const image of images) await exerciseImage(image)
+  console.log(`production rebind target schema attestation passed (${images.join(', ')})`)
+}

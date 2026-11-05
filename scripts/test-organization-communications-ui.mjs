@@ -34,13 +34,29 @@ for (const fragment of [
   'selectedConnection?.selectionError',
   "? 'Pending'",
   "? 'Failed'",
-  "? 'Active'",
+  "? 'Organization default'",
   "? 'Disabled'",
-  "'Not connected'",
+  "'No organization default'",
+  'Selections are not saved until you use the Save default button below.',
+  'Save {label} default',
   'Refresh status',
 ]) {
   assert.ok(settings.includes(fragment), `Organization communication settings UI missing ${fragment}`)
 }
+
+const organizationSettings = settings.slice(
+  settings.indexOf('<Box component="section" aria-labelledby="organization-communications-heading">'),
+  settings.indexOf('Organization communication identities are not available for this role.'),
+)
+assert.ok(
+  !organizationSettings.includes("'Not connected'")
+    && !organizationSettings.includes('`Connect ${label}`'),
+  'Organization defaults must not imply that an available personal provider connection is disconnected',
+)
+assert.ok(
+  settings.includes("if (normalized === 'organization default') return 'success'"),
+  'The explicit saved-organization-default badge must retain the active success color',
+)
 
 assert.ok(
   settings.indexOf('Organization communication identities')
@@ -111,9 +127,11 @@ for (const fragment of [
   'label="Custom duration (minutes)"',
   'label="Ends"',
   'InputProps={{ readOnly: true }}',
-  "if (status === 'sent' || status === 'scheduled') return 'Delivered'",
-  "if (status === 'not-configured') return 'Not configured'",
-  "return textValue(record, 'calendarDeliveryStatus')",
+  'meetingCalendarPresentation(record).label',
+  'meetingDisplayRows(records, groupRecurringMeetings, Date.now())',
+  'Show every occurrence',
+  'Group recurring meetings',
+  'Grouped within loaded results; next occurrence shown.',
   "{entity === 'meetings' ? 'SuiteCRM' : 'Sync'}",
   'aria-label="Meeting delivery status"',
   'label="Meeting status"',
@@ -200,7 +218,7 @@ assert.ok(
   'Meeting delivery must stay disabled until a provider-verified writable Calendar is selected',
 )
 assert.ok(
-  crm.includes("label={`Calendar: ${meetingCalendarStatusLabel(meetingCalendarDeliveryValue(editorRecord))}`}")
+  crm.includes("label={`Calendar: ${meetingCalendarPresentation(editorRecord).label}`}")
     && crm.includes("label={`SuiteCRM: ${suiteCrmSyncStatusLabel(editorRecord.syncStatus)}`}"),
   'Meeting details must render Calendar delivery and SuiteCRM sync independently',
 )
@@ -253,5 +271,7 @@ for (const fragment of [
 ]) {
   assert.ok(mobileAcceptance.includes(fragment), `Rendered meeting acceptance missing ${fragment}`)
 }
+
+await import('./test-maton-organization-default-ui.mjs')
 
 console.log('Organization communication and meeting UI source checks passed.')

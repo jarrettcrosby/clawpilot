@@ -1,3 +1,5 @@
+import type { SuiteCrmEmailProjection } from '@/lib/crm/suiteCrmNativeEmailProjection'
+
 export const CRM_ENTITIES = [
   'organizations',
   'contacts',
@@ -204,6 +206,16 @@ export type CrmOpportunityContact = {
   phoneMobile: string
   jobTitle: string
   isPrimary: boolean
+  organizationId?: string | null
+  organizationName?: string
+  organizationReferenceCode?: string | null
+}
+
+export type CrmInteractionOrganization = {
+  id: string
+  referenceCode: string
+  name: string
+  isPrimary: boolean
 }
 
 export type CrmOpportunity = {
@@ -245,6 +257,10 @@ export type CrmInteraction = {
   pipelineId: string
   organizationId: string | null
   organizationName: string
+  organizationIds?: string[]
+  organizations?: CrmInteractionOrganization[]
+  companyAssociationsReviewed?: boolean
+  canonicalEmail?: boolean
   contactId: string | null
   contactName: string
   contactIds: string[]
@@ -346,6 +362,8 @@ export type CrmMeeting = {
   joinUrl: string | null
   calendarDeliveryStatus: 'not-configured' | 'queued' | 'sent' | 'failed' | 'cancelled' | null
   calendarDeliveryError: string | null
+  calendarImported?: boolean
+  recurringEventId?: string | null
   calendarOwnerEmail: string | null
   calendarConnectionId: string | null
   calendarOrganizerEmail: string | null
@@ -431,6 +449,7 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmModule?: SuiteCrmInteractionModule
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
+  emailProjection?: SuiteCrmEmailProjection
   currencyCode?: string
   productImage?: {
     referenceCode: string

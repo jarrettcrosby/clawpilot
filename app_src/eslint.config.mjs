@@ -11,6 +11,8 @@ const eslintConfig = defineConfig([
     ".next/**",
     "out/**",
     "build/**",
+    // Private operator bundles are compiled output; lint their TypeScript source.
+    "dist/**",
     "next-env.d.ts",
   ]),
 ]);

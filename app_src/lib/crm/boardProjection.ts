@@ -10,6 +10,7 @@ import {
   updateCrmDescriptionWithClient,
 } from '@/lib/persistence/crm'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { shortLinkUrl } from '@/lib/shortlinks'
 
 const CRM_BOARD_NAME = 'crm board'
@@ -138,7 +139,22 @@ function newCrmCard(boardId: string, record: CrmBoardRecord, now: string): Task 
 }
 
 export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardBinding | null> {
+  // The normal, already-bound read must not serialize dashboard requests on
+  // native publication. A missing binding is rechecked under locks below.
+  const current = await query<CrmBoardBinding & { board_name: string; owner_organization_id: string | null }>(
+    `SELECT board.id::text AS board_id, projection.pipeline_id::text,
+       projection.workspace_organization_id::text, board.owner_email,
+       board.workspace_organization_id::text AS owner_organization_id, board.name AS board_name
+     FROM project_boards board
+     LEFT JOIN crm_board_projections projection ON projection.board_id = board.id
+     WHERE board.id = $1::uuid`, [boardId],
+  )
+  const binding = current.rows[0]
+  if (!binding || binding.board_name.trim().toLowerCase() !== CRM_BOARD_NAME || !binding.owner_organization_id) return null
+  if (binding.pipeline_id && binding.workspace_organization_id === binding.owner_organization_id) return binding
   return withTransaction(async (client) => {
+    // Repairing a missing binding can also create an explicit pipeline reader.
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const selected = await client.query<CrmBoardBinding & {
       board_name: string
       owner_organization_id: string | null
@@ -485,6 +501,7 @@ export async function updateCrmBoardTaskDescription(input: {
     // Match stage/archive order before taking either card or CRM row locks.
     // The first read only discovers the lifecycle key; the locked read below
     // must still match the exact card and board binding observed here.
+    await lockCrmNativeEmailAuthorityWithClient(client)
     const discovered = await client.query<{
       pipeline_id: string; workspace_organization_id: string; entity_type: string;
       entity_id: string; reference_code: string

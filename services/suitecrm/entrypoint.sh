@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Restriction only: this branch cannot install, enroll, activate or release
+# anything. It runs before PHP, version/config validation or bootstrap writers.
+# Clearing the flag still reaches the unchanged fail-closed startup checker.
+case "${CLAWPILOT_NATIVE_INITIAL_MAINTENANCE:-0}" in
+  1) cd /; exec python3 -B /opt/clawpilot/native-email-maintenance.py ;;
+  0|'') ;;
+  *) echo '[suitecrm] maintenance selector must be 0 or 1' >&2; exit 1 ;;
+esac
+
 APP_ROOT=/var/lib/suitecrm/app
 VERSION_MARKER="/var/lib/suitecrm/.installed-${SUITECRM_VERSION}"
 
@@ -8,6 +17,23 @@ VERSION_MARKER="/var/lib/suitecrm/.installed-${SUITECRM_VERSION}"
 # first install. Move out of it before bootstrapping so child processes inherit
 # a valid working directory.
 cd /
+
+# Observe retained offline journals before URL config, OAuth/bootstrap or cache
+# writers can run. Never auto-apply a patch/package or release an initial hold.
+CLAWPILOT_NATIVE_RUNTIME_MODE="$(php /opt/clawpilot/native-email-startup-check.php)"
+case "$CLAWPILOT_NATIVE_RUNTIME_MODE" in
+  enrolled)
+    # The fixed root startup verifier already checked immutable Apache bytes,
+    # historical PG origin and the complete CURRENT native invariants. Never
+    # run setup/config/OAuth/principal/cache/messenger/version-marker writers
+    # again on this volume. Background workers remain deliberately disabled.
+    [[ "${PORT:-8080}" == "8080" ]] || { echo '[suitecrm] enrolled startup requires port 8080' >&2; exit 1; }
+    cd "$APP_ROOT"
+    exec /usr/local/bin/apache2-foreground
+    ;;
+  legacy|runtime) ;;
+  *) echo '[suitecrm] native Email startup mode requires review' >&2; exit 1 ;;
+esac
 
 require_value() {
   local name="$1"
@@ -188,8 +214,15 @@ if [[ -f "$EMAILS_LISTVIEW_METADATA" ]] && ! php -l "$EMAILS_LISTVIEW_METADATA" 
 fi
 
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-global-id.php"
-if [[ "${CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED:-}" == "1" ]]; then
-  su -s /bin/bash www-data -c "php /opt/clawpilot/install-record-lifecycle.php --apply '$APP_ROOT/public/legacy'"
+if [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == "legacy" ]]; then
+  su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/install-email-audience.php"
+fi
+# The managed Email installer restores its aggregate router on each boot. Add
+# this read-only route afterwards only when explicitly enabled; no default flip.
+if [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == "legacy" ]]; then
+  if [[ "${CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED:-}" == "1" ]]; then
+    su -s /bin/bash www-data -c "php /opt/clawpilot/install-record-lifecycle.php --apply '$APP_ROOT/public/legacy'"
+  fi
 fi
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:clear --no-warmup"

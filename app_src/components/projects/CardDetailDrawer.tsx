@@ -51,6 +51,8 @@ import type { Task, ChecklistItem, Comment } from '@/lib/types'
 import { ASSIGNABLE_PRODUCT_AGENT_IDS, PRIORITY_COLORS, PRIORITY_LABELS, STATUS_LABELS, AVAILABLE_LABELS, COLUMNS, PEOPLE, CATEGORY_OPTIONS } from '@/lib/types'
 import { displayCategory } from '@/lib/format'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
+import CustomerFolderLinksEditor, { CustomerFolderDescription } from './CustomerFolderLinksEditor'
+import CustomerFolderAutomation from './CustomerFolderAutomation'
 
 type Props = {
   task: Task | null
@@ -224,6 +226,7 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const [titleVal, setTitleVal] = useState('')
   const [editingDesc, setEditingDesc] = useState(false)
   const [descVal, setDescVal] = useState('')
+  const descriptionEditRef = useRef<{ taskId: string; hash: string | null; description: string } | null>(null)
   const [commentText, setCommentText] = useState('')
   const [editingCommentId, setEditingCommentId] = useState<string | null>(null)
   const [editingCommentText, setEditingCommentText] = useState('')
@@ -287,12 +290,23 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
   const displayedDescription = task.crm?.description ?? task.desc
 
   const saveTitle = () => { if (titleVal.trim() && titleVal !== task.title) patch({ title: titleVal.trim() }); setEditingTitle(false) }
-  const saveDesc = () => {
-    if (descVal !== displayedDescription) {
-      patch(task.crm
-        ? { crmDescription: descVal, crmDescriptionHash: task.crm.descriptionHash }
+  const beginDescriptionEdit = () => {
+    if (readOnly || saving) return
+    descriptionEditRef.current = { taskId: task.id, hash: task.crm?.descriptionHash ?? null, description: displayedDescription }
+    setDescVal(displayedDescription)
+    setEditingDesc(true)
+  }
+  const saveDesc = async () => {
+    const baseline = descriptionEditRef.current
+    if (saving || !baseline) return
+    if (baseline.taskId !== task.id) { setPatchError('The selected card changed. Reopen its description before saving.'); return }
+    if (descVal !== baseline.description) {
+      const updated = await patch(task.crm
+        ? { crmDescription: descVal, crmDescriptionHash: baseline.hash }
         : { desc: descVal })
+      if (!updated) return
     }
+    descriptionEditRef.current = null
     setEditingDesc(false)
   }
 
@@ -589,22 +603,29 @@ export default function CardDetailDrawer({ task, open, onClose, onUpdate, onArch
             </Stack>
           )}
           <Typography variant="overline" color="text.disabled" sx={{ fontSize: '0.65rem', letterSpacing: 1.5, display: 'block', mb: 1 }}>DESCRIPTION</Typography>
+          {task.crm?.entity === 'organizations' && <CustomerFolderLinksEditor key={task.id}
+            description={displayedDescription} descriptionHash={task.crm.descriptionHash} readOnly={readOnly}
+            disabled={saving || editingDesc} onSave={async (description, capturedHash) => Boolean(await patch({
+              crmDescription: description, crmDescriptionHash: capturedHash,
+            }))} />}
+          {task.crm?.entity === 'organizations' && <CustomerFolderAutomation key={`folders-${task.id}`}
+            pipelineId={task.crm.pipelineId} accountId={task.crm.entityId} readOnly={readOnly} disabled={saving || editingDesc} />}
           {editingDesc ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <TextField multiline minRows={3} maxRows={8} fullWidth value={descVal} onChange={e => setDescVal(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Escape') setEditingDesc(false) }} placeholder="Add a description..."
                 sx={{ '& .MuiOutlinedInput-root': { fontSize: '0.875rem', backgroundColor: 'var(--mui-palette-surfaceVariant)', borderRadius: 2, '& fieldset': { borderColor: 'rgba(var(--cp-neutral-rgb),0.08)' }, '&.Mui-focused fieldset': { borderColor: 'var(--mui-palette-primary-main)' } } }} />
               <Stack direction="row" spacing={1}>
-                <Button size="small" variant="contained" onClick={saveDesc} disabled={saving}
+                <Button size="small" variant="contained" onClick={() => { void saveDesc() }} disabled={saving}
                   sx={{ borderRadius: 2, textTransform: 'none', fontWeight: 600, backgroundColor: 'var(--mui-palette-primary-main)', color: 'primary.contrastText', fontSize: '0.8rem' }}>Save</Button>
-                <Button size="small" onClick={() => setEditingDesc(false)} sx={{ borderRadius: 2, textTransform: 'none', color: 'text.secondary', fontSize: '0.8rem' }}>Cancel</Button>
+                <Button size="small" disabled={saving} onClick={() => setEditingDesc(false)} sx={{ borderRadius: 2, textTransform: 'none', color: 'text.secondary', fontSize: '0.8rem' }}>Cancel</Button>
               </Stack>
             </Box>
           ) : (
-            <Box onClick={() => { if (!readOnly) { setDescVal(displayedDescription); setEditingDesc(true) } }}
+            <Box onClick={beginDescriptionEdit}
               sx={{ cursor: readOnly ? 'default' : 'pointer', p: 1.5, borderRadius: 2, border: '1px solid transparent', transition: 'border-color 0.15s', '&:hover': { borderColor: readOnly ? 'transparent' : 'rgba(var(--cp-neutral-rgb),0.1)', backgroundColor: readOnly ? 'transparent' : 'rgba(var(--cp-neutral-rgb),0.02)' } }}>
               <Typography variant="body2" color={displayedDescription ? 'text.secondary' : 'text.disabled'} sx={{ lineHeight: 1.7, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
-                {displayedDescription || 'Click to add a description...'}
+                {displayedDescription ? <CustomerFolderDescription description={displayedDescription} /> : 'Click to add a description...'}
               </Typography>
             </Box>
           )}

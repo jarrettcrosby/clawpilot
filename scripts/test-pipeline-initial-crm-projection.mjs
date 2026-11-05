@@ -375,6 +375,49 @@ if (process.argv.includes('--postgres') || process.argv.includes('--native-postg
     await persistence.completePipelineProvisioningInPostgres(secondPipelineId)
     assert.equal((await persistence.claimPipelineSyncOutboxInPostgres()).length, 0, 'second tenant keeps its own unresolved blocker')
 
+    const nativeIntent = { pipelineId, sheetId, aggregateType: 'pipeline_crm_projection', aggregateId: pipelineId,
+      operation: 'project_crm_workbook', actor: 'owner@example.test',
+      payload: { actorEmail: 'owner@example.test', waitForCrmReadiness: true }, idempotencyKey: 'synthetic-native-intent' }
+    await assert.rejects(postgres.withTransaction(async client => {
+      await persistence.enqueuePipelineSyncOutboxWithClient(client, nativeIntent)
+      throw new Error('synthetic settlement rollback')
+    }), /synthetic settlement rollback/)
+    assert.equal((await pool.query('SELECT count(*) FROM sync_outbox WHERE idempotency_key=$1', [nativeIntent.idempotencyKey])).rows[0].count, '0')
+    const intent = await postgres.withTransaction(client => persistence.enqueuePipelineSyncOutboxWithClient(client, nativeIntent))
+    const replayIntent = await postgres.withTransaction(client => persistence.enqueuePipelineSyncOutboxWithClient(client, nativeIntent))
+    assert.equal(replayIntent.id, intent.id, 'the same settlement cannot create duplicate workbook jobs')
+    // Unlike a verified initial bootstrap, a later native intent may point at
+    // an existing writable Sheet. No import and no managed-workbook proof must
+    // never mean permission to overwrite that Sheet.
+    await pool.query('UPDATE pipeline_spaces SET provisioning_sheet_id=$2 WHERE id=$1::uuid', [pipelineId, 'different-unverified-sheet'])
+    assert.equal((await persistence.claimPipelineSyncOutboxInPostgres()).length, 0, 'unimported nonmanaged Sheet stays queued')
+    assert.equal((await pool.query('SELECT attempts FROM sync_outbox WHERE id=$1::uuid', [intent.id])).rows[0].attempts, 0)
+    await pool.query('UPDATE pipeline_spaces SET provisioning_sheet_id=$2 WHERE id=$1::uuid', [pipelineId, sheetId])
+    const blocker = (await pool.query(`INSERT INTO sync_outbox (aggregate_type,aggregate_id,operation,target_system,payload,status)
+      VALUES ('crm_interactions',$1::uuid,'upsert_record','suitecrm',$2::jsonb,'processing') RETURNING id`,
+    [pipelineId, JSON.stringify({ pipelineId })])).rows[0].id
+    assert.equal((await persistence.claimPipelineSyncOutboxInPostgres()).length, 0)
+    assert.equal((await pool.query('SELECT attempts FROM sync_outbox WHERE id=$1::uuid', [intent.id])).rows[0].attempts, 0)
+    await pool.query("UPDATE sync_outbox SET status='succeeded' WHERE id=$1::uuid", [blocker])
+    for (const status of ['running', 'failed']) {
+      const imported = (await pool.query(`INSERT INTO crm_sync_runs (pipeline_id,direction,status)
+        VALUES ($1::uuid,'sheet_to_crm',$2) RETURNING id`, [pipelineId, status])).rows[0].id
+      assert.equal((await persistence.claimPipelineSyncOutboxInPostgres()).length, 0)
+      await pool.query('DELETE FROM crm_sync_runs WHERE id=$1::uuid', [imported])
+    }
+    const [nativeReady] = await persistence.claimPipelineSyncOutboxInPostgres()
+    assert.equal(nativeReady.id, intent.id, 'verified managed Sheet with no import is eligible despite another tenant blocker')
+    assert.equal(nativeReady.attempts, 1)
+    await persistence.completePipelineSyncOutboxInPostgres(nativeReady)
+    const importedIntent = await postgres.withTransaction(client => persistence.enqueuePipelineSyncOutboxWithClient(client,
+      { ...nativeIntent, idempotencyKey: 'synthetic-native-imported-intent' }))
+    await pool.query('UPDATE pipeline_spaces SET provisioning_sheet_id=$2 WHERE id=$1::uuid', [pipelineId, 'different-unverified-sheet'])
+    await pool.query("INSERT INTO crm_sync_runs (pipeline_id,direction,status) VALUES ($1::uuid,'sheet_to_crm','succeeded')", [pipelineId])
+    const [nativeImported] = await persistence.claimPipelineSyncOutboxInPostgres()
+    assert.equal(nativeImported.id, importedIntent.id, 'successful import makes the existing Sheet source ready')
+    await persistence.completePipelineSyncOutboxInPostgres(nativeImported)
+    console.log('PASS PostgreSQL native workbook intents: same-transaction rollback/replay and safe source/dependency waits without attempt burn')
+
     // Prove completion and bootstrap enqueue are one SQL transaction by making
     // this fixture reject the queue insert, then retry after removing that rule.
     const rollbackId = '33333333-4444-4555-8666-777777777777'

@@ -203,6 +203,9 @@ let capturedWwexSmallpackInput = null
 const persistence = runModule(
   'app_src/lib/persistence/oneOffShipments.ts',
   (specifier) => {
+    if (specifier === '@/lib/persistence/crmNativeEmailAuthority') {
+      return { lockCrmNativeEmailAuthorityWithClient: async () => { throw new Error('Authority writes are outside the validation contract') } }
+    }
     if (specifier === '@/lib/auditWriter') {
       return { recordAuditEvent: async () => {} }
     }

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { disposablePostgresDockerArgs } from './lib/disposable-postgres-docker.mjs'
+import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -91,6 +91,7 @@ async function verifyImage(image) {
   assert.ok(majorVersion, `Unexpected PostgreSQL image: ${image}`)
   const container = `clawpilot-career-catalog-${majorVersion}-${process.pid}-${randomUUID().slice(0, 8)}`
   const password = `career_catalog_${majorVersion}`
+  let started = false
   try {
     command(
       'docker',
@@ -110,6 +111,7 @@ async function verifyImage(image) {
       ]),
       { timeout: 180_000 },
     )
+    started = true
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
@@ -136,11 +138,10 @@ async function verifyImage(image) {
       ),
     )
   } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 20_000,
-    })
+    // docker stop with --rm can return while automatic removal is still in
+    // progress. Await exact, volume-aware removal before admitting PG 18;
+    // never bypass the guard's busy-container check or prune other fixtures.
+    if (started) command('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 20_000 })
   }
 }
 

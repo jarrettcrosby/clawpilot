@@ -16,6 +16,7 @@ import type {
   PipelineReportingState,
   PipelineSnapshot,
   ReportPreset,
+  InteractionScope,
 } from '@/components/pipeline/usePipelineReport'
 import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 
@@ -535,6 +536,8 @@ function PotentialVsProbable({ snapshot }: { snapshot: PipelineSnapshot | null }
 
 export default function PipelineDashboard({ stages, totalContacts, lastSyncedLabel, reporting, syncState }: Props) {
   const {
+    interactionScope,
+    setInteractionScope,
     preset,
     setPreset,
     customStart,
@@ -566,6 +569,11 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
           </Typography>
         </Box>
         <Stack direction={{ xs: 'column', md: 'row' }} alignItems={{ xs: 'stretch', md: 'center' }} spacing={1}>
+          <TextField select size="small" label="Interaction scope" value={interactionScope}
+            onChange={(event) => setInteractionScope(event.target.value as InteractionScope)} sx={{ minWidth: 205 }}>
+            <MenuItem value="sales">Customers and prospects</MenuItem>
+            <MenuItem value="all">All activity</MenuItem>
+          </TextField>
           <TextField
             select
             size="small"
@@ -645,7 +653,7 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
           <MetricCard label="Active opportunities · current" value={snapshot ? numeric(snapshot.activeOpportunities) : '—'} />
           <MetricCard label="Total contacts · current" value={currentContacts === null ? '—' : numeric(currentContacts)} />
           <MetricCard label="Contacts added · selected period" value={activity ? numeric(activity.contactsAdded) : '—'} />
-          <MetricCard label="Interactions · selected period" value={activity ? numeric(activity.interactions) : '—'} />
+          <MetricCard label={`${interactionScope === 'sales' ? 'Sales interactions' : 'All interactions'} · selected period`} value={activity ? numeric(activity.interactions) : '—'} />
           <MetricCard label="Opportunities created · selected period" value={activity ? numeric(activity.opportunitiesCreated) : '—'} />
           <MetricCard label="Lifetime win rate" value={snapshot ? `${snapshot.lifetimeWinRate.toFixed(1)}%` : '—'} />
         </Box>
@@ -670,7 +678,9 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
         <Panel title="Opportunities by stage" subtitle="Current snapshot · stage on the y-axis">
           <StageDistribution stageCounts={snapshot?.opportunitiesByStage || null} stages={stages} />
         </Panel>
-        <Panel title={`Interactions · ${periodLabel}`} subtitle="Selected period · grouped by CRM interaction type">
+        <Panel title={`Interactions · ${periodLabel}`} subtitle={interactionScope === 'sales'
+          ? 'Customers and prospects only · shared-company activity counts once · uses current account type'
+          : 'All activity, including suppliers and unclassified accounts · grouped by CRM interaction type'}>
           <GroupedInteractions months={activity?.interactionsByMonth || []} periodLabel={periodLabel} />
         </Panel>
         <Panel title="Potential revenue by stage" subtitle="Current snapshot · next two quarters by expected close month">

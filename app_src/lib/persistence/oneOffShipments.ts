@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   CarrierIntegrationRequestError,
@@ -999,6 +1000,9 @@ async function shippingScope(
   )
   const existing = await read()
   if (existing.rows[0]) return existing.rows[0]
+  // Only the first-time scope creation path can insert pipeline authority.
+  // Its two actor-bearing callers start fresh transactions before this helper.
+  if (actorEmail) await lockCrmNativeEmailAuthorityWithClient(client)
   await acquireTransactionAdvisoryLock(
     client,
     `shipping:scope:${organizationId}`,

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 export type ReportPreset = 'last_30_days' | 'last_3_calendar_months' | 'year_to_date' | 'custom'
+export type InteractionScope = 'sales' | 'all'
 
 export type InteractionTypeCounts = {
   directMail: number
@@ -75,6 +76,7 @@ export type PipelineReportPayload = {
   }
   snapshot: PipelineSnapshot
   activity: {
+    interactionScope: InteractionScope
     contactsAdded: number
     interactions: number
     opportunitiesCreated: number
@@ -111,6 +113,7 @@ function currentDayKey(timeZone: string) {
 
 export function usePipelineReport({ enabled, reportRevision, syncRevision, syncState }: Input) {
   const [preset, setPreset] = useState<ReportPreset>('last_3_calendar_months')
+  const [interactionScope, setInteractionScope] = useState<InteractionScope>('sales')
   const [customStart, setCustomStart] = useState('')
   const [customEnd, setCustomEnd] = useState('')
   const [report, setReport] = useState<PipelineReportPayload | null>(null)
@@ -123,7 +126,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
   const observedDayRef = useRef('')
 
   const customPeriodIncomplete = preset === 'custom' && (!validDateOnly(customStart) || !validDateOnly(customEnd))
-  const requestKey = `${reportRevision}:${preset}:${preset === 'custom' ? `${customStart}:${customEnd}` : ''}`
+  const requestKey = `${reportRevision}:${interactionScope}:${preset}:${preset === 'custom' ? `${customStart}:${customEnd}` : ''}`
   const reportError = requestError?.key === requestKey ? requestError.message : ''
   const reportMatchesSelection = Boolean(report && loadedRequestKey === requestKey)
   const snapshot = loadedReportRevision === reportRevision ? report?.snapshot || null : null
@@ -163,6 +166,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
       if (!controller.signal.aborted) setLoadingRequestKey(requestKey)
     }, 0)
     const params = new URLSearchParams({ preset })
+    params.set('interactionScope', interactionScope)
     if (preset === 'custom') {
       params.set('startDate', customStart)
       params.set('endDate', customEnd)
@@ -171,6 +175,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
     fetch(`/api/pipeline/report?${params.toString()}`, { cache: 'no-store', signal: controller.signal })
       .then(async (response) => {
         const payload = await response.json().catch(() => ({}))
+        if (controller.signal.aborted) return
         if (!response.ok || payload?.ok !== true) throw new Error(payload?.error || 'Unable to load pipeline reporting')
         setReport(payload as PipelineReportPayload)
         setLoadedReportRevision(reportRevision)
@@ -194,9 +199,11 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
       window.clearTimeout(loadingTimer)
       controller.abort()
     }
-  }, [customEnd, customPeriodIncomplete, customStart, dayRefreshRevision, enabled, preset, reportRevision, requestKey, retryRevision, syncRevision, syncState])
+  }, [customEnd, customPeriodIncomplete, customStart, dayRefreshRevision, enabled, interactionScope, preset, reportRevision, requestKey, retryRevision, syncRevision, syncState])
 
   return {
+    interactionScope,
+    setInteractionScope,
     preset,
     setPreset,
     customStart,

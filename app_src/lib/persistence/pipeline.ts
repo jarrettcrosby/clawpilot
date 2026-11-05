@@ -1775,10 +1775,20 @@ export async function deletePipelineGooglePermissionTrackingInPostgres(input: {
   )
 }
 
+/** Add a durable Sheets intent to the caller's transaction (for example native
+ * CRM receipt settlement). No separate transaction may lose that intent after
+ * the source publication has already committed. */
+export async function enqueuePipelineSyncOutboxWithClient(
+  client: PoolClient,
+  input: PipelineOutboxEnqueueInput,
+): Promise<{ id: string; status: string }> {
+  return insertPipelineOutbox(client, input)
+}
+
 export async function enqueuePipelineSyncOutboxInPostgres(
   input: PipelineOutboxEnqueueInput,
 ): Promise<{ id: string; status: string }> {
-  return withTransaction((client) => insertPipelineOutbox(client, input))
+  return withTransaction((client) => enqueuePipelineSyncOutboxWithClient(client, input))
 }
 
 export async function claimPipelineSyncOutboxInPostgres(input: {
@@ -1825,7 +1835,8 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
             AND available_at <= now()
             AND (
               operation <> 'project_crm_workbook'
-              OR payload->>'initialManagedWorkbook' IS DISTINCT FROM 'true'
+              OR (payload->>'initialManagedWorkbook' IS DISTINCT FROM 'true'
+                AND payload->>'waitForCrmReadiness' IS DISTINCT FROM 'true')
               OR (
                 NOT EXISTS (
                   SELECT 1 FROM sync_outbox reconciliation
@@ -1840,7 +1851,19 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
                     AND import_run.direction = 'sheet_to_crm'
                   ORDER BY import_run.started_at DESC, import_run.id DESC
                   LIMIT 1
-                ), 'succeeded') = 'succeeded'
+                ), CASE WHEN payload->>'waitForCrmReadiness' IS DISTINCT FROM 'true'
+                  OR EXISTS (
+                    SELECT 1 FROM pipeline_spaces pipeline
+                    WHERE pipeline.id::text = candidate.payload->>'pipelineId'
+                      AND pipeline.provisioning_status = 'ready'
+                      AND pipeline.sync_enabled = true
+                      AND pipeline.sheet_id IS NOT NULL
+                      AND pipeline.sheet_id = pipeline.provisioning_sheet_id
+                      AND pipeline.provisioning_completed_at IS NOT NULL
+                      AND pipeline.drive_folder_id IS NOT NULL
+                      AND pipeline.google_service_account_email IS NOT NULL
+                      AND pipeline.google_shared_drive_id IS NOT NULL
+                  ) THEN 'succeeded' ELSE 'not_imported' END) = 'succeeded'
               )
             )
           ORDER BY available_at ASC, created_at ASC

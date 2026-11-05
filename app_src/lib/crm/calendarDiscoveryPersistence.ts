@@ -34,6 +34,8 @@ const SOURCE_SELECT = `SELECT source.* FROM crm_calendar_discovery_sources sourc
   JOIN app_user_organization_memberships membership
     ON membership.user_email = source.credential_owner_email
     AND membership.organization_id = source.workspace_organization_id AND membership.status = 'active'
+    AND membership.trashed_at IS NULL
+    AND (membership.role = 'owner' OR COALESCE((membership.permissions->>'viewCrm')::boolean, true))
   JOIN user_maton_connections connection
     ON connection.owner_email = source.credential_owner_email
     AND connection.connection_id = source.connection_id
@@ -242,6 +244,8 @@ async function requireOwnedScope(client: PoolClient, input: {
     JOIN app_users app_user ON app_user.email = pipeline.owner_email AND app_user.status = 'active'
     JOIN app_user_organization_memberships membership ON membership.user_email = app_user.email
       AND membership.organization_id = pipeline.workspace_organization_id AND membership.status = 'active'
+      AND membership.trashed_at IS NULL
+      AND (membership.role = 'owner' OR COALESCE((membership.permissions->>'viewCrm')::boolean, true))
     WHERE pipeline.id = $1::uuid AND pipeline.workspace_organization_id = $2::uuid
       AND pipeline.owner_email = $3 AND NOT pipeline.reference_access_disabled
     FOR SHARE OF pipeline, app_user, membership`, [input.pipelineId, input.organizationId, input.actorEmail])

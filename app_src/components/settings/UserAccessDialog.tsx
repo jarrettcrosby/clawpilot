@@ -57,6 +57,7 @@ import MeasurementPreferencesPanel from './MeasurementPreferencesPanel'
 import OrganizationBrandingPanel from './OrganizationBrandingPanel'
 import OrganizationWebPreferencesPanel from './OrganizationWebPreferencesPanel'
 import SessionSecurityPanel from './SessionSecurityPanel'
+import RootCrmAccessPanel from './RootCrmAccessPanel'
 
 type UserRole = 'owner' | 'admin' | 'member'
 type UserStatus = 'invited' | 'active' | 'disabled'
@@ -95,6 +96,12 @@ type ApiPayload = {
 }
 
 type UsersPayload = ApiPayload & {
+  pendingAccessChange?: {
+    transitionId: string
+    userEmail: string
+    workspaceId: string
+    actionKind: 'status' | 'trash' | 'access' | 'identity_link'
+  } | null
   currentUser?: AppUser
   currentOrganization?: {
     id: string
@@ -129,7 +136,7 @@ type UserMutationPayload = ApiPayload & {
   user?: AppUser
   addedOrganizationIds?: string[]
   delivery?: string
-  crmIdentitySync?: 'queued' | 'not-mapped'
+  crmIdentitySync?: 'queued' | 'verified' | 'not-mapped' | 'retained'
   warning?: string
 }
 
@@ -162,6 +169,14 @@ type PipelineResource = WorkspaceResource & {
 }
 
 type WorkspacesPayload = ApiPayload & {
+  pendingSharingChange?: {
+    transitionId: string
+    workspaceId: string
+    pipelineId: string
+    pipelineName: string
+    userEmail: string
+    accessRole: ShareAccessRole | null
+  } | null
   boards?: WorkspaceResource[]
   pipelines?: PipelineResource[]
   selectedBoardId?: string | null
@@ -477,6 +492,8 @@ export default function UserAccessDialog({
   const [error, setError] = useState('')
 
   const currentUser = usersPayload?.currentUser
+  const pendingAccessChange = usersPayload?.pendingAccessChange
+  const pendingSharingChange = workspacesPayload?.pendingSharingChange
   const busy = pendingAction !== null
   const hasActivePipelineProvisioning = Boolean(workspacesPayload?.pipelines?.some((pipeline) => (
     pipeline.provisioningStatus === 'queued' || pipeline.provisioningStatus === 'provisioning'
@@ -560,7 +577,7 @@ export default function UserAccessDialog({
     setLoading(true)
 
     Promise.allSettled([
-      requestJson<UsersPayload>('/api/users'),
+      requestJson<UsersPayload>('/api/users', { cache: 'no-store' }),
       requestJson<WorkspacesPayload>('/api/workspaces'),
       requestJson<AuthSessionPayload>('/api/auth/session', { cache: 'no-store' }),
     ]).then(([usersResult, workspacesResult, sessionResult]) => {
@@ -643,6 +660,41 @@ export default function UserAccessDialog({
     setPendingAction(null)
   }
 
+  async function refreshUserAccessState() {
+    const active = await requestJson<UsersPayload>('/api/users', { cache: 'no-store' })
+    setUsersPayload(active)
+    if (usersView === 'trash') {
+      const trash = await requestJson<UsersPayload>('/api/users?view=trash', { cache: 'no-store' })
+      setTrashedUsers(trash.users || [])
+    }
+    return active
+  }
+
+  async function finishUserAccessAction() {
+    try {
+      // The app-side change may have committed even when native CRM returns a
+      // resumable hold. Re-read both the rows and the safe pending metadata.
+      await refreshUserAccessState()
+    } catch {
+      setError((current) => [current, 'Unable to refresh access status. Reopen Settings to check the saved change.'].filter(Boolean).join(' '))
+    } finally { finishAction() }
+  }
+
+  async function resumeAccessChange() {
+    if (busy || loading || !pendingAccessChange) return
+    startAction('resume-access-change')
+    try {
+      await requestJson<ApiPayload>('/api/users', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'resume-access-change', transitionId: pendingAccessChange.transitionId }),
+      })
+      window.dispatchEvent(new Event(SESSION_REFRESH_EVENT))
+      setNotice('The saved user access change is complete.')
+    } catch (resumeError) {
+      setError(messageFrom(resumeError, 'Unable to finish the saved access change. You can try Resume change again.'))
+    } finally { await finishUserAccessAction() }
+  }
+
   function upsertUser(user: AppUser) {
     setUsersPayload((current) => {
       if (!current) return current
@@ -700,7 +752,7 @@ export default function UserAccessDialog({
     } catch (saveError) {
       setError(messageFrom(saveError, 'Unable to save profile'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -749,7 +801,7 @@ export default function UserAccessDialog({
     } catch (inviteError) {
       setError(messageFrom(inviteError, 'Unable to invite user'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -763,8 +815,11 @@ export default function UserAccessDialog({
     if (busy) return
     startAction('users-view')
     try {
-      const result = await requestJson<UsersPayload>(`/api/users${view === 'trash' ? '?view=trash' : ''}`)
-      if (view === 'trash') setTrashedUsers(result.users || [])
+      const result = await requestJson<UsersPayload>(`/api/users${view === 'trash' ? '?view=trash' : ''}`, { cache: 'no-store' })
+      if (view === 'trash') {
+        setTrashedUsers(result.users || [])
+        setUsersPayload((current) => current ? { ...current, pendingAccessChange: result.pendingAccessChange ?? null } : current)
+      }
       else setUsersPayload(result)
       setUsersView(view)
     } catch (loadError) {
@@ -779,15 +834,10 @@ export default function UserAccessDialog({
     try {
       await requestJson<UserMutationPayload>('/api/users', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: trashed ? 'trash-user' : 'restore-user', email: user.email, organizationId: user.organizationId }) })
-      const [active, trash] = await Promise.all([
-        requestJson<UsersPayload>('/api/users'), requestJson<UsersPayload>('/api/users?view=trash'),
-      ])
-      setUsersPayload(active)
-      setTrashedUsers(trash.users || [])
       setNotice(trashed ? 'User moved to organization Trash. Historical records were preserved.' : 'User restored to their previous access state. Invited users need a new invitation.')
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update Trash'))
-    } finally { finishAction() }
+    } finally { await finishUserAccessAction() }
   }
 
   async function updateStatus(user: AppUser) {
@@ -806,7 +856,7 @@ export default function UserAccessDialog({
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update user'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -832,7 +882,7 @@ export default function UserAccessDialog({
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to update access'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -860,7 +910,7 @@ export default function UserAccessDialog({
     } catch (updateError) {
       setError(messageFrom(updateError, 'Unable to add organization access'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -883,13 +933,17 @@ export default function UserAccessDialog({
           organizationId: user.organizationId,
         }),
       })
-      if (!result.user) throw new Error('CRM mapping response was incomplete')
+      if (!result.user || !['verified', 'queued'].includes(result.crmIdentitySync || '')) {
+        throw new Error('CRM mapping response was incomplete')
+      }
       upsertUser(result.user)
-      setNotice(`${result.user.displayName || result.user.email} is syncing to SuiteCRM as ${result.user.referenceCode}.`)
+      setNotice(result.crmIdentitySync === 'verified'
+        ? `${result.user.displayName || result.user.email}'s SuiteCRM identity is verified as ${result.user.referenceCode}. ${user.suiteCrmUserId ? 'No identity changes were needed.' : 'Linked to the existing SuiteCRM account.'}`
+        : `${result.user.displayName || result.user.email} is syncing to SuiteCRM as ${result.user.referenceCode}.`)
     } catch (mappingError) {
       setError(messageFrom(mappingError, 'Unable to map SuiteCRM user'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -916,7 +970,7 @@ export default function UserAccessDialog({
     } catch (employeeError) {
       setError(messageFrom(employeeError, 'Unable to update CRM employee access'))
     } finally {
-      finishAction()
+      await finishUserAccessAction()
     }
   }
 
@@ -928,6 +982,7 @@ export default function UserAccessDialog({
   ) {
     if (busy) return false
     startAction(key)
+    let refreshed = false
     try {
       const result = await requestJson<WorkspacesPayload>('/api/workspaces', {
         method: 'POST',
@@ -935,14 +990,31 @@ export default function UserAccessDialog({
         body: JSON.stringify(body),
       })
       setWorkspacesPayload(result)
+      refreshed = true
       setNotice(successMessage)
       return true
     } catch (workspaceError) {
       setError(messageFrom(workspaceError, failureMessage))
       return false
     } finally {
+      if (!refreshed) {
+        try {
+          // A sharing role may already be committed while native grant outcome
+          // is unknown. Discover the saved change without overwriting drafts.
+          setWorkspacesPayload(await requestJson<WorkspacesPayload>('/api/workspaces', { cache: 'no-store' }))
+        } catch {
+          setError((current) => [current, 'Unable to refresh sharing status. Reopen Settings to check the saved change.'].filter(Boolean).join(' '))
+        }
+      }
       finishAction()
     }
+  }
+
+  async function resumeSharingChange() {
+    if (busy || loading || !pendingSharingChange) return
+    await mutateWorkspace({ action: 'resume-sharing-change', transitionId: pendingSharingChange.transitionId },
+      'resume-sharing-change', 'The saved pipeline sharing change is complete.',
+      'Unable to finish the saved sharing change. You can try Resume sharing change again.')
   }
 
   async function createResource(kind: ResourceKind) {
@@ -1167,6 +1239,35 @@ export default function UserAccessDialog({
       <DialogContent sx={{ px: { xs: 2, sm: 3 }, pt: { xs: 2, sm: 2.5 }, pb: { xs: 'calc(env(safe-area-inset-bottom) + 20px)', sm: 2.5 } }}>
         {error ? <Alert severity="error" onClose={() => setError('')} sx={{ mb: 2, borderRadius: '8px' }}>{error}</Alert> : null}
         {notice ? <Alert severity="success" onClose={() => setNotice('')} sx={{ mb: 2, borderRadius: '8px' }}>{notice}</Alert> : null}
+        {pendingAccessChange ? (
+          <Alert severity="warning" sx={{ mb: 2, borderRadius: '8px', '& .MuiAlert-message': { minWidth: 0 } }}>
+            <Typography variant="body2" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+              User access change pending for {pendingAccessChange.userEmail}
+            </Typography>
+            <Typography variant="body2" sx={{ mb: 1 }}>
+              Some access may already be updated. Resume the saved change to finish CRM access; this does not submit new form edits.
+            </Typography>
+            <Button variant="outlined" size="small" startIcon={<ReplayRounded />} disabled={busy || loading}
+              onClick={() => { void resumeAccessChange() }}>
+              {pendingAction === 'resume-access-change' ? 'Resuming…' : 'Resume change'}
+            </Button>
+          </Alert>
+        ) : null}
+        {pendingSharingChange ? (
+          <Alert severity="warning" sx={{ mb: 2, borderRadius: '8px', '& .MuiAlert-message': { minWidth: 0 } }}>
+            <Typography variant="body2" fontWeight={700} sx={{ overflowWrap: 'anywhere' }}>
+              Sharing change pending for {pendingSharingChange.pipelineName}
+            </Typography>
+            <Typography variant="body2" sx={{ mb: 1, overflowWrap: 'anywhere' }}>
+              {pendingSharingChange.userEmail}: {pendingSharingChange.accessRole ? `${pendingSharingChange.accessRole} access` : 'remove access'}.
+              {' '}Some access may already be updated. Resume the saved change; this does not submit new form edits.
+            </Typography>
+            <Button variant="outlined" size="small" startIcon={<ReplayRounded />} disabled={busy || loading}
+              onClick={() => { void resumeSharingChange() }}>
+              {pendingAction === 'resume-sharing-change' ? 'Resuming sharing…' : 'Resume sharing change'}
+            </Button>
+          </Alert>
+        ) : null}
 
         {loading ? (
           <Box display="grid" sx={{ minHeight: 360, placeItems: 'center' }}>
@@ -1312,6 +1413,9 @@ export default function UserAccessDialog({
 
         {!loading && activeTab === 1 ? (
           <Box role="tabpanel" id="settings-panel-1" aria-labelledby="settings-tab-1">
+            {currentUser?.role==='owner'&&usersPayload?.currentOrganization?.id?<RootCrmAccessPanel
+              key={usersPayload.currentOrganization.id} workspaceId={usersPayload.currentOrganization.id} disabled={busy}
+              onBusyChange={value=>setPendingAction(value?'root-crm-access':null)}/>:null}
             {usersPayload?.isAdmin && usersPayload.canInvite ? (
               <Box component="form" onSubmit={inviteUser} mb={2.5}>
                 <Typography variant="subtitle2" color="text.primary" fontWeight={700} mb={1}>Invite</Typography>
@@ -1470,7 +1574,7 @@ export default function UserAccessDialog({
                           checked={inviteCrmEmployee}
                           onChange={(event) => setInviteCrmEmployee(event.target.checked)}
                           disabled={busy}
-                          inputProps={{ 'aria-label': 'Configure invited user as a CRM employee' }}
+                          slotProps={{ input: { role: 'switch', 'aria-label': 'Configure invited user as a CRM employee' } }}
                         />
                       )}
                       label="CRM employee"
@@ -1485,7 +1589,7 @@ export default function UserAccessDialog({
                           checked={inviteDemoAccess}
                           onChange={(event) => setInviteDemoAccess(event.target.checked)}
                           disabled={busy}
-                          inputProps={{ 'aria-label': 'Allow invited user to open the demo account' }}
+                          slotProps={{ input: { role: 'switch', 'aria-label': 'Allow invited user to open the demo account' } }}
                         />
                       )}
                       label="Demo account access"
@@ -1616,6 +1720,7 @@ export default function UserAccessDialog({
                             <Typography variant="body2" color="text.primary" fontWeight={700}>CRM employee</Typography>
                             <Typography variant="caption" color="text.disabled">
                               Employee identities receive a permanent gu Global ID and may own CRM records.
+                              Turning this off retains that identity and does not change CRM module access.
                             </Typography>
                           </Box>
                           <Switch
@@ -1623,7 +1728,7 @@ export default function UserAccessDialog({
                             checked={user.crmUserEnabled}
                             onChange={(event) => { void updateCrmEmployee(user, event.target.checked) }}
                             disabled={busy || !crmEmployeeManageable}
-                            inputProps={{ 'aria-label': `CRM employee access for ${user.email}` }}
+                            slotProps={{ input: { role: 'switch', 'aria-label': `CRM employee access for ${user.email}` } }}
                           />
                         </Box>
                       ) : null}
@@ -1635,7 +1740,7 @@ export default function UserAccessDialog({
                             value={user.referenceCode || ''}
                             disabled={busy}
                             helperText="Permanent ClawPilot user Global ID"
-                            inputProps={{ readOnly: true, 'aria-label': `SuiteCRM username for ${user.email}` }}
+                            slotProps={{ htmlInput: { readOnly: true, 'aria-label': `SuiteCRM username for ${user.email}` } }}
                             sx={fieldSx}
                           />
                           <Button
@@ -2008,7 +2113,7 @@ export default function UserAccessDialog({
                                     value={draft.email}
                                     onChange={(event) => updateShareDraft(section.kind, resource.id, { email: event.target.value })}
                                     disabled={busy}
-                                    inputProps={{ list: `share-users-${resource.id}` }}
+                                    slotProps={{ htmlInput: { list: `share-users-${resource.id}` } }}
                                     sx={fieldSx}
                                   />
                                   <datalist id={`share-users-${resource.id}`}>
@@ -2076,7 +2181,7 @@ export default function UserAccessDialog({
                                   <TextField
                                     select
                                     size="small"
-                                    aria-label={`Access for ${member.email}`}
+                                    slotProps={{ select: { inputProps: { 'aria-label': `Access for ${member.email}` } } }}
                                     value={member.accessRole}
                                     onChange={(event) => { void changeShareRole(section.kind, resource, member, event.target.value as ShareAccessRole) }}
                                     disabled={busy || member.status === 'disabled'}

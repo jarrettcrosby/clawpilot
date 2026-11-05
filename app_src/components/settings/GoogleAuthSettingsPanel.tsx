@@ -69,7 +69,7 @@ type LinkPayload = {
 
 let googleIdentityScript: Promise<void> | null = null
 
-function loadGoogleIdentityServices(): Promise<void> {
+export function loadGoogleIdentityServices(): Promise<void> {
   if (window.google?.accounts.id) return Promise.resolve()
   if (googleIdentityScript) return googleIdentityScript
   googleIdentityScript = new Promise<void>((resolve, reject) => {

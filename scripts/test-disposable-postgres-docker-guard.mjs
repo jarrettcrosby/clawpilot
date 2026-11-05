@@ -168,7 +168,7 @@ function fixture(suffix, overrides = {}) {
         : [...containerIds].find(([candidate, id]) => id === target && containers.has(candidate))?.[0]
       if (name) {
         if (!containerIds.has(name)) containerIds.set(name, (containerIds.size + 1).toString(16).padStart(64, '0'))
-        const result = { id: containerIds.get(name), labels: containers.get(name) }
+        const result = { id: containerIds.get(name), labels: containers.get(name), status: hooks.status ?? 'running' }
         hooks.afterInspect?.(name, result)
         return JSON.stringify(result)
       }
@@ -183,6 +183,7 @@ function fixture(suffix, overrides = {}) {
         error.stderr = `No such container: ${args.at(-1)}`
         throw error
       }
+      if (hooks.remove) return hooks.remove(name)
       containers.delete(name)
       return ''
     }
@@ -191,6 +192,7 @@ function fixture(suffix, overrides = {}) {
   const runtime = createDisposablePostgresRuntime({
     platform: 'darwin', leasePath, pid: 1001, token, lifecycle, execute,
     checkHeadroom: () => {}, isProcessAlive: () => false, warn: () => {},
+    pause: () => {},
     ...overrides,
   })
   return { runtime, leasePath, containers, containerIds, hooks, calls, lifecycle, exits, token, execute }
@@ -264,6 +266,36 @@ try {
     ['rm', '--force', '--volumes', originalId],
   ])
   assert.equal(replaced.containers.has('reused-name'), true, 'replacement name is never removed')
+
+  const removing = fixture('removal-in-progress')
+  removing.runtime.admit('being-removed')
+  simulateContainer(removing, 'being-removed')
+  let removalStarted = false, observedRemoval = 0
+  removing.hooks.remove = () => { removalStarted = true; throw new Error('removal already in progress') }
+  removing.hooks.afterInspect = name => { if (removalStarted && ++observedRemoval === 3) removing.containers.delete(name) }
+  assert.equal(removing.runtime.cleanup(), true, 'wait for confirmed exact-ID absence after Docker reports in-progress removal')
+  assert.equal(existsSync(removing.leasePath), false)
+  assert.equal(removing.calls.filter(args => args[0] === 'rm').length, 1, 'removal polling is read-only, not repeated force removal')
+
+  const stuck = fixture('removal-stuck')
+  stuck.runtime.admit('stuck-owned')
+  simulateContainer(stuck, 'stuck-owned')
+  stuck.hooks.remove = () => { throw new Error('daemon refused removal') }
+  assert.equal(stuck.runtime.cleanup(), false)
+  assert.equal(existsSync(stuck.leasePath), true, 'bounded observation cannot release a still-present container lease')
+  assert.equal(stuck.containers.has('stuck-owned'), true)
+  assert.equal(stuck.calls.filter(args => args[0] === 'rm').length, 1)
+
+  const sequential = fixture('sequential-removal')
+  sequential.runtime.admit('previous-fixture')
+  simulateContainer(sequential, 'previous-fixture')
+  assert.throws(() => sequential.runtime.admit('next-fixture'), /still present/, 'a running same-process fixture is never stopped to admit another')
+  sequential.hooks.status = 'removing'
+  let sequentialReads = 0
+  sequential.hooks.afterInspect = name => { if (name === 'previous-fixture' && ++sequentialReads === 3) sequential.containers.delete(name) }
+  assert.equal(sequential.runtime.admit('next-fixture'), sequential.token)
+  assert.equal(sequential.calls.some(args => args[0] === 'rm'), false, 'sequential admission only observes an already-stopped owned fixture')
+  sequential.runtime.cleanup()
 
   const first = fixture('concurrent', { isProcessAlive: () => true })
   first.runtime.admit('first')

@@ -235,8 +235,12 @@ const guardedRequestUserMock = {
     throw new Error('write guard should run before user lookup')
   },
 }
+const browserSameOrigin = loadTypeScriptModule('app_src/lib/browserSameOrigin.ts', {
+  './publicOriginRouting.mjs': nodeRequire(resolve(root, 'app_src/lib/publicOriginRouting.mjs')),
+})
 const crmWriteRoute = loadTypeScriptModule('app_src/app/api/crm/route.ts', {
   'next/server': nextServerMock,
+  '@/lib/browserSameOrigin': browserSameOrigin,
   '@/lib/globalIds.mjs': { GLOBAL_ID_MAX_LENGTH: 64 },
   '@/lib/crm/types': { CRM_ENTITIES: ['organizations', 'contacts', 'products', 'leads', 'opportunities', 'meetings', 'interactions', 'campaigns'] },
   '@/lib/currency': { isIso4217CurrencyCode: () => true },
@@ -518,6 +522,7 @@ let nativeHierarchyCalls = 0
 let nativeStageCalls = 0
 const replayingNativeMeetingRoute = loadTypeScriptModule('app_src/app/api/crm/route.ts', {
   'next/server': nextServerMock,
+  '@/lib/browserSameOrigin': browserSameOrigin,
   '@/lib/globalIds.mjs': { GLOBAL_ID_MAX_LENGTH: 64 },
   '@/lib/crm/types': { CRM_ENTITIES: ['organizations', 'contacts', 'products', 'leads', 'opportunities', 'meetings', 'interactions', 'campaigns'] },
   '@/lib/currency': { isIso4217CurrencyCode: () => true },

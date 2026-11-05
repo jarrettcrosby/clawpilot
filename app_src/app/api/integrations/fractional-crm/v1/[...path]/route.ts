@@ -2,7 +2,9 @@ import { handleFractionalCrmGateway } from '@/lib/fractionalCrmGatewayHttp'
 import {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
+  readFractionalCrmCustomerFolder, updateFractionalCrmCustomerFolder,
 } from '@/lib/persistence/fractionalCrmGateway'
+import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -10,6 +12,14 @@ export const dynamic = 'force-dynamic'
 const services = {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
+  readFractionalCrmCustomerFolder,
+  updateFractionalCrmCustomerFolder: async (...args: Parameters<typeof updateFractionalCrmCustomerFolder>) => {
+    const result = await updateFractionalCrmCustomerFolder(...args)
+    // Reconciliation is post-commit. A failed response can replay the same
+    // durable command and retry this step without another CRM publication.
+    await reconcileCrmBoardProjectionsForPipeline({ pipelineId: args[0].pipelineId })
+    return result
+  },
 }
 const handle = (request: Request) => handleFractionalCrmGateway(request, services)
 export const GET = handle

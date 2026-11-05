@@ -49,9 +49,11 @@ for (const fragment of [
   'last_user_activity_at',
   'host(session.initial_ip_address) AS initial_ip_address',
   'host(session.last_ip_address) AS last_ip_address',
-  'session.active_workspace_organization_id::text',
+  'COALESCE(session.crm_view_workspace_organization_id,session.active_workspace_organization_id)::text AS active_workspace_organization_id',
   'JOIN app_user_organization_memberships active_membership',
-  'active_membership.status AS active_membership_status',
+  "THEN 'disabled' ELSE active_membership.status END AS active_membership_status",
+  'root_access.source_workspace_id=session.active_workspace_organization_id',
+  'rootEmployeeCrmReadPermissions(row.active_workspace_permissions)',
   '$7::inet',
   "$8::integer * interval '1 second'",
   "$9::integer * interval '1 second'",
@@ -74,7 +76,7 @@ assert.ok(insertedSessionColumns.includes('active_workspace_organization_id'), '
 assert.ok(!/(^|,)\s*token\s*(,|$)/m.test(insertedSessionColumns), 'session inserts must never persist a raw token')
 assert.match(
   sessions,
-  /JOIN LATERAL \(\s*SELECT organization_id, role[\s\S]*?FROM app_user_organization_memberships/,
+  /JOIN LATERAL \(\s*SELECT organization_id, role, source_workspace_id, access_origin\s+FROM clawpilot_effective_workspace_memberships\(app_user.email\)/,
   'session creation must select the membership role used to set its idle policy',
 )
 
