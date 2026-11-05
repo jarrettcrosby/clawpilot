@@ -7,19 +7,43 @@ import { readCustomerFolderControls } from '@/lib/persistence/crmCustomerFolderC
 import { applyCustomerFolderCommand } from '@/lib/crm/customerFolderControlService'
 import { customerFolderUuid, parseCustomerFolderCommand, CustomerFolderCommandError } from '@/lib/crm/customerFolderControls'
 import { CustomerFolderHeldError } from '@/lib/crm/customerDriveFolders'
+import { GoogleWorkspaceRequestError } from '@/lib/integrations/googleWorkspace'
+import { GoogleWorkspaceClientError } from '@/lib/integrations/googleWorkspaceClient'
 
 export const runtime='nodejs'
 export const dynamic='force-dynamic'
 export const revalidate=0
 const json=(body:Record<string,unknown>,status=200)=>NextResponse.json(body,{status,headers:{'Cache-Control':'no-store'}})
+const unavailable=()=>json({ok:false,error:'Customer folder controls are unavailable. No success has been confirmed.'},500)
+// Accept only real integration errors and known, bounded public identifiers.
+// Even a typed error's message can contain provider details: never return/log it.
+const googleStatuses=new Set([400,409,422,500,502,503])
+const googleCodes=new Set([
+  'GOOGLE_API_KEY_INVALID','GOOGLE_API_KEY_REQUIRED','GOOGLE_API_KEY_UNAVAILABLE',
+  'GOOGLE_SERVICE_ACCOUNT_BINDING_MISMATCH','GOOGLE_SERVICE_ACCOUNT_INVALID','GOOGLE_SERVICE_ACCOUNT_REQUIRED',
+  'GOOGLE_SERVICE_ACCOUNT_UNAVAILABLE','GOOGLE_SERVICE_ACCOUNT_AUTH_FAILED','GOOGLE_SERVICE_ACCOUNT_IDENTITY_MISMATCH',
+  'GOOGLE_SHARED_DRIVE_REQUIRED','GOOGLE_SHARED_DRIVE_INSUFFICIENT_ACCESS','GOOGLE_SHARED_DRIVE_INVALID',
+  'GOOGLE_SHARED_DRIVE_PAGE_LIMIT','GOOGLE_SHARED_DRIVE_UNAVAILABLE','GOOGLE_ACCESS_DENIED',
+  'GOOGLE_WORKSPACE_CONFLICT','GOOGLE_WORKSPACE_ENCRYPTION_REQUIRED','GOOGLE_WORKSPACE_INTERNAL_ERROR',
+  'GOOGLE_WORKSPACE_REQUEST_INVALID','GOOGLE_WORKSPACE_VALIDATION_REQUIRED','GOOGLE_WORKSPACE_UNAVAILABLE',
+  'GOOGLE_WORKSPACE_UPSTREAM_FAILED','GOOGLE_REQUEST_REJECTED','GOOGLE_RESOURCE_ID_INVALID',
+  'GOOGLE_RESOURCE_NOT_FOUND','GOOGLE_RESPONSE_INVALID','GOOGLE_RESPONSE_TOO_LARGE','GOOGLE_SHEETS_ACCESS_DENIED',
+])
 function errorResponse(error:unknown) {
+  if(error instanceof GoogleWorkspaceRequestError||error instanceof GoogleWorkspaceClientError){
+    if(!googleStatuses.has(error.status)||!googleCodes.has(error.code))return unavailable()
+    const guidance=error.code.startsWith('GOOGLE_SHARED_DRIVE_')||['GOOGLE_ACCESS_DENIED','GOOGLE_RESOURCE_NOT_FOUND'].includes(error.code)
+      ?'Review the configured service account’s access to the Customers folder and its Shared Drive.'
+      :'Review the Google Workspace integration setup and verification in Settings → Integrations.'
+    return json({ok:false,code:error.code,error:`Google Workspace could not verify folder setup (${error.code}). ${guidance} No success has been confirmed. Refresh status before retrying.`},error.status)
+  }
   if(error instanceof CustomerFolderCommandError)return json({ok:false,error:'Check the folder command and use a Google Drive folder URL.',code:error.code},400)
   if(error instanceof CustomerFolderHeldError)return json({ok:false,error:'Folder work could not proceed. Refresh its status and review the setup.',code:error.code},
     ['customer_folder_access_denied','customer_folder_admin_required','customer_folder_customer_editor_required'].includes(error.code)?403:409)
   if(error instanceof Error&&error.message==='Unauthorized')return json({ok:false,error:'Unauthorized'},401)
   if(error instanceof Error&&['Pipeline access denied','This resource is view-only'].includes(error.message))return json({ok:false,error:'CRM access is required.'},403)
   if(error&&typeof error==='object'&&'status' in error&&error.status===403)return json({ok:false,error:'CRM access is required.'},403)
-  return json({ok:false,error:'Customer folder controls are unavailable. No success has been confirmed.'},500)
+  return unavailable()
 }
 async function context(req:NextRequest,pipelineId:string,write=false) {
   if(!isPostgresStorageEnabled())throw new CustomerFolderHeldError('customer_folder_postgres_required')

@@ -1,8 +1,7 @@
-import { resolveManagedGoogleWorkspaceRuntime } from '@/lib/integrations/googleWorkspace'
 import { postgresCustomerFolderStore } from '@/lib/persistence/crmCustomerFolders'
 import { reconcileCrmBoardProjectionsForPipeline } from './boardProjection'
 import { provisionBpoCustomerFolders, type CustomerFolderScope } from './customerDriveFolders'
-import { customerFolderGoogleDrive } from './customerDriveFolderGoogle'
+import { customerFolderGoogleDrive, resolveCustomerFolderGoogleRuntime } from './customerDriveFolderGoogle'
 
 /** Internal composition; callers must select the configured customer parent,
  * not a browser-supplied arbitrary Drive location. Storage independently
@@ -10,7 +9,7 @@ import { customerFolderGoogleDrive } from './customerDriveFolderGoogle'
 export async function provisionCustomerAccountFolder(input: {
   scope: CustomerFolderScope; customerName: string; actorEmail: string; adoptRootId?: string;
 }) {
-  const runtime = await resolveManagedGoogleWorkspaceRuntime({
+  const runtime = await resolveCustomerFolderGoogleRuntime(input.scope.customersParentId, {
     serviceAccountEmail: input.scope.serviceAccountEmail, sharedDriveId: input.scope.sharedDriveId,
   })
   const result = await provisionBpoCustomerFolders({ scope: input.scope, customerName: input.customerName,
