@@ -123,6 +123,7 @@ function harness(values, enabled = true, controlOverride) {
     interactionSuiteCrmModule: fields => fields.suiteCrmModule,
     suiteCrmRelationships: async () => [], suiteCrmAttributes: () => ({}),
     reviewedEmailAudienceWithClient: async () => ({ fingerprint: 'b'.repeat(64) }),
+    legacyReviewedEmailAudienceWithClient: async () => ({ fingerprint: 'b'.repeat(64) }),
   }
   vm.runInNewContext(compiled, runtime)
   return { api: runtime.exports, client, calls, rows, entityWrites }

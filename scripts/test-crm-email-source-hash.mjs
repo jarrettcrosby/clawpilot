@@ -13,6 +13,7 @@ const ast = ts.createSourceFile('crm.ts', source, ts.ScriptTarget.Latest, true, 
 // Execute the real hash, staging and completion functions. SQL and adjacent
 // normalization/provider helpers are synthetic; this is not database acceptance.
 const functions = ['activeCrmRecordSql', 'stagedCrmSourceHash', 'stageCrmRecordWithClient', 'completeSuiteCrmOutboxInPostgres',
+  'reviewedEmailAudienceModeUnderControlWithClient',
   'lockNativeEmailPublicationModeWithClient', 'nativeEmailOutboxTouchesEmail', 'nativeEmailOutboxUnresolvedGuardSql']
   .map(name => {
     const node = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name && node.body)
@@ -49,6 +50,7 @@ function harness(initial = null) {
     if (sql.startsWith('SELECT enabled, active_operation_id, active_transition_id FROM crm_native_email_publication_control')) {
       return { rows: [{ enabled: false, active_operation_id: null, active_transition_id: null }] }
     }
+    if (sql === 'SELECT enabled FROM crm_native_email_publication_control WHERE singleton') return { rows: [{ enabled: false }] }
     if (sql.includes('SELECT id::text, suitecrm_id, reference_code, source_hash, source_payload, suitecrm_module, metadata')) {
       assert.deepEqual(copy(params), [pipelineId, localId, 'gmail:synthetic-message'])
       return { rows: row ? [copy(row)] : [] }
@@ -88,7 +90,7 @@ function harness(initial = null) {
     },
     interactionSuiteCrmModule: () => 'Emails', ensureCrmReferenceShortLink: async () => 'https://example.test/s/gi1234567',
     recordAuditEvent: async () => {}, withTransaction: callback => callback(client),
-    reviewedEmailAudienceWithClient: async () => audience,
+    legacyReviewedEmailAudienceWithClient: async () => audience,
     tableForAggregate: aggregate => { assert.equal(aggregate, 'crm_interactions'); return 'crm_interactions' },
   }
   vm.runInNewContext(compiled, runtime, { filename: 'actual-crm-source-hash-functions.js' })

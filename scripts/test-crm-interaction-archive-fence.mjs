@@ -52,6 +52,11 @@ function harness(initialRecord = baseRecord) {
       if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
         return result([{ singleton: true }])
       }
+      if (sql === 'SELECT enabled FROM crm_native_email_publication_control WHERE singleton') {
+        assert.equal(calls[0].sql, 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+        assert.deepEqual(plain(params), [])
+        return result([{ enabled: false }])
+      }
       if (sql.includes('set_config(')) {
         assert.equal(sql, sharedWriteContextSql, 'Only the exact transaction-local authorized compatibility context is supported')
         assert.deepEqual(plain(params), [], 'The compatibility context has no caller-supplied authority parameters')

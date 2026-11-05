@@ -48,21 +48,22 @@ if (nativeSocket !== undefined) {
 function loadModule(path, dependencies = {}, extraSource = '') {
   const module = { exports: {} }
   const output = ts.transpileModule(`${read(path)}\n${extraSource}`, {
-    fileName: path,
+    // A .mjs suffix forces ESM emit even with CommonJS selected. This fixture
+    // executes trusted declarations in a CommonJS wrapper, not the ESM loader.
+    fileName: path.replace(/\.mjs$/u, '.ts'),
     compilerOptions: {
       module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true,
     },
   }).outputText
-  vm.runInNewContext(output, {
-    Buffer, Error, TextDecoder, URL, URLSearchParams, Response, AbortSignal,
-    process: { env: { CLAWPILOT_ARCHIVE_EMAIL: 'archive@example.test' } },
-    module, exports: module.exports,
-    require(name) {
+  // Keep actual modules and pg's JSON values in the same realm. A fresh VM per
+  // module makes the production canonical-JSON plain-object guard reject valid
+  // objects produced by an adjacent module. Dependency injection stays explicit.
+  const execute = vm.runInThisContext(`(function(module, exports, require, process) {\n${output}\n})`, { filename: path })
+  execute(module, module.exports, name => {
       if (Object.hasOwn(dependencies, name)) return dependencies[name]
       if (name === 'node:crypto') return nodeRequire(name)
       return unexpected(name)
-    },
-  }, { filename: path })
+    }, { env: { CLAWPILOT_ARCHIVE_EMAIL: 'archive@example.test' } })
   return module.exports
 }
 
@@ -85,7 +86,8 @@ function loadCrmPersistence(query, withTransaction) {
     'stageInteraction', 'stageCrmRecordWithClient', 'stageCrmRecordInPostgres',
     'enrichCrmEmailInteractionParticipantsInPostgres',
     'REVIEWED_GMAIL_RELATIONSHIPS', 'reviewedGmailContentFingerprint',
-    'reviewedEmailAudienceWithClient',
+    'reviewedEmailAudienceModeUnderControlWithClient', 'reviewedEmailAudienceWithClient', 'legacyReviewedEmailAudienceWithClient',
+    'reviewedEmailAudienceUnderNativeControlWithClient',
     'readReviewedGmailInteractionWithClient', 'prepareReviewedGmailInteractionWithClient',
     'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',
     'stageReviewedGmailInteractionInPostgres',
@@ -117,8 +119,13 @@ function loadCrmPersistence(query, withTransaction) {
     '@/lib/persistence/postgres': { query, withTransaction }, '@/lib/crm/emailIdentity': emailIdentity, '@/lib/auditWriter': audit,
   })
   const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
+  const protocol = loadModule('app_src/lib/crm/nativeEmailPublication.ts')
+  const eligibility = loadModule('app_src/lib/crm/nativeEmailEligibility.ts', { './nativeEmailPublication': protocol })
+  const roots = loadModule('scripts/lib/native-root-reader-fixture-modules.mjs')
+    .loadNativeRootReaderFixtureModules(loadModule, protocol)
   const context = {
     query, withTransaction, ...stableId, ...emailIdentity, ...emailReconciliation, ...mailboxPersistence, ...audit,
+    ...eligibility, ...roots,
     ...loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     crypto: nodeRequire('node:crypto'), Buffer,
     suiteCrmEmailAddressAttributes: loadModule('app_src/lib/crm/emailAddressHeaders.ts').suiteCrmEmailAddressAttributes,
