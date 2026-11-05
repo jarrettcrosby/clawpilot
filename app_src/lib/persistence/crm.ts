@@ -4420,6 +4420,11 @@ export async function syncAppUserProfileToCrm(input: {
   )) || hierarchy.customerParent
   const profileSourceKey = `profile:${user.email}`
   const contact = await withTransaction(async (client) => {
+    // Match ordinary account/contact staging before locking the profile or
+    // its joined organization rows. A CRM read can otherwise hold those rows
+    // while waiting for control held by a concurrent hierarchy/staging write.
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    await lockCrmMutation(client, `crm-record-lifecycle:${input.pipelineId}`)
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
       [`crm-app-user-profile:${input.pipelineId}:${user.email}`],

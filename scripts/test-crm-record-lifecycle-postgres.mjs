@@ -152,6 +152,83 @@ try {
   try { const result=await scan.processSuiteCrmAccountContactLifecycle();assert.equal(result.errors,0);assert.equal(result.archived,0);assert.equal(result.protected,1)
   } finally { if(oldFlag===undefined)delete process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED;else process.env.CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=oldFlag }
   console.log(`PASS actual PostgreSQL ${postgresMajor} bounded lifecycle inventory/cursor SQL; provider evidence mocked, no production proof`)
+
+  // Execute the actual profile transaction body against PostgreSQL, not a SQL
+  // model. The existing retained identities make later staging a no-op; user
+  // authorization/hierarchy initialization are outside this bounded lock test.
+  await pool.query('ALTER TABLE crm_contacts ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()')
+  const profileSource = readFileSync('app_src/lib/persistence/crm.ts', 'utf8')
+  const profileTree = ts.createSourceFile('crm.ts', profileSource, ts.ScriptTarget.Latest, true)
+  const declaration = name => profileTree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name)
+  const profileDeclaration = declaration('syncAppUserProfileToCrm'), callbacks = []
+  assert.ok(profileDeclaration)
+  function findProfileTransaction(node) {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'withTransaction') callbacks.push(node.arguments[0])
+    ts.forEachChild(node, findProfileTransaction)
+  }
+  findProfileTransaction(profileDeclaration)
+  assert.equal(callbacks.length, 1)
+  const profileModule = { exports: {} }
+  const profileCode = `${declaration('lockCrmMutation').getText(profileTree)}\nmodule.exports = ${callbacks[0].getText(profileTree)}`
+  vm.runInNewContext(ts.transpileModule(profileCode, { compilerOptions: {
+    module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
+  } }).outputText, {
+    module: profileModule, exports: profileModule.exports,
+    input: base, user: { email: base.actorEmail, contactReferenceCode: 'gc1234567', timezone: 'America/New_York', locale: 'en-US' },
+    displayName: 'Profile fixture',
+    workspaceOrganization: { id: pipelineA }, organization: { id: organizationA, suiteCrmId: 'native-suburbia' },
+    profileSourceKey: `profile:${base.actorEmail}`, clean: value => String(value ?? '').trim(),
+    lockCrmNativeEmailAuthorityWithClient: load('app_src/lib/persistence/crmNativeEmailAuthority.ts').lockCrmNativeEmailAuthorityWithClient,
+    stageCrmRecordWithClient: crm.stageCrmRecordWithClient,
+  }, { filename: 'actual-crm-profile-transaction.ts' })
+  let releaseProfileRows, profileRowsEntered, writerPid = null, writer = null
+  const profileRows = new Promise(resolve => { profileRowsEntered = resolve })
+  const continueProfile = new Promise(resolve => { releaseProfileRows = resolve })
+  const outcome = promise => promise.then(value => ({ status: 'fulfilled', value }), error => ({ status: 'rejected', error }))
+  const profile = outcome(withTransaction(async client => {
+    await client.query("SET LOCAL deadlock_timeout='200ms'")
+    return profileModule.exports({ async query(sql, values) {
+      const result = await client.query(sql, values)
+      if (sql.includes('SELECT contact.id::text, contact.organization_id::text') && sql.includes('FOR UPDATE')) {
+        profileRowsEntered(); await continueProfile
+      }
+      return result
+    } })
+  }))
+  try {
+    let readyTimer
+    try { await Promise.race([profileRows, profile.then(result => { throw result.error || new Error('Profile transaction exited before its row-lock barrier') }),
+      new Promise((_, reject) => { readyTimer = setTimeout(() => reject(new Error('Profile row-lock barrier timed out')), 4000) })])
+    } finally { clearTimeout(readyTimer) }
+    writer = outcome(withTransaction(async client => {
+      writerPid = client.processID
+      await client.query("SET LOCAL deadlock_timeout='200ms'")
+      return crm.stageCrmRecordWithClient(client, { ...base, entity: 'organizations', localId: organizationA,
+        sourceKey: 'source-a', fields: { name: 'Globus' }, sourcePayload: { stale: true } })
+    }))
+    const waitDeadline = Date.now() + 4000
+    let blockedQuery = null
+    while (Date.now() < waitDeadline) {
+      if (writerPid) {
+        const row = (await pool.query('SELECT wait_event_type, query FROM pg_stat_activity WHERE pid=$1', [writerPid])).rows[0]
+        if (row?.wait_event_type === 'Lock') { blockedQuery = row.query; break }
+      }
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.ok(blockedQuery, 'Concurrent actual staging must wait on a real PostgreSQL lock')
+    releaseProfileRows()
+    const results = await Promise.all([profile, writer])
+    assert.ok(results.every(result => result.status === 'fulfilled'),
+      `Profile/staging concurrency failed: ${results.map(result => result.error?.code || result.status).join(', ')}`)
+    assert.match(blockedQuery, /crm_native_email_publication_control/, 'Writer waits for control, not profile-held CRM rows')
+    assert.equal(results[0].value.id, contact)
+    assert.equal(results[1].value.id, organizationA)
+    console.log(`PASS actual PostgreSQL ${postgresMajor} profile transaction/control-first staging contention commits without 40P01; retained-identity fixture, not full profile workflow`)
+  } finally {
+    releaseProfileRows()
+    await profile
+    if (writer) await writer
+  }
 } finally {
   if(pool)await pool.end()
   if(started)command(disposablePostgresDockerCleanupArgs(container))
