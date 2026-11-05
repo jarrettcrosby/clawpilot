@@ -148,6 +148,11 @@ async function stage({ retained = [{ email_address_headers: completeEvidence }],
     if (sql === 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE') {
       return result([{ singleton: true }])
     }
+    if (sql === 'SELECT enabled FROM crm_native_email_publication_control WHERE singleton') {
+      assert.equal(calls[0].sql, 'SELECT singleton FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+      assert.deepEqual(plain(params), [])
+      return result([{ enabled: false }])
+    }
     if (sql.includes('FROM app_users app_user')) return result([])
     if (sql.includes('set_config(')) return result([])
     if (sql === 'SELECT user_email,access_role FROM pipeline_space_members WHERE pipeline_id=$1::uuid FOR SHARE') return result([])
