@@ -9,6 +9,9 @@ const pipelineId = '00000000-0000-4000-8000-000000000002'
 const workspaceId = '00000000-0000-4000-8000-000000000001'
 const mailboxId = '00000000-0000-4000-8000-000000000003'
 const owner = 'owner@example.test'
+const contactChoice = { id: '00000000-0000-4000-8000-000000000005', reference: 'gc1234567',
+  name: 'Exact Contact', email: 'actual@example.test', organizationId: '00000000-0000-4000-8000-000000000006',
+  organizationReference: 'ga1234567', company: 'Exact Company' }
 function harness(options = {}) {
   const queries = []
   const module = { exports: {} }
@@ -27,7 +30,7 @@ function harness(options = {}) {
       if (sql.includes('FROM user_maton_connections')) return { rows: options.noConnection ? [] : [{ account_email: owner }] }
       return { rows: options.rows || [{ message_id: '19abcdef01234567', thread_id: '19abcdef01234560', subject: 'Selected cached message',
         received_at: '2026-10-27T10:00:00Z', participant_emails: ['actual@example.test'],
-        participant_contact_ids: ['00000000-0000-4000-8000-000000000005'], legacy: false }] }
+        participant_contacts: [contactChoice], legacy: false }] }
     } },
   }
   vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
@@ -45,12 +48,25 @@ await check('owner-only bounded candidate metadata uses actual headers, verified
   const { sql, values } = h.queries[1]
   for (const fragment of ['message.owner_email=$1', 'source_pipeline.owner_email=message.owner_email', 'NOT source_pipeline.reference_access_disabled',
     "source_owner.status='active'", "source_membership.status='active'", 'source_pipeline.workspace_organization_id=$3::uuid AND message.mailbox_id=$4::uuid',
-    "ARRAY['from','to','cc','bcc']", 'LIMIT 25', 'contact.pipeline_id=$2::uuid', '$5=ANY(candidate.participant_emails)']) assert.ok(sql.includes(fragment), fragment)
+    "ARRAY['from','to','cc','bcc']", 'LIMIT 25', 'contact.pipeline_id=$2::uuid', '$5=ANY(candidate.participant_emails)',
+    'company.pipeline_id=contact.pipeline_id', "company.source_payload->>'archived'", 'LIMIT 100']) assert.ok(sql.includes(fragment), fragment)
   assert.doesNotMatch(sql, /\bbody_text\b|\bsnippet\b|\brecipient_emails\b|Reply-To/)
   assert.equal(values[0], owner); assert.equal(values[2], workspaceId); assert.equal(values[3], mailboxId)
   assert.equal(values[4], 'actual@example.test'); assert.deepEqual(Array.from(values[5]), ['19abcdef01234567'])
   assert.equal(response.body.messages.length, 1)
-  assert.deepEqual(Object.keys(response.body.messages[0]).sort(), ['legacy','messageId','participantContactIds','participantEmails','receivedAt','subject','threadId'].sort())
+  assert.deepEqual(Object.keys(response.body.messages[0]).sort(), ['legacy','messageId','participantContactIds','participantContacts','participantEmails','receivedAt','subject','threadId'].sort())
+  assert.deepEqual(JSON.parse(JSON.stringify(response.body.messages[0].participantContacts)), [contactChoice])
+})
+await check('contact options expose only bounded exact participant and company labels', async () => {
+  const rows = [{ message_id: '19abcdef01234567', thread_id: '19abcdef01234560', received_at: '2026-10-27T10:00:00Z',
+    participant_emails: [contactChoice.email], participant_contacts: [
+      { ...contactChoice, privateNotes: 'must not appear' }, contactChoice, null,
+      { ...contactChoice, id: '00000000-0000-4000-8000-000000000007', email: 'quoted@example.test' },
+      { ...contactChoice, id: '00000000-0000-4000-8000-000000000008', organizationReference: 'invalid' },
+    ] }]
+  const { body } = await harness({ rows }).request()
+  assert.deepEqual(JSON.parse(JSON.stringify(body.messages[0].participantContacts)), [contactChoice])
+  assert.deepEqual(Array.from(body.messages[0].participantContactIds), [contactChoice.id])
 })
 await check('cross-workspace fallback is only the exact fixed target/thread/three-message allowlist', async () => {
   const h = harness(); await h.request()
@@ -67,7 +83,7 @@ const caseyIds = ['1a18e03ea586cd7e','1a18f01749eb87a6'], caseyThread = '1a179e9
 const caseyParams = { pipelineId: caseyPipeline, connectionId: caseyConnection, admissionScope: caseyScope }
 const caseyRows = caseyIds.map(message_id => ({ message_id, thread_id: caseyThread, subject: 'Synthetic reviewed pair',
   received_at: '2026-10-27T10:00:00Z', participant_emails: ['actual@example.test'],
-  participant_contact_ids: ['00000000-0000-4000-8000-000000000005'], legacy: true }))
+  participant_contacts: [contactChoice], legacy: true }))
 const caseyOptions = { actor: { email: caseyOwner }, session: { authenticatedUser: caseyOwner, effectiveUser: caseyOwner },
   pipeline: { id: caseyPipeline, ownerEmail: caseyOwner }, rows: caseyRows }
 await check('explicit Casey mode lists only its complete pinned pair with unknown historical identity retained on replay', async () => {

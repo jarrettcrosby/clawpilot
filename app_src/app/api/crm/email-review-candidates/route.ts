@@ -14,6 +14,8 @@ export const runtime = 'nodejs'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const GMAIL_ID = /^[a-f0-9]{1,128}$/i
 const EMAIL = /^[^\s@]{1,64}@[^\s@]+\.[^\s@]+$/
+const CONTACT_REFERENCE = /^gc(?:[0-9]{7}|[0-9a-v]{12})$/i
+const COMPANY_REFERENCE = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/i
 // The same deliberately finite bridge as emailReconciliation.ts. This does
 // not authorize a mailbox-wide scan, adoption, or an additional legacy message.
 const LEGACY_PIPELINE = '587c8746-ecf6-40ae-8c50-e456f99ad555'
@@ -103,7 +105,7 @@ export async function GET(req: NextRequest) {
             AND (message.mailbox_id IS NULL OR message.mailbox_id=$4::uuid)))`
     const result = await query<{
       message_id: string; thread_id: string; subject: string; received_at: string | Date
-      participant_emails: string[]; participant_contact_ids: string[]; legacy: boolean
+      participant_emails: string[]; participant_contacts: unknown; legacy: boolean
     }>(`WITH owned_cached_candidates AS (
       SELECT message.external_message_id AS message_id, message.external_thread_id AS thread_id,
         left(message.subject, 500) AS subject, message.received_at,
@@ -128,11 +130,24 @@ export async function GET(req: NextRequest) {
           THEN message.raw_metadata->'emailAddressHeaders'->'from' ELSE '[]'::jsonb END)=1
         AND ${historicalPredicate}
         AND (cardinality($6::text[])=0 OR message.external_message_id=ANY($6::text[]))
-    ) SELECT candidate.*, ARRAY(SELECT contact.id::text FROM crm_contacts contact
-        WHERE contact.pipeline_id=$2::uuid
-          AND lower(btrim(contact.email))=ANY(candidate.participant_emails)
-          AND COALESCE(lower(contact.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
-        ORDER BY contact.id LIMIT 100) AS participant_contact_ids
+    ) SELECT candidate.*, (
+        SELECT COALESCE(jsonb_agg(choice.option ORDER BY choice.id), '[]'::jsonb)
+        FROM (
+          SELECT contact.id, jsonb_build_object(
+            'id', contact.id, 'reference', contact.reference_code, 'name', left(contact.full_name, 300),
+            'email', lower(btrim(contact.email)), 'organizationId', company.id,
+            'organizationReference', company.reference_code, 'company', left(company.name, 300)
+          ) AS option
+          FROM crm_contacts contact
+          JOIN crm_organizations company ON company.id=contact.organization_id AND company.pipeline_id=contact.pipeline_id
+          WHERE contact.pipeline_id=$2::uuid
+            AND lower(btrim(contact.email))=ANY(candidate.participant_emails)
+            AND COALESCE(lower(contact.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
+            AND COALESCE(lower(company.source_payload->>'archived'),'false') NOT IN ('true','1','yes')
+            AND contact.reference_code IS NOT NULL AND company.reference_code IS NOT NULL
+          ORDER BY contact.id LIMIT 100
+        ) choice
+      ) AS participant_contacts
       FROM owned_cached_candidates candidate
       WHERE ($5='' OR $5=ANY(candidate.participant_emails))
       ORDER BY candidate.legacy DESC,candidate.received_at DESC,candidate.message_id LIMIT 25`,
@@ -143,13 +158,30 @@ export async function GET(req: NextRequest) {
       || result.rows.some(row => row.thread_id !== LEGACY_THREAD))) {
       return json({ ok: false, error: 'Both exact retained Casey messages are required; the historical records may have changed' }, 409)
     }
-    const messages = result.rows.filter(row => GMAIL_ID.test(row.message_id) && GMAIL_ID.test(row.thread_id)).map(row => ({
-      messageId: row.message_id.toLowerCase(), threadId: row.thread_id.toLowerCase(), subject: row.subject || '(No subject)',
-      receivedAt: new Date(row.received_at).toISOString(), legacy: row.legacy === true,
-      ...(caseyPair ? { admissionScope: CASEY_SCOPE } : {}),
-      participantEmails: (row.participant_emails || []).filter(email => typeof email === 'string' && email.length <= 254 && EMAIL.test(email)).slice(0, 200),
-      participantContactIds: (row.participant_contact_ids || []).filter(id => UUID.test(id)),
-    }))
+    const messages = result.rows.filter(row => GMAIL_ID.test(row.message_id) && GMAIL_ID.test(row.thread_id)).map(row => {
+      const participantEmails = (row.participant_emails || []).filter(email =>
+        typeof email === 'string' && email.length <= 254 && EMAIL.test(email)).slice(0, 200)
+      const seen = new Set<string>()
+      const participantContacts = (Array.isArray(row.participant_contacts) ? row.participant_contacts.slice(0, 100) : []).flatMap((value: unknown) => {
+        if (!value || typeof value !== 'object') return []
+        const { id, reference, name, email, organizationId, organizationReference, company } = value as Record<string, unknown>
+        if (typeof id !== 'string' || !UUID.test(id) || seen.has(id)
+          || typeof reference !== 'string' || !CONTACT_REFERENCE.test(reference)
+          || typeof organizationId !== 'string' || !UUID.test(organizationId)
+          || typeof organizationReference !== 'string' || !COMPANY_REFERENCE.test(organizationReference)
+          || typeof email !== 'string' || !participantEmails.includes(email)
+          || typeof name !== 'string' || !name.trim() || typeof company !== 'string' || !company.trim()) return []
+        seen.add(id)
+        return [{ id, reference: reference.toLowerCase(), name: name.slice(0, 300), email, organizationId,
+          organizationReference: organizationReference.toLowerCase(), company: company.slice(0, 300) }]
+      })
+      return {
+        messageId: row.message_id.toLowerCase(), threadId: row.thread_id.toLowerCase(), subject: row.subject || '(No subject)',
+        receivedAt: new Date(row.received_at).toISOString(), legacy: row.legacy === true,
+        ...(caseyPair ? { admissionScope: CASEY_SCOPE } : {}),
+        participantEmails, participantContacts, participantContactIds: participantContacts.map(contact => contact.id),
+      }
+    })
     return json({ ok: true, pipelineId, connectionId, messages, maximum: caseyPair ? 2 : 25,
       ...(caseyPair ? { admissionScope: CASEY_SCOPE } : {}),
       scope: 'Selected cached Gmail messages only; no bodies, mailbox replay, or future thread rule' })
