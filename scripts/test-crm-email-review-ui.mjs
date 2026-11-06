@@ -15,14 +15,13 @@ vm.runInNewContext(ts.transpileModule(source, { fileName: 'EmailReviewDialog.tsx
   return requireApp(name)
 } })
 const api = module.exports, plain = value => JSON.parse(JSON.stringify(value))
-const contacts = [{ id: 'contact-a', reference: 'gc1234567', name: 'Airspace Person', email: 'airspace@example.test', organizationId: 'company-a', company: 'Airspace' },
-  { id: 'contact-b', reference: 'gc2345678', name: 'Globus Person', email: 'globus@example.test', organizationId: 'company-b', company: 'Globus' },
-  { id: 'reply-only', reference: 'gc3456789', name: 'Quoted Person', email: 'quoted@example.test', organizationId: 'company-b', company: 'Globus' }]
-const organizations = [{ id: 'company-a', reference: 'ga1234567', name: 'Airspace' }, { id: 'company-b', reference: 'ga2345678', name: 'Globus' }]
+const contacts = [{ id: 'contact-a', reference: 'gc1234567', name: 'Airspace Person', email: 'airspace@example.test', organizationId: 'company-a', organizationReference: 'ga1234567', company: 'Airspace' },
+  { id: 'contact-b', reference: 'gc2345678', name: 'Globus Person', email: 'globus@example.test', organizationId: 'company-b', organizationReference: 'ga2345678', company: 'Globus' },
+  { id: 'reply-only', reference: 'gc3456789', name: 'Quoted Person', email: 'quoted@example.test', organizationId: 'company-b', organizationReference: 'ga2345678', company: 'Globus' }]
 const candidate = { messageId: 'abcdef', threadId: 'aaaaaa', subject: '<script>Untrusted subject</script>', receivedAt: '2026-10-27T10:00:00Z', legacy: false,
-  participantEmails: ['airspace@example.test','globus@example.test'], participantContactIds: ['contact-a','contact-b','reply-only'] }
+  participantEmails: ['airspace@example.test','globus@example.test'], participantContactIds: ['contact-a','contact-b','reply-only'], participantContacts: contacts }
 const base = { pipelineId: 'pipeline', connectionId: 'mailbox', decisionKind: 'review', correctionReason: '', participantEmail: '',
-  candidates: [candidate], selections: { abcdef: { contactIds: ['contact-a','contact-b'], primaryOrganizationReference: 'ga1234567' } }, contacts, organizations }
+  candidates: [candidate], selections: { abcdef: { contactIds: ['contact-a','contact-b'], primaryOrganizationReference: 'ga1234567' } } }
 let checks = 0
 function check(label, run) { run(); checks++; console.log('PASS ' + label) }
 check('actual React/MUI fields show both contact/company identities, exact participants and escaped subject', () => {
@@ -44,6 +43,16 @@ check('unrelated company, absent/header-only mismatch and duplicate Contacts can
     { abcdef: { contactIds: ['contact-a','contact-a'], primaryOrganizationReference: 'ga1234567' } },
     { abcdef: { contactIds: [], primaryOrganizationReference: 'ga1234567' } },
   ]) assert.equal(api.emailReviewCommand({ ...base, selections }), null)
+})
+check('a contact supplied by a different candidate cannot be used for this message', () => {
+  const candidates = [{ ...candidate, participantContacts: [contacts[0]] },
+    { ...candidate, messageId: 'abcdef2', participantContacts: [contacts[1]] }]
+  assert.equal(api.emailReviewCommand({ ...base, candidates }), null)
+  const result = api.emailReviewCommand({ ...base, candidates, selections: {
+    abcdef: { contactIds: ['contact-a'], primaryOrganizationReference: 'ga1234567' },
+    abcdef2: { contactIds: ['contact-b'], primaryOrganizationReference: 'ga2345678' },
+  } })
+  assert.deepEqual(plain(result.reviewedAssociations.map(row => row.contactReferences)), [['gc1234567'], ['gc2345678']])
 })
 check('correction requires bounded reason and late contact requires an actually selected participant', () => {
   assert.equal(api.emailReviewCommand({ ...base, decisionKind: 'correction' }), null)
@@ -158,7 +167,8 @@ check('stale verified mailboxes remain reviewable but repair never auto-applies 
 check('real CRM mount is owner-only and communicates finite/no-audience-expansion scope', () => {
   const crm = readFileSync('app_src/components/crm/CrmSection.tsx', 'utf8')
   assert.match(crm, /pipeline\?\.accessRole === 'owner'[\s\S]*?<EmailReviewDialog/)
-  assert.match(crm, /contacts=\{contacts\} organizations=\{organizations\}/)
+  assert.doesNotMatch(crm.match(/<EmailReviewDialog[\s\S]*?\/>/)?.[0] || '', /contacts=|organizations=/)
+  assert.match(source, /body\.pipelineId !== pipelineId \|\| body\.connectionId !== selectedConnection/)
   assert.ok(source.includes('does not add pipeline readers or make a rule for future messages'))
   assert.ok(source.includes('fixed three messages')); assert.ok(source.includes('Contacts keep their own company'))
 })

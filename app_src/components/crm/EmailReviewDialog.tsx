@@ -1,14 +1,14 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, Autocomplete, Box, Button, Checkbox, CircularProgress, Dialog, DialogActions, DialogContent,
   DialogTitle, FormControlLabel, MenuItem, Stack, TextField, Typography } from '@mui/material'
 import EmailRounded from '@mui/icons-material/EmailRounded'
 import { loadGoogleIdentityServices } from '@/components/settings/GoogleAuthSettingsPanel'
 
-type RecordValue = Record<string, unknown>
 export type EmailReviewCandidate = { messageId: string; threadId: string; subject: string; receivedAt: string
-  legacy: boolean; admissionScope?: 'casey-reviewed-two-v1'; participantEmails: string[]; participantContactIds: string[] }
+  legacy: boolean; admissionScope?: 'casey-reviewed-two-v1'; participantEmails: string[]
+  participantContactIds: string[]; participantContacts: ContactChoice[] }
 type Mailbox = { connectionId: string; accountEmail: string; verified: boolean }
 type MailboxLabelPreview = { required: boolean; oldAccountEmail: string; newAccountEmail: string; expectedDigest: string; expiresAt: string }
 type MailboxLabelProof = { pipelineId: string; connectionId: string; idToken: string; expectedDigest: string; expiresAt: string }
@@ -16,8 +16,13 @@ type Selection = { contactIds: string[]; primaryOrganizationReference: string }
 type Decision = 'review' | 'correction' | 'late-contact' | 'casey-history'
 type ReviewedMessage = { messageId: string; subject: string; organizationReferences: string[]; contactReferences: string[]; alreadyLinked?: boolean }
 type Preview = { digest: string; inputKey: string; messages: ReviewedMessage[] }
-type ContactChoice = { id: string; reference: string; name: string; email: string; organizationId: string; company: string }
-type CompanyChoice = { id: string; reference: string; name: string }
+type ContactChoice = { id: string; reference: string; name: string; email: string; organizationId: string
+  organizationReference: string; company: string }
+
+function exactContactChoices(message: EmailReviewCandidate) {
+  return (message.participantContacts || []).filter(contact => contact.reference && contact.organizationReference
+    && message.participantContactIds.includes(contact.id) && message.participantEmails.includes(contact.email))
+}
 
 export function validMailboxLabelPreview(value: unknown, now = Date.now()): value is MailboxLabelPreview {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -52,8 +57,7 @@ export function MailboxLabelRepairFields({ preview, busy, onConfirm, onCancel }:
 }
 
 export function emailReviewCommand(input: { pipelineId: string; connectionId: string; decisionKind: Decision
-  correctionReason: string; participantEmail: string; candidates: EmailReviewCandidate[]; selections: Record<string, Selection>
-  contacts: ContactChoice[]; organizations: CompanyChoice[] }) {
+  correctionReason: string; participantEmail: string; candidates: EmailReviewCandidate[]; selections: Record<string, Selection> }) {
   const selected = input.candidates.filter(message => Object.hasOwn(input.selections, message.messageId))
     .sort((a, b) => a.messageId.localeCompare(b.messageId))
   if (!input.connectionId || !selected.length || selected.length > 25
@@ -69,15 +73,14 @@ export function emailReviewCommand(input: { pipelineId: string; connectionId: st
       || input.candidates.filter(message => message.legacy).length !== 3)) return null
   const associations = selected.map(message => {
     const selection = input.selections[message.messageId]
-    const contacts = selection.contactIds.map(id => input.contacts.find(contact => contact.id === id))
-    const primary = input.organizations.find(company => company.reference === selection.primaryOrganizationReference)
+    const options = exactContactChoices(message)
+    const contacts = selection.contactIds.map(id => options.find(contact => contact.id === id))
+    const primary = contacts.find(contact => contact?.organizationReference === selection.primaryOrganizationReference)
     if (!contacts.length || contacts.length > 25 || new Set(selection.contactIds).size !== contacts.length
-      || !primary || contacts.some(contact => !contact || !contact.reference
-        || !message.participantContactIds.includes(contact.id) || !message.participantEmails.includes(contact.email))
-      || (input.decisionKind === 'late-contact' && !contacts.some(contact => contact?.email === input.participantEmail.trim().toLowerCase()))
-      || !contacts.some(contact => contact?.organizationId === primary.id)) return null
+      || !primary || contacts.some(contact => !contact)
+      || (input.decisionKind === 'late-contact' && !contacts.some(contact => contact?.email === input.participantEmail.trim().toLowerCase()))) return null
     return { messageId: message.messageId, threadId: message.threadId,
-      primaryOrganizationReference: primary.reference,
+      primaryOrganizationReference: primary.organizationReference,
       contactReferences: contacts.map(contact => contact!.reference).sort() }
   })
   if (associations.some(value => value === null)) return null
@@ -88,16 +91,16 @@ export function emailReviewCommand(input: { pipelineId: string; connectionId: st
     ...(input.decisionKind === 'late-contact' ? { participantEmail: input.participantEmail.trim().toLowerCase() } : {}) }
 }
 
-export function EmailReviewFields({ candidates, selections, contacts, organizations, disabled, onSelection }: {
-  candidates: EmailReviewCandidate[]; selections: Record<string, Selection>; contacts: ContactChoice[]
-  organizations: CompanyChoice[]; disabled: boolean; onSelection: (messageId: string, selection: Selection | null) => void
+export function EmailReviewFields({ candidates, selections, disabled, onSelection }: {
+  candidates: EmailReviewCandidate[]; selections: Record<string, Selection>
+  disabled: boolean; onSelection: (messageId: string, selection: Selection | null) => void
 }) {
   return <Stack gap={2}>
     {candidates.map(message => {
       const selected = selections[message.messageId]
-      const options = contacts.filter(contact => message.participantContactIds.includes(contact.id) && message.participantEmails.includes(contact.email))
-      const chosen = selected ? contacts.filter(contact => selected.contactIds.includes(contact.id)) : []
-      const companies = organizations.filter(company => chosen.some(contact => contact.organizationId === company.id))
+      const options = exactContactChoices(message)
+      const chosen = selected ? options.filter(contact => selected.contactIds.includes(contact.id)) : []
+      const companies = [...new Map(chosen.map(contact => [contact.organizationId, contact])).values()]
       return <Stack key={message.messageId} gap={1} sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1.5 }}>
         <FormControlLabel control={<Checkbox checked={Boolean(selected)} disabled={disabled}
           onChange={(_, checked) => onSelection(message.messageId, checked ? { contactIds: [], primaryOrganizationReference: '' } : null)} />}
@@ -112,17 +115,18 @@ export function EmailReviewFields({ candidates, selections, contacts, organizati
             isOptionEqualToValue={(option, value) => option.id === value.id}
             getOptionLabel={option => `${option.name} — ${option.email} — ${option.company || 'No company'}`}
             onChange={(_, values) => {
-              const remaining = organizations.find(company => company.reference === selected.primaryOrganizationReference
-                && values.some(contact => contact.organizationId === company.id))
-              onSelection(message.messageId, { contactIds: values.map(contact => contact.id), primaryOrganizationReference: remaining?.reference || '' })
+              const remaining = values.find(contact => contact.organizationReference === selected.primaryOrganizationReference)
+              onSelection(message.messageId, { contactIds: values.map(contact => contact.id), primaryOrganizationReference: remaining?.organizationReference || '' })
             }}
             renderInput={params => <TextField {...params} label="Actual participant contacts" helperText="Select existing contacts from these message headers. Names, quoted text, and Reply-To do not create a match." />} />
           <TextField select fullWidth label="Primary company" value={selected.primaryOrganizationReference} disabled={disabled}
             onChange={event => onSelection(message.messageId, { ...selected, primaryOrganizationReference: event.target.value })}>
             <MenuItem value="">Select a selected contact’s company</MenuItem>
-            {companies.map(company => <MenuItem key={company.id} value={company.reference}>{company.name} · {company.reference}</MenuItem>)}
+            {companies.map(company => <MenuItem key={company.organizationId} value={company.organizationReference}>
+              {company.company} · {company.organizationReference}
+            </MenuItem>)}
           </TextField>
-          {!options.length && <Alert severity="warning">No loaded CRM contact matches these actual headers. Create or load the correct contact first, then refresh this review.</Alert>}
+          {!options.length && <Alert severity="warning">No active contact linked to a company in this pipeline matches these message headers.</Alert>}
         </>}
       </Stack>
     })}
@@ -136,8 +140,8 @@ async function requestJson<T extends { ok?: boolean; error?: string }>(url: stri
   return body
 }
 
-export default function EmailReviewDialog({ pipelineId, contacts: contactRecords, organizations: companyRecords, onApplied }: {
-  pipelineId: string; contacts: RecordValue[]; organizations: RecordValue[]; onApplied?: () => void
+export default function EmailReviewDialog({ pipelineId, onApplied }: {
+  pipelineId: string; onApplied?: () => void
 }) {
   const [open, setOpen] = useState(false), [busy, setBusy] = useState(false)
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([]), [clientId, setClientId] = useState('')
@@ -156,11 +160,7 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
   // source pipeline and full evidence. Other workspaces need no one-off action.
   const caseyAvailable = pipelineId === '587c8746-ecf6-40ae-8c50-e456f99ad555'
     && connectionId === 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027'
-  const contacts = useMemo(() => contactRecords.map(contact => ({ id: String(contact.id || ''), reference: String(contact.referenceCode || ''),
-    name: String(contact.fullName || ''), email: String(contact.email || '').trim().toLowerCase(),
-    organizationId: String(contact.organizationId || ''), company: String(contact.organizationName || '') })), [contactRecords])
-  const organizations = useMemo(() => companyRecords.map(company => ({ id: String(company.id || ''), reference: String(company.referenceCode || ''), name: String(company.name || '') })), [companyRecords])
-  const command = emailReviewCommand({ pipelineId, connectionId, decisionKind, correctionReason, participantEmail, candidates, selections, contacts, organizations })
+  const command = emailReviewCommand({ pipelineId, connectionId, decisionKind, correctionReason, participantEmail, candidates, selections })
   const inputKey = command ? JSON.stringify(command) : ''
   const invalidate = useCallback((clearNotice = true) => { revision.current++; setPreview(null); if (clearNotice) setNotice('') }, [])
   const clearMailboxRepair = useCallback(() => { labelProof.current = null; setLabelPreview(null); setRepairingMailbox(false) }, [])
@@ -186,8 +186,6 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
     }, Math.max(0, Math.min(5 * 60_000, Date.parse(labelPreview.expiresAt) - Date.now())))
     return () => clearTimeout(timer)
   }, [labelPreview])
-  useEffect(() => { invalidate() }, [contacts, organizations, invalidate])
-
   const loadCandidates = useCallback(async (selectedConnection: string, exactParticipant = '') => {
     invalidate(false); setCandidates([]); setSelections({})
     const controller = begin()
@@ -195,8 +193,12 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
       const params = new URLSearchParams({ pipelineId, connectionId: selectedConnection,
         ...(decisionKind === 'casey-history' ? { admissionScope: 'casey-reviewed-two-v1' } : {}),
         ...(exactParticipant ? { participantEmail: exactParticipant.trim().toLowerCase() } : {}) })
-      const body = await requestJson<{ ok?: boolean; error?: string; messages?: EmailReviewCandidate[]; admissionScope?: string }>(`/api/crm/email-review-candidates?${params}`, controller)
+      const body = await requestJson<{ ok?: boolean; error?: string; pipelineId?: string; connectionId?: string
+        messages?: EmailReviewCandidate[]; admissionScope?: string }>(`/api/crm/email-review-candidates?${params}`, controller)
       if (!controller.signal.aborted) {
+        if (body.pipelineId !== pipelineId || body.connectionId !== selectedConnection) {
+          throw new Error('Cached messages do not match the selected pipeline and mailbox.')
+        }
         if (decisionKind === 'casey-history' && (body.admissionScope !== 'casey-reviewed-two-v1'
           || !Array.isArray(body.messages) || body.messages.length !== 2
           || body.messages.some(message => message.admissionScope !== 'casey-reviewed-two-v1' || !message.legacy))) {
@@ -367,7 +369,7 @@ export default function EmailReviewDialog({ pipelineId, contacts: contactRecords
             onClick={() => { void loadCandidates(connectionId, participantEmail) }}>Find bounded cached participant messages</Button>
         </Stack>}
         {mailbox?.verified && decisionKind !== 'late-contact' && <Button disabled={busy || repairingMailbox} onClick={() => { void loadCandidates(connectionId) }}>Refresh cached candidates</Button>}
-        <EmailReviewFields candidates={candidates} selections={selections} contacts={contacts} organizations={organizations} disabled={busy || repairingMailbox}
+        <EmailReviewFields candidates={candidates} selections={selections} disabled={busy || repairingMailbox}
           onSelection={(messageId, selection) => { invalidate(); setSelections(current => {
             const next = { ...current }; if (selection) next[messageId] = selection; else delete next[messageId]; return next
           }) }} />

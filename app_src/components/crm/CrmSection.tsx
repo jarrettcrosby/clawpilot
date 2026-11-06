@@ -2580,7 +2580,7 @@ export default function CrmSection() {
               {pipeline?.accessRole === 'owner' && (
                 <>
                   {entity === 'interactions' && <EmailReviewDialog key={pipeline.id} pipelineId={pipeline.id}
-                    contacts={contacts} organizations={organizations} onApplied={() => { void load(entity, query, needsReviewOnly) }} />}
+                    onApplied={() => { void load(entity, query, needsReviewOnly) }} />}
                   {entity === 'meetings' && <CalendarImportSettings key={pipeline.id} pipelineId={pipeline.id} />}
                   <Tooltip title="Import the connected workbook into CRM">
                     <IconButton aria-label="Import workbook" disabled={busy} onClick={() => runWorkbookAction('/api/crm/import', 'Workbook imported and queued for CRM sync')}>

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Real CRM React/MUI drawer and confirmation with synthetic HTTP responses.
-// No live account, CRM deletion, database, or provider calls.
+// Real CRM React/MUI controls with synthetic HTTP responses.
+// No live account, CRM deletion, email recovery, database, or provider calls.
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -39,9 +39,48 @@ try {
   const unrelated = { ...external, id: '00000000-0000-4000-8000-000000000003', referenceCode: 'ga2222222', name: 'BPO example', accountType: 'Customer' }
   const contact = { id: '00000000-0000-4000-8000-000000000004', referenceCode: 'gc1111111', organizationId: external.id, fullName: 'Customer contact', syncStatus: 'synced' }
   let organizations = [external, unrelated], contacts = [contact], accessRole = 'editor', failArchive = false
+  const mailbox = { connectionId: 'fixture-mailbox', accountEmail: 'owner@example.test', verified: true }
+  const participantContacts = [
+    { id: contact.id, reference: contact.referenceCode, name: 'Airspace participant', email: 'airspace@example.test',
+      organizationId: external.id, organizationReference: external.referenceCode, company: 'Airspace fixture' },
+    { id: '00000000-0000-4000-8000-000000000005', reference: 'gc2222222', name: 'Globus participant', email: 'globus@example.test',
+      organizationId: unrelated.id, organizationReference: unrelated.referenceCode, company: 'Globus fixture' },
+  ]
+  const reviewedMessage = { messageId: 'abcdef', threadId: 'abcdef01', subject: 'Synthetic reviewed email',
+    receivedAt: '2026-11-05T12:00:00.000Z', legacy: false, participantContacts,
+    participantContactIds: participantContacts.map(item => item.id), participantEmails: participantContacts.map(item => item.email) }
+  const reviewReads = [], previewRequests = [], unexpectedReviewRequests = []
+  let testingEmailReview = false, reviewDialogRequested = false
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url())
     const json = (body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+    if (testingEmailReview) {
+      const method = request.method()
+      if (url.pathname === '/api/crm/mailbox-identity' && method === 'GET' && url.searchParams.get('pipelineId') === pipelineId) {
+        reviewReads.push('mailbox')
+        return json({ ok: true, mailboxes: [mailbox] })
+      }
+      if (url.pathname === '/api/crm/email-review-candidates' && method === 'GET'
+        && url.searchParams.get('pipelineId') === pipelineId && url.searchParams.get('connectionId') === mailbox.connectionId) {
+        reviewReads.push('candidates')
+        return json({ ok: true, pipelineId, connectionId: mailbox.connectionId, messages: [reviewedMessage] })
+      }
+      if (url.pathname === '/api/crm/email-recovery' && method === 'POST' && request.postDataJSON()?.apply === false) {
+        previewRequests.push(request.postDataJSON())
+        return json({ ok: true, recovery: { applied: false, digest: 'a'.repeat(64), messages: [{
+          messageId: reviewedMessage.messageId, subject: reviewedMessage.subject,
+          organizationReferences: [external.referenceCode, unrelated.referenceCode],
+          contactReferences: participantContacts.map(item => item.reference),
+        }] } })
+      }
+      if (method !== 'GET' || (url.pathname === '/api/crm'
+        && ['contacts', 'organizations'].includes(url.searchParams.get('entity'))
+        && (reviewDialogRequested || !url.searchParams.has('query')))
+        || /^\/api\/crm\/(?:mailbox-identity|email-review-candidates|email-recovery)$/.test(url.pathname)) {
+        unexpectedReviewRequests.push(`${method} ${url.pathname}${url.search}`)
+        return json({ ok: false, error: 'Unexpected email-review request in browser fixture' }, 400)
+      }
+    }
     if (url.pathname === '/api/workspaces') return json({ ok: true, selectedPipelineId: pipelineId,
       pipelines: [{ id: pipelineId, name: 'Customer pipeline', ownerEmail: 'owner@example.test', accessRole }] })
     if (url.pathname === '/api/crm') {
@@ -70,6 +109,39 @@ try {
     await page.getByRole('tab', { name: 'Contacts', exact: true }).click()
     await page.getByText(contact.fullName, { exact: true }).click()
   }
+  // Fresh owner page: never open a record editor to hydrate directory choices.
+  accessRole = 'owner'; testingEmailReview = true
+  await page.goto(origin)
+  await page.getByRole('tab', { name: 'Interactions', exact: true }).click()
+  reviewDialogRequested = true
+  await page.getByRole('button', { name: 'Review email', exact: true }).click()
+  const review = page.getByRole('dialog', { name: 'Review selected Gmail messages' })
+  const preview = review.getByRole('button', { name: 'Preview selected messages', exact: true })
+  await expect(review.getByRole('button', { name: 'Apply reviewed selection', exact: true })).toBeDisabled()
+  await review.getByRole('checkbox', { name: reviewedMessage.subject, exact: true }).check()
+  await expect(preview).toBeDisabled()
+  await review.getByRole('combobox', { name: 'Actual participant contacts', exact: true }).click()
+  for (const participant of participantContacts) {
+    await page.getByRole('option', { name: `${participant.name} — ${participant.email} — ${participant.company}`, exact: true }).click()
+  }
+  await expect(preview).toBeDisabled()
+  await review.getByRole('combobox', { name: /^Primary company/ }).click()
+  await page.getByRole('option', { name: `Globus fixture · ${unrelated.referenceCode}`, exact: true }).click()
+  await expect(preview).toBeEnabled()
+  await preview.click()
+  await expect(review.getByText('Reviewed preview — 1 selected messages', { exact: true })).toBeVisible()
+  await expect(review.getByText(`${reviewedMessage.subject} · Companies: ${external.referenceCode}, ${unrelated.referenceCode} · Contacts: ${participantContacts.map(item => item.reference).join(', ')}`, { exact: true })).toBeVisible()
+  assert.deepEqual(reviewReads, ['mailbox', 'candidates'])
+  assert.deepEqual(previewRequests, [{ pipelineId, connectionId: mailbox.connectionId, messageIds: [reviewedMessage.messageId],
+    reviewedAssociations: [{ messageId: reviewedMessage.messageId, threadId: reviewedMessage.threadId,
+      primaryOrganizationReference: unrelated.referenceCode, contactReferences: participantContacts.map(item => item.reference) }],
+    decisionKind: 'review', apply: false }])
+  await review.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(review).toHaveCount(0)
+  assert.deepEqual(unexpectedReviewRequests, [], 'Review neither fetches editor options nor applies a change')
+  assert.deepEqual(mutations, [])
+  console.log('PASS fresh-owner CRM email review: exact two-company picker and Globus primary preview without directory lookup or Apply; HTTP mocked')
+  testingEmailReview = false; accessRole = 'editor'
   for(const mode of ['light','dark']){
     await page.goto(`${origin}/?mode=${mode}`)
     await expect(page.getByRole('columnheader',{name:'Type',exact:true})).toBeVisible()

@@ -775,15 +775,37 @@ try {
     assert.equal(scoped.body.messages.length, 2)
     assert.deepEqual(scoped.body.messages.map(row => row.messageId).sort(), CASEY.messages.map(row => row.message).sort())
     for (const row of scoped.body.messages) {
-      assert.deepEqual(Object.keys(row).sort(), ['admissionScope', 'legacy', 'messageId', 'participantContactIds', 'participantEmails', 'receivedAt', 'subject', 'threadId'])
+      assert.deepEqual(Object.keys(row).sort(), ['admissionScope', 'legacy', 'messageId', 'participantContactIds', 'participantContacts', 'participantEmails', 'receivedAt', 'subject', 'threadId'])
       assert.equal(row.admissionScope, 'casey-reviewed-two-v1'); assert.equal(row.legacy, true); assert.equal(row.threadId, CASEY.thread)
       assert.deepEqual(row.participantContactIds.sort(), [CASEY.globusContact, CASEY.airspaceContact].sort())
+      assert.deepEqual(row.participantContacts.map(choice => [choice.id, choice.reference, choice.email, choice.organizationId, choice.organizationReference]),
+        caseyTargets.map((target, index) => [target.id, target.referenceCode, target.email, target.organizationId, caseyCompanies[index].referenceCode]))
     }
     assert.ok(!JSON.stringify(scoped.body).includes('Synthetic exact-two retained body'))
     const ordinary = await get()
     assert.equal(ordinary.status, 200); assert.deepEqual(ordinary.body.messages, [])
     assert.equal(Object.hasOwn(ordinary.body, 'admissionScope'), false)
     assert.deepEqual(await durableState(), before, 'Candidate GET never acquires, adopts or rewrites retained mail')
+    const archivedCompany = id(705), foreignCompany = id(706)
+    const archivedContact = id(707), archivedCompanyContact = id(708), foreignContact = id(709)
+    try {
+      await query(`INSERT INTO crm_organizations(id,pipeline_id,name,reference_code,source_key,source_payload)
+        VALUES($1,$3,'Archived option','ga7000001','archived-option','{"archived":true}'),
+              ($2,$4,'Foreign option','ga7000002','foreign-option','{}')`,
+      [archivedCompany, foreignCompany, CASEY.pipeline, CASEY.intake])
+      await query(`INSERT INTO crm_contacts(id,pipeline_id,organization_id,full_name,email,reference_code,source_key,source_payload)
+        VALUES($1,$4,$6,'Archived contact',$9,'gc7000001','archived-contact','{"archived":true}'),
+              ($2,$4,$7,'Archived company contact',$9,'gc7000002','archived-company-contact','{}'),
+              ($3,$5,$8,'Foreign contact',$9,'gc7000003','foreign-contact','{}')`,
+      [archivedContact, archivedCompanyContact, foreignContact, CASEY.pipeline, CASEY.intake, CASEY.globus,
+        archivedCompany, foreignCompany, caseyTargets[0].email])
+      const result = await get('casey-reviewed-two-v1')
+      assert.equal(result.status, 200)
+      assert.deepEqual(result.body.messages, scoped.body.messages)
+    } finally {
+      await query('DELETE FROM crm_contacts WHERE id=ANY($1::uuid[])', [[archivedContact, archivedCompanyContact, foreignContact]])
+      await query('DELETE FROM crm_organizations WHERE id=ANY($1::uuid[])', [[archivedCompany, foreignCompany]])
+    }
   })
   let caseyPreviews, caseyApply
   await check('Casey exact-two is a separately named read-only admission, never a generic or three-message alias', async () => {
