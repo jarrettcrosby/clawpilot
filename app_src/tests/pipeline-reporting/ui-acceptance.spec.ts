@@ -1,6 +1,11 @@
 import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
 
+test.beforeEach(async ({ page, baseURL }) => {
+  const fixtureOrigin = new URL(baseURL || 'http://localhost:4002').origin
+  await page.route((url) => url.origin !== fixtureOrigin, (route) => route.abort())
+})
+
 const reportPayload = {
   ok: true,
   period: {
@@ -56,6 +61,7 @@ const reportPayload = {
     },
   },
   activity: {
+    interactionScope: 'sales',
     contactsAdded: 2,
     interactions: 3,
     opportunitiesCreated: 1,
@@ -108,6 +114,47 @@ test('report fetch can recover and chart marks disclose values on hover and keyb
   await proposalMark.focus()
   await expect(page.getByRole('tooltip')).toContainText('Proposal · 3 opportunities')
   await page.keyboard.press('Tab')
+})
+
+test('report defaults to sales interactions and restores them after viewing all activity', async ({ page }) => {
+  const scopes: (string | null)[] = []
+  const allActivity = {
+    ...reportPayload.activity,
+    interactionScope: 'all',
+    interactions: 11,
+    interactionsByMonth: reportPayload.activity.interactionsByMonth.map((month) => ({
+      ...month, total: 11, types: { ...month.types, note: 8 },
+    })),
+  }
+  await page.route((url) => url.pathname === '/api/pipeline/report', async (route) => {
+    const scope = new URL(route.request().url()).searchParams.get('interactionScope')
+    scopes.push(scope)
+    await route.fulfill({ json: { ...reportPayload, activity: scope === 'all' ? allActivity : reportPayload.activity } })
+  })
+  const total = (label: string, value: string) => page.getByText(`${label} · selected period`, { exact: true })
+    .locator('..').getByText(value, { exact: true })
+  const scope = page.getByRole('combobox', { name: 'Interaction scope' })
+  const extraActivity = page.getByRole('img', { name: 'Aug 2026 · Note: 8 interactions' })
+
+  await page.goto('/dev/pipeline-reporting')
+  await expect(scope).toHaveText('Customers and prospects')
+  await expect(total('Sales interactions', '3')).toBeVisible()
+  await expect(extraActivity).toHaveCount(0)
+  expect(scopes).toEqual(['sales'])
+
+  await scope.click()
+  await page.getByRole('option', { name: 'All activity' }).click()
+  await expect(scope).toHaveText('All activity')
+  await expect(total('All interactions', '11')).toBeVisible()
+  await expect(extraActivity).toBeVisible()
+  expect(scopes).toEqual(['sales', 'all'])
+
+  await scope.click()
+  await page.getByRole('option', { name: 'Customers and prospects' }).click()
+  await expect(scope).toHaveText('Customers and prospects')
+  await expect(total('Sales interactions', '3')).toBeVisible()
+  await expect(extraActivity).toHaveCount(0)
+  expect(scopes).toEqual(['sales', 'all', 'sales'])
 })
 
 test.describe('touch chart details', () => {
