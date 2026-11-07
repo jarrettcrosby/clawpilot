@@ -2,6 +2,8 @@
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 import vm from 'node:vm'
 const require = createRequire(import.meta.url)
 const { SCOPE, audienceSnapshot, messagePlan, reviewedPreviewRequestDrafts, collect, inspectionFailure } = require('./inspect-bpo-email-recovery-readonly.cjs')
@@ -223,5 +225,113 @@ await check('diagnostics distinguish safe runtime stages without returning arbit
   assert.equal(inspectionFailure({message:secret,code:secret},'metadata').runtimeCode,null)
   assert.equal(inspectionFailure({message:'EXACT_PRODUCTION_ENVIRONMENT_REQUIRED'},'environment').errorCode,'EXACT_PRODUCTION_ENVIRONMENT_REQUIRED')
   assert.equal(inspectionFailure({message:secret,code:'42703'},'metadata').databaseCode,'42703')
+})
+const wrapperSource=readFileSync(new URL('./run-bpo-email-recovery-readonly.mjs',import.meta.url),'utf8')
+const wrapperDeclarations=declaration('scripts/run-bpo-email-recovery-readonly.mjs',
+  ['DEFAULT_RAILWAY_BINARY','RAILWAY_HASH','readOnlyOptions','verifiedRailwayBinary'])
+const binaryBytes=Buffer.from('synthetic reviewed CLI bytes, never executed')
+const binarySha=createHash('sha256').update(binaryBytes).digest('hex')
+const reviewedBinary='/reviewed/private/railway'
+function wrapperFixture(args,options={}) {
+  const calls=[],writes=[],logs=[],reads=[]
+  let binaryReads=0
+  const fakeProcess={argv:['node','run-bpo-email-recovery-readonly.mjs',...args],getuid:()=>1000,exitCode:undefined}
+  const defaultAlias='/opt/homebrew/bin/railway',defaultCanonical='/reviewed/private/default-railway'
+  const stat=()=>({uid:options.foreignOwner?2000:1000,mode:options.writable?0o100777:0o100755,
+    size:binaryBytes.length,isFile:()=>!options.notFile,isSymbolicLink:()=>Boolean(options.symlink)})
+  const files={lstatSync:()=>{
+    if(options.missingFile)throw new Error('PRIVATE_FILE_PATH_ERROR')
+    return stat()
+  },realpathSync:path=>path===defaultAlias?defaultCanonical:options.symlink?'/another/railway':path,
+  readFileSync:(path)=>{
+    if(path instanceof URL)return '#!/usr/bin/env node\n// SELECT-only collector fixture; not executed\n'
+    reads.push(path);binaryReads++
+    return options.changedAt===binaryReads?Buffer.from('different CLI bytes'):binaryBytes
+  },writeFileSync:(path,bytes,flags)=>writes.push({path,document:JSON.parse(bytes),flags})}
+  const collector={SCOPE,validateReadOnlyPostgresTrust:bundle=>{
+    assert.equal(bundle.projectId,SCOPE.projectId);assert.equal(bundle.environmentId,SCOPE.environmentId);assert.equal(bundle.service,'Postgres')
+    return {leafFingerprint256:'fixture-leaf',rootFingerprint256:'fixture-root',serverName:'fixture-postgres'}
+  }}
+  const execFileSync=(program,argv,opts)=>{
+    calls.push({program,argv,opts})
+    if(options.transportFailure){const error=new Error('PRIVATE_TRANSPORT_ERROR');error.stderr='PRIVATE_SECRET unauthorized';throw error}
+    if(calls.length===1)return options.invalidCertificates?'no certificates':
+      '-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nQg==\n-----END CERTIFICATE-----'
+    return JSON.stringify({failed:false,kind:'bpo-exact-email-recovery-readonly-v1',readOnly:true,rolledBack:true,
+      messages:[],interactions:[],holds:[],previewRequestDraft:null})
+  }
+  const mocks={'node:fs':files,'node:child_process':{execFileSync},'node:crypto':require('node:crypto'),
+    'node:path':require('node:path'),'node:url':require('node:url'),'node:module':{createRequire:()=>name=>{
+      assert.equal(name,'./inspect-bpo-email-recovery-readonly.cjs');return collector
+    }}}
+  const code=ts.transpileModule(wrapperSource.replace(/^#![^\n]*\n/u,'').replaceAll('import.meta.url',JSON.stringify(new URL('./run-bpo-email-recovery-readonly.mjs',import.meta.url).href)),
+    {fileName:'run-bpo-email-recovery-readonly.ts',compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
+  let error
+  try {new Function('require','module','exports','process','console',code)(name=>{
+    assert.ok(Object.hasOwn(mocks,name),'Unexpected wrapper dependency: '+name);return mocks[name]
+  },{exports:{}},{},fakeProcess,{log:line=>logs.push(line)})}catch(caught){error=caught}
+  return {calls,writes,logs,reads,process:fakeProcess,error}
+}
+await check('wrapper accepts only exact read-only plus complete explicit binary/hash pairs',()=>{
+  const context={isAbsolute,createHash,process:{getuid:()=>1000}}
+  vm.runInNewContext(wrapperDeclarations+'\nglobalThis.options=readOnlyOptions;',context)
+  const plain=value=>JSON.parse(JSON.stringify(value))
+  assert.deepEqual(plain(context.options(['--read-only'])),{binary:'/opt/homebrew/bin/railway',sha256:null,explicit:false})
+  const pair=[`--railway-binary=${reviewedBinary}`,`--railway-sha256=${binarySha}`]
+  assert.deepEqual(plain(context.options([...pair,'--read-only'])),{binary:reviewedBinary,sha256:binarySha,explicit:true})
+  for(const args of [[],pair,['--read-only=true'],['--read-only','--apply'],['--read-only','--public'],
+    ['--read-only','--read-only'],['--read-only',pair[0]],['--read-only',pair[1]],['--read-only','--railway-binary'],
+    ['--read-only',...pair,pair[0]],['--read-only',...pair,pair[1]],['--read-only',`--railway-binary=relative-cli`,pair[1]],
+    ['--read-only','--railway-binary=/private/cli\n',pair[1]],['--read-only',pair[0],'--railway-sha256=bad'],
+    ['--read-only',pair[0],`--railway-sha256=${binarySha.toUpperCase()}`]]) {
+    const result=wrapperFixture(args)
+    assert.match(result.error?.message||'',/Explicit --read-only/);assert.equal(result.calls.length+result.writes.length+result.reads.length,0)
+  }
+})
+await check('explicit protected CLI is rehashed before both fixed-scope SSH steps and retained only in private evidence',()=>{
+  const result=wrapperFixture(['--read-only',`--railway-binary=${reviewedBinary}`,`--railway-sha256=${binarySha}`])
+  assert.equal(result.error,undefined);assert.equal(result.calls.length,2);assert.equal(result.reads.length,3)
+  for(const call of result.calls){assert.equal(call.program,reviewedBinary);assert.equal(call.argv[0],'ssh')
+    assert.equal(call.argv[call.argv.indexOf('-p')+1],SCOPE.projectId);assert.equal(call.argv[call.argv.indexOf('-e')+1],SCOPE.environmentId)}
+  assert.equal(result.calls[0].argv[result.calls[0].argv.indexOf('-s')+1],'Postgres')
+  assert.equal(result.calls[1].argv[result.calls[1].argv.indexOf('-s')+1],'clawpilot')
+  assert.match(result.calls[1].argv.at(-1),/CLAWPILOT_BPO_READONLY_TLS_TRUST=[\s\S]* -- --read-only$/)
+  assert.equal(result.writes.length,1);assert.deepEqual(result.writes[0].flags,{flag:'wx',mode:0o600})
+  assert.deepEqual(result.writes[0].document.railwayCli,{binary:reviewedBinary,sha256:binarySha,selection:'explicit-hash-pin'})
+  assert.equal(result.writes[0].document.tlsTrust.source,'authenticated-exact-service-ssh')
+  assert.equal(result.writes[0].document.result.failed,false)
+  assert.ok(!result.logs[0].includes(reviewedBinary)&&!result.logs[0].includes(binarySha))
+})
+await check('explicit CLI symlink writable foreign non-file missing and hash mismatches hold before any SSH',()=>{
+  const args=['--read-only',`--railway-binary=${reviewedBinary}`,`--railway-sha256=${binarySha}`]
+  for(const options of [{symlink:true},{writable:true},{foreignOwner:true},{notFile:true},{missingFile:true},{changedAt:1},{changedAt:2}]){
+    const result=wrapperFixture(args,options)
+    assert.equal(result.error,undefined);assert.equal(result.calls.length,0)
+    assert.equal(result.writes.length,1);assert.equal(result.process.exitCode,1)
+    assert.match(result.writes[0].document.result.errorCode,/READONLY_RAILWAY_BINARY_(?:INVALID|CHANGED)/)
+    assert.equal(result.writes[0].document.result.diagnostic,'railway-binary-guard')
+    assert.ok(!JSON.stringify(result.logs).includes('PRIVATE_FILE_PATH_ERROR'))
+  }
+  const changed=wrapperFixture(args,{changedAt:3})
+  assert.equal(changed.calls.length,1,'A changed binary after certificate collection must never run the app collector')
+  assert.equal(changed.writes[0].document.result.errorCode,'READONLY_RAILWAY_BINARY_CHANGED')
+})
+await check('default Homebrew alias stays compatible but its resolved bytes are pinned for both calls',()=>{
+  const result=wrapperFixture(['--read-only'])
+  assert.equal(result.error,undefined);assert.equal(result.calls.length,2)
+  assert.ok(result.calls.every(call=>call.program==='/reviewed/private/default-railway'))
+  assert.deepEqual(result.writes[0].document.railwayCli,{binary:'/reviewed/private/default-railway',sha256:binarySha,selection:'observed-default'})
+  const changed=wrapperFixture(['--read-only'],{changedAt:3})
+  assert.equal(changed.calls.length,1);assert.equal(changed.writes[0].document.result.errorCode,'READONLY_RAILWAY_BINARY_CHANGED')
+})
+await check('CLI choice never weakens TLS certificate gating or transport diagnostics',()=>{
+  const args=['--read-only',`--railway-binary=${reviewedBinary}`,`--railway-sha256=${binarySha}`]
+  const certificates=wrapperFixture(args,{invalidCertificates:true})
+  assert.equal(certificates.calls.length,1);assert.equal(certificates.writes[0].document.result.errorCode,'READONLY_TLS_TRUST_INVALID')
+  const transport=wrapperFixture(args,{transportFailure:true})
+  assert.equal(transport.calls.length,1);assert.equal(transport.writes[0].document.result.errorCode,'READONLY_TRANSPORT_FAILED')
+  assert.equal(transport.writes[0].document.result.diagnostic,'authentication-unavailable')
+  assert.ok(!JSON.stringify(transport.writes).includes('PRIVATE_SECRET')&&!JSON.stringify(transport.logs).includes('PRIVATE_TRANSPORT_ERROR'))
+  assert.doesNotMatch(wrapperSource,/rejectUnauthorized\s*:\s*false|NODE_TLS_REJECT_UNAUTHORIZED|npm\s+(?:install|update)|shell\s*:\s*true|\b(?:spawnSync|execSync)\(/)
 })
 console.log(`BPO recovery metadata collector passed ${checks} local synthetic/source checks. No database, provider, login or recovery executed.`)
