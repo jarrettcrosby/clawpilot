@@ -29,11 +29,36 @@ jobs:
       - name: SuiteCRM Email search PHP and Smarty behavioral tests
         run: npm run test:suitecrm-email-search
 
-  validate:
+  validate-postgres-catalog:
+    name: PostgreSQL ${{ matrix.postgres }} catalog attestation
     runs-on: ubuntu-24.04
-    # Hosted-runner progress projects about 32 minutes per PostgreSQL catalog
-    # matrix, in addition to the application/browser and downstream gates.
-    # Keep both complete matrices within an explicit, finite job deadline.
+    # Each runner executes the entire catalog and final lock check for its
+    # PostgreSQL major. Running both serially exceeded the app job deadline.
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['16', '18']
+    env:
+      CLAWPILOT_TEST_POSTGRES_IMAGE: pgvector/pgvector:pg${{ matrix.postgres }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app_src/package-lock.json
+      - name: Install application test dependencies
+        run: npm --prefix app_src ci
+      - name: Preload the exact PostgreSQL major
+        run: |
+          docker pull "$CLAWPILOT_TEST_POSTGRES_IMAGE"
+          docker image inspect "$CLAWPILOT_TEST_POSTGRES_IMAGE" --format '{{json .RepoDigests}}'
+      - name: Full production rebind history and schema attestation
+        run: node scripts/test-production-rebind-history-schema-attestation.mjs
+
+  validate-app:
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -101,8 +126,11 @@ jobs:
           docker image inspect pgvector/pgvector:pg16 --format '{{json .RepoDigests}}'
           npm run test:fractional-crm-gateway
 
-      - name: Tests
-        run: npm run test
+      - name: Verify the hosted test partition
+        run: node --test scripts/test-ci-app-test-plan.mjs
+
+      - name: Application tests (full catalogs run in the PostgreSQL matrix)
+        run: node scripts/run-ci-app-tests.mjs
 
       - name: Managed workbook bootstrap PostgreSQL acceptance
         run: npm run test:pipeline-workbook-postgres
@@ -124,3 +152,21 @@ jobs:
 
       - name: Predeploy verification
         run: npm run verify:predeploy
+
+  validate:
+    # Preserve the existing check name and never turn a skipped, failed or
+    # cancelled predecessor into a successful release gate.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [suitecrm-email-search, validate-app, validate-postgres-catalog]
+    if: ${{ always() }}
+    steps:
+      - name: Require every validation job to pass
+        env:
+          SUITECRM_CHECK_RESULT: ${{ needs.suitecrm-email-search.result }}
+          APP_CHECK_RESULT: ${{ needs.validate-app.result }}
+          CATALOG_CHECK_RESULT: ${{ needs.validate-postgres-catalog.result }}
+        run: |
+          test "$SUITECRM_CHECK_RESULT" = success
+          test "$APP_CHECK_RESULT" = success
+          test "$CATALOG_CHECK_RESULT" = success
