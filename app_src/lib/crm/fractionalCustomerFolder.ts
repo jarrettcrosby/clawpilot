@@ -7,6 +7,16 @@ export function fractionalFolderUrl(value: unknown): string | null {
   return normalizeCustomerFolderLinks({ bpoDriveUrl: '', fractionalCustomerFolderUrl: value }).fractionalCustomerFolderUrl
 }
 
+/** Match the sender's verified Drive URL contract without fetching the URL.
+ * An already saved non-Drive reference remains a manual/legacy link. */
+export function isFractionalDriveFolderUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.origin === 'https://drive.google.com' && url.href === value && !url.hash
+      && /^\/drive\/folders\/[A-Za-z0-9_-]{10,200}$/u.test(url.pathname)
+  } catch { return false }
+}
+
 export function fractionalFolderState(description: string, previous: { lastPublishedUrl: string | null } | null) {
   const parsed = parseCustomerFolderLinks(description)
   if (parsed.hasDuplicates || parsed.invalidLabels.length) throw new Error('FOLDER_DESCRIPTION_REPAIR_REQUIRED')

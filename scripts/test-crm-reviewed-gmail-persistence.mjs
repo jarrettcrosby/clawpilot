@@ -681,13 +681,6 @@ try {
     (id,owner_email,workspace_organization_id,is_default) VALUES($1,$2,$3,$4)`, [pipeline, CASEY.owner, CASEY.workspace, isDefault])
   for (const [email, role] of [[CASEY.owner, 'owner'], [OWNER, 'member']]) await query(`INSERT INTO app_user_organization_memberships
     (organization_id,user_email,status,role) VALUES($1,$2,'active',$3)`, [CASEY.workspace, email, role])
-  await query(`INSERT INTO user_maton_connections VALUES($1,$2,$3,'google-mail','ACTIVE','maton',true)`,
-    [CASEY.owner, CASEY.connection, caseyMailboxEmail])
-  await persistence.bindVerifiedGmailMailboxInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
-    identity: { subject: 'synthetic-casey-google-subject', email: caseyMailboxEmail }, observedAccountEmail: caseyMailboxEmail })
-  const caseyIdentity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: CASEY.owner,
-    connectionId: CASEY.connection, accountEmail: caseyMailboxEmail })
-  assert.ok(caseyIdentity)
   const caseyCompanies = [{ id: CASEY.globus, referenceCode: 'gagmco24va588e' }, { id: CASEY.airspace, referenceCode: 'gajl1dq5i03jga' }]
   for (const [company, name, native] of [[caseyCompanies[0], 'Synthetic Globus', 'native-casey-globus'], [caseyCompanies[1], 'Synthetic Airspace', 'native-casey-airspace']]) {
     await query(`INSERT INTO crm_organizations(id,pipeline_id,name,reference_code,source_key,suitecrm_id)
@@ -700,6 +693,120 @@ try {
   for (const target of caseyTargets) await query(`INSERT INTO crm_contacts
     (id,pipeline_id,organization_id,full_name,email,reference_code,source_key,suitecrm_id) VALUES($1,$2,$3,$4,$5,$4,$4,$6)`,
   [target.id, CASEY.pipeline, target.organizationId, target.referenceCode, target.email, `native-casey-contact-${target.id.slice(-1)}`])
+  await query("ALTER TABLE workspace_organizations ADD COLUMN parent_id uuid, ADD COLUMN organization_type text NOT NULL DEFAULT 'root'")
+  await query(read('db/migrations/0392_crm_root_employee_access_registry.sql'))
+  await check('Casey first-seen exact pair stages fresh sources, two-company relationships and one guarded job each, with whole-batch rollback and replay', async () => {
+    // Savepoints exercise the production SQL transaction on one isolated branch;
+    // rolling the fixture branch back preserves the separate retained-case test.
+    const client = await pool.connect()
+    let savepoint = 0
+    const localQuery = (sql, values) => client.query(sql, values)
+    const withLocalTransaction = async callback => {
+      const name = `first_seen_fixture_${++savepoint}`
+      await client.query(`SAVEPOINT ${name}`)
+      try { const result = await callback(client); await client.query(`RELEASE SAVEPOINT ${name}`); return result }
+      catch (error) { await client.query(`ROLLBACK TO SAVEPOINT ${name}`); await client.query(`RELEASE SAVEPOINT ${name}`); throw error }
+    }
+    try {
+      await client.query('BEGIN')
+      const fixtureProviderSubject = 'synthetic-casey-first-seen-google-subject'
+      const scoped = fixtureContext.fixture.loadCrmPersistence(localQuery, withLocalTransaction, fixtureProviderSubject)
+      const policy = fixtureContext.fixture.loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity })
+      const { CASEY_FIRST_SEEN_SCOPE, CASEY_PAIR } = policy
+      await client.query(`INSERT INTO user_maton_connections VALUES($1,$2,$3,'google-mail','ACTIVE','maton',true)`,
+        [CASEY.owner, CASEY.connection, CASEY_PAIR.mailboxEmail])
+      await scoped.bindVerifiedGmailMailboxInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+        identity: { subject: fixtureProviderSubject, email: CASEY_PAIR.mailboxEmail }, observedAccountEmail: CASEY_PAIR.mailboxEmail })
+      await client.query(`UPDATE crm_email_mailbox_bindings SET verified_at=date_trunc('milliseconds',verified_at)+interval '123 microseconds'
+        WHERE owner_email=$1 AND connection_id=$2`, [CASEY.owner, CASEY.connection])
+      const identity = await scoped.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: CASEY.owner,
+        connectionId: CASEY.connection, accountEmail: CASEY_PAIR.mailboxEmail })
+      assert.match(identity.verifiedAt, /\.\d{3}123Z$/u, 'readback must preserve the exact PostgreSQL lock token')
+      const targets = caseyTargets.map((target, index) => ({ ...target, email: index === 0 ? CASEY_PAIR.customerContact : CASEY_PAIR.sender }))
+      for (const target of targets) await client.query('UPDATE crm_contacts SET email=$1 WHERE id=$2', [target.email, target.id])
+      const firstSeen = CASEY_PAIR.messageIds.map((messageId, index) => {
+        const to = [...(index === 0 ? [CASEY_PAIR.mailboxEmail] : []), CASEY_PAIR.customerContact]
+        const current = emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: messageId, externalThreadId: CASEY_PAIR.threadId,
+          senderEmail: CASEY_PAIR.sender, recipientEmails: to, subject: 'Synthetic first-seen Casey fixture',
+          receivedAt: '2026-10-30T17:00:00.123Z', bodyText: 'Synthetic current complete provider body.', snippet: 'Synthetic current snippet.', markerReferences: [],
+          emailAddressHeaders: { version: 1, from: [{ address: CASEY_PAIR.sender }], to: to.map(address => ({ address })), cc: [], bcc: [] } })
+        return { admissionScope: CASEY_FIRST_SEEN_SCOPE, firstSeenLabelIds: ['INBOX'], ownerEmail: CASEY.owner,
+          connectionId: CASEY.connection, pipelineId: CASEY.pipeline, mailboxIdentity: identity, messageEvidence: current,
+          providerMessageId: messageId, providerThreadId: CASEY_PAIR.threadId, primaryOrganization: caseyCompanies[0],
+          contactTargets: targets, participantEmails: targets.map(target => target.email), interaction: {
+            entity: 'interactions', pipelineId: CASEY.pipeline, actorEmail: CASEY.owner,
+            sourceKey: emailIdentity.gmailMessageSourceKey(identity, messageId), sourcePayload: { source: 'gmail-inbound' },
+            fields: { interactionType: 'email', subject: current.subject, description: current.bodyText,
+              occurredAt: current.receivedAt, agentEmail: CASEY.owner, direction: 'inbound', deliveryStatus: 'received',
+              providerMessageId: messageId, providerThreadId: CASEY_PAIR.threadId, metadata: { source: 'gmail-inbound' } },
+          } }
+      })
+      const state = async () => (await client.query(`SELECT jsonb_build_object(
+        'sources',(SELECT count(*) FROM crm_email_sources WHERE owner_email=$1),
+        'inbound',(SELECT count(*) FROM crm_inbound_messages WHERE owner_email=$1),
+        'interactions',(SELECT count(*) FROM crm_interactions WHERE pipeline_id=$2),
+        'companies',(SELECT count(*) FROM crm_interaction_organizations WHERE pipeline_id=$2),
+        'contacts',(SELECT count(*) FROM crm_interaction_contacts WHERE pipeline_id=$2),
+        'links',(SELECT count(*) FROM crm_inbound_message_links WHERE interaction_id IN(SELECT id FROM crm_interactions WHERE pipeline_id=$2)),
+        'decisions',(SELECT count(*) FROM crm_email_review_decisions WHERE pipeline_id=$2),
+        'jobs',(SELECT count(*) FROM sync_outbox WHERE aggregate_id IN(SELECT id::text FROM crm_interactions WHERE pipeline_id=$2)),
+        'audits',(SELECT count(*) FROM audit_events WHERE event_type='crm.email_association.reviewed'
+          AND aggregate_id IN(SELECT id::text FROM crm_interactions WHERE pipeline_id=$2))) AS state`,
+      [CASEY.owner, CASEY.pipeline])).rows[0].state
+      const absent = await state(); assert.ok(Object.values(absent).every(count => count === 0))
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: firstSeen }), /evidence changed or conflicts/)
+      await client.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
+        native_policy_fingerprint=$1,activation_receipt_hash=$2 WHERE singleton`, ['a'.repeat(64), 'b'.repeat(64)])
+      const preview = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: firstSeen })
+      assert.ok(preview.every(row => !row.applied && !row.interactionId && !row.inboundMessageId))
+      assert.deepEqual(await state(), absent)
+      const apply = firstSeen.map((row, index) => ({ ...row, expectedTargetFingerprint: preview[index].targetFingerprint,
+        expectedExistingInteractionId: null }))
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: [apply[0], { ...apply[1], expectedTargetFingerprint: 'stale' }], apply: true }))
+      assert.deepEqual(await state(), absent)
+      await client.query(`INSERT INTO crm_inbound_messages(owner_email,pipeline_id,external_message_id,external_thread_id,raw_metadata)
+        VALUES($1,$2,$3,$4,'{}')`, [CASEY.owner, CASEY.intake, ` ${CASEY_PAIR.messageIds[1].toUpperCase()} `, CASEY_PAIR.threadId])
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true }))
+      assert.equal((await state()).inbound, 1)
+      await client.query('DELETE FROM crm_inbound_messages WHERE owner_email=$1', [CASEY.owner])
+      await client.query(`CREATE FUNCTION test_casey_fresh_second_fails() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN
+        IF (SELECT provider_message_id FROM crm_email_sources WHERE id=NEW.source_id)='1a18f01749eb87a6' THEN
+          IF NOT EXISTS(SELECT 1 FROM crm_interactions WHERE provider_message_id='1a18e03ea586cd7e') THEN
+            RAISE EXCEPTION 'first Casey row not staged'; END IF;
+          RAISE EXCEPTION 'synthetic fresh second decision failure'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER test_casey_fresh_second_fails BEFORE INSERT ON crm_email_review_decisions
+          FOR EACH ROW EXECUTE FUNCTION test_casey_fresh_second_fails()`)
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true }), /synthetic fresh second decision failure/)
+      assert.deepEqual(await state(), absent)
+      await client.query('DROP TRIGGER test_casey_fresh_second_fails ON crm_email_review_decisions;DROP FUNCTION test_casey_fresh_second_fails()')
+      const result = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(result.every(row => row.applied && row.interactionId && row.inboundMessageId && row.linksAdded === 4))
+      const applied = await state()
+      assert.deepEqual(applied, { sources: 2, inbound: 2, interactions: 2, companies: 4, contacts: 4, links: 8, decisions: 2, jobs: 2, audits: 2 })
+      const rows = (await client.query(`SELECT interaction.organization_id::text, interaction.suitecrm_module, decision.kind, decision.provenance,
+          cache.raw_metadata, job.payload
+        FROM crm_interactions interaction JOIN crm_email_review_decisions decision ON decision.interaction_id=interaction.id
+        JOIN crm_inbound_messages cache ON cache.interaction_id=interaction.id JOIN sync_outbox job ON job.aggregate_id=interaction.id::text
+        WHERE interaction.pipeline_id=$1 ORDER BY interaction.provider_message_id`, [CASEY.pipeline])).rows
+      assert.equal(rows.length, 2)
+      for (const row of rows) {
+        assert.equal(row.organization_id, CASEY.globus); assert.equal(row.suitecrm_module, 'Emails'); assert.equal(row.kind, 'review')
+        assert.equal(row.provenance.admissionScope, CASEY_FIRST_SEEN_SCOPE); assert.equal(row.provenance.legacyAdoption, null)
+        assert.equal(row.raw_metadata.identityStatus, 'verified'); assert.equal(row.raw_metadata.reviewedIntakeScope, CASEY_FIRST_SEEN_SCOPE)
+        assert.deepEqual(row.payload.emailProjection.audience.allowedSuiteCrmUserIds, ['native-fixture-casey-owner'])
+      }
+      const replay = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(replay.every((row, index) => !row.applied && row.alreadyLinked && row.interactionId === result[index].interactionId))
+      assert.deepEqual(await state(), applied)
+    } finally { await client.query('ROLLBACK'); client.release() }
+  })
+  await query(`INSERT INTO user_maton_connections VALUES($1,$2,$3,'google-mail','ACTIVE','maton',true)`,
+    [CASEY.owner, CASEY.connection, caseyMailboxEmail])
+  await persistence.bindVerifiedGmailMailboxInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+    identity: { subject: 'synthetic-casey-google-subject', email: caseyMailboxEmail }, observedAccountEmail: caseyMailboxEmail })
+  const caseyIdentity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: CASEY.owner,
+    connectionId: CASEY.connection, accountEmail: caseyMailboxEmail })
+  assert.ok(caseyIdentity)
   const caseyEvidence = message => emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: message,
     externalThreadId: CASEY.thread, senderEmail: caseyTargets[1].email, recipientEmails: [CASEY.owner, caseyTargets[0].email],
     subject: `Synthetic exact-two ${message}`, receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Synthetic Casey snippet',
@@ -746,6 +853,8 @@ try {
     })
     const candidateRoute = fixtureContext.fixture.loadModule('app_src/app/api/crm/email-review-candidates/route.ts', {
       'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
+      '@/lib/crm/caseyGmailReview': { CASEY_FIRST_SEEN_SCOPE: 'casey-reviewed-two-first-seen-v1' },
+      '@/lib/crm/emailIngestion': { readCaseyFirstSeenGmailCandidates: () => { throw new Error('Only retained candidates are exercised here') } },
       '@/lib/browserSameOrigin': browserSameOrigin,
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
       '@/lib/persistence/postgres': { query },
@@ -874,6 +983,106 @@ try {
       assert.deepEqual(await durableState(), before)
     } finally { await query('DROP TRIGGER test_deny_casey_second_review ON crm_email_review_decisions;DROP FUNCTION test_deny_casey_second_review()') }
   })
+  await check('retained Casey pair stages under enabled native authority and the exact production adapter claims only its two jobs', async () => {
+    // Use the original retained (not first-seen) cache shape. The branch rolls
+    // back at the end so the separate default-off Casey regression stays intact.
+    const client = await pool.connect()
+    let savepoint = 0
+    const scopedQuery = (sql, values) => client.query(sql, values)
+    const scopedTransaction = async callback => {
+      const name = `retained_casey_native_${++savepoint}`
+      await client.query(`SAVEPOINT ${name}`)
+      try { const result = await callback(client); await client.query(`RELEASE SAVEPOINT ${name}`); return result }
+      catch (error) { await client.query(`ROLLBACK TO SAVEPOINT ${name}`); await client.query(`RELEASE SAVEPOINT ${name}`); throw error }
+    }
+    try {
+      await client.query('BEGIN')
+      const scoped = fixtureContext.fixture.loadCrmPersistence(scopedQuery, scopedTransaction)
+      const exact = fixtureContext.fixture.loadModule('app_src/lib/persistence/crmExactEmailPublication.ts', {
+        './postgres': { withTransaction: scopedTransaction },
+        // The existing AST fixture executes persistence in a different VM
+        // realm. Bring its actual audience result into the adapter/pg realm
+        // without changing the production strict plain-JSON check.
+        './crm': { reviewedEmailAudienceUnderNativeControlWithClient: async (...args) =>
+          structuredClone(await scoped.reviewedEmailAudienceUnderNativeControlWithClient(...args)) },
+        '../crm/stableId': fixtureContext.fixture.loadModule('app_src/lib/crm/stableId.ts'),
+        '../crm/nativeEmailPublication': fixtureContext.fixture.loadModule('app_src/lib/crm/nativeEmailPublication.ts'),
+      })
+      const appOnly = 'synthetic-retained-casey-app-only@example.invalid'
+      await client.query(`INSERT INTO app_users(email,status,display_name,suitecrm_user_id,crm_user_enabled,reference_code)
+        VALUES($1,'active','Retained Casey app-only fixture',NULL,false,'gu8765400')`, [appOnly])
+      await client.query(`INSERT INTO app_user_organization_memberships(organization_id,user_email,status,role,permissions)
+        VALUES($1,$2,'active','member','{"viewCrm":true}')`, [CASEY.workspace, appOnly])
+      await client.query(`INSERT INTO pipeline_space_members(pipeline_id,user_email,access_role) VALUES($1,$2,'viewer')`, [CASEY.pipeline, appOnly])
+      const selection = { ownerEmail: CASEY.owner, workspaceId: CASEY.workspace, pipelineId: CASEY.pipeline,
+        connectionId: CASEY.connection, messageIds: CASEY.messages.map(row => row.message) }
+      const snapshot = async () => (await client.query(`SELECT jsonb_build_object(
+        'interactions',(SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY i.id),'[]') FROM crm_interactions i WHERE i.pipeline_id=$1),
+        'cache',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM crm_inbound_messages m WHERE m.owner_email=$2),
+        'sources',(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.id),'[]') FROM crm_email_sources s WHERE s.owner_email=$2),
+        'decisions',(SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id),'[]') FROM crm_email_review_decisions d WHERE d.pipeline_id=$1),
+        'jobs',(SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY o.id),'[]') FROM sync_outbox o WHERE o.payload->>'pipelineId'=$1::text)) AS state`,
+      [CASEY.pipeline, CASEY.owner])).rows[0].state
+      const outsideJobs = async () => (await client.query(`SELECT coalesce(jsonb_agg(to_jsonb(o) ORDER BY o.id),'[]') AS jobs
+        FROM sync_outbox o WHERE o.payload->>'pipelineId' IS DISTINCT FROM $1`, [CASEY.pipeline])).rows[0].jobs
+      const absent = await snapshot(), unrelated = await outsideJobs()
+      assert.equal(absent.cache.length, 2); assert.ok(absent.cache.every(row => row.mailbox_id === null && row.canonical_source_id === null))
+      assert.ok(['interactions','sources','decisions','jobs'].every(key => absent[key].length === 0))
+      // An app-only viewer makes the old legacy audience path fail. The
+      // actual enabled reader policy must keep its app share but not add a
+      // native reader. These synthetic control rows are not live activation.
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: caseyMessages }), /verified native identities/)
+      await assert.rejects(exact.previewExactEmailPublicationInPostgres(selection), /unavailable or changed/)
+      await client.query(`UPDATE crm_native_email_publication_control SET enabled=true,verified_generation=generation,
+        native_policy_fingerprint=$1,activation_receipt_hash=$2 WHERE singleton`, ['a'.repeat(64), 'b'.repeat(64)])
+      const previews = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: caseyMessages })
+      assert.ok(previews.every(row => !row.applied && !row.interactionId && row.inboundMessageId))
+      assert.deepEqual(await snapshot(), absent)
+      const apply = caseyMessages.map((row, index) => ({ ...row, expectedExistingInteractionId: null,
+        expectedTargetFingerprint: previews[index].targetFingerprint }))
+      await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: [apply[0], { ...apply[1], expectedTargetFingerprint: 'f'.repeat(64) }], apply: true }))
+      assert.deepEqual(await snapshot(), absent)
+      const staged = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(staged.every(row => row.applied && row.linksAdded === 4))
+      const queued = await snapshot()
+      assert.ok(['interactions','sources','decisions','jobs'].every(key => queued[key].length === 2))
+      assert.ok(queued.cache.every(row => row.mailbox_id === caseyIdentity.mailboxId && row.raw_metadata.originalMailboxProvenance === 'unknown'))
+      for (const row of queued.interactions) {
+        assert.equal(row.organization_id, CASEY.globus)
+        const organizations = (await client.query(`SELECT organization_id::text,is_primary FROM crm_interaction_organizations
+          WHERE pipeline_id=$1 AND interaction_id=$2 ORDER BY is_primary DESC`, [CASEY.pipeline, row.id])).rows
+        assert.deepEqual(organizations, [{ organization_id: CASEY.globus, is_primary: true }, { organization_id: CASEY.airspace, is_primary: false }])
+        const decision = queued.decisions.find(value => value.interaction_id === row.id)
+        const job = queued.jobs.find(value => value.aggregate_id === row.id)
+        assert.equal(decision.kind, 'legacy-adoption'); assert.equal(decision.provenance.legacyAdoption.originalMailboxProvenance, 'unknown')
+        assert.deepEqual(decision.audience.allowedSuiteCrmUserIds, ['native-fixture-casey-owner'])
+        assert.deepEqual(job.payload.emailProjection.audience, decision.audience)
+        assert.deepEqual(job.payload.emailProjection.accounts, ['native-casey-airspace', 'native-casey-globus'])
+        assert.equal(job.payload.attributes.parent_id, 'native-casey-globus')
+      }
+      const repeated = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(repeated.every((row, index) => !row.applied && row.interactionId === staged[index].interactionId))
+      assert.deepEqual(await snapshot(), queued)
+      const claimPreview = await exact.previewExactEmailPublicationInPostgres(selection)
+      assert.match(claimPreview.digest, /^[a-f0-9]{64}$/)
+      assert.deepEqual(claimPreview.messages.map(row => [row.messageId, row.status]), selection.messageIds.map(id => [id, 'queued']))
+      assert.deepEqual(new Set(claimPreview.messages.map(row => row.globalId)), new Set(queued.interactions.map(row => row.reference_code)))
+      assert.deepEqual(await snapshot(), queued)
+      await assert.rejects(exact.claimExactEmailPublicationInPostgres(selection, 'f'.repeat(64)), /unavailable or changed/)
+      await assert.rejects(exact.claimExactEmailPublicationInPostgres({ ...selection, messageIds: selection.messageIds.slice(0, 1) }, claimPreview.digest), /unavailable or changed/)
+      assert.deepEqual(await snapshot(), queued)
+      const claim = await exact.claimExactEmailPublicationInPostgres(selection, claimPreview.digest)
+      assert.deepEqual(new Set(claim.items.map(item => item.aggregateId)), new Set(staged.map(row => row.interactionId)))
+      assert.equal(claim.items.length, 2); assert.equal(claim.alreadyCompleted, 0)
+      assert.ok(claim.items.every(item => item.attempts === 1 && item.lockToken && item.payload.suiteCrmModule === 'Emails'))
+      const claimed = await snapshot()
+      assert.ok(claimed.jobs.every(job => job.status === 'processing' && job.attempts === 1 && job.lock_token))
+      await assert.rejects(exact.claimExactEmailPublicationInPostgres(selection, claimPreview.digest), /unavailable or changed/)
+      assert.deepEqual(await snapshot(), claimed, 'Exact active leases cannot be claimed a second time')
+      assert.deepEqual(await outsideJobs(), unrelated, 'No unrelated outbox work is claimed or changed')
+      assert.equal((await client.query(`SELECT count(*)::int AS count FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2`, [CASEY.pipeline, appOnly])).rows[0].count, 1)
+    } finally { await client.query('ROLLBACK'); client.release() }
+  })
   await check('Casey exact-two stages one Email per message, both companies, original-unknown proof and current audience', async () => {
     const results = await persistence.stageReviewedGmailInteractionsInPostgres({ messages: caseyApply, apply: true })
     assert.equal(results.length, 2); assert.ok(results.every(row => row.applied))
@@ -914,8 +1123,6 @@ try {
   await check('enabled reviewed SQL preview/apply keep app-only sharing and use the same native audience in decision and outbox', async () => {
     // Install the real registry and execute its actual source collector with a
     // synthetic inherited reader (no explicit target-pipeline membership).
-    await query("ALTER TABLE workspace_organizations ADD COLUMN parent_id uuid, ADD COLUMN organization_type text NOT NULL DEFAULT 'root'")
-    await query(read('db/migrations/0392_crm_root_employee_access_registry.sql'))
     const messageId = 'ed1', appOnly = 'reviewed-app-only@example.invalid', rootEmployee = 'reviewed-root-reader@example.invalid'
     const current = caseyEvidence(messageId)
     await persistence.recordGmailMessageIntakeInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,

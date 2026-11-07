@@ -138,6 +138,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts', {}),
   '@/lib/crm/emailIdentity': emailIdentity,
   '@/lib/crm/emailReconciliation': loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
+  '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
   '@/lib/persistence/crmEmailIdentity': {
     readVerifiedGmailMailboxIdentityInPostgres: async () => verifiedIdentity,
     recordGmailMessageIntakeInPostgres: async input => {

@@ -21,6 +21,34 @@ function publisherCommand(string $operation, string $mode, array $identity, arra
         'expectedRecordFingerprint'=>$fingerprint,'projection'=>$projection];
 }
 
+/** Raw exact-target state only, including deleted and unrelated-module link
+ * rows for the same record ID. Used before and after a rejected operation. */
+function publisherStrictCreateState(array $command): array
+{
+    $email=publisherQ($command['suiteCrmId']); $global=publisherQ($command['globalId']);
+    $local=publisherQ($command['localId']); $op=publisherQ($command['operationId']);
+    return [
+        'email'=>rows('SELECT * FROM emails WHERE id='.$email),
+        'text'=>rows('SELECT * FROM emails_text WHERE email_id='.$email),
+        'custom'=>rows('SELECT * FROM emails_cstm WHERE id_c='.$email.' OR global_id_c='.$global.' ORDER BY id_c'),
+        'beans'=>rows('SELECT * FROM emails_beans WHERE email_id='.$email.' ORDER BY id'),
+        'addresses'=>rows('SELECT * FROM emails_email_addr_rel WHERE email_id='.$email.' ORDER BY id'),
+        'groups'=>rows('SELECT * FROM securitygroups_records WHERE record_id='.$email.' ORDER BY id'),
+        'identity'=>rows('SELECT * FROM clawpilot_email_identities WHERE email_id='.$email.' OR global_id='.$global.' OR local_id='.$local.' ORDER BY email_id'),
+        'operation'=>rows('SELECT * FROM clawpilot_email_operations WHERE operation_id='.$op),
+    ];
+}
+
+function publisherStrictCreateRefused(ClawPilotNativeEmailPublisher $publisher, array $command, string $method, string $expected): void
+{
+    $before=publisherStrictCreateState($command); $reason=null;
+    try { $publisher->$method($command); }
+    catch (ClawPilotNativeEmailTransactionRefused $error) { $reason=$error->holdCode; }
+    must($reason===$expected,'Strict-create '.$method.' must refuse '.$expected.', observed '.($reason??'no refusal'));
+    must((int)rows('SELECT @@in_transaction AS active')[0]['active']===0
+        && publisherStrictCreateState($command)===$before,'Strict-create refusal changed the exact target state');
+}
+
 // SuiteCRM owns the global $db (a DBManager). Keep our raw mysqli handle
 // function-local: native User.save()/CacheManager and other stock hooks still
 // require that original global manager, even though we use its connection.
@@ -44,6 +72,8 @@ try {
     // unsupported by this candidate's exact write-access contract.
     $target = userFixture('publisher-viewer');
     $group = native('SecurityGroups'); $group->name = 'Synthetic publisher exact pipeline'; $group->noninheritable=1; $group->save(false);
+    $foreignGroup = native('SecurityGroups'); $foreignGroup->name = 'Synthetic publisher unrelated group';
+    $foreignGroup->noninheritable=1; $foreignGroup->save(false);
     $readers = [(string)$admin->id,(string)$target->id]; sort($readers, SORT_STRING);
     linkBeans($group, 'users', $readers);
     publisherSql('UPDATE securitygroups_users SET noninheritable=1 WHERE securitygroup_id='.publisherQ((string)$group->id));
@@ -89,6 +119,73 @@ try {
         must($result['state']==='committed' && $result['result']['readerSuiteCrmUserIds']===$readers,'Exact native audience readback required');
         must(count(rows('SELECT * FROM clawpilot_email_operations WHERE operation_id='.publisherQ($future['operationId'])))===1,'Durable same-transaction receipt required');
         must(rows('SELECT description FROM emails_text WHERE email_id='.publisherQ($future['suiteCrmId']))[0]['description']===$future['projection']['attributes']['description'],'Exact raw plain body required');
+    });
+    check('strict create rejects every orphan group link, including one inserted after successful prepare',function () use ($publisher,$binding,$projection,$group,$foreignGroup): void {
+        $cases=[
+            ['same-group',(string)$group->id,'Emails',0],
+            ['foreign-group',(string)$foreignGroup->id,'Emails',0],
+            ['deleted',(string)$group->id,'Emails',1],
+            ['other-module',(string)$group->id,'Accounts',0],
+        ];
+        foreach($cases as $index=>[$label,$groupId,$module,$deleted]) {
+            $identity=['id'=>create_guid(),'global'=>'gi'.(8800020+$index),'local'=>create_guid()];
+            $command=publisherCommand('strict-create-group-'.$label,'publish',$identity,$binding,$projection($identity),null);
+            if($index===0) {
+                $before=publisherStrictCreateState($command);
+                must($publisher->prepare($command)['expectedRecordFingerprint']===null
+                    && publisherStrictCreateState($command)===$before,'The clean candidate must prepare without writing');
+            }
+            // Independent fixture write after prepare has rolled back, before
+            // the execute transaction starts; old prepare cannot authorize it.
+            $linkId=create_guid();
+            publisherSql('INSERT INTO securitygroups_records(id,securitygroup_id,record_id,module,date_modified,deleted) VALUES ('.
+                implode(',',array_map('publisherQ',[$linkId,$groupId,$identity['id'],$module,'2026-10-30 13:00:00'])).','.$deleted.')');
+            try {
+                publisherStrictCreateRefused($publisher,$command,'publish','orphaned_native_group_record');
+                publisherStrictCreateRefused($publisher,$command,'prepare','orphaned_native_group_record');
+            } finally {
+                publisherSql('DELETE FROM securitygroups_records WHERE id='.publisherQ($linkId).' AND record_id='.publisherQ($identity['id']));
+            }
+        }
+    });
+    check('strict create never adopts a matching managed identity or a core orphan',function () use ($publisher,$binding,$projection): void {
+        $identity=['id'=>create_guid(),'global'=>'gi8800024','local'=>create_guid()];
+        $command=publisherCommand('strict-create-managed-orphan','publish',$identity,$binding,$projection($identity),null);
+        must($publisher->prepare($command)['expectedRecordFingerprint']===null,'Managed-orphan candidate must prepare before fixture drift');
+        publisherSql('INSERT INTO clawpilot_email_identities(email_id,global_id,local_id,pipeline_id,workspace_id,app_archived) VALUES ('.
+            implode(',',array_map('publisherQ',[$identity['id'],$identity['global'],$identity['local'],$binding['pipeline'],$binding['workspace']])).',0)');
+        try {
+            publisherStrictCreateRefused($publisher,$command,'publish','missing_previously_managed_email');
+            publisherStrictCreateRefused($publisher,$command,'prepare','missing_previously_managed_email');
+        } finally {
+            publisherSql('DELETE FROM clawpilot_email_identities WHERE email_id='.publisherQ($identity['id']).' AND global_id='.publisherQ($identity['global']));
+        }
+        $identity=['id'=>create_guid(),'global'=>'gi8800025','local'=>create_guid()];
+        $command=publisherCommand('strict-create-custom-orphan','publish',$identity,$binding,$projection($identity),null);
+        publisherSql('INSERT INTO emails_cstm(id_c,global_id_c) VALUES ('.publisherQ($identity['id']).','.publisherQ($identity['global']).')');
+        try {
+            publisherStrictCreateRefused($publisher,$command,'prepare','orphaned_native_identity');
+            publisherStrictCreateRefused($publisher,$command,'publish','orphaned_native_identity');
+        }
+        finally { publisherSql('DELETE FROM emails_cstm WHERE id_c='.publisherQ($identity['id']).' AND global_id_c='.publisherQ($identity['global'])); }
+    });
+    check('strict create rejects a stale new operation without invalidating its original committed replay',function () use ($publisher,$future): void {
+        $stale=$future; $stale['operationId']=hash('sha256','strict-create-stale-new-operation');
+        publisherStrictCreateRefused($publisher,$stale,'publish','create_requires_absent_identity');
+        $before=publisherStrictCreateState($future); $receipt=$publisher->publish($future);
+        must($receipt['state']==='committed' && $receipt['replayed']===true
+            && publisherStrictCreateState($future)===$before,'Only the exact original operation may replay without writes');
+        must($publisher->prepare($future)['expectedRecordFingerprint']===$receipt['result']['recordFingerprint'],
+            'Ordinary managed edit preparation must still return the existing fingerprint');
+        $id=publisherQ($future['suiteCrmId']);
+        publisherSql('UPDATE emails SET deleted=1 WHERE id='.$id.' AND deleted=0');
+        try {
+            publisherStrictCreateRefused($publisher,$stale,'prepare','native_identity_or_owner_changed');
+            publisherStrictCreateRefused($publisher,$stale,'publish','create_requires_absent_identity');
+        } finally {
+            publisherSql('UPDATE emails SET deleted=0 WHERE id='.$id.' AND deleted=1');
+        }
+        must(publisherStrictCreateState($future)===$before,'Synthetic deletion probe must restore its exact control');
     });
     check('historical and future retries do not create duplicates or change native timestamps',function () use ($publisher,$repair,$future,$db,$profile): void {
         foreach ([$repair,$future] as $command) {

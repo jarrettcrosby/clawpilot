@@ -77,6 +77,7 @@ function fixture() {
   } }).outputText, { module, exports: module.exports, Buffer, Date: FixtureDate, Error, process: { env: environment }, require(name) {
     if (name === 'node:crypto') return crypto
     if (name === '@/lib/persistence/postgres') return { query, withTransaction }
+    if (name === '@/lib/persistence/crmNativeEmailAuthority') return {}
     if (name === '@/lib/auditWriter') return { recordAuditEvent: async value => { audits.push(value) } }
     if (name === '@/lib/crm/emailIdentity') return {}
     throw new Error(`Unexpected pure dependency ${name}`)

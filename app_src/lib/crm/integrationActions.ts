@@ -1892,7 +1892,6 @@ async function importedMeetingCalendarCommunication(
        ON connection.owner_email = source.credential_owner_email
        AND connection.connection_id = source.connection_id
        AND connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'
-       AND lower(connection.account_email) = source.account_email
      WHERE mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid
        AND meeting.reference_code = $3 AND mapping.external_event_id = $4
        AND source.credential_owner_email = $5 AND source.connection_id = $6
@@ -1989,10 +1988,10 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
     app: 'google-calendar',
     boundConnectionId: communication.connectionId,
   })
-  if (
-    credential.connectionId !== communication.connectionId
-    || (credential.accountEmail && normalizeEmail(credential.accountEmail, 'Selected provider account') !== communication.accountEmail)
-  ) {
+  // Admission checks the pinned active connection without provider I/O. Its
+  // cached account label is not identity proof; the worker re-verifies the
+  // recorded account and calendar against Google before writing.
+  if (credential.connectionId !== communication.connectionId) {
     throw new CrmIntegrationActionError('The recorded Calendar connection no longer matches its reviewed identity', 409)
   }
   return { actorEmail, communication, previousCalendar }
@@ -2032,7 +2031,7 @@ async function selectedMatonConnection(
   }
   await assertQueuedCommunicationAuthorization(action, app)
   const credentialOwnerEmail = action.communicationCredentialOwnerEmail
-  const { connectionId, accountEmail } = await resolveUserMatonGatewayCredential({
+  const { connectionId } = await resolveUserMatonGatewayCredential({
     ownerEmail: credentialOwnerEmail,
     app,
     boundConnectionId: action.communicationConnectionId,
@@ -2040,24 +2039,16 @@ async function selectedMatonConnection(
   if (connectionId !== action.communicationConnectionId) {
     throw new PermanentCrmIntegrationActionError('The queued communication connection no longer matches its reviewed identity')
   }
-  if (
-    // Gmail verifies the reviewed account against the live provider profile
-    // immediately below; cached connection email can lag a Workspace rename.
-    app !== 'google-mail'
-    && action.communication?.accountEmail
-    && accountEmail
-    && normalizeEmail(accountEmail, 'Selected provider account') !== action.communication.accountEmail
-  ) {
-    throw new PermanentCrmIntegrationActionError('The queued communication account no longer matches its reviewed identity')
-  }
+  // Maton's cached account label can lag a Workspace rename. Both provider
+  // paths verify the reviewed account against live identity on this connection.
   await bindAttemptConnection(action, connectionId)
   return {
     credentialOwnerEmail,
     connectionId,
-    accountEmail: action.communication?.accountEmail || accountEmail,
-    identityEmail: action.communication?.identityEmail || accountEmail,
-    calendarId: action.communication?.calendarId || null,
-    bindingSource: action.communication?.source || null,
+    accountEmail: action.communication.accountEmail,
+    identityEmail: action.communication.identityEmail,
+    calendarId: action.communication.calendarId || null,
+    bindingSource: action.communication.source,
   }
 }
 
@@ -2106,15 +2097,23 @@ async function verifiedCalendarConnection(
 }> {
   const requestedCalendarId = calendarIdentifier(selectedConnection.calendarId, 'Queued Calendar ID')
   const calendars = await writableCalendarsForAction(action, selectedConnection.connectionId)
+  const primaryCalendar = calendars.find((calendar) => calendar.primary)
+  if (!primaryCalendar) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar connection has no writable primary calendar to verify its account')
+  }
+  const primaryAccountEmail = verifiedCalendarEmail(primaryCalendar.id, 'Live primary Calendar account')
+  if (!selectedConnection.accountEmail || primaryAccountEmail !== normalizeEmail(selectedConnection.accountEmail, 'Queued Calendar account')) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar account no longer matches its reviewed identity')
+  }
   const selectedCalendar = requestedCalendarId === 'primary'
-    ? calendars.find((calendar) => calendar.primary)
+    ? primaryCalendar
     : calendars.find((calendar) => calendar.id === requestedCalendarId)
   if (!selectedCalendar) {
     throw new PermanentCrmIntegrationActionError(
       'The queued Calendar is no longer accessible with write permission on its reviewed connection',
     )
   }
-  const organizerEmail = normalizeEmail(selectedCalendar.id, 'Selected Calendar organizer')
+  const organizerEmail = verifiedCalendarEmail(selectedCalendar.id, 'Selected Calendar organizer')
   if (
     selectedConnection.identityEmail
     && organizerEmail !== normalizeEmail(selectedConnection.identityEmail, 'Queued Calendar organizer')
@@ -2126,6 +2125,14 @@ async function verifiedCalendarConnection(
     calendarId: selectedCalendar.id,
     calendarSummary: selectedCalendar.summary,
     accessRole: selectedCalendar.accessRole,
+  }
+}
+
+function verifiedCalendarEmail(value: string, field: string): string {
+  try {
+    return normalizeEmail(value, field)
+  } catch {
+    throw new PermanentCrmIntegrationActionError(`${field} is invalid`)
   }
 }
 
@@ -2502,8 +2509,9 @@ async function listWritableCalendars(
 ): Promise<WritableCalendarOption[]> {
   const calendars: WritableCalendarOption[] = []
   const seen = new Set<string>()
+  let hasPrimary = false
   let pageToken = ''
-  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && calendars.length < MAX_CALENDAR_OPTIONS; page += 1) {
+  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES; page += 1) {
     const parameters = new URLSearchParams({
       maxResults: '250',
       minAccessRole: 'writer',
@@ -2519,6 +2527,12 @@ async function listWritableCalendars(
       const item = value as JsonObject
       const accessRole = String(item.accessRole || '').trim().toLowerCase()
       if (accessRole !== 'owner' && accessRole !== 'writer') continue
+      const primary = item.primary === true
+      if (primary) {
+        // Check before ID deduplication: a repeated primary row is ambiguous.
+        if (hasPrimary) throw new PermanentCrmIntegrationActionError('Google Calendar list returned multiple writable primary calendars')
+        hasPrimary = true
+      }
       let id: string
       try {
         id = calendarIdentifier(item.id, 'Provider Calendar ID')
@@ -2526,20 +2540,22 @@ async function listWritableCalendars(
         continue
       }
       if (seen.has(id)) continue
+      if (calendars.length >= MAX_CALENDAR_OPTIONS) {
+        throw new PermanentCrmIntegrationActionError('Google Calendar list exceeded the bounded identity verification limit')
+      }
       seen.add(id)
       const rawSummary = String(item.summaryOverride || item.summary || id)
       const summary = rawSummary.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 300) || id
-      calendars.push({ id, summary, primary: item.primary === true, accessRole })
-      if (calendars.length >= MAX_CALENDAR_OPTIONS) break
+      calendars.push({ id, summary, primary, accessRole })
     }
     const nextPageToken = typeof response.nextPageToken === 'string' ? response.nextPageToken.trim() : ''
-    if (!nextPageToken) break
+    if (!nextPageToken) return calendars
     if (nextPageToken.length > 2048 || /[\u0000-\u001f\u007f]/.test(nextPageToken)) {
       throw new PermanentCrmIntegrationActionError('Google Calendar list returned an invalid page token')
     }
     pageToken = nextPageToken
   }
-  return calendars
+  throw new PermanentCrmIntegrationActionError('Google Calendar list exceeded the bounded identity verification limit')
 }
 
 async function writableCalendarsForAction(
@@ -3301,7 +3317,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
           },
         )
       } else {
-        const calendarId = selectedConnection.calendarId || 'primary'
+        const calendarId = calendar.calendarId
         response = await matonFetch(
           `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
           { method: 'DELETE' },
@@ -3352,7 +3368,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     verifiedCalendarId = calendar.calendarId
     calendarSummary = calendar.calendarSummary
     calendarAccessRole = calendar.accessRole
-    const calendarId = selectedConnection.calendarId || 'primary'
+    const calendarId = calendar.calendarId
     const existingEventId = currentEventId || previousCalendar?.eventId || ''
     const existingEventOnSelectedCalendar = Boolean(
       existingEventId
@@ -3361,7 +3377,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       && previousCalendar.connectionId === selectedConnection.connectionId
       && (
         previousCalendar.calendarId === calendar.calendarId
-        || previousCalendar.calendarId === calendarId
+        || previousCalendar.calendarId === selectedConnection.calendarId
         || previousCalendar.organizerEmail === calendar.organizerEmail
       ),
     )

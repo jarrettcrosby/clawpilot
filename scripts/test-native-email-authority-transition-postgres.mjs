@@ -45,6 +45,8 @@ const publication=load('app_src/lib/persistence/crmNativeEmailPublication.ts',{
   '../crm/nativeEmailPublicationPostgres':load('app_src/lib/crm/nativeEmailPublicationPostgres.ts',{'./nativeEmailPublication':protocol}),
   '../crm/nativeEmailPublicationWorkContext':load('app_src/lib/crm/nativeEmailPublicationWorkContext.ts',{'./nativeEmailPublication':protocol}),
   '../crm/nativeEmailPublicationTransport':load('app_src/lib/crm/nativeEmailPublicationTransport.ts',{'./nativeEmailPublication':protocol}),
+  '../crm/legacyEmailRecoveryReleaseApproval':{},
+  '../crm/nativeEmailRecoveryDispatchPermit':{},
 })
 const id=n=>`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,hash=protocol.nativeEmailDigest,clone=value=>JSON.parse(JSON.stringify(value))
 const held=code=>error=>error?.name==='NativeEmailPublicationHeld'&&(!code||error.code===code)

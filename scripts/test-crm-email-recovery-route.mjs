@@ -60,6 +60,7 @@ function harness(options = {}) {
     '@/lib/tenancy': { resolvePipelineSpaceAccess: async input => {
       accessCalls.push(input); if (options.accessError) throw new Error('private pipeline metadata'); return pipeline
     } },
+    '@/lib/crm/caseyGmailReview': load(readFileSync('app_src/lib/crm/caseyGmailReview.ts', 'utf8'), { '@/lib/crm/emailIdentity': {} }),
     '@/lib/crm/emailIngestion': {
       SafeEmailIngestionError,
       reconcileGmailMessages: async input => {
@@ -114,10 +115,10 @@ test('Casey admission forwards only the explicit exact-two review scope and auth
     primaryOrganizationReference: 'gagmco24va588e', contactReferences: ['gc2345678', 'gc3456789'] }))
   const options = { actor: { email: ownerEmail }, session: { authenticatedUser: ownerEmail, effectiveUser: ownerEmail },
     pipeline: { id: selected.pipelineId, ownerEmail } }
-  for (const apply of [false, true]) {
+  for (const apply of [false, true]) for (const admissionScope of [selected.admissionScope, 'casey-reviewed-two-first-seen-v1']) {
     const app = harness(options)
-    assert.equal((await app.request({ ...selected, apply, ...(apply ? { expectedDigest: digest } : {}) })).status, 200)
-    assert.deepEqual(JSON.parse(JSON.stringify(app.calls[0])), { ...selected, ownerEmail, apply, ...(apply ? { expectedDigest: digest } : {}) })
+    assert.equal((await app.request({ ...selected, admissionScope, apply, ...(apply ? { expectedDigest: digest } : {}) })).status, 200)
+    assert.deepEqual(JSON.parse(JSON.stringify(app.calls[0])), { ...selected, admissionScope, ownerEmail, apply, ...(apply ? { expectedDigest: digest } : {}) })
   }
   for (const change of [{ admissionScope: 'casey-reviewed-two-v1 ' }, { admissionScope: null }, { decisionKind: undefined },
     { decisionKind: 'correction', correctionReason: 'Not this admission' }, { correctionReason: '' },

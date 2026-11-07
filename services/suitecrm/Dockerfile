@@ -29,8 +29,10 @@ RUN a2enmod mpm_prefork rewrite headers expires remoteip \
   && apt-get purge -y --auto-remove git unzip \
   && rm -rf /var/lib/apt/lists/*
 
-COPY apache-site.conf /etc/apache2/sites-available/000-default.conf
-COPY apache-ports.conf /etc/apache2/ports.conf
+# Enrolled startup checks exact root ownership and modes. Do not inherit
+# group-write from the source archive or the builder's checkout umask.
+COPY --chown=0:0 --chmod=0644 apache-site.conf /etc/apache2/sites-available/000-default.conf
+COPY --chown=0:0 --chmod=0644 apache-ports.conf /etc/apache2/ports.conf
 COPY suitecrm.ini /usr/local/etc/php/conf.d/99-suitecrm.ini
 COPY supervisord.conf /etc/supervisor/conf.d/suitecrm.conf
 COPY entrypoint.sh scheduler-loop.sh messenger-loop.sh /usr/local/bin/
@@ -43,6 +45,7 @@ COPY email-audience /opt/clawpilot/email-audience
 COPY install-native-email-scope.php install-native-email-runtime.php native-email-startup-check.php /opt/clawpilot/
 COPY install-native-email-initial-state.php native-email-initial-cli.php native-email-initial-install-profile.json /opt/clawpilot/
 COPY native-email-initial-artifacts.php native-email-enrolled-startup.php /opt/clawpilot/
+COPY native-email-recovery-cli.php /opt/clawpilot/native-email-recovery-cli.php
 COPY native-email-maintenance.py native-email-liveness.json /opt/clawpilot/
 COPY native-email-scope /opt/clawpilot/native-email-scope
 COPY install-record-lifecycle.php /opt/clawpilot/install-record-lifecycle.php
@@ -50,6 +53,7 @@ COPY record-lifecycle /opt/clawpilot/record-lifecycle
 COPY bootstrap-image-principals.php /opt/clawpilot/bootstrap-image-principals.php
 
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/scheduler-loop.sh /usr/local/bin/messenger-loop.sh \
+  && chmod 0644 /opt/clawpilot/email-audience/NativeEmailRecoveryReadyProof.php \
   && mkdir -p /var/lib/suitecrm /var/log/supervisor \
   && chown -R www-data:www-data /var/lib/suitecrm
 

@@ -40,7 +40,7 @@ const SOURCE_HASH = 'a'.repeat(64)
 const normalizeUserEmail = (value) => String(value || '').trim().toLowerCase()
 const archived = (row) => ['true', '1', 'yes'].includes(String(row.source_payload?.archived).toLowerCase())
 let meeting, prior, staged, queued, requests, scopeFailure, bindingFailure, credentialFailure
-let scopeOrganization, activeBinding, credentialAccount, racedHash, insertFailure, cursorWrites
+let scopeOrganization, activeBinding, credentialAccount, liveAccountEmail, racedHash, insertFailure, cursorWrites
 let pipelineRole, onMeetingRead, importedAuthority
 let projectionRow, pendingProjection, liveSnapshotOverride, lastPolledSnapshot, nativeReads, onProjectionRead
 const clientSource = ts.createSourceFile('suiteCrmClient.ts', readFileSync('app_src/lib/crm/suiteCrmClient.ts', 'utf8'),
@@ -92,7 +92,7 @@ function reset(mode = 'in_person', source = 'organization') {
   staged = []; queued = null; requests = []; cursorWrites = []
   scopeFailure = false; bindingFailure = false; credentialFailure = false; insertFailure = false
   scopeOrganization = ORGANIZATION; activeBinding = communication
-  credentialAccount = communication.accountEmail; racedHash = null
+  credentialAccount = communication.accountEmail; liveAccountEmail = communication.accountEmail; racedHash = null
   pipelineRole = 'editor'
   onMeetingRead = null
   importedAuthority = null
@@ -148,12 +148,12 @@ async function query(sql, parameters = []) {
       "owner_user.status = 'active'",
       "membership.organization_id = source.workspace_organization_id AND membership.status = 'active'",
       "connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'",
-      'lower(connection.account_email) = source.account_email',
       'mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid',
       'meeting.reference_code = $3 AND mapping.external_event_id = $4',
       'source.credential_owner_email = $5 AND source.connection_id = $6',
       'mapping.calendar_id = $7 AND source.calendar_id = $8',
     ]) assert.ok(sql.includes(guard), `Imported Calendar authority must retain ${guard}`)
+    assert.ok(!sql.includes('connection.account_email'), 'Do not use a cached Maton label as imported Calendar authority')
     const row = importedAuthority
     const matches = row && row.authorized && row.pipeline_id === parameters[0]
       && row.meeting_id === parameters[1] && row.reference_code === parameters[2]
@@ -276,7 +276,7 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
     requests.push({ pathname, method: init.method || 'GET', context, body: init.body && JSON.parse(init.body) })
     assert.equal(context.boundConnectionId, CONNECTION)
     if (pathname.includes('/calendarList?')) return Response.json({ items: [
-      { id: prior.communication_account_email, primary: true, accessRole: 'owner' },
+      { id: liveAccountEmail, primary: true, accessRole: 'owner' },
       { id: CALENDAR, summary: 'Independent team', accessRole: 'writer' },
     ] })
     if (init.method === 'DELETE') {
@@ -410,6 +410,34 @@ function lossyNativeProjection() {
   assert.notEqual(queued.idempotency_key, firstKey,
     'A→B→A native reverts with the same timestamp use their distinct canonical preimage')
 }
+for (const imported of [false, true]) {
+  const label = imported ? 'imported Calendar' : 'previously delivered Calendar'
+  for (const primaryChanged of [false, true]) {
+    if (imported) importMeeting()
+    else reset()
+    credentialAccount = 'outdated-maton-label@example.com'
+    if (primaryChanged) liveAccountEmail = 'unreviewed-live-account@example.com'
+    const reviewedAccount = imported ? importedAuthority.account_email : prior.communication_account_email
+    assert.equal((await inbound.reconcileMeeting(inboundSnapshot())).calendarActionQueued, true, label)
+    assert.equal(queued.communication_account_email, reviewedAccount, `${label}: queue the reviewed account, not the cached label`)
+    assert.equal(requests.length, 0, `${label}: admission does not call Google`)
+    const delivery = () => integration.createCalendarEventAction(integration.leasedAction({ ...queued,
+      status: 'processing', attempts: 1, lock_token: 'fixture-live-account-lease' }), target())
+    if (primaryChanged) {
+      await assert.rejects(delivery, /Calendar account no longer matches/, label)
+      assert.ok(requests.length > 0, `${label}: verify the live account at delivery`)
+      assert.ok(requests.every((request) => request.method === 'GET' && request.pathname.includes('/calendarList?')),
+        `${label}: a new account that can still access the shared calendar must not mutate its event`)
+    } else {
+      await delivery()
+      const writes = requests.filter((request) => request.method !== 'GET')
+      assert.equal(writes.length, 1, `${label}: do not recreate the existing event`)
+      assert.equal(writes[0].method, 'PATCH')
+      assert.ok(writes[0].pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
+    }
+  }
+}
+
 for (const [name, mutate] of [
   ['legacy missing projection receipt', () => { projectionRow = null }],
   ['queued projection', () => { pendingProjection = true }],
@@ -626,7 +654,6 @@ for (const [name, mutate] of [
   ['different imported owner', () => { importedAuthority.credential_owner_email = OWNER }],
   ['metadata without import mapping', () => { importedAuthority = null }],
   ['revoked imported credential', () => { credentialFailure = true }],
-  ['changed imported provider account', () => { credentialAccount = 'changed@example.com' }],
   ['revoked imported membership', () => { scopeFailure = true }],
   ['revoked imported pipeline access', () => { pipelineRole = null }],
 ]) {
@@ -645,7 +672,6 @@ for (const [name, mutate] of [
   ['revoked organization binding', () => { bindingFailure = true }],
   ['changed organization selection', () => { activeBinding = { ...activeBinding, calendarId: 'other@example.com' } }],
   ['revoked bound connection', () => { credentialFailure = true }],
-  ['changed provider account', () => { credentialAccount = 'other@example.com' }],
   ['missing historical snapshot', () => { prior.communication_binding_source = null }],
   ['failed original action', () => { prior.status = 'failed' }],
   ['pending original action', () => { prior.status = 'processing' }],

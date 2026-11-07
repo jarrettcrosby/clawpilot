@@ -14,8 +14,14 @@ require_once __DIR__.'/NativeEmailCapabilityContract.php';
  */
 final class ClawPilotNativeEmailPublisher
 {
+    // The native transaction's complete commit deadline is five seconds. A
+    // private permit must cover the subsequent locked policy recheck too.
+    private const MAINTENANCE_COMMIT_MARGIN_SECONDS = 6;
+
     public function __construct(private mysqli $db, private array $profile, private string $callerId,
-        private ?string $oauthClientId = null, private ?string $oauthAccessTokenId = null) {}
+        private ?string $oauthClientId = null, private ?string $oauthAccessTokenId = null,
+        private ?ClawPilotNativeEmailRecoveryDispatchPermit $maintenancePermit = null,
+        private ?string $maintenanceDbPrincipal = null, private ?string $maintenancePolicyFingerprint = null) {}
 
     public function publish(array $command): array { return $this->execute($command, false); }
 
@@ -25,16 +31,26 @@ final class ClawPilotNativeEmailPublisher
     public function prepare(array $c): array
     {
         self::validateCommand($c);
+        $this->assertMaintenanceEntry($c);
+        $hash = $this->maintenancePermit === null ? '' : self::digest($c);
         $tx = ClawPilotNativeEmailTransaction::begin($this->db, $this->profile);
+        $stage='storage';
         try {
             $this->assertStorage($tx);
+            $stage='caller';
             $this->assertCaller();
+            $stage='policy';
+            $this->assertMaintenancePolicy($tx);
+            $this->assertMaintenanceAction('prepare',$c,$hash);
+            $stage='binding';
             $bindings = $this->rows('SELECT * FROM clawpilot_email_bindings WHERE pipeline_id=? FOR UPDATE', [$c['pipelineId']]);
             if (count($bindings) !== 1 || $bindings[0]['workspace_id'] !== $c['workspaceId'] || $bindings[0]['owner_id'] !== $this->callerId) self::refuse('binding_missing');
             $policy=$this->assertBinding($bindings[0], $c, $tx);
+            $stage='preimage';
             $existing = $this->rows('SELECT id,deleted FROM emails WHERE id=? FOR UPDATE', [$c['suiteCrmId']]);
             $snapshot = ClawPilotNativeEmailProjection::snapshot($this->db, $tx, $c['suiteCrmId']);
             if ($existing) {
+                if ($this->maintenancePermit!==null) self::refuse('native_recovery_dispatch_target_exists');
                 $identity=$this->assertIdentity($c);
                 $this->assertExistingEmail($c, $bindings[0]);
                 if($policy!==null) {
@@ -42,17 +58,44 @@ final class ClawPilotNativeEmailPublisher
                     $this->assertCapabilities($c,$bindings[0],$c['mode']==='repair');
                 }
             } else {
-                if ($c['mode'] !== 'publish' || $this->rows('SELECT email_id FROM clawpilot_email_identities WHERE email_id=? OR global_id=? OR local_id=? FOR UPDATE',
-                    [$c['suiteCrmId'],$c['globalId'],$c['localId']])) self::refuse('missing_previously_managed_email');
+                if ($c['mode'] !== 'publish') self::refuse('missing_previously_managed_email');
+                $this->assertCreatePreimage($tx,$c,$snapshot);
+                if ($this->lockedIdentityRows($c)) self::refuse('missing_previously_managed_email');
                 if($policy!==null)$this->assertCapabilityExpected($c,$policy,null);
             }
             $result = ['version'=>$c['version'],'suiteCrmId'=>$c['suiteCrmId'],'globalId'=>$c['globalId'],'pipelineId'=>$c['pipelineId'],
                 'generation'=>$c['generation'],'audienceFingerprint'=>$c['audienceFingerprint'],
                 'expectedRecordFingerprint'=>$existing ? $snapshot['fingerprint'] : null];
             $result+=self::capabilityPins($c);
+            $this->assertMaintenanceAction('prepare',$c,$hash);
             $tx->rollback();
             return $result;
-        } catch (Throwable $error) { try{$tx->rollback();}catch(Throwable $ignored){} if($error instanceof ClawPilotNativeEmailTransactionRefused)throw $error;self::refuse('preparation_failed'); }
+        } catch (Throwable $error) {
+            try{$tx->rollback();}catch(Throwable $ignored){}
+            if($error instanceof ClawPilotNativeEmailTransactionRefused)throw $error;
+            if($this->maintenancePermit!==null){
+                // Only fixed phases and known metadata error categories are
+                // available to the private operator. Never include raw errors.
+                $reason=$error instanceof mysqli_sql_exception
+                    ?match($error->getCode()){1044,1045,1142,1143,1227=>'access_denied',1049,1054,1146=>'schema_changed',default=>'query_failed'}
+                    :match($error->getMessage()){'database_metadata_visibility_unproven'=>'metadata_visibility',
+                        'database_metadata_principal_unproven'=>'metadata_principal','unknown_database_trigger'=>'trigger_present',
+                        'unknown_database_event'=>'event_present','profile_read_failed'=>'metadata_read_failed',
+                        'pending_native_relationship_resave'=>'pending_relationship_resave',
+                        'Unknown application hooks must hold'=>'application_hooks',
+                        'External indexing must be disabled'=>'external_index',
+                        default=>$error instanceof TypeError?'type_error':($error instanceof Error?'runtime_error':'held')};
+                // Report only bounded hashed source coordinates; never names,
+                // arguments, paths, or a raw exception message.
+                $frames=[hash('sha256',basename($error->getFile())).':'.$error->getLine()];
+                foreach(array_slice($error->getTrace(),0,7) as $frame){
+                    if(isset($frame['file'],$frame['line'])&&is_string($frame['file'])&&is_int($frame['line']))
+                        $frames[]=hash('sha256',basename($frame['file'])).':'.$frame['line'];
+                }
+                throw new ClawPilotNativeEmailTransactionRefused('native_recovery_dispatch_prepare_'.$stage.'_'.$reason,'php-origin:'.implode(',',$frames));
+            }
+            self::refuse('preparation_failed');
+        }
     }
 
     /** Same command and operation ID. Serializes with publish and commits an
@@ -64,13 +107,16 @@ final class ClawPilotNativeEmailPublisher
     private function execute(array $c, bool $cancel): array
     {
         self::validateCommand($c);
+        $this->assertMaintenanceEntry($c);
+        $action = $cancel ? 'resolve' : 'publish';
         $hash = self::digest($c);
         $tx = ClawPilotNativeEmailTransaction::begin($this->db, $this->profile);
         try {
             $this->assertStorage($tx);
             $this->assertCaller();
-            // Policy locks are always first, followed by binding, operation,
-            // identity, and content locks. All cooperating calls use this order.
+            $this->assertMaintenancePolicy($tx);
+            $this->assertMaintenanceAction($action,$c,$hash);
+            // Policy locks are always first, followed by binding and operation.
             $binding = $this->rows('SELECT * FROM clawpilot_email_bindings WHERE pipeline_id=? FOR UPDATE', [$c['pipelineId']]);
             if (count($binding) !== 1 || $binding[0]['workspace_id'] !== $c['workspaceId'] || $binding[0]['owner_id'] !== $this->callerId) self::refuse('binding_missing');
             $b = $binding[0];
@@ -79,6 +125,7 @@ final class ClawPilotNativeEmailPublisher
                 $r = $previous[0];
                 if (!hash_equals($r['command_hash'], $hash) || $r['pipeline_id'] !== $c['pipelineId'] || $r['email_id'] !== $c['suiteCrmId']) self::refuse('operation_conflict');
                 if (!in_array($r['state'], ['committed','cancelled'], true)) self::refuse('operation_state_invalid');
+                if (!$cancel && $this->maintenancePermit!==null) self::refuse('native_recovery_dispatch_resolution_required');
                 $result = $r['result_json'] === null ? null : json_decode($r['result_json'], true, 64, JSON_THROW_ON_ERROR);
                 // Resolution answers a historical outcome, not current readability
                 // or sync completion. Ordinary retries additionally revalidate.
@@ -92,11 +139,14 @@ final class ClawPilotNativeEmailPublisher
                     if($policy!==null)$this->assertCapabilities($c,$b);
                     else $this->assertReaders($c['suiteCrmId'], $b);
                 }
+                $this->assertMaintenanceAction($action,$c,$hash,self::MAINTENANCE_COMMIT_MARGIN_SECONDS);
                 $tx->commit();
                 return ['version'=>$c['version'],'operationId'=>$c['operationId'],'commandHash'=>$hash,'state'=>$r['state'],'replayed'=>true,'result'=>$result];
             }
             if ($cancel) {
+                $this->assertMaintenanceAction($action,$c,$hash);
                 $this->writeOperation($c, $hash, 'cancelled', null);
+                $this->assertMaintenanceAction($action,$c,$hash,self::MAINTENANCE_COMMIT_MARGIN_SECONDS);
                 $tx->commit();
                 return ['version'=>$c['version'],'operationId'=>$c['operationId'],'commandHash'=>$hash,'state'=>'cancelled','replayed'=>false,'result'=>null];
             }
@@ -104,9 +154,15 @@ final class ClawPilotNativeEmailPublisher
             $before = ClawPilotNativeEmailProjection::snapshot($this->db, $tx, $c['suiteCrmId']);
             // New capability enrollment is legal only for a genuinely absent
             // native Email. Existing rows require separately reviewed pins.
+            $creating = $c['mode'] === 'publish' && $c['expectedRecordFingerprint'] === null;
+            if ($creating) $this->assertCreatePreimage($tx,$c,$before);
             if($policy!==null && !$before['exists'])$this->assertCapabilityExpected($c,$policy,null);
-            $identity = $this->assertIdentity($c, !$before['exists'] && $c['mode'] === 'publish' && $c['expectedRecordFingerprint'] === null);
-            if(!$before['exists'] && $c['mode']==='publish')ClawPilotNativeEmailWriteScope::newPublication($this->db,$c);
+            $this->assertMaintenanceAction($action,$c,$hash);
+            $identity = $this->assertIdentity($c,$creating);
+            if($creating) {
+                $this->assertMaintenanceAction($action,$c,$hash);
+                ClawPilotNativeEmailWriteScope::newPublication($this->db,$c);
+            }
             if($policy!==null) {
                 $this->assertCapabilityExpected($c,$policy,$identity);
                 if($before['exists']) {
@@ -122,6 +178,7 @@ final class ClawPilotNativeEmailPublisher
                 $projection = null; // Never Email.save(), recreate, or unarchive.
             } else {
                 if ((int)$identity['app_archived'] !== 0) self::refuse('archived_publication');
+                $this->assertMaintenanceAction($action,$c,$hash);
                 $projection = ClawPilotNativeEmailProjection::upsert($this->db, $tx, [
                     'suiteCrmId'=>$c['suiteCrmId'], 'attributes'=>$c['projection']['attributes'],
                     'accounts'=>$c['projection']['accounts'], 'contacts'=>$c['projection']['contacts'],
@@ -134,6 +191,7 @@ final class ClawPilotNativeEmailPublisher
                 $linkId = create_guid(); $date = gmdate('Y-m-d H:i:s');
                 $delta = new ClawPilotNativeEmailGroupRecordInsert($linkId, $c['suiteCrmId'], $c['globalId'], $b['group_id'], $date, $b['owner_id'], $this->callerId);
                 $tx->admitEmailGroupRecordInsert($delta);
+                $this->assertMaintenanceAction($action,$c,$hash);
                 $this->write('INSERT INTO securitygroups_records(id,securitygroup_id,record_id,module,date_modified,deleted) VALUES (?,?,?,?,?,0)',
                     [$linkId,$b['group_id'],$c['suiteCrmId'],'Emails',$date]);
             }
@@ -146,7 +204,9 @@ final class ClawPilotNativeEmailPublisher
                 'pipelineId'=>$c['pipelineId'],'generation'=>$c['generation'],'audienceFingerprint'=>$c['audienceFingerprint'],
                 'recordFingerprint'=>$after['fingerprint'],'readerSuiteCrmUserIds'=>$readers,'projection'=>$projection];
             $result+=self::capabilityPins($c);
+            $this->assertMaintenanceAction($action,$c,$hash);
             $this->writeOperation($c, $hash, 'committed', $result);
+            $this->assertMaintenanceAction($action,$c,$hash,self::MAINTENANCE_COMMIT_MARGIN_SECONDS);
             $tx->commit();
             return ['version'=>$c['version'],'operationId'=>$c['operationId'],'commandHash'=>$hash,'state'=>'committed','replayed'=>false,'result'=>$result];
         } catch (Throwable $error) {
@@ -154,6 +214,44 @@ final class ClawPilotNativeEmailPublisher
             if ($error instanceof ClawPilotNativeEmailTransactionRefused) throw $error;
             self::refuse('publication_failed');
         }
+    }
+
+    private function assertMaintenanceEntry(array $c): void
+    {
+        if ($this->maintenancePermit===null && $this->maintenanceDbPrincipal===null && $this->maintenancePolicyFingerprint===null) return;
+        // A verified object is not authority to bypass the public bearer
+        // route. Only the immutable root entrypoint may supply private scope.
+        $script=$_SERVER['SCRIPT_FILENAME']??null;
+        if ($this->maintenancePermit===null || PHP_SAPI!=='cli' || PHP_OS_FAMILY!=='Linux'
+            || !function_exists('posix_geteuid') || posix_geteuid()!==0
+            || !is_string($script) || realpath($script)!=='/opt/clawpilot/native-email-recovery-cli.php'
+            || getenv('CLAWPILOT_NATIVE_INITIAL_MAINTENANCE')!=='1'
+            || $this->oauthClientId===null || preg_match('/\A[a-z0-9][a-z0-9-]{0,35}\z/i',$this->oauthClientId)!==1
+            || $this->oauthAccessTokenId!==null
+            || $this->maintenanceDbPrincipal===null || preg_match('/\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}@[A-Za-z0-9_.:%-]{1,255}\z/',$this->maintenanceDbPrincipal)!==1
+            || $this->maintenancePolicyFingerprint===null || preg_match('/\A[a-f0-9]{64}\z/',$this->maintenancePolicyFingerprint)!==1
+            || $c['version']!==2 || $c['mode']!=='publish' || $c['expectedRecordFingerprint']!==null) self::refuse('native_recovery_dispatch_entry_refused');
+    }
+
+    private function assertMaintenancePolicy(ClawPilotNativeEmailTransaction $tx): void
+    {
+        if ($this->maintenancePermit!==null && !hash_equals($this->maintenancePolicyFingerprint??'',$tx->immutablePolicyFingerprint()))
+            self::refuse('native_recovery_dispatch_policy_changed');
+    }
+
+    private function assertMaintenanceAction(string $action,array $c,string $hash,int $margin=0): void
+    {
+        if ($this->maintenancePermit===null) return;
+        // The same MariaDB connection whose policy/identity locks we hold
+        // supplies both the effective account and timezone-independent time.
+        $rows=$this->rows('SELECT CURRENT_USER() AS principal, CAST(UNIX_TIMESTAMP() AS UNSIGNED) AS epoch');
+        $epoch=$rows[0]['epoch']??null;
+        if (count($rows)!==1 || ($rows[0]['principal']??null)!==$this->maintenanceDbPrincipal
+            || !(is_int($epoch) || (is_string($epoch)&&ctype_digit($epoch)))
+            || (int)$epoch<=0 || (int)$epoch>9007199254740991-$margin) self::refuse('native_recovery_dispatch_connection_changed');
+        $now=(int)$epoch;
+        $this->maintenancePermit->assertActionCurrent($action,$c['operationId'],$hash,$now);
+        if ($margin!==0) $this->maintenancePermit->assertActionCurrent($action,$c['operationId'],$hash,$now+$margin);
     }
 
     private function assertStorage(ClawPilotNativeEmailTransaction $tx): void
@@ -229,6 +327,12 @@ final class ClawPilotNativeEmailPublisher
             if(count($clients)!==1 || (int)$clients[0]['deleted']!==0 || $clients[0]['assigned_user_id']!==$this->callerId) self::refuse('native_client_revoked');
         }
         if($this->oauthAccessTokenId===null) {
+            if ($this->maintenancePermit!==null) {
+                // Entry and principal proof are separate from the existing
+                // active user/client assignment and retained client row lock.
+                $this->assertOAuthStorage(['oauth2clients']);
+                return;
+            }
             // Only the existing explicitly opted-in disposable CLI fixtures
             // exercise the service directly without an authenticated bearer.
             if(PHP_SAPI!=='cli' || getenv('CLAWPILOT_NATIVE_FIXTURE_REMEDIATION')!=='1'
@@ -246,11 +350,16 @@ final class ClawPilotNativeEmailPublisher
             if(count($tokens)!==1 || (int)$tokens[0]['deleted']!==0 || !in_array($tokens[0]['token_is_revoked'],[0,'0'],true)
                 || (int)$tokens[0]['unexpired']!==1 || $tokens[0]['client']!==$this->oauthClientId
                 || $tokens[0]['assigned_user_id']!==$this->callerId) self::refuse('native_token_revoked');
-            foreach(['oauth2clients','oauth2tokens'] as $table) {
-                $storage=$this->rows('SELECT ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?',[$table]);
-                if(count($storage)!==1 || $storage[0]['ENGINE']!=='InnoDB' || $storage[0]['TABLE_TYPE']!=='BASE TABLE')
-                    self::refuse('native_auth_storage_unproven');
-            }
+            $this->assertOAuthStorage(['oauth2clients','oauth2tokens']);
+        }
+    }
+
+    private function assertOAuthStorage(array $tables): void
+    {
+        foreach ($tables as $table) {
+            $storage=$this->rows('SELECT ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?',[$table]);
+            if (count($storage)!==1 || $storage[0]['ENGINE']!=='InnoDB' || $storage[0]['TABLE_TYPE']!=='BASE TABLE')
+                self::refuse('native_auth_storage_unproven');
         }
     }
 
@@ -259,6 +368,11 @@ final class ClawPilotNativeEmailPublisher
         if ((int)$b['enabled'] !== 1 || (int)$b['generation'] !== $c['generation'] || $b['owner_id'] !== $this->callerId
             || !hash_equals($b['audience_fingerprint'], $c['audienceFingerprint'])
             || !hash_equals($b['policy_fingerprint'], $tx->immutablePolicyFingerprint())) self::refuse('binding_or_policy_changed');
+        // Stock Administration hydrates the system mailer while loading
+        // Maps settings, and attempts to create it if absent. An offline
+        // recovery must never create or configure an outbound mailer.
+        if($this->maintenancePermit!==null&&count($this->rows("SELECT id FROM outbound_email WHERE type='system' AND deleted=0 ORDER BY id LIMIT 2 FOR UPDATE"))!==1)
+            self::refuse('native_recovery_dispatch_system_mailer_unproven');
         // The deployment supplies a reviewed runtime attestor, not a caller
         // boolean. It must cover native source/hook/config files before writes.
         if (!class_exists('ClawPilotNativeEmailRuntime') || !hash_equals($b['runtime_fingerprint'], ClawPilotNativeEmailRuntime::attest($this->db))) self::refuse('native_runtime_changed');
@@ -357,9 +471,9 @@ final class ClawPilotNativeEmailPublisher
         // a new publication from the authenticated app's durable admission may
         // enroll a new identity; native create-only validation occurs in the same
         // transaction. Existing, archived, and conflicting identities never move.
-        $rows = $this->rows('SELECT * FROM clawpilot_email_identities WHERE email_id=? OR global_id=? OR local_id=? ORDER BY email_id FOR UPDATE',
-            [$c['suiteCrmId'],$c['globalId'],$c['localId']]);
-        if (!$rows && $allowNew) {
+        $rows = $this->lockedIdentityRows($c);
+        if ($allowNew) {
+            if ($rows) self::refuse('missing_previously_managed_email');
             $capabilities=$c['version']===2 ? json_encode($c['expectedCapabilities'],JSON_THROW_ON_ERROR) : null;
             if($c['version']===2)$this->write('INSERT INTO clawpilot_email_identities(email_id,global_id,local_id,pipeline_id,workspace_id,app_archived,capabilities_json) VALUES (?,?,?,?,?,0,?)',
                 [$c['suiteCrmId'],$c['globalId'],$c['localId'],$c['pipelineId'],$c['workspaceId'],$capabilities]);
@@ -373,6 +487,26 @@ final class ClawPilotNativeEmailPublisher
             || $r['pipeline_id'] !== $c['pipelineId'] || $r['workspace_id'] !== $c['workspaceId']) self::refuse('identity_changed');
         ClawPilotNativeEmailWriteScope::assertIdentity($this->db,$r);
         return $r;
+    }
+
+    private function assertCreatePreimage(ClawPilotNativeEmailTransaction $tx,array $c,array $snapshot): void
+    {
+        if (($c['projection']['attributes']['global_id_c'] ?? null) !== $c['globalId']) self::refuse('identity_changed');
+        try {
+            ClawPilotNativeEmailProjection::assertCreatePreimage($this->db,$tx,$snapshot,$c['suiteCrmId'],$c['globalId'],$c['projection']['previousManaged'] ?? null);
+        } catch (ClawPilotNativeEmailProjectionRefused $error) {
+            self::refuse($error->holdCode);
+        }
+        // The policy lock already covers all group records and insertion gaps.
+        // A stale link is a collision even if it is deleted, in another module,
+        // or happens to name the group this command would otherwise grant.
+        if ($this->rows('SELECT id FROM securitygroups_records WHERE record_id=? LIMIT 1 FOR UPDATE',[$c['suiteCrmId']])) self::refuse('orphaned_native_group_record');
+    }
+
+    private function lockedIdentityRows(array $c): array
+    {
+        return $this->rows('SELECT * FROM clawpilot_email_identities WHERE email_id=? OR global_id=? OR local_id=? ORDER BY email_id FOR UPDATE',
+            [$c['suiteCrmId'],$c['globalId'],$c['localId']]);
     }
 
     private function assertExistingEmail(array $c, array $b): void

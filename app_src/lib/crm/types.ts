@@ -449,6 +449,8 @@ export type SuiteCrmOutboxRecord = {
   suiteCrmModule?: SuiteCrmInteractionModule
   previousSuiteCrmModule?: SuiteCrmInteractionModule
   attributes: Record<string, unknown>
+  /** Existing Account only; never use the generic native create/upsert. */
+  accountDescriptionPatch?: { previousDescription: string }
   emailProjection?: SuiteCrmEmailProjection
   currencyCode?: string
   productImage?: {

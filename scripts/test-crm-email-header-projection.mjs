@@ -113,6 +113,7 @@ const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/globalIds.mjs': { globalIdFragment },
   '@/lib/crm/emailIdentity': emailIdentity,
   '@/lib/crm/emailReconciliation': loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
+  '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
   '@/lib/persistence/crmEmailIdentity': { recordGmailMessageIntakeInPostgres: async input => {
     ingestionWrites.push(plain(input))
     return { id: inboundId, pipelineId, inserted: true, identityStatus: 'verified' }

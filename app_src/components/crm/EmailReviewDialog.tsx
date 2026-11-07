@@ -7,13 +7,15 @@ import EmailRounded from '@mui/icons-material/EmailRounded'
 import { loadGoogleIdentityServices } from '@/components/settings/GoogleAuthSettingsPanel'
 
 export type EmailReviewCandidate = { messageId: string; threadId: string; subject: string; receivedAt: string
-  legacy: boolean; admissionScope?: 'casey-reviewed-two-v1'; participantEmails: string[]
+  legacy: boolean; admissionScope?: 'casey-reviewed-two-v1' | 'casey-reviewed-two-first-seen-v1'; participantEmails: string[]
   participantContactIds: string[]; participantContacts: ContactChoice[] }
 type Mailbox = { connectionId: string; accountEmail: string; verified: boolean }
 type MailboxLabelPreview = { required: boolean; oldAccountEmail: string; newAccountEmail: string; expectedDigest: string; expiresAt: string }
 type MailboxLabelProof = { pipelineId: string; connectionId: string; idToken: string; expectedDigest: string; expiresAt: string }
 type Selection = { contactIds: string[]; primaryOrganizationReference: string }
-type Decision = 'review' | 'correction' | 'late-contact' | 'casey-history'
+type Decision = 'review' | 'correction' | 'late-contact' | 'casey-history' | 'casey-first-seen'
+const caseyAdmission = (decision: Decision) => decision === 'casey-history' ? 'casey-reviewed-two-v1'
+  : decision === 'casey-first-seen' ? 'casey-reviewed-two-first-seen-v1' : undefined
 type ReviewedMessage = { messageId: string; subject: string; organizationReferences: string[]; contactReferences: string[]; alreadyLinked?: boolean }
 type Preview = { digest: string; inputKey: string; messages: ReviewedMessage[] }
 type ContactChoice = { id: string; reference: string; name: string; email: string; organizationId: string
@@ -63,10 +65,11 @@ export function emailReviewCommand(input: { pipelineId: string; connectionId: st
   if (!input.connectionId || !selected.length || selected.length > 25
     || (input.decisionKind === 'correction' && (!input.correctionReason.trim() || input.correctionReason.trim().length > 500))
     || (input.decisionKind === 'late-contact' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.participantEmail.trim()))) return null
-  const caseyPair = input.decisionKind === 'casey-history'
+  const admissionScope = caseyAdmission(input.decisionKind)
+  const caseyPair = admissionScope !== undefined
   if (caseyPair && (selected.length !== 2 || input.candidates.length !== 2
     || new Set(selected.map(message => message.messageId)).size !== 2
-    || selected.some(message => !message.legacy || message.admissionScope !== 'casey-reviewed-two-v1'))) return null
+    || selected.some(message => message.legacy !== (input.decisionKind === 'casey-history') || message.admissionScope !== admissionScope))) return null
   if (!caseyPair && input.candidates.some(message => message.admissionScope !== undefined)) return null
   if (!caseyPair && selected.some(message => message.legacy)
     && (selected.length !== 3 || selected.some(message => !message.legacy)
@@ -86,7 +89,7 @@ export function emailReviewCommand(input: { pipelineId: string; connectionId: st
   if (associations.some(value => value === null)) return null
   return { pipelineId: input.pipelineId, connectionId: input.connectionId, messageIds: selected.map(message => message.messageId),
     reviewedAssociations: associations, decisionKind: caseyPair ? 'review' : input.decisionKind,
-    ...(caseyPair ? { admissionScope: 'casey-reviewed-two-v1' } : {}),
+    ...(admissionScope ? { admissionScope } : {}),
     ...(input.decisionKind === 'correction' ? { correctionReason: input.correctionReason.trim() } : {}),
     ...(input.decisionKind === 'late-contact' ? { participantEmail: input.participantEmail.trim().toLowerCase() } : {}) }
 }
@@ -107,7 +110,8 @@ export function EmailReviewFields({ candidates, selections, disabled, onSelectio
           label={<Typography sx={{ overflowWrap: 'anywhere' }}>{message.subject}</Typography>} />
         <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
           Message {message.messageId} · {message.receivedAt} · {message.admissionScope === 'casey-reviewed-two-v1'
-            ? 'Separate two-message Casey review' : message.legacy ? 'Fixed three-message legacy review' : 'Verified mailbox cache'}
+            ? 'Retained two-message Casey review' : message.admissionScope === 'casey-reviewed-two-first-seen-v1' ? 'Exact Gmail Casey recovery'
+              : message.legacy ? 'Fixed three-message legacy review' : 'Verified mailbox cache'}
         </Typography>
         <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>Actual participants: {message.participantEmails.join(', ')}</Typography>
         {selected && <>
@@ -190,21 +194,22 @@ export default function EmailReviewDialog({ pipelineId, onApplied }: {
     invalidate(false); setCandidates([]); setSelections({})
     const controller = begin()
     try {
+      const admissionScope = caseyAdmission(decisionKind)
       const params = new URLSearchParams({ pipelineId, connectionId: selectedConnection,
-        ...(decisionKind === 'casey-history' ? { admissionScope: 'casey-reviewed-two-v1' } : {}),
+        ...(admissionScope ? { admissionScope } : {}),
         ...(exactParticipant ? { participantEmail: exactParticipant.trim().toLowerCase() } : {}) })
       const body = await requestJson<{ ok?: boolean; error?: string; pipelineId?: string; connectionId?: string
         messages?: EmailReviewCandidate[]; admissionScope?: string }>(`/api/crm/email-review-candidates?${params}`, controller)
       if (!controller.signal.aborted) {
         if (body.pipelineId !== pipelineId || body.connectionId !== selectedConnection) {
-          throw new Error('Cached messages do not match the selected pipeline and mailbox.')
+          throw new Error('Messages do not match the selected pipeline and mailbox.')
         }
-        if (decisionKind === 'casey-history' && (body.admissionScope !== 'casey-reviewed-two-v1'
+        if (admissionScope && (body.admissionScope !== admissionScope
           || !Array.isArray(body.messages) || body.messages.length !== 2
-          || body.messages.some(message => message.admissionScope !== 'casey-reviewed-two-v1' || !message.legacy))) {
-          throw new Error('Both reviewed Casey messages are required. The retained records may have changed; no recovery was applied.')
+          || body.messages.some(message => message.admissionScope !== admissionScope || message.legacy !== (decisionKind === 'casey-history')))) {
+          throw new Error('Both reviewed Casey messages are required. No recovery was applied.')
         }
-        setCandidates((body.messages || []).slice(0, decisionKind === 'casey-history' ? 2 : 25))
+        setCandidates((body.messages || []).slice(0, admissionScope ? 2 : 25))
       }
     } catch (cause) { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Cached messages could not be loaded') }
     finally { finish(controller) }
@@ -331,7 +336,7 @@ export default function EmailReviewDialog({ pipelineId, onApplied }: {
         {busy && <CircularProgress size={22} aria-label="Working on selected email review" />}
         <TextField select label="Linked Google mailbox" value={connectionId} disabled={busy} onChange={event => {
           clearMailboxRepair(); invalidate(); setConnectionId(event.target.value); setCandidates([]); setSelections({})
-          if (decisionKind === 'casey-history') setDecisionKind('review')
+          if (caseyAdmission(decisionKind)) setDecisionKind('review')
         }}>
           <MenuItem value="">Select a linked mailbox</MenuItem>
           {mailboxes.map(value => <MenuItem key={value.connectionId} value={value.connectionId}>{value.accountEmail} · {value.verified ? 'Verified identity' : 'Verify identity first'}</MenuItem>)}
@@ -358,7 +363,8 @@ export default function EmailReviewDialog({ pipelineId, onApplied }: {
         }}>
           <MenuItem value="review">Review company and contact links</MenuItem><MenuItem value="correction">Correct a reviewed decision</MenuItem>
           <MenuItem value="late-contact">Reconcile a newly added contact</MenuItem>
-          {(caseyAvailable || decisionKind === 'casey-history') && <MenuItem value="casey-history" disabled={!caseyAvailable}>Recover the separately reviewed Casey pair</MenuItem>}
+          {(caseyAvailable || decisionKind === 'casey-first-seen') && <MenuItem value="casey-first-seen" disabled={!caseyAvailable}>Recover the two reviewed Casey emails from Gmail</MenuItem>}
+          {(caseyAvailable || decisionKind === 'casey-history') && <MenuItem value="casey-history" disabled={!caseyAvailable}>Recover the two retained Casey records</MenuItem>}
         </TextField>
         {decisionKind === 'correction' && <TextField label="Reason for correction" required multiline inputProps={{ maxLength: 500 }}
           value={correctionReason} disabled={busy} onChange={event => { invalidate(); setCorrectionReason(event.target.value) }} />}
@@ -374,6 +380,7 @@ export default function EmailReviewDialog({ pipelineId, onApplied }: {
             const next = { ...current }; if (selection) next[messageId] = selection; else delete next[messageId]; return next
           }) }} />
         {decisionKind === 'casey-history' && <Alert severity="warning">This separate recovery accepts only both reviewed Casey messages, with Globus as primary and Airspace related. The server rechecks their exact retained records, complete current content and actual participants. Original historical mailbox provenance remains unknown; this does not change the original three-message bridge or create a future thread rule.</Alert>}
+        {decisionKind === 'casey-first-seen' && <Alert severity="info">Review both exact Gmail messages together. Each will appear once, under Globus as primary and Airspace as related. This does not search or replay the mailbox. Applying requires protected SuiteCRM email access.</Alert>}
         {decisionKind !== 'casey-history' && candidates.some(message => message.legacy && selections[message.messageId]) && <Alert severity="warning">All three allowlisted legacy messages must be reviewed together, with Globus as the approved primary company and Airspace related. The server verifies the exact references. No additional legacy message can be included.</Alert>}
         {preview && preview.inputKey === inputKey && <Stack gap={1}>
           <Typography variant="subtitle2">Reviewed preview — {preview.messages.length} selected messages</Typography>

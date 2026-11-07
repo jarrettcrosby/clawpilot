@@ -8,6 +8,7 @@ import { nativeEmailDigest } from '../crm/nativeEmailPublication'
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/
 const HASH = /^[a-f0-9]{64}(?![\s\S])/
 const GMAIL_ID = /^[a-f0-9]{1,128}(?![\s\S])/
+const GLOBAL_ID = /^gi(?:[0-9]{7}|[0-9a-v]{12})(?![\s\S])/
 const MAX_ATTEMPTS = 8
 type Row = Record<string, unknown>
 
@@ -44,7 +45,7 @@ function selection(input: ExactEmailPublicationSelection) {
  * not recycle leases or resolve the global active operation: either can write
  * messages outside the operator's selection. The ordinary resolver owns those
  * outcomes. No disabled-mode/legacy writer fallback is permitted here. */
-async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
+async function lockedCanonicalSelection(tx: PoolClient, input: ExactEmailPublicationSelection) {
   const control = await tx.query(`SELECT enabled,generation,verified_generation,native_policy_fingerprint,
     activation_receipt_hash,active_operation_id,active_transition_id
     FROM crm_native_email_publication_control WHERE singleton FOR UPDATE`)
@@ -105,6 +106,62 @@ async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
       && !['true','1','yes'].includes(String((i.source_payload as Row | null)?.archived || '').toLowerCase()))
     return { interaction:i,source,key:`crm:interactions:v4:${i.id}:Emails:${i.source_hash}` }
   })
+  return { control:c,mailbox:mailbox.rows[0],audience,identities }
+}
+
+/** App-side candidate inspection only. The caller must independently verify
+ * archive/activation receipts and fresh native absence; this function does
+ * not authenticate those facts or authorize creating an outbox row.
+ * Keep its transaction open only for database work, never provider I/O. */
+export async function inspectExactLegacyEmailRecoveryWithClient(tx: PoolClient, input: ExactEmailPublicationSelection,
+  archived: { oldOutboxId: string; localId: string; nativeId: string; globalId: string; pipelineId: string; workspaceId: string
+    sourceFingerprint: string; retirementReceiptDigest: string }) {
+  const selected = selection(input)
+  check(selected.messageIds.length === 1 && archived)
+  const {oldOutboxId,localId,nativeId,globalId,pipelineId,workspaceId,sourceFingerprint,retirementReceiptDigest} = archived
+  check([oldOutboxId,localId,nativeId].every(value => typeof value === 'string' && UUID.test(value))
+    && typeof globalId === 'string' && GLOBAL_ID.test(globalId)
+    && pipelineId === selected.pipelineId && workspaceId === selected.workspaceId
+    && typeof sourceFingerprint === 'string' && HASH.test(sourceFingerprint)
+    && typeof retirementReceiptDigest === 'string' && HASH.test(retirementReceiptDigest))
+  const {control,mailbox,audience,identities} = await lockedCanonicalSelection(tx,selected)
+  const [{ interaction:i,source,key }] = identities
+  check(i.id === localId && i.suitecrm_id === nativeId && i.reference_code === globalId)
+  // Legacy rows may claim the same provider ID without a canonical source or
+  // matching native/global IDs. Never guess between same-pipeline placements.
+  const collision = await tx.query(`SELECT
+    (source_row.suitecrm_synced_at IS NULL AND source_row.sync_status='failed'
+      AND lower(source_row.source_key) NOT LIKE 'suitecrm%'
+      AND jsonb_typeof(source_row.metadata)='object'
+      AND NOT (source_row.metadata ?| ARRAY['suiteCrmEmailProjection','suiteCrmEmailPublication'])) AS no_local_history,
+    encode(public.digest(to_jsonb(source_row)::text,'sha256'),'hex') AS source_fingerprint,
+    EXISTS(SELECT 1 FROM crm_interactions other WHERE other.id<>$1::uuid
+      AND (lower(other.suitecrm_id)=lower($2) OR lower(other.reference_code)=lower($3)
+        OR (other.pipeline_id=source_row.pipeline_id
+          AND lower(btrim(other.provider_message_id))=NULLIF(lower(btrim(source_row.provider_message_id)),'')))) AS interaction_exists,
+    EXISTS(SELECT 1 FROM sync_outbox other WHERE other.id=$4::uuid OR (other.target_system='suitecrm' AND
+      (other.idempotency_key=$5 OR (other.aggregate_type='crm_interactions' AND other.aggregate_id=$1::text)
+        OR (other.payload->>'entity'='interactions' AND (other.payload->>'localId'=$1::text
+          OR lower(other.payload->>'suiteCrmId')=lower($2) OR lower(other.payload#>>'{attributes,global_id_c}')=lower($3)))))) AS outbox_exists,
+    EXISTS(SELECT 1 FROM crm_native_email_publication_admissions a WHERE a.local_id=$1::uuid
+      OR lower(a.native_id)=lower($2) OR lower(a.global_id)=lower($3)) AS admission_exists
+    FROM crm_interactions source_row WHERE source_row.id=$1::uuid`,
+  [i.id,i.suitecrm_id,i.reference_code,oldOutboxId,key])
+  check(collision.rows.length === 1 && collision.rows[0].no_local_history === true
+    && collision.rows[0].source_fingerprint === sourceFingerprint
+    && collision.rows[0].interaction_exists === false
+    && collision.rows[0].outbox_exists === false && collision.rows[0].admission_exists === false)
+  const generation = Number(control.generation)
+  const digest = nativeEmailDigest({version:1,purpose:'legacy-email-recovery-app-candidate',selection:selected,
+    archive:{oldOutboxId,localId,nativeId,globalId,pipelineId,workspaceId,sourceFingerprint,retirementReceiptDigest},
+    generation,policyFingerprint:control.native_policy_fingerprint,activationReceiptHash:control.activation_receipt_hash,
+    mailbox,source,audience,key})
+  return Object.freeze({digest,generation,localId,globalId,nativeId,messageId:selected.messageIds[0],
+    nativeAbsenceVerified:false as const,claimAuthorized:false as const})
+}
+
+async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
+  const {control:c,mailbox,audience,identities} = await lockedCanonicalSelection(tx,input)
   const outboxes = await tx.query(`SELECT outbox.*,outbox.available_at<=now() AS ready,
     EXISTS(SELECT 1 FROM crm_native_email_publication_work work
       JOIN crm_native_email_publication_admissions admission ON admission.operation_id=work.operation_id
@@ -112,6 +169,7 @@ async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
         AND admission.state IN ('admitted','dispatched','unknown')) AS unresolved
     FROM sync_outbox outbox WHERE outbox.target_system='suitecrm' AND outbox.aggregate_type='crm_interactions'
       AND outbox.aggregate_id=ANY($1::text[]) AND outbox.idempotency_key=ANY($2::text[])
+      AND outbox.available_at IS DISTINCT FROM 'infinity'::timestamptz
     ORDER BY outbox.id FOR UPDATE OF outbox`,[identities.map(row => row.interaction.id),identities.map(row => row.key)])
   check(outboxes.rows.length === identities.length)
   const rows = identities.map(({interaction:i,source,key}) => {
@@ -127,7 +185,7 @@ async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
       && o.unresolved === false && ['queued','failed','processing','succeeded','dead'].includes(o.status))
     return {interaction:i,source,outbox:o}
   }).sort((a,b) => a.source.provider_message_id.localeCompare(b.source.provider_message_id))
-  const digest = nativeEmailDigest({ version:1,input,mailbox:mailbox.rows[0],generation:Number(c.generation),
+  const digest = nativeEmailDigest({ version:1,input,mailbox,generation:Number(c.generation),
     policyFingerprint:c.native_policy_fingerprint,activationReceiptHash:c.activation_receipt_hash,audience,
     messages:rows.map(({interaction:i,source,outbox:o}) => ({source,localId:i.id,globalId:i.reference_code,
       nativeId:i.suitecrm_id,sourceHash:i.source_hash,outboxId:o.id,idempotencyKey:o.idempotency_key,payloadHash:crmSourceHash(o.payload)})) })

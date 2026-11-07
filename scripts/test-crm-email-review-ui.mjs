@@ -92,13 +92,25 @@ check('Casey history is an explicit complete pair, never the default review or a
   assert.notEqual(JSON.stringify(command), JSON.stringify(ordinary), 'Scope is part of the existing reviewed input key')
   const html = renderToStaticMarkup(React.createElement(api.EmailReviewFields,
     { ...input, disabled: false, onSelection: () => assert.fail('Render cannot apply') }))
-  assert.ok(html.includes('Separate two-message Casey review'))
+  assert.ok(html.includes('Retained two-message Casey review'))
   assert.ok(!html.includes('Fixed three-message legacy review'))
-  assert.match(source, /decisionKind === 'casey-history' \? \{ admissionScope: 'casey-reviewed-two-v1' \} : \{\}/)
-  assert.match(source, /body\.admissionScope !== 'casey-reviewed-two-v1'/)
+  assert.match(source, /body\.admissionScope !== admissionScope/)
   assert.match(source, /body\.messages\.length !== 2/)
   assert.match(source, /Original historical mailbox provenance remains unknown/)
   assert.match(source, /caseyAvailable \|\| decisionKind === 'casey-history'/)
+})
+check('Casey Gmail discovery issues its distinct exact-pair command without claiming retained provenance', () => {
+  const scope = 'casey-reviewed-two-first-seen-v1'
+  const candidates = ['1a18e03ea586cd7e','1a18f01749eb87a6'].map(messageId => ({ ...candidate, messageId, legacy: false, admissionScope: scope }))
+  const selections = Object.fromEntries(candidates.map(message => [message.messageId, base.selections.abcdef]))
+  const input = { ...base, decisionKind: 'casey-first-seen', candidates, selections }
+  const command = plain(api.emailReviewCommand(input))
+  assert.equal(command.admissionScope, scope); assert.equal(command.decisionKind, 'review')
+  assert.deepEqual(command.messageIds, candidates.map(message => message.messageId))
+  assert.equal(api.emailReviewCommand({ ...input, decisionKind: 'casey-history' }), null)
+  assert.equal(api.emailReviewCommand({ ...input, decisionKind: 'review' }), null)
+  assert.equal(api.emailReviewCommand({ ...input, candidates: candidates.slice(0, 1) }), null)
+  assert.equal(api.emailReviewCommand({ ...input, candidates: [candidates[0], { ...candidates[1], legacy: true }] }), null)
 })
 check('every material review input produces a different preview key and apply sends only the reviewed digest', () => {
   const key = JSON.stringify(api.emailReviewCommand(base))

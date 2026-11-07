@@ -14,19 +14,23 @@ import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
 import {inspectFractionalFolderSenderSources,runFractionalCustomerFolderJoined} from './lib/fractional-customer-folder-joined.mjs'
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),{Pool}=require('pg'),ts=require('typescript')
 const args=process.argv.slice(2)
-let joined=false,fractionalRoot=null,fractionalCommit=null
+let joined=false,fractionalRoot=null,fractionalCommit=null,reviewedLegacyClaim=false
 for(const arg of args){
  if(arg==='--with-fractional-folder-sender'){assert.equal(joined,false);joined=true}
+ else if(arg==='--with-reviewed-legacy-claim'){assert.equal(reviewedLegacyClaim,false);reviewedLegacyClaim=true}
  else if(arg.startsWith('--fractional-root=')){assert.equal(fractionalRoot,null);fractionalRoot=arg.slice('--fractional-root='.length)}
  else if(arg.startsWith('--fractional-commit=')){assert.equal(fractionalCommit,null);fractionalCommit=arg.slice('--fractional-commit='.length)}
- else throw Error('Use [--with-fractional-folder-sender --fractional-root=/absolute/reviewed/Fractional --fractional-commit=FULL40]')
+ else throw Error('Use [--with-fractional-folder-sender --fractional-root=/absolute/reviewed/Fractional --fractional-commit=FULL40] [--with-reviewed-legacy-claim]')
 }
 assert.equal(joined,fractionalRoot!==null&&fractionalCommit!==null,'Joined sender requires an explicit root and full commit; no Desktop fallback is permitted')
 if(!joined){assert.equal(fractionalRoot,null);assert.equal(fractionalCommit,null)
  console.log('FRACTIONAL_FOLDER_JOINED_SKIPPED=No external sender root/commit selected; this run proves the ClawPilot gateway only')}
 const joinedSources=joined?await inspectFractionalFolderSenderSources(ts,{root:fractionalRoot,commit:fractionalCommit}):null
+const reviewedLegacyCommit='44aadaf5f9907d5f6fb2e473ba7de1a258dcfdb3'
+const legacyCrmSource=reviewedLegacyClaim?execFileSync('git',['show',`${reviewedLegacyCommit}:app_src/lib/persistence/crm.ts`],
+ {cwd:new URL('../',import.meta.url),encoding:'utf8',timeout:10000}):null
 const read=path=>readFileSync(new URL(`../${path}`,import.meta.url),'utf8')
-function load(path,deps={},environment={}){const module={exports:{}};vm.runInNewContext(ts.transpileModule(read(path),{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
+function load(path,deps={},environment={},source=read(path)){const module={exports:{}};vm.runInNewContext(ts.transpileModule(source,{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText,
  {module,exports:module.exports,Buffer,URL,URLSearchParams,Request,Response,AbortSignal,Date,Error,Set,Map,process:{env:environment},require(name){if(Object.hasOwn(deps,name))return deps[name];if(name==='node:crypto')return require(name);return new Proxy({__esModule:true},{get(target,key){if(key==='__esModule')return true;return ()=>{throw new Error(`Unexpected integration dependency ${name}:${String(key)}`)}}})}}, {filename:path});return module.exports}
 const container=`clawpilot-fractional-crm-test-${process.pid}-${randomUUID().slice(0,8)}`;let started=false,pool
 try{
@@ -40,9 +44,12 @@ try{
  const auth=load('app_src/lib/fractionalCrmGatewayAuth.ts'),model=load('app_src/lib/crm/fractionalGatewayModel.ts'),stable=load('app_src/lib/crm/stableId.ts')
  const audit=load('app_src/lib/auditWriter.ts',{'@/lib/persistence/postgres':{query},'next/headers':{headers:()=>{throw new Error('No browser context')}},'@/lib/authAttribution':{verifyAuthAttributionHeaders:()=>null}})
  const authority=load('app_src/lib/persistence/crmNativeEmailAuthority.ts')
- const crm=load('app_src/lib/persistence/crm.ts',{'@/lib/persistence/crmNativeEmailAuthority':authority,'@/lib/crm/stableId':stable,'@/lib/persistence/postgres':{query,withTransaction},'@/lib/persistence/config':{isPostgresStorageEnabled:()=>true},'@/lib/publicUrl':{appPublicUrl:()=> 'https://clawpilot.example.invalid'},'@/lib/shortlinks':{shortLinkUrl:code=>`https://clawpilot.example.invalid/s/${code}`},'@/lib/auditWriter':audit})
+ const crmPath='app_src/lib/persistence/crm.ts'
+ const crmDeps={'@/lib/persistence/crmNativeEmailAuthority':authority,'@/lib/crm/stableId':stable,'@/lib/persistence/postgres':{query,withTransaction},'@/lib/persistence/config':{isPostgresStorageEnabled:()=>true},'@/lib/publicUrl':{appPublicUrl:()=> 'https://clawpilot.example.invalid'},'@/lib/shortlinks':{shortLinkUrl:code=>`https://clawpilot.example.invalid/s/${code}`},'@/lib/auditWriter':audit}
+ const crm=load(crmPath,crmDeps)
  const folderLinks=load('app_src/lib/crm/customerFolderLinks.ts'),folderContract=load('app_src/lib/crm/fractionalCustomerFolder.ts',{'./customerFolderLinks':folderLinks})
- const gateway=load('app_src/lib/persistence/fractionalCrmGateway.ts',{'@/lib/persistence/crmNativeEmailAuthority':authority,'@/lib/crm/fractionalCustomerFolder':folderContract,'@/lib/persistence/postgres':{query,withTransaction},'@/lib/persistence/crm':crm,'@/lib/fractionalCrmGatewayAuth':auth,'@/lib/crm/fractionalGatewayModel':model})
+ const scopedProjection=load('app_src/lib/crm/fractionalFolderBoardProjection.ts',{'@/lib/fractionalCrmGatewayAuth':auth,'@/lib/persistence/crm':crm})
+ const gateway=load('app_src/lib/persistence/fractionalCrmGateway.ts',{'@/lib/persistence/crmNativeEmailAuthority':authority,'@/lib/crm/fractionalCustomerFolder':folderContract,'@/lib/crm/fractionalFolderBoardProjection':scopedProjection,'@/lib/persistence/postgres':{query,withTransaction},'@/lib/persistence/crm':crm,'@/lib/fractionalCrmGatewayAuth':auth,'@/lib/crm/fractionalGatewayModel':model})
  const org=randomUUID(),pipeline=randomUUID(),root=randomUUID(),instance=randomUUID(),deployment=randomUUID(),credentialId=randomUUID(),owner='gateway.owner@example.invalid'
  await pool.query("INSERT INTO app_users(email,role,status,activated_at) VALUES($1,'owner','active',now())",[owner])
  await pool.query("INSERT INTO workspace_organizations(id,name,organization_type,created_by,updated_by) VALUES($1,'Gateway fixture','root',$2,$2)",[org,owner])
@@ -142,17 +149,17 @@ try{
  await pool.query(`UPDATE crm_board_cards SET payload=jsonb_set(payload,'{comments}','[{"id":"retained-comment","text":"Operator card note"}]') WHERE card_id=$1`,[originalCard.card_id])
  const boundary=load('app_src/lib/fractionalCrmGatewayHttp.ts',{'./fractionalCrmGatewayAuth':auth,
   './fractionalCrmGatewayPath.mjs':{isFractionalCrmGatewayPath},'./crm/fractionalCustomerFolder':folderContract})
- const services={...gateway,updateFractionalCrmCustomerFolder:async(...args)=>{
-  const result=await gateway.updateFractionalCrmCustomerFolder(...args)
-  await projection.reconcileCrmBoardProjectionsForPipeline({pipelineId:args[0].pipelineId});return result
- }}
- const folderHttp=async command=>{
-  const origin='https://clawpilot.example.invalid',query=new URLSearchParams({sourceInstanceId:instance,workspaceOrganizationId:org,pipelineId:pipeline,rootCompanyGlobalId:ga,customerId:folderActor.customerId})
-  const response=await boundary.handleFractionalCrmGateway(new Request(`${origin}/api/integrations/fractional-crm/v1/companies/${a.referenceCode}/customer-folder?${query}`,{
+ let legacyReconciliations=0
+ const services={...gateway,updateFractionalCrmCustomerFolder:(...args)=>gateway.updateFractionalCrmCustomerFolder(...args,async input=>{
+  legacyReconciliations++;await projection.reconcileCrmBoardProjectionsForPipeline(input)
+ })}
+ const folderHttp=async(command,{company=a.referenceCode,customerId=folderActor.customerId,status=200}={})=>{
+  const origin='https://clawpilot.example.invalid',query=new URLSearchParams({sourceInstanceId:instance,workspaceOrganizationId:org,pipelineId:pipeline,rootCompanyGlobalId:ga,customerId})
+  const response=await boundary.handleFractionalCrmGateway(new Request(`${origin}/api/integrations/fractional-crm/v1/companies/${company}/customer-folder?${query}`,{
    method:command?'PATCH':'GET',headers:{authorization:`Bearer ${fixtureToken}`,...(command?{'content-type':'application/json','if-match':`"${command.ifMatch}"`,'idempotency-key':command.idempotencyKey}:{})},
    ...(command?{body:JSON.stringify({schemaVersion:1,folderUrl:command.folderUrl,assertedFractionalActor:command.assertedFractionalActor})}:{})}),services,
   {FRACTIONAL_CRM_GATEWAY_ENABLED:'1',FRACTIONAL_CRM_GATEWAY_ORIGIN:origin,FRACTIONAL_CRM_GATEWAY_SOURCE_INSTANCE_ID:instance})
-  const body=await response.json();assert.equal(response.status,200,body.error);return body
+  const body=await response.json();assert.equal(response.status,status,body.error);return body
  }
  await denied(()=>gateway.readFractionalCrmCustomerFolder(principal,a.referenceCode,'unknown-source-customer'),'RECORD_NOT_FOUND')
  const emptyFolder=await gateway.readFractionalCrmCustomerFolder(principal,a.referenceCode,folderActor.customerId)
@@ -256,13 +263,150 @@ try{
  await denied(()=>gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),'RECORD_NOT_FOUND')
  await pool.query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1',[credentialId,results[0].company.record.globalId])
  principal=await gateway.readFractionalCrmCredential(credentialId)
- if(joinedSources){const joined=await runFractionalCustomerFolderJoined({Pool,connectionOptions:{host:'127.0.0.1',port:Number(port),user:'postgres',password:'fractional_gateway_fixture',ssl:false,connectionTimeoutMillis:1000},capture:joinedSources,
-  load,query,gateway,projection,stage,onboardingRequest:request,fixture:{org,pipeline,rootGlobalId:ga,instance,deployment,credentialId,token:fixtureToken,board,auth,isGatewayPath:isFractionalCrmGatewayPath,folderContract,fractionalOrganizationId:'fractional-fixture'}})
-  assert.equal(joined.passed,true);console.log(`FRACTIONAL_FOLDER_JOINED_EVIDENCE=${JSON.stringify(joined)}`)}
  const staleReview=request('stale-review','Existing A','another@example.invalid');staleReview.reviewDecisionToken='x'.repeat(43);check((await gateway.resolveOrCreateFractionalCrmOnboarding(principal,staleReview,'gateway-bogus-review')).reasonCodes.includes('REVIEW_STALE'),'caller cannot forge review decision')
  const duplicateDifferentSource=await gateway.resolveOrCreateFractionalCrmOnboarding(principal,request('another-new-source',"Unique O'Neil &amp; <x>",'unique-new@example.invalid'),'gateway-create-duplicate');check(duplicateDifferentSource.status==='review_required','different source ID cannot create duplicate same-company invitation')
+ const narrowCompany=pausedResult.company.record.globalId,narrowAccount=pausedResult.company.record.recordId
+ const narrowScope={company:narrowCompany,customerId:paused.origin.customerId}
+ const narrowFolderUrl='https://drive.google.com/drive/folders/exact_fixture_folder_id'
+ const otherNarrowFolderUrl='https://drive.google.com/drive/folders/other_fixture_folder_id'
+ const adoptedDescription='Keep operator notes\nBPO Supply Chain Drive: https://bposupplychain.com/s/customer\nFractional Customer Folder: '+narrowFolderUrl
+ const adopt=await stage({name:'Existing folder adoption fixture',accountType:'Customer',description:adoptedDescription})
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1',[credentialId,adopt.referenceCode])
+ const adoptSource=request('folder-adopt-source','Existing folder adoption fixture','fixture-adopt@example.invalid',adopt.referenceCode)
+ await gateway.resolveOrCreateFractionalCrmOnboarding(principal,adoptSource,'gateway-adopt-folder-mapping')
+ const stalePrincipal=principal
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=$2 WHERE id=$1',[credentialId,['crm.company.read','crm.customer-folder.write']])
+ principal=await gateway.readFractionalCrmCredential(credentialId)
+ const exactBefore=await folderHttp(undefined,narrowScope)
+ const exactCommand={...folderCommand,folderUrl:narrowFolderUrl,ifMatch:exactBefore.version,idempotencyKey:'gateway-scoped-initial',
+  assertedFractionalActor:{...actor,customerId:narrowScope.customerId}}
+ const narrowState=async()=> (await pool.query(`SELECT
+   (SELECT to_jsonb(a) FROM crm_organizations a WHERE id=$1) AS account,
+   (SELECT to_jsonb(b) FROM crm_fractional_customer_folders b WHERE account_id=$1) AS binding,
+   (SELECT to_jsonb(c) FROM crm_board_cards c WHERE board_id=$2 AND entity_id=$1) AS card,
+   (SELECT count(*) FROM fractional_crm_gateway_operations) AS receipts,
+   (SELECT count(*) FROM sync_outbox) AS outbox,
+   (SELECT count(*) FROM audit_events) AS audit,
+   (SELECT count(*) FROM crm_customer_folder_jobs) AS bpo_jobs`,[narrowAccount,board])).rows[0]
+ const noCardBefore=await narrowState()
+ assert.equal(noCardBefore.card,null)
+ check((await folderHttp(exactCommand,{...narrowScope,status:409})).error==='FOLDER_CARD_REVIEW_REQUIRED','missing exact card fails safely')
+ assert.deepEqual(await narrowState(),noCardBefore);checks++
+ await projection.reconcileCrmBoardProjectionsForPipeline({pipelineId:pipeline})
+ await pool.query("UPDATE crm_board_cards SET payload=jsonb_set(payload,'{comments}',$3::jsonb) WHERE board_id=$1 AND entity_id=$2",[board,narrowAccount,JSON.stringify([{id:'narrow-comment',text:'Retain this'}])])
+ await pool.query("UPDATE crm_organizations SET description='Unrelated description drift' WHERE id=$1",[narrowAccount])
+ const drift=await folderHttp(undefined,narrowScope),driftedState=await narrowState()
+ check((await folderHttp({...exactCommand,ifMatch:drift.version},{...narrowScope,status:409})).error==='FOLDER_CARD_REVIEW_REQUIRED','narrow grant cannot project unrelated description drift')
+ assert.deepEqual(await narrowState(),driftedState);checks++
+ await pool.query('UPDATE crm_organizations SET description=$2 WHERE id=$1',[narrowAccount,noCardBefore.account.description])
+ const pendingAccount=await narrowState()
+ check((await folderHttp(exactCommand,{...narrowScope,status:409})).error==='FOLDER_ACCOUNT_REVIEW_REQUIRED','the narrow command cannot replace an unfinished native Account projection')
+ assert.deepEqual(await narrowState(),pendingAccount);checks++
+ await pool.query("UPDATE crm_organizations SET sync_status='synced',suitecrm_synced_at=now() WHERE id=$1",[narrowAccount])
+ const cleanBefore=await narrowState(),legacyBefore=legacyReconciliations
+ const unrelated=async()=> (await pool.query(`SELECT
+   (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.board_id,c.entity_type,c.entity_id) FROM crm_board_cards c WHERE c.entity_id<>$1::uuid) AS cards,
+   (SELECT jsonb_agg(to_jsonb(l) ORDER BY l.slug) FROM short_links l) AS links,
+   (SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM sync_outbox s WHERE s.aggregate_id<>$1::text) AS outbox`,[narrowAccount])).rows[0]
+ const unrelatedBefore=await unrelated()
+ await denied(()=>gateway.updateFractionalCrmCompany(stalePrincipal,narrowCompany,{...exactCommand,fields:{companyName:'Not authorized'}}),'CAPABILITY_DENIED')
+ await denied(()=>gateway.updateFractionalCrmCustomerFolder(stalePrincipal,narrowCompany,{...exactCommand,folderUrl}),'INVALID_FOLDER_URL')
+ check((await gateway.readFractionalCrmCompany(principal,narrowCompany)).canPush===false,'folder grant does not enable generic company profile pushes')
+ await denied(()=>gateway.updateFractionalCrmCustomerFolder(stalePrincipal,narrowCompany,{...exactCommand,assertedFractionalActor:{...actor,customerId:'unknown'}}),'RECORD_NOT_FOUND')
+ await denied(()=>gateway.updateFractionalCrmCustomerFolder({...stalePrincipal,workspaceOrganizationId:randomUUID()},narrowCompany,exactCommand),'CAPABILITY_DENIED')
+ beforeCommit=async()=>{beforeCommit=null;throw Error('scoped folder projection rollback')}
+ await assert.rejects(()=>gateway.updateFractionalCrmCustomerFolder(stalePrincipal,narrowCompany,exactCommand),/scoped folder projection rollback/);checks++
+ assert.deepEqual(await narrowState(),cleanBefore);checks++
+ const scopedPublished=await folderHttp(exactCommand,narrowScope),publishedState=await narrowState()
+ check(scopedPublished.status==='published'&&scopedPublished.folderUrl===narrowFolderUrl&&publishedState.card.payload.crm.referenceCode===narrowCompany
+  &&publishedState.card.payload.desc===publishedState.account.description&&publishedState.card.payload.comments[0].id==='narrow-comment',
+  'narrow publish updates the exact account and pre-existing card while preserving its operator state')
+ const patchRow=(await pool.query("SELECT id,operation,payload FROM sync_outbox WHERE aggregate_id=$1 AND idempotency_key LIKE 'crm:organizations:description-v1:%'",[narrowAccount])).rows[0]
+ check(patchRow.operation==='patch_account_description','folder work uses a dedicated operation, never a generic upsert')
+ const nativePatch=patchRow.payload
+ assert.deepEqual(nativePatch,{entity:'organizations',pipelineId:pipeline,localId:narrowAccount,suiteCrmId:cleanBefore.account.suitecrm_id,
+  attributes:{global_id_c:narrowCompany,description:publishedState.account.description},
+  accountDescriptionPatch:{previousDescription:cleanBefore.account.description??''}});checks++
+ assert.equal(publishedState.account.source_key,cleanBefore.account.source_key);assert.equal(publishedState.account.identity_key,cleanBefore.account.identity_key);checks+=2
+ assert.deepEqual(await unrelated(),unrelatedBefore);checks++
+ check(legacyReconciliations===legacyBefore&&publishedState.bpo_jobs===cleanBefore.bpo_jobs,'narrow request does not reconcile a pipeline or queue a BPO folder')
+ assert.deepEqual(await folderHttp(exactCommand,narrowScope),scopedPublished);assert.deepEqual(await narrowState(),publishedState);checks+=2
+ for(const url of [null,otherNarrowFolderUrl]){
+  const response=await folderHttp({...exactCommand,folderUrl:url,ifMatch:scopedPublished.version,idempotencyKey:'gateway-scoped-change-'+String(Boolean(url))},{...narrowScope,status:409})
+  assert.equal(response.error,'FOLDER_MANUAL_REVIEW_REQUIRED');checks++
+ }
+ check((await folderHttp({...exactCommand,folderUrl:otherNarrowFolderUrl},{...narrowScope,status:409})).error==='IDEMPOTENCY_CONFLICT','different URL cannot reuse a scoped publication key')
+ await pool.query("UPDATE sync_outbox SET available_at='2000-01-01T00:00:00Z' WHERE id=$1",[patchRow.id])
+ // The old claim operation allowlist is also checked in shallow CI. The
+ // optional reviewed checkout test executes the actual predecessor code.
+ const legacyCandidate=(await pool.query(`SELECT id FROM sync_outbox WHERE target_system='suitecrm'
+   AND operation IN ('upsert_record', 'delete_record', 'reproject_record', 'upsert_user_identity')
+   AND status IN ('queued','failed') AND attempts<8 AND available_at<=now()
+   ORDER BY available_at,created_at LIMIT 1`)).rows[0]
+ check(legacyCandidate&&legacyCandidate.id!==patchRow.id,'legacy claim allowlist excludes the highest-priority folder job')
+ if(legacyCrmSource){
+  for(const expiredLease of [false,true]){
+   const rollbackLegacyClaim=async fn=>{const c=await pool.connect();try{
+    await c.query('BEGIN')
+    if(expiredLease)await c.query("UPDATE sync_outbox SET status='processing', attempts=1, locked_at='2000-01-01T00:00:00Z', lock_token='expired-folder-fixture' WHERE id=$1",[patchRow.id])
+    const claimed=await fn(c)
+    const seen=(await c.query('SELECT status,attempts,lock_token FROM sync_outbox WHERE id=$1',[patchRow.id])).rows[0]
+    assert.deepEqual(seen,{status:expiredLease?'failed':'queued',attempts:expiredLease?1:0,lock_token:null});checks++
+    return claimed
+   }finally{try{await c.query('ROLLBACK')}finally{c.release()}}}
+   const legacyCrm=load(crmPath,{...crmDeps,'@/lib/persistence/postgres':{query,withTransaction:rollbackLegacyClaim}}, {},legacyCrmSource)
+   const claimed=await legacyCrm.claimSuiteCrmOutboxInPostgres({limit:1})
+   check(claimed.length===1&&claimed[0].id!==patchRow.id,'actual pre-fix worker never claims the queued or reclaimed folder job')
+  }
+  console.log(`PASS exact legacy claim at ${reviewedLegacyCommit}; no dedicated folder work selected or delivered`)
+ }
+ const claimed=await crm.claimSuiteCrmOutboxInPostgres({limit:1});let patchItem=claimed[0]
+ check(claimed.length===1&&patchItem.id===patchRow.id&&patchItem.operation==='patch_account_description'&&patchItem.attempts===1,
+   'current worker claims the highest-priority dedicated job')
+ const genericSpoof={...patchItem,operation:'upsert_record'}
+ await assert.rejects(crm.withVerifiedSuiteCrmRecordLifecycle(genericSpoof,
+  async()=>assert.fail('spoofed generic patch must not dispatch')),/publication scope changed/);checks++
+ await assert.rejects(crm.completeSuiteCrmOutboxInPostgres(genericSpoof),/publication scope changed/);checks++
+ await assert.rejects(crm.withVerifiedSuiteCrmRecordLifecycle({...patchItem,idempotencyKey:'stale-revision'},
+  async()=>assert.fail('stale patch must not dispatch')),/identity changed/);checks++
+ check(await crm.failSuiteCrmOutboxInPostgres({item:patchItem,error:'fixture description retry'})==='failed'
+   &&(await narrowState()).account.sync_status==='pending','a failed exact attempt stays pending for compatible retry')
+ await pool.query("UPDATE sync_outbox SET available_at='2000-01-01T00:00:00Z' WHERE id=$1",[patchRow.id])
+ const retry=await crm.claimSuiteCrmOutboxInPostgres({limit:1});patchItem=retry[0]
+ check(retry.length===1&&patchItem.id===patchRow.id&&patchItem.attempts===2,'dedicated retry reacquires the same exact job')
+ check(await crm.withVerifiedSuiteCrmRecordLifecycle(patchItem,async()=>true),'current exact patch may dispatch through the existing lease/revision guard')
+ await crm.completeSuiteCrmOutboxInPostgres(patchItem)
+ check((await narrowState()).account.sync_status==='synced','ordinary completion updates only the exact current description revision')
+ check((await pool.query('SELECT status FROM sync_outbox WHERE id=$1',[patchItem.id])).rows[0].status==='succeeded','exact description job reaches a durable completed status')
+ assert.deepEqual(await unrelated(),unrelatedBefore);checks++
+ const adoptScope={company:adopt.referenceCode,customerId:adoptSource.origin.customerId}
+ const adoptRead=await folderHttp(undefined,adoptScope)
+ const readAdoptCard=async()=> (await pool.query('SELECT to_jsonb(c) AS card FROM crm_board_cards c WHERE board_id=$1 AND entity_id=$2',[board,adopt.id])).rows[0].card
+ const adoptCardBefore=await readAdoptCard()
+ const adopted=await folderHttp({...folderCommand,folderUrl:narrowFolderUrl,ifMatch:adoptRead.version,idempotencyKey:'gateway-scoped-adoption',assertedFractionalActor:{...actor,customerId:adoptScope.customerId}},adoptScope)
+ check(adoptRead.status==='manual_override'&&adopted.status==='published','existing matching manual reference is adopted')
+ assert.deepEqual(await readAdoptCard(),adoptCardBefore);checks++
+ await pool.query('UPDATE crm_organizations SET description=$2 WHERE id=$1',[narrowAccount,'Operator removed link'])
+ await projection.reconcileCrmBoardProjectionsForPipeline({pipelineId:pipeline})
+ check((await folderHttp(exactCommand,{...narrowScope,status:409})).error==='FOLDER_MANUAL_REVIEW_REQUIRED','scoped replay cannot restore an operator-removed link')
+ const queuedBeforeArchive=(await pool.query(`INSERT INTO sync_outbox(aggregate_type,aggregate_id,operation,target_system,payload,status,idempotency_key)
+   SELECT aggregate_type,aggregate_id,operation,target_system,payload,'queued','fixture-pending-folder-archive' FROM sync_outbox WHERE id=$1
+   RETURNING id`,[patchItem.id])).rows[0].id
+ await crm.archiveCrmRecordInPostgres({pipelineId:pipeline,entity:'organizations',id:narrowAccount,actorEmail:owner,emitSuiteCrmOutbox:false})
+ check((await pool.query('SELECT id,status FROM sync_outbox WHERE id=ANY($1::uuid[])',[[queuedBeforeArchive,patchItem.id]])).rows.length===1
+   &&(await pool.query('SELECT status FROM sync_outbox WHERE id=$1',[patchItem.id])).rows[0].status==='succeeded',
+   'archive removes unclaimed dedicated writes without erasing completed delivery evidence')
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=$2 WHERE id=$1',[credentialId,['crm.company.read']])
+ await denied(()=>gateway.updateFractionalCrmCustomerFolder(stalePrincipal,narrowCompany,exactCommand),'CAPABILITY_DENIED')
+ await pool.query('UPDATE fractional_crm_gateway_credentials SET capabilities=$2 WHERE id=$1',[credentialId,capabilities])
+ principal=await gateway.readFractionalCrmCredential(credentialId)
  await pool.query("UPDATE crm_contacts SET source_payload=jsonb_set(source_payload,'{archived}','true') WHERE id=$1",[cb.id]);await denied(()=>gateway.readFractionalCrmContact(principal,b.referenceCode,cb.referenceCode),'RECORD_RETIRED')
  await assert.rejects(()=>pool.query('UPDATE fractional_crm_gateway_credentials SET token_hash=$2 WHERE id=$1',[credentialId,'b'.repeat(64)]),error=>error.code==='P0001'&&error.message.includes('credential identity is immutable'));checks++
+ // The opt-in fixture prepares existing cards across this synthetic pipeline.
+ // Run it only after assertions that intentionally exercise a missing card.
+ if(joinedSources){const joined=await runFractionalCustomerFolderJoined({Pool,connectionOptions:{host:'127.0.0.1',port:Number(port),user:'postgres',password:'fractional_gateway_fixture',ssl:false,connectionTimeoutMillis:1000},capture:joinedSources,
+  load,query,gateway,projection,stage,onboardingRequest:request,fixture:{org,pipeline,rootGlobalId:ga,instance,deployment,onboardingCredentialId:credentialId,board,auth,isGatewayPath:isFractionalCrmGatewayPath,folderContract,fractionalOrganizationId:'fractional-fixture'}})
+  assert.equal(joined.passed,true);check(joined.folderOnlyMachineCredential===true,'actual joined sender uses an independently scoped credential');console.log(`FRACTIONAL_FOLDER_JOINED_EVIDENCE=${JSON.stringify(joined)}`)}
  await pool.query('UPDATE fractional_crm_gateway_credentials SET revoked_at=now() WHERE id=$1',[credentialId]);await denied(()=>gateway.readFractionalCrmOrganization(principal),'UNAUTHORIZED');await denied(()=>gateway.resolveOrCreateFractionalCrmOnboarding(principal,fresh,'gateway-create-pair'),'UNAUTHORIZED')
  check((await pool.query('SELECT count(*)::int AS n FROM app_users')).rows[0].n===1,'gateway creates no login or invitation user')
  console.log(`PASS ${checks} gateway PostgreSQL assertions; all migrations; real CRM staging/outbox; no external calls`)

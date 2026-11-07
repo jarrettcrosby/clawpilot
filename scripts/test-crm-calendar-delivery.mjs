@@ -104,7 +104,7 @@ const communicationSnapshot = {
   organizationId: ORGANIZATION_ID,
   credentialOwnerEmail: CREDENTIAL_OWNER_EMAIL,
   connectionId: CONNECTION_ID,
-  accountEmail: CREDENTIAL_OWNER_EMAIL,
+  accountEmail: ORGANIZER_EMAIL,
   identityEmail: ORGANIZER_EMAIL,
   calendarId: 'primary',
   source: 'organization',
@@ -146,7 +146,7 @@ function actionRow(overrides = {}) {
     workspace_organization_id: ORGANIZATION_ID,
     communication_credential_owner_email: CREDENTIAL_OWNER_EMAIL,
     communication_connection_id: CONNECTION_ID,
-    communication_account_email: CREDENTIAL_OWNER_EMAIL,
+    communication_account_email: ORGANIZER_EMAIL,
     communication_identity_email: ORGANIZER_EMAIL,
     communication_calendar_id: 'primary',
     communication_binding_source: 'organization',
@@ -765,6 +765,7 @@ let retryMeetingUpdate = null
 let joinUrlClearCount = 0
 let communicationScopeFailure = null
 let activeCommunicationSnapshot = communicationSnapshot
+let destinationCalendarList = null
 
 const processQuery = async (sql, parameters = []) => {
   if (sql.includes('SELECT organization_id::text, contact_id::text, lead_id::text')) {
@@ -897,6 +898,9 @@ const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.
       const body = typeof init.body === 'string' ? JSON.parse(init.body) : null
       providerRequests.push({ pathname, init, context, body })
       if (pathname.includes('/calendarList?')) {
+        if (context.boundConnectionId === CONNECTION_ID && destinationCalendarList) {
+          return Response.json(destinationCalendarList)
+        }
         const items = context.boundConnectionId === PERSONAL_CONNECTION_ID
           ? [{
               id: ACTOR_EMAIL,
@@ -1071,8 +1075,11 @@ assert.equal(stageCalls.at(-1).sourcePayload.calendarOrganizerEmail, ORGANIZER_E
 assert.equal(currentRow.response_summary.calendarId, ORGANIZER_EMAIL)
 assert.equal(currentRow.response_summary.calendarSummary, 'BPO Supply Chain')
 assert.equal(currentRow.response_summary.calendarAccessRole, 'owner')
-assert.equal(currentRow.response_summary.accountEmail, CREDENTIAL_OWNER_EMAIL)
+assert.equal(currentRow.response_summary.accountEmail, ORGANIZER_EMAIL,
+  'the live primary must match the queued account, not the stale Maton account label')
 assert.equal(currentRow.response_summary.organizerEmail, ORGANIZER_EMAIL)
+assert.match(legacyMeetWrite.pathname, /calendars\/jarrett%40bposupplychain\.com\/events/,
+  'the historical primary alias must be dispatched to the verified literal calendar ID')
 
 const inPersonWrite = await processMode('in_person', { location: '100 Logistics Way' })
 assert.doesNotMatch(inPersonWrite.pathname, /conferenceDataVersion/)
@@ -1101,6 +1108,55 @@ assert.ok(
 )
 assert.equal(currentRow.response_summary.calendarSummary, 'BPO Warehouse')
 assert.equal(currentRow.response_summary.calendarAccessRole, 'writer')
+
+const verifiedPrimary = { id: ORGANIZER_EMAIL, primary: true, accessRole: 'owner' }
+const sharedCalendar = { id: SECONDARY_CALENDAR_EMAIL, accessRole: 'writer' }
+for (const [name, listing, expectedError, organizer = SECONDARY_CALENDAR_EMAIL] of [
+  ['different live primary can write the same shared calendar', {
+    items: [{ ...verifiedPrimary, id: 'another-owner@example.com' }, sharedCalendar],
+  }, /Calendar account no longer matches/],
+  ['missing live primary', { items: [sharedCalendar] }, /no writable primary/],
+  ['malformed live primary', {
+    items: [{ ...verifiedPrimary, id: 'not-an-account-email' }, sharedCalendar],
+  }, /Live primary Calendar account is invalid/],
+  ['same primary row returned twice', {
+    items: [verifiedPrimary, { ...verifiedPrimary }, sharedCalendar],
+  }, /multiple writable primary/],
+  ['different live primary also marked primary', {
+    items: [verifiedPrimary, { ...verifiedPrimary, id: 'another-owner@example.com' }, sharedCalendar],
+  }, /multiple writable primary/],
+  ['selected shared calendar lost write permission', {
+    items: [verifiedPrimary, { ...sharedCalendar, accessRole: 'reader' }],
+  }, /no longer accessible with write permission/],
+  ['selected literal ID no longer matches the reviewed organizer', {
+    items: [verifiedPrimary, sharedCalendar],
+  }, /Calendar organizer no longer matches/, 'another-organizer@example.com'],
+  ['calendar list cannot be verified within the page bound', {
+    items: [sharedCalendar], nextPageToken: 'still-incomplete',
+  }, /exceeded the bounded identity verification limit/],
+]) {
+  destinationCalendarList = listing
+  activeCommunicationSnapshot = {
+    ...communicationSnapshot,
+    identityEmail: organizer,
+    calendarId: SECONDARY_CALENDAR_EMAIL,
+  }
+  providerRequests = []
+  stageCalls = []
+  const result = await processRuntime.processCrmIntegrationAction(leasedCalendarAction({}, {
+    communication_identity_email: organizer,
+    communication_calendar_id: SECONDARY_CALENDAR_EMAIL,
+  }))
+  assert.equal(result.status, 'dead', name)
+  assert.match(result.lastError, expectedError, name)
+  assert.ok(providerRequests.length > 0, `${name}: reverify against the provider`)
+  assert.ok(providerRequests.every(({ pathname, init, context }) => (
+    pathname.includes('/calendarList?') && (init.method || 'GET') === 'GET'
+    && context.boundConnectionId === CONNECTION_ID
+  )), `${name}: no event read, mutation, or fallback connection`)
+}
+activeCommunicationSnapshot = communicationSnapshot
+destinationCalendarList = null
 
 const personalCalendarWrite = await processMode(
   'google_meet',
@@ -1224,7 +1280,7 @@ updateRequests = await processExistingMeeting(
 const destinationCreateIndex = updateRequests.findIndex((request) => request.init.method === 'POST')
 const oldDeleteIndex = updateRequests.findIndex((request) => request.init.method === 'DELETE')
 assert.ok(destinationCreateIndex >= 0 && oldDeleteIndex > destinationCreateIndex, 'a Calendar move must create the destination before deleting the source')
-assert.match(updateRequests[destinationCreateIndex].pathname, /calendars\/primary\/events/)
+assert.match(updateRequests[destinationCreateIndex].pathname, /calendars\/jarrett%40bposupplychain\.com\/events/)
 assert.equal(updateRequests[destinationCreateIndex].context.boundConnectionId, CONNECTION_ID)
 assert.match(updateRequests[oldDeleteIndex].pathname, /legacy-calendar%40example\.com\/events\/existing-event-id/)
 assert.equal(updateRequests[oldDeleteIndex].context.ownerEmail, ACTOR_EMAIL)
