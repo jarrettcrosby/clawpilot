@@ -20,18 +20,20 @@ function declarations(path, names) {
     return node.getText(ast)
   }).join('\n')
 }
-function load(path) {
+function load(path, dependencies = {}) {
   const module = { exports: {} }
   const code = ts.transpileModule(read(path), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText
   new Function('module', 'exports', 'require', code)(module, module.exports, name => {
+    if (Object.hasOwn(dependencies, name)) return dependencies[name]
     assert.equal(name, 'node:crypto', 'No external provider/runtime dependency is available')
     return crypto
   })
   return module.exports
 }
 const identity = load('app_src/lib/crm/emailIdentity.ts')
+const caseyPolicy = load('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': identity })
 const stable = load('app_src/lib/crm/stableId.ts')
 const headers = load('app_src/lib/crm/emailAddressHeaders.ts')
 const participants = load('app_src/lib/crm/participantEligibility.ts')
@@ -121,7 +123,7 @@ function harness({ enabled = true, appOnly = true } = {}) {
     }
     throw new Error(`Unexpected synthetic SQL: ${sql}`)
   } }
-  const runtime = { exports: {}, Buffer, ...identity, ...stable, ...headers, ...participants, ...projection,
+  const runtime = { exports: {}, Buffer, ...identity, ...caseyPolicy, ...stable, ...headers, ...participants, ...projection,
     requireNativeEmail: (condition, code) => { if (!condition) throw new Error(code) },
     crmSourceHash: value => {
       if (value?.audience) state.audiences.push(copy(value.audience))
