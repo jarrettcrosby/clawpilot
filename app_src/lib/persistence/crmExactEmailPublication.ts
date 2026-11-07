@@ -162,6 +162,22 @@ export async function inspectExactLegacyEmailRecoveryWithClient(tx: PoolClient, 
 
 async function snapshot(tx: PoolClient, input: ExactEmailPublicationSelection) {
   const {control:c,mailbox,audience,identities} = await lockedCanonicalSelection(tx,input)
+  // Reviewed staging and claim are separate transactions. Check that no
+  // guarded writer inserted another same-owner placement after staging. Do
+  // not treat another pipeline, an unbound legacy row, or a malformed alias
+  // as authority to publish another native Email for this message.
+  const conflicts = await tx.query(`SELECT
+    EXISTS (SELECT 1 FROM crm_email_sources source
+      WHERE (source.owner_email=$1 OR source.mailbox_id=$2::uuid)
+        AND lower(btrim(source.provider_message_id))=ANY($3::text[])
+        AND source.id<>ALL($4::uuid[])) AS source_conflict,
+    EXISTS (SELECT 1 FROM crm_interactions interaction JOIN pipeline_spaces pipeline ON pipeline.id=interaction.pipeline_id
+      WHERE pipeline.owner_email=$1 AND interaction.id<>ALL($5::uuid[])
+        AND (lower(btrim(interaction.provider_message_id))=ANY($3::text[])
+          OR interaction.canonical_source_id=ANY($4::uuid[]))) AS interaction_conflict`,
+  [input.ownerEmail,mailbox.id,input.messageIds,identities.map(row => row.source.id),identities.map(row => row.interaction.id)])
+  check(conflicts.rows.length === 1 && conflicts.rows[0].source_conflict === false
+    && conflicts.rows[0].interaction_conflict === false)
   const outboxes = await tx.query(`SELECT outbox.*,outbox.available_at<=now() AS ready,
     EXISTS(SELECT 1 FROM crm_native_email_publication_work work
       JOIN crm_native_email_publication_admissions admission ON admission.operation_id=work.operation_id
