@@ -8,6 +8,14 @@ export const ROLLBACK_ARTIFACT_FORMAT = 'clawpilot-crm-compatible-rollback-sourc
 export const ROLLBACK_ACCEPTANCE_FORMAT = 'clawpilot-crm-rolling-rollback-acceptance-v1'
 export const ROLLBACK_BUILD_FORMAT = 'clawpilot-crm-rollback-local-build-v1'
 export const LEGACY_WRITER_COMMIT = 'b61192200b6d990adb320fd7f941a619976bc4af'
+// A new floor must protect the current authority inventory. Verification of
+// already-pinned artifacts below remains independent of this build-time floor.
+const CURRENT_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v20'
+export const RETAINED_V20_LAST_MIGRATION = 'db/migrations/0412_crm_calendar_occurrence_claims.sql'
+export const REQUIRED_RETAINED_V20_CHECKS = Object.freeze([
+  'full_migration_checksum_ledger', 'reloaded_email_preserves_single_identity_and_links',
+  'reloaded_calendar_preserves_single_occurrence', 'retained_native_authority_and_recovery_controls_unchanged',
+])
 export const REQUIRED_ROLLING_CHECKS = Object.freeze([
   'legacy_scalar_insert_after_migration', 'legacy_scalar_primary_bridge',
   'legacy_shared_interaction_denied', 'legacy_shared_contacts_denied', 'legacy_shared_companies_denied',
@@ -43,6 +51,16 @@ const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
   'db/migrations/0400_crm_native_email_demo_quarantine.sql',
   'db/migrations/0401_crm_native_root_owner_source_fence.sql',
   'db/migrations/0402_crm_native_unmanaged_app_only_pipelines.sql',
+  'db/migrations/0403_fractional_crm_customer_folder_capability.sql',
+  'db/migrations/0404_crm_legacy_email_recovery_holds.sql',
+  'db/migrations/0405_crm_legacy_email_recovery_settlement.sql',
+  'db/migrations/0406_crm_legacy_email_recovery_archive.sql',
+  'db/migrations/0407_crm_legacy_email_recovery_stage.sql',
+  'db/migrations/0408_crm_legacy_email_recovery_relationship_fence.sql',
+  'db/migrations/0409_crm_email_control_side_effect_scope.sql',
+  'db/migrations/0410_crm_legacy_email_exact_account_repair.sql',
+  'db/migrations/0411_crm_legacy_email_archive_disposition.sql',
+  RETAINED_V20_LAST_MIGRATION,
 ])
 export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   ...ROLLBACK_CRM_AUTHORITY_MIGRATIONS,
@@ -58,6 +76,15 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   'app_src/lib/crm/nativeEmailInitialEnrollmentPostgres.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentCoordinator.ts',
   'app_src/lib/crm/nativeEmailInitialEnrollmentOperator.ts', 'app_src/lib/crm/nativeEmailInitialEnrollmentCliTransport.ts',
   'app_src/lib/crm/nativeEmailInitialStartupOrigin.ts', 'app_src/ops/native-email-initial.ts',
+  'app_src/ops/native-email-recovery.ts', 'app_src/lib/persistence/crmLegacyEmailRecoveryStage.ts',
+  'app_src/lib/crm/legacyEmailRecoveryReleaseApproval.ts', 'app_src/lib/crm/nativeEmailRecoveryPrivateStage.ts',
+  'app_src/lib/crm/nativeEmailRecoveryMaintenanceOperator.ts', 'app_src/lib/crm/nativeEmailRecoveryPrivatePostgres.ts',
+  'app_src/lib/crm/nativeEmailRecoveryDispatchPermit.ts', 'app_src/lib/crm/nativeEmailRecoveryReadyProof.ts',
+  'app_src/lib/crm/nativeEmailRecoveryStoreBinding.ts', 'app_src/lib/crm/nativeEmailRecoveryPostgresFence.ts',
+  'app_src/lib/crm/nativeEmailRecoveryMariaFence.ts', 'app_src/lib/crm/nativeEmailRecoveryCustodyProof.ts',
+  'app_src/lib/crm/nativeEmailRecoveryCustodian.ts', 'app_src/lib/crm/nativeEmailRecoveryCustodySocket.ts',
+  'app_src/lib/crm/nativeEmailRecoveryDuplexRunner.ts', 'app_src/lib/crm/nativeEmailRecoveryCliTransport.ts',
+  'app_src/lib/crm/calendarOccurrenceClaims.ts', 'app_src/lib/crm/fractionalCustomerFolder.ts',
   'app_src/components/settings/RootCrmAccessPanel.tsx', 'app_src/components/settings/UserAccessDialog.tsx',
   'app_src/components/crm/CrmSection.tsx', 'app_src/components/settings/GoogleAuthSettingsPanel.tsx',
   'app_src/lib/browserSameOrigin.ts', 'app_src/lib/requestUser.ts', 'app_src/lib/tenancy.ts',
@@ -92,12 +119,17 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   'services/suitecrm/email-audience/NativeEmailInitialPolicyDelta.php',
   'services/suitecrm/email-audience/NativeEmailInitialInstallationLineage.php',
   'services/suitecrm/email-audience/NativeEmailStartupOrigin.php',
+  'services/suitecrm/native-email-recovery-cli.php',
+  'services/suitecrm/email-audience/NativeEmailRecoveryDispatchPermit.php',
+  'services/suitecrm/email-audience/NativeEmailRecoveryReadyProof.php',
   'services/suitecrm/email-audience/publication-routes.php', 'services/suitecrm/email-audience/authority-routes.php',
   'services/suitecrm/email-audience/publication-schema.sql', 'services/suitecrm/email-audience/authority-transition-schema.sql',
   'services/suitecrm/email-audience/initial-enrollment-schema.sql',
   'scripts/build-crm-compatible-rollback.mjs', 'scripts/certify-crm-rollback-build.mjs',
   'scripts/build-native-email-initial-operator.mjs', 'scripts/test-native-email-initial-private-operator.mjs',
+  'scripts/build-native-email-recovery-operator.mjs', 'scripts/test-native-email-recovery-private-operator.mjs',
   'scripts/lib/crm-compatible-rollback-artifact.mjs', 'scripts/test-crm-rolling-rollback-postgres.mjs',
+  'scripts/lib/crm-rollback-retained-v20-fixture.mjs', 'scripts/lib/postgres-test-migrations.mjs',
   'scripts/test-crm-compatible-rollback-artifact.mjs', 'scripts/test-crm-email-routing-postgres.mjs',
   'scripts/test-crm-reviewed-gmail-persistence.mjs', 'scripts/test-production-rebind-history-schema-attestation.mjs',
   'docs/operations/crm-compatible-rollback.md', 'docs/operations/suitecrm.md',
@@ -106,6 +138,16 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
 
 export const sha256 = value => createHash('sha256').update(value).digest('hex')
 export const canonicalJson = value => JSON.stringify(value, null, 2) + '\n'
+export function retainedV20MigrationInventory(sourceTree) {
+  const entries = sourceTree.filter(({ path }) => /^db\/migrations\/\d+_.+\.sql$/u.test(path))
+    .map(({ path, gitBlob }) => ({ path, gitBlob })).sort((a, b) => a.path < b.path ? -1 : Number(a.path > b.path))
+  assert.equal(entries.at(-1)?.path, RETAINED_V20_LAST_MIGRATION,
+    'Current floor cannot certify an unexpected final migration')
+  assert.ok(entries.every(({ gitBlob }) => /^[a-f0-9]{40}$/u.test(gitBlob)), 'Migration source must bind each committed Git blob')
+  assert.equal(new Set(entries.map(entry => entry.path)).size, entries.length, 'Duplicate migration source path')
+  return { paths: entries.map(entry => entry.path), migrationCount: entries.length,
+    lastMigration: RETAINED_V20_LAST_MIGRATION, sourceInventorySha256: sha256(canonicalJson(entries)) }
+}
 const git = (repository, args, options = {}) => execFileSync('git', ['-C', repository, ...args], {
   encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], ...options,
 })
@@ -147,7 +189,7 @@ export function inspectRollbackSources(readSource) {
   assert.ok(files['app_src/lib/crm/suiteCrmClient.ts'].includes('record.relationships'), 'Rollback floor lacks native relationship publication')
   assert.ok(attester.includes('if (inspection.schemaDigest !== expectedDigest)'), 'Rollback floor must retain strict raw catalog acceptance')
   const format = attester.match(/PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT\s*=\s*'([^']+)'/u)?.[1]
-  assert.equal(format, 'clawpilot-production-rebind-target-schema-attestation-v18')
+  assert.equal(format, CURRENT_ROLLBACK_ATTESTATION, 'New rollback floors require the exact current catalog attestation')
   const enrolledMigration = attester.match(/filename:\s*'0374_crm_interaction_organizations\.sql',\s*checksum:\s*'([a-f0-9]{64})'/u)?.[1]
   assert.equal(enrolledMigration, sha256(migration), 'Rollback floor must attest its exact migration bytes')
   for(const path of ROLLBACK_CRM_AUTHORITY_MIGRATIONS){
@@ -199,6 +241,16 @@ export function validateRollbackReceipts(identity, acceptance, build) {
   assert.equal(acceptance.legacyWriterCommit, LEGACY_WRITER_COMMIT)
   assert.ok([16, 18].includes(acceptance.postgresMajor))
   assert.deepEqual([...acceptance.checks].sort(), [...REQUIRED_ROLLING_CHECKS].sort())
+  const containsRetainedV20 = identity.sourceTree?.some(({ path }) => path === RETAINED_V20_LAST_MIGRATION)
+  if (containsRetainedV20 || identity.attestation?.format === CURRENT_ROLLBACK_ATTESTATION) {
+    assert.equal(identity.attestation?.format, CURRENT_ROLLBACK_ATTESTATION,
+      'The retained v20 migration cannot be verified under a different attestation')
+    const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV20MigrationInventory(identity.sourceTree)
+    const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
+    assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Current floor lacks the catalog digest for the measured PostgreSQL major')
+    assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
+      schemaDigest, checks: [...REQUIRED_RETAINED_V20_CHECKS] }, 'New rollback floors require the exact retained v20 schema transition receipt')
+  }
   assert.deepEqual(build.command, ['npm', 'run', 'build'])
   assert.match(build.nodeVersion, /^v24\./u, 'Rollback certification requires the supported Node 24 build')
   assert.equal(build.environmentMode, 'isolated-committed-source-no-provider-credentials')
