@@ -86,6 +86,16 @@ function fixture(rows = [meeting()], options = {}) {
     legacyEvents: options.legacyEvents || [],
   }
   const selected = { owner_email: OWNER, connection_id: options.selectedConnection || 'legacy-primary-connection' }
+  const hasCurrentDiscoveryMapping = (sql, row) => {
+    if (!options.discoveryMappings) return false
+    assert.match(sql, /NOT EXISTS\s*\(SELECT 1 FROM crm_calendar_discovery_events discovery/u)
+    assert.match(sql, /discovery\.pipeline_id\s*=\s*meeting\.pipeline_id/u)
+    assert.match(sql, /discovery\.meeting_id\s*=\s*meeting\.id/u)
+    assert.match(sql, /discovery\.calendar_id\s*=\s*meeting\.source_payload\s*->>\s*'calendarId'/u)
+    assert.match(sql, /discovery\.external_event_id\s*=\s*meeting\.external_event_id/u)
+    return options.discoveryMappings.some((mapping) => mapping.pipelineId === row.pipeline_id && mapping.meetingId === row.id
+      && mapping.calendarId === row.source_payload?.calendarId && mapping.eventId === row.external_event_id)
+  }
   async function db(sql, params = [], client = false) {
     state.queries.push({ sql, params, client })
     if (sql.includes('SELECT 1 FROM crm_integration_actions action')) {
@@ -123,7 +133,8 @@ function fixture(rows = [meeting()], options = {}) {
       assert.ok(sql.includes("connection.status = 'ACTIVE'") && sql.includes("app_user.status = 'active'"))
       assert.ok(sql.includes("NOT IN ('true', '1', 'yes')"))
       const eligible = state.rows.filter((row) => active(row) && row.source_payload?.calendarOwnerEmail === OWNER
-        && row.source_payload?.calendarConnectionId && row.source_payload?.calendarId && row.external_event_id)
+        && row.source_payload?.calendarConnectionId && row.source_payload?.calendarId && row.external_event_id
+        && !hasCurrentDiscoveryMapping(sql, row))
       return { rows: state.activeConnection ? [...new Set(eligible.map((row) => row.source_payload.calendarConnectionId))]
         .map((connection_id) => ({ owner_email: OWNER, connection_id })) : [] }
     }
@@ -145,7 +156,8 @@ function fixture(rows = [meeting()], options = {}) {
       assert.ok(sql.includes("NOT IN ('true', '1', 'yes')"))
       return { rows: copy(state.rows.filter((row) => active(row) && row.source_payload?.calendarOwnerEmail === params[0]
         && row.source_payload?.calendarConnectionId === params[1] && row.source_payload?.calendarId
-        && row.external_event_id && (!params[2] || row.id > params[2])).sort((a, b) => a.id.localeCompare(b.id)).slice(0, params[3])) }
+        && row.external_event_id && !hasCurrentDiscoveryMapping(sql, row)
+        && (!params[2] || row.id > params[2])).sort((a, b) => a.id.localeCompare(b.id)).slice(0, params[3])) }
     }
     if (sql.includes('meeting.external_event_id = $2')) {
       assert.ok(sql.includes('?| ARRAY'), 'primary matching excludes explicit selections')
@@ -339,6 +351,32 @@ for (const status of ['queued', 'processing', 'failed', 'dead']) {
   assert.equal(state.authority.length, 0)
   assert.equal(state.gets.length, 0)
   assert.equal(state.staged.length, 0)
+}
+{
+  const movedCalendar = meeting(1)
+  movedCalendar.source_payload.calendarId = 'new-calendar@example.com'
+  movedCalendar.source_payload.calendarOrganizerEmail = 'new-calendar@example.com'
+  movedCalendar.source_payload.calendarConnectionId = 'new-connection'
+  const movedEvent = meeting(2, { external_event_id: 'replacement-event-2' })
+  const currentMapped = meeting(3)
+  const discoveryMappings = [
+    { pipelineId: PIPELINE, meetingId: movedCalendar.id, calendarId: CALENDAR, eventId: movedCalendar.external_event_id },
+    { pipelineId: PIPELINE, meetingId: movedEvent.id, calendarId: CALENDAR, eventId: 'event-2' },
+    { pipelineId: PIPELINE, meetingId: currentMapped.id, calendarId: CALENDAR, eventId: currentMapped.external_event_id },
+  ]
+  const { state, run } = fixture([movedCalendar, movedEvent, currentMapped], { discoveryMappings })
+  const result = await run()
+  assert.equal(result.errors, 0)
+  assert.equal(result.recordedMeetingsPolled, 2, 'old discovery mappings do not own moved event reads')
+  const path = (row) => `/google-calendar/calendar/v3/calendars/${encodeURIComponent(row.source_payload.calendarId)}/events/${encodeURIComponent(row.external_event_id)}`
+  assert.deepEqual(state.gets.map(({ path }) => path).sort(), [path(movedCalendar), path(movedEvent)].sort())
+  assert.deepEqual(state.staged.map((item) => item.localId).sort(), [movedCalendar.id, movedEvent.id].sort(),
+    'reverse edits stage each original meeting only from its current recorded tuple')
+
+  const mappedOnly = fixture([currentMapped], { discoveryMappings })
+  await mappedOnly.run()
+  assert.equal(mappedOnly.state.gets.length, 0, 'current discovery tuple remains excluded from recorded-provider polling')
+  assert.equal(mappedOnly.state.staged.length, 0)
 }
 for (const timing of ['get', 'lock']) {
   const row = meeting(1, { subject: 'Newer local intent' })

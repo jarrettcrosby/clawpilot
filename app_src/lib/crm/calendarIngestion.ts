@@ -20,6 +20,13 @@ const MAX_PAGES_PER_CALENDAR = 10
 const MAX_RECORDED_MEETINGS_PER_CALENDAR = 50
 // Same active-row semantics as persistence/crm.ts activeCrmRecordSql.
 const ACTIVE_MEETING_SQL = "COALESCE(lower(meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')"
+// A current discovery mapping owns that exact provider observation, even if
+// its source is paused. A retained mapping from before a move still prevents
+// reimport, but must not suppress polling the new authorized Calendar tuple.
+const NO_CURRENT_DISCOVERY_TUPLE_SQL = `NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
+  WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id
+    AND discovery.calendar_id = meeting.source_payload->>'calendarId'
+    AND discovery.external_event_id = meeting.external_event_id)`
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000
 const POLL_OVERLAP_MS = 5 * 60 * 1000
@@ -532,8 +539,7 @@ async function recordedCalendars(): Promise<SelectedCalendar[]> {
        AND app_user.status = 'active'
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
-       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
-         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
+       AND ${NO_CURRENT_DISCOVERY_TUPLE_SQL}
      ORDER BY connection.owner_email, connection.connection_id`,
     [CALENDAR_APP],
   )
@@ -558,8 +564,7 @@ async function recordedMeetingPage(calendar: SelectedCalendar, afterMeetingId: s
        AND meeting.source_payload->>'calendarConnectionId' = $2
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
-       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
-         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
+       AND ${NO_CURRENT_DISCOVERY_TUPLE_SQL}
        AND ($3::uuid IS NULL OR meeting.id > $3::uuid)
      ORDER BY meeting.id ASC
      LIMIT $4`,
