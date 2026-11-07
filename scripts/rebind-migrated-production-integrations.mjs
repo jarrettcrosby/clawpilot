@@ -33,6 +33,7 @@ import {
 import {
   PRODUCTION_REBIND_CRITICAL_RELATIONS,
   PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
+  PRODUCTION_REBIND_RECOVERY_RELATIONS,
   PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
   attestProductionRebindTargetSchema,
 } from './production-rebind-history-schema-attestation.mjs'
@@ -2033,13 +2034,19 @@ async function lockProductionSchemaMigrations(client) {
   )
 }
 
+export function isProductionRebindSchemaLockRelation(relation) {
+  return typeof relation === 'string'
+    && PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation)
+    && (/^public\.[a-z][a-z0-9_]*$/u.test(relation)
+      || (/^crm_legacy_email_retirement\.[a-z][a-z0-9_]*$/u.test(relation)
+        && PRODUCTION_REBIND_RECOVERY_RELATIONS.includes(relation)))
+}
+
 async function lockProductionRebindSchemaRelations(client) {
   if (
     !Array.isArray(PRODUCTION_REBIND_CRITICAL_RELATIONS)
     || PRODUCTION_REBIND_CRITICAL_RELATIONS.length === 0
-    || PRODUCTION_REBIND_CRITICAL_RELATIONS.some(
-      (relation) => !/^public\.[a-z][a-z0-9_]*$/u.test(relation),
-    )
+    || PRODUCTION_REBIND_CRITICAL_RELATIONS.some(relation => !isProductionRebindSchemaLockRelation(relation))
   ) fail('Production rebind critical relation allowlist is invalid')
   await client.query(
     `LOCK TABLE ${SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_RELATION} IN SHARE ROW EXCLUSIVE MODE`,

@@ -44,6 +44,7 @@ import {
   databaseEndpointFingerprint,
   digest,
   exportCommittedReceipt,
+  isProductionRebindSchemaLockRelation,
   main,
   managedRebindMaterialDigest,
   managedSourceAuthorityApprovalToken,
@@ -472,8 +473,9 @@ async function completeTargetSchemaLockFixture(target) {
     [PRODUCTION_REBIND_CRITICAL_RELATIONS],
   )
   const before = await inspect()
+  await target.query('CREATE SCHEMA IF NOT EXISTS crm_legacy_email_retirement')
   for (const { relation_name: relation, present } of before.rows) {
-    assert.match(relation, /^public\.[a-z][a-z0-9_]*$/u)
+    assert.ok(isProductionRebindSchemaLockRelation(relation), `Unreviewed fixture relation ${relation}`)
     if (!present) {
       await target.query(`CREATE TABLE ${relation} (id uuid PRIMARY KEY DEFAULT gen_random_uuid())`)
     }
