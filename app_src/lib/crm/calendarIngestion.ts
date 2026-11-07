@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import type { PoolClient } from 'pg'
+import { calendarOccurrenceKey } from '@/lib/crm/calendarDiscovery'
+import { claimVerifiedCalendarOccurrence, lockCalendarOccurrencePipeline } from '@/lib/crm/calendarOccurrenceClaims'
 import { resolveRecordedCrmMeetingCalendarCommunication } from '@/lib/crm/integrationActions'
 import type { CrmMeeting } from '@/lib/crm/types'
 import { globalIdFragment, globalIdPattern } from '@/lib/globalIds.mjs'
@@ -450,7 +452,12 @@ function sameRecordedIdentity(previous: MeetingRow, current: MeetingRow): boolea
 }
 
 function assertEventIdentity(event: JsonObject, meeting: MeetingRow): void {
-  const marker = asRecord(asRecord(event.extendedProperties)?.private)?.clawpilotMeetingReference
+  const metadata = asRecord(asRecord(event.extendedProperties)?.private)
+  const marker = metadata?.clawpilotMeetingReference
+  if (metadata && Object.hasOwn(metadata, 'clawpilotPipelineId')
+    && (metadata.clawpilotPipelineId !== meeting.pipeline_id || !marker)) {
+    throw new SafeCalendarIngestionError('Google Calendar event pipeline reference does not match')
+  }
   if (marker !== undefined && marker !== null && marker !== '') {
     if (calendarMeetingReference(event) !== meeting.reference_code.toLowerCase()) {
       throw new SafeCalendarIngestionError('Google Calendar event meeting reference does not match')
@@ -822,7 +829,9 @@ async function reconcileEvent(input: {
 async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): Promise<ReconciliationResult> {
   assertEventIdentity(event, meeting)
   const status = calendarEventStatus(event)
+  const occurrenceKey = calendarOccurrenceKey(event)
   return withTransaction(async (client) => {
+    if (occurrenceKey) await lockCalendarOccurrencePipeline(client, meeting.pipeline_id)
     const current = await lockedMeeting(client, meeting)
     if (!current || !sameRecordedIdentity(meeting, current)) return { matched: false, staged: false }
     // Re-read authority after the row lock: an in-flight provider response must
@@ -831,6 +840,19 @@ async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): P
       return { matched: true, staged: false, deferred: true }
     }
     const authority = await recordedAuthority(current)
+    if (occurrenceKey) {
+      const tuple = authority.previousCalendar
+      // The already authorized exact-event GET can enroll a pre-ledger
+      // meeting, even outside the discovery window. No new scan, event write,
+      // content revision, or change to its edit authority is needed.
+      if (tuple.calendarId !== current.source_payload?.calendarId || tuple.eventId !== current.external_event_id
+        || await claimVerifiedCalendarOccurrence(client, {
+          pipelineId: current.pipeline_id, meetingId: current.id, calendarId: tuple.calendarId,
+          externalEventId: tuple.eventId, occurrenceKey,
+        }) === 'conflict') {
+        throw new SafeCalendarIngestionError('Recorded Calendar occurrence conflicts with an existing meeting')
+      }
+    }
     return stageReconciledMeeting(client, current, event, status,
       authority.actorEmail, authority.communication.credentialOwnerEmail)
   })

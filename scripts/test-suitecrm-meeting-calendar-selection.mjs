@@ -43,6 +43,7 @@ let meeting, prior, staged, queued, requests, scopeFailure, bindingFailure, cred
 let scopeOrganization, activeBinding, credentialAccount, liveAccountEmail, racedHash, insertFailure, cursorWrites
 let pipelineRole, onMeetingRead, importedAuthority
 let projectionRow, pendingProjection, liveSnapshotOverride, lastPolledSnapshot, nativeReads, onProjectionRead
+let retainedOccurrence
 const clientSource = ts.createSourceFile('suiteCrmClient.ts', readFileSync('app_src/lib/crm/suiteCrmClient.ts', 'utf8'),
   ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 const normalizerNode = clientSource.statements.find((node) => ts.isFunctionDeclaration(node)
@@ -90,6 +91,7 @@ function reset(mode = 'in_person', source = 'organization') {
     updated_at: '2026-09-03T12:00:00Z', processed_at: '2026-09-03T12:00:00Z',
   }
   staged = []; queued = null; requests = []; cursorWrites = []
+  retainedOccurrence = null
   scopeFailure = false; bindingFailure = false; credentialFailure = false; insertFailure = false
   scopeOrganization = ORGANIZATION; activeBinding = communication
   credentialAccount = communication.accountEmail; liveAccountEmail = communication.accountEmail; racedHash = null
@@ -194,6 +196,10 @@ async function query(sql, parameters = []) {
 }
 const client = { query: async (sql, parameters = []) => {
   if (sql.includes('pg_advisory_xact_lock')) return { rows: [] }
+  if (sql.includes('SELECT id FROM crm_integration_actions') && sql.includes("status='processing' AND lock_token=$2 FOR UPDATE")) {
+    assert.equal(parameters[0], NEXT); assert.match(parameters[1], /^fixture-/u)
+    return { rows: [{ id: NEXT }], rowCount: 1 }
+  }
   if (sql.includes('SELECT * FROM crm_integration_actions') && sql.includes('FOR UPDATE')) return { rows: [] }
   if (sql.includes('SELECT source_hash') && sql.includes('FROM crm_meetings')) {
     assert.match(sql, /FOR UPDATE/); assert.deepEqual(Array.from(parameters), [PIPELINE, MEETING])
@@ -224,9 +230,30 @@ const client = { query: async (sql, parameters = []) => {
   }
   if (sql.includes('INSERT INTO audit_events') || sql.includes('UPDATE crm_integration_actions')
     || sql.includes('UPDATE crm_integration_action_attempts')) return { rows: [], rowCount: 1 }
+  if (sql.includes('SELECT organization_id::text, contact_id::text') || sql.includes('SET join_url = NULL')) return query(sql, parameters)
   throw new Error(`Unexpected transaction query: ${sql.slice(0, 140)}`)
 } }
 const integration = load('app_src/lib/crm/integrationActions.ts', {
+  '@/lib/crm/calendarDiscovery': process.argv.includes('--baseline') ? {} : load('app_src/lib/crm/calendarDiscovery.ts', {
+    '@/lib/maton': {}, '@/lib/zonedDateTime': { zonedDateTimeToIso: value => new Date(value).toISOString() },
+  }),
+  '@/lib/crm/calendarOccurrenceClaims': {
+    lockCalendarOccurrencePipeline: async (actual, pipelineId) => {
+      assert.equal(actual, client); assert.equal(pipelineId, PIPELINE)
+    },
+    readVerifiedCalendarOccurrence: async (actual, tuple) => {
+      assert.equal(actual, client); assert.equal(tuple.meetingId, MEETING)
+      return retainedOccurrence?.occurrenceKey ?? null
+    },
+    claimVerifiedCalendarOccurrence: async (actual, proof) => {
+      assert.equal(actual, client)
+      assert.equal(proof.pipelineId, PIPELINE); assert.equal(proof.meetingId, MEETING)
+      assert.equal(proof.calendarId, CALENDAR); assert.equal(proof.externalEventId, EVENT)
+      assert.match(proof.occurrenceKey, /^[a-f0-9]{64}$/u)
+      retainedOccurrence = structuredClone(proof)
+      return 'claimed'
+    },
+  },
   '@/lib/crm/emailIdentity': load('app_src/lib/crm/emailIdentity.ts', {}),
   '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => {
     assert.fail('Meeting-calendar selection cannot acquire an email mailbox identity')
@@ -270,7 +297,8 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
   },
   '@/lib/persistence/postgres': { query, withTransaction: async (work) => {
     const before = structuredClone(meeting); const beforeStages = staged.length
-    try { return await work(client) } catch (error) { meeting = before; staged.length = beforeStages; throw error }
+    const beforeOccurrence = retainedOccurrence
+    try { return await work(client) } catch (error) { meeting = before; staged.length = beforeStages; retainedOccurrence = beforeOccurrence; throw error }
   } },
   '@/lib/maton': { matonFetch: async (pathname, init = {}, context) => {
     requests.push({ pathname, method: init.method || 'GET', context, body: init.body && JSON.parse(init.body) })
@@ -283,9 +311,13 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
       assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
       return new Response(null, { status: 204 })
     }
+    if ((init.method || 'GET') === 'GET') {
+      assert.ok(pathname.endsWith(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}`))
+      return Response.json({ id: EVENT, iCalUID: 'recorded-invite@calendar.example', status: 'confirmed' })
+    }
     assert.equal(init.method, 'PATCH', 'A CRM edit must not create/move/delete its recorded event')
     assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
-    return Response.json({ id: EVENT, htmlLink: meeting.external_event_url, hangoutLink: 'https://meet.google.com/fixture' })
+    return Response.json({ id: EVENT, iCalUID: 'recorded-invite@calendar.example', htmlLink: meeting.external_event_url, hangoutLink: 'https://meet.google.com/fixture' })
   } },
 }, '\nexport { createCalendarEventAction, leasedAction };\n')
 const inbound = load('app_src/lib/crm/suiteCrmMeetingIngestion.ts', {
@@ -344,6 +376,7 @@ for (const mode of ['in_person', 'custom_link', 'google_meet']) {
     else assert.equal(write.body.conferenceData, null)
     assert.equal(write.body.location, mode === 'in_person' ? '100 Example Avenue' : mode === 'custom_link' ? CUSTOM : null)
     assert.equal(staged.at(-1).fields.joinUrl, mode === 'custom_link' ? CUSTOM : mode === 'in_person' ? null : 'https://meet.google.com/fixture')
+    if (!process.argv.includes('--baseline')) assert.equal(retainedOccurrence?.externalEventId, EVENT)
   }
 }
 reset()

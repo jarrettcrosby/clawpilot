@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v19'
+  'clawpilot-production-rebind-target-schema-attestation-v20'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -131,7 +131,7 @@ const THROUGH_0402_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({ filename: '0402_crm_native_unmanaged_app_only_pipelines.sql',
     checksum: 'cf346831bf9c1c5d94f9a25fcd6152d27837090f3d324d8cf3584605044766a1' }),
 ])
-export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+const THROUGH_0411_SCHEMA_MIGRATIONS = Object.freeze([
   ...THROUGH_0402_SCHEMA_MIGRATIONS,
   Object.freeze({ filename: '0403_fractional_crm_customer_folder_capability.sql',
     checksum: '3fa6f3c6db912a91e44a3a4b4ce3cb5226650a0f11227ab9e4bd985a5c05414f' }),
@@ -151,6 +151,11 @@ export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
     checksum: 'e3a080fc2fe2b3c8189f2ecada8e9c8a8e889e4f998a9365c8fdda28ab82b921' }),
   Object.freeze({ filename: '0411_crm_legacy_email_archive_disposition.sql',
     checksum: '0f7d41a3ebb11901af0c575165cd48632d8b25eb351777a41413b21b1e2c9fd3' }),
+])
+export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+  ...THROUGH_0411_SCHEMA_MIGRATIONS,
+  Object.freeze({ filename: '0412_crm_calendar_occurrence_claims.sql',
+    checksum: 'dcd430b14721d3267bef4ce39f84d6fac490deb9cf55f7f0cf0a55ba6859a8c3' }),
 ])
 
 // The rebind caller can take ACCESS SHARE locks on this exact, static list
@@ -270,9 +275,16 @@ export const PRODUCTION_REBIND_RECOVERY_RELATIONS = Object.freeze([
   'crm_legacy_email_retirement.account_repair_approvals',
   'crm_legacy_email_retirement.account_repairs',
 ].sort())
-export const PRODUCTION_REBIND_CRITICAL_RELATIONS = Object.freeze([
+const THROUGH_0411_CRITICAL_RELATIONS = Object.freeze([
   ...THROUGH_0402_CRITICAL_RELATIONS,
   ...PRODUCTION_REBIND_RECOVERY_RELATIONS,
+].sort())
+export const PRODUCTION_REBIND_CRITICAL_RELATIONS = Object.freeze([
+  ...THROUGH_0411_CRITICAL_RELATIONS,
+  'public.crm_calendar_discovery_events',
+  'public.crm_calendar_discovery_sources',
+  'public.crm_calendar_occurrence_bindings',
+  'public.crm_calendar_occurrence_claims',
 ].sort())
 
 const PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
@@ -378,9 +390,14 @@ export const PRODUCTION_REBIND_RECOVERY_GUARD_HELPERS = Object.freeze([
   'crm_legacy_email_retirement.repair_account_links(uuid,jsonb,text)',
   'crm_legacy_email_retirement.guard_reviewed_recovery_stage()',
 ])
-export const PRODUCTION_REBIND_CRM_GUARD_HELPERS = Object.freeze([
+const THROUGH_0411_CRM_GUARD_HELPERS = Object.freeze([
   ...THROUGH_0402_CRM_GUARD_HELPERS,
   ...PRODUCTION_REBIND_RECOVERY_GUARD_HELPERS,
+])
+export const PRODUCTION_REBIND_CRM_GUARD_HELPERS = Object.freeze([
+  ...THROUGH_0411_CRM_GUARD_HELPERS,
+  'public.clawpilot_crm_keep_calendar_occurrence()',
+  'public.clawpilot_crm_require_calendar_occurrence()',
 ])
 const THROUGH_0402_CRITICAL_FUNCTIONS = Object.freeze([
   ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
@@ -398,6 +415,11 @@ const PRODUCTION_REBIND_CRITICAL_FUNCTIONS = Object.freeze([
   ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
   ...PRODUCTION_REBIND_CRM_GUARD_HELPERS,
 ])
+const THROUGH_0411_CRITICAL_FUNCTIONS = Object.freeze([
+  ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
+  ...THROUGH_0411_CRM_GUARD_HELPERS,
+])
+const THROUGH_0411_ADDITIONAL_SCHEMAS = Object.freeze(['crm_legacy_email_retirement'])
 const PRE_INITIAL_REPLAN_CRITICAL_FUNCTIONS = Object.freeze([
   ...PRE_CRM_PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
   ...PRE_INITIAL_REPLAN_CRM_GUARD_HELPERS,
@@ -442,11 +464,17 @@ export const PRE_LEGACY_RECOVERY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze
   16: '87612f0c87538fceb059b571b15f981f765bca69fb3bb13844be0193f6f78e3f',
   18: '8fe6418063cccbf842a777841e9876943b25f8c800aadfa64e7b1e5d9d623bcb',
 })
-// Enrollment requires independent full-catalog PG16/18 diagnostics followed by
-// the complete tamper gate. Never learn replacement pins from a live runtime.
-const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+// Exact, independently accepted through-0411 v19 catalogue evidence.
+// Calendar occurrence enrollment cannot fall back to these fingerprints.
+export const PRE_CALENDAR_OCCURRENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
   16: '1f65875ffecdbb7204d00daaaa9d3dc3864f25bdd3760b86195f7f5eed224fef',
   18: '283d8d6f0728bde8c19b73975ae71c2f2d08c41360195ee88d89a94f58cce1a4',
+})
+// Enrollment requires independent full-catalog PG16/18 diagnostics followed by
+// the tamper gate. Never learn replacement pins from a live runtime.
+const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
+  16: '7a302187e1c5082cb8bcb33dee6717667b8f26ee3a28a715f7ffb7cd04660ad6',
+  18: '8dff7fb7b1e42d8878a3920838cb03851049426b0b1d54f1cf20a76e3ed03cca',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -1184,7 +1212,7 @@ async function inspectSchemaWithFunctions(client, criticalFunctions,
 export async function inspectProductionRebindHistorySchema(client) {
   return inspectSchemaWithFunctions(client, PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
     PRODUCTION_REBIND_CRITICAL_RELATIONS, PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
-    ['crm_legacy_email_retirement'])
+    THROUGH_0411_ADDITIONAL_SCHEMAS)
 }
 
 /** Read-only historical comparison, never an attestation or fallback. Current
@@ -1246,13 +1274,23 @@ export async function inspectPreUnmanagedPipelineProductionRebindSchemaMetadata(
 }
 
 /** Exact through-0402 v18 comparison only. The inventory and old fingerprints
- * remain frozen; this read-only evidence never activates a v19 target. */
+ * remain frozen; this read-only evidence never activates a current target. */
 export async function inspectPreLegacyRecoveryProductionRebindSchemaMetadata(client) {
   const result = await inspectSchemaWithFunctions(client,
     THROUGH_0402_CRITICAL_FUNCTIONS,
     THROUGH_0402_CRITICAL_RELATIONS,
     THROUGH_0402_SCHEMA_MIGRATIONS)
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v18-metadata-only' })
+}
+
+/** Frozen through-0411 v19 metadata, never a current-attestation fallback. */
+export async function inspectPreCalendarOccurrenceProductionRebindSchemaMetadata(client) {
+  const result = await inspectSchemaWithFunctions(client,
+    THROUGH_0411_CRITICAL_FUNCTIONS,
+    THROUGH_0411_CRITICAL_RELATIONS,
+    THROUGH_0411_SCHEMA_MIGRATIONS,
+    THROUGH_0411_ADDITIONAL_SCHEMAS)
+  return Object.freeze({ ...result, format:'clawpilot-production-rebind-v19-metadata-only' })
 }
 
 export async function attestProductionRebindHistorySchema(client) {
@@ -1262,7 +1300,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0411',
+      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0412',
     )
   }
   if (

@@ -82,6 +82,7 @@ function fixture(rows = [meeting()], options = {}) {
   const state = {
     rows: copy(rows), staged: [], gets: [], queries: [], authority: [], cursors: new Map(), actions: [],
     transaction: false, locked: false, activeConnection: true, access: true, pipelineAccessDisabled: false,
+    occurrenceLocked: false, occurrences: [],
     legacyEvents: options.legacyEvents || [],
   }
   const selected = { owner_email: OWNER, connection_id: options.selectedConnection || 'legacy-primary-connection' }
@@ -155,15 +156,31 @@ function fixture(rows = [meeting()], options = {}) {
     throw new Error(`Unexpected mocked SQL: ${sql.slice(0, 80)}`)
   }
   const client = { query: (sql, params) => db(sql, params, true) }
+  const dateTime = load('app_src/lib/zonedDateTime.ts')
   const module = load(sourcePath, {
     '@/lib/globalIds.mjs': globalIds,
-    '@/lib/zonedDateTime': load('app_src/lib/zonedDateTime.ts'),
+    '@/lib/zonedDateTime': dateTime,
+    '@/lib/crm/calendarDiscovery': load('app_src/lib/crm/calendarDiscovery.ts', { '@/lib/zonedDateTime': dateTime, '@/lib/maton': {} }),
+    '@/lib/crm/calendarOccurrenceClaims': {
+      lockCalendarOccurrencePipeline: async (actualClient, pipelineId) => {
+        assert.equal(actualClient, client); assert.equal(pipelineId, PIPELINE)
+        assert.equal(state.transaction && !state.locked, true, 'pipeline lock precedes meeting-row lock')
+        state.occurrenceLocked = true
+      },
+      claimVerifiedCalendarOccurrence: async (actualClient, input) => {
+        assert.equal(actualClient, client)
+        assert.equal(state.transaction && state.locked && state.occurrenceLocked, true)
+        assert.equal(state.authority.at(-1).locked, true, 'claim only after post-lock reauthorization')
+        state.occurrences.push(copy(input))
+        return options.occurrenceConflict ? 'conflict' : 'claimed'
+      },
+    },
     '@/lib/persistence/postgres': {
       query: (sql, params) => db(sql, params),
       withTransaction: async (fn) => {
         assert.equal(state.transaction, false)
         state.transaction = true
-        try { return await fn(client) } finally { state.transaction = false; state.locked = false }
+        try { return await fn(client) } finally { state.transaction = false; state.locked = false; state.occurrenceLocked = false }
       },
     },
     '@/lib/persistence/crm': {
@@ -209,6 +226,24 @@ function fixture(rows = [meeting()], options = {}) {
 }
 
 {
+  const row = meeting()
+  for (const occurrenceConflict of [false, true]) {
+    const f = fixture([row], { occurrenceConflict, event: value => event(value, {
+      iCalUID: 'old-exact-tuple@calendar.example', summary: row.subject,
+    }) })
+    const result = await f.run()
+    assert.equal(f.state.gets.length, 1, 'reuses the already-authorized exact provider read')
+    assert.equal(f.state.occurrences.length, 1)
+    const { occurrenceKey, ...tuple } = f.state.occurrences[0]
+    assert.match(occurrenceKey, /^[a-f0-9]{64}$/u)
+    assert.deepEqual(tuple, { pipelineId: PIPELINE, meetingId: row.id, calendarId: CALENDAR, externalEventId: row.external_event_id })
+    assert.equal(f.state.staged.length, 0, 'identity-only enrollment or conflict must not revise the meeting')
+    assert.equal(result.errors, occurrenceConflict ? 1 : 0)
+    assert.equal(result.unchangedMeetings, occurrenceConflict ? 0 : 1)
+  }
+}
+
+{
   const row = meeting(1, { external_event_id: 'event/one+two' })
   const { state, run } = fixture([row])
   const counts = await run()
@@ -226,6 +261,7 @@ function fixture(rows = [meeting()], options = {}) {
 for (const overrides of [
   { extendedProperties: { private: { clawpilotMeetingReference: 'gm9999999' } } },
   { extendedProperties: { private: { clawpilotMeetingReference: 'invalid-marker' } } },
+  { extendedProperties: { private: { clawpilotMeetingReference: 'gm0000001', clawpilotPipelineId: '10000000-0000-4000-8000-000000000002' } } },
   { id: 'other-event' },
 ]) {
   const { state, run } = fixture(undefined, { event: (row) => event(row, overrides) })

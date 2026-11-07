@@ -4,7 +4,7 @@
 // native fixture remains available when Docker is unavailable on the Mac.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
@@ -130,8 +130,10 @@ try {
       organizationSuiteCrmId: foreignAccount.suiteCrmId, fullName: 'Foreign Adrian', email: 'adrian@client.example.invalid' } })
   const providerCalls = []
   const discovery = load('app_src/lib/crm/calendarDiscovery.ts', { '@/lib/maton': {}, '@/lib/zonedDateTime': load('app_src/lib/zonedDateTime.ts') })
+  const occurrenceClaims = load('app_src/lib/crm/calendarOccurrenceClaims.ts')
   const adapter = load('app_src/lib/crm/calendarDiscoveryPersistence.ts', {
     '@/lib/crm/calendarDiscovery': discovery,
+    '@/lib/crm/calendarOccurrenceClaims': occurrenceClaims,
     '@/lib/crm/participantEligibility': load('app_src/lib/crm/participantEligibility.ts'),
     '@/lib/persistence/postgres': postgres, '@/lib/persistence/crm': crm,
     '@/lib/integrations/organizationCommunications': { resolveVerifiedPipelineCalendarSelection: async input => ({
@@ -161,7 +163,8 @@ try {
     location: '', attendeeEmails: [calendar, 'adrian@client.example.invalid', 'joe@client.example.invalid'],
     matchingAttendeeEmails: ['adrian@client.example.invalid', 'joe@client.example.invalid'], organizerEmail: calendar,
     externalEventUrl: 'https://calendar.google.com/event?eid=fixture', joinUrl: 'https://meet.google.com/aaa-bbbb-ccc',
-    recurringEventId: 'business-series', originalStartTime: null, clawpilotMeetingReference: null, allowCreate: true }
+    recurringEventId: 'business-series', originalStartTime: null, occurrenceKey: 'a'.repeat(64),
+    clawpilotMeetingReference: null, allowCreate: true }
   // Pipeline ownership is not a substitute for the current organization's
   // module permission. Keep the same real owner identity and connection while
   // changing only its live membership, as ordinary access settings do.
@@ -391,8 +394,10 @@ try {
   check(unspecified.join_url === null && unspecified.source_payload.meetingMode === 'unspecified'
     && unspecified.source_payload.customJoinUrl === null, 'no-location snapshot clears old custom link without creating Meet')
   check((await reconcile(source, { ...event, matchingAttendeeEmails: ['adrian@client.example.invalid', 'other@client.example.invalid'] })).status === 'ambiguous', 'multi-account meeting stays fail-closed')
-  check((await reconcile(source, { ...event, externalEventId: 'unmatched', matchingAttendeeEmails: ['unknown@example.invalid'] })).status === 'unmatched', 'unmatched event is not copied')
-  check((await reconcile(source, { ...event, externalEventId: 'untrusted-marker', clawpilotMeetingReference: 'gm1234567' })).status === 'skipped', 'unrecognized marker cannot duplicate or rebind CRM records')
+  check((await reconcile(source, { ...event, externalEventId: 'unmatched', occurrenceKey: 'f'.repeat(64),
+    matchingAttendeeEmails: ['unknown@example.invalid'] })).status === 'unmatched', 'unmatched event is not copied')
+  check((await reconcile(source, { ...event, externalEventId: 'untrusted-marker', occurrenceKey: 'f'.repeat(64),
+    clawpilotMeetingReference: 'gm1234567' })).status === 'skipped', 'unrecognized marker cannot duplicate or rebind CRM records')
   const cancellation = { ...event, status: 'cancelled', startsAt: null, endsAt: null,
     matchingAttendeeEmails: [], attendeeEmails: [], allowCreate: false }
   const moveReadback = async () => (await query(`SELECT to_jsonb(m) AS meeting, to_jsonb(d) AS mapping,
@@ -423,6 +428,151 @@ try {
   check((await query('SELECT count(*) FROM crm_meeting_contacts WHERE meeting_id=$1', [meeting.id])).rows[0].count === '2', 'cancellation preserves contact associations')
   await query("UPDATE crm_meetings SET source_payload=source_payload || '{\"archived\":true}'::jsonb WHERE id=$1", [meeting.id])
   check((await reconcile(source, event)).status === 'skipped', 'archived meeting is never resurrected')
+
+  const copyCalendar = 'other-approved@example.invalid', copyConnection = 'other-approved-calendar'
+  await query(`INSERT INTO user_maton_connections(owner_email,connection_id,app,name,account_email,status,source,is_selected)
+    VALUES($1,$2,'google-calendar',$3,$3,'ACTIVE','maton',false)`, [owner, copyConnection, copyCalendar])
+  const copySourceId = (await query(`INSERT INTO crm_calendar_discovery_sources
+    (pipeline_id,workspace_organization_id,credential_owner_email,connection_id,calendar_id,account_email,time_zone,enabled,verified_at)
+    VALUES($1,$2,$3,$4,$5,$5,'America/New_York',true,now()) RETURNING id`, [pipeline, org, owner, copyConnection, copyCalendar])).rows[0].id
+  const copySource = { ...source, id: copySourceId, calendarId: copyCalendar, accountEmail: copyCalendar, connectionId: copyConnection }
+  const occurrenceCounts = async () => (await query(`SELECT
+    (SELECT count(*)::int FROM crm_meetings) AS meetings,
+    (SELECT count(*)::int FROM sync_outbox) AS outbox,
+    (SELECT count(*)::int FROM crm_integration_actions) AS actions,
+    (SELECT count(*)::int FROM crm_calendar_discovery_events) AS mappings,
+    (SELECT count(*)::int FROM crm_calendar_occurrence_claims) AS claims,
+    (SELECT count(*)::int FROM crm_calendar_occurrence_bindings) AS bindings`)).rows[0]
+  const localMeetingInput = (sourceKey, externalEventId, pipelineId = pipeline) => ({
+    entity: 'meetings', pipelineId, sourceKey,
+    sourcePayload: { source: 'clawpilot', calendarId: calendar, calendarOwnerEmail: owner },
+    fields: { subject: 'Pre-existing Calendar fixture', startsAt: event.startsAt, endsAt: event.endsAt,
+      timezone: event.timeZone, status: 'scheduled', provider: 'maton', externalEventId },
+  })
+  for (const archived of [false, true]) {
+    const legacyEvent = { ...event, externalEventId: `legacy-${archived}`, occurrenceKey: archived ? 'c'.repeat(64) : 'b'.repeat(64) }
+    const legacyInput = localMeetingInput(`legacy:${archived}`, legacyEvent.externalEventId)
+    const legacy = await stage({ ...legacyInput, fields: { ...legacyInput.fields, organizationId: account.id,
+      organizationSuiteCrmId: account.suiteCrmId, contactIds: [adrian.id, joe.id] } })
+    const legacyHash = createHash('sha256').update(JSON.stringify({ event: { ...legacyEvent, occurrenceKey: undefined },
+      contactIds: [adrian.id, joe.id].sort() })).digest('hex')
+    await query(`INSERT INTO crm_calendar_discovery_events(pipeline_id,source_id,calendar_id,external_event_id,meeting_id,event_hash)
+      VALUES($1,$2,$3,$4,$5,$6)`, [pipeline, source.id, calendar, legacyEvent.externalEventId, legacy.id, legacyHash])
+    if (archived) await query("UPDATE crm_meetings SET source_payload=source_payload || '{\"archived\":true}'::jsonb WHERE id=$1", [legacy.id])
+    const readLegacy = async () => (await query('SELECT to_jsonb(m) AS row FROM crm_meetings m WHERE id=$1', [legacy.id])).rows[0].row
+    const legacyBefore = await readLegacy(), beforeHydration = await occurrenceCounts()
+    const legacyCopy = { ...legacyEvent, externalEventId: `attendee-copy-${archived}` }
+    check((await reconcile(copySource, legacyCopy)).status === 'ambiguous', 'copy cannot beat exact legacy identity hydration')
+    assert.deepEqual(await occurrenceCounts(), beforeHydration); checks++
+    check((await reconcile(source, legacyEvent)).status === (archived ? 'skipped' : 'unchanged'), 'known exact snapshot hydrates without content writes')
+    assert.deepEqual(await readLegacy(), legacyBefore); checks++
+    assert.deepEqual(await occurrenceCounts(), { ...beforeHydration,
+      claims: beforeHydration.claims + 1, bindings: beforeHydration.bindings + 1 }); checks++
+    check((await reconcile(copySource, legacyCopy)).status === 'skipped', 'hydrated or archived owner prevents copy creation')
+  }
+
+  const concurrentEvent = { ...event, externalEventId: 'first-calendar-occurrence', occurrenceKey: 'd'.repeat(64) }
+  const concurrentCopy = { ...concurrentEvent, externalEventId: 'second-calendar-occurrence' }
+  const beforeConcurrent = await occurrenceCounts()
+  await query("UPDATE crm_integration_actions SET status='processing' WHERE id=$1", [pendingAction])
+  check((await reconcile(copySource, concurrentCopy)).status === 'ambiguous', 'unresolved outbound write holds unmatched creations without stalling the page')
+  assert.deepEqual(await occurrenceCounts(), beforeConcurrent); checks++
+  await query("UPDATE crm_integration_actions SET status='succeeded' WHERE id=$1", [pendingAction])
+  const results = await Promise.all([reconcile(source, concurrentEvent), reconcile(copySource, concurrentCopy)])
+  assert.deepEqual(results.map(row => row.status).sort(), ['created', 'skipped']); checks++
+  const firstWon = results[0].status === 'created'
+  const winningSource = firstWon ? source : copySource, winningEvent = firstWon ? concurrentEvent : concurrentCopy
+  const losingSource = firstWon ? copySource : source, losingEvent = firstWon ? concurrentCopy : concurrentEvent
+  const afterConcurrent = await occurrenceCounts()
+  assert.deepEqual(afterConcurrent, { ...beforeConcurrent, meetings: beforeConcurrent.meetings + 1, outbox: beforeConcurrent.outbox + 1,
+    mappings: beforeConcurrent.mappings + 1, claims: beforeConcurrent.claims + 1, bindings: beforeConcurrent.bindings + 1 }); checks++
+  check((await reconcile(winningSource, winningEvent)).status === 'unchanged', 'canonical replay retains the one meeting')
+  check((await reconcile(losingSource, { ...losingEvent, subject: 'Different attendee copy' })).status === 'skipped', 'secondary cannot overwrite canonical content')
+  check((await reconcile(losingSource, { ...cancellation, externalEventId: losingEvent.externalEventId,
+    occurrenceKey: null })).status === 'skipped', 'sparse secondary cancellation cannot cancel canonical meeting')
+  check((await reconcile(losingSource, { ...losingEvent, clawpilotMeetingReference: 'gm1234567' })).status === 'ambiguous', 'conflicting marker never rebinds an occurrence')
+  check((await reconcile(winningSource, { ...winningEvent, occurrenceKey: 'e'.repeat(64) })).status === 'ambiguous', 'known provider tuple cannot change its occurrence identity')
+  assert.deepEqual(await occurrenceCounts(), afterConcurrent); checks++
+  await assert.rejects(query('DELETE FROM crm_calendar_occurrence_bindings WHERE pipeline_id=$1 AND occurrence_key=$2',
+    [pipeline, winningEvent.occurrenceKey]), /immutable/); checks++
+
+  const oldWorkerInput = localMeetingInput('calendar-discovery:old-worker', 'old-worker-unkeyed')
+  await assert.rejects(stage(oldWorkerInput), /requires an exact occurrence claim and source binding/); checks++
+  assert.deepEqual(await occurrenceCounts(), afterConcurrent, 'old discovery writer must roll back both meeting and outbox'); checks++
+  check((await reconcile(winningSource, { ...winningEvent, externalEventId: 'later-occurrence-of-same-series',
+    occurrenceKey: 'e'.repeat(64), originalStartTime: '2026-10-28T14:00:00.000Z' })).status === 'created',
+  'a different recurring occurrence remains a distinct meeting even with the same series ID')
+
+  // Deduplication is per pipeline, and the existing tenant's hard removal
+  // cascades its evidence without allowing direct deletion from live meetings.
+  const retiredPipeline = randomUUID()
+  await query('INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id) VALUES($1,$2,$3,$4)',
+    [retiredPipeline, 'Disposable occurrence scope', owner, org])
+  const retired = await stage(localMeetingInput('retired-occurrence', winningEvent.externalEventId, retiredPipeline))
+  await withTransaction(async client => {
+    await occurrenceClaims.lockCalendarOccurrencePipeline(client, retiredPipeline)
+    check(await occurrenceClaims.claimVerifiedCalendarOccurrence(client, {
+      pipelineId: retiredPipeline, meetingId: retired.id, calendarId: calendar,
+      externalEventId: winningEvent.externalEventId, occurrenceKey: winningEvent.occurrenceKey,
+    }) === 'claimed', 'the same provider occurrence cannot merge different pipelines')
+  })
+  const scope = { pipelineId: retiredPipeline, meetingId: retired.id }
+  const originalTuple = { calendarId: calendar, externalEventId: winningEvent.externalEventId, occurrenceKey: winningEvent.occurrenceKey }
+  const otherOwner = await stage(localMeetingInput('other-move-owner', 'already-owned', retiredPipeline))
+  await stage(localMeetingInput('unkeyed-move-owner', 'unkeyed-destination', retiredPipeline))
+  const otherTuple = { calendarId: calendar, externalEventId: 'already-owned', occurrenceKey: '9'.repeat(64) }
+  await withTransaction(async client => {
+    await occurrenceClaims.lockCalendarOccurrencePipeline(client, retiredPipeline)
+    check(await occurrenceClaims.claimVerifiedCalendarOccurrence(client, {
+      pipelineId: retiredPipeline, meetingId: otherOwner.id, ...otherTuple,
+    }) === 'claimed', 'another exact meeting can hold the proposed destination occurrence')
+  })
+  const reserve = (source, destination) => withTransaction(client => occurrenceClaims.reserveVerifiedCalendarMoveDestination(
+    client, { ...scope, source, destination },
+  ))
+  const authority = async () => (await query(`SELECT external_event_id AS "externalEventId",
+    source_payload->>'calendarId' AS "calendarId" FROM crm_meetings WHERE id=$1`, [retired.id])).rows[0]
+  const beforeReservation = await occurrenceCounts()
+  const initialAuthority = await authority()
+  check(await reserve(originalTuple, { ...otherTuple, externalEventId: 'duplicate-destination-key' }) === 'conflict',
+    'destination owned by another meeting is held before any source deletion')
+  check(await reserve(originalTuple, { ...otherTuple, occurrenceKey: originalTuple.occurrenceKey }) === 'conflict',
+    'an existing exact destination binding cannot be transferred')
+  check(await reserve(originalTuple, { calendarId: calendar, externalEventId: 'unkeyed-destination', occurrenceKey: '8'.repeat(64) }) === 'conflict',
+    'an existing unkeyed row with the exact destination tuple is held before deletion')
+  check(await reserve({ ...originalTuple, occurrenceKey: otherTuple.occurrenceKey }, { ...originalTuple, externalEventId: 'wrong-source-proof' }) === 'conflict',
+    'move reservation requires the exact retained source proof')
+  check(await reserve(originalTuple, originalTuple) === 'conflict', 'move cannot delete its own physical destination')
+  assert.deepEqual(await occurrenceCounts(), beforeReservation); checks++
+  assert.deepEqual(await authority(), initialAuthority); checks++
+
+  let currentTuple = originalTuple
+  for (const [calendarId, externalEventId, occurrenceKey] of [
+    [copyCalendar, 'moved-same-uid', winningEvent.occurrenceKey], [calendar, 'moved-new-uid', 'f'.repeat(64)],
+  ]) {
+    const destination = { calendarId, externalEventId, occurrenceKey }
+    const beforeMove = await authority()
+    check(await reserve(currentTuple, destination) === 'claimed', 'verified destination is reserved before changing Calendar authority')
+    check(await reserve(currentTuple, destination) === 'unchanged', 'lost-response retry reuses the durable destination reservation')
+    assert.deepEqual(await authority(), beforeMove, 'reservation cannot change the active provider tuple'); checks++
+    await withTransaction(async client => {
+      await occurrenceClaims.lockCalendarOccurrencePipeline(client, retiredPipeline)
+      await client.query(`UPDATE crm_meetings SET external_event_id=$2,
+        source_payload=jsonb_set(source_payload,'{calendarId}',to_jsonb($3::text)) WHERE id=$1`, [retired.id, externalEventId, calendarId])
+      check(await occurrenceClaims.claimVerifiedCalendarOccurrence(client, { ...scope, ...destination }) === 'unchanged',
+        'only completed move adopts its already reserved destination on the same meeting')
+      check(await occurrenceClaims.readVerifiedCalendarOccurrence(client, { ...scope, ...originalTuple }) === originalTuple.occurrenceKey,
+        'earlier provider tuple evidence remains immutable after a move')
+    })
+    currentTuple = destination
+  }
+  await query('DELETE FROM pipeline_spaces WHERE id=$1', [retiredPipeline])
+  const removed = (await query(`SELECT
+    (SELECT count(*)::int FROM crm_meetings WHERE pipeline_id=$1) AS meetings,
+    (SELECT count(*)::int FROM crm_calendar_occurrence_claims WHERE pipeline_id=$1) AS claims,
+    (SELECT count(*)::int FROM crm_calendar_occurrence_bindings WHERE pipeline_id=$1) AS bindings`, [retiredPipeline])).rows[0]
+  assert.deepEqual(removed, { meetings: 0, claims: 0, bindings: 0 }); checks++
+
   await adapter.configureCalendarDiscoverySource({ ...input, enabled: false })
   check(!await store.isAuthorized(source), 'paused source revokes discovery authority')
   check((await reconcile(source, { ...event, externalEventId: 'after-pause' })).status === 'deferred', 'revalidation prevents mutation after pause')

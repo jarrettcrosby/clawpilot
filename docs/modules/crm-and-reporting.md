@@ -97,6 +97,8 @@ An Opportunity owns one permanent `go` reference, one required Organization rela
 - Organization, contact, lead, opportunity, and meeting records can create Google Calendar invitations through that user's selected `google-calendar` connection. The action composer displays the selected organizer and records it with the provider result.
 - Every Calendar invitation created by ClawPilot includes the meeting's permanent `gm` reference and organization-scoped short link. The `gm` reference is also stored in the event's private Google metadata so later Calendar changes can be reconciled safely.
 - Pipeline owners can explicitly enable a linked calendar from **CRM → Meetings → Calendar import**. Discovery imports only meetings whose participant emails match active CRM Contacts on one account in that pipeline. All matched Contacts are retained in native CRM Meetings relationships; unrelated-account ambiguity stays unlinked. Personal/default calendars are never automatically enabled. The initial and daily rolling window covers the last 30 and next 90 days, with bounded pagination, incremental updates, cancellations, and stable calendar/event identity across reconnects. Import itself sends no invitations. Existing-event edits retain that exact verified calendar and update the same Google event from either ClawPilot or SuiteCRM, subject to Google event permissions. Meetings without a location or conferencing retain that state rather than generating a Google Meet link.
+- Reimports and edits retain the same Meeting and Global ID. Within one pipeline, copies of the same Google Calendar occurrence share one durable claim. The original date or instant distinguishes recurring occurrences even after they are rescheduled. A secondary copy or a former calendar binding cannot edit, cancel, or rebind the canonical meeting. A verified move retains the old claims as duplicate protection.
+- If an existing Calendar meeting has no verified occurrence identity, or a prior delivery may still be unresolved, discovery holds new imports rather than guessing whether they are copies. Verified exact observations can fill missing identity evidence without recreating the meeting. Review unavailable or conflicting historical sources by their exact provider identities; do not reset cursors, reassign meetings, or delete a suspected duplicate automatically.
 - Before a Google Calendar write, the worker verifies the reviewed account against Google's unique live writable primary calendar on the pinned connection, then checks the exact selected calendar and organizer separately. An outdated Maton account label does not block a verified selection. A different or unverified live account blocks delivery even if it can write to the same shared calendar. Recorded and imported SuiteCRM edits queue against their original verified identity without contacting Google until delivery.
 - Records with a phone number expose a call command. It records a native Call before returning a validated `tel:` URL to the device. A logged call defaults to **Held**, **Outbound**, and 15 minutes; the operator can change status, direction, and duration before submitting.
 - Campaigns accept `gc` and `gl` recipients, support `{{firstName}}`, `{{lastName}}`, `{{name}}`, `{{email}}`, and `{{referenceCode}}` merge fields, deduplicate recipients by email, and suppress opted-out recipients.
@@ -206,6 +208,10 @@ matching Global ID, or leftover SecurityGroups link (including a deleted link)
 holds creation for review. Native publication rechecks the condition inside its
 write transaction; a preview does not reserve the ID. An exact retry of a
 committed operation resolves its existing receipt instead of creating a copy.
+For reviewed recovery, verify one ClawPilot interaction and one corresponding
+SuiteCRM Email per selected provider message, with the customer and supplier
+relationships on that same Email. A conflicting existing identity holds the
+operation for review; it is not permission to recreate, merge, or delete it.
 
 Legacy failed Email jobs use a separate private maintenance path. A reviewed
 archive transaction retains each exact terminal original and blocks its old
@@ -343,6 +349,12 @@ must identify any allowed idle PostgreSQL writer session by its exact role,
 backend PID and start time. Installing and proving the real custody capability,
 the direct observer identities and the Railway connection are separate release
 gates; the library has no default custody implementation or listener.
+
+The forward release uses production-rebind schema attestation v20 for the
+reviewed migrations through `0412`. It includes the recovery evidence,
+private-schema authority, and Calendar occurrence claims and guards. Earlier v9–v19 catalogs
+remain frozen historical evidence, never a fallback for current acceptance;
+their existing receipts and source artifacts are not relabeled.
 
 ## Workbook Contract
 

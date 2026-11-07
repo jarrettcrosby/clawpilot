@@ -158,6 +158,11 @@ function actionRow(overrides = {}) {
 }
 
 const commonMocks = {
+  '@/lib/crm/calendarOccurrenceClaims': { lockCalendarOccurrencePipeline: async () => {} },
+  '@/lib/crm/calendarDiscovery': loadTypeScriptModule('app_src/lib/crm/calendarDiscovery.ts', {
+    '@/lib/maton': { matonFetch: async () => assert.fail('Occurrence key derivation is pure') },
+    '@/lib/zonedDateTime': {},
+  }),
   '@/lib/crm/emailIdentity': loadTypeScriptModule('app_src/lib/crm/emailIdentity.ts'),
   '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => {
     assert.fail('Calendar delivery cannot acquire an email mailbox identity')
@@ -766,6 +771,12 @@ let joinUrlClearCount = 0
 let communicationScopeFailure = null
 let activeCommunicationSnapshot = communicationSnapshot
 let destinationCalendarList = null
+let previousCalendarList = null
+let occurrenceClaims = []
+let occurrenceClaimConflict = false
+let moveReservationConflict = false
+let moveReservations = []
+let committedDeliveryMeeting = null
 
 const processQuery = async (sql, parameters = []) => {
   if (sql.includes('SELECT organization_id::text, contact_id::text, lead_id::text')) {
@@ -802,6 +813,13 @@ const processQuery = async (sql, parameters = []) => {
 
 const transactionClient = {
   async query(sql, parameters = []) {
+    if (sql.includes('SELECT id FROM crm_integration_actions') && sql.includes('FOR UPDATE')) {
+      return { rows: [{ id: currentRow.id }], rowCount: 1 }
+    }
+    if (sql.includes('SELECT organization_id::text, contact_id::text, lead_id::text')
+      || sql.includes('SELECT suitecrm_id FROM crm_contacts') || sql.includes('SET join_url = NULL')) {
+      return processQuery(sql, parameters)
+    }
     if (sql.includes('SELECT *') && sql.includes('FROM crm_integration_actions') && sql.includes('FOR UPDATE')) {
       return { rows: [currentRow], rowCount: 1 }
     }
@@ -880,8 +898,39 @@ const transactionClient = {
   },
 }
 
+async function stageDeliveryMeeting(input) {
+  stageCalls.push(input)
+  committedDeliveryMeeting = input
+  return {
+    id: MEETING_ID, referenceCode: MEETING_REFERENCE,
+    shortUrl: 'https://clawpilot.example/m/gm1234567', sourceHash: 'meeting-source-hash',
+  }
+}
+
 const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.ts', {
   ...commonMocks,
+  '@/lib/crm/calendarOccurrenceClaims': {
+    lockCalendarOccurrencePipeline: async (client, pipelineId) => {
+      assert.equal(client, transactionClient); assert.equal(pipelineId, PIPELINE_ID)
+    },
+    readVerifiedCalendarOccurrence: async () => null,
+    claimVerifiedCalendarOccurrence: async (client, proof) => {
+      assert.equal(client, transactionClient)
+      assert.equal(currentRow.status, 'processing', 'The occurrence must be claimed before success becomes visible')
+      assert.equal(stageCalls.at(-1).sourcePayload.calendarId, proof.calendarId)
+      occurrenceClaims.push(structuredClone(proof))
+      return occurrenceClaimConflict ? 'conflict' : 'claimed'
+    },
+    reserveVerifiedCalendarMoveDestination: async (client, request) => {
+      assert.equal(client, transactionClient)
+      assert.equal(currentRow.status, 'processing')
+      assert.equal(currentRow.response_summary.calendarMove.state, 'destination-written-source-delete-pending')
+      assert.equal(committedDeliveryMeeting.sourcePayload.calendarId, request.source.calendarId)
+      assert.equal(providerRequests.some(item => item.init.method === 'DELETE'), false, 'Source removal must follow durable reservation')
+      moveReservations.push(structuredClone(request))
+      return moveReservationConflict ? 'conflict' : 'claimed'
+    },
+  },
   '@/lib/integrations/matonGatewayCredentials': {
     resolveUserMatonGatewayCredential: async ({ ownerEmail, boundConnectionId }) => ({
       connectionId: boundConnectionId,
@@ -900,6 +949,9 @@ const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.
       if (pathname.includes('/calendarList?')) {
         if (context.boundConnectionId === CONNECTION_ID && destinationCalendarList) {
           return Response.json(destinationCalendarList)
+        }
+        if (context.boundConnectionId === PREVIOUS_CONNECTION_ID && previousCalendarList) {
+          return Response.json(previousCalendarList)
         }
         const items = context.boundConnectionId === PERSONAL_CONNECTION_ID
           ? [{
@@ -953,17 +1005,28 @@ const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.
           headers: { 'Content-Type': 'application/json' },
         })
       }
-      if (providerResult === 'lost-post-response' && (init.method || 'GET') === 'GET' && pathname.includes('/events/')) {
+      const method = init.method || 'GET'
+      const eventId = body?.id || decodeURIComponent(pathname.split('?')[0].split('/').at(-1))
+      const oldEvent = context.boundConnectionId === PREVIOUS_CONNECTION_ID
+      const iCalUID = oldEvent ? 'previous@calendar.fixture.invalid' : 'destination@calendar.fixture.invalid'
+      if (providerResult === 'already-cancelled' && pathname.includes('/events/')) return new Response(null, { status: 410 })
+      if (providerResult === 'lost-post-response' && method === 'GET' && eventId === MEETING_REFERENCE) {
         return new Response(JSON.stringify({
           id: MEETING_REFERENCE,
-          extendedProperties: { private: { clawpilotMeetingReference: MEETING_REFERENCE } },
+          iCalUID,
+          extendedProperties: { private: { clawpilotMeetingReference: MEETING_REFERENCE, clawpilotPipelineId: PIPELINE_ID } },
         }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (providerResult === 'lost-post-response' && init.method === 'DELETE') {
         return new Response(null, { status: 404 })
       }
       return new Response(JSON.stringify({
-        id: 'provider-event-id',
+        id: eventId,
+        ...(providerResult === 'missing-occurrence' || (providerResult === 'missing-prior-occurrence' && oldEvent)
+          || (providerResult === 'lost-post-response' && method === 'PATCH') ? {} : { iCalUID }),
+        ...(method === 'GET' && !oldEvent ? { extendedProperties: { private: {
+          clawpilotMeetingReference: MEETING_REFERENCE, clawpilotPipelineId: PIPELINE_ID,
+        } } } : {}),
         htmlLink: 'https://calendar.google.com/event?eid=test',
         hangoutLink: 'https://meet.google.com/abc-defg-hij',
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -974,16 +1037,11 @@ const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.
       ? { ...contactTarget, entity: 'meetings', id: MEETING_ID, referenceCode: MEETING_REFERENCE }
       : contactTarget,
     resolveCrmReferenceCode: async (value) => value,
-    stageCrmRecordWithClient: async () => { throw new Error('not expected') },
-    stageCrmRecordInPostgres: async (input) => {
-      stageCalls.push(input)
-      return {
-        id: MEETING_ID,
-        referenceCode: MEETING_REFERENCE,
-        shortUrl: 'https://clawpilot.example/m/gm1234567',
-        sourceHash: 'meeting-source-hash',
-      }
+    stageCrmRecordWithClient: async (client, input) => {
+      assert.equal(client, transactionClient)
+      return stageDeliveryMeeting(input)
     },
+    stageCrmRecordInPostgres: stageDeliveryMeeting,
   },
   '@/lib/persistence/organizationCommunications': {
     OrganizationCommunicationPersistenceError,
@@ -995,7 +1053,14 @@ const processRuntime = loadTypeScriptModule('app_src/lib/crm/integrationActions.
   },
   '@/lib/persistence/postgres': {
     query: processQuery,
-    withTransaction: async (work) => work(transactionClient),
+    withTransaction: async (work) => {
+      const preimage = { row: currentRow, meeting: committedDeliveryMeeting }
+      try { return await work(transactionClient) } catch (error) {
+        currentRow = preimage.row
+        committedDeliveryMeeting = preimage.meeting
+        throw error
+      }
+    },
   },
 })
 
@@ -1056,6 +1121,7 @@ async function processMode(mode, fields = {}, actionOverrides = {}) {
   existingCalendarEvent = null
   providerRequests = []
   stageCalls = []
+  occurrenceClaims = []
   terminalMeetingFailure = null
   joinUrlClearCount = 0
   const payload = mode ? { meetingMode: mode, ...fields } : fields
@@ -1078,6 +1144,9 @@ assert.equal(currentRow.response_summary.calendarAccessRole, 'owner')
 assert.equal(currentRow.response_summary.accountEmail, ORGANIZER_EMAIL,
   'the live primary must match the queued account, not the stale Maton account label')
 assert.equal(currentRow.response_summary.organizerEmail, ORGANIZER_EMAIL)
+assert.deepEqual(occurrenceClaims, [{ pipelineId: PIPELINE_ID, meetingId: MEETING_ID, calendarId: ORGANIZER_EMAIL,
+  externalEventId: MEETING_REFERENCE, occurrenceKey: currentRow.response_summary.calendarOccurrence.occurrenceKey }])
+assert.match(currentRow.response_summary.calendarOccurrence.occurrenceKey, /^[a-f0-9]{64}$/)
 assert.match(legacyMeetWrite.pathname, /calendars\/jarrett%40bposupplychain\.com\/events/,
   'the historical primary alias must be dispatched to the verified literal calendar ID')
 
@@ -1222,6 +1291,7 @@ async function processExistingMeeting(payloadOverrides, previous, mode = 'succes
   providerResult = mode
   providerRequests = []
   stageCalls = []
+  occurrenceClaims = []
   terminalMeetingFailure = null
   joinUrlClearCount = 0
   existingCalendarEvent = {
@@ -1273,18 +1343,28 @@ const oldCalendar = previousCalendarSnapshot({
   calendarId: PREVIOUS_CALENDAR_EMAIL,
   organizerEmail: PREVIOUS_CALENDAR_EMAIL,
 })
+moveReservations = []
 updateRequests = await processExistingMeeting(
   { meetingMode: 'in_person', location: '400 Fulfillment Avenue' },
   oldCalendar,
 )
 const destinationCreateIndex = updateRequests.findIndex((request) => request.init.method === 'POST')
 const oldDeleteIndex = updateRequests.findIndex((request) => request.init.method === 'DELETE')
+const oldReadIndex = updateRequests.findIndex((request) => (request.init.method || 'GET') === 'GET'
+  && request.pathname.includes('/events/existing-event-id'))
+assert.ok(oldReadIndex >= 0 && oldReadIndex < destinationCreateIndex, 'move must verify the old exact occurrence before dispatch')
 assert.ok(destinationCreateIndex >= 0 && oldDeleteIndex > destinationCreateIndex, 'a Calendar move must create the destination before deleting the source')
 assert.match(updateRequests[destinationCreateIndex].pathname, /calendars\/jarrett%40bposupplychain\.com\/events/)
 assert.equal(updateRequests[destinationCreateIndex].context.boundConnectionId, CONNECTION_ID)
 assert.match(updateRequests[oldDeleteIndex].pathname, /legacy-calendar%40example\.com\/events\/existing-event-id/)
 assert.equal(updateRequests[oldDeleteIndex].context.ownerEmail, ACTOR_EMAIL)
 assert.equal(updateRequests[oldDeleteIndex].context.boundConnectionId, PREVIOUS_CONNECTION_ID)
+assert.deepEqual(occurrenceClaims.map(({ calendarId, externalEventId }) => [calendarId, externalEventId]),
+  [[PREVIOUS_CALENDAR_EMAIL, oldCalendar.eventId], [ORGANIZER_EMAIL, MEETING_REFERENCE]])
+assert.notEqual(occurrenceClaims[0].occurrenceKey, occurrenceClaims[1].occurrenceKey, 'Both different keys remain attached to the same moved meeting')
+assert.equal(moveReservations.length, 1)
+assert.equal(moveReservations[0].source.occurrenceKey, occurrenceClaims[0].occurrenceKey)
+assert.equal(moveReservations[0].destination.occurrenceKey, occurrenceClaims[1].occurrenceKey)
 
 updateRequests = await processExistingMeeting(
   { meetingMode: 'in_person', location: '500 Retry Road' },
@@ -1298,6 +1378,57 @@ assert.ok(
   updateRequests.some((request) => (request.init.method || 'GET') === 'GET' && request.pathname.includes(`/events/${MEETING_REFERENCE}`)),
   'a 409 retry must verify that the destination event belongs to the same ClawPilot meeting',
 )
+assert.equal(occurrenceClaims.at(-1).occurrenceKey, currentRow.response_summary.calendarOccurrence.occurrenceKey,
+  'the exact 409 GET preserves the occurrence when the reconciliation PATCH response omits it')
+
+providerResult = 'missing-prior-occurrence'
+providerRequests = []
+const missingPrior = await processRuntime.processCrmIntegrationAction(leasedCalendarAction(
+  { previousCalendar: oldCalendar }, { aggregate_type: 'crm_meeting', aggregate_id: MEETING_ID, reference_code: MEETING_REFERENCE },
+))
+assert.equal(missingPrior.status, 'dead')
+assert.match(missingPrior.lastError, /previous Calendar occurrence could not be verified/)
+assert.equal(providerRequests.some(request => request.init.method && request.init.method !== 'GET'), false,
+  'no destination event or source deletion is authorized without prior occurrence proof')
+
+providerResult = 'success'
+providerRequests = []
+moveReservations = []
+moveReservationConflict = true
+const conflictingMovePayload = { previousCalendar: oldCalendar }
+const moveTarget = { aggregate_type: 'crm_meeting', aggregate_id: MEETING_ID, reference_code: MEETING_REFERENCE }
+const conflictingMove = await processRuntime.processCrmIntegrationAction(leasedCalendarAction(conflictingMovePayload, moveTarget))
+assert.equal(conflictingMove.status, 'dead')
+assert.match(conflictingMove.lastError, /destination occurrence already belongs.*source was not deleted/)
+assert.equal(conflictingMove.responseSummary.calendarMove.destinationEventId, MEETING_REFERENCE)
+assert.equal(committedDeliveryMeeting.sourcePayload.calendarId, PREVIOUS_CALENDAR_EMAIL, 'The source remains the current edit tuple')
+assert.equal(providerRequests.filter(request => request.init.method === 'POST').length, 1)
+assert.equal(providerRequests.some(request => request.init.method === 'DELETE'), false)
+assert.equal(moveReservations.length, 1)
+providerRequests = []
+const conflictingMoveRetry = await processRuntime.processCrmIntegrationAction(leasedCalendarAction(conflictingMovePayload, {
+  ...moveTarget, attempts: 2, external_id: conflictingMove.externalId, response_summary: structuredClone(conflictingMove.responseSummary),
+}))
+moveReservationConflict = false
+assert.equal(conflictingMoveRetry.status, 'dead')
+assert.equal(committedDeliveryMeeting.sourcePayload.calendarId, PREVIOUS_CALENDAR_EMAIL)
+assert.equal(moveReservations.length, 2)
+assert.equal(providerRequests.some(request => request.init.method && request.init.method !== 'GET'), false,
+  'A resumed destination conflict must never recreate, patch, or delete an event')
+
+providerRequests = []
+const samePhysicalCalendar = { ...oldCalendar, calendarId: ORGANIZER_EMAIL, organizerEmail: ORGANIZER_EMAIL }
+const oldEventSnapshot = existingCalendarEvent
+existingCalendarEvent = { ...oldEventSnapshot, source_payload: { ...oldEventSnapshot.source_payload,
+  calendarId: ORGANIZER_EMAIL, calendarOrganizerEmail: ORGANIZER_EMAIL } }
+previousCalendarList = { items: [{ id: ORGANIZER_EMAIL, summary: 'Same Calendar from another credential', accessRole: 'writer' }] }
+const samePhysicalMove = await processRuntime.processCrmIntegrationAction(leasedCalendarAction({ previousCalendar: samePhysicalCalendar }, moveTarget))
+previousCalendarList = null
+existingCalendarEvent = oldEventSnapshot
+assert.equal(samePhysicalMove.status, 'dead')
+assert.match(samePhysicalMove.lastError, /source and destination resolve to the same Calendar/)
+assert.equal(providerRequests.some(request => request.init.method && request.init.method !== 'GET'), false,
+  'Changing credentials cannot recreate or delete an event on the same physical Calendar')
 
 providerResult = 'delete-403'
 providerRequests = []
@@ -1323,14 +1454,16 @@ const failedMove = await processRuntime.processCrmIntegrationAction(leasedCalend
   { aggregate_type: 'crm_meeting', aggregate_id: MEETING_ID, reference_code: MEETING_REFERENCE },
 ))
 assert.equal(failedMove.status, 'dead')
-assert.equal(failedMove.externalId, 'provider-event-id')
+assert.equal(failedMove.externalId, MEETING_REFERENCE)
 assert.equal(
   failedMove.responseSummary.calendarMove.state,
   'destination-written-source-delete-pending',
   'destination evidence must survive an old-Calendar delete failure',
 )
 assert.equal(failedMove.responseSummary.calendarMove.sourceEventId, oldCalendar.eventId)
-assert.equal(failedMove.responseSummary.calendarMove.destinationEventId, 'provider-event-id')
+assert.equal(failedMove.responseSummary.calendarMove.destinationEventId, MEETING_REFERENCE)
+assert.match(failedMove.responseSummary.calendarOccurrence.occurrenceKey, /^[a-f0-9]{64}$/)
+assert.match(failedMove.responseSummary.previousCalendarOccurrence.occurrenceKey, /^[a-f0-9]{64}$/)
 assert.equal(providerRequests.filter((request) => request.init.method === 'POST').length, 1)
 
 const durableMoveSummary = structuredClone(failedMove.responseSummary)
@@ -1349,7 +1482,7 @@ const resumedMove = await processRuntime.processCrmIntegrationAction(leasedCalen
     aggregate_id: MEETING_ID,
     reference_code: MEETING_REFERENCE,
     attempts: 2,
-    external_id: 'provider-event-id',
+    external_id: MEETING_REFERENCE,
     response_summary: durableMoveSummary,
   },
 ))
@@ -1360,7 +1493,36 @@ assert.equal(
   'a move retry must reuse durable destination evidence rather than create another event',
 )
 assert.equal(providerRequests.filter((request) => request.init.method === 'DELETE').length, 1)
+assert.equal(providerRequests.filter((request) => request.pathname.includes('/events/') && !request.init.method).length, 0,
+  'the retry reuses the durable source and destination occurrence proof without re-reading a deleted source')
 assert.equal(Object.hasOwn(resumedMove.responseSummary, 'calendarMove'), false)
+
+providerResult = 'success'
+providerRequests = []
+stageCalls = []
+existingCalendarEvent = null
+const hydrationSummary = { eventId: MEETING_REFERENCE, calendarId: ORGANIZER_EMAIL, organizerEmail: ORGANIZER_EMAIL }
+const hydrated = await processRuntime.processCrmIntegrationAction(leasedCalendarAction({}, {
+  attempts: 2, external_id: MEETING_REFERENCE, response_summary: hydrationSummary,
+}))
+assert.equal(hydrated.status, 'succeeded', hydrated.lastError || 'recorded exact delivery could not hydrate')
+assert.equal(providerRequests.some(request => request.init.method && request.init.method !== 'GET'), false,
+  'occurrence hydration of a previously delivered event must not write to Google')
+assert.match(hydrated.responseSummary.calendarOccurrence.occurrenceKey, /^[a-f0-9]{64}$/)
+
+providerRequests = []
+stageCalls = []
+occurrenceClaimConflict = true
+const conflicted = await processRuntime.processCrmIntegrationAction(leasedCalendarAction())
+occurrenceClaimConflict = false
+assert.equal(conflicted.status, 'dead')
+assert.match(conflicted.lastError, /occurrence already belongs to a different CRM meeting/)
+assert.equal(conflicted.externalId, MEETING_REFERENCE)
+assert.match(conflicted.responseSummary.calendarOccurrence.occurrenceKey, /^[a-f0-9]{64}$/,
+  'A hold preserves exact provider delivery evidence rather than causing another POST')
+assert.equal(providerRequests.filter(request => request.init.method === 'POST').length, 1)
+assert.equal(committedDeliveryMeeting.sourcePayload.calendarDeliveryStatus, 'queued',
+  'A conflicting occurrence must roll back the final sent meeting along with action completion')
 
 providerResult = 'success'
 providerRequests = []
@@ -1442,6 +1604,28 @@ assert.equal(deleteFailure.status, 'dead')
 assert.equal(deleteFailure.responseSummary.providerCode, 'PERMISSION_DENIED')
 assert.match(deleteFailure.responseSummary.providerError, /cannot delete this event/)
 assert.ok(providerRequests.some((request) => request.init.method === 'DELETE'))
+
+providerResult = 'success'
+providerRequests = []
+occurrenceClaims = []
+const cancellation = await processRuntime.processCrmIntegrationAction(leasedCalendarAction(
+  { meetingStatus: 'cancelled' }, { aggregate_type: 'crm_meeting', aggregate_id: MEETING_ID, reference_code: MEETING_REFERENCE },
+))
+assert.equal(cancellation.status, 'succeeded', cancellation.lastError || 'Exact cancellation failed')
+assert.equal(cancellation.responseSummary.calendarOccurrence.externalEventId, 'event-to-delete')
+assert.ok(providerRequests.findIndex(request => request.pathname.includes('/events/') && !request.init.method)
+  < providerRequests.findIndex(request => request.init.method === 'DELETE'))
+assert.ok(occurrenceClaims.every(proof => proof.externalEventId === 'event-to-delete' && proof.calendarId === ORGANIZER_EMAIL))
+
+providerResult = 'already-cancelled'
+providerRequests = []
+occurrenceClaims = []
+const missingCancellation = await processRuntime.processCrmIntegrationAction(leasedCalendarAction(
+  { meetingStatus: 'cancelled' }, { aggregate_type: 'crm_meeting', aggregate_id: MEETING_ID, reference_code: MEETING_REFERENCE },
+))
+assert.equal(missingCancellation.status, 'succeeded', missingCancellation.lastError || 'Previously cancelled event did not settle')
+assert.equal(Object.hasOwn(missingCancellation.responseSummary, 'calendarOccurrence'), false)
+assert.deepEqual(occurrenceClaims, [], 'An absent event cannot prove an occurrence key')
 
 currentRow = actionRow({
   status: 'dead',

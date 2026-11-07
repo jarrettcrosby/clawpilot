@@ -7,6 +7,12 @@ import {
   type CalendarDiscoverySource,
   type CalendarDiscoveryStore,
 } from '@/lib/crm/calendarDiscovery'
+import {
+  calendarOccurrenceCreationHeld,
+  claimVerifiedCalendarOccurrence,
+  lockCalendarOccurrencePipeline,
+  readCalendarOccurrenceOwnership,
+} from '@/lib/crm/calendarOccurrenceClaims'
 import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
 import { resolveVerifiedPipelineCalendarSelection } from '@/lib/integrations/organizationCommunications'
 import { matonFetch } from '@/lib/maton'
@@ -65,7 +71,7 @@ async function lockedSource(client: PoolClient, expected: CalendarDiscoverySourc
 }
 
 type MeetingRow = {
-  id: string; source_key: string; source_payload: Record<string, unknown>
+  id: string; reference_code: string; source_key: string; source_payload: Record<string, unknown>
   organization_id: string | null; contact_id: string | null; lead_id: string | null
   opportunity_id: string | null; subject: string; description: string | null
   starts_at: Date | string; ends_at: Date | string; timezone: string
@@ -77,6 +83,7 @@ type MeetingRow = {
 async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarDiscoveryEvent) {
   return withTransaction(async (client) => {
     if (!await lockedSource(client, current)) return { status: 'deferred' as const }
+    await lockCalendarOccurrencePipeline(client, current.pipelineId)
     // Serialize event identity across worker passes and reconnects before lookup.
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
       `crm-calendar-discovery:${current.pipelineId}:${current.calendarId}:${event.externalEventId}`,
@@ -102,14 +109,33 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
       if (known.rows.length > 1) return { status: 'ambiguous' as const }
       meeting = known.rows[0]
     }
-    if (meeting && ['true', '1', 'yes'].includes(String(meeting.source_payload?.archived ?? '').toLowerCase())) {
+    const tuple = { pipelineId: current.pipelineId, calendarId: current.calendarId, externalEventId: event.externalEventId }
+    const occurrenceKey = event.occurrenceKey ?? null
+    const ownership = await readCalendarOccurrenceOwnership(client, { ...tuple, occurrenceKey })
+    if (event.clawpilotMeetingReference && (
+      (meeting && meeting.reference_code !== event.clawpilotMeetingReference)
+      || (ownership.claim_reference_code && ownership.claim_reference_code !== event.clawpilotMeetingReference)
+    )) return { status: 'ambiguous' as const }
+    if (ownership.bound_meeting_id && (
+      (meeting && ownership.bound_meeting_id !== meeting.id)
+      || (occurrenceKey && ownership.bound_occurrence_key !== occurrenceKey)
+    )) return { status: 'ambiguous' as const }
+    if (ownership.claim_meeting_id && meeting && ownership.claim_meeting_id !== meeting.id) {
+      // Existing historical duplicates need exact operator review; never
+      // silently merge records, move associations or choose a new edit target.
+      return { status: 'ambiguous' as const }
+    }
+    if (!meeting && (ownership.claim_meeting_id || ownership.bound_meeting_id)) {
+      // Another calendar's copy and any retained former tuple are read-only.
+      // Do not insert a discovery mapping for them: that grants edit authority.
       return { status: 'skipped' as const }
     }
+    const archived = Boolean(meeting && ['true', '1', 'yes'].includes(String(meeting.source_payload?.archived ?? '').toLowerCase()))
     if (meeting && (!Number.isFinite(Date.parse(event.observedAt))
       || new Date(meeting.updated_at).getTime() > Date.parse(event.observedAt))) {
       // A page fetched before a local save must not overwrite that save even
       // if its outbound action has already completed by the time we get a lock.
-      return { status: 'deferred' as const }
+      return { status: archived ? 'skipped' as const : 'deferred' as const }
     }
     if (meeting) {
       const pending = await client.query(`SELECT 1 FROM crm_integration_actions
@@ -118,11 +144,20 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
           AND status IN ('queued', 'processing', 'failed', 'dead') LIMIT 1`, [current.pipelineId, meeting.id])
       // Preserve unsent local intent, including a failed edit awaiting review.
       // No action lock: dispatch can hold that row while waiting for the meeting.
-      if (pending.rowCount) return { status: 'deferred' as const }
+      if (pending.rowCount) return { status: archived ? 'skipped' as const : 'deferred' as const }
       // A completed Calendar move can leave the old discovery mapping behind.
       // That mapping still prevents a duplicate import but cannot overwrite or
       // cancel the meeting now bound to a different Calendar event.
       if (meeting.external_event_id !== event.externalEventId || meeting.source_payload?.calendarId !== current.calendarId) {
+        return { status: 'skipped' as const }
+      }
+      if (occurrenceKey && event.status !== 'cancelled') {
+        const claim = await claimVerifiedCalendarOccurrence(client, { ...tuple, meetingId: meeting.id, occurrenceKey })
+        if (claim === 'conflict') return { status: 'ambiguous' as const }
+      }
+      // Retain exact identity even for an archived row, without touching its
+      // content, state, relationships, provider mapping or outbox.
+      if (archived) {
         return { status: 'skipped' as const }
       }
     }
@@ -130,6 +165,11 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
     if (!meeting && event.clawpilotMeetingReference) {
       // A marked but unrecognized event needs explicit reconciliation, not a copy.
       return { status: 'skipped' as const }
+    }
+    if (!meeting && (!occurrenceKey || await calendarOccurrenceCreationHeld(client, current.pipelineId))) {
+      // Do not defer the page: subsequent exact known records on it can supply
+      // the missing identity, and the next bounded refresh revisits new items.
+      return { status: 'ambiguous' as const }
     }
     const candidates = event.status === 'cancelled' ? { rows: [] } : await client.query<{
       id: string; organization_id: string | null; email: string; entity: string
@@ -147,7 +187,7 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
     }
     const contactIds = contacts.map((row) => row.id).sort()
     const digest = crypto.createHash('sha256').update(JSON.stringify({
-      event: { ...event, observedAt: undefined }, contactIds,
+      event: { ...event, observedAt: undefined, occurrenceKey: undefined }, contactIds,
     })).digest('hex')
     if (meeting?.event_hash === digest) return { status: 'unchanged' as const }
     const cancelled = event.status === 'cancelled'
@@ -194,6 +234,13 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
         replaceConferenceDetails: !cancelled,
       },
     })
+    if (!meeting) {
+      if (!occurrenceKey || await claimVerifiedCalendarOccurrence(client, { ...tuple, meetingId: staged.id, occurrenceKey }) !== 'claimed') {
+        // The insert, relationships and SuiteCRM outbox must roll back if the
+        // claim cannot be retained in the same transaction.
+        throw new Error('Calendar occurrence ownership changed during import')
+      }
+    }
     await client.query(`INSERT INTO crm_calendar_discovery_events
       (pipeline_id, source_id, calendar_id, external_event_id, meeting_id, event_hash)
       VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid, $6)

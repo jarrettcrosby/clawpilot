@@ -51,6 +51,8 @@ export type CalendarDiscoveryEvent = {
   joinUrl: string | null
   recurringEventId: string | null
   originalStartTime: string | null
+  /** Provider occurrence identity for deduplication only, never edit authority. */
+  occurrenceKey: string | null
   clawpilotMeetingReference: string | null
   /** Outside the bounded window, only an already recorded event may update. */
   allowCreate: boolean
@@ -194,6 +196,40 @@ function eventTime(value: unknown, fallbackZone: string): string | null {
   return result
 }
 
+function calendarDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const date = isoDate(`${value}T00:00:00Z`)
+  return date?.slice(0, 10) === value
+}
+
+/** Google event IDs are calendar-local. Recurring instances share an iCalUID,
+ * so only its original occurrence (not a rescheduled start or calendar-local
+ * parent ID) can distinguish instances across calendars. Do not guess when a
+ * tombstone or incomplete snapshot has no proof. */
+export function calendarOccurrenceKey(input: unknown): string | null {
+  const event = record(input)
+  const uid = event?.iCalUID
+  if (typeof uid !== 'string' || !uid || uid.length > 1024 || /[\s\p{Cc}]/u.test(uid)) return null
+  if (event?.recurrence !== undefined) return null // A series master is not a meeting instance.
+  let occurrence = 'single'
+  if (event?.recurringEventId !== undefined || event?.originalStartTime !== undefined) {
+    const start = record(event?.originalStartTime)
+    if (typeof event?.recurringEventId !== 'string' || !event.recurringEventId || !start) return null
+    if (start.dateTime === undefined && calendarDate(start.date)) {
+      occurrence = `date:${start.date}`
+    } else if (start.date === undefined && typeof start.dateTime === 'string') {
+      // A floating original start cannot distinguish the two instants of a
+      // DST fold. Require offset-bearing provider evidence for a timed key.
+      const time = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:0\d|1[0-4]):[0-5]\d)$/u.exec(start.dateTime)
+      if (!time || !calendarDate(time[1]) || /[+-]14:(?!00$)/u.test(start.dateTime)) return null
+      const instant = isoDate(start.dateTime)
+      if (!instant) return null
+      occurrence = `instant:${instant}`
+    } else return null
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(['google-calendar-occurrence-v1', uid, occurrence])).digest('hex')
+}
+
 function validateSource(source: CalendarDiscoverySource): void {
   if (![source.id, source.pipelineId, source.workspaceOrganizationId].every((value) => UUID.test(value))) {
     throw new SafeCalendarDiscoveryError('Calendar discovery source is invalid')
@@ -314,7 +350,14 @@ export function parseCalendarDiscoveryEvent(
   // account/self alias or room resource must never become CRM matching proof.
   if (organizerEmail && !excluded.has(organizerEmail)) matching.add(organizerEmail)
   for (const address of excluded) if (address) matching.delete(address)
-  const privateReference = text(record(record(event.extendedProperties)?.private)?.clawpilotMeetingReference, 50, 'meeting reference').toLowerCase()
+  const privateMetadata = record(record(event.extendedProperties)?.private)
+  const privateReference = text(privateMetadata?.clawpilotMeetingReference, 50, 'meeting reference').toLowerCase()
+  const validReference = /^gm(?:[0-9]{7}|[0-9a-v]{12})$/.test(privateReference)
+  // A provider marker is never authority to select a local meeting. Its
+  // presence can only prevent ambiguous or cross-pipeline import.
+  if (privateMetadata && ((Object.hasOwn(privateMetadata, 'clawpilotMeetingReference') && !validReference)
+    || (Object.hasOwn(privateMetadata, 'clawpilotPipelineId')
+      && (privateMetadata.clawpilotPipelineId !== source.pipelineId || !validReference)))) return null
   const allowCreate = status !== 'cancelled' && Boolean(startsAt && endsAt
     && Date.parse(endsAt) > now.getTime() - 30 * DAY_MS
     && Date.parse(startsAt) < now.getTime() + 90 * DAY_MS)
@@ -328,7 +371,8 @@ export function parseCalendarDiscoveryEvent(
     externalEventUrl: https(event.htmlLink), joinUrl: conferenceJoinUrl(event),
     recurringEventId: event.recurringEventId ? identifier(event.recurringEventId, 1000, 'recurring event ID') : null,
     originalStartTime: eventTime(event.originalStartTime, timeZone),
-    clawpilotMeetingReference: /^gm(?:[0-9]{7}|[0-9a-v]{12})$/.test(privateReference) ? privateReference : null,
+    occurrenceKey: calendarOccurrenceKey(event),
+    clawpilotMeetingReference: validReference ? privateReference : null,
     allowCreate,
   }
 }

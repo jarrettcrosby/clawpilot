@@ -37,6 +37,46 @@ function event(overrides = {}) {
     htmlLink: 'https://calendar.google.com/event?eid=public', hangoutLink: 'https://meet.google.com/aaa-bbbb-ccc',
     ...overrides }
 }
+{
+  const uid = 'fixture-invite@provider.example'
+  const single = event({ iCalUID: uid })
+  const parse = (value, actualSource = source) => api.parseCalendarDiscoveryEvent(actualSource, value, actualSource.timeZone, now)
+  const copySource = { ...source, calendarId: 'attendee@workspace.example', timeZone: 'America/Los_Angeles' }
+  const key = parse(single).occurrenceKey
+  assert.match(key, /^[a-f0-9]{64}$/u)
+  assert.equal(parse({ ...single, id: 'copy-on-another-calendar' }, copySource).occurrenceKey, key)
+  assert.notEqual(parse({ ...single, iCalUID: uid.toUpperCase() }).occurrenceKey, key, 'provider UID is opaque')
+  const recurring = { ...single, recurringEventId: 'series-on-calendar-a', originalStartTime: { dateTime: '2026-10-21T10:00:00-04:00' } }
+  const original = parse(recurring).occurrenceKey
+  assert.match(original, /^[a-f0-9]{64}$/u)
+  assert.notEqual(original, key, 'single events and instances do not alias')
+  assert.equal(parse({ ...recurring, id: 'moved-copy', recurringEventId: 'series-on-calendar-b',
+    originalStartTime: { dateTime: '2026-10-21T14:00:00.000Z' },
+    start: { dateTime: '2026-10-22T18:00:00Z' }, end: { dateTime: '2026-10-22T18:30:00Z' } }, copySource).occurrenceKey, original,
+  'calendar IDs, presentation time zones and rescheduling do not change the occurrence')
+  assert.notEqual(parse({ ...recurring, originalStartTime: { dateTime: '2026-10-28T14:00:00Z' } }).occurrenceKey, original)
+  const allDay = { ...recurring, originalStartTime: { date: '2026-10-21' } }
+  assert.equal(parse(allDay).occurrenceKey, parse(allDay, copySource).occurrenceKey, 'all-day identity is a date, not local midnight')
+  assert.notEqual(parse(allDay).occurrenceKey, parse({ ...allDay, originalStartTime: { dateTime: '2026-10-21T00:00:00Z' } }).occurrenceKey)
+  for (const incomplete of [
+    event(), { ...single, iCalUID: ` ${uid}` }, { ...single, recurrence: ['RRULE:FREQ=WEEKLY'] },
+    { ...recurring, originalStartTime: undefined }, { ...recurring, recurringEventId: undefined },
+    { ...recurring, originalStartTime: { date: '2026-02-30' } },
+    { ...recurring, originalStartTime: { date: '2026-10-21', dateTime: '2026-10-21T14:00:00Z' } },
+    { ...recurring, originalStartTime: { dateTime: '2026-11-01T01:30:00', timeZone: 'America/New_York' } },
+    { id: 'tombstone-only', status: 'cancelled' },
+  ]) assert.equal(api.calendarOccurrenceKey(incomplete), null, 'incomplete evidence cannot prove a cross-calendar identity')
+  assert.notEqual(api.calendarOccurrenceKey({ ...recurring, originalStartTime: { dateTime: '2026-11-01T01:30:00-04:00' } }),
+    api.calendarOccurrenceKey({ ...recurring, originalStartTime: { dateTime: '2026-11-01T01:30:00-05:00' } }), 'DST folds are distinct instants')
+  for (const privateMetadata of [
+    { clawpilotMeetingReference: 'malformed' },
+    { clawpilotPipelineId: source.pipelineId },
+    { clawpilotMeetingReference: 'gm1234567', clawpilotPipelineId: '20000000-0000-4000-8000-000000000002' },
+  ]) assert.equal(parse({ ...single, extendedProperties: { private: privateMetadata } }), null)
+  assert.equal(parse({ ...single, extendedProperties: { private: {
+    clawpilotMeetingReference: 'gm1234567', clawpilotPipelineId: source.pipelineId,
+  } } }).clawpilotMeetingReference, 'gm1234567', 'matching marker is retained only as conflicting-identity evidence')
+}
 function fixture(options = {}) {
   const state = { cursor: options.cursor ? copy(options.cursor) : null, writes: [], gets: [], events: [],
     authorized: true, results: [], authorities: 0 }
