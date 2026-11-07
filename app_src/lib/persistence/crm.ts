@@ -3261,50 +3261,38 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   await lockGmailMailboxBindingWithClient(client, { ownerEmail: input.ownerEmail, connectionId: input.connectionId,
     identity: input.mailboxIdentity, observedAt: new Date().toISOString() })
   if (!missingIntake) assertSameRetainedGmailEvidence(retainedGmailMessageEvidence(cached), input.messageEvidence)
-  if (firstSeen) {
-    // The batch already holds the ordinary per-owner intake lock. Use the same
-    // per-mailbox source fence as ensureGmailSourceWithClient before checking
-    // absence, including malformed or misplaced rows excluded by cache above.
-    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',
-      [`crm-email-source:${input.mailboxIdentity.mailboxId}:${input.providerMessageId}`])
-    const inbound = await client.query(`SELECT id::text FROM crm_inbound_messages
-      WHERE owner_email=$1 AND lower(btrim(external_message_id))=$2 ORDER BY id LIMIT 2 FOR UPDATE`, [input.ownerEmail, input.providerMessageId])
-    const sources = await client.query(`SELECT id::text,mailbox_id::text,owner_email,intake_pipeline_id::text,provider_message_id,
-        intake_workspace_id::text,observed_connection_id,provider_thread_id,evidence_hash
-      FROM crm_email_sources WHERE lower(btrim(provider_message_id))=$1 AND (owner_email=$2 OR mailbox_id=$3::uuid)
-      ORDER BY id LIMIT 2 FOR UPDATE`, [input.providerMessageId, input.ownerEmail, input.mailboxIdentity.mailboxId])
-    if (missingIntake) {
-      if (inbound.rows.length || sources.rows.length) throw refuse()
-    } else {
-      const source = sources.rows[0]
-      if (inbound.rows.length !== 1 || inbound.rows[0].id !== cached.id || sources.rows.length !== 1
-        || source.id !== cached.canonical_source_id || source.mailbox_id !== input.mailboxIdentity.mailboxId
-        || source.owner_email !== input.ownerEmail || source.intake_pipeline_id !== input.pipelineId
-        || source.intake_workspace_id !== scope.rows[0].workspace_organization_id || source.observed_connection_id !== input.connectionId
-        || source.provider_message_id !== input.providerMessageId || source.provider_thread_id !== input.providerThreadId
-        || source.evidence_hash !== gmailEvidenceHash(input.messageEvidence)
-        || cached.pipeline_id !== input.pipelineId
-        || (cached.raw_metadata as Record<string, unknown>)?.reviewedIntakeScope !== CASEY_FIRST_SEEN_SCOPE) throw refuse()
-    }
-    const other = await client.query(`SELECT interaction.id FROM crm_interactions interaction
-      JOIN pipeline_spaces pipeline ON pipeline.id=interaction.pipeline_id
-      WHERE pipeline.owner_email=$1 AND ((lower(btrim(interaction.provider_message_id))=$3
-        AND (interaction.pipeline_id<>$2::uuid OR interaction.provider_message_id<>$3))
-        OR (interaction.pipeline_id<>$2::uuid AND interaction.canonical_source_id=$4::uuid))
-      ORDER BY interaction.id LIMIT 1 FOR UPDATE OF interaction`,
-    [input.ownerEmail, input.pipelineId, input.providerMessageId, cached.canonical_source_id || null])
-    if (other.rows.length) throw refuse()
-  }
+  // The batch already holds the ordinary per-owner intake lock. Use the same
+  // per-mailbox source fence as ensureGmailSourceWithClient before checking for
+  // normalized aliases or misplaced records that the exact cache query misses.
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',
+    [`crm-email-source:${input.mailboxIdentity.mailboxId}:${input.providerMessageId}`])
+  const inbound = await client.query(`SELECT id::text FROM crm_inbound_messages
+    WHERE owner_email=$1 AND lower(btrim(external_message_id))=lower($2::text) ORDER BY id LIMIT 2 FOR UPDATE`, [input.ownerEmail, input.providerMessageId])
+  if (missingIntake ? inbound.rows.length !== 0 : inbound.rows.length !== 1 || inbound.rows[0].id !== cached.id) throw refuse()
+  const sources = await client.query(`SELECT id::text,mailbox_id::text,owner_email,intake_pipeline_id::text,provider_message_id,
+      intake_workspace_id::text,observed_connection_id,provider_thread_id,evidence_hash
+    FROM crm_email_sources WHERE lower(btrim(provider_message_id))=lower($1::text) AND (owner_email=$2 OR mailbox_id=$3::uuid)
+    ORDER BY id LIMIT 2 FOR UPDATE`, [input.providerMessageId, input.ownerEmail, input.mailboxIdentity.mailboxId])
   if (cached.mailbox_id) {
-    if (cached.mailbox_id !== input.mailboxIdentity.mailboxId || !cached.canonical_source_id) throw refuse()
-    const original = await client.query(`SELECT id FROM crm_email_sources WHERE id=$1::uuid
-      AND mailbox_id=$2::uuid AND owner_email=$3 AND provider_message_id=$4
-      AND provider_thread_id IS NOT DISTINCT FROM $5::text FOR SHARE`,
-    [cached.canonical_source_id, input.mailboxIdentity.mailboxId, input.ownerEmail, input.providerMessageId, input.providerThreadId])
-    if (original.rows.length !== 1) throw refuse()
-  } else if (!missingIntake) {
-    if (cached.canonical_source_id || !input.legacyAdoption) throw refuse()
-  }
+    const source = sources.rows[0]
+    if (cached.mailbox_id !== input.mailboxIdentity.mailboxId || !cached.canonical_source_id || sources.rows.length !== 1
+      || source.id !== cached.canonical_source_id || source.mailbox_id !== input.mailboxIdentity.mailboxId
+      || source.owner_email !== input.ownerEmail || source.provider_message_id !== input.providerMessageId
+      || source.provider_thread_id !== input.providerThreadId || source.evidence_hash !== gmailEvidenceHash(input.messageEvidence)) throw refuse()
+    // Historical intake may have occurred in another pipeline. The stricter
+    // target-intake pins apply only to a replay of first-seen admission.
+    if (firstSeen && (source.intake_pipeline_id !== input.pipelineId
+      || source.intake_workspace_id !== scope.rows[0].workspace_organization_id || source.observed_connection_id !== input.connectionId
+      || cached.pipeline_id !== input.pipelineId
+      || (cached.raw_metadata as Record<string, unknown>)?.reviewedIntakeScope !== CASEY_FIRST_SEEN_SCOPE)) throw refuse()
+  } else if (sources.rows.length || cached.canonical_source_id || (!missingIntake && (firstSeen || !input.legacyAdoption))) throw refuse()
+  const other = await client.query(`SELECT interaction.id FROM crm_interactions interaction
+    JOIN pipeline_spaces pipeline ON pipeline.id=interaction.pipeline_id
+    WHERE pipeline.owner_email=$1 AND (lower(btrim(interaction.provider_message_id))=lower($3::text) OR interaction.canonical_source_id=$4::uuid)
+      AND (interaction.pipeline_id<>$2::uuid OR interaction.provider_message_id IS DISTINCT FROM $3)
+    ORDER BY interaction.id LIMIT 1 FOR UPDATE OF interaction`,
+  [input.ownerEmail, input.pipelineId, input.providerMessageId, cached.canonical_source_id || null])
+  if (other.rows.length) throw refuse()
   const raw = cached.raw_metadata as Record<string, unknown> || {}
   const headers = raw.emailAddressHeaders as Record<string, Array<{ address?: string }>> || {}
   if (!Array.isArray(headers.from) || headers.from.length !== 1
@@ -3585,8 +3573,8 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     const identityKeys = [...new Set(input.messages.flatMap(message => message.participantEmails.map(email =>
       `crm-participant:${message.ownerEmail}:${email.trim().toLowerCase()}`)))].sort()
     for (const key of identityKeys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
-    if (firstSeen) for (const id of [...messageIds].sort()) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',
-      [`crm-email-intake:${input.messages[0].ownerEmail}:${id}`])
+    const intakeKeys = [...new Set(input.messages.map(message => `crm-email-intake:${message.ownerEmail}:${message.providerMessageId}`))].sort()
+    for (const key of intakeKeys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
     const plans = new Map<ReviewedGmailInteractionInput, Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>>()
     for (const message of [...input.messages].sort((a, b) => `${a.pipelineId}:${a.providerMessageId}`.localeCompare(`${b.pipelineId}:${b.providerMessageId}`))) {
       plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceMode))

@@ -1017,7 +1017,8 @@ try {
       const selection = { ownerEmail: CASEY.owner, workspaceId: CASEY.workspace, pipelineId: CASEY.pipeline,
         connectionId: CASEY.connection, messageIds: CASEY.messages.map(row => row.message) }
       const snapshot = async () => (await client.query(`SELECT jsonb_build_object(
-        'interactions',(SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY i.id),'[]') FROM crm_interactions i WHERE i.pipeline_id=$1),
+        'interactions',(SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY i.id),'[]') FROM crm_interactions i
+          JOIN pipeline_spaces p ON p.id=i.pipeline_id WHERE p.owner_email=$2),
         'cache',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM crm_inbound_messages m WHERE m.owner_email=$2),
         'sources',(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.id),'[]') FROM crm_email_sources s WHERE s.owner_email=$2),
         'decisions',(SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.id),'[]') FROM crm_email_review_decisions d WHERE d.pipeline_id=$1),
@@ -1042,6 +1043,40 @@ try {
         expectedTargetFingerprint: previews[index].targetFingerprint }))
       await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: [apply[0], { ...apply[1], expectedTargetFingerprint: 'f'.repeat(64) }], apply: true }))
       assert.deepEqual(await snapshot(), absent)
+      const second = CASEY.messages[1].message, alias = ` ${second.toUpperCase()} `
+      const addInteraction = (pipeline, providerId, sourceId = null) => client.query(`INSERT INTO crm_interactions
+        (pipeline_id,source_key,interaction_type,suitecrm_module,subject,provider_message_id,provider_thread_id,canonical_source_id)
+        VALUES($1,'synthetic-casey-collision','email','Emails','Synthetic Casey collision',$2,$3,$4)`,
+      [pipeline, providerId, CASEY.thread, sourceId])
+      const withCollision = async (insert, verify) => {
+        const name = `retained_casey_collision_${++savepoint}`
+        await client.query(`SAVEPOINT ${name}`)
+        try { await insert(); await verify() }
+        finally { await client.query(`ROLLBACK TO SAVEPOINT ${name}`); await client.query(`RELEASE SAVEPOINT ${name}`) }
+      }
+      const assertWholeBatchHeld = async () => {
+        const withConflict = await snapshot()
+        for (const doApply of [false, true]) await assert.rejects(scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: doApply }),
+          /evidence changed or conflicts/)
+        assert.deepEqual(await snapshot(), withConflict, 'The second-message collision must leave both Casey messages unchanged')
+        assert.deepEqual(await outsideJobs(), unrelated)
+      }
+      await withCollision(() => addInteraction(CASEY.pipeline, alias), assertWholeBatchHeld)
+      await withCollision(() => addInteraction(CASEY.intake, second), assertWholeBatchHeld)
+      await withCollision(() => client.query(`INSERT INTO crm_inbound_messages
+        (owner_email,pipeline_id,external_message_id,external_thread_id,raw_metadata) VALUES($1,$2,$3,$4,'{}')`,
+      [CASEY.owner, CASEY.intake, alias, CASEY.thread]), assertWholeBatchHeld)
+      await withCollision(() => client.query(`INSERT INTO crm_email_sources
+        (mailbox_id,owner_email,provider_message_id,provider_thread_id,intake_pipeline_id,intake_workspace_id,
+          observed_connection_id,observed_account_email,evidence,evidence_hash,provenance)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'{}',$9,'{}')`,
+      [caseyIdentity.mailboxId, CASEY.owner, alias, CASEY.thread, CASEY.intake, CASEY.workspace,
+        CASEY.connection, caseyIdentity.accountEmail, 'a'.repeat(64)]), assertWholeBatchHeld)
+      await withCollision(() => addInteraction(FOREIGN_PIPELINE, second), async () => {
+        assert.deepEqual(await scoped.stageReviewedGmailInteractionsInPostgres({ messages: caseyMessages }), previews,
+          'Another owner’s independent message identity must not enter this collision check')
+      })
+      assert.deepEqual(await snapshot(), absent)
       const staged = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
       assert.ok(staged.every(row => row.applied && row.linksAdded === 4))
       const queued = await snapshot()
@@ -1060,6 +1095,9 @@ try {
         assert.deepEqual(job.payload.emailProjection.accounts, ['native-casey-airspace', 'native-casey-globus'])
         assert.equal(job.payload.attributes.parent_id, 'native-casey-globus')
       }
+      const secondSource = queued.sources.find(row => row.provider_message_id === second)
+      assert.ok(secondSource)
+      await withCollision(() => addInteraction(CASEY.intake, 'different-synthetic-provider-id', secondSource.id), assertWholeBatchHeld)
       const repeated = await scoped.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
       assert.ok(repeated.every((row, index) => !row.applied && row.interactionId === staged[index].interactionId))
       assert.deepEqual(await snapshot(), queued)

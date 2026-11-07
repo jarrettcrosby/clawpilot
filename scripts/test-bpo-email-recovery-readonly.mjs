@@ -202,6 +202,32 @@ await check('missing schema returns bounded metadata hold and always rolls back'
   assert.equal(report.previewRequestDraft,null)
   assert.equal(statements.at(-1),'ROLLBACK')
 })
+await check('metadata preflight fails closed on aliases of the five exact reviewed provider IDs', async () => {
+  const keys = ['cache_alias','interaction_alias','canonical_source_alias']
+  const clean = Object.fromEntries(keys.map(key=>[key,false]))
+  for (const alias of [null,...keys,'unknown']) {
+    const statements = []
+    const report = await collect({ query: async (sql, values) => {
+      statements.push(sql)
+      if (sql.startsWith('SELECT now()')) return { rows:[{ transaction_read_only:'on',isolation:'repeatable read' }] }
+      if (sql.includes('FROM information_schema.tables')) return { rows:values[0].map(table_name=>({table_name})) }
+      if (sql.includes('AS cache_alias')) {
+        assert.deepEqual(values,[SCOPE.ownerEmail,SCOPE.messageIds])
+        for (const [table,column] of [['m','external_message_id'],['i','provider_message_id'],['s','provider_message_id']]) {
+          assert.ok(sql.includes(`lower(btrim(${table}.${column}))=ANY($2::text[])`))
+          assert.ok(sql.includes(`NOT (${table}.${column}=ANY($2::text[]))`))
+        }
+        assert.match(sql,/m\.owner_email=\$1[\s\S]+p\.owner_email=\$1[\s\S]+s\.owner_email=\$1/)
+        return { rows:alias==='unknown'?[]:[{...clean,...(alias?{[alias]:true}:{})}] }
+      }
+      return { rows:[] }
+    } })
+    const expected = (alias==='unknown'?keys:alias?[alias]:[]).map(key=>`reviewed_provider_identity_conflict:${key}`).sort()
+    assert.deepEqual(report.holds.filter(hold=>hold.startsWith('reviewed_provider_identity_conflict:')),expected)
+    assert.equal(report.rolledBack,true)
+    assert.equal(statements.at(-1),'ROLLBACK')
+  }
+})
 await check('query failure and row-bound overrun roll back rather than return partial success', async () => {
   for (const mode of ['failure','overflow']) {
     const statements = []
