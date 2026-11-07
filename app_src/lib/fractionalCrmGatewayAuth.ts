@@ -2,8 +2,18 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 
 export const fractionalCrmCapabilities = [
   'crm.company.read', 'crm.contact.read', 'crm.company.write', 'crm.contact.write', 'crm.onboarding.write',
+  'crm.customer-folder.write',
 ] as const
 export type FractionalCrmCapability = typeof fractionalCrmCapabilities[number]
+export type FractionalCrmCapabilityRequirement = FractionalCrmCapability | readonly FractionalCrmCapability[]
+export const fractionalCrmFolderReadCapabilities = ['crm.customer-folder.write', 'crm.company.read'] as const
+export const fractionalCrmFolderWriteCapabilities = ['crm.customer-folder.write', 'crm.company.write'] as const
+export function hasFractionalCrmCapability(
+  capabilities: readonly FractionalCrmCapability[],
+  required: FractionalCrmCapabilityRequirement,
+): boolean {
+  return (typeof required === 'string' ? [required] : required).some(value => capabilities.includes(value))
+}
 export type FractionalCrmPrincipal = {
   credentialId: string
   sourceInstanceId: string
@@ -84,7 +94,7 @@ export async function authenticateFractionalCrmGateway(
   request: Request,
   config: FractionalCrmGatewayConfiguration,
   readCredential: (id: string) => Promise<FractionalCrmCredential | null>,
-  capability: FractionalCrmCapability,
+  capability: FractionalCrmCapabilityRequirement,
   now = Date.now(),
 ): Promise<FractionalCrmPrincipal> {
   if (!hasFractionalCrmGatewayOrigin(request, config.origin)) throw new FractionalCrmGatewayError(403, 'ORIGIN_DENIED')
@@ -112,7 +122,7 @@ export async function authenticateFractionalCrmGateway(
     || !Array.isArray(row.capabilities) || !row.capabilities.length
     || row.capabilities.some(value => !fractionalCrmCapabilities.includes(value))
     || new Set(row.capabilities).size !== row.capabilities.length) return denied()
-  if (!row.capabilities.includes(capability)) throw new FractionalCrmGatewayError(403, 'CAPABILITY_DENIED')
+  if (!hasFractionalCrmCapability(row.capabilities, capability)) throw new FractionalCrmGatewayError(403, 'CAPABILITY_DENIED')
   return {
     credentialId, sourceInstanceId: row.sourceInstanceId, workspaceOrganizationId: row.workspaceOrganizationId,
     pipelineId: row.pipelineId, rootCompanyGlobalId: row.rootCompanyGlobalId,

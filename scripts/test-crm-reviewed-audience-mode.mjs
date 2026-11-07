@@ -20,18 +20,20 @@ function declarations(path, names) {
     return node.getText(ast)
   }).join('\n')
 }
-function load(path) {
+function load(path, dependencies = {}) {
   const module = { exports: {} }
   const code = ts.transpileModule(read(path), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText
   new Function('module', 'exports', 'require', code)(module, module.exports, name => {
+    if (Object.hasOwn(dependencies, name)) return dependencies[name]
     assert.equal(name, 'node:crypto', 'No external provider/runtime dependency is available')
     return crypto
   })
   return module.exports
 }
 const identity = load('app_src/lib/crm/emailIdentity.ts')
+const caseyPolicy = load('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': identity })
 const stable = load('app_src/lib/crm/stableId.ts')
 const headers = load('app_src/lib/crm/emailAddressHeaders.ts')
 const participants = load('app_src/lib/crm/participantEligibility.ts')
@@ -89,7 +91,19 @@ function harness({ enabled = true, appOnly = true } = {}) {
     if (sql.includes('connection.connection_id, connection.account_email')) return { rows: [{ id: pipeline,
       workspace_organization_id: workspace, owner_email: owner, connection_id: 'selected-connection', account_email: owner }] }
     if (sql.includes('SELECT message.* FROM crm_inbound_messages')) return { rows: [copy(cached)] }
-    if (sql.startsWith('SELECT id FROM crm_email_sources')) return { rows: [{ id: sourceId }] }
+    if (sql.includes('lower(btrim(external_message_id))=lower($2::text) ORDER BY id LIMIT 2 FOR UPDATE')) {
+      assert.deepEqual(copy(params), [owner, evidence.messageId])
+      return { rows: [{ id: cacheId }] }
+    }
+    if (sql.includes('FROM crm_email_sources WHERE lower(btrim(provider_message_id))=lower($1::text)')) {
+      assert.deepEqual(copy(params), [evidence.messageId, owner, mailbox])
+      return { rows: [{ id: sourceId, mailbox_id: mailbox, owner_email: owner,
+        provider_message_id: evidence.messageId, provider_thread_id: evidence.threadId, evidence_hash: identity.gmailEvidenceHash(evidence) }] }
+    }
+    if (sql.includes('lower(btrim(interaction.provider_message_id))=lower($3::text)')) {
+      assert.deepEqual(copy(params), [owner, pipeline, evidence.messageId, sourceId])
+      return { rows: [] }
+    }
     if (sql.includes('lower(btrim(email)) AS email')) return { rows: copy(contacts) }
     if (sql.includes('ORDER BY pipeline.id FOR SHARE OF pipeline, membership')) return { rows: [{ id: pipeline }] }
     if (sql.startsWith('WITH participant_candidates')) return { rows: contacts.map(contact => ({ ...contact, pipeline_id: pipeline, entity: 'contacts' })) }
@@ -121,7 +135,7 @@ function harness({ enabled = true, appOnly = true } = {}) {
     }
     throw new Error(`Unexpected synthetic SQL: ${sql}`)
   } }
-  const runtime = { exports: {}, Buffer, ...identity, ...stable, ...headers, ...participants, ...projection,
+  const runtime = { exports: {}, Buffer, ...identity, ...caseyPolicy, ...stable, ...headers, ...participants, ...projection,
     requireNativeEmail: (condition, code) => { if (!condition) throw new Error(code) },
     crmSourceHash: value => {
       if (value?.audience) state.audiences.push(copy(value.audience))

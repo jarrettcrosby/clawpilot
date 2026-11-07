@@ -1,9 +1,10 @@
 import {
   authenticateFractionalCrmGateway, fractionalCrmGatewayConfiguration, FractionalCrmGatewayError,
-  type FractionalCrmCapability, type FractionalCrmCredential, type FractionalCrmPrincipal,
+  fractionalCrmFolderReadCapabilities, fractionalCrmFolderWriteCapabilities,
+  type FractionalCrmCapabilityRequirement, type FractionalCrmCredential, type FractionalCrmPrincipal,
 } from './fractionalCrmGatewayAuth'
 import { isFractionalCrmGatewayPath } from './fractionalCrmGatewayPath.mjs'
-import { fractionalFolderUrl } from './crm/fractionalCustomerFolder'
+import { fractionalFolderUrl, isFractionalDriveFolderUrl } from './crm/fractionalCustomerFolder'
 
 type Fields = Record<string, unknown>
 export type FractionalCrmPatch = {
@@ -99,6 +100,9 @@ function folderPatch(input: unknown, request: Request, principal: FractionalCrmP
     || actor.organizationId !== principal.fractionalOrganizationId || actor.customerId !== customerId) invalid(422, 'INVALID_ACTOR')
   let folderUrl: string | null
   try { folderUrl = fractionalFolderUrl(value.folderUrl) } catch { return invalid(422, 'INVALID_FOLDER_URL') }
+  if (folderUrl && principal.capabilities.includes('crm.customer-folder.write') && !isFractionalDriveFolderUrl(folderUrl)) {
+    invalid(422, 'INVALID_FOLDER_URL')
+  }
   return { schemaVersion: 1, folderUrl, ifMatch: conditionalVersion(request), idempotencyKey: idempotency(request),
     assertedFractionalActor: { userId: actor.userId, organizationId: actor.organizationId, customerId } }
 }
@@ -135,6 +139,7 @@ const publicErrors = new Set([
   'UNAUTHORIZED', 'INVALID_GLOBAL_ID', 'INVALID_PAGE', 'INVALID_IDEMPOTENCY_KEY',
   'ADDRESS_SHAPE_CONFLICT', 'CONTACT_NAME_SHAPE_CONFLICT', 'CONTACT_RELATIONSHIP_REVIEW', 'CANONICAL_WRITE_MISMATCH',
   'INVALID_FOLDER_URL', 'FOLDER_DESCRIPTION_REPAIR_REQUIRED', 'FOLDER_MANUAL_REVIEW_REQUIRED', 'FOLDER_BINDING_CONFLICT',
+  'FOLDER_CARD_REVIEW_REQUIRED', 'FOLDER_ACCOUNT_REVIEW_REQUIRED',
 ])
 function errorResponse(error: unknown) {
   const known = error instanceof FractionalCrmGatewayError && publicErrors.has(error.code)
@@ -158,9 +163,9 @@ export async function handleFractionalCrmGateway(
     const isFolder = parts.length === 3 && parts[2] === 'customer-folder'
     const isContact = !isFolder && parts.length >= 3
     const isList = isContact && parts.length === 3
-    const capability: FractionalCrmCapability = isOnboarding ? 'crm.onboarding.write'
-      : request.method === 'PATCH' ? (isContact ? 'crm.contact.write' : 'crm.company.write')
-        : isContact ? 'crm.contact.read' : 'crm.company.read'
+    const capability: FractionalCrmCapabilityRequirement = isOnboarding ? 'crm.onboarding.write'
+      : request.method === 'PATCH' ? (isFolder ? fractionalCrmFolderWriteCapabilities : isContact ? 'crm.contact.write' : 'crm.company.write')
+        : isFolder ? fractionalCrmFolderReadCapabilities : isContact ? 'crm.contact.read' : 'crm.company.read'
     const principal = await authenticateFractionalCrmGateway(request, fractionalCrmGatewayConfiguration(env), services.readFractionalCrmCredential, capability)
     exactScope(url, principal, isList, isFolder)
     let result: unknown

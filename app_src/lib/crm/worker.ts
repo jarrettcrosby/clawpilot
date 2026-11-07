@@ -1,5 +1,6 @@
 import {
   deleteSuiteCrmRecord,
+  patchExistingSuiteCrmAccountDescription,
   upsertSuiteCrmRecordWithResult,
   upsertSuiteCrmUserIdentity,
   type SuiteCrmMeetingProjectionReadback,
@@ -41,6 +42,19 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
     let nativeEmailHandled = touchesNativeEmail(item)
     try {
       if (!item.payload || item.payload.localId !== item.aggregateId) throw new Error('SuiteCRM outbox payload is invalid')
+      const accountDescriptionPatch = item.operation === 'patch_account_description'
+      const hasAccountDescriptionMarker = 'accountDescriptionPatch' in item.payload
+      if (accountDescriptionPatch !== hasAccountDescriptionMarker
+        || (accountDescriptionPatch && item.payload.entity !== 'organizations')) {
+        nativeEmailHandled = false
+        throw new Error('CRM Account description publication scope changed')
+      }
+      if (item.operation === 'patch_account_description') {
+        await withVerifiedSuiteCrmRecordLifecycle(item, () => patchExistingSuiteCrmAccountDescription(item.payload))
+        await completeSuiteCrmOutboxInPostgres(item)
+        results.push({ id: item.id, status: 'succeeded' })
+        continue
+      }
       const nativeResult = await nativeEmail.process(item, maxAttempts)
       if (nativeResult.handled) {
         if (nativeResult.settled?.projectionQueued) nativeProjectionsQueued += 1

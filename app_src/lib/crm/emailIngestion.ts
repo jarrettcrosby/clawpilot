@@ -11,6 +11,8 @@ import {
 } from '@/lib/crm/emailIdentity'
 import { assertCaseyGmailAdoption, prepareCaseyGmailAdoption, prepareBoundedLegacyGmailAdoption, selectLateContactGmailMessages,
   type GmailReviewedHistoricalAdoption } from '@/lib/crm/emailReconciliation'
+import { CASEY_FIRST_SEEN_SCOPE, CASEY_PAIR, assertCaseyFirstSeenEvidence, assertCaseyFirstSeenMailbox,
+  assertCaseyFirstSeenPlacement, isCaseyGmailScope, matchesCaseyPair, type CaseyGmailScope } from '@/lib/crm/caseyGmailReview'
 import { matonFetch } from '@/lib/maton'
 import {
   enrichCrmEmailInteractionParticipantsInPostgres,
@@ -544,10 +546,11 @@ async function listGmailPage(mailbox: SelectedMailbox, state: PollCursor) {
   }
 }
 
-async function getGmailMessage(mailbox: SelectedMailbox, messageId: string): Promise<GmailMessage> {
+async function getGmailMessage(mailbox: SelectedMailbox, messageId: string, metadataOnly = false): Promise<GmailMessage> {
+  const format = metadataOnly ? 'format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc&metadataHeaders=Subject' : 'format=full'
   const payload = await gmailJson(
     mailbox,
-    `${GMAIL_LIST_PATH}/${encodeURIComponent(messageId)}?format=full`,
+    `${GMAIL_LIST_PATH}/${encodeURIComponent(messageId)}?${format}`,
     'get',
   )
   return payload as GmailMessage
@@ -630,6 +633,14 @@ function fullGmailEvidence(raw: GmailMessage, parsed: ParsedGmailMessage): Gmail
   return normalizeGmailMessageEvidence({ ...parsed,
     subject: cleanSingleLine(subjects[0] || '', 2 * 1024 * 1024), bodyText: extractGmailMessageBody(raw.payload),
   })
+}
+
+function hasIncompleteInlineGmailText(part: GmailMessagePart | undefined): boolean {
+  if (!part || cleanSingleLine(part.filename, 500)) return false
+  const type = cleanSingleLine(part.mimeType || firstHeader(part, 'content-type').split(';', 1)[0], 100).toLowerCase()
+  const missingText = (type === 'text/plain' || type === 'text/html') && !part.body?.data?.trim()
+    && (Boolean(part.body?.attachmentId) || Number(part.body?.size) > 0)
+  return missingText || (Array.isArray(part.parts) && part.parts.some(hasIncompleteInlineGmailText))
 }
 
 /** Capture only an already-delivered message through its original verified
@@ -1455,6 +1466,54 @@ async function reviewedParticipantTargets(routing: MessageRoutingInput, associat
     organizationReferences: organizations.rows.map((organization) => organization.reference_code).sort() }
 }
 
+/** Discovery only for the two pinned IDs. The candidate picker gets headers
+ * and authorized CRM contact choices, not email bodies or a mailbox search. */
+export async function readCaseyFirstSeenGmailCandidates(input: { ownerEmail: string; connectionId: string; pipelineId: string }) {
+  try {
+    if (!matchesCaseyPair({ ...input, messageIds: CASEY_PAIR.messageIds })) throw new Error()
+    const mailbox = (await selectedMailboxes()).find(entry => entry.owner_email === input.ownerEmail && entry.connection_id === input.connectionId)
+    if (!mailbox) throw new Error()
+    const { mailboxIdentity } = await verifiedMailbox(mailbox)
+    if (!mailboxIdentity) throw new Error()
+    assertCaseyFirstSeenMailbox(mailboxIdentity)
+    const pipelines = await ownedPipelines(input.ownerEmail, input.pipelineId)
+    const selfAddresses = await configuredMailboxAddresses(mailbox)
+    const candidates = await query<{ pipeline_id: string; entity: string; reference_code: string; email: string }>(
+      crmParticipantEmailCandidatesSql(), [pipelines.map(pipeline => pipeline.id), [CASEY_PAIR.sender, CASEY_PAIR.customerContact]],
+    )
+    if (candidates.rows.length !== 2 || candidates.rows.some(candidate => candidate.pipeline_id !== input.pipelineId
+      || candidate.entity !== 'contacts') || new Set(candidates.rows.map(candidate => candidate.email)).size !== 2) throw new Error()
+    const messages = []
+    for (const messageId of CASEY_PAIR.messageIds) {
+      const raw = await getGmailMessage(mailbox, messageId, true)
+      const message = parseGmailMessage(raw)
+      if (message.externalMessageId !== messageId || isClawPilotAuthEmail(raw)) throw new Error()
+      assertCaseyFirstSeenEvidence({ evidence: fullGmailEvidence(raw, message), labelIds: message.labelIds })
+      const association = { messageId, threadId: CASEY_PAIR.threadId, primaryOrganizationReference: CASEY_PAIR.primary,
+        contactReferences: candidates.rows.map(candidate => candidate.reference_code).sort() }
+      const resolved = await reviewedParticipantTargets({ ownerEmail: input.ownerEmail, mailboxEmail: mailbox.account_email,
+        selfAddresses, defaultPipelineId: input.pipelineId, ownedPipelines: pipelines, message }, association)
+      assertCaseyFirstSeenPlacement({ primaryOrganization: resolved.primary,
+        organizations: resolved.companyTargets.map(target => ({ id: target.record.id, referenceCode: target.record.referenceCode })),
+        contacts: resolved.targets.map(target => ({ email: target.matchedEmail!, organizationId: target.record.organizationId! })) })
+      const participantContacts = resolved.targets.map(target => {
+        const contact = target.record
+        if (contact.entity !== 'contacts' || !target.matchedEmail || !contact.organizationId) throw new Error()
+        const company = resolved.companyTargets.find(value => value.record.id === contact.organizationId)?.record
+        if (company?.entity !== 'organizations') throw new Error()
+        return { id: contact.id, reference: contact.referenceCode, name: contact.name.slice(0, 300),
+          email: target.matchedEmail, organizationId: company.id, organizationReference: company.referenceCode, company: company.name.slice(0, 300) }
+      })
+      messages.push({ messageId, threadId: association.threadId, subject: message.subject || '(No subject)', receivedAt: message.receivedAt,
+        legacy: false, admissionScope: CASEY_FIRST_SEEN_SCOPE, participantEmails: resolved.participantEmails,
+        participantContacts, participantContactIds: participantContacts.map(contact => contact.id) })
+    }
+    return messages
+  } catch {
+    throw new SafeEmailIngestionError('Both exact Casey messages and their verified mailbox and participant links are required')
+  }
+}
+
 async function reconcileReviewedGmailMessages(input: {
   ownerEmail: string
   connectionId: string
@@ -1470,8 +1529,13 @@ async function reconcileReviewedGmailMessages(input: {
   lateContactEmail?: string
   decisionKind?: 'review' | 'correction' | 'late-contact'
   correctionReason?: string
-  admissionScope?: 'casey-reviewed-two-v1'
+  admissionScope?: CaseyGmailScope
 }) {
+  const firstSeen = input.admissionScope === CASEY_FIRST_SEEN_SCOPE
+  if (firstSeen) {
+    try { assertCaseyFirstSeenMailbox(input.mailboxIdentity) }
+    catch { throw new SafeEmailIngestionError('The selected Gmail mailbox does not match the reviewed Casey mailbox') }
+  }
   const planned = []
   for (const association of input.associations) {
     const raw = await getGmailMessage(input.mailbox, association.messageId)
@@ -1486,41 +1550,48 @@ async function reconcileReviewedGmailMessages(input: {
     if (input.lateContactEmail && !resolved.targets.some(target => target.matchedEmail === input.lateContactEmail!.trim().toLowerCase())) {
       throw new SafeEmailIngestionError('The late contact must be one of the exact reviewed message participants')
     }
-    const cached = await query<Record<string, unknown> & { id: string; pipeline_id: string }>(
+    const cached = firstSeen ? null : await query<Record<string, unknown> & { id: string; pipeline_id: string }>(
       `SELECT message.* FROM crm_inbound_messages message
        WHERE owner_email = $1 AND external_message_id = $2`,
       [input.ownerEmail, message.externalMessageId],
     )
-    if (cached.rows.length !== 1) throw new SafeEmailIngestionError('Reviewed cross-company recovery requires an existing owned cached Gmail message')
+    if (cached && cached.rows.length !== 1) throw new SafeEmailIngestionError('Reviewed cross-company recovery requires an existing owned cached Gmail message')
     const messageEvidence = fullGmailEvidence(raw, message)
+    if (firstSeen && (hasIncompleteInlineGmailText(raw.payload) || !messageEvidence.bodyText
+      || /^(?:inbound email received\.?|\(no content\)|\[no message body\])$/i.test(messageEvidence.bodyText))) {
+      throw new SafeEmailIngestionError('Complete Gmail message body is required for the Casey review')
+    }
     let legacyAdoption: GmailReviewedHistoricalAdoption | undefined
     try {
-      const retainedEvidence = retainedGmailMessageEvidence(cached.rows[0])
-      assertSameRetainedGmailEvidence(retainedEvidence, messageEvidence)
-      const retainedMetadata = asRecord(cached.rows[0].raw_metadata)
       const scope = { pipelineId: input.pipelineId, messageIds: input.associations.map(value => value.messageId),
         threadId: association.threadId, primaryOrganization: { id: resolved.primary.id, referenceCode: resolved.primary.referenceCode },
         organizations: resolved.companyTargets.map(target => ({ id: target.record.id, referenceCode: target.record.referenceCode })) }
-      if (input.admissionScope === 'casey-reviewed-two-v1') {
-        legacyAdoption = prepareCaseyGmailAdoption({ scope: { ...scope, ownerEmail: input.ownerEmail,
-          connectionId: input.connectionId, inboundMessageId: cached.rows[0].id, intakePipelineId: cached.rows[0].pipeline_id },
-        identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(), cached: retainedEvidence, current: messageEvidence })
-        if (cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption) throw new Error('Historical admission proof is required')
-        if (retainedMetadata?.legacyAdoption) {
-          const previous = retainedMetadata.legacyAdoption as typeof legacyAdoption
-          assertCaseyGmailAdoption(previous)
-          // Reverification may renew the current label/time, never the original
-          // unknown provenance, immutable subject, retained evidence or placement.
-          const oldPins: Partial<typeof previous> = { ...previous }; delete oldPins.accountEmail; delete oldPins.identityVerifiedAt
-          const newPins: Partial<typeof legacyAdoption> = { ...legacyAdoption }; delete newPins.accountEmail; delete newPins.identityVerifiedAt
-          if (JSON.stringify(stableEvidence(oldPins)) !== JSON.stringify(stableEvidence(newPins))) throw new Error('Historical admission proof changed')
-        }
-      } else legacyAdoption = cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption ? undefined : prepareBoundedLegacyGmailAdoption({
-        scope: { pipelineId: input.pipelineId, messageIds: input.associations.map(value => value.messageId),
-          threadId: association.threadId, primaryOrganization: { id: resolved.primary.id, referenceCode: resolved.primary.referenceCode },
-          organizations: resolved.companyTargets.map(target => ({ id: target.record.id, referenceCode: target.record.referenceCode })) },
-        identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(), cached: retainedEvidence, current: messageEvidence,
-      })
+      if (!cached) {
+        assertCaseyFirstSeenEvidence({ evidence: messageEvidence, labelIds: message.labelIds })
+        assertCaseyFirstSeenPlacement({ ...scope, contacts: resolved.targets.map(target => ({ email: target.matchedEmail!,
+          organizationId: target.record.organizationId! })) })
+      } else {
+        const retainedEvidence = retainedGmailMessageEvidence(cached.rows[0])
+        assertSameRetainedGmailEvidence(retainedEvidence, messageEvidence)
+        const retainedMetadata = asRecord(cached.rows[0].raw_metadata)
+        if (input.admissionScope === 'casey-reviewed-two-v1') {
+          legacyAdoption = prepareCaseyGmailAdoption({ scope: { ...scope, ownerEmail: input.ownerEmail,
+            connectionId: input.connectionId, inboundMessageId: cached.rows[0].id, intakePipelineId: cached.rows[0].pipeline_id },
+          identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(), cached: retainedEvidence, current: messageEvidence })
+          if (cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption) throw new Error('Historical admission proof is required')
+          if (retainedMetadata?.legacyAdoption) {
+            const previous = retainedMetadata.legacyAdoption as typeof legacyAdoption
+            assertCaseyGmailAdoption(previous)
+            // Reverification may renew the current label/time, never the original
+            // unknown provenance, immutable subject, retained evidence or placement.
+            const oldPins: Partial<typeof previous> = { ...previous }; delete oldPins.accountEmail; delete oldPins.identityVerifiedAt
+            const newPins: Partial<typeof legacyAdoption> = { ...legacyAdoption }; delete newPins.accountEmail; delete newPins.identityVerifiedAt
+            if (JSON.stringify(stableEvidence(oldPins)) !== JSON.stringify(stableEvidence(newPins))) throw new Error('Historical admission proof changed')
+          }
+        } else legacyAdoption = cached.rows[0].mailbox_id && !retainedMetadata?.legacyAdoption ? undefined : prepareBoundedLegacyGmailAdoption({
+          scope, identity: input.mailboxIdentity, adoptedAt: new Date().toISOString(), cached: retainedEvidence, current: messageEvidence,
+        })
+      }
     } catch (error) {
       throw new SafeEmailIngestionError(error instanceof GmailIdentityError
         ? 'Retained Gmail content or identity changed; a matching complete source is required'
@@ -1552,6 +1623,7 @@ async function reconcileReviewedGmailMessages(input: {
       mailboxIdentity: input.mailboxIdentity, messageEvidence,
       ...(legacyAdoption ? { legacyAdoption } : {}),
       ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
+      ...(firstSeen ? { firstSeenLabelIds: [...new Set(message.labelIds)].sort() } : {}),
       ...(input.lateContactEmail ? { lateContactEmail: input.lateContactEmail } : {}),
       decisionKind: input.decisionKind || 'review',
       ...(input.correctionReason ? { correctionReason: input.correctionReason } : {}),
@@ -1560,7 +1632,7 @@ async function reconcileReviewedGmailMessages(input: {
         referenceCode: target.record.referenceCode, email: target.matchedEmail!, organizationId: target.record.organizationId! })),
       interaction,
     }
-    planned.push({ association, raw, routing, resolved, cached: cached.rows[0], persistence })
+    planned.push({ association, raw, routing, resolved, persistence })
   }
   if (input.lateContactEmail) selectLateContactGmailMessages({
     messageIds: input.associations.map(association => association.messageId), participantEmail: input.lateContactEmail,
@@ -1575,7 +1647,8 @@ async function reconcileReviewedGmailMessages(input: {
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     pipelineId: input.pipelineId, mailboxEmail: input.mailbox.account_email,
     selfAddresses: [...input.selfAddresses].sort(),
-    messages: planned.map((plan, index) => ({ association: plan.association, raw: plan.raw,
+    messages: planned.map((plan, index) => ({ association: plan.association, raw: firstSeen
+      ? { evidence: plan.persistence.messageEvidence, labelIds: plan.persistence.firstSeenLabelIds } : plan.raw,
       targets: plan.resolved.targets.map((target) => ({ id: target.record.id,
         reference: target.record.referenceCode, email: target.matchedEmail, organization: target.record.organizationId })),
       organizationReferences: plan.resolved.organizationReferences, targetFingerprint: snapshots[index].targetFingerprint,
@@ -1624,7 +1697,7 @@ export async function reconcileGmailMessages(input: {
   lateContactEmail?: string
   decisionKind?: 'review' | 'correction' | 'late-contact'
   correctionReason?: string
-  admissionScope?: 'casey-reviewed-two-v1'
+  admissionScope?: CaseyGmailScope
 }) {
   const ownerEmail = String(input.ownerEmail || '').trim().toLowerCase()
   if (input.decisionKind && !['review', 'correction', 'late-contact'].includes(input.decisionKind)) {
@@ -1646,13 +1719,11 @@ export async function reconcileGmailMessages(input: {
     throw new SafeEmailIngestionError('A bounded, exact Gmail recovery selection is required')
   }
   const reviewedAssociations = reviewedAssociationSelection(input.reviewedAssociations, input.messageIds)
-  if (input.admissionScope !== undefined && (input.admissionScope !== 'casey-reviewed-two-v1'
-    || ownerEmail !== 'jarrett@suburbiasandwichco.com' || input.connectionId !== 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027'
-    || input.pipelineId !== '587c8746-ecf6-40ae-8c50-e456f99ad555' || input.decisionKind !== 'review'
+  if (input.admissionScope !== undefined && (!isCaseyGmailScope(input.admissionScope)
+    || !matchesCaseyPair({ ...input, ownerEmail }) || input.decisionKind !== 'review'
     || input.correctionReason !== undefined || input.lateContactEmail !== undefined || !reviewedAssociations
-    || [...input.messageIds].sort().join(',') !== '1a18e03ea586cd7e,1a18f01749eb87a6'
-    || reviewedAssociations.some(association => association.threadId !== '1a179e9e2743f926'
-      || association.primaryOrganizationReference !== 'gagmco24va588e'))) {
+    || reviewedAssociations.some(association => association.threadId !== CASEY_PAIR.threadId
+      || association.primaryOrganizationReference !== CASEY_PAIR.primary))) {
     throw new SafeEmailIngestionError('Casey Gmail admission requires the exact separately reviewed two-message scope')
   }
   const mailbox = (await selectedMailboxes()).find((entry) => (

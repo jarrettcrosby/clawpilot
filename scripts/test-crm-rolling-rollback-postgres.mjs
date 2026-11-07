@@ -4,12 +4,14 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import { assertExternalRollbackOutput, canonicalJson, committedRollbackIdentity, LEGACY_WRITER_COMMIT,
-  REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, rollbackReceiptSource, sha256 } from './lib/crm-compatible-rollback-artifact.mjs'
+  REQUIRED_RETAINED_V20_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV20MigrationInventory,
+  rollbackReceiptSource, sha256 } from './lib/crm-compatible-rollback-artifact.mjs'
+import { attestProductionRebindHistorySchema } from './production-rebind-history-schema-attestation.mjs'
 
 const repository = process.cwd()
 const requireApp = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -19,11 +21,13 @@ const { Pool } = requireApp('pg')
 const args = process.argv.slice(2)
 const sourceCheckOnly = args.length === 1 && args[0] === '--check-source'
 const transitionCheckOnly = args.length === 1 && args[0] === '--check-transition'
-assert.ok(sourceCheckOnly || transitionCheckOnly || (args.length === 4 && args[0] === '--commit' && args[2] === '--receipt'),
-  'Use --check-source, --check-transition (no receipt), or --commit SHA40 --receipt NEW_FILE; no database URL override is supported')
+const retainedCheckOnly = args.length === 1 && args[0] === '--check-retained-transition'
+const checkoutCheckOnly = sourceCheckOnly || transitionCheckOnly || retainedCheckOnly
+assert.ok(checkoutCheckOnly || (args.length === 4 && args[0] === '--commit' && args[2] === '--receipt'),
+  'Use --check-source, --check-transition, --check-retained-transition (no receipts), or --commit SHA40 --receipt NEW_FILE; no database URL override is supported')
 const gitSource = (commit, path) => execFileSync('git', ['show', `${commit}:${path}`],
   { cwd: repository, encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024 })
-const read = path => sourceCheckOnly || transitionCheckOnly ? readFileSync(new URL(`../${path}`, import.meta.url), 'utf8') : gitSource(args[1], path)
+const read = path => checkoutCheckOnly ? readFileSync(new URL(`../${path}`, import.meta.url), 'utf8') : gitSource(args[1], path)
 
 function declarations(source, filename, names) {
   const parsed = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true)
@@ -53,7 +57,7 @@ const fixtureSource = read('scripts/test-crm-email-routing-postgres.mjs')
 const fixtureContext = { ts, read, assert, vm, Buffer, TextDecoder, URL, URLSearchParams, Response, AbortSignal,
   nodeRequire: requireNode, unexpected: name => { throw new Error(`Unexpected external dependency: ${name}`) } }
 const fixture = evaluate(declarations(fixtureSource, 'fixture.ts', ['loadModule', 'loadCrmPersistence', 'fixtureSchema']),
-  fixtureContext, ['loadCrmPersistence', 'fixtureSchema'])
+  fixtureContext, ['loadModule', 'loadCrmPersistence', 'fixtureSchema'])
 const producerDeclarations = declarations(currentSource, 'crm.ts', [
   'clean', 'normalizedInteractionType', 'interactionSuiteCrmModule', 'suiteCrmRelationships',
 ])
@@ -69,8 +73,9 @@ if (sourceCheckOnly) {
   process.exit(0)
 }
 
-const identity = transitionCheckOnly ? null : committedRollbackIdentity(repository, args[1])
-const receiptPath = transitionCheckOnly ? null : assertExternalRollbackOutput(repository, args[3])
+const identity = checkoutCheckOnly ? null : committedRollbackIdentity(repository, args[1])
+const receiptPath = identity ? assertExternalRollbackOutput(repository, args[3]) : null
+const inventory = identity ? retainedV20MigrationInventory(identity.sourceTree) : null
 const container = `clawpilot-crm-rolling-${process.pid}-${randomUUID().slice(0, 8)}`
 const image = process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16'
 assert.match(image, /^pgvector\/pgvector:pg(?:16|18)$/u, 'Use an already installed approved PostgreSQL image')
@@ -86,8 +91,9 @@ try {
   const port = execFileSync('docker', ['port', container, '5432/tcp'], { encoding: 'utf8', timeout: 10_000 })
     .match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
   assert.ok(port, 'Disposable fixture must bind only to loopback')
-  pool = new Pool({ host: '127.0.0.1', port: Number(port), user: 'postgres', password: 'crm_rolling_fixture',
-    database: 'crm_rolling_fixture', ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 })
+  const connection = { host: '127.0.0.1', port: Number(port), user: 'postgres', password: 'crm_rolling_fixture',
+    ssl: false, max: 2, connectionTimeoutMillis: 1000, statement_timeout: 5000 }
+  pool = new Pool({ ...connection, database: 'crm_rolling_fixture' })
   const deadline = Date.now() + 30_000
   while (true) {
     try { await pool.query('SELECT 1'); break }
@@ -200,13 +206,39 @@ try {
   if (transitionCheckOnly) {
     console.log(`PASS ${checks.length} working-tree rolling transition checks; NON-CERTIFYING, no receipt or rollback artifact created`)
   } else {
-  assert.deepEqual(committedRollbackIdentity(repository, args[1]), identity, 'Source changed during transition acceptance')
-  const postgresMajor = Math.trunc(Number((await query("SELECT current_setting('server_version_num') AS version")).rows[0].version) / 10000)
-  const receipt = { format: ROLLBACK_ACCEPTANCE_FORMAT, status: 'passed', source: rollbackReceiptSource(identity),
-    legacyWriterCommit: LEGACY_WRITER_COMMIT, postgresMajor, checks,
-    boundary: 'Actual old/new persistence declarations and real synthetic local PostgreSQL only; no provider, native audience, deployment or worker-drain proof' }
-  writeFileSync(receiptPath, canonicalJson(receipt), { flag: 'wx', mode: 0o444 })
-  console.log(JSON.stringify({ passed: checks.length, receipt: receiptPath, receiptSha256: sha256(canonicalJson(receipt)), sourceCommit: identity.commit }))
+    const { checkRetainedV20 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
+    const migrationPaths = inventory?.paths ?? readdirSync(new URL('../db/migrations/', import.meta.url))
+      .filter(file => /^\d+_.+\.sql$/u.test(file)).sort().map(file => `db/migrations/${file}`)
+    // Same loopback-only disposable instance. Keep the legacy bridge fixture
+    // and full retained-schema fixture in separate, empty databases.
+    await query('CREATE DATABASE crm_rolling_retained_v20')
+    const retainedPool = new Pool({ ...connection, database: 'crm_rolling_retained_v20', statement_timeout: 15000 })
+    let retained, catalog
+    try {
+      retained = await checkRetainedV20({ pool: retainedPool, read, migrationPaths,
+        loadCrmPersistence: fixture.loadCrmPersistence,
+        loadOccurrenceClaims: () => fixture.loadModule('app_src/lib/crm/calendarOccurrenceClaims.ts', { 'server-only': {} }) })
+      catalog = await attestProductionRebindHistorySchema(retainedPool)
+    } finally { await retainedPool.end() }
+    assert.deepEqual(retained.checks, [...REQUIRED_RETAINED_V20_CHECKS])
+    assert.equal(retained.migrationCount, migrationPaths.length)
+    assert.equal(retained.lastMigration, migrationPaths.at(-1))
+    if (!identity) {
+      console.log(`PASS ${checks.length} rolling and ${retained.checks.length} full retained-schema checks; NON-CERTIFYING, no receipt or rollback artifact created`)
+    } else {
+      assert.deepEqual(committedRollbackIdentity(repository, args[1]), identity, 'Source changed during transition acceptance')
+      const postgresMajor = Math.trunc(Number((await query("SELECT current_setting('server_version_num') AS version")).rows[0].version) / 10000)
+      assert.equal(catalog.postgresMajor, postgresMajor)
+      assert.equal(catalog.schemaDigest, identity.attestation.postgresDigests[postgresMajor])
+      const receipt = { format: ROLLBACK_ACCEPTANCE_FORMAT, status: 'passed', source: rollbackReceiptSource(identity),
+        legacyWriterCommit: LEGACY_WRITER_COMMIT, postgresMajor, checks,
+        retainedSchema: { migrationCount: retained.migrationCount, lastMigration: retained.lastMigration,
+          sourceInventorySha256: inventory.sourceInventorySha256, schemaDigest: catalog.schemaDigest, checks: retained.checks },
+        boundary: 'Actual old/new persistence declarations and full retained schema in real synthetic local PostgreSQL only; no provider, native audience, deployment or worker-drain proof' }
+      writeFileSync(receiptPath, canonicalJson(receipt), { flag: 'wx', mode: 0o444 })
+      console.log(JSON.stringify({ passed: checks.length + retained.checks.length, receipt: receiptPath,
+        receiptSha256: sha256(canonicalJson(receipt)), sourceCommit: identity.commit }))
+    }
   }
 } finally {
   try { if (pool) await pool.end() }

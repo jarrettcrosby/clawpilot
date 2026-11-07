@@ -260,6 +260,8 @@ await check('actual adapter transition mode fails closed and candidate rechecks 
     '../crm/nativeEmailCapabilityContract':load('app_src/lib/crm/nativeEmailCapabilityContract.ts',{'node:crypto':crypto,'./nativeEmailPublication':protocol}),
     '../crm/nativeEmailPublicationPostgres':{PostgresNativeEmailPublicationStore:class{}},
     '../crm/nativeEmailPublicationWorkContext':{},'../crm/nativeEmailPublicationTransport':{},
+    '../crm/legacyEmailRecoveryReleaseApproval':{},
+    '../crm/nativeEmailRecoveryDispatchPermit':{},
   })
   const adapter=adapterApi.createPostgresNativeEmailWorkerPersistence()
   assert.deepEqual(await adapter.mode(),{enabled:true,activeOperationId:null,activeTransitionId:hash('f')})

@@ -13,6 +13,8 @@ const eslintConfig = defineConfig([
     "build/**",
     // Private operator bundles are compiled output; lint their TypeScript source.
     "dist/**",
+    // Playwright output and one-off local validation artifacts are not app source.
+    "test-results/**",
     "next-env.d.ts",
   ]),
 ]);

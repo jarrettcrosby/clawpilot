@@ -1,14 +1,15 @@
 import crypto from 'node:crypto'
 import type {PoolClient} from 'pg'
 import {query,withTransaction} from '@/lib/persistence/postgres'
-import {stageCrmRecordWithClient,updateCrmDescriptionWithClient} from '@/lib/persistence/crm'
+import {stageCrmRecordWithClient,updateCrmDescriptionWithClient,stageFractionalAccountDescriptionWithClient} from '@/lib/persistence/crm'
 import {lockCrmNativeEmailAuthorityWithClient} from '@/lib/persistence/crmNativeEmailAuthority'
 import type {StageOrganizationInput,StageContactInput} from '@/lib/persistence/crm'
-import {FractionalCrmGatewayError} from '@/lib/fractionalCrmGatewayAuth'
-import type {FractionalCrmPrincipal,FractionalCrmCredential} from '@/lib/fractionalCrmGatewayAuth'
+import {FractionalCrmGatewayError,fractionalCrmFolderReadCapabilities,fractionalCrmFolderWriteCapabilities,hasFractionalCrmCapability} from '@/lib/fractionalCrmGatewayAuth'
+import type {FractionalCrmPrincipal,FractionalCrmCredential,FractionalCrmCapabilityRequirement} from '@/lib/fractionalCrmGatewayAuth'
 import {canonicalHash,exactKeys,gatewayGlobalId,gatewayObject,gatewayUuid,gatewayVersion,mapGatewayFields,normalizedEmail,normalizedName,parseGatewayFields} from '@/lib/crm/fractionalGatewayModel'
 import type {GatewayEntity,GatewayFields,GatewayRecord} from '@/lib/crm/fractionalGatewayModel'
-import {fractionalFolderUrl,fractionalFolderState,mergeFractionalCustomerFolder} from '@/lib/crm/fractionalCustomerFolder'
+import {fractionalFolderUrl,fractionalFolderState,isFractionalDriveFolderUrl,mergeFractionalCustomerFolder} from '@/lib/crm/fractionalCustomerFolder'
+import {lockFractionalFolderBoardCards,projectFractionalFolderBoardCards,assertFractionalFolderBoardCardsCurrent} from '@/lib/crm/fractionalFolderBoardProjection'
 import type {FractionalCrmFolderPatch} from '@/lib/fractionalCrmGatewayHttp'
 
 type Row=Record<string,unknown>
@@ -26,12 +27,12 @@ export async function readFractionalCrmCredential(credentialId:string):Promise<F
  if(!gatewayUuid(credentialId))return null
  const row=(await query('SELECT * FROM fractional_crm_gateway_credentials WHERE id=$1::uuid',[credentialId])).rows[0];return row?credential(row):null
 }
-async function context(client:PoolClient,supplied:FractionalCrmPrincipal,capability:FractionalCrmPrincipal['capabilities'][number],write=false,lockRecords=false):Promise<Context>{
+async function context(client:PoolClient,supplied:FractionalCrmPrincipal,capability:FractionalCrmCapabilityRequirement,write=false,lockRecords=false):Promise<Context>{
  const row=(await client.query(`SELECT * FROM fractional_crm_gateway_credentials WHERE id=$1::uuid ${write?'FOR UPDATE':'FOR SHARE'}`,[supplied.credentialId])).rows[0]
  if(!row||!row.enabled||row.revoked_at||new Date(row.expires_at).getTime()<=Date.now())fail(401,'UNAUTHORIZED')
  const p=credential(row)
  for(const key of ['sourceInstanceId','workspaceOrganizationId','pipelineId','rootCompanyGlobalId','fractionalDeploymentId','fractionalOrganizationId'] as const)if(p[key]!==supplied[key])fail(403,'CAPABILITY_DENIED')
- if(!p.capabilities.includes(capability))fail(403,'CAPABILITY_DENIED')
+ if(!hasFractionalCrmCapability(p.capabilities,capability))fail(403,'CAPABILITY_DENIED')
  const bound=(await client.query(`SELECT ps.id FROM pipeline_spaces ps JOIN workspace_organizations wo ON wo.id=ps.workspace_organization_id
   JOIN app_user_organization_memberships m ON m.organization_id=wo.id AND m.user_email=$3 JOIN app_users u ON u.email=m.user_email
   WHERE ps.id=$1::uuid AND wo.id=$2::uuid AND wo.parent_id IS NULL AND NOT wo.is_demo AND NOT ps.reference_access_disabled
@@ -166,6 +167,8 @@ export const updateFractionalCrmCompany=(p:FractionalCrmPrincipal,ga:string,inpu
 export const updateFractionalCrmContact=(p:FractionalCrmPrincipal,ga:string,gc:string,input:WriteInput)=>update(p,'contact',ga,gc,input)
 
 type FolderBinding={last_published_url:string|null;source_instance_id:string;fractional_deployment_id:string;fractional_organization_id:string;customer_id:string}
+const folderStageColumns=new Set(['description','source_hash','sync_status','sync_error','updated_by','updated_at'])
+const folderAccountProfile=(row:Row)=>JSON.stringify(Object.fromEntries(Object.entries(row).filter(([key])=>!folderStageColumns.has(key))))
 function folderParse<T>(fn:()=>T):T{try{return fn()}catch(error){
  const code=error instanceof Error?error.message:''
  return fail(code==='FOLDER_DESCRIPTION_REPAIR_REQUIRED'||code==='FOLDER_MANUAL_REVIEW_REQUIRED'?409:422,
@@ -194,40 +197,76 @@ function folderEnvelope(ctx:Context,row:Row,customerId:string,binding:FolderBind
  return {...record,version:canonicalHash({record,description:str(row,'description'),binding})}
 }
 export async function readFractionalCrmCustomerFolder(p:FractionalCrmPrincipal,ga:string,customerId:string){return withTransaction(async client=>{
- const ctx=await context(client,p,'crm.company.read'),row=await companyRow(client,ctx,ga)
+ const ctx=await context(client,p,fractionalCrmFolderReadCapabilities),row=await companyRow(client,ctx,ga)
  if(row.reference_code!==ga)fail(409,'IDENTITY_CONFLICT')
  const binding=await folderMapping(client,ctx,row,customerId)
  return folderEnvelope(ctx,row,customerId,binding)
 })}
-export async function updateFractionalCrmCustomerFolder(p:FractionalCrmPrincipal,ga:string,input:FractionalCrmFolderPatch){return withTransaction(async client=>{
+export async function updateFractionalCrmCustomerFolder(
+ p:FractionalCrmPrincipal,ga:string,input:FractionalCrmFolderPatch,
+ reconcileLegacy?: (scope:{pipelineId:string})=>Promise<void>,
+){
+ const {result,narrow}=await withTransaction(async client=>{
  await lockCrmNativeEmailAuthorityWithClient(client)
  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))',[`crm-record-lifecycle:${p.pipelineId}`])
- const ctx=await context(client,p,'crm.company.write',true),actor=parse(()=>gatewayObject(input.assertedFractionalActor))
+ const ctx=await context(client,p,fractionalCrmFolderWriteCapabilities,true),actor=parse(()=>gatewayObject(input.assertedFractionalActor))
+ // The credential can be narrowed after HTTP authentication. Choose effects
+ // only from the live, locked grant, not the earlier request principal.
+ const narrow=ctx.principal.capabilities.includes('crm.customer-folder.write')
  parse(()=>exactKeys(actor,['userId','organizationId','customerId']))
  if(input.schemaVersion!==1||actor.organizationId!==ctx.principal.fractionalOrganizationId
   ||Object.values(actor).length!==3||Object.values(actor).some(v=>typeof v!=='string'||!v||v.length>200||/[\u0000-\u001f\u007f]/u.test(v)))fail(422,'INVALID_ACTOR')
  const customerId=String(actor.customerId),folderUrl=folderParse(()=>fractionalFolderUrl(input.folderUrl))
+ if(narrow&&folderUrl&&!isFractionalDriveFolderUrl(folderUrl))fail(422,'INVALID_FOLDER_URL')
  const row=await companyRow(client,ctx,ga,true)
  if(row.reference_code!==ga)fail(409,'IDENTITY_CONFLICT')
  const binding=await folderMapping(client,ctx,row,customerId),before=folderEnvelope(ctx,row,customerId,binding)
+ const cards=narrow?await lockFractionalFolderBoardCards(client,{
+  pipelineId:ctx.principal.pipelineId,workspaceOrganizationId:ctx.principal.workspaceOrganizationId,
+  accountId:str(row,'id'),referenceCode:ga,
+ }):null
+ if(cards)assertFractionalFolderBoardCardsCurrent(cards,str(row,'description'))
+ let applied=false
  // Authorization, live source mapping and immutable account binding are
  // checked before a historical receipt can be replayed.
- return operation(client,ctx,input.idempotencyKey,'update-customer-folder',{ga,ifMatch:input.ifMatch,folderUrl,actor},async()=>{
+ const result=await operation(client,ctx,input.idempotencyKey,'update-customer-folder',{ga,ifMatch:input.ifMatch,folderUrl,actor},async()=>{
   if(input.ifMatch!==before.version)fail(412,'VERSION_CONFLICT')
+  if(narrow&&(!folderUrl||(binding&&binding.last_published_url!==folderUrl)))fail(409,'FOLDER_MANUAL_REVIEW_REQUIRED')
   const description=folderParse(()=>mergeFractionalCustomerFolder({description:str(row,'description'),folderUrl,
    previous:binding?{lastPublishedUrl:binding.last_published_url}:null}))
   if(description!==str(row,'description')){
-   const staged=await updateCrmDescriptionWithClient(client,{entity:'organizations',pipelineId:p.pipelineId,id:str(row,'id'),description,actorEmail:ctx.actorEmail})
-   if(staged.id!==row.id||staged.referenceCode!==ga)fail(409,'CANONICAL_WRITE_MISMATCH')
+   const change={pipelineId:p.pipelineId,id:str(row,'id'),description,actorEmail:ctx.actorEmail}
+   if(narrow){
+    if(!await stageFractionalAccountDescriptionWithClient(client,{...change,referenceCode:ga}))fail(409,'FOLDER_ACCOUNT_REVIEW_REQUIRED')
+   }else{
+    const staged=await updateCrmDescriptionWithClient(client,{...change,entity:'organizations'})
+    if(staged.id!==row.id||staged.referenceCode!==ga)fail(409,'CANONICAL_WRITE_MISMATCH')
+   }
   }
-  await client.query(`INSERT INTO crm_fractional_customer_folders(account_id,source_instance_id,fractional_deployment_id,
+  if(!narrow||!binding)await client.query(`INSERT INTO crm_fractional_customer_folders(account_id,source_instance_id,fractional_deployment_id,
    fractional_organization_id,customer_id,local_id,last_published_url) VALUES($1,$2,$3,$4,$5,$5,$6)
    ON CONFLICT(account_id) DO UPDATE SET last_published_url=EXCLUDED.last_published_url,updated_at=now()`,
   [row.id,p.sourceInstanceId,p.fractionalDeploymentId,p.fractionalOrganizationId,customerId,folderUrl])
   const after=await companyRow(client,ctx,ga,true),saved=await folderMapping(client,ctx,after,customerId)
-  return folderEnvelope(ctx,after,customerId,saved)
+  const envelope=folderEnvelope(ctx,after,customerId,saved)
+  if(cards){
+   if(envelope.status!=='published'||envelope.folderUrl!==folderUrl||str(after,'description')!==description
+    ||folderAccountProfile(after)!==folderAccountProfile(row))fail(409,'CANONICAL_WRITE_MISMATCH')
+   await projectFractionalFolderBoardCards(client,cards,str(after,'description'))
+  }
+  applied=true
+  return envelope
  })
-})}
+ // A replay proves no new mutation; do not re-project an old result over
+ // manual changes, a detached card, or an unlinked/otherwise different folder.
+ if(cards&&!applied){
+  if(!folderUrl||before.status!=='published'||before.folderUrl!==folderUrl)fail(409,'FOLDER_MANUAL_REVIEW_REQUIRED')
+ }
+ return {result,narrow}
+ })
+ if(!narrow)await reconcileLegacy?.({pipelineId:p.pipelineId})
+ return result
+}
 
 type OnboardingInput={schemaVersion:1;sourceInstanceId:string;origin:{deploymentId:string;organizationId:string;customerId:string;contactId?:string;onboardingId:string};
  company:{globalId:string|null;verifiedIdentifiers:{scheme:string;value:string;evidenceId:string}[];fields:GatewayFields};contact?:{globalId:string|null;fields:GatewayFields};

@@ -72,7 +72,7 @@ function loadModule(path, dependencies = {}, extraSource = '') {
 // are left out. The routing runner uses real is_demo suppression; the reviewed
 // fixture can enable the actual enqueue/lease/publication guards without ever
 // invoking a provider. Neither fixture pretends to prove SuiteCRM delivery.
-function loadCrmPersistence(query, withTransaction) {
+function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject) {
   const path = 'app_src/lib/persistence/crm.ts'
   const parsed = ts.createSourceFile(path, read(path), ts.ScriptTarget.Latest, true)
   const names = [
@@ -111,12 +111,18 @@ function loadCrmPersistence(query, withTransaction) {
   const stableId = loadModule('app_src/lib/crm/stableId.ts')
   const emailIdentity = loadModule('app_src/lib/crm/emailIdentity.ts')
   const emailReconciliation = loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity })
+  const productionCaseyReview = loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity })
+  const caseyReview = fixtureCaseyProviderSubject ? loadModule('app_src/lib/crm/caseyGmailReview.ts', {
+    '@/lib/crm/emailIdentity': { ...emailIdentity, gmailMailboxKey: identity => identity.providerAccountId === fixtureCaseyProviderSubject
+      ? productionCaseyReview.CASEY_PAIR.mailboxKey : emailIdentity.gmailMailboxKey(identity) },
+  }) : productionCaseyReview
   const audit = loadModule('app_src/lib/auditWriter.ts', {
     '@/lib/persistence/postgres': { query }, 'next/headers': { headers: async () => { throw new Error('No browser request in fixture') } },
     '@/lib/authAttribution': { verifyAuthAttributionHeaders: () => null },
   })
   const mailboxPersistence = loadModule('app_src/lib/persistence/crmEmailIdentity.ts', {
     '@/lib/persistence/postgres': { query, withTransaction }, '@/lib/crm/emailIdentity': emailIdentity, '@/lib/auditWriter': audit,
+    '@/lib/persistence/crmNativeEmailAuthority': loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
   })
   const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
   const protocol = loadModule('app_src/lib/crm/nativeEmailPublication.ts')
@@ -124,7 +130,7 @@ function loadCrmPersistence(query, withTransaction) {
   const roots = loadModule('scripts/lib/native-root-reader-fixture-modules.mjs')
     .loadNativeRootReaderFixtureModules(loadModule, protocol)
   const context = {
-    query, withTransaction, ...stableId, ...emailIdentity, ...emailReconciliation, ...mailboxPersistence, ...audit,
+    query, withTransaction, ...stableId, ...emailIdentity, ...emailReconciliation, ...caseyReview, ...mailboxPersistence, ...audit,
     ...eligibility, ...roots,
     ...loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     crypto: nodeRequire('node:crypto'), Buffer,
@@ -138,6 +144,7 @@ function loadCrmPersistence(query, withTransaction) {
   vm.runInNewContext(`${output}\nglobalThis.persistence = {
     stageCrmRecordInPostgres, readCrmRecordByReference, enrichCrmEmailInteractionParticipantsInPostgres,
     stageReviewedGmailInteractionsInPostgres, stageReviewedGmailInteractionInPostgres,
+    reviewedEmailAudienceUnderNativeControlWithClient,
     claimSuiteCrmOutboxInPostgres, withVerifiedSuiteCrmEmailPublication,
     completeSuiteCrmOutboxInPostgres, failSuiteCrmOutboxInPostgres,
   }`, context, { filename: path })
@@ -308,6 +315,7 @@ async function run(pool) {
     '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts'),
     '@/lib/crm/emailIdentity': emailIdentity,
     '@/lib/crm/emailReconciliation': emailReconciliation,
+    '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
     '@/lib/persistence/crmEmailIdentity': persistence,
     '@/lib/persistence/crm': { ...persistence, enrichCrmEmailInteractionParticipantsInPostgres: async input => {
       try { return await persistence.enrichCrmEmailInteractionParticipantsInPostgres(input) }

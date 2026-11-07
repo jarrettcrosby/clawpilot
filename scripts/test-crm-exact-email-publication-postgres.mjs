@@ -58,7 +58,8 @@ try {
   const query=(sql,params)=>pool.query(sql,params)
   const withTransaction=async fn=>{const tx=await pool.connect();try{await tx.query('BEGIN');const value=await fn(tx);await tx.query('COMMIT');return value}
     catch(error){await tx.query('ROLLBACK');throw error}finally{tx.release()}}
-  await query(`CREATE TABLE app_users(email text PRIMARY KEY,status text,suitecrm_user_id text,role text,permissions jsonb,organization_id uuid);
+  await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    CREATE TABLE app_users(email text PRIMARY KEY,status text,suitecrm_user_id text,role text,permissions jsonb,organization_id uuid);
     CREATE TABLE workspace_organizations(id uuid PRIMARY KEY,is_demo boolean NOT NULL DEFAULT false);
     CREATE TABLE pipeline_spaces(id uuid PRIMARY KEY,owner_email text,workspace_organization_id uuid,reference_access_disabled boolean DEFAULT false);
     CREATE TABLE pipeline_space_members(pipeline_id uuid,user_email text,access_role text,shared_by text,
@@ -74,10 +75,12 @@ try {
     CREATE TABLE crm_interactions(id uuid PRIMARY KEY,pipeline_id uuid,canonical_source_id uuid REFERENCES crm_email_sources(id),
       provider_message_id text,provider_thread_id text,suitecrm_id text,reference_code text,suitecrm_module text,source_hash text,source_payload jsonb DEFAULT '{}',
       suitecrm_synced_at timestamptz,sync_status text DEFAULT 'pending',sync_error text,metadata jsonb DEFAULT '{}',updated_at timestamptz DEFAULT now(),
+      source_key text NOT NULL DEFAULT 'gmail-fixture',
       UNIQUE(pipeline_id,canonical_source_id));
     CREATE TABLE sync_outbox(id uuid PRIMARY KEY,aggregate_type text,aggregate_id text,operation text,target_system text,payload jsonb,
       status text DEFAULT 'queued',attempts integer DEFAULT 0,idempotency_key text,lock_token text,locked_at timestamptz,
-      available_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),UNIQUE(target_system,idempotency_key));
+      available_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),created_at timestamptz DEFAULT now(),
+      processed_at timestamptz,last_error text,UNIQUE(target_system,idempotency_key));
     INSERT INTO workspace_organizations VALUES('${id(1)}',false);
     INSERT INTO app_users VALUES('owner@example.test','active','owner-native','owner','{}','${id(1)}');
     INSERT INTO app_user_organization_memberships VALUES('owner@example.test','${id(1)}','active','owner','{}',NULL);
@@ -88,11 +91,15 @@ try {
   for(const name of ['0375_crm_native_email_publication_admission.sql','0376_crm_native_email_publication_work_context.sql',
     '0377_crm_native_email_authority_transitions.sql','0378_crm_native_email_capability_policies.sql',
     '0379_crm_native_email_app_only_lifecycle.sql','0380_crm_native_email_grant_attempts.sql',
-    '0381_crm_native_email_identity_quiescence.sql','0392_crm_root_employee_access_registry.sql']) {
+    '0381_crm_native_email_identity_quiescence.sql','0392_crm_root_employee_access_registry.sql',
+    '0404_crm_legacy_email_recovery_holds.sql','0405_crm_legacy_email_recovery_settlement.sql']) {
     await withTransaction(tx=>tx.query(source(`db/migrations/${name}`)))
   }
   const api=load('app_src/lib/persistence/crmExactEmailPublication.ts',{'node:crypto':crypto,'./postgres':{withTransaction},
     './crm':audienceApi,'../crm/stableId':stable,'../crm/nativeEmailPublication':protocol})
+  const ordinary=run("import {withTransaction} from 'fixture'; import * as crypto from 'node:crypto'; const ENTITY_TABLE={interactions:'crm_interactions'};\n"
+    +declarations('app_src/lib/persistence/crm.ts',['nativeEmailOutboxUnresolvedGuardSql','lockNativeEmailPublicationModeWithClient',
+      'nativeEmailOutboxTouchesEmail','claimSuiteCrmOutboxInPostgres']),{fixture:{withTransaction},'node:crypto':crypto})
   const audience=await withTransaction(async tx=>{await tx.query('SELECT * FROM crm_native_email_publication_control FOR UPDATE')
     return audienceApi.reviewedEmailAudienceUnderNativeControlWithClient(tx,id(2))})
   for(let n=1;n<=4;n++) {
@@ -155,6 +162,120 @@ try {
       await assert.rejects(api.previewExactEmailPublicationInPostgres({...selection,...mutation}),/unavailable or changed/)
     }
     assert.deepEqual(await queue(),before)
+  })
+  await check('private candidate inspection checks a synthetic archive tuple without staging or claiming an outbox row',async()=>{
+    const one={...selection,messageIds:['a4']}
+    const before=await queue(),stop=new Error('rollback fixture-only queue removal')
+    await assert.rejects(withTransaction(async tx=>{
+      await tx.query("UPDATE crm_interactions SET sync_status='failed' WHERE id=$1",[id(24)])
+      const sourceFingerprint=(await tx.query("SELECT encode(public.digest(to_jsonb(i)::text,'sha256'),'hex') AS pin FROM crm_interactions i WHERE id=$1",[id(24)])).rows[0].pin
+      const archive={oldOutboxId:id(44),localId:id(24),nativeId:id(34),globalId:'gi1234564',pipelineId:one.pipelineId,
+        workspaceId:one.workspaceId,sourceFingerprint,retirementReceiptDigest:hash('synthetic retirement receipt')}
+      const inspect=(selected=one,pins=archive)=>api.inspectExactLegacyEmailRecoveryWithClient(tx,selected,pins)
+      await assert.rejects(inspect(),/unavailable or changed/)
+      await tx.query('DELETE FROM sync_outbox WHERE id=$1',[archive.oldOutboxId])
+      const candidate=await inspect()
+      assert.deepEqual(Object.keys(candidate).sort(),['claimAuthorized','digest','generation','globalId','localId','messageId','nativeAbsenceVerified','nativeId'].sort())
+      assert.equal(candidate.messageId,'a4');assert.equal(candidate.localId,archive.localId)
+      assert.equal(candidate.claimAuthorized,false);assert.equal(candidate.nativeAbsenceVerified,false)
+      assert.equal((await tx.query('SELECT count(*) FROM sync_outbox')).rows[0].count,'3')
+      assert.deepEqual(await inspect(),candidate)
+      assert.notEqual((await inspect(one,{...archive,retirementReceiptDigest:hash('other retirement')})).digest,candidate.digest)
+      await assert.rejects(inspect(selection),/unavailable or changed/)
+      await assert.rejects(inspect(one,{...archive,globalId:'gi7654321'}),/unavailable or changed/)
+      await assert.rejects(inspect(one,{...archive,workspaceId:id(99)}),/unavailable or changed/)
+      await assert.rejects(inspect(one,{...archive,sourceFingerprint:hash('drift')}),/unavailable or changed/)
+      await assert.rejects(inspect({...one,connectionId:id(999)}),/unavailable or changed/)
+      await tx.query('SAVEPOINT alias_collision')
+      await tx.query("INSERT INTO crm_interactions(id,pipeline_id,suitecrm_id,reference_code,suitecrm_module) VALUES($1,$2,$3,'gi7654321','Emails')",
+        [id(97),id(98),archive.nativeId.toUpperCase()])
+      await assert.rejects(inspect(),/unavailable or changed/)
+      await tx.query('ROLLBACK TO SAVEPOINT alias_collision')
+      await tx.query('SAVEPOINT history')
+      await tx.query("UPDATE crm_interactions SET sync_status='synced' WHERE id=$1",[archive.localId])
+      await assert.rejects(inspect(),/unavailable or changed/)
+      await tx.query('ROLLBACK TO SAVEPOINT history')
+      await tx.query("UPDATE crm_interactions SET source_key='SuiteCRM:fixture' WHERE id=$1",[archive.localId])
+      await assert.rejects(inspect(),/unavailable or changed/)
+      await tx.query('ROLLBACK TO SAVEPOINT history')
+      await tx.query('RELEASE SAVEPOINT history')
+      await tx.query("UPDATE crm_interactions SET metadata='{\"suiteCrmEmailProjection\":null}' WHERE id=$1",[archive.localId])
+      await assert.rejects(inspect(),/unavailable or changed/)
+      await tx.query("UPDATE crm_interactions SET metadata='{}' WHERE id=$1",[archive.localId])
+      await tx.query("UPDATE sync_outbox SET payload=jsonb_set(payload,'{attributes,global_id_c}',to_jsonb($2::text)) WHERE id=$1",
+        [id(43),archive.globalId])
+      await assert.rejects(inspect(),/unavailable or changed/)
+      throw stop
+    }),e=>e===stop)
+    assert.deepEqual(await queue(),before)
+  })
+  await check('private recovery hold survives ordinary and old-worker attempts without blocking unrelated queue work',async()=>{
+    const replacement=id(45),retired=id(44),local=id(24),op=id(70)
+    const directAdmission=`INSERT INTO crm_native_email_publication_admissions(operation_id,pipeline_id,local_id,native_id,global_id,generation,
+      native_policy_fingerprint,command_hash,audience_fingerprint,command,allowed_reader_ids,request_fingerprint)
+      VALUES($1,$2,$3,$4,'gi1234564',1,$1,$1,$1,'{}','[]',$1)`
+    const admissionArgs=[hash('attempt to bypass private authorization'),id(2),local,id(34)]
+    const intended=[replacement,retired,op,local,id(2),id(34),'gi1234564',hash('fixture retired'),hash('fixture release intent')]
+    const hold=(c,values=intended)=>c.query(`INSERT INTO crm_legacy_email_recovery_holds(outbox_id,retired_outbox_id,operation_id,local_id,
+      pipeline_id,native_id,global_id,retirement_receipt_hash,release_intent_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,values)
+    await assert.rejects(hold(pool,[retired,...intended.slice(1)]),e=>e.code==='23514'||e.code==='55000')
+    const oldSnapshot=await pool.connect()
+    try {
+      await oldSnapshot.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
+      assert.equal((await oldSnapshot.query('SELECT count(*) FROM crm_legacy_email_recovery_holds')).rows[0].count,'0')
+      await withTransaction(async c=>{
+        const previous=(await c.query('DELETE FROM sync_outbox WHERE id=$1 RETURNING payload,idempotency_key',[retired])).rows[0]
+        await c.query("UPDATE crm_interactions SET sync_status='failed' WHERE id=$1",[local])
+        await c.query(`INSERT INTO sync_outbox(id,aggregate_type,aggregate_id,operation,target_system,payload,idempotency_key,status,
+          attempts,lock_token,locked_at,available_at) VALUES($1,'crm_interactions',$2,'upsert_record','suitecrm',$3,$4,'processing',
+          1,'private-fixture-lock',now()-interval '1 hour','infinity')`,[replacement,local,previous.payload,previous.idempotency_key])
+        await hold(c)
+      })
+      await assert.rejects(oldSnapshot.query(directAdmission,admissionArgs),e=>e.code==='40001')
+    } finally {
+      await oldSnapshot.query('ROLLBACK')
+      oldSnapshot.release()
+    }
+    const before=(await query('SELECT to_jsonb(o) AS row FROM sync_outbox o WHERE id=$1',[replacement])).rows[0].row
+    await assert.rejects(api.previewExactEmailPublicationInPostgres({...selection,messageIds:['a4']}),/unavailable or changed/)
+    const claims=await ordinary.claimSuiteCrmOutboxInPostgres({limit:10})
+    assert.ok(claims.length>0&&claims.every(job=>job.id!==replacement))
+    for(const [sql,params] of [
+      ["UPDATE sync_outbox SET status='failed',available_at=now() WHERE id=$1",[replacement]],
+      ['DELETE FROM sync_outbox WHERE id=$1',[replacement]],
+      ["INSERT INTO sync_outbox(id,aggregate_type,aggregate_id,operation,target_system,payload) VALUES($1,'other','other','other','other','{}')",[retired]],
+      ["UPDATE crm_interactions SET source_payload='{\"archived\":true}' WHERE id=$1",[local]],
+      ['DELETE FROM crm_legacy_email_recovery_holds WHERE outbox_id=$1',[replacement]],
+    ])await assert.rejects(query(sql,params),e=>e.code==='55000')
+    assert.deepEqual((await query('SELECT to_jsonb(o) AS row FROM sync_outbox o WHERE id=$1',[replacement])).rows[0].row,before)
+    await query('CREATE ROLE fixture_private_recovery_reader NOLOGIN')
+    await query('GRANT EXECUTE ON FUNCTION clawpilot_crm_legacy_email_outbox_held(uuid) TO fixture_private_recovery_reader')
+    await query(`GRANT SELECT,UPDATE ON sync_outbox,crm_interactions TO fixture_private_recovery_reader;
+      GRANT INSERT ON crm_native_email_publication_admissions TO fixture_private_recovery_reader;
+      GRANT SELECT ON crm_native_email_publication_control TO fixture_private_recovery_reader;
+      GRANT UPDATE(updated_at) ON crm_native_email_publication_control TO fixture_private_recovery_reader`)
+    await withTransaction(async c=>{
+      await c.query('SET LOCAL ROLE fixture_private_recovery_reader')
+      assert.equal((await c.query('SELECT clawpilot_crm_legacy_email_outbox_held($1) AS held',[replacement])).rows[0].held,true)
+      await c.query("SELECT set_config('clawpilot.crm_shared_write_v1','on',true)")
+      const [operationHash]=admissionArgs
+      for(const [sql,params,code] of [
+        ['SELECT * FROM crm_legacy_email_recovery_holds',[],'42501'],
+        ['SELECT * FROM crm_legacy_email_recovery_releases',[],'42501'],
+        ['SELECT * FROM crm_legacy_email_recovery_settlements',[],'42501'],
+        ["INSERT INTO crm_legacy_email_recovery_settlements(native_operation_id,state,receipt_hash,settled_at,settling_xid) VALUES($1,'cancelled',$1,now(),pg_current_xact_id())",[operationHash],'42501'],
+        ['SELECT clawpilot_crm_legacy_email_register_release($1,$2,$3,$3,$3,$3,$3,$3)',[op,replacement,operationHash],'42501'],
+        ['SELECT clawpilot_crm_legacy_email_settle_release($1,$2,$3,1::bigint)',[op,operationHash,id(1)],'42501'],
+        ["UPDATE sync_outbox SET status='succeeded',locked_at=NULL,lock_token=NULL,processed_at=now() WHERE id=$1",[replacement],'55000'],
+        ["UPDATE crm_interactions SET sync_status='synced',suitecrm_synced_at=now() WHERE id=$1",[local],'55000'],
+        [directAdmission,admissionArgs,'55000'],
+      ]) {
+        await c.query('SAVEPOINT before_denied')
+        await assert.rejects(c.query(sql,params),e=>e.code===code)
+        await c.query('ROLLBACK TO SAVEPOINT before_denied')
+      }
+    })
+    assert.deepEqual((await query('SELECT to_jsonb(o) AS row FROM sync_outbox o WHERE id=$1',[replacement])).rows[0].row,before)
   })
   console.log(`PASS ${checks.length} exact publication real PostgreSQL groups; synthetic data, no provider/native/deployment proof`)
 } finally {

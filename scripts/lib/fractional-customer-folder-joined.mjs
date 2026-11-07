@@ -198,7 +198,9 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
   try {
   workDirectory = mkdtempSync(resolve(tmpdir(), 'clawpilot-folder-sender-'))
   const fQuery = (sql, values) => fractional.query(sql, values)
-  const { org, pipeline, rootGlobalId, instance, deployment, credentialId, token, board } = fixture
+  const { org, pipeline, rootGlobalId, instance, deployment, onboardingCredentialId, board } = fixture
+  const credentialId = randomUUID()
+  const token = `fcg_${credentialId.replaceAll('-', '')}_${'J'.repeat(43)}`
   const fractionalOrg = fixture.fractionalOrganizationId, actor = 'joined-folder-administrator'
   assert.equal(fractionalOrg, 'fractional-fixture', 'Only the parent synthetic organization is admitted')
   const origin = 'https://clawpilot.example.invalid', parent = 'fractional_joined_customers', driveId = 'fractional_joined_shared_drive'
@@ -216,7 +218,9 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
   const route = load('app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts', {
     '@/lib/fractionalCrmGatewayHttp': http,
     '@/lib/persistence/fractionalCrmGateway': gateway,
-    '@/lib/crm/boardProjection': projection,
+    '@/lib/crm/boardProjection': {
+      reconcileCrmBoardProjectionsForPipeline: async () => assert.fail('Folder-only publication cannot reconcile the pipeline'),
+    },
   }, gatewayEnv)
   assert.equal(typeof route.GET, 'function'); assert.equal(typeof route.PATCH, 'function')
   const env = { PATH: process.env.PATH || '/usr/bin:/bin', TZ: 'UTC', NODE_ENV: 'test', FRACTIONAL_TEST_DATABASE: '1',
@@ -393,8 +397,8 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
       const description = `Retained joined customer notes\nBPO Supply Chain Drive: ${bpoUrl}`
         + (scenario === 'manual-override' ? '\nFractional Customer Folder: https://drive.google.com/drive/folders/manual_operator_reference' : '')
       const accountRecord = await stage({ name: `Synthetic joined folder ${scenario}`, accountType: 'Customer', description })
-      await query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1', [credentialId, accountRecord.referenceCode])
-      const principal = await gateway.readFractionalCrmCredential(credentialId)
+      await query('UPDATE fractional_crm_gateway_credentials SET allowed_company_global_ids=array_append(allowed_company_global_ids,$2) WHERE id=$1', [onboardingCredentialId, accountRecord.referenceCode])
+      const principal = await gateway.readFractionalCrmCredential(onboardingCredentialId)
       // Existing canonical account first; onboarding only establishes this
       // synthetic reciprocal mapping, never a replacement account/global ID.
       const onboarding = onboardingRequest(customerId, `Synthetic joined folder ${scenario}`, `joined-${scenario}@example.invalid`, accountRecord.referenceCode)
@@ -402,6 +406,10 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
       const linked = await gateway.resolveOrCreateFractionalCrmOnboarding(principal, onboarding, `joined-map-${scenario}`)
       assert.equal(linked.company.record.recordId, accountRecord.id)
       assert.equal(linked.company.record.globalId, accountRecord.referenceCode)
+      // The receiving policy requires a verified existing native Account.
+      // Seed that synthetic precondition; no native network I/O is performed.
+      assert.equal((await query(`UPDATE crm_organizations SET sync_status='synced',suitecrm_synced_at=now()
+        WHERE id=$1 AND reference_code=$2 AND suitecrm_id IS NOT NULL RETURNING id`, [accountRecord.id, accountRecord.referenceCode])).rowCount, 1)
       const row = { scenario, customerId, folderId, folderUrl, bpoUrl, description, localId: accountRecord.id, globalId: accountRecord.referenceCode }
       records.push(row)
       await fQuery('INSERT INTO customers(organization_id,id,name) VALUES($1,$2,$3)', [fractionalOrg, customerId, `Synthetic ${scenario}`])
@@ -413,14 +421,22 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
         ['customer.setup.drive', { status: 'ready', folderId, parentFolderId: parent, url: folderUrl, globalAccountId: row.globalId }]]) {
         await fQuery('INSERT INTO audit_events(organization_id,customer_id,actor_id,action,resource_id,detail) VALUES($1,$2,$3,$4,$2,$5)', [fractionalOrg, customerId, actor, action, detail])
       }
-      assert.equal(await child(row, '--private-opt-in'), true)
     }
+    assert.equal((await query(`INSERT INTO fractional_crm_gateway_credentials
+      (id,token_hash,source_instance_id,workspace_organization_id,pipeline_id,root_company_global_id,
+       allowed_company_global_ids,capabilities,fractional_deployment_id,fractional_organization_id,actor_email,expires_at,enabled)
+      SELECT $1,$2,source_instance_id,workspace_organization_id,pipeline_id,root_company_global_id,
+       $3::text[],ARRAY['crm.customer-folder.write']::text[],fractional_deployment_id,fractional_organization_id,actor_email,expires_at,true
+      FROM fractional_crm_gateway_credentials WHERE id=$4 AND enabled AND revoked_at IS NULL RETURNING id`,
+    [credentialId, fixture.auth.hashFractionalCrmGatewayToken(token), records.map(row => row.globalId), onboardingCredentialId])).rowCount, 1)
+    assert.deepEqual(Array.from((await gateway.readFractionalCrmCredential(credentialId)).capabilities), ['crm.customer-folder.write'])
     await projection.reconcileCrmBoardProjectionsForPipeline({ pipelineId: pipeline })
     for (const row of records) {
       row.originalCard = await card(row)
       assert.ok(row.originalCard)
       await query(`UPDATE crm_board_cards SET payload=jsonb_set(payload,'{comments}',$2::jsonb) WHERE card_id=$1`,
         [row.originalCard.card_id, JSON.stringify([{ id: `joined-${row.scenario}`, text: 'Retained operator comment' }])])
+      assert.equal(await child(row, '--private-opt-in'), true)
     }
     const happy = records[0]
     const authProbeUrl = new URL(`${origin}/api/integrations/fractional-crm/v1/companies/${happy.globalId}/customer-folder`)
@@ -436,6 +452,10 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     assert.equal(await child(), true)
     assert.equal((await receipts(happy)).at(-1).detail.status, 'retry')
     const afterLostAck = await effects(happy), retainedCard = await card(happy)
+    const nativeWork = (await query(`SELECT operation,payload FROM sync_outbox
+      WHERE aggregate_id=$1 AND operation='patch_account_description'`, [happy.localId])).rows
+    assert.equal(nativeWork.length, 1)
+    assert.deepEqual(nativeWork[0].payload.attributes, { global_id_c: happy.globalId, description: `${happy.description}\nFractional Customer Folder: ${happy.folderUrl}` })
     assert.equal(retainedCard.card_id, happy.originalCard.card_id)
     assert.equal(retainedCard.payload.crm.referenceCode, happy.globalId)
     const expectedDescription = `${happy.description}\nFractional Customer Folder: ${happy.folderUrl}`
@@ -468,7 +488,7 @@ export async function runFractionalCustomerFolderJoined({ Pool, connectionOption
     assert.equal(counters.poolOneVerified, counters.senderWorkers)
     unchanged(capture)
     return { passed: true, kind: 'actual-fractional-sender-clawpilot-receiver-local-joined', fixtureDataSynthetic: true,
-      actualSenderProcess: true, actualReceiverNextRoute: true, actualMachineAuth: true, actualSeparateDatabases: true,
+      actualSenderProcess: true, actualReceiverNextRoute: true, actualMachineAuth: true, folderOnlyMachineCredential: true, actualSeparateDatabases: true,
       actualProjectCardProjection: true, providerIoControlled: true, providerFolderWrites: 0, productionTouched: false,
       fractionalSourceRoot: capture.root, fractionalSourceCommit: capture.commit,
       migrationCount: capture.migrationCount, migrationBoundary: capture.migrationBoundary,

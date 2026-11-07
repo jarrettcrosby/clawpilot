@@ -97,6 +97,9 @@ An Opportunity owns one permanent `go` reference, one required Organization rela
 - Organization, contact, lead, opportunity, and meeting records can create Google Calendar invitations through that user's selected `google-calendar` connection. The action composer displays the selected organizer and records it with the provider result.
 - Every Calendar invitation created by ClawPilot includes the meeting's permanent `gm` reference and organization-scoped short link. The `gm` reference is also stored in the event's private Google metadata so later Calendar changes can be reconciled safely.
 - Pipeline owners can explicitly enable a linked calendar from **CRM → Meetings → Calendar import**. Discovery imports only meetings whose participant emails match active CRM Contacts on one account in that pipeline. All matched Contacts are retained in native CRM Meetings relationships; unrelated-account ambiguity stays unlinked. Personal/default calendars are never automatically enabled. The initial and daily rolling window covers the last 30 and next 90 days, with bounded pagination, incremental updates, cancellations, and stable calendar/event identity across reconnects. Import itself sends no invitations. Existing-event edits retain that exact verified calendar and update the same Google event from either ClawPilot or SuiteCRM, subject to Google event permissions. Meetings without a location or conferencing retain that state rather than generating a Google Meet link.
+- Reimports and edits retain the same Meeting and Global ID. Within one pipeline, copies of the same Google Calendar occurrence share one durable claim. The original date or instant distinguishes recurring occurrences even after they are rescheduled. A secondary copy or a former calendar binding cannot edit, cancel, or rebind the canonical meeting. A verified move retains the old claims as duplicate protection.
+- If an existing Calendar meeting has no verified occurrence identity, or a prior delivery may still be unresolved, discovery holds new imports rather than guessing whether they are copies. Verified exact observations can fill missing identity evidence without recreating the meeting. Review unavailable or conflicting historical sources by their exact provider identities; do not reset cursors, reassign meetings, or delete a suspected duplicate automatically.
+- Before a Google Calendar write, the worker verifies the reviewed account against Google's unique live writable primary calendar on the pinned connection, then checks the exact selected calendar and organizer separately. An outdated Maton account label does not block a verified selection. A different or unverified live account blocks delivery even if it can write to the same shared calendar. Recorded and imported SuiteCRM edits queue against their original verified identity without contacting Google until delivery.
 - Records with a phone number expose a call command. It records a native Call before returning a validated `tel:` URL to the device. A logged call defaults to **Held**, **Outbound**, and 15 minutes; the operator can change status, direction, and duration before submitting.
 - Campaigns accept `gc` and `gl` recipients, support `{{firstName}}`, `{{lastName}}`, `{{name}}`, `{{email}}`, and `{{referenceCode}}` merge fields, deduplicate recipients by email, and suppress opted-out recipients.
 - Every action is a durable intent with an idempotency key, leased provider attempt, retry state, and audit event. Email, call, and campaign actions also create the corresponding interaction. A Calendar action updates its one canonical `gm` Meeting and never creates a second `gi` Meeting interaction. The worker handles failed retries and campaign child messages.
@@ -182,19 +185,176 @@ verification; the saved label is not a grant-continuity or historical proof.
 
 Previously missed messages are not recovered by resetting a mailbox cursor. The owner-only `POST /api/crm/email-recovery` accepts one active workspace pipeline, its owner's selected Gmail connection, and 1–25 exact Gmail message IDs. It requires a real, non-impersonated same-origin session. The default dry run returns a content/routing digest and proposed references without changing CRM or Gmail. An explicit apply must supply that digest; it refetches the messages, rejects changed content or routing and rechecks current pipeline membership before staging. Drafts, spam, trash, authentication codes and messages routed outside the reviewed pipeline are ineligible. Recovery is audited and idempotent, queues normal CRM synchronization, never sends mail, and does not alter polling cursors. Review each bounded selection and verify the resulting CRM/SuiteCRM activity before expanding it.
 
-The separately reviewed historical Casey pair has its own explicit action in
-the matching BPO pipeline/mailbox's review dialog. It loads only both pinned
-cache records and sends `admissionScope: 'casey-reviewed-two-v1'` with
-`decisionKind: 'review'`. The server independently pins the owner, connection,
-original intake pipeline, exact message/cache/thread identities, Globus primary
-and Airspace related, and actual selected participant Contacts. Both complete
-retained messages must equal fresh provider content. Preview, CAS, audience and
-the whole-pair transaction are rechecked before apply; failure leaves both
-unchanged. Replay retains their canonical identities and **unknown original
-mailbox provenance**. This one-off historical review is not a generic history
-import, association correction, late-contact rule or automatic future thread
-association. The original three-message bridge is unchanged, and the five
-reviewed messages must be recovered as separate three- and two-message batches.
+The separately reviewed historical Casey pair has two exact actions in the
+matching BPO pipeline/mailbox's review dialog. The retained-cache action
+(`casey-reviewed-two-v1`) verifies both pinned cache records against fresh
+provider content and preserves their **unknown original mailbox provenance**.
+If there are no retained placements, the first-seen action
+(`casey-reviewed-two-first-seen-v1`) gets the headers of only the two pinned
+message IDs for selection. It never searches Gmail. Preview then reads those
+two complete messages through the verified mailbox and binds their current
+content, participants, access and planned placement into the review digest.
+Apply re-fetches and rechecks that digest, then saves both complete sources,
+interactions, account links and exact publication jobs in one transaction.
+The path requires native publication authority; it stops on partial or
+conflicting placements. Either path uses Globus as primary, Airspace as
+additional, and the reviewed Contacts, with one Email per message. Neither is
+a generic import, a future thread rule, or a mailbox-cursor replay. Keep the
+original three-message review separate from this two-message review.
+
+Native first-time Email publication requires the exact native record and its
+managed identity to be absent. A deleted record, orphaned body or relationship,
+matching Global ID, or leftover SecurityGroups link (including a deleted link)
+holds creation for review. Native publication rechecks the condition inside its
+write transaction; a preview does not reserve the ID. An exact retry of a
+committed operation resolves its existing receipt instead of creating a copy.
+For reviewed recovery, verify one ClawPilot interaction and one corresponding
+SuiteCRM Email per selected provider message, with the customer and supplier
+relationships on that same Email. A conflicting existing identity holds the
+operation for review; it is not permission to recreate, merge, or delete it.
+
+Legacy failed Email jobs use a separate private maintenance path. A reviewed
+archive transaction retains each exact terminal original and blocks its old
+queue identity from being reused. The historical provider outcome stays
+unknown. This also prevents ordinary edits, deletion, and resync of each
+protected interaction identity; it is not a general cleanup action. The
+manifest must explicitly distinguish a reviewed-recovery batch from an
+archive-only batch. Archive-only records cannot be previewed or staged for
+publication, even if a later stage command supplies a separate approval. Archiving
+requires independent signatures and an externally verified writer fence kept
+through commit; an approval alone is not a fence.
+
+When the exact terminal Email is still Supplier-only but a reviewed Customer
+must be primary, correct the association before signing its archive manifest.
+The private pre-archive repair compares the approved hashes of the current
+Email, dead job, relationship and derived payload; it keeps the same Email,
+provider identity and dead job, adds the Customer as primary, and preserves
+the Supplier and its existing Contact. It retains immutable originals and
+updates the job payload and revision key without requeueing or publishing.
+An old or mismatched approval cannot write. The private controller below
+exposes `repair-preview`, `repair`, and `repair-inspect` as distinct modes.
+The migration installs no grants. An attended retained writer fence and
+separate trusted attestor and repair logins are required for live use. Do not
+repair an already archived or previously reviewed record through this path.
+
+After verified native activation, a separate stage transaction checks one
+archive receipt, the exact canonical source, the reviewed primary and related
+accounts, and the current approved audience. It refuses stale placement
+instead of silently publishing or correcting it. A second local row with the
+same provider message ID in the reviewed pipeline also holds recovery for
+review, even when the two rows have different CRM IDs.
+It parks one replacement and its hold together, retaining the original content
+and relationships. An expired release approval can be renewed for the same
+parked intent before admission; it cannot change the selected job or command.
+The job stays outside ordinary claims and retries, including after cancellation.
+An uncertain archive, stage, or publication commit is resolved by its exact
+receipt, not by repeating the write. The migrations grant no access to public
+or application roles and install no live maintenance controller or credentials.
+
+ClawPilot rechecks the live Account/Contact projection at staging, admission,
+and dispatch. While an admitted replacement is unresolved, its exact local
+relationship inputs cannot change; unrelated CRM edits still work. The guard
+ends when the replacement is settled or safely cancelled. It does not pause
+SuiteCRM or replace the verified writer pause required in both stores during
+attended recovery. SuiteCRM's public maintenance responder blocks the normal
+publication routes; the local fixture's PHP bridge is not a production
+transport. The private controller prepares, publishes, and resolves with
+separate signed action permits bound to the exact operation, verified writer
+fence, and native target. A publish permit is issued only on the first durable
+dispatch transition, after the same connection verifies readiness. For a new
+operation, the controller registers, admits, and dispatches in one database
+transaction. A refusal before that commit leaves the reviewed item parked
+without creating an admission, so a fresh approval can still be given to the
+same exact item. An operation already admitted by a previous controller still
+requires its original approval; an expired one requires separate review, not
+a dispatch bypass. Verify no such operation exists before activating the
+atomic controller. Once dispatched, an uncertain response can only be resolved
+with an active lease, not resent. Permits expire after at most 30 seconds. The
+SuiteCRM image packages a private command for these
+actions, not an HTTP endpoint. It refuses to run without maintenance mode, a
+protected fence pinned to the deployment instance, replica and enrolled image, and a
+dedicated MariaDB login distinct from the normal application login. The
+command does not create that login, install a production fence, or prove that
+writers have drained. Stock SuiteCRM also requires one existing system mailer
+record to read Maps settings; the private recovery path refuses to create one.
+The SSH client uses a pre-registered identity and does not send the email
+packet until the same connection returns a fresh readiness proof for the
+action, native target and maintenance window. A separate per-window secret
+authenticates that proof and stays out of the SSH command and packet. Verify
+the production route and separate database roles, and retain independent
+writer-drain evidence in both stores before recovering live mail.
+
+The private recovery executable is built separately with Node 24 using
+`npm run build:native-email-recovery-operator`. Run its emitted entry only with
+`node --conditions=react-server`, as an unprivileged operator identity. It has
+separate profiles. The publication profile can inspect the exact durable
+state, publish an already staged and separately signed release, or resolve that
+same operation without republishing. The staging profile can preview one
+archived Email, stage it against a separately signed exact intent, or inspect
+its receipt. It accepts no Railway identity or native dispatch credentials
+and cannot publish. The pre-archive account-repair profile also has no native
+transport: `repair-preview` returns the bounded review and destination digest;
+`repair` requires its exact signed, short-lived approval, explicit operation
+UUID, two distinct direct PostgreSQL logins and independently verified writer
+custody. It reserves a private, durable, single-use journal before either
+login can write, then closes the attestor connection and rechecks custody
+before opening the repair connection. The compiled
+`nativeEmailAccountRepairCustodySelection` helper derives its stable
+challenge hashes for the separate custodian without database credentials.
+After any uncertain result, use the
+same journal with `repair-inspect` and an independently scoped receipt-only
+login. Inspection needs no fresh mutation approval and does not issue any
+repair SQL. Do not delete a journal or retry even if inspection reports
+unknown. The separate archive profile has `archive` and `archive-inspect`.
+It accepts only an exact manifest signed by the native-absence attestor and
+the independent review operator. The controller checks the manifest's
+deployment and database pins, then requires fresh challenges from a third,
+independent custodian. It reserves a distinct durable archive journal, closes
+the attestor database connection, rechecks writer custody, and calls only the
+exact archive SQL action. After any uncertain archive result, look up the
+same receipt using the archive journal and a receipt-only database login.
+The archive profile cannot publish or replay an Email. None of these
+profiles can grant access, pause services, or restore them.
+The controller takes a SHA-256-pinned canonical JSON configuration and protected
+credential/approval files. Each mutating invocation also names the full exact
+approved operation hash. Do not reuse the ordinary app's database credential,
+the initial-enrollment keys, or the Railway identity of another service.
+
+The command verifies fresh, challenge-bound attestations from a separately
+owned custodian socket before and after the command and each native action.
+The custodian's key, the release reviewer key, and the dispatch key are
+distinct. The custodian must independently retain the exclusive writer pause
+for the whole window: stopping producers, blocking their database logins,
+draining both stores, and preventing alternate writers or a concurrent restore.
+The signed observations authenticate that custodian's assertion; they do not
+create or substitute for the pause. The only PostgreSQL connection is direct,
+bounded, TLS-verified and pinned to the selected database, CA and role. A failure
+to re-attest after an attempt is an uncertain outcome: keep maintenance in
+place, inspect the exact operation and reconcile it. Do not repeat a write
+based on a timeout or automatically reopen the writers. Local fixture passes
+are not approval to install production roles, signing keys or maintenance
+state, and do not establish the production custodian or Railway route.
+
+The same private build emits a separate custodian responder library; the
+controller does not import its signer. It runs the PostgreSQL and MariaDB
+observers inside the independent custody capability before signing and closes
+both observer connections before replying. Version 2 of the custody proof
+binds the signed destination to the database identities observed on those
+connections: PostgreSQL system identifier and database OID/name, and the
+MariaDB database name and server identity (including `server_uid`). Missing or
+mismatched identities, and older proofs without that binding, cannot authorize
+a write. The SuiteCRM command independently checks the MariaDB identity on its
+own writer connection before running the publisher. The custodian, not the client,
+must identify any allowed idle PostgreSQL writer session by its exact role,
+backend PID and start time. Installing and proving the real custody capability,
+the direct observer identities and the Railway connection are separate release
+gates; the library has no default custody implementation or listener.
+
+The forward release uses production-rebind schema attestation v20 for the
+reviewed migrations through `0412`. It includes the recovery evidence,
+private-schema authority, and Calendar occurrence claims and guards. Earlier v9–v19 catalogs
+remain frozen historical evidence, never a fallback for current acceptance;
+their existing receipts and source artifacts are not relabeled.
 
 ## Workbook Contract
 

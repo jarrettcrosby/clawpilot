@@ -31,7 +31,8 @@ try{
   '-e','POSTGRES_PASSWORD=initial_fixture','-e','POSTGRES_DB=initial_fixture','-p','127.0.0.1::5432',`pgvector/pgvector:pg${major}`]),{stdio:'pipe',timeout:60000});started=true
  const port=execFileSync('docker',['port',container,'5432/tcp'],{encoding:'utf8',timeout:10000}).match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
  assert.ok(port,'Fixture must bind loopback only')
- pool=new Pool({host:'127.0.0.1',port:Number(port),database:'initial_fixture',user:'postgres',password:'initial_fixture',ssl:false,max:4,statement_timeout:20000})
+ const localPoolOptions={host:'127.0.0.1',port:Number(port),database:'initial_fixture',user:'postgres',password:'initial_fixture',ssl:false,max:4,statement_timeout:20000}
+ pool=new Pool(localPoolOptions)
  const until=Date.now()+30000;for(;;){try{await pool.query('SELECT 1');break}catch(error){if(Date.now()>until)throw error;await new Promise(r=>setTimeout(r,100))}}
  const query=(sql,params)=>pool.query(sql,params)
  const tx=async fn=>{const c=await pool.connect();try{await c.query('BEGIN');const result=await fn(c);await c.query('COMMIT');return result}
@@ -229,6 +230,154 @@ try{
    await assert.rejects(reserve(await reservation(c),owner,c),refusal,label+' must not be called drained')
   }finally{await c.query('ROLLBACK');c.release()}}
   assert.deepEqual(await quarantineRows(),quarantineBefore,'All negative cases roll back without altering retained quarantine evidence')
+ })
+ await check('signed fixture retirement consumes approval with eleven retained originals and resolves lost acknowledgement read-only',async()=>{
+  await query(readFileSync(new URL('./fixtures/native-email-legacy-retirement.sql',import.meta.url),'utf8'))
+  const lost=new Error('synthetic acknowledgement loss after PostgreSQL commit')
+  const crypto=require('node:crypto')
+  const approvalApi=load('app_src/lib/crm/legacyEmailRetirementApproval.ts')
+  const fenceKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
+  const operatorKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
+  const wrap=(proof,key)=>({proof,signature:crypto.sign('sha256',Buffer.from(canonical(proof),'ascii'),
+   {key,padding:crypto.constants.RSA_PKCS1_PADDING}).toString('base64')})
+  let pins
+  await assert.rejects(async()=>{
+   await tx(async c=>{
+   const ids=[],batch=randomUUID(),epoch=randomUUID()
+   const sourceRows=async()=> (await c.query('SELECT to_jsonb(i) AS r FROM crm_interactions i WHERE source_key LIKE \'legacy-retirement-fixture-%\' ORDER BY id')).rows
+   const body='SYNTHETIC_RETAINED_ORIGINAL'
+   for(let index=0;index<11;index++){
+    const local=randomUUID(),native=randomUUID(),outbox=randomUUID(),pipeline=pipelines[index%2],sourceHash=hash(['legacy',index])
+    const created=await c.query(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,
+     reference_code,source_payload,sync_status) VALUES($1,$2,$3,'Synthetic terminal legacy email',$4,$5,'Emails',allocate_crm_reference('gi'),'{}','failed')
+     RETURNING reference_code`,[local,pipeline,'legacy-retirement-fixture-'+index,sourceHash,native])
+    const global=created.rows[0].reference_code
+    await c.query(`INSERT INTO sync_outbox(id,target_system,aggregate_type,aggregate_id,operation,payload,
+     status,attempts,last_error,processed_at,idempotency_key) VALUES($1,'suitecrm','crm_interactions',$2,'upsert_record',$3,
+     'dead',8,'synthetic legacy result unknown',now(),$4)`,[outbox,local,{entity:'interactions',localId:local,
+      pipelineId:pipeline,suiteCrmId:native,suiteCrmModule:'Emails',attributes:{global_id_c:global,description:body}},
+      `crm:interactions:v4:${local}:Emails:${sourceHash}`])
+    ids.push(outbox)
+   }
+   const old=async()=> (await c.query('SELECT to_jsonb(o) AS original FROM sync_outbox o WHERE id=ANY($1::uuid[]) ORDER BY id',[ids])).rows
+   const original=await old(),sources=await sourceRows()
+   const attempt=async(action,expected)=>{
+    await c.query('SAVEPOINT refusal')
+    await assert.rejects(action,e=>e.code===expected)
+    await c.query('ROLLBACK TO SAVEPOINT refusal')
+    await c.query('RELEASE SAVEPOINT refusal')
+   }
+   const blocked=await reservation(c)
+   await attempt(()=>reserve(blocked,owner,c),'55000')
+   const evidence=(await c.query(`SELECT o.id,i.id AS local_id,i.pipeline_id,i.suitecrm_id AS native_id,i.reference_code AS global_id,
+    p.workspace_organization_id AS workspace_id,encode(digest(to_jsonb(o)::text,'sha256'),'hex') AS job_hash,
+    encode(digest(to_jsonb(i)::text,'sha256'),'hex') AS source_hash,
+    encode(digest(o.payload::text,'sha256'),'hex') AS payload_hash,
+    encode(digest(o.idempotency_key,'sha256'),'hex') AS key_hash
+    FROM sync_outbox o JOIN crm_interactions i ON i.id::text=o.aggregate_id JOIN pipeline_spaces p ON p.id=i.pipeline_id
+    WHERE o.id=ANY($1::uuid[]) ORDER BY o.id`,[ids])).rows
+   const expectedManifest={version:1,action:'archive_exact_legacy_terminal_rows_only',operationId:batch,publicationDisposition:'archive_only',
+    scope:{projectId:randomUUID(),environmentId:randomUUID(),postgresDatabaseFingerprint:hash('synthetic database'),appCommit:'a'.repeat(40),
+     nativeDeploymentId:randomUUID(),nativeReplicaId:randomUUID(),nativeCommit:'b'.repeat(40),nativeDatabaseFingerprint:hash('synthetic native')},
+    actorEmail:owner,operatorAccountId:account,rootWorkspaceId:root,appGeneration:blocked.generation,
+    gateFingerprint:hash('unchanged fixture gate'),appSourceFingerprint:blocked.live.fingerprint,fenceEpoch:epoch,
+    fenceEvidenceFingerprint:hash('synthetic fence'),nativeAbsenceFingerprint:hash('synthetic absence'),historicalProviderOutcome:'unknown',
+    rows:evidence.map(r=>({outboxId:r.id,localId:r.local_id,pipelineId:r.pipeline_id,workspaceId:r.workspace_id,
+     nativeId:r.native_id,globalId:r.global_id,attempts:8,rowFingerprint:r.job_hash,sourceFingerprint:r.source_hash,
+     payloadFingerprint:r.payload_hash,keyFingerprint:r.key_hash}))}
+   const nowSeconds=Number((await c.query('SELECT floor(extract(epoch FROM clock_timestamp())) AS n')).rows[0].n)
+   const manifestDigest=approvalApi.legacyEmailRetirementManifestDigest(expectedManifest)
+   const common={version:1,audience:'clawpilot-private-legacy-email-retirement-controller',operationId:batch,manifestDigest,
+    issuedAt:nowSeconds,expiresAt:nowSeconds+90}
+   const fenceEnvelope=wrap({...common,keyId:'fixture-fence',issuer:'clawpilot-crm-fence-attestor',
+    purpose:'clawpilot-legacy-email-fenced-absence-v1'},fenceKey.privateKey)
+   const operatorEnvelope=wrap({...common,keyId:'fixture-operator',issuer:'clawpilot-crm-retirement-operator',
+    purpose:'clawpilot-legacy-email-retirement-review-v1',fenceEnvelopeDigest:hash(fenceEnvelope)},operatorKey.privateKey)
+   const verified=approvalApi.verifyLegacyEmailRetirementApproval({expectedManifest,nowSeconds,fenceEnvelope,operatorEnvelope,
+    fenceAnchor:{keyId:'fixture-fence',key:fenceKey.publicKey},operatorAnchor:{keyId:'fixture-operator',key:operatorKey.publicKey}})
+   assert.equal(verified.liveFenceProven,false);assert.equal(verified.consumed,false)
+   pins=[batch,verified.manifestDigest,verified.approvalEnvelopeDigest]
+   const retire=(list=ids,approval=verified.approvalEnvelopeDigest)=>c.query('SELECT crm_retirement_fixture.retire($1,$2,$3) AS n',[batch,list,approval])
+   await c.query('SET LOCAL ROLE crm_fixture_retirement_attestor')
+   await c.query(`INSERT INTO crm_retirement_fixture.verified_batch VALUES($1,$2,$3,to_timestamp($4),$5,$6,$7,$8)`,
+    [batch,blocked.generation,epoch,verified.expiresAt,ids.length,verified.manifestDigest,verified.fenceEnvelopeDigest,verified.approvalEnvelopeDigest])
+   for(const row of evidence)await c.query(`INSERT INTO crm_retirement_fixture.review
+    VALUES($1,$2,$3,$4,$5,$6,to_timestamp($7),'synthetic_fenced_absence_only')`,
+    [batch,row.id,blocked.generation,row.job_hash,row.source_hash,epoch,verified.expiresAt])
+   await attempt(()=>retire(),'42501')
+   await c.query('RESET ROLE')
+   await c.query('SET LOCAL ROLE crm_fixture_ordinary_writer')
+   await attempt(()=>c.query('SELECT original FROM crm_retirement_fixture.retained'),'42501')
+   await attempt(()=>retire(),'42501')
+   await attempt(()=>c.query('SELECT crm_retirement_fixture.resolve($1,$2,$3)',pins),'42501')
+   await c.query('RESET ROLE')
+   await c.query('SAVEPOINT drift')
+   await c.query("UPDATE sync_outbox SET last_error='source changed after review' WHERE id=$1",[ids[0]])
+   await c.query('SET LOCAL ROLE crm_fixture_retirement_controller')
+   await attempt(()=>retire(),'55000')
+   await c.query('ROLLBACK TO SAVEPOINT drift')
+   await c.query('RELEASE SAVEPOINT drift')
+   assert.deepEqual(await old(),original)
+   await c.query('SET LOCAL ROLE crm_fixture_retirement_controller')
+   await attempt(()=>retire(null),'55000')
+   await attempt(()=>retire(ids.slice(1)),'55000')
+   await attempt(()=>retire(ids,hash('different approval')),'55000')
+   const retained=(await retire()).rows[0].n
+   assert.equal(retained,11)
+   await attempt(()=>retire(),'55000')
+   await attempt(()=>c.query('DELETE FROM crm_retirement_fixture.retained'),'42501')
+   await c.query('RESET ROLE')
+   assert.deepEqual(await old(),[])
+   assert.deepEqual((await c.query('SELECT original FROM crm_retirement_fixture.retained ORDER BY outbox_id')).rows,original)
+   assert.deepEqual(await sourceRows(),sources)
+   assert.equal((await c.query("SELECT count(*) FROM crm_retirement_fixture.retained WHERE historical_provider_outcome='unknown'")).rows[0].count,'11')
+   await c.query('SET LOCAL ROLE crm_fixture_ordinary_writer')
+   const raw=original[0].original
+   await attempt(()=>c.query(`INSERT INTO sync_outbox(target_system,aggregate_type,aggregate_id,operation,payload)
+    VALUES('suitecrm','crm_interactions',$1,'delete_record',$2)`,[raw.aggregate_id,raw.payload]),'55000')
+   await attempt(()=>c.query('UPDATE sync_outbox SET payload=$2 WHERE id=$1',[queuedId,raw.payload]),'55000')
+   await c.query('RESET ROLE')
+   await c.query('SAVEPOINT before_reservation')
+   const valid=await reservation(c)
+   await reserve(valid,owner,c)
+   assert.equal((await c.query('SELECT active_initial_enrollment_id AS op FROM crm_native_email_publication_control')).rows[0].op,valid.operationId)
+   await c.query('ROLLBACK TO SAVEPOINT before_reservation')
+   await c.query('RELEASE SAVEPOINT before_reservation')
+   // A different connection cannot infer non-dispatch from an absent
+   // receipt while the controller's transaction is still in flight.
+   const beforeCommit=(await query('SELECT crm_retirement_fixture.resolve($1,$2,$3) AS result',pins)).rows[0].result
+   assert.deepEqual(beforeCommit,{state:'unknown'})
+   })
+   throw lost
+  },e=>e===lost)
+  const resolverPool=new Pool({...localPoolOptions,max:1})
+  try{
+   const c=await resolverPool.connect()
+   try{
+    await c.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY')
+    await c.query('SET LOCAL ROLE crm_fixture_retirement_resolver')
+    const resolve=async args=>(await c.query('SELECT crm_retirement_fixture.resolve($1,$2,$3) AS result',args)).rows[0].result
+    assert.deepEqual(await resolve(pins),{state:'committed',operationId:pins[0],manifestDigest:pins[1],
+     approvalDigest:pins[2],rows:11,historicalProviderOutcome:'unknown'})
+    assert.deepEqual(await resolve([pins[0],pins[1],hash('wrong approval')]),{state:'unknown'})
+    assert.deepEqual(await resolve([randomUUID(),pins[1],pins[2]]),{state:'unknown'})
+   }finally{try{await c.query('ROLLBACK')}finally{c.release()}}
+  }finally{await resolverPool.end()}
+  assert.equal((await query('SELECT count(*) FROM crm_retirement_fixture.retained')).rows[0].count,'11')
+  assert.equal((await query('SELECT count(*) FROM crm_retirement_fixture.consumed')).rows[0].count,'1')
+ })
+ await check('legacy retirement serial fence rejects queue writes using a pre-retirement snapshot',async()=>{
+  const stale=await pool.connect()
+  try{
+   await stale.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
+   await stale.query('SET LOCAL ROLE crm_fixture_ordinary_writer')
+   await stale.query('SELECT id FROM sync_outbox WHERE id=$1',[queuedId])
+   await tx(async c=>{
+    await c.query('SELECT 1 FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+    await c.query('UPDATE crm_retirement_fixture.serial SET epoch=epoch+1 WHERE singleton')
+   })
+   await assert.rejects(stale.query('UPDATE sync_outbox SET available_at=now() WHERE id=$1',[queuedId]),e=>e.code==='40001')
+  }finally{try{await stale.query('ROLLBACK')}finally{stale.release()}}
  })
  const reserved=await reservation()
  await check('reservation installs the disabled durable fence before any final plan, native forecast or signature exists',async()=>{

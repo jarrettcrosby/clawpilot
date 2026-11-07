@@ -28,7 +28,7 @@ function harness(mutate=()=>{}) {
   const state={control:{enabled:true,generation:3,verified_generation:3,native_policy_fingerprint:'a'.repeat(64),
       activation_receipt_hash:'b'.repeat(64),active_operation_id:null,active_transition_id:null},
     owners:[{id:selected.pipelineId}],mailboxes:[{id:uuid(4),verified_at:'2026-10-30 12:00:00+00',account_email:'mailbox@example.test'}],
-    sources:[],interactions:[],outboxes:[],audience}
+    sources:[],interactions:[],outboxes:[],audience,sourceConflict:false,interactionConflict:false}
   for(let n=1;n<=4;n++) {
     const source={id:uuid(10+n),provider_message_id:`a${n}`,provider_thread_id:'b1',evidence_hash:hash(`source${n}`)}
     const interaction={id:uuid(20+n),canonical_source_id:source.id,pipeline_id:selected.pipelineId,
@@ -62,6 +62,14 @@ function harness(mutate=()=>{}) {
       assert.match(sql,/remote_updated_at.*<=binding\.verified_at/)
       assert.match(sql,/FOR SHARE OF mailbox,binding,connection/)
       assert.deepEqual(copy(params),[selected.ownerEmail,selected.connectionId]);return {rows:state.mailboxes}
+    }
+    if(sql.includes('AS source_conflict')) {
+      assert.match(sql,/source\.owner_email=\$1 OR source\.mailbox_id=\$2::uuid/)
+      assert.match(sql,/lower\(btrim\(source\.provider_message_id\)\)=ANY\(\$3::text\[\]\)/)
+      assert.match(sql,/pipeline\.owner_email=\$1 AND interaction\.id<>ALL\(\$5::uuid\[\]\)/)
+      assert.match(sql,/interaction\.canonical_source_id=ANY\(\$4::uuid\[\]\)/)
+      assert.deepEqual(copy(params.slice(0,3)),[selected.ownerEmail,uuid(4),selected.messageIds])
+      return {rows:[{source_conflict:state.sourceConflict,interaction_conflict:state.interactionConflict}]}
     }
     if(sql.includes('FROM crm_email_sources')) {
       assert.match(sql,/mailbox_id=\$1::uuid AND owner_email=\$2/)
@@ -138,6 +146,16 @@ test('policy, audience, source, mailbox verification or payload drift invalidate
   for(const mutate of mutations){const h=harness(),p=await h.api.previewExactEmailPublicationInPostgres(selected)
     mutate(h.state);await assert.rejects(h.api.claimExactEmailPublicationInPostgres(selected,p.digest),/unavailable or changed/)
     assert.equal(h.writes.length,0)}
+})
+test('a later same-owner collision holds the complete reviewed selection without claiming any job',async()=>{
+  for(const key of ['sourceConflict','interactionConflict']){
+    const h=harness(),preview=await h.api.previewExactEmailPublicationInPostgres(selected)
+    h.state[key]=true
+    const before=copy(h.state.outboxes)
+    await assert.rejects(h.api.claimExactEmailPublicationInPostgres(selected,preview.digest),/unavailable or changed/)
+    assert.deepEqual(h.state.outboxes,before)
+    assert.equal(h.writes.length,0)
+  }
 })
 test('all owner, mailbox, source, archive, duplicate and relationship audience constraints are checked before claim',async()=>{
   const mutations=[s=>s.owners=[],s=>s.mailboxes=[],s=>s.sources.pop()&&s.sources.shift(),

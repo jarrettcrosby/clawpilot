@@ -249,6 +249,23 @@ async function collect(client) {
       WHERE m.owner_email=$1 AND m.external_message_id=ANY($2::text[]) ORDER BY m.external_message_id LIMIT 6`, [SCOPE.ownerEmail, SCOPE.messageIds], 5)
     if (messages.length !== SCOPE.messageIds.length
       || new Set(messages.map(row => row.message_id)).size !== SCOPE.messageIds.length) result.holds.push('exact_reviewed_cached_messages_unavailable')
+    // Check malformed historical aliases without reading their mail content or
+    // admitting them as the exact reviewed source. The write path must repeat
+    // this check under its own transaction locks.
+    const aliases = (await q(`SELECT
+      EXISTS (SELECT 1 FROM crm_inbound_messages m WHERE m.owner_email=$1
+        AND lower(btrim(m.external_message_id))=ANY($2::text[])
+        AND NOT (m.external_message_id=ANY($2::text[]))) AS cache_alias,
+      EXISTS (SELECT 1 FROM crm_interactions i JOIN pipeline_spaces p ON p.id=i.pipeline_id
+        WHERE p.owner_email=$1 AND lower(btrim(i.provider_message_id))=ANY($2::text[])
+        AND NOT (i.provider_message_id=ANY($2::text[]))) AS interaction_alias,
+      ${present.has('crm_email_sources') ? `EXISTS (SELECT 1 FROM crm_email_sources s WHERE s.owner_email=$1
+        AND lower(btrim(s.provider_message_id))=ANY($2::text[])
+        AND NOT (s.provider_message_id=ANY($2::text[])))` : 'false'} AS canonical_source_alias`,
+    [SCOPE.ownerEmail, SCOPE.messageIds], 1))[0]
+    for (const key of ['cache_alias', 'interaction_alias', 'canonical_source_alias']) {
+      if (aliases?.[key] !== false) result.holds.push(`reviewed_provider_identity_conflict:${key}`)
+    }
     const participantEmails = [...new Set(messages.flatMap(row => ['from','to','cc','bcc'].flatMap(kind =>
       Array.isArray(row.headers?.[kind]) ? row.headers[kind].map(value => address(value?.address)).filter(Boolean) : [])))].sort()
     if (participantEmails.length > 100) throw new Error('PARTICIPANT_BOUND_EXCEEDED')

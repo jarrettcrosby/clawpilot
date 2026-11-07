@@ -6,7 +6,7 @@
 // neither path certifies Railway SSH, signed-in application UI or production.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
-import {execFileSync} from 'node:child_process'
+import {execFileSync,spawnSync} from 'node:child_process'
 import {createRequire} from 'node:module'
 import {createReadStream,lstatSync,mkdtempSync,readFileSync,readdirSync,realpathSync,rmSync,statfsSync,writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
@@ -108,14 +108,24 @@ for(const arg of process.argv.slice(2)){
   else if(arg==='--replan-after-expiry'){assert.equal(options.replanAfterExpiry,undefined);options.replanAfterExpiry=true}
   else if(arg==='--with-record-lifecycle'){assert.equal(options.withRecordLifecycle,undefined);options.withRecordLifecycle=true}
   else if(arg==='--with-meeting-roundtrip'){assert.equal(options.withMeetingRoundtrip,undefined);options.withMeetingRoundtrip=true}
+  else if(arg==='--with-legacy-recovery'){assert.equal(options.withLegacyRecovery,undefined);options.withLegacyRecovery=true}
+  else if(arg==='--with-legacy-account-repair'){assert.equal(options.withLegacyAccountRepair,undefined);options.withLegacyAccountRepair=true}
+  else if(arg==='--with-private-maintenance-dispatch'){assert.equal(options.withPrivateMaintenanceDispatch,undefined);options.withPrivateMaintenanceDispatch=true}
+  else if(arg==='--with-scoped-recovery-postgres'){assert.equal(options.withScopedRecoveryPostgres,undefined);options.withScopedRecoveryPostgres=true}
   else if(arg==='--with-unmanaged-app-only'){assert.equal(options.withUnmanagedAppOnly,undefined);options.withUnmanagedAppOnly=true}
   else if(arg==='--zip-preflight-only'){assert.equal(options.zipPreflightOnly,undefined);options.zipPreflightOnly=true}
-  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip] [--with-unmanaged-app-only]')
+  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip] [--with-legacy-recovery] [--with-legacy-account-repair] [--with-private-maintenance-dispatch] [--with-scoped-recovery-postgres] [--with-unmanaged-app-only]')
 }
 assert.ok(!(options.serviceImage&&options.zipPreflightOnly),'Archive-only preflight does not exercise the service image')
 assert.ok(!options.replanAfterExpiry||options.serviceImage,'Expiry/replan proof requires the actual service image and true container restart')
 assert.ok(!options.withRecordLifecycle||options.serviceImage,'Authenticated record lifecycle proof requires the actual service image')
 assert.ok(!options.withMeetingRoundtrip||options.withRecordLifecycle&&options.serviceImage,'Meeting roundtrip requires lifecycle OAuth and the actual service image')
+assert.ok(!options.withLegacyRecovery||options.withRecordLifecycle&&options.serviceImage,'Legacy recovery requires lifecycle OAuth and the actual service image')
+assert.ok(!options.withLegacyAccountRepair||options.withLegacyRecovery,'Account repair requires the isolated legacy recovery scenario')
+assert.ok(!options.withPrivateMaintenanceDispatch||options.withLegacyRecovery&&!options.withMeetingRoundtrip,
+  'Private maintenance dispatch requires the isolated legacy recovery scenario')
+assert.ok(!options.withScopedRecoveryPostgres||options.withPrivateMaintenanceDispatch,
+  'Scoped PostgreSQL recovery requires private maintenance dispatch')
 assert.ok(!options.withUnmanagedAppOnly||options.serviceImage,'Unmanaged app-only acceptance requires the actual native service image')
 if(options.withMeetingRoundtrip)assert.equal(process.env.TZ,'UTC','Launch the opt-in native meeting fixture with explicit TZ=UTC; do not rewrite native API dates')
 assert.ok(isAbsolute(options['source-zip']??'')&&isAbsolute(options.build??'')&&isAbsolute(options.output??''))
@@ -147,6 +157,7 @@ const {createNativeEmailInitialStartupOriginIssuer:createOriginIssuer}=fromBuild
 const {nativeEmailCanonicalJson:json}=fromBuild('nativeEmailPublication')
 const source=resolve('services/suitecrm'),fixture=resolve('scripts/fixtures/native-email-audience-real'),startupFixture=resolve('scripts/fixtures/native-email-initial-joint-startup.php')
 const meetingModule=options.withMeetingRoundtrip?await import('./lib/native-joint-meeting-roundtrip.mjs'):null
+const legacyRecoveryModule=options.withLegacyRecovery?await import('./lib/native-joint-legacy-email-recovery.mjs'):null
 if(meetingModule){assert.equal(typeof meetingModule.runNativeJointMeetingRoundtrip,'function')
   assert.equal(typeof meetingModule.prepareNativeJointMeetingFixture,'function')
   assert.ok(Array.isArray(meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS)&&meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.length>0)
@@ -162,7 +173,7 @@ for(const name of ['email-audience','email-search','native-email-scope','record-
 for(const name of ['bootstrap-client.php','bootstrap-global-id.php','install-email-search.php','install-email-audience.php',
   'install-native-email-scope.php','install-native-email-runtime.php','native-email-startup-check.php','install-native-email-initial-state.php',
   'native-email-initial-cli.php','native-email-initial-install-profile.json','native-email-initial-artifacts.php','native-email-enrolled-startup.php',
-  'native-email-maintenance.py','native-email-liveness.json','install-record-lifecycle.php','bootstrap-image-principals.php'])imageSourceMap[join(source,name)]='/opt/clawpilot/'+name
+  'native-email-maintenance.py','native-email-liveness.json','native-email-recovery-cli.php','install-record-lifecycle.php','bootstrap-image-principals.php'])imageSourceMap[join(source,name)]='/opt/clawpilot/'+name
 for(const name of ['entrypoint.sh','scheduler-loop.sh','messenger-loop.sh'])imageSourceMap[join(source,name)]='/usr/local/bin/'+name
 for(const [name,path]of Object.entries({'apache-site.conf':'/etc/apache2/sites-available/000-default.conf','apache-ports.conf':'/etc/apache2/ports.conf',
   'suitecrm.ini':'/usr/local/etc/php/conf.d/99-suitecrm.ini','supervisord.conf':'/etc/supervisor/conf.d/suitecrm.conf'}))imageSourceMap[join(source,name)]=path
@@ -174,7 +185,8 @@ const candidates=[resolve('scripts/test-native-email-initial-joint.mjs'),resolve
     'native-email-initial-cli.php','native-email-initial-artifacts.php','native-email-enrolled-startup.php','install-native-email-initial-state.php','native-email-initial-install-profile.json'].map(p=>join(source,p)),
   ...readdirSync('db/migrations').filter(p=>/^\d+_.+\.sql$/.test(p)).sort().map(p=>resolve('db/migrations',p)),
   ...(options.serviceImage?[join(source,'Dockerfile'),...Object.keys(imageSourceMap)]:[]),
-  ...(meetingModule?[resolve('scripts/lib/native-joint-meeting-roundtrip.mjs'),...meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.map(path=>resolve(path))]:[])]
+  ...(meetingModule?[resolve('scripts/lib/native-joint-meeting-roundtrip.mjs'),...meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.map(path=>resolve(path))]:[]),
+  ...(legacyRecoveryModule?legacyRecoveryModule.nativeJointLegacyEmailRecoverySources().map(path=>resolve(path)):[])]
 const sourceHashes=Object.fromEntries(candidates.map(p=>[p,sha(readFileSync(p))]))
 const root=realpathSync(mkdtempSync(join(tmpdir(),'clawpilot-initial-joint.'))),owner=id(),label='com.clawpilot.native-initial-joint'
 writeFileSync(join(root,'owner.json'),JSON.stringify({owner,pid:process.pid})+'\n',{flag:'wx',mode:0o600})
@@ -183,6 +195,7 @@ const suffix=owner.slice(0,8),names={pg:'cp-initial-joint-'+suffix+'-pg',maria:'
 const deadline=Date.now()+600000,audits=[],checks=[],commandLog=[],storagePhases=[],appDataBudgets=[],appContainerHistory=[]
 let pool,token,secondaryClean=false,cleanupMode=false,cleaned=false,activeTransactions=0,report,imageProof,primaryCleanupAttempted=false,replanEvidence=null
 let meetingRoundtrip=null
+let legacyRecovery=null
 let meetingFixtureSeeds=null
 let unmanagedAppOnly=null
 const meetingPrivateValues=[]
@@ -343,9 +356,12 @@ try{
     '--cap-drop','ALL','--cap-add','CHOWN','--cap-add','DAC_OVERRIDE','--cap-add','FOWNER','--cap-add','SETGID','--cap-add','SETUID','--security-opt','no-new-privileges',
     '--env','MARIADB_ROOT_PASSWORD=Synthetic-native-root-password-only','--env','MARIADB_DATABASE=suitecrm_native_test',
     '--env','MARIADB_USER=fixture','--env','MARIADB_PASSWORD=Synthetic-native-db-password-only',maria.Id,'--skip-log-bin','--innodb-buffer-pool-size=64M','--max-connections=20',
-    '--performance-schema=OFF','--character-set-server=utf8mb3','--collation-server=utf8mb3_general_ci'])
-  const sql=text=>run('docker',['exec','--env','MYSQL_PWD=Synthetic-native-db-password-only',names.maria,'mariadb','--protocol=TCP','--host=127.0.0.1',
+    ...(options.withPrivateMaintenanceDispatch?['--performance-schema=ON','--performance-schema-consumer-events-statements-history-long=ON',
+      '--performance-schema-events-statements-history-long-size=256']:['--performance-schema=OFF']),
+    '--character-set-server=utf8mb3','--collation-server=utf8mb3_general_ci'])
+  const fixtureSql=text=>run('docker',['exec','--env','MYSQL_PWD=Synthetic-native-db-password-only',names.maria,'mariadb','--protocol=TCP','--host=127.0.0.1',
     '--user=fixture','--database=suitecrm_native_test','--batch','--skip-column-names','--execute='+text])
+  let sql=fixtureSql
   until=Date.now()+60000;for(;;){try{sql('SELECT 1');break}catch(e){if(Date.now()>until)throw e;await new Promise(r=>setTimeout(r,250))}}
   const constructionBudget=options.serviceImage
     ?'joint_budget() { joint_blocks=$(du -sk /var/lib/suitecrm); joint_blocks=${joint_blocks%%[[:space:]]*}; [ "$joint_blocks" -le 655360 ]; printf "JOINT_APP_DATA_BUDGET=%s:%s\\n" "$1" "$joint_blocks"; }; '
@@ -503,13 +519,40 @@ try{
       appOnlyIdentitiesPreserved:unmanagedAppOnly?2:0}
     console.log('PASS actual configured owner normalization prepared before RootA without bypassing user or scope authorization')
   }
+  const legacyArchive=legacyRecoveryModule?await check('exact failed original is retained before native activation with a durable archive receipt',async()=>{
+    const {suiteCrmId,globalId}=legacyRecoveryModule.JOINT_LEGACY_EMAIL_NATIVE_IDENTITY
+    assert.match(suiteCrmId,/^[a-f0-9-]{36}$/u);assert.match(globalId,/^gi[0-9]{7}$/u)
+    const policy=observed.pipelines[0].policy
+    const related=JSON.parse(sql(`SELECT JSON_ARRAYAGG(JSON_OBJECT('accountId',a.id,'contactId',c.id) ORDER BY a.name)
+      FROM accounts a JOIN accounts_contacts ac ON ac.account_id=a.id AND ac.deleted=0
+      JOIN contacts c ON c.id=ac.contact_id AND c.deleted=0 WHERE a.deleted=0 AND
+      ((a.name='Synthetic initial related first' AND c.last_name='Initial first') OR
+       (a.name='Synthetic initial related second' AND c.last_name='Initial second'))`))
+    assert.equal(related.length,2)
+    const assertNativeAbsent=async()=>{
+      assert.equal(activeTransactions,0)
+      assert.equal(sql(`SELECT (SELECT count(*) FROM emails WHERE id='${suiteCrmId}')
+        +(SELECT count(*) FROM emails_cstm WHERE id_c='${suiteCrmId}' OR global_id_c='${globalId}')
+        +(SELECT count(*) FROM emails_text WHERE email_id='${suiteCrmId}')
+        +(SELECT count(*) FROM emails_beans WHERE email_id='${suiteCrmId}')
+        +(SELECT count(*) FROM emails_email_addr_rel WHERE email_id='${suiteCrmId}')
+        +(SELECT count(*) FROM securitygroups_records WHERE record_id='${suiteCrmId}')`).trim(),'0')
+    }
+    return legacyRecoveryModule.archiveNativeJointLegacyEmail({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+      authority:{...selection,pipelineId:policy.pipelineId,workspaceId:policy.workspaceId,ownerNativeId:observed.serviceUserId},
+      assertNativeAbsent,related,repairFirst:options.withLegacyAccountRepair===true})
+  }):null
   const verification={publicKey,keyId,serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId}
   const initialStore=new Store(transaction,selection,undefined,verification),preview=await initialStore.preview(),operationId=observed.operationId
   await check('real SQL source reservation is committed before native source transport or any offline installation',async()=>{
     assert.equal(preview.publicationEnabled,false);assert.equal(preview.activeOperationId,null)
     await initialStore.reserve(operationId,preview.sourceFingerprint)
     assert.equal((await q('SELECT active_initial_enrollment_id FROM crm_native_email_publication_control WHERE singleton')).rows[0].active_initial_enrollment_id,operationId)
-    assert.equal((await q('SELECT count(*)::int AS n FROM crm_interactions')).rows[0].n,329)
+    // The exact failed recovery source is still retained in the app, but has
+    // no native identity to enroll. The native source count stays at 329.
+    const counts=(await q(`SELECT count(*)::int AS total,
+      count(*) FILTER (WHERE suitecrm_synced_at IS NOT NULL)::int AS synced FROM crm_interactions`)).rows[0]
+    assert.deepEqual(counts,{total:329+(legacyArchive?1:0),synced:329})
   })
   const rawState=()=>{const output=stage('raw-state'),line=output.split('\n').findLast(x=>x.startsWith('{'));assert.ok(line);return JSON.parse(line)}
   const invoke=(script,args,extra={})=>run('docker',['exec',...(extra.input!==undefined?['--interactive']:[]),...nativeEnv.flatMap(x=>['--env',x]),names.app,
@@ -855,12 +898,23 @@ try{
         removeSecondary(names.app);assert.equal(inspect(names.app),null);assert.deepEqual(ownedVolume(),volumeBefore)
         // No entrypoint override, extra command or source overlay is present.
         // This is the actual configured service-image ENTRYPOINT as PID1.
-        run('docker',['run','--rm','--detach','--pull=never','--platform=linux/amd64','--name',names.app,'--network',names.net,'--read-only',
+        // Retain an exited service container long enough to read its bounded
+        // failure log; owner-checked removeSecondary/finally always removes it.
+        run('docker',['run','--detach','--pull=never','--platform=linux/amd64','--name',names.app,'--network',names.net,'--read-only',
           ...limits('1152m','1'),'--cap-drop=ALL','--cap-add=SETUID','--cap-add=SETGID','--security-opt=no-new-privileges',
           ...appDataMount,'--tmpfs','/tmp:rw,nosuid,size=32m','--tmpfs','/run/apache2:rw,nosuid,nodev,noexec,size=4m,mode=0755',
           '--tmpfs','/run/lock/apache2:rw,nosuid,nodev,noexec,size=1m,mode=0755',...fixtureMounts,
           ...entrypointEnvironment.flatMap(value=>['--env',value]),php.Id])
-        const started=inspect(names.app);assert.ok(started?.State.Running);validateMounts(started)
+        const started=inspect(names.app)
+        const stoppedService=found=>{
+          if(!found)return Error('Actual enrolled entrypoint container disappeared before Apache liveness')
+          assert.equal(found.Config.Labels?.[label],owner);assert.equal(found.Config.Labels?.[DISPOSABLE_POSTGRES_OWNER_LABEL],token)
+          const logs=spawnSync('docker',['logs','--tail','20',found.Id],{encoding:'utf8',timeout:5000,maxBuffer:500000})
+          const lines=logs.status===0?`${logs.stdout}${logs.stderr}`.slice(-2000):'bounded logs unavailable'
+          return Error(`Actual enrolled entrypoint exited (${found.State.ExitCode}) before Apache liveness: ${lines}`)
+        }
+        if(!started?.State.Running)throw stoppedService(started)
+        validateMounts(started)
         assert.equal(started.Image,options.serviceImage);assert.deepEqual(started.Config.Entrypoint,['/usr/local/bin/entrypoint.sh'])
         assert.equal(started.HostConfig.ReadonlyRootfs,true);assert.equal(Object.keys(started.HostConfig.PortBindings??{}).length,0)
         assert.ok(started.Mounts.every(m=>!['/opt/clawpilot','/usr/local/bin/entrypoint.sh','/etc/apache2/ports.conf',
@@ -871,7 +925,7 @@ try{
         for(;;){try{response=run('docker',['exec',names.app,'curl','--silent','--show-error','--fail','--max-time','2','--include',
           'http://127.0.0.1:8080/_clawpilot/liveness'],{timeout:3000});ready=true;break}catch(error){
           const current=inspect(names.app)
-          if(!current?.State.Running)throw Error('Actual enrolled entrypoint exited before Apache liveness: '+(current?run('docker',['logs',current.Id]):'owned --rm container is absent'))
+          if(!current?.State.Running)throw stoppedService(current)
           if(Date.now()>readyUntil)throw error;await new Promise(resolve=>setTimeout(resolve,250))}}
         assert.equal(ready,true)
         const boundary=response.indexOf('\r\n\r\n');assert.ok(boundary>0)
@@ -1131,11 +1185,204 @@ try{
       if(verifyAncestorPreservation)await verifyAncestorPreservation('after-C-joined-meeting-roundtrip')
     })
   }
+  if(legacyRecoveryModule) {
+    legacyRecovery=await check('actual joined private held Email commits once and lost native response settles only through exact resolution',async()=>{
+      assert.equal(serviceStartup?.passed,true);assert.equal(recordLifecycle?.passed,true)
+      const {suiteCrmId,globalId}=legacyRecoveryModule.JOINT_LEGACY_EMAIL_NATIVE_IDENTITY
+      assert.match(suiteCrmId,/^[a-f0-9-]{36}$/u);assert.match(globalId,/^gi[0-9]{7}$/u)
+      // The operator plans a fresh deterministic group ID; the stock fixture
+      // inventory's placeholder is not the applied enrollment authority.
+      const pipelineId=observed.pipelines[0].policy.pipelineId
+      assert.match(pipelineId,/^[a-f0-9-]{36}$/u)
+      const enrolled=material.plan.pipelines.filter(row=>row.policy.pipelineId===pipelineId)
+      assert.equal(enrolled.length,1)
+      const {policy,groupId}=enrolled[0];assert.match(groupId,/^[a-f0-9-]{36}$/u)
+      assert.equal(policy.ownerSuiteCrmId,observed.serviceUserId,'Recovery audience must retain the exact enrolled native owner')
+      assert.equal(sql(`SELECT group_id FROM clawpilot_email_bindings WHERE pipeline_id='${pipelineId}'`).trim(),groupId,
+        'Native binding must match the approved enrollment plan before recovery')
+      const recoveryUntil=Math.min(deadline,Date.now()+90000)
+      let maintenance,maintenanceFixture
+      if(options.withPrivateMaintenanceDispatch){
+        const role='fixture_recovery_dispatch',password='Synthetic-maintenance-'+crypto.randomBytes(18).toString('hex')
+        const transportAttestationKey=crypto.randomBytes(32),transportAttestationKeyBase64=transportAttestationKey.toString('base64')
+        meetingPrivateValues.push(password,transportAttestationKeyBase64)
+        const rootSql=text=>run('docker',['exec','--env','MYSQL_PWD=Synthetic-native-root-password-only',names.maria,'mariadb',
+          '--user=root','--database=suitecrm_native_test','--batch','--skip-column-names','--execute='+text])
+        const roleSql=text=>run('docker',['exec','--env','MYSQL_PWD='+password,names.maria,'mariadb','--protocol=TCP','--host=127.0.0.1',
+          '--user='+role,'--database=suitecrm_native_test','--batch','--skip-column-names','--execute='+text])
+        const volume=ownedVolume();assert.ok(volume)
+        removeSecondary(names.app);assert.equal(inspect(names.app),null);assert.deepEqual(ownedVolume(),volume)
+        // Stock Account/Contact bean hydration reads the installed Global ID
+        // tables; Contact also inspects its native user relationship.
+        const readTables=['accounts','accounts_contacts','accounts_cstm','acl_actions','acl_roles','acl_roles_actions','acl_roles_users',
+          'aow_actions','aow_conditions','aow_workflow','config','contacts','contacts_cstm','contacts_users','email_addresses','email_addr_bean_rel','emails','emails_beans',
+          'emails_cstm','emails_email_addr_rel','emails_text','fields_meta_data','oauth2clients','outbound_email','securitygroups',
+          'securitygroups_acl_roles','securitygroups_default','securitygroups_records','securitygroups_users','user_preferences','users',
+          'clawpilot_email_bindings','clawpilot_email_identities','clawpilot_email_operations','clawpilot_email_write_permissions','clawpilot_email_write_scopes']
+        const insertTables=['emails','emails_beans','emails_cstm','emails_text','securitygroups_records',
+          'clawpilot_email_identities','clawpilot_email_operations','clawpilot_email_write_permissions']
+        const updateTables=['emails','emails_beans','emails_cstm','emails_text']
+        const grant=(priv,tables)=>tables.map(table=>`GRANT ${priv} ON suitecrm_native_test.\`${table}\` TO '${role}'@'%';`).join('\n')
+        rootSql(`CREATE USER '${role}'@'%' IDENTIFIED BY '${password}';
+          GRANT EVENT, TRIGGER ON \`suitecrm\\_native\\_test\`.* TO '${role}'@'%';
+          ${grant('SELECT',readTables)} ${grant('INSERT',insertTables)} ${grant('UPDATE',updateTables)}
+          ALTER USER 'fixture'@'%' ACCOUNT LOCK; SET GLOBAL event_scheduler=OFF;`)
+        assert.throws(()=>fixtureSql('SELECT 1'),error=>/account is locked/i.test(String(error.stderr)))
+        assert.equal(roleSql('SELECT CURRENT_USER(),DATABASE()').trim(),`${role}@%\tsuitecrm_native_test`)
+        assert.throws(()=>roleSql('SELECT id FROM meetings LIMIT 0'),error=>/denied/i.test(String(error.stderr)))
+        assert.throws(()=>roleSql('UPDATE users SET status=status WHERE 0'),error=>/denied/i.test(String(error.stderr)))
+        assert.throws(()=>roleSql('UPDATE oauth2clients SET deleted=deleted WHERE 0'),error=>/denied/i.test(String(error.stderr)))
+        assert.throws(()=>roleSql('UPDATE outbound_email SET deleted=deleted WHERE 0'),error=>/denied/i.test(String(error.stderr)))
+        assert.equal(roleSql("SELECT COUNT(*) FROM outbound_email WHERE type='system' AND deleted=0").trim(),'1',
+          'Stock installed fixture must already have its exact system mailer; the private login must not create it')
+        sql=rootSql
+        const cliSourceHash=sha(readFileSync(join(source,'native-email-recovery-cli.php')))
+        const mariaIdentity=JSON.parse(sql("SELECT JSON_OBJECT('database',DATABASE(),'hostname',@@GLOBAL.hostname,'serverId',CAST(@@GLOBAL.server_id AS CHAR),'serverVersion',@@GLOBAL.version,'serverUid',@@GLOBAL.server_uid)"))
+        assert.equal(mariaIdentity.database,'suitecrm_native_test')
+        assert.match(mariaIdentity.serverUid,/^[A-Za-z0-9+/]{27}=$/)
+        const mariaStoreFingerprint=sha(stable({version:1,purpose:'clawpilot-native-email-custody-maria-store-v1',...mariaIdentity}))
+        const nativeTarget={projectId:id(),environmentId:id(),serviceId:id(),deploymentId:id(),deploymentInstanceId:id(),replicaId:id(),
+          nativeInstanceId:selection.nativeInstanceId,database:'suitecrm_native_test',databasePrincipal:`${role}@%`,
+          serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId,cliSourceHash,imagePackageHash:packet.packageHash,mariaStoreFingerprint}
+        const identityEnv={RAILWAY_PROJECT_ID:nativeTarget.projectId,RAILWAY_ENVIRONMENT_ID:nativeTarget.environmentId,
+          RAILWAY_SERVICE_ID:nativeTarget.serviceId,RAILWAY_DEPLOYMENT_ID:nativeTarget.deploymentId,RAILWAY_REPLICA_ID:nativeTarget.replicaId}
+        const fenceEnv=[...nativeEnv,'CLAWPILOT_NATIVE_EMAIL_PUBLICATION_ENABLED=1','CLAWPILOT_NATIVE_EMAIL_AUTHORITY_ENABLED=1','PORT=8080',
+          'SUITECRM_NATIVE_RECOVERY_DB_USER='+role,'SUITECRM_NATIVE_RECOVERY_DB_PASSWORD='+password,
+          ...Object.entries(identityEnv).map(([key,value])=>`${key}=${value}`)]
+        run('docker',['run','--rm','--detach','--pull=never','--platform=linux/amd64','--name',names.app,'--network',names.net,'--read-only',
+          ...limits('1152m','1'),'--cap-drop=ALL','--security-opt=no-new-privileges',...appDataMount,
+          '--tmpfs','/tmp:rw,nosuid,size=32m',...fixtureMounts,...fenceEnv.flatMap(value=>['--env',value]),php.Id])
+        const started=inspect(names.app);assert.ok(started?.State.Running);validateMounts(started)
+        assert.equal(started.Image,options.serviceImage);assert.deepEqual(started.Config.Entrypoint,['/usr/local/bin/entrypoint.sh'])
+        assert.ok(!appContainerHistory.some(row=>row.id===started.Id));appContainerHistory.push({phase:'private-maintenance-dispatch',id:started.Id})
+        const maintenanceHealth=()=>JSON.parse(run('docker',['exec',names.app,'curl','--silent','--fail','--max-time','2',
+          'http://127.0.0.1:8080/_clawpilot/liveness'],{timeout:3500}))
+        for(const startUntil=Date.now()+15000;;){try{assert.deepEqual(maintenanceHealth(),{service:'suitecrm',mode:'maintenance',live:true,ready:false});break}
+          catch(error){if(Date.now()>startUntil||!inspect(names.app)?.State.Running)throw error;await new Promise(r=>setTimeout(r,250))}}
+        const deniedStatus=run('docker',['exec',names.app,'curl','--silent','--show-error','--max-time','2','-X','POST','--output','/dev/null',
+          '--write-out','%{http_code}','http://127.0.0.1:8080/legacy/Api/V8/custom/clawpilot-email-publication/publish']).trim()
+        assert.equal(deniedStatus,'405')
+        const assertFence=()=>{
+          assert.equal(inspect(names.app)?.Id,started.Id);assert.equal(maintenanceHealth().mode,'maintenance')
+          assert.equal(rootSql('SELECT @@global.event_scheduler').trim(),'OFF')
+          assert.equal(rootSql('SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID<>CONNECTION_ID()').trim(),'0')
+        }
+        assertFence()
+        const keypair=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),keyId='joint-recovery-dispatch-key',fenceEpoch=id()
+        const expiresAt=Math.floor(recoveryUntil/1000)
+        const bootstrapPins=JSON.parse(run('docker',['exec',names.app,'php','-r',
+          '$value=json_decode(file_get_contents($argv[1]),true,64,JSON_THROW_ON_ERROR);echo json_encode($value["bootstrapPins"],JSON_THROW_ON_ERROR);',
+          nativePaths.state+'/operations/'+activationOperationId+'/input.json']))
+        const config={version:2,target:nativeTarget,bootstrapPins,fenceEpoch,expiresAt,keyId,transportAttestationKey:transportAttestationKeyBase64,
+          publicKeyPem:keypair.publicKey.export({type:'spki',format:'pem'})}
+        run('docker',['exec','--interactive',names.app,'php','-r',
+          '$p=$argv[1];$b=stream_get_contents(STDIN);$f=fopen($p,"x");if(!$f||!chmod($p,0600)||fwrite($f,$b)!==strlen($b)||!fflush($f)||!fsync($f))exit(2);fclose($f);',
+          nativePaths.state+'/dispatch-fence.json'],{input:stable(config)+'\n'})
+        const {maintenanceCli,maintenanceDuplex}=legacyRecoveryModule.loadNativeJointLegacyEmailRecoveryApp({query:q,withTransaction:transaction,getPostgresPool:()=>pool})
+        const localBinary=realpathSync('/usr/bin/true'),railwayIdentityFile=join(root,'synthetic-recovery-identity')
+        writeFileSync(railwayIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
+        // The production argv is inspected, not executed. The replacement
+        // runs only the exact owned Docker container on the fixture's Unix
+        // socket; the duplex runner deliberately inherits no Docker config.
+        const dockerBinary=realpathSync(run('/usr/bin/which',['docker']).trim())
+        assert.ok(lstatSync(dockerBinary).isFile())
+        const dockerContext=run(dockerBinary,['context','show']).trim()
+        const dockerHost=(!process.env.DOCKER_CONTEXT&&process.env.DOCKER_HOST)||
+          run(dockerBinary,['context','inspect',dockerContext,'--format','{{.Endpoints.docker.Host}}']).trim()
+        assert.ok(dockerHost.startsWith('unix:///'),'Private maintenance fixture requires a local Unix Docker socket')
+        const dockerSocket=realpathSync(dockerHost.slice('unix://'.length))
+        assert.ok(lstatSync(dockerSocket).isSocket())
+        const dockerPrefix=['--host','unix://'+dockerSocket]
+        const [dockerApp]=JSON.parse(run(dockerBinary,[...dockerPrefix,'inspect',started.Id],
+          {env:{...process.env,DOCKER_HOST:'',DOCKER_CONTEXT:''}}))
+        assert.equal(dockerApp.Id,started.Id);assert.equal(dockerApp.Config.Labels?.[label],owner)
+        const attestedActions=[];let rejectedBeforeAuthentication=false
+        const bridge=maintenanceCli.createNativeEmailRecoveryCliTransport({target:nativeTarget,railwayBinary:localBinary,
+          railwayBinarySha256:sha(readFileSync(localBinary)),railwayIdentityFile,transportAttestationKey},async spec=>{
+          assert.equal(activeTransactions,0);assert.equal(spec.program,localBinary)
+          const script='/opt/clawpilot/native-email-recovery-cli.php'
+          assert.deepEqual(spec.args.slice(0,-2),['ssh','--project',nativeTarget.projectId,'--environment',nativeTarget.environmentId,
+            '--service',nativeTarget.serviceId,'--deployment-instance',nativeTarget.deploymentInstanceId,'--identity-file',railwayIdentityFile,'--','php',script])
+          const [action,nonce]=spec.args.slice(-2);assert.ok(['prepare','publish','resolve'].includes(action));assert.match(nonce,/^[0-9a-f]{64}$/u)
+          if(action==='publish'&&!rejectedBeforeAuthentication){
+            // Reject this fixture's first publish before a ready frame (and
+            // before the runner can ask for any authorized packet bytes).
+            rejectedBeforeAuthentication=true
+            throw Error('legacy_dispatch_transport_destination_unverified')
+          }
+          const start=rootSql('SELECT COALESCE(MAX(TIMER_START),0) FROM performance_schema.events_statements_history_long').trim()
+          assert.match(start,/^\d+$/u)
+          const runDuplex=maintenanceDuplex.createNativeEmailRecoveryDuplexCommandRunner(Math.max(1,Math.min(20000,recoveryUntil-Date.now())))
+          try{return await runDuplex({...spec,program:dockerBinary,args:[...dockerPrefix,'exec','--interactive',started.Id,
+            'php','-d','memory_limit=384M','-d','display_errors=0',script,action,nonce],
+            verifyReady:line=>{const verified=spec.verifyReady(line);if(verified)attestedActions.push(action);return verified}})}
+          catch(error){
+            // This observer is available only in the isolated synthetic test.
+            // Do not export SQL text, messages, rows, account names or hosts.
+            const failures=rootSql(`SELECT MYSQL_ERRNO, IF(MYSQL_ERRNO IN (1142,1146),
+                SUBSTRING_INDEX(SUBSTRING_INDEX(MESSAGE_TEXT,CHAR(39),-2),CHAR(39),1),'')
+              FROM performance_schema.events_statements_history_long
+              WHERE TIMER_START>${start} AND CURRENT_SCHEMA='suitecrm_native_test' AND MYSQL_ERRNO>0
+              ORDER BY TIMER_START DESC LIMIT 12`).trim().split('\n').filter(Boolean).map(line=>{
+                const [errno,rawTable]=line.split('\t');const table=(rawTable??'').replace(/^suitecrm_native_test\./u,'')
+                return {errno:/^\d{1,5}$/u.test(errno)?Number(errno):null,
+                  ...(table&&/^[a-z][a-z0-9_]{0,63}$/u.test(table)?{table}:{})}
+              })
+            throw Error(redactMeetingSecrets(error.message)+'\nSynthetic MariaDB error metadata: '+JSON.stringify(failures))
+          }
+        })
+        assert.equal(bridge.targetFingerprint,sha(stable(nativeTarget)))
+        let busy=false
+        maintenance={signer:{keyId,key:keypair.privateKey,targetFingerprint:bridge.targetFingerprint},
+          withVerifiedFence:async callback=>{assert.equal(busy,false);busy=true;try{assertFence();return await callback({
+            fenceEpoch,targetFingerprint:bridge.targetFingerprint,expiresAt})}finally{busy=false;assertFence()}},
+          exchange:packet=>{assert.equal(busy,true);return bridge.exchange(packet)},
+          exchangePublish:input=>{assert.equal(busy,true);return bridge.exchangePublish(input)}}
+        maintenanceFixture={actualMaintenanceEntrypoint:true,ordinaryHttpPostStatus:deniedStatus,normalDatabaseLoginLocked:true,
+          distinctNativeDatabasePrincipal:true,deniedUnrelatedReadsAndWrites:true,nonAuditNativeConnectionsDrained:true,
+          eventSchedulerOff:true,roleTableReadGrants:readTables.length,roleTableInsertGrants:insertTables.length,
+          roleTableUpdateGrants:updateTables.length,roleSchemaEventTriggerMetadataPrivileges:true,
+          actualLocalSameProcessReadiness:true,attestedActions,get firstPublishRejectedBeforeAuthentication(){return rejectedBeforeAuthentication},
+          postgresLeastPrivilegeProven:false,externalProductionDrainProven:false}
+      }
+      const inspectNative=async op=>{
+        assert.equal(activeTransactions,0)
+        if(op!==null){assert.match(op,/^[a-f0-9]{64}$/u)
+          assert.equal(sql(`SELECT state FROM clawpilot_email_operations WHERE operation_id='${op}' AND email_id='${suiteCrmId}'`).trim(),'committed')
+          assert.equal(sql(`SELECT SHA2(description,256) FROM emails_text WHERE email_id='${suiteCrmId}' AND deleted=0`).trim(),legacyRecoveryModule.JOINT_LEGACY_EMAIL_BODY_SHA256)
+          assert.equal(sql(`SELECT parent_id FROM emails WHERE id='${suiteCrmId}' AND deleted=0`).trim(),legacyArchive.related[0].accountId)
+          const links=JSON.parse(sql(`SELECT JSON_ARRAYAGG(JSON_OBJECT('module',bean_module,'id',bean_id)
+            ORDER BY BINARY bean_module,BINARY bean_id) FROM emails_beans WHERE email_id='${suiteCrmId}' AND deleted=0`))
+          assert.deepEqual(links,[...legacyArchive.accounts.map(id=>({module:'Accounts',id})),
+            ...legacyArchive.contacts.map(id=>({module:'Contacts',id}))])
+          assert.equal(sql(`SELECT count(*) FROM securitygroups_records WHERE record_id='${suiteCrmId}' AND module='Emails' AND deleted=0 AND securitygroup_id='${groupId}'`).trim(),'1')}
+        return JSON.parse(sql(`SELECT JSON_OBJECT(
+          'emails',(SELECT count(*) FROM emails WHERE id='${suiteCrmId}'),
+          'custom',(SELECT count(*) FROM emails_cstm WHERE id_c='${suiteCrmId}' AND BINARY global_id_c=BINARY '${globalId}'),
+          'global',(SELECT count(*) FROM emails_cstm WHERE global_id_c='${globalId}'),
+          'text',(SELECT count(*) FROM emails_text WHERE email_id='${suiteCrmId}'),
+          'groups',(SELECT count(*) FROM securitygroups_records WHERE record_id='${suiteCrmId}'),
+          'managed',(SELECT count(*) FROM clawpilot_email_identities WHERE email_id='${suiteCrmId}' OR global_id='${globalId}'),
+          'operations',(SELECT count(*) FROM clawpilot_email_operations WHERE email_id='${suiteCrmId}'))`))
+      }
+      const invokeNative=(action,body)=>JSON.parse(run('docker',['exec','--interactive','--env','CLAWPILOT_NATIVE_JOINT_LEGACY_RECOVERY=1',
+        names.app,'php','-d','memory_limit=384M','-d','display_errors=0','/fixture/native-joint-legacy-email-recovery.php',action],
+        {input:body,timeout:Math.max(1,Math.min(12000,recoveryUntil-Date.now()))}))
+      const result=await legacyRecoveryModule.runNativeJointLegacyEmailRecovery({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+        authority:{actorEmail:selection.actorEmail,pipelineId:policy.pipelineId,workspaceId:policy.workspaceId,ownerNativeId:observed.serviceUserId},
+        deadline:recoveryUntil,invokeNative,assertOutsideTransaction:()=>assert.equal(activeTransactions,0),inspectNative,archive:legacyArchive,maintenance,
+        scopedRecoveryPostgres:options.withScopedRecoveryPostgres===true})
+      assert.equal(result.passed,true);appDataBudget('after-joined-private-held-email-recovery')
+      if(maintenanceFixture){assert.equal(maintenanceFixture.firstPublishRejectedBeforeAuthentication,true)
+        assert.deepEqual(maintenanceFixture.attestedActions,['prepare','prepare','publish','resolve'])}
+      return maintenanceFixture?{...result,maintenanceFixture}:result
+    })
+  }
   for(const [p,h]of Object.entries(sourceHashes))assert.equal(sha(readFileSync(p)),h,'Consumed source changed: '+p)
   checkBuild()
   report={version:1,kind:'actual-local-native-initial-joint-rehearsal',passed:true,postgresMajor:Number(options.major),sourceZipSha256:ZIP_SHA,resourceOwner:owner,resourceNames:names,
     sourceHashes,buildManifestSha256:sha(readFileSync(join(build,'build-manifest.json'))),checks,audits,commandLog,storagePhases,startupComponent,
-    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,unmanagedAppOnly,
+    serviceStartup,imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,legacyRecovery,unmanagedAppOnly,
     emailCount:329,principalCount:4,pipelineCount:3,actualPgReservation:true,actualSqlAuthorityCollector:true,actualNativeCli:true,
     actualNativeForecasts:true,actualDurableRsaApproval:true,actualNativeCommit:true,actualFreshNativeResolve:true,actualPgActivation:true,
     lostActualNativeCommitResponseRecovered:true,nativeExecuteCount:nativeExecutionCount,actualSqlOriginSignedAndPublished:true,actualCurrentNativeStartupInspection:true,
@@ -1147,7 +1394,7 @@ try{
   }
 }catch(error){
   writeFileSync(options.output.replace(/\.json$/,'.failed.json'),JSON.stringify({version:1,failed:true,resourceOwner:owner,resourceNames:names,sourceHashes,checks,audits,commandLog,storagePhases,
-    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,unmanagedAppOnly,
+    imageProof,appDataBudgets,appContainerHistory,replanEvidence,recordLifecycle,meetingRoundtrip,meetingFixtureSeeds,legacyRecovery,unmanagedAppOnly,
     error:redactMeetingSecrets(error.stack??error),stdout:redactMeetingSecrets(error.stdout),stderr:redactMeetingSecrets(error.stderr),productionTouched:false},null,2)+'\n',{flag:'wx',mode:0o600})
   if(meetingPrivateValues.length)throw Error(redactMeetingSecrets(error.stack??error));throw error
 }finally{try{if(pool)await pool.end()}finally{cleanup()}}

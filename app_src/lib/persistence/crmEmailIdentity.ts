@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg'
 import type { VerifiedGoogleIdentity } from '@/lib/googleSso'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { query, withTransaction } from '@/lib/persistence/postgres'
+import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import {
   assertSameRetainedGmailEvidence, gmailEvidenceHash, gmailIntakeProvenance,
   retainedGmailMessageEvidence, verifyGmailMailboxBinding,
@@ -231,8 +232,9 @@ export async function applyGmailMailboxLabelRepairInPostgres(input: {
 export async function readVerifiedGmailMailboxIdentityInPostgres(input: {
   ownerEmail: string; connectionId: string; accountEmail: string
 }): Promise<VerifiedGmailMailboxIdentity | null> {
-  const result = await query<{ id: string; provider_account_id: string; account_email: string; verified_at: Date }>(`
-    SELECT mailbox.id::text,mailbox.provider_account_id,binding.account_email,binding.verified_at
+  const result = await query<{ id: string; provider_account_id: string; account_email: string; verified_at: string }>(`
+    SELECT mailbox.id::text,mailbox.provider_account_id,binding.account_email,
+      to_char(binding.verified_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
     FROM crm_email_mailboxes mailbox JOIN crm_email_mailbox_bindings binding
       ON binding.mailbox_id=mailbox.id AND binding.owner_email=mailbox.owner_email
     JOIN user_maton_connections connection ON connection.owner_email=binding.owner_email
@@ -246,7 +248,7 @@ export async function readVerifiedGmailMailboxIdentityInPostgres(input: {
   if (result.rows.length !== 1) return null
   const row = result.rows[0]
   return { version: 1, provider: 'gmail', mailboxId: row.id, providerAccountId: row.provider_account_id,
-    accountEmail: row.account_email, verifiedAt: new Date(row.verified_at).toISOString(), verifiedConnectionId: input.connectionId }
+    accountEmail: row.account_email, verifiedAt: row.verified_at, verifiedConnectionId: input.connectionId }
 }
 
 export async function lockGmailMailboxBindingWithClient(client: PoolClient, input: {
@@ -299,6 +301,10 @@ export async function recordGmailMessageIntakeInPostgres(input: {
   messageEvidence: GmailMessageEvidence; rawMetadata: Record<string, unknown>
 }): Promise<{ id: string; pipelineId: string; inserted: boolean; identityStatus: 'verified' | 'unknown'; sourceId?: string }> {
   return withTransaction(async client => {
+    // A verified intake may insert a canonical source, whose native policy
+    // trigger locks control. Match the reviewed path's control -> intake ->
+    // mailbox/source order, before taking any per-message lock.
+    if (input.mailboxIdentity) await lockCrmNativeEmailAuthorityWithClient(client)
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`crm-email-intake:${input.ownerEmail}:${input.messageEvidence.messageId}`])
     const scope = await client.query<{ workspace_id: string }>(`SELECT pipeline.workspace_organization_id::text AS workspace_id
       FROM pipeline_spaces pipeline JOIN app_users owner_user ON owner_user.email=pipeline.owner_email AND owner_user.status='active'

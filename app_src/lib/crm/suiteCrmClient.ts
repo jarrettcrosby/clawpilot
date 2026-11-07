@@ -513,10 +513,52 @@ export async function readSuiteCrmMeetingSnapshot(
   return { id: suiteCrmId, attributes: normalizeSuiteCrmMeetingProjectionAttributes(response.data.attributes) }
 }
 
+export async function patchExistingSuiteCrmAccountDescription(record: SuiteCrmOutboxRecord, fetchImpl: typeof fetch = fetch) {
+  const { suiteCrmId, attributes, accountDescriptionPatch: patch } = record
+  const { global_id_c: globalId, description } = attributes
+  if (record.entity !== 'organizations' || record.suiteCrmModule !== undefined || record.previousSuiteCrmModule !== undefined
+    || !/^[a-z0-9][a-z0-9-]{0,63}(?![\s\S])/iu.test(suiteCrmId)
+    || typeof globalId !== 'string' || !/^ga(?:[0-9]{7}|[0-9a-v]{12})(?![\s\S])/u.test(globalId)
+    || Object.keys(attributes).length !== 2 || typeof description !== 'string' || description.length > 10_000
+    || !patch || Object.keys(patch).length !== 1 || typeof patch.previousDescription !== 'string'
+    || patch.previousDescription.length > 10_000 || record.relationships !== undefined || record.emailProjection !== undefined
+    || record.currencyCode !== undefined || record.productImage !== undefined || record.productImageProjectionRequired !== undefined) {
+    throw new Error('SuiteCRM Account description patch scope is invalid')
+  }
+  const previous = patch.previousDescription
+  const path = `/Api/V8/module/Accounts/${encodeURIComponent(suiteCrmId)}`
+  async function readExact(): Promise<string> {
+    // Deliberately do not interpret a missing record as authority to create it.
+    const { data } = await request(path, { method: 'GET' }, fetchImpl) as JsonApiResponse
+    const current = data?.attributes
+    if (data?.id !== suiteCrmId || (data.type && !['Accounts', 'Account'].includes(data.type))
+      || !current || current.global_id_c !== globalId || !Object.hasOwn(current, 'description')
+      || (current.description !== null && typeof current.description !== 'string')) {
+      throw new Error('SuiteCRM Account description identity could not be verified')
+    }
+    return current.description ?? ''
+  }
+  const before = await readExact()
+  if (before === description) return suiteCrmId // Exact readback after a lost write response.
+  if (before !== previous) throw new Error('SuiteCRM Account description changed; review before synchronizing')
+  const { data } = await request('/Api/V8/module', {
+    method: 'PATCH',
+    body: JSON.stringify({ data: { type: 'Accounts', id: suiteCrmId, attributes: { description } } }),
+  }, fetchImpl) as JsonApiResponse
+  if (data?.id !== suiteCrmId || (data.type && !['Accounts', 'Account'].includes(data.type))) {
+    throw new Error('SuiteCRM returned an unexpected Account description patch identity')
+  }
+  if (await readExact() !== description) throw new Error('SuiteCRM Account description could not be verified after writing')
+  return suiteCrmId
+}
+
 export async function upsertSuiteCrmRecordWithResult(
   record: SuiteCrmOutboxRecord,
   fetchImpl: typeof fetch = fetch,
 ): Promise<SuiteCrmUpsertResult> {
+  if (record.accountDescriptionPatch !== undefined) {
+    throw new Error('SuiteCRM Account description patches require their dedicated outbox operation')
+  }
   const moduleName = suiteCrmRecordModule(record)
   if (moduleName === 'Emails') {
     const emailProjection = await projectSuiteCrmNativeEmail(record,

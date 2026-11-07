@@ -13,12 +13,18 @@ const contactChoice = { id: '00000000-0000-4000-8000-000000000005', reference: '
   name: 'Exact Contact', email: 'actual@example.test', organizationId: '00000000-0000-4000-8000-000000000006',
   organizationReference: 'ga1234567', company: 'Exact Company' }
 function harness(options = {}) {
-  const queries = []
+  const queries = [], firstSeenCalls = []
   const module = { exports: {} }
   const mocks = {
     'next/server': { NextResponse: { json: (body, init) => ({ body, ...init }) } },
     '@/lib/browserSameOrigin': { isBrowserSameOriginRequest: ({ headers }) => options.sameOrigin !== false
       && headers.get('origin') === 'https://app.example.invalid' },
+    '@/lib/crm/caseyGmailReview': { CASEY_FIRST_SEEN_SCOPE: 'casey-reviewed-two-first-seen-v1' },
+    '@/lib/crm/emailIngestion': { readCaseyFirstSeenGmailCandidates: async input => {
+      firstSeenCalls.push(input)
+      if (!options.firstSeenMessages) throw new Error('fixture refusal')
+      return options.firstSeenMessages
+    } },
     '@/lib/publicUrl': { appPublicUrl: () => 'https://app.example.invalid' },
     '@/lib/persistence/config': { isPostgresStorageEnabled: () => options.postgres !== false },
     '@/lib/requestUser': { requestSession: async () => options.noSession ? null : { authenticatedUser: owner, effectiveUser: owner,
@@ -35,7 +41,7 @@ function harness(options = {}) {
   }
   vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
     { module, exports: module.exports, URL, require: name => { assert.ok(name in mocks, name); return mocks[name] } })
-  return { queries, async request(params = {}, extra = '', headers = { origin: 'https://app.example.invalid' }) {
+  return { queries, firstSeenCalls, async request(params = {}, extra = '', headers = { origin: 'https://app.example.invalid' }) {
     const nextUrl = new URL('https://app.example.invalid/api/crm/email-review-candidates?' + new URLSearchParams({ pipelineId, connectionId: 'selected-mailbox', ...params }) + extra)
     return module.exports.GET({ nextUrl, headers: new Headers(headers) })
   } }
@@ -122,6 +128,24 @@ await check('missing, duplicated or different-thread Casey rows fail without ret
     const h = harness({ ...caseyOptions, rows })
     const response = await h.request(caseyParams)
     assert.equal(response.status, 409); assert.equal(response.body.messages, undefined)
+  }
+})
+await check('exact Casey Gmail discovery is separate, owner-only and never queries retained candidates or falls back', async () => {
+  const scope = 'casey-reviewed-two-first-seen-v1'
+  const params = { ...caseyParams, admissionScope: scope }
+  const firstSeenMessages = caseyIds.map(messageId => ({ messageId, legacy: false, admissionScope: scope }))
+  const h = harness({ ...caseyOptions, firstSeenMessages })
+  const response = await h.request(params)
+  assert.equal(response.status, 200); assert.equal(response.body.maximum, 2)
+  assert.deepEqual(response.body.messages, firstSeenMessages)
+  assert.equal(h.queries.length, 0); assert.equal(h.firstSeenCalls.length, 1)
+  assert.equal(h.firstSeenCalls[0].ownerEmail, caseyOwner)
+  const refused = harness(caseyOptions)
+  assert.equal((await refused.request(params)).status, 409); assert.equal(refused.queries.length, 0)
+  for (const change of [{ messageIds: caseyIds[0] }, { connectionId: 'other' }, { participantEmail: 'casey@example.test' }]) {
+    const denied = harness({ ...caseyOptions, firstSeenMessages })
+    assert.equal((await denied.request({ ...params, ...change })).status, 400)
+    assert.equal(denied.firstSeenCalls.length + denied.queries.length, 0)
   }
 })
 await check('normal browser GET without Origin succeeds; cross-site or foreign supplied Origin is refused', async () => {
