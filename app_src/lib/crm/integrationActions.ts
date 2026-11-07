@@ -1950,6 +1950,9 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
   const actionId = source.actionId === undefined || source.actionId === null
     ? null
     : normalizeUuid(source.actionId, 'Recorded Calendar action ID')
+  // The `primary` branch recognizes the exact retained provider receipt, not
+  // a default-calendar lookup. Preserve the original reviewed communication
+  // snapshot for authorization; previousCalendar already pins the edit tuple.
   const result = await query<ActionRow>(
     `SELECT * FROM crm_integration_actions
      WHERE pipeline_id = $1::uuid
@@ -1957,7 +1960,30 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
        AND status = 'succeeded' AND external_id = $2
        AND communication_credential_owner_email = $3
        AND communication_connection_id = $4
-       AND communication_calendar_id = $5
+       AND (
+         communication_calendar_id = $5
+         OR (
+           communication_calendar_id = 'primary' AND $5 <> 'primary' AND lower($5::text) = $6
+           AND communication_account_email = $6 AND id = $7::uuid
+           AND response_summary->>'eventId' = $2
+           AND response_summary->>'calendarId' = $5
+           AND response_summary->>'organizerEmail' = $6
+           AND response_summary->>'accountEmail' = communication_account_email
+           AND response_summary->>'meetingReferenceCode' = $9
+           AND response_summary->'calendarMove' IS NULL
+           AND EXISTS (
+             SELECT 1 FROM crm_meetings current_meeting
+             WHERE current_meeting.pipeline_id = $1::uuid AND current_meeting.id = $8::text::uuid
+               AND current_meeting.reference_code = $9 AND current_meeting.external_event_id = $2
+               AND current_meeting.source_payload->>'actionId' = crm_integration_actions.id::text
+               AND current_meeting.source_payload->>'calendarOwnerEmail' = $3
+               AND current_meeting.source_payload->>'calendarConnectionId' = $4
+               AND current_meeting.source_payload->>'calendarId' = $5
+               AND current_meeting.source_payload->>'calendarOrganizerEmail' = $6
+               AND COALESCE(lower(current_meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+           )
+         )
+       )
        AND communication_identity_email = $6
        AND ($7::uuid IS NULL OR id = $7::uuid)
        AND (

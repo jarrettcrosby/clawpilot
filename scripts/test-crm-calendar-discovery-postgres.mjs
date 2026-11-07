@@ -353,6 +353,57 @@ try {
   check(deliveredAuthority.actorEmail === owner && deliveredAuthority.communication.calendarId === calendar
     && deliveredAuthority.previousCalendar.eventId === event.externalEventId,
   'real PostgreSQL text aggregate identity resolves an exact successful delivered action')
+  const deliveredSource = { ...meeting.source_payload, actionId: deliveredId }
+  const exactPrimaryInput = { ...recordedInput, sourcePayload: deliveredSource }
+  const primaryReceipt = { calendarId: calendar, organizerEmail: calendar, accountEmail: calendar,
+    eventId: meeting.external_event_id, meetingReferenceCode: meeting.reference_code }
+  const setPrimaryReceipt = (proof, alias = 'primary') => query(`UPDATE crm_integration_actions
+    SET communication_calendar_id=$2,response_summary=$3::jsonb WHERE id=$1`, [deliveredId, alias, JSON.stringify(proof)])
+  const setCurrentMeeting = (sourcePayload, provider = 'maton', externalEventId = meeting.external_event_id) => query(`UPDATE crm_meetings
+    SET provider=$2,source_payload=$3::jsonb,external_event_id=$4 WHERE id=$1`,
+  [meeting.id, provider, JSON.stringify(sourcePayload), externalEventId])
+  const resolvePrimary = () => integration.resolveRecordedCrmMeetingCalendarCommunication(exactPrimaryInput)
+  const denyPrimary = async (input = exactPrimaryInput) => {
+    await assert.rejects(integration.resolveRecordedCrmMeetingCalendarCommunication(input), /no matching successful reviewed Calendar action/); checks++
+  }
+  // Deliberately disable the import fallback so the retained action proof is
+  // the only way any of these queries could recover Calendar authority.
+  await setCurrentMeeting(deliveredSource)
+  try {
+    await setPrimaryReceipt(primaryReceipt)
+    let primary = await resolvePrimary()
+    check(primary.communication.calendarId === 'primary' && primary.previousCalendar.calendarId === calendar
+      && primary.previousCalendar.eventId === meeting.external_event_id && primary.communication.connectionId === connection,
+    'authorized historic primary keeps its reviewed binding while recovering the exact literal Calendar tuple')
+    await query(`UPDATE crm_integration_actions SET aggregate_type='crm_contact',aggregate_id=$2,reference_code='gc0000001' WHERE id=$1`,
+      [deliveredId, randomUUID()])
+    primary = await resolvePrimary()
+    check(primary.communication.calendarId === 'primary' && primary.previousCalendar.calendarId === calendar,
+      'contact-created meeting resolves only from its exact current action and response meeting reference')
+    for (const field of ['calendarId', 'organizerEmail', 'accountEmail', 'eventId', 'meetingReferenceCode']) {
+      await setPrimaryReceipt({ ...primaryReceipt, [field]: 'wrong-proof' })
+      await denyPrimary()
+    }
+    await setPrimaryReceipt({ ...primaryReceipt, calendarMove: { state: 'destination-written-source-delete-pending' } })
+    await denyPrimary()
+    await setPrimaryReceipt(primaryReceipt, 'not-a-primary-alias')
+    await denyPrimary()
+    await setPrimaryReceipt(primaryReceipt)
+    await denyPrimary({ ...exactPrimaryInput, sourcePayload: { ...deliveredSource, actionId: null } })
+    await denyPrimary({ ...exactPrimaryInput, sourcePayload: { ...deliveredSource, actionId: randomUUID() } })
+    await denyPrimary({ ...exactPrimaryInput, meetingId: randomUUID() })
+    for (const field of ['actionId', 'calendarOwnerEmail', 'calendarConnectionId', 'calendarId', 'calendarOrganizerEmail']) {
+      await setCurrentMeeting({ ...deliveredSource, [field]: 'wrong-current-tuple' })
+      await denyPrimary()
+    }
+    await setCurrentMeeting(deliveredSource, 'maton', 'different-current-event')
+    await denyPrimary()
+  } finally {
+    await setCurrentMeeting(meeting.source_payload, meeting.provider)
+    await setPrimaryReceipt({}, calendar)
+    await query(`UPDATE crm_integration_actions SET aggregate_type='crm_meeting',aggregate_id=$2,reference_code=$3 WHERE id=$1`,
+      [deliveredId, meeting.id, meeting.reference_code])
+  }
   check((await reconcile(source, event)).status === 'unchanged', 'repeat import is idempotent')
   check((await reconcile(source, { ...event, subject: 'Updated agenda' })).status === 'updated', 'Google event edit updates original CRM identity')
   check((await query('SELECT count(*) FROM crm_meetings')).rows[0].count === '1', 'updates never duplicate meeting')
