@@ -393,8 +393,32 @@ try {
   check((await reconcile(source, { ...event, matchingAttendeeEmails: ['adrian@client.example.invalid', 'other@client.example.invalid'] })).status === 'ambiguous', 'multi-account meeting stays fail-closed')
   check((await reconcile(source, { ...event, externalEventId: 'unmatched', matchingAttendeeEmails: ['unknown@example.invalid'] })).status === 'unmatched', 'unmatched event is not copied')
   check((await reconcile(source, { ...event, externalEventId: 'untrusted-marker', clawpilotMeetingReference: 'gm1234567' })).status === 'skipped', 'unrecognized marker cannot duplicate or rebind CRM records')
-  check((await reconcile(source, { ...event, status: 'cancelled', startsAt: null, endsAt: null,
-    matchingAttendeeEmails: [], attendeeEmails: [], allowCreate: false })).status === 'updated', 'minimal cancellation updates known meeting')
+  const cancellation = { ...event, status: 'cancelled', startsAt: null, endsAt: null,
+    matchingAttendeeEmails: [], attendeeEmails: [], allowCreate: false }
+  const moveReadback = async () => (await query(`SELECT to_jsonb(m) AS meeting, to_jsonb(d) AS mapping,
+      (SELECT count(*)::text FROM crm_meetings) AS meeting_count,
+      (SELECT count(*)::text FROM sync_outbox) AS outbox_count
+    FROM crm_meetings m JOIN crm_calendar_discovery_events d ON d.meeting_id=m.id
+    WHERE m.id=$1 AND d.calendar_id=$2 AND d.external_event_id=$3`, [meeting.id, calendar, event.externalEventId])).rows[0]
+  const beforeMove = await moveReadback()
+  assert.ok(beforeMove?.mapping, 'fixture retains the discovery mapping for the previous event')
+  for (const [label, calendarId, eventId] of [
+    ['same event ID on another calendar', 'moved-calendar@example.invalid', event.externalEventId],
+    ['replacement event ID', calendar, 'moved-business-event'],
+  ]) {
+    // Match the final provider identity written by a successful delivery, with
+    // no pending Calendar action and the previous discovery mapping retained.
+    await query(`UPDATE crm_meetings SET external_event_id=$2,
+      source_payload=jsonb_set(source_payload,'{calendarId}',to_jsonb($3::text)) WHERE id=$1`, [meeting.id, eventId, calendarId])
+    const moved = await moveReadback()
+    check((await reconcile(source, cancellation)).status === 'skipped', `${label}: the previous event's cancellation cannot cancel the moved meeting`)
+    check((await reconcile(source, { ...event, subject: 'Old calendar echo' })).status === 'skipped', `${label}: the previous event cannot overwrite or duplicate the moved meeting`)
+    assert.deepEqual(await moveReadback(), moved, `${label}: meeting, mapping and outbox remain unchanged`); checks++
+  }
+  await query('UPDATE crm_meetings SET external_event_id=$2,source_payload=$3::jsonb WHERE id=$1', [
+    meeting.id, beforeMove.meeting.external_event_id, JSON.stringify(beforeMove.meeting.source_payload),
+  ])
+  check((await reconcile(source, cancellation)).status === 'updated', 'minimal cancellation updates known meeting')
   check((await query('SELECT status FROM crm_meetings WHERE id=$1', [meeting.id])).rows[0].status === 'cancelled', 'cancellation retained in CRM')
   check((await query('SELECT count(*) FROM crm_meeting_contacts WHERE meeting_id=$1', [meeting.id])).rows[0].count === '2', 'cancellation preserves contact associations')
   await query("UPDATE crm_meetings SET source_payload=source_payload || '{\"archived\":true}'::jsonb WHERE id=$1", [meeting.id])

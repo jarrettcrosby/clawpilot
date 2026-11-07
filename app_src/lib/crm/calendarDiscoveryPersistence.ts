@@ -70,7 +70,7 @@ type MeetingRow = {
   opportunity_id: string | null; subject: string; description: string | null
   starts_at: Date | string; ends_at: Date | string; timezone: string
   location: string | null; attendee_emails: string[]; status: 'planned' | 'queued' | 'scheduled' | 'completed' | 'cancelled' | 'failed'
-  external_event_url: string | null; join_url: string | null; event_hash: string | null
+  external_event_id: string | null; external_event_url: string | null; join_url: string | null; event_hash: string | null
   updated_at: Date | string
 }
 
@@ -119,6 +119,12 @@ async function reconcileEvent(current: CalendarDiscoverySource, event: CalendarD
       // Preserve unsent local intent, including a failed edit awaiting review.
       // No action lock: dispatch can hold that row while waiting for the meeting.
       if (pending.rowCount) return { status: 'deferred' as const }
+      // A completed Calendar move can leave the old discovery mapping behind.
+      // That mapping still prevents a duplicate import but cannot overwrite or
+      // cancel the meeting now bound to a different Calendar event.
+      if (meeting.external_event_id !== event.externalEventId || meeting.source_payload?.calendarId !== current.calendarId) {
+        return { status: 'skipped' as const }
+      }
     }
     if (!meeting && (!event.allowCreate || event.status === 'cancelled')) return { status: 'skipped' as const }
     if (!meeting && event.clawpilotMeetingReference) {
