@@ -64,7 +64,7 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   'app_src/lib/googleSso.ts', 'app_src/lib/authSessions.ts', 'app_src/lib/globalIds.mjs',
   'app_src/lib/crm/emailAddressHeaders.ts', 'app_src/lib/crm/participantEligibility.ts',
   'app_src/lib/crm/types.ts', 'app_src/lib/crm/emailIngestion.ts',
-  'app_src/lib/crm/emailIdentity.ts', 'app_src/lib/crm/emailReconciliation.ts',
+  'app_src/lib/crm/emailIdentity.ts', 'app_src/lib/crm/emailReconciliation.ts', 'app_src/lib/crm/caseyGmailReview.ts',
   'app_src/lib/persistence/crmEmailIdentity.ts', 'app_src/lib/crm/suiteCrmNativeEmailProjection.ts',
   'app_src/lib/crm/suiteCrmClient.ts', 'app_src/lib/crm/worker.ts', 'app_src/lib/persistence/crm.ts',
   'db/migrations/0374_crm_interaction_organizations.sql',

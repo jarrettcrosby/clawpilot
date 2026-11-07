@@ -1,5 +1,5 @@
 // Local acceptance helper only. Real PostgreSQL and actual SuiteCRM OAuth/V8;
-// Calendar is deliberately one controlled synthetic event, never a live account.
+// Calendar is deliberately one controlled synthetic invitation on two calendars.
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
@@ -164,14 +164,16 @@ export async function runNativeJointMeetingRoundtrip({ query, withTransaction, g
   const owner = authority.actorEmail.toLowerCase()
   const connectionId = 'joint-meeting-calendar-connection'
   const calendarId = owner
+  const copyCalendarId = 'joint-attendee-calendar@fixture.invalid'
   const eventId = 'jointmeetingevent01'
+  const copyEventId = 'jointmeetingcopy01'
   const key = `joint-synthetic-${randomBytes(24).toString('hex')}`
   const counters = { nativeRequests: 0, nativeBytes: 0, nativePolls: 0, oauthGrants: 0,
     nativeMeetingCreates: 0, nativeMeetingUpdates: 0, calendarRequests: 0,
     calendarPolls: 0, calendarPatches: 0, outboxCompletions: 0 }
   const start = new Date(Date.now() + 86_400_000)
   start.setUTCSeconds(0, 0)
-  let event = { id: eventId, status: 'confirmed', summary: 'Joint imported meeting',
+  let event = { id: eventId, iCalUID: 'joint-meeting-invite@fixture.invalid', status: 'confirmed', summary: 'Joint imported meeting',
     description: 'Initial Calendar fixture agenda', location: 'Original fixture room',
     start: { dateTime: start.toISOString(), timeZone: 'UTC' },
     end: { dateTime: new Date(start.getTime() + 30 * 60_000).toISOString(), timeZone: 'UTC' },
@@ -234,14 +236,26 @@ export async function runNativeJointMeetingRoundtrip({ query, withTransaction, g
     assert.ok(url.pathname.startsWith(prefix), 'Only the Calendar adapter is admitted')
     const route = url.pathname.slice(prefix.length)
     if (method === 'GET' && route === 'users/me/calendarList') {
-      return Response.json({ items: [{ id: calendarId, summary: 'Joint fixture calendar', accessRole: 'owner', primary: true }] })
+      return Response.json({ items: [
+        { id: calendarId, summary: 'Joint fixture calendar', accessRole: 'owner', primary: true },
+        { id: copyCalendarId, summary: 'Joint attendee copy calendar', accessRole: 'writer' },
+      ] })
     }
     if (method === 'GET' && route === `calendars/${encodeURIComponent(calendarId)}`) {
       return Response.json({ id: calendarId, summary: 'Joint fixture calendar', timeZone: 'UTC' })
     }
+    if (method === 'GET' && route === `calendars/${encodeURIComponent(copyCalendarId)}`) {
+      return Response.json({ id: copyCalendarId, summary: 'Joint attendee copy calendar', timeZone: 'UTC' })
+    }
     if (method === 'GET' && route === `calendars/${encodeURIComponent(calendarId)}/events`) {
       assert.ok(++counters.calendarPolls <= 3, 'Calendar polling bound exceeded')
       return Response.json({ timeZone: 'UTC', items: [structuredClone(event)], nextSyncToken: `joint-v${counters.calendarPolls}` })
+    }
+    if (method === 'GET' && route === `calendars/${encodeURIComponent(copyCalendarId)}/events`) {
+      assert.ok(++counters.calendarPolls <= 3, 'Calendar polling bound exceeded')
+      const copy = { ...event, id: copyEventId, summary: 'Non-authoritative attendee copy',
+        organizer: { email: owner, self: false }, extendedProperties: undefined }
+      return Response.json({ timeZone: 'UTC', items: [structuredClone(copy)], nextSyncToken: 'joint-copy-v1' })
     }
     if (method === 'PATCH' && route === `calendars/${encodeURIComponent(calendarId)}/events/${eventId}`) {
       assert.ok(++counters.calendarPatches <= 3, 'Calendar PATCH bound exceeded')
@@ -322,6 +336,17 @@ export async function runNativeJointMeetingRoundtrip({ query, withTransaction, g
   assert.equal(associations.rows.length, 1); assert.equal(associations.rows[0].contact_id, contact.id)
   assert.equal((await query('SELECT count(*)::int AS count FROM crm_integration_actions')).rows[0].count, 0,
     'Import must not send or create a Calendar event')
+  const overlapping = await adapter.configureCalendarDiscoverySource({ pipelineId: authority.pipelineId,
+    organizationId: authority.workspaceOrganizationId, actorEmail: owner, connectionId, calendarId: copyCalendarId, enabled: true })
+  const copySource = overlapping.find(item => item.calendarId === copyCalendarId)
+  assert.equal(overlapping.length, 2); assert.ok(copySource?.enabled)
+  const beforeCopy = await query(`SELECT (SELECT count(*)::int FROM crm_meetings) AS meetings,
+    (SELECT count(*)::int FROM sync_outbox) AS outbox, (SELECT count(*)::int FROM crm_integration_actions) AS actions`)
+  const overlap = await discovery.processCalendarDiscovery({ sources: [copySource], store: adapter.calendarDiscoveryStore })
+  assert.equal(overlap.errors, 0); assert.equal(overlap.eventsListed, 1); assert.equal(overlap.created, 0); assert.equal(overlap.updated, 0)
+  assert.deepEqual((await query(`SELECT (SELECT count(*)::int FROM crm_meetings) AS meetings,
+    (SELECT count(*)::int FROM sync_outbox) AS outbox, (SELECT count(*)::int FROM crm_integration_actions) AS actions`)).rows, beforeCopy.rows)
+  assert.deepEqual(await meeting(), row, 'Attendee copy cannot alter the canonical meeting or Calendar authority')
 
   async function flushMeetingOutbox() {
     for (let iteration = 0; iteration < 12; iteration++) {
@@ -447,6 +472,7 @@ export async function runNativeJointMeetingRoundtrip({ query, withTransaction, g
     identity, accountReferenceCode: contact.account_reference, contactReferenceCode: contact.contact_reference,
     counters, receipts: receipts.rows[0].count, imported: { created: imported.created, eventsListed: imported.eventsListed },
     reverse: { meetingsStaged: reverse.meetingsStaged, calendarActionsQueued: reverse.calendarActionsQueued },
+    overlappingCalendar: { eventsListed: overlap.eventsListed, created: overlap.created, updated: overlap.updated, sameCanonicalTuple: true },
     replay: { nativeMeetingsStaged: replayNative.meetingsStaged, calendarCreated: replayCalendar.created },
     limitations: ['Synthetic local fixture only', 'Calendar adapter is controlled, not live Google Calendar',
       'Scalar meeting edits only; not recurrence, attendees, or signed-in UI acceptance'] }

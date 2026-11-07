@@ -29,6 +29,7 @@ import {
   databaseEndpointFingerprint,
   destroyValidatedMaterials,
   digest,
+  isProductionRebindSchemaLockRelation,
   managedSourceAuthorityApprovalToken,
   parseArguments,
   plannedHistoryPolicyEvidence,
@@ -739,6 +740,12 @@ assert.ok(
   'the serializable transaction must own the migration lock before rechecking exact schema',
 )
 assert.match(source, /LOCK TABLE.*IN ACCESS SHARE MODE/u)
+assert.equal(isProductionRebindSchemaLockRelation('public.crm_meetings'), true)
+assert.equal(isProductionRebindSchemaLockRelation('crm_legacy_email_retirement.account_repair_approvals'), true)
+for (const relation of ['arbitrary.review', 'crm_legacy_email_retirement.not_enrolled', 'public.not_enrolled',
+  'crm_legacy_email_retirement.review; SELECT 1', 'crm_legacy_email_retirement."review"', 'crm_legacy_email_retirement.review\n', null]) {
+  assert.equal(isProductionRebindSchemaLockRelation(relation), false)
+}
 assert.match(
   source,
   /LOCK TABLE \$\{SHOPIFY_FULFILLMENT_NOTIFICATION_POLICY_RELATION\} IN SHARE ROW EXCLUSIVE MODE/u,

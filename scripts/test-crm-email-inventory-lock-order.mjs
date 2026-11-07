@@ -10,6 +10,20 @@ import vm from 'node:vm'
 
 const ts = createRequire(new URL('../app_src/package.json', import.meta.url))('typescript')
 const read = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
+function load(path, dependencies = {}) {
+  const module = { exports: {} }
+  const code = ts.transpileModule(read(path), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+  }).outputText
+  new Function('module', 'exports', 'require', code)(module, module.exports, name => {
+    if (Object.hasOwn(dependencies, name)) return dependencies[name]
+    assert.equal(name, 'node:crypto', 'No external provider/runtime dependency is available')
+    return crypto
+  })
+  return module.exports
+}
+const emailIdentity = load('app_src/lib/crm/emailIdentity.ts')
+const caseyPolicy = load('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity })
 const functions = (path, names) => {
   const ast = ts.createSourceFile(path, read(path), ts.ScriptTarget.Latest, true)
   return names.map(name => {
@@ -48,7 +62,7 @@ function harness({ controlRows = [{ singleton: true }], modeRows = [{ enabled: f
     if (sql.includes('SELECT COALESCE(wo.is_demo')) return { rows: [{ is_demo: false }] }
     throw new Error(`Unexpected SQL: ${sql}`)
   } }
-  const runtime = { exports: {}, withTransaction: async callback => callback(client),
+  const runtime = { exports: {}, ...caseyPolicy, withTransaction: async callback => callback(client),
     crmSourceHash: value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex'),
     clean: value => String(value ?? '').trim(),
     normalizeStageCrmRecordInput: async (_client, value) => {

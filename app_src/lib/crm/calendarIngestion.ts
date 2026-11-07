@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import type { PoolClient } from 'pg'
+import { calendarOccurrenceKey } from '@/lib/crm/calendarDiscovery'
+import { claimVerifiedCalendarOccurrence, lockCalendarOccurrencePipeline } from '@/lib/crm/calendarOccurrenceClaims'
 import { resolveRecordedCrmMeetingCalendarCommunication } from '@/lib/crm/integrationActions'
 import type { CrmMeeting } from '@/lib/crm/types'
 import { globalIdFragment, globalIdPattern } from '@/lib/globalIds.mjs'
@@ -18,6 +20,13 @@ const MAX_PAGES_PER_CALENDAR = 10
 const MAX_RECORDED_MEETINGS_PER_CALENDAR = 50
 // Same active-row semantics as persistence/crm.ts activeCrmRecordSql.
 const ACTIVE_MEETING_SQL = "COALESCE(lower(meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')"
+// A current discovery mapping owns that exact provider observation, even if
+// its source is paused. A retained mapping from before a move still prevents
+// reimport, but must not suppress polling the new authorized Calendar tuple.
+const NO_CURRENT_DISCOVERY_TUPLE_SQL = `NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
+  WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id
+    AND discovery.calendar_id = meeting.source_payload->>'calendarId'
+    AND discovery.external_event_id = meeting.external_event_id)`
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000
 const POLL_OVERLAP_MS = 5 * 60 * 1000
@@ -450,7 +459,12 @@ function sameRecordedIdentity(previous: MeetingRow, current: MeetingRow): boolea
 }
 
 function assertEventIdentity(event: JsonObject, meeting: MeetingRow): void {
-  const marker = asRecord(asRecord(event.extendedProperties)?.private)?.clawpilotMeetingReference
+  const metadata = asRecord(asRecord(event.extendedProperties)?.private)
+  const marker = metadata?.clawpilotMeetingReference
+  if (metadata && Object.hasOwn(metadata, 'clawpilotPipelineId')
+    && (metadata.clawpilotPipelineId !== meeting.pipeline_id || !marker)) {
+    throw new SafeCalendarIngestionError('Google Calendar event pipeline reference does not match')
+  }
   if (marker !== undefined && marker !== null && marker !== '') {
     if (calendarMeetingReference(event) !== meeting.reference_code.toLowerCase()) {
       throw new SafeCalendarIngestionError('Google Calendar event meeting reference does not match')
@@ -525,8 +539,7 @@ async function recordedCalendars(): Promise<SelectedCalendar[]> {
        AND app_user.status = 'active'
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
-       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
-         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
+       AND ${NO_CURRENT_DISCOVERY_TUPLE_SQL}
      ORDER BY connection.owner_email, connection.connection_id`,
     [CALENDAR_APP],
   )
@@ -551,8 +564,7 @@ async function recordedMeetingPage(calendar: SelectedCalendar, afterMeetingId: s
        AND meeting.source_payload->>'calendarConnectionId' = $2
        AND NULLIF(meeting.source_payload->>'calendarId', '') IS NOT NULL
        AND NULLIF(meeting.external_event_id, '') IS NOT NULL
-       AND NOT EXISTS (SELECT 1 FROM crm_calendar_discovery_events discovery
-         WHERE discovery.pipeline_id = meeting.pipeline_id AND discovery.meeting_id = meeting.id)
+       AND ${NO_CURRENT_DISCOVERY_TUPLE_SQL}
        AND ($3::uuid IS NULL OR meeting.id > $3::uuid)
      ORDER BY meeting.id ASC
      LIMIT $4`,
@@ -822,7 +834,9 @@ async function reconcileEvent(input: {
 async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): Promise<ReconciliationResult> {
   assertEventIdentity(event, meeting)
   const status = calendarEventStatus(event)
+  const occurrenceKey = calendarOccurrenceKey(event)
   return withTransaction(async (client) => {
+    if (occurrenceKey) await lockCalendarOccurrencePipeline(client, meeting.pipeline_id)
     const current = await lockedMeeting(client, meeting)
     if (!current || !sameRecordedIdentity(meeting, current)) return { matched: false, staged: false }
     // Re-read authority after the row lock: an in-flight provider response must
@@ -831,6 +845,19 @@ async function reconcileRecordedEvent(meeting: MeetingRow, event: JsonObject): P
       return { matched: true, staged: false, deferred: true }
     }
     const authority = await recordedAuthority(current)
+    if (occurrenceKey) {
+      const tuple = authority.previousCalendar
+      // The already authorized exact-event GET can enroll a pre-ledger
+      // meeting, even outside the discovery window. No new scan, event write,
+      // content revision, or change to its edit authority is needed.
+      if (tuple.calendarId !== current.source_payload?.calendarId || tuple.eventId !== current.external_event_id
+        || await claimVerifiedCalendarOccurrence(client, {
+          pipelineId: current.pipeline_id, meetingId: current.id, calendarId: tuple.calendarId,
+          externalEventId: tuple.eventId, occurrenceKey,
+        }) === 'conflict') {
+        throw new SafeCalendarIngestionError('Recorded Calendar occurrence conflicts with an existing meeting')
+      }
+    }
     return stageReconciledMeeting(client, current, event, status,
       authority.actorEmail, authority.communication.credentialOwnerEmail)
   })

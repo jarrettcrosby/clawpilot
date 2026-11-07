@@ -86,6 +86,19 @@ final class ClawPilotNativeEmailProjection
         return ['suiteCrmId'=>$emailId,'exists'=>$raw['emails'] !== [],'fingerprint'=>self::digest($raw),'raw'=>$raw,'globalIndex'=>$globalIndex];
     }
 
+    /** Requires the current transaction's locked snapshot of this exact ID. */
+    public static function assertCreatePreimage(mysqli $db, ClawPilotNativeEmailTransaction $transaction, array $before,
+        string $id, string $globalId, mixed $previousManaged): void
+    {
+        self::connection($db,$transaction);
+        self::need($before['suiteCrmId'] === $id && !$before['exists'] && is_array($previousManaged)
+            && count($previousManaged) === 2 && ($previousManaged['accounts'] ?? null) === []
+            && ($previousManaged['contacts'] ?? null) === [], 'create_requires_absent_identity');
+        foreach (['emails_text','emails_cstm','emails_beans','emails_email_addr_rel'] as $table) self::need($before['raw'][$table] === [], 'orphaned_native_identity');
+        // Use native collation so case and trailing-space collisions also hold.
+        self::need(self::rows($db,'SELECT id_c FROM emails_cstm FORCE INDEX (PRIMARY) WHERE global_id_c=? ORDER BY id_c FOR UPDATE',[$globalId],2) === [], 'duplicate_or_changed_global_id');
+    }
+
     public static function upsert(mysqli $db, ClawPilotNativeEmailTransaction $transaction, array $command): array
     {
         try {
@@ -96,8 +109,7 @@ final class ClawPilotNativeEmailProjection
             self::need($writer instanceof User && $writer->isAdmin() && is_string($writer->id) && $writer->id !== '', 'native_writer_unproven');
             self::need($_REQUEST === [] && empty($GLOBALS['sugar_config']['email_enable_auto_send_opt_in']), 'unsafe_save_context');
             if ($command['expectedBeforeFingerprint'] === null) {
-                self::need(!$before['exists'] && $command['previousManaged'] === ['accounts'=>[],'contacts'=>[]], 'create_requires_absent_identity');
-                foreach (['emails_text','emails_cstm','emails_beans','emails_email_addr_rel'] as $table) self::need($before['raw'][$table] === [], 'orphaned_native_identity');
+                self::assertCreatePreimage($db,$transaction,$before,$id,$attributes['global_id_c'],$command['previousManaged']);
             } else {
                 self::need($before['exists'] && hash_equals($command['expectedBeforeFingerprint'],$before['fingerprint']), 'existing_preimage_changed');
                 $old=$before['raw']['emails'][0];
@@ -106,13 +118,10 @@ final class ClawPilotNativeEmailProjection
                     && count($before['raw']['emails_text']) === 1 && (int)$before['raw']['emails_text'][0]['deleted'] === 0
                     && count($before['raw']['emails_cstm']) === 1, 'existing_lifecycle_or_ownership_changed');
                 self::need((string)($before['raw']['emails_text'][0]['raw_source'] ?? '') === '', 'unsupported_existing_raw_source');
+                $globalMatches=self::rows($db,'SELECT id_c,global_id_c FROM emails_cstm FORCE INDEX (PRIMARY) WHERE global_id_c=? ORDER BY id_c FOR UPDATE',[$attributes['global_id_c']],2);
+                self::need(array_column($globalMatches,'id_c') === [$id]
+                    && $before['raw']['emails_cstm'][0]['global_id_c'] === $attributes['global_id_c'],'duplicate_or_changed_global_id');
             }
-            // Use the actual native column collation for duplicate lookup, not
-            // PHP string equality (case/trailing-space collisions also hold).
-            $globalMatches=self::rows($db,'SELECT id_c,global_id_c FROM emails_cstm FORCE INDEX (PRIMARY) WHERE global_id_c=? ORDER BY id_c FOR UPDATE',[$attributes['global_id_c']],2);
-            $globalIds=array_column($globalMatches,'id_c');
-            self::need($globalIds === ($before['exists'] ? [$id] : []), 'duplicate_or_changed_global_id');
-            if ($before['exists']) self::need($before['raw']['emails_cstm'][0]['global_id_c'] === $attributes['global_id_c'],'duplicate_or_changed_global_id');
             // Existing app projections write native *_names fields, not bare
             // address links. Unknown normalized address relationships hold;
             // never erase them or lose display names through retrieveEmailAddresses.

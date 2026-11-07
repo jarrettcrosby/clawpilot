@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
+import { readCaseyFirstSeenGmailCandidates } from '@/lib/crm/emailIngestion'
+import { CASEY_FIRST_SEEN_SCOPE } from '@/lib/crm/caseyGmailReview'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query } from '@/lib/persistence/postgres'
 import { readVerifiedGmailMailboxIdentityInPostgres } from '@/lib/persistence/crmEmailIdentity'
@@ -57,9 +59,10 @@ export async function GET(req: NextRequest) {
     const messageIds = rawIds === null ? [] : rawIds.split(',').map(id => id.toLowerCase())
     const admissionScope = req.nextUrl.searchParams.get('admissionScope')
     const caseyPair = admissionScope === CASEY_SCOPE
+    const firstSeen = admissionScope === CASEY_FIRST_SEEN_SCOPE
     if (!UUID.test(pipelineId) || !/^[A-Za-z0-9_-]{1,200}$/.test(connectionId)
-      || (admissionScope !== null && !caseyPair)
-      || (caseyPair && (participantEmail !== '' || pipelineId !== LEGACY_PIPELINE || connectionId !== CASEY_CONNECTION
+      || (admissionScope !== null && !caseyPair && !firstSeen)
+      || ((caseyPair || firstSeen) && (participantEmail !== '' || pipelineId !== LEGACY_PIPELINE || connectionId !== CASEY_CONNECTION
         || (rawIds !== null && [...messageIds].sort().join() !== [...CASEY_MESSAGES].sort().join())))
       || (participantEmail && (participantEmail.length > 254 || !EMAIL.test(participantEmail)))
       || (rawIds !== null && (!messageIds.length || messageIds.length > 25
@@ -75,11 +78,17 @@ export async function GET(req: NextRequest) {
     const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId })
     if (pipeline.id !== pipelineId || pipeline.ownerEmail !== actor.email || actor.email !== session.effectiveUser
       || !actor.organizationId || pipeline.workspaceOrganizationId !== actor.organizationId
-      || (caseyPair && actor.email !== CASEY_OWNER)
+      || ((caseyPair || firstSeen) && actor.email !== CASEY_OWNER)
       || (session.activeWorkspaceOrganizationId && session.activeWorkspaceOrganizationId !== actor.organizationId)) {
       return json({ ok: false, error: 'Pipeline owner access is required in the active workspace' }, 403)
     }
     if (!isPostgresStorageEnabled()) return json({ ok: false, error: 'Email review requires Postgres storage' }, 503)
+    if (firstSeen) {
+      const messages = await readCaseyFirstSeenGmailCandidates({ ownerEmail: actor.email, connectionId, pipelineId }).catch(() => null)
+      if (!messages) return json({ ok: false, error: 'Both exact Casey messages and their verified mailbox and participant links are required' }, 409)
+      return json({ ok: true, pipelineId, connectionId, messages, maximum: 2, admissionScope: CASEY_FIRST_SEEN_SCOPE,
+        scope: 'Only the two pinned Gmail message headers; no mailbox replay or future thread rule' })
+    }
     const connection = await query<{ account_email: string }>(`SELECT account_email FROM user_maton_connections
       WHERE owner_email=$1 AND connection_id=$2 AND app='google-mail' AND source='maton'
         AND status='ACTIVE' AND is_selected`, [actor.email, connectionId])

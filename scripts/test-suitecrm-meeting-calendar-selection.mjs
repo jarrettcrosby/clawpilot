@@ -40,9 +40,10 @@ const SOURCE_HASH = 'a'.repeat(64)
 const normalizeUserEmail = (value) => String(value || '').trim().toLowerCase()
 const archived = (row) => ['true', '1', 'yes'].includes(String(row.source_payload?.archived).toLowerCase())
 let meeting, prior, staged, queued, requests, scopeFailure, bindingFailure, credentialFailure
-let scopeOrganization, activeBinding, credentialAccount, racedHash, insertFailure, cursorWrites
+let scopeOrganization, activeBinding, credentialAccount, liveAccountEmail, racedHash, insertFailure, cursorWrites
 let pipelineRole, onMeetingRead, importedAuthority
 let projectionRow, pendingProjection, liveSnapshotOverride, lastPolledSnapshot, nativeReads, onProjectionRead
+let retainedOccurrence
 const clientSource = ts.createSourceFile('suiteCrmClient.ts', readFileSync('app_src/lib/crm/suiteCrmClient.ts', 'utf8'),
   ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 const normalizerNode = clientSource.statements.find((node) => ts.isFunctionDeclaration(node)
@@ -90,9 +91,10 @@ function reset(mode = 'in_person', source = 'organization') {
     updated_at: '2026-09-03T12:00:00Z', processed_at: '2026-09-03T12:00:00Z',
   }
   staged = []; queued = null; requests = []; cursorWrites = []
+  retainedOccurrence = null
   scopeFailure = false; bindingFailure = false; credentialFailure = false; insertFailure = false
   scopeOrganization = ORGANIZATION; activeBinding = communication
-  credentialAccount = communication.accountEmail; racedHash = null
+  credentialAccount = communication.accountEmail; liveAccountEmail = communication.accountEmail; racedHash = null
   pipelineRole = 'editor'
   onMeetingRead = null
   importedAuthority = null
@@ -148,12 +150,12 @@ async function query(sql, parameters = []) {
       "owner_user.status = 'active'",
       "membership.organization_id = source.workspace_organization_id AND membership.status = 'active'",
       "connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'",
-      'lower(connection.account_email) = source.account_email',
       'mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid',
       'meeting.reference_code = $3 AND mapping.external_event_id = $4',
       'source.credential_owner_email = $5 AND source.connection_id = $6',
       'mapping.calendar_id = $7 AND source.calendar_id = $8',
     ]) assert.ok(sql.includes(guard), `Imported Calendar authority must retain ${guard}`)
+    assert.ok(!sql.includes('connection.account_email'), 'Do not use a cached Maton label as imported Calendar authority')
     const row = importedAuthority
     const matches = row && row.authorized && row.pipeline_id === parameters[0]
       && row.meeting_id === parameters[1] && row.reference_code === parameters[2]
@@ -194,6 +196,10 @@ async function query(sql, parameters = []) {
 }
 const client = { query: async (sql, parameters = []) => {
   if (sql.includes('pg_advisory_xact_lock')) return { rows: [] }
+  if (sql.includes('SELECT id FROM crm_integration_actions') && sql.includes("status='processing' AND lock_token=$2 FOR UPDATE")) {
+    assert.equal(parameters[0], NEXT); assert.match(parameters[1], /^fixture-/u)
+    return { rows: [{ id: NEXT }], rowCount: 1 }
+  }
   if (sql.includes('SELECT * FROM crm_integration_actions') && sql.includes('FOR UPDATE')) return { rows: [] }
   if (sql.includes('SELECT source_hash') && sql.includes('FROM crm_meetings')) {
     assert.match(sql, /FOR UPDATE/); assert.deepEqual(Array.from(parameters), [PIPELINE, MEETING])
@@ -224,9 +230,30 @@ const client = { query: async (sql, parameters = []) => {
   }
   if (sql.includes('INSERT INTO audit_events') || sql.includes('UPDATE crm_integration_actions')
     || sql.includes('UPDATE crm_integration_action_attempts')) return { rows: [], rowCount: 1 }
+  if (sql.includes('SELECT organization_id::text, contact_id::text') || sql.includes('SET join_url = NULL')) return query(sql, parameters)
   throw new Error(`Unexpected transaction query: ${sql.slice(0, 140)}`)
 } }
 const integration = load('app_src/lib/crm/integrationActions.ts', {
+  '@/lib/crm/calendarDiscovery': process.argv.includes('--baseline') ? {} : load('app_src/lib/crm/calendarDiscovery.ts', {
+    '@/lib/maton': {}, '@/lib/zonedDateTime': { zonedDateTimeToIso: value => new Date(value).toISOString() },
+  }),
+  '@/lib/crm/calendarOccurrenceClaims': {
+    lockCalendarOccurrencePipeline: async (actual, pipelineId) => {
+      assert.equal(actual, client); assert.equal(pipelineId, PIPELINE)
+    },
+    readVerifiedCalendarOccurrence: async (actual, tuple) => {
+      assert.equal(actual, client); assert.equal(tuple.meetingId, MEETING)
+      return retainedOccurrence?.occurrenceKey ?? null
+    },
+    claimVerifiedCalendarOccurrence: async (actual, proof) => {
+      assert.equal(actual, client)
+      assert.equal(proof.pipelineId, PIPELINE); assert.equal(proof.meetingId, MEETING)
+      assert.equal(proof.calendarId, CALENDAR); assert.equal(proof.externalEventId, EVENT)
+      assert.match(proof.occurrenceKey, /^[a-f0-9]{64}$/u)
+      retainedOccurrence = structuredClone(proof)
+      return 'claimed'
+    },
+  },
   '@/lib/crm/emailIdentity': load('app_src/lib/crm/emailIdentity.ts', {}),
   '@/lib/persistence/crmEmailIdentity': { readVerifiedGmailMailboxIdentityInPostgres: async () => {
     assert.fail('Meeting-calendar selection cannot acquire an email mailbox identity')
@@ -270,22 +297,27 @@ const integration = load('app_src/lib/crm/integrationActions.ts', {
   },
   '@/lib/persistence/postgres': { query, withTransaction: async (work) => {
     const before = structuredClone(meeting); const beforeStages = staged.length
-    try { return await work(client) } catch (error) { meeting = before; staged.length = beforeStages; throw error }
+    const beforeOccurrence = retainedOccurrence
+    try { return await work(client) } catch (error) { meeting = before; staged.length = beforeStages; retainedOccurrence = beforeOccurrence; throw error }
   } },
   '@/lib/maton': { matonFetch: async (pathname, init = {}, context) => {
     requests.push({ pathname, method: init.method || 'GET', context, body: init.body && JSON.parse(init.body) })
     assert.equal(context.boundConnectionId, CONNECTION)
     if (pathname.includes('/calendarList?')) return Response.json({ items: [
-      { id: prior.communication_account_email, primary: true, accessRole: 'owner' },
+      { id: liveAccountEmail, primary: true, accessRole: 'owner' },
       { id: CALENDAR, summary: 'Independent team', accessRole: 'writer' },
     ] })
     if (init.method === 'DELETE') {
       assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
       return new Response(null, { status: 204 })
     }
+    if ((init.method || 'GET') === 'GET') {
+      assert.ok(pathname.endsWith(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}`))
+      return Response.json({ id: EVENT, iCalUID: 'recorded-invite@calendar.example', status: 'confirmed' })
+    }
     assert.equal(init.method, 'PATCH', 'A CRM edit must not create/move/delete its recorded event')
     assert.ok(pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
-    return Response.json({ id: EVENT, htmlLink: meeting.external_event_url, hangoutLink: 'https://meet.google.com/fixture' })
+    return Response.json({ id: EVENT, iCalUID: 'recorded-invite@calendar.example', htmlLink: meeting.external_event_url, hangoutLink: 'https://meet.google.com/fixture' })
   } },
 }, '\nexport { createCalendarEventAction, leasedAction };\n')
 const inbound = load('app_src/lib/crm/suiteCrmMeetingIngestion.ts', {
@@ -344,6 +376,7 @@ for (const mode of ['in_person', 'custom_link', 'google_meet']) {
     else assert.equal(write.body.conferenceData, null)
     assert.equal(write.body.location, mode === 'in_person' ? '100 Example Avenue' : mode === 'custom_link' ? CUSTOM : null)
     assert.equal(staged.at(-1).fields.joinUrl, mode === 'custom_link' ? CUSTOM : mode === 'in_person' ? null : 'https://meet.google.com/fixture')
+    if (!process.argv.includes('--baseline')) assert.equal(retainedOccurrence?.externalEventId, EVENT)
   }
 }
 reset()
@@ -410,6 +443,34 @@ function lossyNativeProjection() {
   assert.notEqual(queued.idempotency_key, firstKey,
     'A→B→A native reverts with the same timestamp use their distinct canonical preimage')
 }
+for (const imported of [false, true]) {
+  const label = imported ? 'imported Calendar' : 'previously delivered Calendar'
+  for (const primaryChanged of [false, true]) {
+    if (imported) importMeeting()
+    else reset()
+    credentialAccount = 'outdated-maton-label@example.com'
+    if (primaryChanged) liveAccountEmail = 'unreviewed-live-account@example.com'
+    const reviewedAccount = imported ? importedAuthority.account_email : prior.communication_account_email
+    assert.equal((await inbound.reconcileMeeting(inboundSnapshot())).calendarActionQueued, true, label)
+    assert.equal(queued.communication_account_email, reviewedAccount, `${label}: queue the reviewed account, not the cached label`)
+    assert.equal(requests.length, 0, `${label}: admission does not call Google`)
+    const delivery = () => integration.createCalendarEventAction(integration.leasedAction({ ...queued,
+      status: 'processing', attempts: 1, lock_token: 'fixture-live-account-lease' }), target())
+    if (primaryChanged) {
+      await assert.rejects(delivery, /Calendar account no longer matches/, label)
+      assert.ok(requests.length > 0, `${label}: verify the live account at delivery`)
+      assert.ok(requests.every((request) => request.method === 'GET' && request.pathname.includes('/calendarList?')),
+        `${label}: a new account that can still access the shared calendar must not mutate its event`)
+    } else {
+      await delivery()
+      const writes = requests.filter((request) => request.method !== 'GET')
+      assert.equal(writes.length, 1, `${label}: do not recreate the existing event`)
+      assert.equal(writes[0].method, 'PATCH')
+      assert.ok(writes[0].pathname.includes(`/calendars/${encodeURIComponent(CALENDAR)}/events/${EVENT}?`))
+    }
+  }
+}
+
 for (const [name, mutate] of [
   ['legacy missing projection receipt', () => { projectionRow = null }],
   ['queued projection', () => { pendingProjection = true }],
@@ -626,7 +687,6 @@ for (const [name, mutate] of [
   ['different imported owner', () => { importedAuthority.credential_owner_email = OWNER }],
   ['metadata without import mapping', () => { importedAuthority = null }],
   ['revoked imported credential', () => { credentialFailure = true }],
-  ['changed imported provider account', () => { credentialAccount = 'changed@example.com' }],
   ['revoked imported membership', () => { scopeFailure = true }],
   ['revoked imported pipeline access', () => { pipelineRole = null }],
 ]) {
@@ -645,7 +705,6 @@ for (const [name, mutate] of [
   ['revoked organization binding', () => { bindingFailure = true }],
   ['changed organization selection', () => { activeBinding = { ...activeBinding, calendarId: 'other@example.com' } }],
   ['revoked bound connection', () => { credentialFailure = true }],
-  ['changed provider account', () => { credentialAccount = 'other@example.com' }],
   ['missing historical snapshot', () => { prior.communication_binding_source = null }],
   ['failed original action', () => { prior.status = 'failed' }],
   ['pending original action', () => { prior.status = 'processing' }],

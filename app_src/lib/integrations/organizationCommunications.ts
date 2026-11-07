@@ -196,11 +196,13 @@ async function listGmailSendAsIdentities(input: {
 async function listAccessibleGoogleCalendars(input: {
   ownerEmail: string
   connectionId: string
+  requireComplete?: boolean
 }): Promise<AccessibleGoogleCalendar[]> {
   const calendars: AccessibleGoogleCalendar[] = []
   const seen = new Set<string>()
+  let hasPrimary = false
   let pageToken = ''
-  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && calendars.length < MAX_CALENDAR_OPTIONS; page += 1) {
+  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && (input.requireComplete || calendars.length < MAX_CALENDAR_OPTIONS); page += 1) {
     const parameters = new URLSearchParams({
       maxResults: '250',
       minAccessRole: 'writer',
@@ -217,6 +219,17 @@ async function listAccessibleGoogleCalendars(input: {
     for (const item of providerObjectList(response.items)) {
       const accessRole = String(item.accessRole || '').trim().toLowerCase()
       if (accessRole !== 'owner' && accessRole !== 'writer') continue
+      const primary = item.primary === true
+      if (primary) {
+        if (input.requireComplete && hasPrimary) {
+          throw new OrganizationCommunicationRequestError(
+            'This connection returned multiple writable primary Google Calendars',
+            422,
+            'ORGANIZATION_COMMUNICATION_CALENDAR_ACCOUNT_UNVERIFIED',
+          )
+        }
+        hasPrimary = true
+      }
       let id: string
       try {
         id = calendarId(item.id)
@@ -224,17 +237,27 @@ async function listAccessibleGoogleCalendars(input: {
         continue
       }
       if (seen.has(id)) continue
+      if (calendars.length >= MAX_CALENDAR_OPTIONS) {
+        throw new OrganizationCommunicationRequestError(
+          'Google Calendar list exceeded the bounded identity verification limit',
+          502,
+          'ORGANIZATION_COMMUNICATION_PROVIDER_INVALID',
+        )
+      }
       seen.add(id)
       calendars.push({
         id,
         summary: String(item.summaryOverride || item.summary || id).trim().slice(0, 300) || id,
-        primary: item.primary === true,
+        primary,
         accessRole,
       })
-      if (calendars.length >= MAX_CALENDAR_OPTIONS) break
+      if (!input.requireComplete && calendars.length >= MAX_CALENDAR_OPTIONS) break
     }
     const nextPageToken = String(response.nextPageToken || '').trim()
-    if (!nextPageToken) break
+    if (!nextPageToken) {
+      pageToken = ''
+      break
+    }
     if (nextPageToken.length > 2048 || CONTROL_CHARACTER_PATTERN.test(nextPageToken)) {
       throw new OrganizationCommunicationRequestError(
         'Google Calendar list returned an invalid response',
@@ -243,6 +266,13 @@ async function listAccessibleGoogleCalendars(input: {
       )
     }
     pageToken = nextPageToken
+  }
+  if (input.requireComplete && pageToken) {
+    throw new OrganizationCommunicationRequestError(
+      'Google Calendar list exceeded the bounded identity verification limit',
+      502,
+      'ORGANIZATION_COMMUNICATION_PROVIDER_INVALID',
+    )
   }
   return calendars.sort((left, right) => Number(right.primary) - Number(left.primary) || left.summary.localeCompare(right.summary))
 }
@@ -279,29 +309,33 @@ async function verifiedGmailIdentity(input: {
 async function verifiedCalendarIdentity(input: {
   ownerEmail: string
   connectionId: string
-  accountEmail: string | null
   requestedCalendarId?: unknown
 }): Promise<{ accountEmail: string; identityEmail: string; calendarId: string }> {
-  const calendars = await listAccessibleGoogleCalendars(input)
+  const calendars = await listAccessibleGoogleCalendars({ ...input, requireComplete: true })
+  const primaryCalendar = calendars.find((calendar) => calendar.primary)
+  if (!primaryCalendar) {
+    throw new OrganizationCommunicationRequestError(
+      'This connection has no writable primary Google Calendar to verify its account',
+      422,
+      'ORGANIZATION_COMMUNICATION_CALENDAR_ACCOUNT_UNVERIFIED',
+    )
+  }
   const requestedCalendarId = input.requestedCalendarId === undefined || input.requestedCalendarId === null
     || String(input.requestedCalendarId).trim() === ''
     ? null
     : calendarId(input.requestedCalendarId)
   const selectedCalendar = requestedCalendarId
     ? calendars.find((calendar) => calendar.id === requestedCalendarId)
-    : calendars.find((calendar) => calendar.primary)
+    : primaryCalendar
   if (!selectedCalendar) {
     throw new OrganizationCommunicationRequestError(
-      requestedCalendarId
-        ? 'The selected Google Calendar is not accessible with write permission on this connection'
-        : 'This connection has no writable primary Google Calendar',
+      'The selected Google Calendar is not accessible with write permission on this connection',
       422,
       'ORGANIZATION_COMMUNICATION_CALENDAR_NOT_WRITABLE',
     )
   }
   const identityEmail = normalizeCommunicationIdentityEmail(selectedCalendar.id)
-  const primaryCalendar = calendars.find((calendar) => calendar.primary)
-  const accountEmail = normalizeCommunicationIdentityEmail(primaryCalendar?.id, input.accountEmail || identityEmail)
+  const accountEmail = normalizeCommunicationIdentityEmail(primaryCalendar.id)
   return { accountEmail, identityEmail, calendarId: selectedCalendar.id }
 }
 
@@ -332,7 +366,6 @@ export async function resolveVerifiedPipelineCalendarSelection(input: {
   const verified = await verifiedCalendarIdentity({
     ownerEmail: actorEmail,
     connectionId: credential.connectionId,
-    accountEmail: credential.accountEmail,
     requestedCalendarId: normalizedCalendarId,
   })
   return {
@@ -496,7 +529,6 @@ export async function bindOrganizationCommunication(input: {
     : await verifiedCalendarIdentity({
         ownerEmail: actorEmail,
         connectionId: credential.connectionId,
-        accountEmail: credential.accountEmail,
         requestedCalendarId: input.calendarId,
       })
 

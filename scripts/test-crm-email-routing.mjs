@@ -13,6 +13,7 @@ const require = createRequire(import.meta.url)
 const ts = createRequire(new URL('../app_src/package.json', import.meta.url))('typescript')
 const plain = value => JSON.parse(JSON.stringify(value))
 const sourcePath = 'app_src/lib/crm/emailIngestion.ts'
+const fixtureCaseyProviderSubject = 'synthetic-casey-first-seen-google-subject'
 function loadModule(path, mocks = {}, extraExports = '') {
   const source = readFileSync(new URL(`../${path}`, import.meta.url), 'utf8') + extraExports
   const output = ts.transpileModule(source, {
@@ -172,6 +173,11 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
     '@/lib/crm/participantEligibility': participantEligibility,
     '@/lib/crm/emailIdentity': emailIdentity,
     '@/lib/crm/emailReconciliation': emailReconciliation,
+    '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', {
+      '@/lib/crm/emailIdentity': { ...emailIdentity, gmailMailboxKey: identity => identity.providerAccountId === fixtureCaseyProviderSubject
+        ? loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }).CASEY_PAIR.mailboxKey
+        : emailIdentity.gmailMailboxKey(identity) },
+    }),
     '@/lib/persistence/crmEmailIdentity': {
       readVerifiedGmailMailboxIdentityInPostgres: async () => verifiedIdentity,
       recordGmailMessageIntakeInPostgres: async input => {
@@ -277,7 +283,7 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
             candidate.email.toLowerCase() === record.email.toLowerCase() && !candidate.accountingMirror
           )))
         }
-        return result(candidates.map(record => ({ pipeline_id: record.pipelineId, reference_code: record.referenceCode, email: record.email.toLowerCase() })))
+        return result(candidates.map(record => ({ pipeline_id: record.pipelineId, entity: record.entity, reference_code: record.referenceCode, email: record.email.toLowerCase() })))
       }
       if (sql.includes('FROM crm_inbound_message_links')) {
         return result([...(links.get(values[0]) || new Map()).entries()]
@@ -1382,23 +1388,24 @@ const CASEY_PRODUCER = { owner: 'jarrett@suburbiasandwichco.com', connection: 'e
     { id: '1a18e03ea586cd7e', cacheId: '756e4e17-2458-470b-b00c-129c85ee821a' },
     { id: '1a18f01749eb87a6', cacheId: '78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' },
   ] }
-function caseyProducerFixture() {
-  const pins = CASEY_PRODUCER, account = 'synthetic-casey-mailbox@example.invalid'
-  const identity = { ...mailboxIdentity, providerAccountId: 'synthetic-casey-google-subject', accountEmail: account,
+function caseyProducerFixture({ firstSeen = false, subjectId } = {}) {
+  const pins = CASEY_PRODUCER, account = firstSeen ? 'jarrett@bposupplychain.com' : 'synthetic-casey-mailbox@example.invalid'
+  const identity = { ...mailboxIdentity, providerAccountId: subjectId || (firstSeen ? fixtureCaseyProviderSubject : 'synthetic-casey-google-subject'), accountEmail: account,
     verifiedConnectionId: pins.connection }
-  const contacts = [fixtureContact('gc7654321', 'adrian@globus.example.invalid', pins.pipeline, customerOrganization),
-    fixtureContact('gc8765432', 'casey@airspace.example.invalid', pins.pipeline, otherOrganization)]
-  const organizations = [{ id: customerOrganization, referenceCode: 'gagmco24va588e', pipelineId: pins.pipeline, entity: 'organizations' },
-    { id: otherOrganization, referenceCode: 'gajl1dq5i03jga', pipelineId: pins.pipeline, entity: 'organizations' }]
+  const contacts = [{ ...fixtureContact('gc7654321', firstSeen ? 'jcook@globusmedical.com' : 'adrian@globus.example.invalid', pins.pipeline, customerOrganization), name: 'Fixture customer contact' },
+    { ...fixtureContact('gc8765432', firstSeen ? 'casey@airspace.com' : 'casey@airspace.example.invalid', pins.pipeline, otherOrganization), name: 'Fixture supplier contact' }]
+  const organizations = [{ id: customerOrganization, referenceCode: 'gagmco24va588e', pipelineId: pins.pipeline, entity: 'organizations', name: 'Fixture Globus' },
+    { id: otherOrganization, referenceCode: 'gajl1dq5i03jga', pipelineId: pins.pipeline, entity: 'organizations', name: 'Fixture Airspace' }]
   const activePipelines = [{ id: pins.intake, is_default: true }, { id: pins.pipeline, is_default: false }]
   const selectedMailboxes = [{ owner_email: pins.owner, account_email: account, connection_id: pins.connection }]
-  const raws = pins.messages.map(row => ({ ...rawMessage(row.id, { from: contacts[1].email,
-    to: `${pins.owner}, ${contacts[0].email}`, body: 'Synthetic exact-two Casey producer contents.' }), threadId: pins.thread }))
+  const raws = pins.messages.map((row, index) => ({ ...rawMessage(row.id, { from: contacts[1].email,
+    to: firstSeen ? `${index === 0 ? `${account}, ` : ''}${contacts[0].email}` : `${pins.owner}, ${contacts[0].email}`,
+    body: 'Synthetic exact-two Casey producer contents.' }), threadId: pins.thread }))
   const h = harness({ records: contacts, organizations, activePipelines, selectedMailboxes, polledMessages: raws,
     verifiedIdentity: identity, retainCaseyHistoricalMarker: true, fixtureOwnerEmail: pins.owner,
     fixtureMailboxEmail: account, fixtureConnectionId: pins.connection,
     fixturePrimaryPipeline: pins.intake, fixtureBusinessPipeline: pins.pipeline })
-  for (const [index, row] of pins.messages.entries()) {
+  if (!firstSeen) for (const [index, row] of pins.messages.entries()) {
     const evidence = emailIdentity.normalizeGmailMessageEvidence(h.ingestion.parseGmailMessage(raws[index]))
     h.messages.set(row.id, { id: row.cacheId, owner_email: pins.owner, pipeline_id: pins.intake,
       mailbox_id: null, canonical_source_id: null, external_message_id: row.id, external_thread_id: pins.thread,
@@ -1410,9 +1417,47 @@ function caseyProducerFixture() {
     primaryOrganizationReference: 'gagmco24va588e', contactReferences: contacts.map(contact => contact.referenceCode).sort() }))
   const selection = overrides => ({ ownerEmail: pins.owner, connectionId: pins.connection, pipelineId: pins.pipeline,
     messageIds: pins.messages.map(row => row.id), reviewedAssociations: associations, decisionKind: 'review',
-    admissionScope: 'casey-reviewed-two-v1', ...overrides })
+    admissionScope: firstSeen ? 'casey-reviewed-two-first-seen-v1' : 'casey-reviewed-two-v1', ...overrides })
   return { h, pins, identity, contacts, organizations, activePipelines, selectedMailboxes, raws, associations, selection }
 }
+
+await check('first-seen Casey discovery and preview use only the pinned verified mailbox and direct two-ID GETs', async () => {
+  const f = caseyProducerFixture({ firstSeen: true })
+  const candidates = await f.h.ingestion.readCaseyFirstSeenGmailCandidates({ ownerEmail: f.pins.owner, connectionId: f.pins.connection, pipelineId: f.pins.pipeline })
+  assert.equal(candidates.length, 2); assert.equal(f.h.reviewedBatches.length, 0)
+  assert.deepEqual(plain(candidates.map(candidate => candidate.messageId)), f.pins.messages.map(row => row.id))
+  assert.ok(candidates.every(candidate => candidate.participantContacts.length === 2 && !candidate.legacy && !Object.hasOwn(candidate, 'bodyText')))
+  assert.deepEqual(f.h.providerCalls.map(path => new URL(path, 'https://fixture.test').searchParams.get('format')), [null, 'metadata', 'metadata'])
+  const preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+  assert.equal(preview.applied, false); assert.equal(f.h.messages.size, 0)
+  assert.deepEqual(f.h.providerCalls.slice(3).map(path => new URL(path, 'https://fixture.test').searchParams.get('format')), [null, 'full', 'full'])
+  const rows = f.h.reviewedBatches[0].messages
+  assert.ok(rows.every(row => row.admissionScope === 'casey-reviewed-two-first-seen-v1' && !row.legacyAdoption
+    && row.primaryOrganization.referenceCode === 'gagmco24va588e' && row.contactTargets.length === 2))
+  assert.ok(!f.h.queries.some(({ sql }) => /crm_integration_cursors|FROM crm_inbound_messages|INSERT INTO crm_inbound_messages/.test(sql)))
+  const applied = await f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: preview.digest }))
+  assert.equal(applied.interactions, 2); assert.equal(f.h.staged.length, 0)
+})
+
+await check('first-seen Casey fails before staging on wrong subject, provider/header/placement drift or a stale digest', async () => {
+  const wrong = caseyProducerFixture({ firstSeen: true, subjectId: 'synthetic-wrong-account' })
+  await assert.rejects(wrong.h.ingestion.reconcileGmailMessages(wrong.selection()), /reviewed Casey mailbox/)
+  assert.ok(wrong.h.providerCalls.every(path => path.endsWith('/profile')))
+  for (const change of ['sender', 'recipient', 'thread', 'spam', 'body', 'empty-body', 'unresolved-text', 'wrong-placement']) {
+    const f = caseyProducerFixture({ firstSeen: true }), preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+    const raw = f.raws[1]
+    if (change === 'sender') raw.payload.headers.find(value => value.name === 'From').value = 'stranger@example.test'
+    if (change === 'recipient') raw.payload.headers.find(value => value.name === 'To').value += ', extra@example.test'
+    if (change === 'thread') raw.threadId = 'deadbeef'
+    if (change === 'spam') raw.labelIds = ['SPAM']
+    if (change === 'body') raw.payload.body.data = Buffer.from('Changed provider body').toString('base64url')
+    if (change === 'empty-body') delete raw.payload.body.data
+    if (change === 'unresolved-text') raw.payload.parts = [{ mimeType: 'text/plain', body: { attachmentId: 'unresolved-text-part', size: 100 } }]
+    if (change === 'wrong-placement') f.organizations[1].referenceCode = 'ga3456789'
+    await assert.rejects(f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: preview.digest })), /scope|eligible|participants|changed after preview|Complete Gmail message body/)
+    assert.equal(f.h.reviewedBatches.some(batch => batch.apply), false); assert.equal(f.h.messages.size, 0)
+  }
+})
 
 await check('Casey exact-two producer previews/applies one bounded batch and preserves unknown marker provenance on replay', async () => {
   const f = caseyProducerFixture(), original = plain([...f.h.messages.entries()])

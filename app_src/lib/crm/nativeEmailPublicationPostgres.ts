@@ -43,46 +43,59 @@ export class PostgresNativeEmailPublicationStore implements NativeEmailPublicati
       && typeof control.activation_receipt_hash === 'string' && /^[a-f0-9]{64}$/.test(control.activation_receipt_hash),
     'publication_not_enabled_for_generation')
   }
-  private async read(tx: NativeEmailSqlClient, id: string): Promise<NativeEmailAdmission> {
+  private async readIfPresent(tx: NativeEmailSqlClient, id: string): Promise<NativeEmailAdmission | null> {
     requireNativeEmail(/^[a-f0-9]{64}$/.test(id), 'invalid_operation_id')
     const result = await tx.query('SELECT * FROM crm_native_email_publication_admissions WHERE operation_id=$1 FOR UPDATE', [id])
-    requireNativeEmail(result.rows.length === 1, 'admission_missing')
-    return fromRow(result.rows[0])
+    requireNativeEmail(result.rows.length<=1,'stored_admission_identity_changed')
+    return result.rows.length ? fromRow(result.rows[0]) : null
+  }
+  private async read(tx: NativeEmailSqlClient, id: string): Promise<NativeEmailAdmission> {
+    const admission = await this.readIfPresent(tx, id)
+    requireNativeEmail(admission, 'admission_missing')
+    return admission
   }
   private active(control: Record<string, unknown>, admission: NativeEmailAdmission): void {
     this.enabled(control, admission.request)
     requireNativeEmail(control.active_operation_id === admission.request.command.operationId, 'admission_not_active')
   }
   async admit(input: NativeEmailPublicationInput, validate: NativeEmailAuthorityValidator<NativeEmailSqlClient>): Promise<NativeEmailAdmission> {
+    return this.transaction(tx => this.admitInTransaction(tx, input, validate))
+  }
+  /** The caller owns the open transaction. Only the private readiness-gated
+   * path uses this to bind admission and dispatch before the same COMMIT. */
+  async admitInTransaction(tx: NativeEmailSqlClient, input: NativeEmailPublicationInput,
+    validate: NativeEmailAuthorityValidator<NativeEmailSqlClient>): Promise<NativeEmailAdmission> {
     const request = prepareNativeEmailPublication(input), c = request.command
-    return this.transaction(async tx => {
-      const control = await this.control(tx)
-      this.enabled(control, request)
-      const prior = await tx.query('SELECT * FROM crm_native_email_publication_admissions WHERE operation_id=$1 FOR UPDATE', [c.operationId])
-      if (prior.rows.length) {
-        const existing = fromRow(prior.rows[0])
-        requireNativeEmail(existing.request.requestFingerprint === request.requestFingerprint, 'operation_identity_conflict')
-        if (!existing.receipt) this.active(control, existing)
-        return existing
-      }
-      requireNativeEmail(control.active_operation_id === null, 'another_publication_unresolved')
-      requireNativeEmail(typeof validate === 'function', 'authority_validator_required')
-      // Authority SELECTs must run under this control lock. Use plain reads for
-      // those four tables (statement guards serialize writes); do not acquire
-      // their row locks in reverse order. Validate outbox/identity too.
-      await validate(tx, request)
-      await tx.query(`INSERT INTO crm_native_email_publication_admissions
-        (operation_id,pipeline_id,local_id,native_id,global_id,generation,native_policy_fingerprint,
-         command_hash,audience_fingerprint,command,allowed_reader_ids,request_fingerprint)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`,
-      [c.operationId,c.pipelineId,c.localId,c.suiteCrmId,c.globalId,c.generation,request.nativePolicyFingerprint,
-        request.commandHash,c.audienceFingerprint,nativeEmailCanonicalJson(c),JSON.stringify(request.allowedReaderSuiteCrmUserIds),request.requestFingerprint])
-      await tx.query('UPDATE crm_native_email_publication_control SET active_operation_id=$1,updated_at=now() WHERE singleton', [c.operationId])
-      return { request, state: 'admitted', receipt: null }
-    })
+    const control = await this.control(tx)
+    this.enabled(control, request)
+    const existing = await this.readIfPresent(tx, c.operationId)
+    if (existing) {
+      requireNativeEmail(existing.request.requestFingerprint === request.requestFingerprint, 'operation_identity_conflict')
+      if (!existing.receipt) this.active(control, existing)
+      return existing
+    }
+    requireNativeEmail(control.active_operation_id === null, 'another_publication_unresolved')
+    requireNativeEmail(typeof validate === 'function', 'authority_validator_required')
+    // Authority SELECTs must run under this control lock. Use plain reads for
+    // those four tables (statement guards serialize writes); do not acquire
+    // their row locks in reverse order. Validate outbox/identity too.
+    await validate(tx, request)
+    await tx.query(`INSERT INTO crm_native_email_publication_admissions
+      (operation_id,pipeline_id,local_id,native_id,global_id,generation,native_policy_fingerprint,
+       command_hash,audience_fingerprint,command,allowed_reader_ids,request_fingerprint)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`,
+    [c.operationId,c.pipelineId,c.localId,c.suiteCrmId,c.globalId,c.generation,request.nativePolicyFingerprint,
+      request.commandHash,c.audienceFingerprint,nativeEmailCanonicalJson(c),JSON.stringify(request.allowedReaderSuiteCrmUserIds),request.requestFingerprint])
+    await tx.query('UPDATE crm_native_email_publication_control SET active_operation_id=$1,updated_at=now() WHERE singleton', [c.operationId])
+    return { request, state: 'admitted', receipt: null }
   }
   async get(id: string): Promise<NativeEmailAdmission> {
     return this.transaction(async tx => { await this.control(tx); return this.read(tx, id) })
+  }
+  /** Locks the same control row as admission, including when no row exists. */
+  async findInTransaction(tx: NativeEmailSqlClient, id: string): Promise<NativeEmailAdmission | null> {
+    await this.control(tx)
+    return this.readIfPresent(tx, id)
   }
   async markDispatched(id: string): Promise<boolean> {
     return this.transaction(async tx => {
@@ -103,6 +116,18 @@ export class PostgresNativeEmailPublicationStore implements NativeEmailPublicati
     })
   }
   async settle(id: string, value: unknown, finalize: NativeEmailFinalizer<NativeEmailSqlClient>): Promise<NativeEmailTerminalReceipt> {
+    return this.settleInTransaction(id,value,finalize)
+  }
+  /** The private held-job SQL finalizer requires the verified terminal receipt
+   * already stored, while the active pointer still fences every other writer.
+   * Both callbacks, the receipt and pointer update share one transaction. */
+  async settlePrivateRelease(id: string, value: unknown, preflight: NativeEmailFinalizer<NativeEmailSqlClient>,
+    finalize: NativeEmailFinalizer<NativeEmailSqlClient>): Promise<NativeEmailTerminalReceipt> {
+    requireNativeEmail(typeof finalize === 'function','projection_finalizer_required')
+    return this.settleInTransaction(id,value,preflight,finalize)
+  }
+  private async settleInTransaction(id: string, value: unknown, finalize: NativeEmailFinalizer<NativeEmailSqlClient>,
+    afterReceipt?: NativeEmailFinalizer<NativeEmailSqlClient>): Promise<NativeEmailTerminalReceipt> {
     return this.transaction(async tx => {
       const control = await this.control(tx), admission = await this.read(tx, id)
       const receipt = verifyNativeEmailTerminalReceipt(admission.request, value)
@@ -123,6 +148,7 @@ export class PostgresNativeEmailPublicationStore implements NativeEmailPublicati
       await finalize(tx, admission.request, receipt)
       await tx.query('UPDATE crm_native_email_publication_admissions SET state=$2,native_receipt=$3::jsonb,updated_at=now() WHERE operation_id=$1',
         [id,receipt.state,nativeEmailCanonicalJson(receipt)])
+      if (afterReceipt) await afterReceipt(tx, admission.request, receipt)
       await tx.query('UPDATE crm_native_email_publication_control SET active_operation_id=NULL,updated_at=now() WHERE singleton')
       return receipt
     })

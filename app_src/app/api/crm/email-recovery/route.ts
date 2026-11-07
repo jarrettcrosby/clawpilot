@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import { reconcileGmailMessages, reconcileLateContactGmailMessages, SafeEmailIngestionError } from '@/lib/crm/emailIngestion'
+import { CASEY_PAIR, isCaseyGmailScope, matchesCaseyPair, type CaseyGmailScope } from '@/lib/crm/caseyGmailReview'
 import { globalIdPattern } from '@/lib/globalIds.mjs'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { appPublicUrl } from '@/lib/publicUrl'
@@ -156,13 +157,12 @@ export async function POST(req: NextRequest) {
       throw new RecoveryCommandError('Gmail message IDs must be unique')
     }
     const reviewedAssociations = parseReviewedAssociations(body.reviewedAssociations, messageIds)
-    if (body.admissionScope !== undefined && (body.admissionScope !== 'casey-reviewed-two-v1'
-      || actor.email !== 'jarrett@suburbiasandwichco.com' || body.connectionId !== 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027'
-      || body.pipelineId !== '587c8746-ecf6-40ae-8c50-e456f99ad555' || body.decisionKind !== 'review'
+    if (body.admissionScope !== undefined && (!isCaseyGmailScope(body.admissionScope)
+      || !matchesCaseyPair({ ownerEmail: actor.email, connectionId: body.connectionId, pipelineId: body.pipelineId, messageIds })
+      || body.decisionKind !== 'review'
       || body.correctionReason !== undefined || body.participantEmail !== undefined || !reviewedAssociations
-      || [...messageIds].sort().join(',') !== '1a18e03ea586cd7e,1a18f01749eb87a6'
-      || reviewedAssociations.some(association => association.threadId !== '1a179e9e2743f926'
-        || association.primaryOrganizationReference !== 'gagmco24va588e'))) {
+      || reviewedAssociations.some(association => association.threadId !== CASEY_PAIR.threadId
+        || association.primaryOrganizationReference !== CASEY_PAIR.primary))) {
       throw new RecoveryCommandError('Casey Gmail admission requires the exact separately reviewed two-message scope')
     }
     if (body.decisionKind === 'late-contact' && !reviewedAssociations) {
@@ -185,7 +185,7 @@ export async function POST(req: NextRequest) {
       decisionKind: body.decisionKind as 'review' | 'correction' | 'late-contact' | undefined,
       correctionReason: body.correctionReason as string | undefined,
       ...(reviewedAssociations ? { reviewedAssociations } : {}),
-      ...(body.admissionScope ? { admissionScope: body.admissionScope as 'casey-reviewed-two-v1' } : {}),
+      ...(body.admissionScope ? { admissionScope: body.admissionScope as CaseyGmailScope } : {}),
       ...(apply ? { expectedDigest: (body.expectedDigest as string).toLowerCase() } : {}),
     }
     const recovery = body.decisionKind === 'late-contact'

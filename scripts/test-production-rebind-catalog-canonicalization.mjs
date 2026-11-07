@@ -53,4 +53,50 @@ assert.equal(digest({...catalog,triggers:[trigger,external]}),digest({...catalog
 assert.notEqual(digest(catalog),digest({...catalog,triggers:[trigger,trigger]}),'Duplicate guards are not discarded')
 assert.notEqual(digest(catalog),digest({...catalog,functions:[{source:catalog.functions[0].source.replace('  x',' x')}]}),
   'Function text remains byte-for-byte, including literals and repeated generated-looking names')
+// Private recovery enrolls four exact FK identities. Portability replaces
+// only the verified internal generated name token, not a descriptor field.
+for(const [name,source,target] of [
+  ['review_batch_fkey','review','verified_batch'],
+  ['retained_batch_outbox_id_fkey','retained','review'],
+  ['consumed_batch_fkey','consumed','verified_batch'],
+  ['account_repairs_operation_id_fkey','account_repairs','account_repair_approvals'],
+]){
+  const schema='crm_legacy_email_retirement'
+  const privateFk={...fk,schema,name,source:`${schema}.${source}`,target:`${schema}.${target}`,
+    index:`${schema}.${target}_pkey`,
+    definition:`FOREIGN KEY (batch) REFERENCES ${schema}.${target}(batch) ON DELETE RESTRICT`,
+    columns:fk.columns.map(c=>({...c,name:'batch',type:'uuid'})),
+    operators:fk.operators.map(o=>({...o,operator:'=(uuid,uuid)'}))}
+  const privateTrigger={...trigger,relation:`${schema}.${target}`,physicalRelation:privateFk.target,
+    constraint:name,constraintRelation:privateFk.source,constraintIndex:privateFk.index,foreignKey:privateFk,
+    definition:`CREATE CONSTRAINT TRIGGER "${trigger.name}" AFTER DELETE ON ${privateFk.target} FROM ${privateFk.source} NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION "RI_FKey_restrict_del"()`}
+  assert.equal(digest(changed(privateTrigger)),digest(changed(rename(privateTrigger,'RI_ConstraintTrigger_a_999991'))),
+    `Exact private ${name} action trigger is portable across cluster OIDs`)
+  const sourceTrigger={...privateTrigger,relation:privateFk.source,physicalRelation:privateFk.source,
+    constraintRelation:privateFk.target,name:'RI_ConstraintTrigger_c_1234',typeMask:5,
+    function:'pg_catalog."RI_FKey_check_ins"()',
+    definition:`CREATE CONSTRAINT TRIGGER "RI_ConstraintTrigger_c_1234" AFTER INSERT ON ${privateFk.source} FROM ${privateFk.target} NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION "RI_FKey_check_ins"()`}
+  assert.equal(digest(changed(sourceTrigger)),digest(changed(rename(sourceTrigger,'RI_ConstraintTrigger_c_999991'))),
+    `Exact private ${name} source trigger is portable across cluster OIDs`)
+  for(const patch of [
+    {foreignKey:{...privateFk,schema:'foreign_private'}},
+    {foreignKey:{...privateFk,name:'unreviewed_private_fkey'},constraint:'unreviewed_private_fkey'},
+    {foreignKey:{...privateFk,source:`${schema}.other`}},
+    {foreignKey:{...privateFk,target:`${schema}.other`}},
+    {physicalRelation:'wrong'},
+    {function:'public.fake()'},
+    {internal:false},
+    {constraintIndex:'wrong'},
+  ]){
+    const unsupported={...privateTrigger,...patch}
+    assert.notEqual(digest(changed(unsupported)),digest(changed(rename(unsupported,'RI_ConstraintTrigger_a_999991'))),
+      `Malformed or foreign private ${name} must retain exact names`)
+  }
+  for(const [field,value] of Object.entries({validated:false,deleteAction:'c',deferrable:true,
+    definition:privateFk.definition+' /* changed */',columns:[...privateFk.columns,{unexpected:true}]})){
+    assert.notEqual(digest(changed(privateTrigger)),
+      digest(changed({...privateTrigger,foreignKey:{...privateFk,[field]:value}})),
+      `Private ${name} complete FK descriptor ${field} remains fingerprinted`)
+  }
+}
 console.log('Production rebind catalog canonicalization: generated-name portability and semantic tamper checks passed')

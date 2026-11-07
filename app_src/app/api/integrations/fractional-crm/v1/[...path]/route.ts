@@ -1,4 +1,4 @@
-import { handleFractionalCrmGateway } from '@/lib/fractionalCrmGatewayHttp'
+import { handleFractionalCrmGateway, type FractionalCrmGatewayServices } from '@/lib/fractionalCrmGatewayHttp'
 import {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
@@ -13,13 +13,8 @@ const services = {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
   readFractionalCrmCustomerFolder,
-  updateFractionalCrmCustomerFolder: async (...args: Parameters<typeof updateFractionalCrmCustomerFolder>) => {
-    const result = await updateFractionalCrmCustomerFolder(...args)
-    // Reconciliation is post-commit. A failed response can replay the same
-    // durable command and retry this step without another CRM publication.
-    await reconcileCrmBoardProjectionsForPipeline({ pipelineId: args[0].pipelineId })
-    return result
-  },
+  updateFractionalCrmCustomerFolder: (...args: Parameters<FractionalCrmGatewayServices['updateFractionalCrmCustomerFolder']>) =>
+    updateFractionalCrmCustomerFolder(...args, reconcileCrmBoardProjectionsForPipeline),
 }
 const handle = (request: Request) => handleFractionalCrmGateway(request, services)
 export const GET = handle

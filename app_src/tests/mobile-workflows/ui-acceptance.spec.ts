@@ -41,7 +41,7 @@ async function gotoApp(page: Page, path: string) {
 
 async function openWorkspaceSettings(page: Page) {
   const settingsButton = page.getByRole('button', { name: 'Settings' })
-  const workspaceSettings = page.getByRole('menuitem', { name: /Workspace settings/ })
+  const workspaceSettings = page.getByRole('menuitem', { name: /workspace settings/i })
 
   await expect(async () => {
     if (!await workspaceSettings.isVisible()) await settingsButton.click()
@@ -160,6 +160,7 @@ function note(testInfo: TestInfo, description: string) {
 }
 
 type MockCrmOptions = {
+  pipelineId?: string
   failFirstCalendarAction?: boolean
   failFirstMeetingCreate?: boolean
   failFirstMeetingUpdate?: boolean
@@ -174,6 +175,7 @@ type CapturedCrmWrite = {
 }
 
 async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
+  const pipelineId = options.pipelineId ?? '00000000-0000-4000-8000-000000000100'
   const crmWrites: Array<Record<string, unknown>> = []
   const crmWriteRequests: CapturedCrmWrite[] = []
   let failedCalendarAction = false
@@ -185,13 +187,13 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
         ok: true,
         boards: [],
         pipelines: [{
-          id: '00000000-0000-4000-8000-000000000100',
+          id: pipelineId,
           name: 'Mobile Acceptance Pipeline',
           ownerEmail: 'operator@example.test',
           accessRole: 'owner',
         }],
         selectedBoardId: null,
-        selectedPipelineId: '00000000-0000-4000-8000-000000000100',
+        selectedPipelineId: pipelineId,
       },
     })
   })
@@ -458,7 +460,7 @@ async function mockCrmRecords(page: Page, options: MockCrmOptions = {}) {
           failedSync: 0,
         },
         pipeline: {
-          id: '00000000-0000-4000-8000-000000000100',
+          id: pipelineId,
           name: 'Mobile Acceptance Pipeline',
           ownerEmail: 'operator@example.test',
           workspaceOrganizationId: null,
@@ -1189,7 +1191,7 @@ for (const viewport of MOBILE_VIEWPORTS) {
       await expect(meetingRow.getByText('Delivered', { exact: true })).toBeVisible()
       await expect(meetingRow.getByText('Synced', { exact: true })).toBeVisible()
       const legacyMeetingRow = page.getByRole('row').filter({ hasText: 'Legacy Meeting Without Delivery Evidence' })
-      await expect(legacyMeetingRow.getByText('Unknown', { exact: true })).toBeVisible()
+      await expect(legacyMeetingRow.getByText('Not verified', { exact: true })).toBeVisible()
       await expect(legacyMeetingRow.getByText('Delivered', { exact: true })).toHaveCount(0)
       await expect(legacyMeetingRow.getByText('Synced', { exact: true })).toBeVisible()
       await page.getByRole('cell', { name: 'Acceptance Meeting', exact: true }).click()
@@ -1674,6 +1676,111 @@ for (const viewport of MOBILE_VIEWPORTS) {
     })
   })
 }
+
+test('Casey first-seen email review requires the exact pair and its preview digest', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const pipelineId = '587c8746-ecf6-40ae-8c50-e456f99ad555'
+  const connectionId = 'eb13a0fd-c0b2-4ad1-99b7-3bbda178a027'
+  const admissionScope = 'casey-reviewed-two-first-seen-v1'
+  const threadId = '1a179e9e2743f926'
+  const messageIds = ['1a18e03ea586cd7e', '1a18f01749eb87a6']
+  const globusReference = 'gagmco24va588e', airspaceReference = 'gajl1dq5i03jga'
+  const contacts = [{
+    id: '00000000-0000-4000-8000-000000000102', reference: 'gc7654321', name: 'Globus Browser Fixture',
+    email: 'globus-contact@example.test', organizationId: '00000000-0000-4000-8000-000000000101',
+    organizationReference: globusReference, company: 'Globus Medical',
+  }, {
+    id: '00000000-0000-4000-8000-000000000202', reference: 'gc9753102', name: 'Casey Browser Fixture',
+    email: 'airspace-contact@example.test', organizationId: '00000000-0000-4000-8000-000000000201',
+    organizationReference: airspaceReference, company: 'Airspace',
+  }]
+  const candidates = messageIds.map((messageId, index) => ({
+    messageId, threadId, admissionScope, legacy: false, subject: `Synthetic Casey message ${index + 1}`,
+    receivedAt: '2026-10-30T13:00:00.000Z', participantEmails: contacts.map(contact => contact.email),
+    participantContactIds: contacts.map(contact => contact.id), participantContacts: contacts,
+  }))
+  const contactReferences = contacts.map(contact => contact.reference).sort()
+  const reviewed = candidates.map(({ messageId, subject }) => ({
+    messageId, subject, organizationReferences: [globusReference, airspaceReference], contactReferences,
+  }))
+  const expectedCommand = {
+    pipelineId, connectionId, messageIds, admissionScope, decisionKind: 'review',
+    reviewedAssociations: messageIds.map(messageId => ({
+      messageId, threadId, primaryOrganizationReference: globusReference, contactReferences,
+    })),
+  }
+  const digest = 'd'.repeat(64)
+  const candidateScopes: Array<string | null> = [], writes: Array<Record<string, unknown>> = [], providerRequests: string[] = []
+  await mockCrmRecords(page, { pipelineId })
+  await page.route(url => ['accounts.google.com', 'gmail.googleapis.com', 'googleapis.com', 'api.maton.ai', 'gateway.maton.ai'].includes(url.hostname),
+    async route => {
+      providerRequests.push(new URL(route.request().url()).hostname)
+      await route.abort()
+    })
+  await page.route(url => url.pathname === '/api/crm/mailbox-identity', async route => {
+    expect(new URL(route.request().url()).searchParams.get('pipelineId')).toBe(pipelineId)
+    await route.fulfill({ json: { ok: true, mailboxes: [{ connectionId, accountEmail: 'browser-mailbox@example.test', verified: true }] } })
+  })
+  await page.route(url => url.pathname === '/api/crm/email-review-candidates', async route => {
+    const params = new URL(route.request().url()).searchParams
+    expect(params.get('pipelineId')).toBe(pipelineId)
+    expect(params.get('connectionId')).toBe(connectionId)
+    expect(params.has('participantEmail')).toBe(false)
+    const scope = params.get('admissionScope')
+    candidateScopes.push(scope)
+    await route.fulfill({ json: { ok: true, pipelineId, connectionId,
+      ...(scope === admissionScope ? { admissionScope, messages: candidates } : { messages: [] }) } })
+  })
+  await page.route(url => url.pathname === '/api/crm/email-recovery', async route => {
+    expect(route.request().method()).toBe('POST')
+    const body = route.request().postDataJSON() as Record<string, unknown>
+    writes.push(body)
+    await route.fulfill({ json: { ok: true, recovery: { applied: body.apply === true, digest, messages: reviewed } } })
+  })
+
+  await gotoApp(page, '/#crm')
+  await page.getByRole('tab', { name: 'Interactions', exact: true }).click()
+  await page.getByRole('button', { name: 'Review email', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Review selected Gmail messages' })
+  const action = dialog.getByRole('combobox', { name: 'Review action' })
+  await expect(action).toBeEnabled()
+  await action.click()
+  await page.getByRole('option', { name: 'Recover the two reviewed Casey emails from Gmail' }).click()
+  await expect(dialog.getByRole('checkbox')).toHaveCount(2)
+  expect(candidateScopes).toContain(admissionScope)
+  const preview = dialog.getByRole('button', { name: 'Preview selected messages' })
+  const apply = dialog.getByRole('button', { name: 'Apply reviewed selection' })
+  const selectMessage = async (subject: string) => {
+    const checkbox = dialog.getByRole('checkbox', { name: subject, exact: true })
+    await checkbox.check()
+    const card = checkbox.locator('xpath=ancestor::label[1]/parent::*')
+    const participant = card.getByRole('combobox', { name: 'Actual participant contacts' })
+    await participant.click()
+    await page.getByRole('option', { name: /Casey Browser Fixture/ }).click()
+    await page.getByRole('option', { name: /Globus Browser Fixture/ }).click()
+    if (await page.getByRole('listbox').isVisible()) await participant.press('Escape')
+    await card.getByRole('combobox', { name: 'Primary company' }).click()
+    await page.getByRole('option', { name: `Globus Medical · ${globusReference}`, exact: true }).click()
+  }
+  await selectMessage(candidates[0].subject)
+  await expect(preview).toBeDisabled()
+  await expect(apply).toBeDisabled()
+  expect(writes).toEqual([])
+  await selectMessage(candidates[1].subject)
+  await expect(preview).toBeEnabled()
+  await expect(apply).toBeDisabled()
+  await preview.click()
+  await expect(dialog.getByText('Reviewed preview — 2 selected messages')).toBeVisible()
+  expect(writes).toEqual([{ ...expectedCommand, apply: false }])
+  await expect(apply).toBeEnabled()
+  await apply.click()
+  await expect(dialog.getByText(/Selected messages were reconciled/)).toBeVisible()
+  expect(writes).toEqual([
+    { ...expectedCommand, apply: false },
+    { ...expectedCommand, apply: true, expectedDigest: digest },
+  ])
+  expect(providerRequests).toEqual([])
+})
 
 test.describe('agent discussion regression', () => {
   test.beforeEach(async ({ page }) => {

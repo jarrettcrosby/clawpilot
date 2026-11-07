@@ -1368,6 +1368,8 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
   }
 
   const transactionResult = await withTransaction(async (client) => {
+    const { lockCalendarOccurrencePipeline } = await import('@/lib/crm/calendarOccurrenceClaims')
+    await lockCalendarOccurrencePipeline(client, pipelineId)
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
       [`crm-meeting-save:${actorEmail}:${idempotencyKey}`],
@@ -1441,7 +1443,11 @@ export async function stageCrmMeetingAndEnqueueCalendarAction(input: {
         )
       }
     }
-    const staged = await stageCrmRecordWithClient(client, stageInput)
+    // A queued move must keep the source's exact edit tuple until delivery
+    // settles; an old event ID paired with the destination is not evidence.
+    const staged = await stageCrmRecordWithClient(client, previousCalendar ? {
+      ...stageInput, sourcePayload: { ...stageInput.sourcePayload, ...calendarIdentityFields(previousCalendar) },
+    } : stageInput)
     const inserted = await insertPreparedAction(client, {
       pipelineId,
       actorEmail,
@@ -1892,7 +1898,6 @@ async function importedMeetingCalendarCommunication(
        ON connection.owner_email = source.credential_owner_email
        AND connection.connection_id = source.connection_id
        AND connection.app = 'google-calendar' AND connection.status = 'ACTIVE' AND connection.source = 'maton'
-       AND lower(connection.account_email) = source.account_email
      WHERE mapping.pipeline_id = $1::uuid AND mapping.meeting_id = $2::uuid
        AND meeting.reference_code = $3 AND mapping.external_event_id = $4
        AND source.credential_owner_email = $5 AND source.connection_id = $6
@@ -1945,6 +1950,9 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
   const actionId = source.actionId === undefined || source.actionId === null
     ? null
     : normalizeUuid(source.actionId, 'Recorded Calendar action ID')
+  // The `primary` branch recognizes the exact retained provider receipt, not
+  // a default-calendar lookup. Preserve the original reviewed communication
+  // snapshot for authorization; previousCalendar already pins the edit tuple.
   const result = await query<ActionRow>(
     `SELECT * FROM crm_integration_actions
      WHERE pipeline_id = $1::uuid
@@ -1952,7 +1960,30 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
        AND status = 'succeeded' AND external_id = $2
        AND communication_credential_owner_email = $3
        AND communication_connection_id = $4
-       AND communication_calendar_id = $5
+       AND (
+         communication_calendar_id = $5
+         OR (
+           communication_calendar_id = 'primary' AND $5 <> 'primary' AND lower($5::text) = $6
+           AND communication_account_email = $6 AND id = $7::uuid
+           AND response_summary->>'eventId' = $2
+           AND response_summary->>'calendarId' = $5
+           AND response_summary->>'organizerEmail' = $6
+           AND response_summary->>'accountEmail' = communication_account_email
+           AND response_summary->>'meetingReferenceCode' = $9
+           AND response_summary->'calendarMove' IS NULL
+           AND EXISTS (
+             SELECT 1 FROM crm_meetings current_meeting
+             WHERE current_meeting.pipeline_id = $1::uuid AND current_meeting.id = $8::text::uuid
+               AND current_meeting.reference_code = $9 AND current_meeting.external_event_id = $2
+               AND current_meeting.source_payload->>'actionId' = crm_integration_actions.id::text
+               AND current_meeting.source_payload->>'calendarOwnerEmail' = $3
+               AND current_meeting.source_payload->>'calendarConnectionId' = $4
+               AND current_meeting.source_payload->>'calendarId' = $5
+               AND current_meeting.source_payload->>'calendarOrganizerEmail' = $6
+               AND COALESCE(lower(current_meeting.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')
+           )
+         )
+       )
        AND communication_identity_email = $6
        AND ($7::uuid IS NULL OR id = $7::uuid)
        AND (
@@ -1989,10 +2020,10 @@ export async function resolveRecordedCrmMeetingCalendarCommunication(input: {
     app: 'google-calendar',
     boundConnectionId: communication.connectionId,
   })
-  if (
-    credential.connectionId !== communication.connectionId
-    || (credential.accountEmail && normalizeEmail(credential.accountEmail, 'Selected provider account') !== communication.accountEmail)
-  ) {
+  // Admission checks the pinned active connection without provider I/O. Its
+  // cached account label is not identity proof; the worker re-verifies the
+  // recorded account and calendar against Google before writing.
+  if (credential.connectionId !== communication.connectionId) {
     throw new CrmIntegrationActionError('The recorded Calendar connection no longer matches its reviewed identity', 409)
   }
   return { actorEmail, communication, previousCalendar }
@@ -2032,7 +2063,7 @@ async function selectedMatonConnection(
   }
   await assertQueuedCommunicationAuthorization(action, app)
   const credentialOwnerEmail = action.communicationCredentialOwnerEmail
-  const { connectionId, accountEmail } = await resolveUserMatonGatewayCredential({
+  const { connectionId } = await resolveUserMatonGatewayCredential({
     ownerEmail: credentialOwnerEmail,
     app,
     boundConnectionId: action.communicationConnectionId,
@@ -2040,24 +2071,16 @@ async function selectedMatonConnection(
   if (connectionId !== action.communicationConnectionId) {
     throw new PermanentCrmIntegrationActionError('The queued communication connection no longer matches its reviewed identity')
   }
-  if (
-    // Gmail verifies the reviewed account against the live provider profile
-    // immediately below; cached connection email can lag a Workspace rename.
-    app !== 'google-mail'
-    && action.communication?.accountEmail
-    && accountEmail
-    && normalizeEmail(accountEmail, 'Selected provider account') !== action.communication.accountEmail
-  ) {
-    throw new PermanentCrmIntegrationActionError('The queued communication account no longer matches its reviewed identity')
-  }
+  // Maton's cached account label can lag a Workspace rename. Both provider
+  // paths verify the reviewed account against live identity on this connection.
   await bindAttemptConnection(action, connectionId)
   return {
     credentialOwnerEmail,
     connectionId,
-    accountEmail: action.communication?.accountEmail || accountEmail,
-    identityEmail: action.communication?.identityEmail || accountEmail,
-    calendarId: action.communication?.calendarId || null,
-    bindingSource: action.communication?.source || null,
+    accountEmail: action.communication.accountEmail,
+    identityEmail: action.communication.identityEmail,
+    calendarId: action.communication.calendarId || null,
+    bindingSource: action.communication.source,
   }
 }
 
@@ -2106,15 +2129,23 @@ async function verifiedCalendarConnection(
 }> {
   const requestedCalendarId = calendarIdentifier(selectedConnection.calendarId, 'Queued Calendar ID')
   const calendars = await writableCalendarsForAction(action, selectedConnection.connectionId)
+  const primaryCalendar = calendars.find((calendar) => calendar.primary)
+  if (!primaryCalendar) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar connection has no writable primary calendar to verify its account')
+  }
+  const primaryAccountEmail = verifiedCalendarEmail(primaryCalendar.id, 'Live primary Calendar account')
+  if (!selectedConnection.accountEmail || primaryAccountEmail !== normalizeEmail(selectedConnection.accountEmail, 'Queued Calendar account')) {
+    throw new PermanentCrmIntegrationActionError('The queued Calendar account no longer matches its reviewed identity')
+  }
   const selectedCalendar = requestedCalendarId === 'primary'
-    ? calendars.find((calendar) => calendar.primary)
+    ? primaryCalendar
     : calendars.find((calendar) => calendar.id === requestedCalendarId)
   if (!selectedCalendar) {
     throw new PermanentCrmIntegrationActionError(
       'The queued Calendar is no longer accessible with write permission on its reviewed connection',
     )
   }
-  const organizerEmail = normalizeEmail(selectedCalendar.id, 'Selected Calendar organizer')
+  const organizerEmail = verifiedCalendarEmail(selectedCalendar.id, 'Selected Calendar organizer')
   if (
     selectedConnection.identityEmail
     && organizerEmail !== normalizeEmail(selectedConnection.identityEmail, 'Queued Calendar organizer')
@@ -2126,6 +2157,14 @@ async function verifiedCalendarConnection(
     calendarId: selectedCalendar.id,
     calendarSummary: selectedCalendar.summary,
     accessRole: selectedCalendar.accessRole,
+  }
+}
+
+function verifiedCalendarEmail(value: string, field: string): string {
+  try {
+    return normalizeEmail(value, field)
+  } catch {
+    throw new PermanentCrmIntegrationActionError(`${field} is invalid`)
   }
 }
 
@@ -2204,8 +2243,13 @@ async function completeAction(
   action: LeasedCrmIntegrationAction,
   externalId: string | null,
   responseSummary: JsonObject,
+  settleCalendar?: (client: PoolClient) => Promise<void>,
 ) {
   await withTransaction(async (client) => {
+    if (settleCalendar) {
+      await lockCalendarActionLease(client, action)
+      await settleCalendar(client)
+    }
     await client.query(
       `UPDATE crm_integration_action_attempts
        SET status = 'succeeded', external_id = COALESCE($3, external_id),
@@ -2502,8 +2546,9 @@ async function listWritableCalendars(
 ): Promise<WritableCalendarOption[]> {
   const calendars: WritableCalendarOption[] = []
   const seen = new Set<string>()
+  let hasPrimary = false
   let pageToken = ''
-  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES && calendars.length < MAX_CALENDAR_OPTIONS; page += 1) {
+  for (let page = 0; page < MAX_CALENDAR_LIST_PAGES; page += 1) {
     const parameters = new URLSearchParams({
       maxResults: '250',
       minAccessRole: 'writer',
@@ -2519,6 +2564,12 @@ async function listWritableCalendars(
       const item = value as JsonObject
       const accessRole = String(item.accessRole || '').trim().toLowerCase()
       if (accessRole !== 'owner' && accessRole !== 'writer') continue
+      const primary = item.primary === true
+      if (primary) {
+        // Check before ID deduplication: a repeated primary row is ambiguous.
+        if (hasPrimary) throw new PermanentCrmIntegrationActionError('Google Calendar list returned multiple writable primary calendars')
+        hasPrimary = true
+      }
       let id: string
       try {
         id = calendarIdentifier(item.id, 'Provider Calendar ID')
@@ -2526,20 +2577,22 @@ async function listWritableCalendars(
         continue
       }
       if (seen.has(id)) continue
+      if (calendars.length >= MAX_CALENDAR_OPTIONS) {
+        throw new PermanentCrmIntegrationActionError('Google Calendar list exceeded the bounded identity verification limit')
+      }
       seen.add(id)
       const rawSummary = String(item.summaryOverride || item.summary || id)
       const summary = rawSummary.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 300) || id
-      calendars.push({ id, summary, primary: item.primary === true, accessRole })
-      if (calendars.length >= MAX_CALENDAR_OPTIONS) break
+      calendars.push({ id, summary, primary, accessRole })
     }
     const nextPageToken = typeof response.nextPageToken === 'string' ? response.nextPageToken.trim() : ''
-    if (!nextPageToken) break
+    if (!nextPageToken) return calendars
     if (nextPageToken.length > 2048 || /[\u0000-\u001f\u007f]/.test(nextPageToken)) {
       throw new PermanentCrmIntegrationActionError('Google Calendar list returned an invalid page token')
     }
     pageToken = nextPageToken
   }
-  return calendars
+  throw new PermanentCrmIntegrationActionError('Google Calendar list exceeded the bounded identity verification limit')
 }
 
 async function writableCalendarsForAction(
@@ -2895,11 +2948,13 @@ async function stageCalendarMeeting(
   target: CrmReferenceRecord,
   result: { eventId: string | null; eventUrl: string | null; joinUrl: string | null },
   status: CrmMeeting['status'],
-  options: { preserveMissingJoinUrl?: boolean } = {},
+  options: { preserveMissingJoinUrl?: boolean; pendingDelivery?: boolean; client: PoolClient; calendarIdentity?: PreviousCalendarEventSnapshot | null },
 ) {
+  const runQuery = <T extends Record<string, unknown>>(sql: string, values: unknown[]) =>
+    options.client.query<T>(sql, values)
   const meetingMode = storedMeetingMode(action.payload.meetingMode)
   const customJoinUrl = storedCustomJoinUrl(action.payload.customJoinUrl, meetingMode)
-  const calendarDeliveryStatus = status === 'queued' || status === 'planned'
+  const calendarDeliveryStatus = options.pendingDelivery || status === 'queued' || status === 'planned'
     ? 'queued'
     : status === 'failed'
       ? 'failed'
@@ -2915,7 +2970,7 @@ async function stageCalendarMeeting(
   let existingSourcePayload: JsonObject = {}
 
   if (target.entity === 'meetings') {
-    const current = await query<{
+    const current = await runQuery<{
       organization_id: string | null
       contact_id: string | null
       lead_id: string | null
@@ -2944,7 +2999,7 @@ async function stageCalendarMeeting(
 
   let organizationSuiteCrmId: string | null = null
   if (organizationId) {
-    const organization = await query<{ suitecrm_id: string | null }>(
+    const organization = await runQuery<{ suitecrm_id: string | null }>(
       `SELECT suitecrm_id FROM crm_organizations
        WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [action.pipelineId, organizationId],
@@ -2954,7 +3009,7 @@ async function stageCalendarMeeting(
   let parentSuiteCrmId: string | null = null
   let parentSuiteCrmType: 'Accounts' | 'Contacts' | 'Leads' | 'Opportunities' | null = null
   if (opportunityId) {
-    const opportunity = await query<{ suitecrm_id: string | null }>(
+    const opportunity = await runQuery<{ suitecrm_id: string | null }>(
       `SELECT suitecrm_id FROM crm_opportunities
        WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [action.pipelineId, opportunityId],
@@ -2962,7 +3017,7 @@ async function stageCalendarMeeting(
     parentSuiteCrmId = opportunity.rows[0]?.suitecrm_id || null
     parentSuiteCrmType = parentSuiteCrmId ? 'Opportunities' : null
   } else if (contactId) {
-    const contact = await query<{ suitecrm_id: string | null }>(
+    const contact = await runQuery<{ suitecrm_id: string | null }>(
       `SELECT suitecrm_id FROM crm_contacts
        WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [action.pipelineId, contactId],
@@ -2970,7 +3025,7 @@ async function stageCalendarMeeting(
     parentSuiteCrmId = contact.rows[0]?.suitecrm_id || null
     parentSuiteCrmType = parentSuiteCrmId ? 'Contacts' : null
   } else if (leadId) {
-    const lead = await query<{ suitecrm_id: string | null }>(
+    const lead = await runQuery<{ suitecrm_id: string | null }>(
       `SELECT suitecrm_id FROM crm_leads
        WHERE pipeline_id = $1::uuid AND id = $2::uuid LIMIT 1`,
       [action.pipelineId, leadId],
@@ -2982,7 +3037,7 @@ async function stageCalendarMeeting(
     parentSuiteCrmType = 'Accounts'
   }
 
-  const staged = await stageCrmRecordInPostgres({
+  const stageInput: StageMeetingInput = {
     entity: 'meetings',
     pipelineId: action.pipelineId,
     localId,
@@ -2996,6 +3051,7 @@ async function stageCalendarMeeting(
       calendarConnectionId: action.communicationConnectionId,
       calendarOrganizerEmail: action.communication?.identityEmail || null,
       calendarId: action.communication?.calendarId || null,
+      ...(options.calendarIdentity ? calendarIdentityFields(options.calendarIdentity) : {}),
       calendarDeliveryStatus,
       calendarDeliveryError: null,
       calendarDeliveryFailure: null,
@@ -3025,9 +3081,10 @@ async function stageCalendarMeeting(
       externalEventUrl: result.eventUrl,
       joinUrl: result.joinUrl,
     },
-  })
+  }
+  const staged = await stageCrmRecordWithClient(options.client, stageInput)
   if (!result.joinUrl && !options.preserveMissingJoinUrl) {
-    await query(
+    await runQuery(
       `UPDATE crm_meetings
        SET join_url = NULL, updated_at = now()
        WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
@@ -3107,6 +3164,72 @@ type PendingCalendarMove = {
   sourceCalendarId: string
   destinationEventId: string
   destinationCalendarId: string
+}
+
+type CalendarOccurrenceProof = { calendarId: string; externalEventId: string; occurrenceKey: string }
+
+async function lockCalendarActionLease(client: PoolClient, action: LeasedCrmIntegrationAction) {
+  const { lockCalendarOccurrencePipeline } = await import('@/lib/crm/calendarOccurrenceClaims')
+  await lockCalendarOccurrencePipeline(client, action.pipelineId)
+  const lease = await client.query(`SELECT id FROM crm_integration_actions
+    WHERE id=$1::uuid AND status='processing' AND lock_token=$2 FOR UPDATE`, [action.id, action.lockToken])
+  if (lease.rowCount !== 1) throw new Error('CRM action lease was lost')
+}
+
+function calendarIdentityFields(selection: PreviousCalendarEventSnapshot): JsonObject {
+  return {
+    calendarOwnerEmail: selection.credentialOwnerEmail,
+    calendarConnectionId: selection.connectionId,
+    calendarId: selection.calendarId,
+    calendarOrganizerEmail: selection.organizerEmail,
+  }
+}
+
+function queuedCalendarOccurrence(value: unknown): CalendarOccurrenceProof | null {
+  if (value === undefined || value === null) return null
+  try {
+    const proof = objectValue(value, 'Calendar occurrence proof')
+    assertOnlyFields(proof, ['calendarId', 'externalEventId', 'occurrenceKey'])
+    if (typeof proof.occurrenceKey !== 'string' || !/^[a-f0-9]{64}$/u.test(proof.occurrenceKey)) throw new Error()
+    return {
+      calendarId: calendarIdentifier(proof.calendarId, 'Calendar occurrence Calendar ID'),
+      externalEventId: requiredString(proof.externalEventId, 1000, 'Calendar occurrence event ID'),
+      occurrenceKey: proof.occurrenceKey,
+    }
+  } catch {
+    throw new PermanentCrmIntegrationActionError('Recorded Calendar occurrence evidence is invalid')
+  }
+}
+
+async function verifiedProviderOccurrence(event: JsonObject, calendarId: string, eventId: string): Promise<CalendarOccurrenceProof | null> {
+  if (event.id !== eventId) throw new PermanentCrmIntegrationActionError('Calendar response did not match the reviewed event ID')
+  const { calendarOccurrenceKey } = await import('@/lib/crm/calendarDiscovery')
+  const occurrenceKey = calendarOccurrenceKey(event)
+  return occurrenceKey ? { calendarId, externalEventId: eventId, occurrenceKey } : null
+}
+
+function assertManagedCalendarEvent(event: JsonObject, action: LeasedCrmIntegrationAction, referenceCode: string) {
+  const properties = event.extendedProperties as JsonObject | undefined
+  const identity = properties?.private as JsonObject | undefined
+  if (identity?.clawpilotMeetingReference !== referenceCode || identity.clawpilotPipelineId !== action.pipelineId) {
+    throw new PermanentCrmIntegrationActionError('The destination Calendar event does not belong to this CRM meeting')
+  }
+}
+
+function assertCalendarOccurrenceTuple(proof: CalendarOccurrenceProof | null, calendarId: string, eventId: string) {
+  if (proof && (proof.calendarId !== calendarId || proof.externalEventId !== eventId)) {
+    throw new PermanentCrmIntegrationActionError('Recorded Calendar occurrence does not match the reviewed event identity')
+  }
+}
+
+async function claimCalendarOccurrence(
+  client: PoolClient, action: LeasedCrmIntegrationAction, meetingId: string, proof: CalendarOccurrenceProof | null,
+) {
+  if (!proof) return
+  const { claimVerifiedCalendarOccurrence } = await import('@/lib/crm/calendarOccurrenceClaims')
+  if (await claimVerifiedCalendarOccurrence(client, { pipelineId: action.pipelineId, meetingId, ...proof }) === 'conflict') {
+    throw new PermanentCrmIntegrationActionError('Calendar occurrence already belongs to a different CRM meeting; review before retrying')
+  }
 }
 
 function queuedPendingCalendarMove(value: unknown): PendingCalendarMove | null {
@@ -3204,22 +3327,35 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
 
   const currentEvent = await existingCalendarEvent(action.pipelineId, target)
   const currentEventId = cleanString(currentEvent?.external_event_id, 1000, 'Calendar event ID') || null
+  const currentCalendar = currentEventId ? previousCalendarSnapshotFromSource(currentEventId, currentEvent?.source_payload || null) : null
   const queuedPreviousCalendar = queuedPreviousCalendarSnapshot(action.payload.previousCalendar)
+  const pendingCalendarMove = queuedPendingCalendarMove(action.responseSummary.calendarMove)
+  let occurrence = queuedCalendarOccurrence(action.responseSummary.calendarOccurrence)
+  let previousOccurrence = queuedCalendarOccurrence(action.responseSummary.previousCalendarOccurrence)
+  const recordedCalendarId = typeof action.responseSummary.calendarId === 'string'
+    ? calendarIdentifier(action.responseSummary.calendarId, 'Recorded Calendar ID') : null
+  const recordedDelivery = !pendingCalendarMove && Boolean(action.externalId && action.responseSummary.eventId === action.externalId && recordedCalendarId)
+  const recordedTupleAlreadyStaged = recordedDelivery && currentEventId === action.externalId
+    && currentEvent?.source_payload?.calendarId === recordedCalendarId
+    && currentCalendar?.credentialOwnerEmail === action.communicationCredentialOwnerEmail
+    && currentCalendar?.connectionId === action.communicationConnectionId
+  const samePreviousTuple = queuedPreviousCalendar && currentCalendar
+    && queuedPreviousCalendar.eventId === currentCalendar.eventId
+    && queuedPreviousCalendar.credentialOwnerEmail === currentCalendar.credentialOwnerEmail
+    && queuedPreviousCalendar.connectionId === currentCalendar.connectionId
+    && (queuedPreviousCalendar.calendarId === currentCalendar.calendarId || (queuedPreviousCalendar.calendarId === 'primary'
+      && queuedPreviousCalendar.organizerEmail === currentCalendar.calendarId && currentCalendar.organizerEmail === currentCalendar.calendarId))
   if (
     queuedPreviousCalendar
     && currentEventId
-    && queuedPreviousCalendar.eventId !== currentEventId
+    && !samePreviousTuple
+    && !recordedTupleAlreadyStaged
   ) {
     throw new PermanentCrmIntegrationActionError(
       'The recorded Calendar event changed after this action was queued; review and create a new action',
     )
   }
-  const previousCalendar = queuedPreviousCalendar || (
-    currentEventId
-      ? previousCalendarSnapshotFromSource(currentEventId, currentEvent?.source_payload || null)
-      : null
-  )
-  const pendingCalendarMove = queuedPendingCalendarMove(action.responseSummary.calendarMove)
+  const previousCalendar = queuedPreviousCalendar || currentCalendar
   if (currentEventId && !previousCalendar) {
     throw new PermanentCrmIntegrationActionError(
       'The existing Calendar event has no verified Calendar identity; review the meeting before updating it',
@@ -3239,13 +3375,11 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     )
   }
 
-  const provisionalMeeting = await stageCalendarMeeting(
-    action,
-    target,
-    { eventId: null, eventUrl: null, joinUrl: customJoinUrl },
-    provisionalStatus,
-    { preserveMissingJoinUrl: true },
-  )
+  const provisionalMeeting = await withTransaction(async client => {
+    await lockCalendarActionLease(client, action)
+    return stageCalendarMeeting(action, target, { eventId: null, eventUrl: null, joinUrl: customJoinUrl }, provisionalStatus,
+      { client, pendingDelivery: true, preserveMissingJoinUrl: true, calendarIdentity: currentCalendar || previousCalendar })
+  })
   const meetingTarget = await readCrmRecordByReference({
     pipelineId: action.pipelineId,
     referenceCode: provisionalMeeting.referenceCode,
@@ -3272,10 +3406,67 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     || action.responseSummary.calendarAccessRole === 'writer'
     ? action.responseSummary.calendarAccessRole
     : null
+  let finalCalendarIdentity: PreviousCalendarEventSnapshot | null = null
+  const calendarSummaryFields = () => ({
+    eventId, eventUrl, joinUrl, meetingReferenceCode: provisionalMeeting.referenceCode, meetingUrl,
+    organizerEmail, calendarId: verifiedCalendarId, calendarSummary, calendarAccessRole,
+    accountEmail: action.communication?.accountEmail || organizerEmail,
+    communicationBindingSource: action.communication?.source || null,
+    communicationOrganizationId: action.communication?.organizationId || null,
+    meetingStatus: finalMeetingStatus, meetingMode, customJoinUrl,
+    ...(occurrence ? { calendarOccurrence: occurrence } : {}),
+    ...(previousOccurrence ? { previousCalendarOccurrence: previousOccurrence } : {}),
+  })
+  const settleMeeting = async (summary: JsonObject, status: CrmMeeting['status']) => completeAction(action, eventId, summary, async (client) => {
+    const staged = await stageCalendarMeeting(action, meetingTarget, { eventId, eventUrl, joinUrl }, status,
+      { client, calendarIdentity: finalCalendarIdentity })
+    await claimCalendarOccurrence(client, action, staged.id, occurrence)
+  })
+  const retainCurrentOccurrence = async (identity: PreviousCalendarEventSnapshot, known: CalendarOccurrenceProof | null,
+    readExact: () => Promise<JsonObject>, requiredForMove: boolean): Promise<CalendarOccurrenceProof | null> => {
+    assertCalendarOccurrenceTuple(known, identity.calendarId, identity.eventId)
+    let proof = known
+    if (!proof) {
+      const { lockCalendarOccurrencePipeline, readVerifiedCalendarOccurrence } = await import('@/lib/crm/calendarOccurrenceClaims')
+      const priorKey = await withTransaction(async client => {
+        await lockCalendarOccurrencePipeline(client, action.pipelineId)
+        return readVerifiedCalendarOccurrence(client, { pipelineId: action.pipelineId, meetingId: provisionalMeeting.id,
+          calendarId: identity.calendarId, externalEventId: identity.eventId })
+      })
+      if (priorKey) proof = { calendarId: identity.calendarId, externalEventId: identity.eventId, occurrenceKey: priorKey }
+    }
+    if (!proof) {
+      try {
+        proof = await verifiedProviderOccurrence(await readExact(), identity.calendarId, identity.eventId)
+      } catch (error) {
+        // A previously cancelled provider event is still cancellable locally.
+        // Absence is never evidence of its UID or cross-calendar occurrence.
+        if (requiredForMove || !(error instanceof ProviderCrmIntegrationActionError)
+          || (error.providerStatus !== 404 && error.providerStatus !== 410)) throw error
+      }
+    }
+    if (!proof && requiredForMove) throw new PermanentCrmIntegrationActionError('The previous Calendar occurrence could not be verified; review before moving the meeting')
+    if (proof) await withTransaction(async client => {
+      await lockCalendarActionLease(client, action)
+      if (currentCalendar?.calendarId !== identity.calendarId) {
+        if (currentCalendar?.calendarId !== 'primary' || currentCalendar.organizerEmail !== identity.calendarId
+          || currentCalendar.credentialOwnerEmail !== identity.credentialOwnerEmail || currentCalendar.connectionId !== identity.connectionId) {
+          throw new PermanentCrmIntegrationActionError('The current Calendar tuple changed; review before removing the provider event')
+        }
+        await stageCalendarMeeting(action, meetingTarget, { eventId: null, eventUrl: null, joinUrl: customJoinUrl }, provisionalStatus,
+          { client, calendarIdentity: identity, pendingDelivery: true, preserveMissingJoinUrl: true })
+      }
+      await claimCalendarOccurrence(client, action, provisionalMeeting.id, proof)
+    })
+    return proof
+  }
 
   if (desiredMeetingStatus === 'cancelled') {
     eventId = eventId || currentEventId
     if (eventId) {
+      if (!previousCalendar || eventId !== previousCalendar.eventId) {
+        throw new PermanentCrmIntegrationActionError('Calendar cancellation does not match the reviewed current event')
+      }
       const selectedConnection = await selectedMatonConnection(action, 'google-calendar')
       const calendar = await verifiedCalendarConnection(action, selectedConnection)
       organizerEmail = calendar.organizerEmail
@@ -3284,63 +3475,37 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       calendarAccessRole = calendar.accessRole
       const deleteFromPrevious = previousCalendar
         && !sameCalendarSelection(previousCalendar, selectedConnection)
-      let response: Response
+      let credential: { ownerEmail: string; app: 'google-calendar'; boundConnectionId: string }
+      let readExact: () => Promise<JsonObject>
       if (deleteFromPrevious && previousCalendar) {
         const previous = await verifiedPreviousCalendarSelection(action, previousCalendar)
         organizerEmail = previous.id
         verifiedCalendarId = previous.id
         calendarSummary = previous.summary
         calendarAccessRole = previous.accessRole
-        response = await matonFetch(
-          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.id)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
-          { method: 'DELETE' },
-          {
-            ownerEmail: previousCalendar.credentialOwnerEmail,
-            app: 'google-calendar',
-            boundConnectionId: previousCalendar.connectionId,
-          },
-        )
+        finalCalendarIdentity = { ...previousCalendar, eventId, calendarId: previous.id, organizerEmail: previous.id }
+        credential = { ownerEmail: previousCalendar.credentialOwnerEmail, app: 'google-calendar', boundConnectionId: previousCalendar.connectionId }
+        const path = `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.id)}/events/${encodeURIComponent(eventId)}`
+        readExact = () => previousCalendarJson(previousCalendar, path, { headers: { Accept: 'application/json' } })
       } else {
-        const calendarId = selectedConnection.calendarId || 'primary'
-        response = await matonFetch(
-          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
-          { method: 'DELETE' },
-          {
-            ownerEmail: selectedConnection.credentialOwnerEmail,
-            app: 'google-calendar',
-            boundConnectionId: selectedConnection.connectionId,
-          },
-        )
+        const calendarId = calendar.calendarId
+        finalCalendarIdentity = { eventId, calendarId, organizerEmail: calendar.organizerEmail,
+          credentialOwnerEmail: selectedConnection.credentialOwnerEmail, connectionId: selectedConnection.connectionId }
+        credential = { ownerEmail: selectedConnection.credentialOwnerEmail, app: 'google-calendar', boundConnectionId: selectedConnection.connectionId }
+        const path = `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`
+        readExact = () => matonJson(action, 'google-calendar', selectedConnection.connectionId, path, { headers: { Accept: 'application/json' } })
       }
+      occurrence = await retainCurrentOccurrence(finalCalendarIdentity, occurrence, readExact, false)
+      const response = await matonFetch(
+        `/google-calendar/calendar/v3/calendars/${encodeURIComponent(finalCalendarIdentity.calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+        { method: 'DELETE' }, credential,
+      )
       if (!response.ok && response.status !== 404 && response.status !== 410) {
         throw await providerRequestError('google-calendar', response)
       }
     }
-    const summary = {
-      eventId,
-      eventUrl,
-      joinUrl,
-      meetingReferenceCode: provisionalMeeting.referenceCode,
-      meetingUrl,
-      organizerEmail,
-      calendarId: verifiedCalendarId,
-      calendarSummary,
-      calendarAccessRole,
-      accountEmail: action.communication?.accountEmail || organizerEmail,
-      communicationBindingSource: action.communication?.source || null,
-      communicationOrganizationId: action.communication?.organizationId || null,
-      meetingStatus: 'cancelled',
-      meetingMode,
-      customJoinUrl,
-    }
-    await recordAttemptSucceeded(action, eventId, summary)
-    await stageCalendarMeeting(
-      action,
-      meetingTarget,
-      { eventId, eventUrl, joinUrl },
-      'cancelled',
-    )
-    await completeAction(action, eventId, summary)
+    if (eventId && verifiedCalendarId) assertCalendarOccurrenceTuple(occurrence, verifiedCalendarId, eventId)
+    await settleMeeting(calendarSummaryFields(), 'cancelled')
     return
   }
 
@@ -3352,7 +3517,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     verifiedCalendarId = calendar.calendarId
     calendarSummary = calendar.calendarSummary
     calendarAccessRole = calendar.accessRole
-    const calendarId = selectedConnection.calendarId || 'primary'
+    const calendarId = calendar.calendarId
     const existingEventId = currentEventId || previousCalendar?.eventId || ''
     const existingEventOnSelectedCalendar = Boolean(
       existingEventId
@@ -3361,7 +3526,7 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
       && previousCalendar.connectionId === selectedConnection.connectionId
       && (
         previousCalendar.calendarId === calendar.calendarId
-        || previousCalendar.calendarId === calendarId
+        || previousCalendar.calendarId === selectedConnection.calendarId
         || previousCalendar.organizerEmail === calendar.organizerEmail
       ),
     )
@@ -3370,6 +3535,9 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     const verifiedPreviousCalendar = calendarSelectionChanged && previousCalendar
       ? await verifiedPreviousCalendarSelection(action, previousCalendar)
       : null
+    if (verifiedPreviousCalendar?.id === calendarId) {
+      throw new PermanentCrmIntegrationActionError('Calendar move source and destination resolve to the same Calendar; no provider changes were made')
+    }
     if (
       pendingCalendarMove
       && (
@@ -3385,6 +3553,19 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     const requestedEventId = createDestinationEvent
       ? calendarEventIdForMeeting(provisionalMeeting.referenceCode)
       : existingEventId
+    const destinationPath = `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(requestedEventId)}`
+    const readDestination = async () => {
+      const delivered = await matonJson(action, 'google-calendar', connectionId, destinationPath, { headers: { Accept: 'application/json' } })
+      assertManagedCalendarEvent(delivered, action, provisionalMeeting.referenceCode)
+      return delivered
+    }
+    if (verifiedPreviousCalendar && previousCalendar) {
+      const previous = { ...previousCalendar, calendarId: verifiedPreviousCalendar.id, organizerEmail: verifiedPreviousCalendar.id }
+      // Read the authorized old tuple before creating or deleting anything.
+      const path = `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.calendarId)}/events/${encodeURIComponent(previous.eventId)}`
+      previousOccurrence = await retainCurrentOccurrence(previous, previousOccurrence,
+        () => previousCalendarJson(previous, path, { headers: { Accept: 'application/json' } }), true)
+    }
     const eventBody: JsonObject = {
       ...(createDestinationEvent ? { id: requestedEventId } : {}),
       ...(meetingMode === 'google_meet' ? {
@@ -3411,13 +3592,13 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
     const eventWriteQuery = meetingMode === 'google_meet' || !createDestinationEvent
       ? 'conferenceDataVersion=1&sendUpdates=all'
       : 'sendUpdates=all'
-    let delivered: JsonObject
+    let delivered: JsonObject | null = null
+    let duplicateOccurrence: CalendarOccurrenceProof | null = null
     if (pendingCalendarMove) {
-      delivered = {
-        id: pendingCalendarMove.destinationEventId,
-        htmlLink: eventUrl,
-        hangoutLink: joinUrl,
+      if (pendingCalendarMove.destinationEventId !== requestedEventId) {
+        throw new PermanentCrmIntegrationActionError('The pending Calendar move does not match its reviewed destination event')
       }
+      assertCalendarOccurrenceTuple(occurrence, calendarId, requestedEventId)
     } else if (!createDestinationEvent) {
       delivered = await matonJson(
         action,
@@ -3445,28 +3626,8 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         )
       } catch (error) {
         if (!(error instanceof ProviderCrmIntegrationActionError) || error.providerStatus !== 409) throw error
-        const existingDestination = await matonJson(
-          action,
-          'google-calendar',
-          connectionId,
-          `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(requestedEventId)}`,
-          { headers: { Accept: 'application/json' } },
-        )
-        const extendedProperties = existingDestination.extendedProperties
-          && typeof existingDestination.extendedProperties === 'object'
-          && !Array.isArray(existingDestination.extendedProperties)
-          ? existingDestination.extendedProperties as JsonObject
-          : {}
-        const existingPrivate = extendedProperties.private
-          && typeof extendedProperties.private === 'object'
-          && !Array.isArray(extendedProperties.private)
-          ? extendedProperties.private as JsonObject
-          : {}
-        if (existingPrivate.clawpilotMeetingReference !== provisionalMeeting.referenceCode) {
-          throw new PermanentCrmIntegrationActionError(
-            'The destination Calendar already contains an event with the reserved ClawPilot ID',
-          )
-        }
+        const existingDestination = await readDestination()
+        duplicateOccurrence = await verifiedProviderOccurrence(existingDestination, calendarId, requestedEventId)
         const patchBody = { ...eventBody }
         delete patchBody.id
         delivered = await matonJson(
@@ -3482,14 +3643,19 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         )
       }
     }
-    eventId = cleanString(delivered.id, 1000, 'Calendar event ID') || requestedEventId
-    if (!eventId) throw new Error('google-calendar provider returned no event ID')
-    eventUrl = safeHttpsUrl(delivered.htmlLink) || (calendarSelectionChanged ? null : eventUrl)
-    joinUrl = meetingMode === 'google_meet'
-      ? safeHttpsUrl(delivered.hangoutLink)
-      : meetingMode === 'custom_link'
-        ? customJoinUrl
-        : null
+    if (delivered) {
+      const responseOccurrence = await verifiedProviderOccurrence(delivered, calendarId, requestedEventId)
+      if (duplicateOccurrence && responseOccurrence && duplicateOccurrence.occurrenceKey !== responseOccurrence.occurrenceKey) {
+        throw new PermanentCrmIntegrationActionError('Calendar retry returned a different occurrence for the reviewed event')
+      }
+      occurrence = responseOccurrence || duplicateOccurrence
+      eventUrl = safeHttpsUrl(delivered.htmlLink) || (calendarSelectionChanged ? null : eventUrl)
+      joinUrl = meetingMode === 'google_meet' ? safeHttpsUrl(delivered.hangoutLink)
+        : meetingMode === 'custom_link' ? customJoinUrl : null
+    }
+    eventId = requestedEventId
+    finalCalendarIdentity = { eventId, calendarId, organizerEmail: calendar.organizerEmail,
+      credentialOwnerEmail: selectedConnection.credentialOwnerEmail, connectionId }
 
     if (calendarSelectionChanged && previousCalendar && verifiedPreviousCalendar) {
       const previous = verifiedPreviousCalendar
@@ -3497,22 +3663,8 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         && previousCalendar.connectionId === selectedConnection.connectionId
         && previous.id === calendar.calendarId
       if (!sameVerifiedCalendar) {
-        const pendingMoveSummary = {
-          eventId,
-          eventUrl,
-          joinUrl,
-          meetingReferenceCode: provisionalMeeting.referenceCode,
-          meetingUrl,
-          organizerEmail,
-          calendarId: verifiedCalendarId,
-          calendarSummary,
-          calendarAccessRole,
-          accountEmail: action.communication?.accountEmail || organizerEmail,
-          communicationBindingSource: action.communication?.source || null,
-          communicationOrganizationId: action.communication?.organizationId || null,
-          meetingStatus: finalMeetingStatus,
-          meetingMode,
-          customJoinUrl,
+        const pendingMoveSummary = () => ({
+          ...calendarSummaryFields(),
           calendarMove: {
             state: 'destination-written-source-delete-pending',
             sourceEventId: previousCalendar.eventId,
@@ -3520,8 +3672,27 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
             destinationEventId: eventId,
             destinationCalendarId: calendar.calendarId,
           },
+        })
+        await recordAttemptProgress(action, eventId, pendingMoveSummary())
+        if (!occurrence) {
+          occurrence = await verifiedProviderOccurrence(await readDestination(), calendarId, eventId)
+          if (!occurrence) throw new Error('The destination Calendar event was delivered but has no verified occurrence; the source was not deleted')
+          await recordAttemptProgress(action, eventId, pendingMoveSummary())
         }
-        await recordAttemptProgress(action, eventId, pendingMoveSummary)
+        const sourceProof = previousOccurrence, destinationProof = occurrence
+        if (!sourceProof) throw new PermanentCrmIntegrationActionError('Calendar move has no retained source occurrence; the source was not deleted')
+        // The destination binding must be reserved while the source is still
+        // the current exact tuple. A conflicting copy is held before the
+        // irreversible provider DELETE, including on a lost-response retry.
+        await withTransaction(async client => {
+          await lockCalendarActionLease(client, action)
+          const { reserveVerifiedCalendarMoveDestination } = await import('@/lib/crm/calendarOccurrenceClaims')
+          if (await reserveVerifiedCalendarMoveDestination(client, {
+            pipelineId: action.pipelineId, meetingId: provisionalMeeting.id, source: sourceProof, destination: destinationProof,
+          }) === 'conflict') {
+            throw new PermanentCrmIntegrationActionError('Calendar move destination occurrence already belongs to a different CRM meeting; the source was not deleted')
+          }
+        })
         const response = await matonFetch(
           `/google-calendar/calendar/v3/calendars/${encodeURIComponent(previous.id)}/events/${encodeURIComponent(previousCalendar.eventId)}?sendUpdates=all`,
           { method: 'DELETE' },
@@ -3536,32 +3707,30 @@ async function createCalendarEventAction(action: LeasedCrmIntegrationAction, tar
         }
       }
     }
+    if (!occurrence) {
+      // Record the exact successful delivery before optional GET hydration so
+      // a failed read is never retried as a fresh Calendar write.
+      await recordAttemptProgress(action, eventId, calendarSummaryFields())
+      occurrence = await verifiedProviderOccurrence(await readDestination(), calendarId, eventId)
+    }
+  } else {
+    if (!recordedDelivery) throw new PermanentCrmIntegrationActionError('Recorded Calendar delivery has no verified event identity')
+    const selected = await selectedMatonConnection(action, 'google-calendar')
+    const calendar = await verifiedCalendarConnection(action, selected)
+    if (calendar.calendarId !== recordedCalendarId) throw new PermanentCrmIntegrationActionError('Recorded Calendar delivery no longer matches its reviewed Calendar')
+    assertCalendarOccurrenceTuple(occurrence, calendar.calendarId, eventId)
+    if (!occurrence) {
+      const path = `/google-calendar/calendar/v3/calendars/${encodeURIComponent(calendar.calendarId)}/events/${encodeURIComponent(eventId)}`
+      const delivered = await matonJson(action, 'google-calendar', selected.connectionId, path, { headers: { Accept: 'application/json' } })
+      assertManagedCalendarEvent(delivered, action, provisionalMeeting.referenceCode)
+      occurrence = await verifiedProviderOccurrence(delivered, calendar.calendarId, eventId)
+    }
+    finalCalendarIdentity = { eventId, calendarId: calendar.calendarId, organizerEmail: calendar.organizerEmail,
+      credentialOwnerEmail: selected.credentialOwnerEmail, connectionId: selected.connectionId }
   }
-  const summary = {
-    eventId,
-    eventUrl,
-    joinUrl,
-    meetingReferenceCode: provisionalMeeting.referenceCode,
-    meetingUrl,
-    organizerEmail,
-    calendarId: verifiedCalendarId,
-    calendarSummary,
-    calendarAccessRole,
-    accountEmail: action.communication?.accountEmail || organizerEmail,
-    communicationBindingSource: action.communication?.source || null,
-    communicationOrganizationId: action.communication?.organizationId || null,
-    meetingStatus: finalMeetingStatus,
-    meetingMode,
-    customJoinUrl,
-  }
-  await recordAttemptSucceeded(action, eventId, summary)
-  await stageCalendarMeeting(
-    action,
-    meetingTarget,
-    { eventId, eventUrl, joinUrl },
-    finalMeetingStatus,
-  )
-  await completeAction(action, eventId, summary)
+  const summary = calendarSummaryFields()
+  await recordAttemptProgress(action, eventId, summary)
+  await settleMeeting(summary, finalMeetingStatus)
 }
 
 function telUrl(value: unknown): string {

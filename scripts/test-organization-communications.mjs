@@ -624,6 +624,7 @@ assert.equal(nativeCalendarResolutionCalls, 0)
 
 const writes = []
 let providerMode = 'alias-accepted'
+let calendarListOverride = null
 const providerRequests = []
 const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommunications.ts', {
   '@/lib/integrations/matonGatewayCredentials': {
@@ -749,6 +750,9 @@ const service = loadTypeScriptModule('app_src/lib/integrations/organizationCommu
         ] }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
       if (pathname.includes('/calendarList?')) {
+        if (context.boundConnectionId === 'calendar-connection' && calendarListOverride) {
+          return Response.json(calendarListOverride)
+        }
         if (context.boundConnectionId === 'personal-calendar-connection') {
           return new Response(JSON.stringify({ items: [
             {
@@ -1042,6 +1046,31 @@ assert.equal(bpoMeetingSelection.accountEmail, 'jarrett@suburbiasandwichco.com')
 assert.equal(bpoMeetingSelection.identityEmail, 'jarrett@bposupplychain.com')
 assert.equal(bpoMeetingSelection.calendarId, 'jarrett@bposupplychain.com')
 assert.equal(bpoMeetingSelection.source, 'meeting-override')
+
+const liveBpoPrimary = { id: 'jarrett@bposupplychain.com', primary: true, accessRole: 'owner' }
+const liveBpoSelection = () => service.resolveVerifiedPipelineCalendarSelection({
+  pipelineId: '22222222-2222-4222-8222-222222222222',
+  actorEmail: 'jarrett@suburbiasandwichco.com',
+  connectionId: 'calendar-connection',
+  calendarId: 'jarrett@bposupplychain.com',
+})
+calendarListOverride = { items: [liveBpoPrimary] }
+const renamedCalendarSelection = await liveBpoSelection()
+assert.equal(renamedCalendarSelection.credentialOwnerEmail, 'jarrett@suburbiasandwichco.com')
+assert.equal(renamedCalendarSelection.accountEmail, 'jarrett@bposupplychain.com',
+  'the reviewed account must come from the live primary rather than the cached Maton label')
+assert.equal(renamedCalendarSelection.calendarId, liveBpoPrimary.id)
+for (const [listing, code] of [
+  [{ items: [{ ...liveBpoPrimary, primary: false, accessRole: 'writer' }] },
+    'ORGANIZATION_COMMUNICATION_CALENDAR_ACCOUNT_UNVERIFIED'],
+  [{ items: [liveBpoPrimary, { ...liveBpoPrimary }] },
+    'ORGANIZATION_COMMUNICATION_CALENDAR_ACCOUNT_UNVERIFIED'],
+  [{ items: [], nextPageToken: 'still-incomplete' }, 'ORGANIZATION_COMMUNICATION_PROVIDER_INVALID'],
+]) {
+  calendarListOverride = listing
+  await assert.rejects(liveBpoSelection, (error) => error?.code === code)
+}
+calendarListOverride = null
 
 const personalMeetingSelection = await service.resolveVerifiedPipelineCalendarSelection({
   pipelineId: '22222222-2222-4222-8222-222222222222',

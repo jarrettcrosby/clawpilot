@@ -315,10 +315,10 @@ test('Next route exports only intended methods and all use the authenticated HTT
   assert.equal(route.GET, route.PATCH); assert.equal(route.GET, route.POST)
 })
 
-test('customer folder subresource is source-customer scoped and uses company capabilities, never contact dispatch', async () => {
+test('customer folder subresource is source-customer scoped and dispatches only the authorized folder operation', async () => {
   const path = `/companies/${company}/customer-folder`, query = new URLSearchParams({ ...scope, customerId: 'local-customer' }).toString()
   const body = { schemaVersion: 1, folderUrl: 'https://app.bposupplychain.com/s/d_fixture', assertedFractionalActor: patch.assertedFractionalActor }
-  const app = harness()
+  const app = harness({ row: fixture({ capabilities: ['crm.company.read', 'crm.company.write'] }) })
   assert.equal((await app.request(path, { query })).status, 200)
   assert.equal(app.calls[0].name, 'readFractionalCrmCustomerFolder')
   assert.equal(app.calls[0].args[2], 'local-customer')
@@ -329,6 +329,23 @@ test('customer folder subresource is source-customer scoped and uses company cap
   const denied = harness({ row: fixture({ capabilities: ['crm.contact.read', 'crm.contact.write'] }) })
   for (const method of ['GET', 'PATCH']) assert.equal((await denied.request(path, { query, method, ...(method === 'PATCH' ? { body, headers: writeHeaders } : {}) })).status, 403)
   assert.equal(denied.calls.length, 0)
+  for (const capability of ['crm.company.write', 'crm.customer-folder.write']) {
+    const writer = harness({ row: fixture({ capabilities: [capability] }) })
+    const verified = { ...body, folderUrl: 'https://drive.google.com/drive/folders/fixture_folder_id' }
+    assert.equal((await writer.request(path, { query, method: 'PATCH', body: verified, headers: writeHeaders })).status, 200)
+    const folderOnly = capability === 'crm.customer-folder.write'
+    assert.equal((await writer.request(path, { query })).status, folderOnly ? 200 : 403, 'only the folder capability includes exact folder readback')
+    assert.deepEqual(writer.calls.map(call => call.name), folderOnly
+      ? ['updateFractionalCrmCustomerFolder', 'readFractionalCrmCustomerFolder'] : ['updateFractionalCrmCustomerFolder'])
+  }
+  const narrow = harness({ row: fixture({ capabilities: ['crm.customer-folder.write'] }) })
+  for (const folderUrl of [body.folderUrl, 'https://drive.google.com/file/d/fixture_folder_id',
+    'https://drive.google.com.evil.invalid/drive/folders/fixture_folder_id', 'https://drive.google.com/drive/folders/fixture_folder_id#other']) {
+    const response = await narrow.request(path, { query, method: 'PATCH', body: { ...body, folderUrl }, headers: writeHeaders })
+    assert.equal(response.status, 422)
+    assert.equal((await response.json()).error, 'INVALID_FOLDER_URL')
+  }
+  assert.equal(narrow.calls.length, 0)
   for (const candidate of [undefined, null, { ...body, schemaVersion: 2 }, { ...body, folderUrl: 'javascript:alert(1)' },
     { ...body, folderUrl: 'https://user:secret@example.test/folder' }, { ...body, fields: {} },
     { ...body, assertedFractionalActor: { ...body.assertedFractionalActor, customerId: 'other-customer' } }]) {
@@ -341,6 +358,20 @@ test('customer folder subresource is source-customer scoped and uses company cap
   }
   assert.equal((await harness().request(path, { query, method: 'PATCH', body })).status, 428)
   assert.equal(isFractionalCrmGatewayPath(`${base}${path}`, 'POST'), false)
+})
+
+test('a folder-only grant cannot read profiles or write any profile or onboarding route', async () => {
+  const app = harness({ row: fixture({ capabilities: ['crm.customer-folder.write'] }) })
+  for (const [path, method] of [
+    ['/organization', 'GET'], [`/companies/${company}`, 'GET'], [`/companies/${company}`, 'PATCH'],
+    [`/companies/${company}/contacts`, 'GET'], [`/companies/${company}/contacts/${contact}`, 'PATCH'],
+    ['/onboarding/resolve-or-create', 'POST'],
+  ]) {
+    const response = await app.request(path, { method, ...(method === 'GET' ? {} : { body: patch, headers: writeHeaders }) })
+    assert.equal(response.status, 403, `${method} ${path}`)
+    assert.equal((await response.json()).error, 'CAPABILITY_DENIED')
+  }
+  assert.equal(app.calls.length, 0)
 })
 
 test('Fractional folder merge preserves BPO link and notes, adopts an exact reference and respects later manual edits', () => {
@@ -357,11 +388,12 @@ test('Fractional folder merge preserves BPO link and notes, adopts an exact refe
   assert.throws(() => folderContract.mergeFractionalCustomerFolder({ description: description + `\nFractional Customer Folder: ${url}`, previous: null, folderUrl: url }), /FOLDER_DESCRIPTION_REPAIR_REQUIRED/)
 })
 
-test('folder route retries card reconciliation after a committed command without reporting premature success', async () => {
-  const app = harness(), reconciliations = [], applied = new Set()
+test('folder route retries legacy card reconciliation after a committed command without reporting premature success', async () => {
+  const app = harness({ row: fixture({ capabilities: ['crm.company.write'] }) }), reconciliations = [], applied = new Set()
   let failCard = true
-  app.services.updateFractionalCrmCustomerFolder = async (principal, ga, input) => {
+  app.services.updateFractionalCrmCustomerFolder = async (principal, ga, input, reconcileLegacy) => {
     applied.add(input.idempotencyKey)
+    await reconcileLegacy({ pipelineId: principal.pipelineId })
     return { globalId: ga, folderUrl: input.folderUrl }
   }
   const route = load('app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts', {
