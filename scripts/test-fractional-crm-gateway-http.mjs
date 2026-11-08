@@ -53,7 +53,7 @@ function harness(options = {}) {
   const services = { readFractionalCrmCredential: async id => { lookups.push(id); return row } }
   for (const name of ['readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
     'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding',
-    'readFractionalCrmCustomerFolder', 'updateFractionalCrmCustomerFolder']) {
+    'readFractionalCrmCustomerFolder', 'updateFractionalCrmCustomerFolder', 'readFractionalCrmProduct', 'listFractionalCrmProducts']) {
     services[name] = async (...args) => { calls.push({ name, args }); if (options.error) throw options.error; return options.result ?? { ok: true } }
   }
   async function request(path = `/companies/${company}`, options2 = {}) {
@@ -438,4 +438,55 @@ test('organization name cannot bypass capability, revoked credentials, tenant sc
     assert.equal(app.calls.length, 0)
   }
   assert.equal(isFractionalCrmGatewayPath(`${base}/organization/other`, 'GET'), false)
+})
+
+test('product list and detail require their own capability and exact CRM scope', async () => {
+  const routes = ['/products', '/products/gp0000009']
+  for (const row of [fixture({ capabilities: ['crm.company.read', 'crm.contact.read', 'crm.customer-folder.write'] }), fixture({ revokedAt: new Date() }), fixture({ enabled: false })]) {
+    const app = harness({ row })
+    for (const route of routes) assert.ok([401, 403].includes((await app.request(route)).status))
+    assert.equal(app.calls.length, 0)
+  }
+  const app = harness({ row: fixture({ capabilities: ['crm.product.read'], allowedCompanyGlobalIds: [] }) })
+  for (const key of Object.keys(scope)) {
+    const query = new URLSearchParams({ ...scope, [key]: 'wrong' }).toString()
+    for (const route of routes) assert.equal((await app.request(route, { query })).status, 403)
+  }
+  for (const route of ['/organization', `/companies/${company}/contacts`, `/companies/${company}/customer-folder`]) {
+    assert.equal((await app.request(route)).status, 403)
+  }
+  assert.equal(app.calls.length, 0)
+  const list = await app.request(routes[0], { query: new URLSearchParams({ ...scope, limit: '100', cursor: 'page_2' }).toString() })
+  assert.equal(list.status, 200)
+  assert.equal(list.headers.get('cache-control'), 'private, no-store')
+  assert.equal(app.calls[0].name, 'listFractionalCrmProducts')
+  assert.equal(app.calls[0].args[0].pipelineId, pipelineId)
+  assert.equal(app.calls[0].args[1].limit, 100)
+  assert.equal(app.calls[0].args[1].cursor, 'page_2')
+  assert.equal((await app.request(routes[1])).status, 200)
+  assert.equal(app.calls[1].name, 'readFractionalCrmProduct')
+  assert.equal(app.calls[1].args[1], 'gp0000009')
+})
+
+test('product gateway bypass admits only exact bounded GET with machine authority', async () => {
+  const app = harness()
+  for (const route of ['/products', '/products/gp0000009', '/products/gp0123456789av']) {
+    assert.equal(isFractionalCrmGatewayPath(`${base}${route}`, 'GET'), true)
+    for (const method of ['HEAD', 'OPTIONS', 'POST', 'PATCH', 'DELETE']) {
+      assert.equal(isFractionalCrmGatewayPath(`${base}${route}`, method), false)
+      assert.equal((await app.request(route, { method })).status, 404)
+    }
+    assert.equal((await app.request(route, { headers: { cookie: 'native-session=forbidden' } })).status, 403)
+    assert.equal((await app.request(route, { headers: { authorization: '' } })).status, 401)
+  }
+  for (const route of ['/products/', '/products/ga0000009', '/products/gp0000009/extra', '/products/gp0123456789aw']) {
+    assert.equal(isFractionalCrmGatewayPath(`${base}${route}`, 'GET'), false)
+    assert.equal((await app.request(route)).status, 404)
+  }
+  for (const [route, params] of [
+    ['/products', { limit: '101' }], ['/products', { cursor: 'invalid!' }], ['/products', { customerId: 'customer' }],
+    ['/products/gp0000009', { limit: '1' }], ['/products/gp0000009', { cursor: 'page_2' }],
+  ]) assert.equal((await app.request(route, { query: new URLSearchParams({ ...scope, ...params }).toString() })).status, 400)
+  assert.equal((await app.request('/products', { query: `${new URLSearchParams(scope)}&limit=10&limit=20` })).status, 400)
+  assert.equal(app.calls.length, 0)
 })

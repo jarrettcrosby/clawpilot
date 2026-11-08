@@ -10,11 +10,27 @@ export const ROLLBACK_BUILD_FORMAT = 'clawpilot-crm-rollback-local-build-v1'
 export const LEGACY_WRITER_COMMIT = 'b61192200b6d990adb320fd7f941a619976bc4af'
 // A new floor must protect the current authority inventory. Verification of
 // already-pinned artifacts below remains independent of this build-time floor.
-const CURRENT_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v20'
+const HISTORICAL_V20_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v20'
+const CURRENT_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v21'
+const FRACTIONAL_PRODUCT_MIGRATION = 'db/migrations/0373_fractional_crm_product_read.sql'
+const FRACTIONAL_FOLDER_MIGRATION = 'db/migrations/0403_fractional_crm_customer_folder_capability.sql'
+const FRACTIONAL_GATEWAY_PROTECTED_PATHS = Object.freeze([
+  FRACTIONAL_PRODUCT_MIGRATION, FRACTIONAL_FOLDER_MIGRATION,
+  'app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts',
+  'app_src/lib/fractionalCrmGatewayAuth.ts', 'app_src/lib/fractionalCrmGatewayHttp.ts',
+  'app_src/lib/fractionalCrmGatewayPath.mjs', 'app_src/lib/persistence/fractionalCrmGateway.ts',
+  'app_src/lib/crm/fractionalGatewayModel.ts', 'app_src/lib/crm/fractionalFolderBoardProjection.ts',
+  'app_src/lib/crm/customerFolderLinks.ts',
+  'scripts/fixtures/0403_fractional_crm_customer_folder_capability.v20.sql',
+  'scripts/test-fractional-crm-gateway-http.mjs', 'scripts/test-fractional-crm-gateway-postgres.mjs',
+])
 export const RETAINED_V20_LAST_MIGRATION = 'db/migrations/0412_crm_calendar_occurrence_claims.sql'
 export const REQUIRED_RETAINED_V20_CHECKS = Object.freeze([
   'full_migration_checksum_ledger', 'reloaded_email_preserves_single_identity_and_links',
   'reloaded_calendar_preserves_single_occurrence', 'retained_native_authority_and_recovery_controls_unchanged',
+])
+export const REQUIRED_RETAINED_V21_CHECKS = Object.freeze([
+  ...REQUIRED_RETAINED_V20_CHECKS, 'retained_fractional_product_credential_and_scope_unchanged',
 ])
 export const REQUIRED_ROLLING_CHECKS = Object.freeze([
   'legacy_scalar_insert_after_migration', 'legacy_scalar_primary_bridge',
@@ -51,7 +67,6 @@ const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
   'db/migrations/0400_crm_native_email_demo_quarantine.sql',
   'db/migrations/0401_crm_native_root_owner_source_fence.sql',
   'db/migrations/0402_crm_native_unmanaged_app_only_pipelines.sql',
-  'db/migrations/0403_fractional_crm_customer_folder_capability.sql',
   'db/migrations/0404_crm_legacy_email_recovery_holds.sql',
   'db/migrations/0405_crm_legacy_email_recovery_settlement.sql',
   'db/migrations/0406_crm_legacy_email_recovery_archive.sql',
@@ -64,6 +79,7 @@ const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
 ])
 export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
   ...ROLLBACK_CRM_AUTHORITY_MIGRATIONS,
+  ...FRACTIONAL_GATEWAY_PROTECTED_PATHS,
   'app_src/app/api/crm/email-recovery/route.ts', 'app_src/app/api/crm/email-review-candidates/route.ts',
   'app_src/app/api/crm/mailbox-identity/route.ts', 'app_src/components/crm/EmailReviewDialog.tsx',
   'app_src/app/api/crm/route.ts', 'app_src/app/api/crm/actions/route.ts',
@@ -139,6 +155,17 @@ export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
 export const sha256 = value => createHash('sha256').update(value).digest('hex')
 export const canonicalJson = value => JSON.stringify(value, null, 2) + '\n'
 export function retainedV20MigrationInventory(sourceTree) {
+  assert.ok(!sourceTree.some(({ path }) => path === FRACTIONAL_PRODUCT_MIGRATION),
+    'The restored Fractional product migration requires retained v21 proof')
+  return retainedMigrationInventory(sourceTree)
+}
+export function retainedV21MigrationInventory(sourceTree) {
+  for (const required of [FRACTIONAL_PRODUCT_MIGRATION, FRACTIONAL_FOLDER_MIGRATION]) {
+    assert.ok(sourceTree.some(({ path }) => path === required), `Retained v21 proof lacks ${required}`)
+  }
+  return retainedMigrationInventory(sourceTree)
+}
+function retainedMigrationInventory(sourceTree) {
   const entries = sourceTree.filter(({ path }) => /^db\/migrations\/\d+_.+\.sql$/u.test(path))
     .map(({ path, gitBlob }) => ({ path, gitBlob })).sort((a, b) => a.path < b.path ? -1 : Number(a.path > b.path))
   assert.equal(entries.at(-1)?.path, RETAINED_V20_LAST_MIGRATION,
@@ -198,6 +225,15 @@ export function inspectRollbackSources(readSource) {
     const enrolled=attester.match(new RegExp("filename:\\s*'"+escaped+"',\\s*checksum:\\s*'([a-f0-9]{64})'"))?.[1]
     assert.equal(enrolled,sha256(files[path]),`Rollback floor must retain and attest ${filename}`)
   }
+  // 0403 is named twice in the attester. The old entry is frozen metadata;
+  // only this dedicated compatibility block supplies the live v21 ledger.
+  const compatibilityBlock = attester.match(/const FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS = Object\.freeze\(\[([\s\S]*?)\]\)/u)?.[1]
+  assert.ok(compatibilityBlock, 'Rollback floor must retain the current Fractional capability enrollment')
+  const compatibilityMigrations = [...compatibilityBlock.matchAll(/filename:\s*'([^']+)',\s*checksum:\s*'([a-f0-9]{64})'/gu)]
+    .map(([, filename, checksum]) => ({ filename, checksum }))
+  assert.deepEqual(compatibilityMigrations, [FRACTIONAL_PRODUCT_MIGRATION, FRACTIONAL_FOLDER_MIGRATION]
+    .map(path => ({ filename: basename(path), checksum: sha256(files[path]) })),
+  'Rollback floor must retain and attest both exact active Fractional capability migrations')
   const rawDigestBlock = attester.match(/const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object\.freeze\(\{([\s\S]*?)\}\)/u)?.[1]
   assert.ok(rawDigestBlock, 'Rollback floor must enroll raw catalog digests')
   const postgresDigests = Object.fromEntries([...rawDigestBlock.matchAll(/(16|18):\s*'([a-f0-9]{64})'/gu)].map(([, major, digest]) => [major, digest]))
@@ -242,14 +278,29 @@ export function validateRollbackReceipts(identity, acceptance, build) {
   assert.ok([16, 18].includes(acceptance.postgresMajor))
   assert.deepEqual([...acceptance.checks].sort(), [...REQUIRED_ROLLING_CHECKS].sort())
   const containsRetainedV20 = identity.sourceTree?.some(({ path }) => path === RETAINED_V20_LAST_MIGRATION)
-  if (containsRetainedV20 || identity.attestation?.format === CURRENT_ROLLBACK_ATTESTATION) {
-    assert.equal(identity.attestation?.format, CURRENT_ROLLBACK_ATTESTATION,
+  const containsV21 = identity.sourceTree?.some(({ path }) => path === FRACTIONAL_PRODUCT_MIGRATION)
+    || Object.hasOwn(identity.protectedFiles ?? {}, FRACTIONAL_PRODUCT_MIGRATION)
+  const format = identity.attestation?.format
+  if (containsV21 || format === CURRENT_ROLLBACK_ATTESTATION) {
+    assert.equal(format, CURRENT_ROLLBACK_ATTESTATION,
+      'The retained v21 migration cannot be verified under a different attestation')
+    const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV21MigrationInventory(identity.sourceTree)
+    for (const path of FRACTIONAL_GATEWAY_PROTECTED_PATHS) {
+      assert.ok(identity.sourceTree.some(entry => entry.path === path), `Retained v21 proof omits ${path}`)
+      assert.match(identity.protectedFiles[path] ?? '', /^[a-f0-9]{64}$/u, `Retained v21 proof does not protect ${path}`)
+    }
+    const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
+    assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Current floor lacks the catalog digest for the measured PostgreSQL major')
+    assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
+      schemaDigest, checks: [...REQUIRED_RETAINED_V21_CHECKS] }, 'New rollback floors require the exact retained v21 schema transition receipt')
+  } else if (containsRetainedV20 || format === HISTORICAL_V20_ROLLBACK_ATTESTATION) {
+    assert.equal(format, HISTORICAL_V20_ROLLBACK_ATTESTATION,
       'The retained v20 migration cannot be verified under a different attestation')
     const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV20MigrationInventory(identity.sourceTree)
     const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
     assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Current floor lacks the catalog digest for the measured PostgreSQL major')
     assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
-      schemaDigest, checks: [...REQUIRED_RETAINED_V20_CHECKS] }, 'New rollback floors require the exact retained v20 schema transition receipt')
+      schemaDigest, checks: [...REQUIRED_RETAINED_V20_CHECKS] }, 'Historical rollback floors require the exact retained v20 schema transition receipt')
   }
   assert.deepEqual(build.command, ['npm', 'run', 'build'])
   assert.match(build.nodeVersion, /^v24\./u, 'Rollback certification requires the supported Node 24 build')

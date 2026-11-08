@@ -4,6 +4,9 @@ import { basename } from 'node:path'
 import { applyMigrationSqlForTest } from './postgres-test-migrations.mjs'
 
 const LAST = '0412_crm_calendar_occurrence_claims.sql'
+const PRODUCT_CAPABILITY = '0373_fractional_crm_product_read.sql'
+const PRODUCT_CHECKSUM = '0e01f96a2862c22e785cd16a49a5079d0e9492f7503e155941b45e111b64a764'
+const FOLDER_CAPABILITY = '0403_fractional_crm_customer_folder_capability.sql'
 const hash = value => createHash('sha256').update(value).digest('hex')
 const denied = code => error => error?.code === code
 const one = result => {
@@ -13,7 +16,7 @@ const one = result => {
 
 // Called only with the rolling runner's second blank owned database, not a
 // connection string or an environment-selected target. The caller owns it.
-export async function checkRetainedV20({ pool, read, migrationPaths, loadCrmPersistence, loadOccurrenceClaims }) {
+export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPersistence, loadOccurrenceClaims, loadFractionalGateway }) {
   const query = (sql, values) => pool.query(sql, values)
   async function transaction(fn) {
     const client = await pool.connect()
@@ -33,7 +36,16 @@ export async function checkRetainedV20({ pool, read, migrationPaths, loadCrmPers
   assert.ok(migrationPaths.every(path => /^db\/migrations\/\d{4}_[a-z0-9_]+\.sql$/u.test(path)))
   assert.deepEqual(migrationPaths, [...new Set(migrationPaths)].sort())
   assert.equal(basename(migrationPaths.at(-1)), LAST)
+  assert.ok(migrationPaths.includes(`db/migrations/${PRODUCT_CAPABILITY}`))
+  assert.ok(migrationPaths.includes(`db/migrations/${FOLDER_CAPABILITY}`))
   const ledger = []
+  const retainedCredential = randomUUID(), retainedGatewayInstance = randomUUID(), retainedGatewayDeployment = randomUUID()
+  const retainedGatewayWorkspace = randomUUID(), retainedGatewayPipeline = randomUUID(), retainedGatewayRoot = randomUUID()
+  const retainedGatewayOwner = 'retained-fractional-gateway@example.invalid'
+  const retainedToken = `fcg_${retainedCredential.replaceAll('-','')}_${'R'.repeat(43)}`
+  const credentialRows = async client => (await client.query(`SELECT to_jsonb(c) AS row
+    FROM fractional_crm_gateway_credentials c ORDER BY c.id`)).rows
+  let beforeFolderUpgrade, retainedGatewayReference
   const migrationClient = await pool.connect()
   try {
     await migrationClient.query(`CREATE TABLE schema_migrations (
@@ -41,13 +53,45 @@ export async function checkRetainedV20({ pool, read, migrationPaths, loadCrmPers
     for (const path of migrationPaths) {
       const filename = basename(path), sql = read(path), checksum = hash(sql)
       assert.ok(sql.trim(), `Empty fixture migration: ${filename}`)
+      if (filename === PRODUCT_CAPABILITY) assert.equal(checksum, PRODUCT_CHECKSUM, 'Do not rewrite the published product migration')
+      if (filename === FOLDER_CAPABILITY) {
+        // A preexisting, enabled product grant exercises the real upgrade,
+        // unlike a fresh schema on which there are no rows to invalidate.
+        assert.equal(one(await migrationClient.query('SELECT checksum FROM schema_migrations WHERE filename=$1', [PRODUCT_CAPABILITY])).checksum,
+          PRODUCT_CHECKSUM)
+        const { auth } = loadFractionalGateway(query, transaction)
+        await migrationClient.query("INSERT INTO app_users(email,role,status,activated_at) VALUES($1,'owner','active',now())", [retainedGatewayOwner])
+        retainedGatewayReference = one(await migrationClient.query(`INSERT INTO workspace_organizations(id,name,organization_type,created_by,updated_by)
+          VALUES($1,'Synthetic Fractional retained workspace','root',$2,$2) RETURNING reference_code`, [retainedGatewayWorkspace, retainedGatewayOwner])).reference_code
+        await migrationClient.query(`INSERT INTO app_user_organization_memberships(user_email,organization_id,role,status,created_by,updated_by)
+          VALUES($1,$2,'owner','active',$1,$1)`, [retainedGatewayOwner, retainedGatewayWorkspace])
+        await migrationClient.query(`INSERT INTO pipeline_spaces(id,name,owner_email,workspace_organization_id,is_default)
+          VALUES($1,'Synthetic Fractional retained pipeline',$2,$3,true)`, [retainedGatewayPipeline, retainedGatewayOwner, retainedGatewayWorkspace])
+        await migrationClient.query(`INSERT INTO crm_organizations(id,pipeline_id,suitecrm_id,source_key,identity_key,reference_code,name,
+          source_hash,workspace_organization_id,relationship_type,created_by,updated_by)
+          VALUES($1::uuid,$2,$1::text,'retained-fractional-root','retained-fractional-root',$3,'Synthetic Fractional retained root',
+          'root',$4,'workspace_root',$5,$5)`, [retainedGatewayRoot, retainedGatewayPipeline, retainedGatewayReference, retainedGatewayWorkspace, retainedGatewayOwner])
+        await migrationClient.query(`INSERT INTO fractional_crm_gateway_credentials(id,token_hash,source_instance_id,workspace_organization_id,
+          pipeline_id,root_company_global_id,capabilities,fractional_deployment_id,fractional_organization_id,actor_email,expires_at,enabled)
+          VALUES($1,$2,$3,$4,$5,$6,ARRAY['crm.product.read'],$7,'synthetic-retained-fractional',$8,now()+interval '1 hour',true)`,
+        [retainedCredential, auth.hashFractionalCrmGatewayToken(retainedToken), retainedGatewayInstance, retainedGatewayWorkspace,
+          retainedGatewayPipeline, retainedGatewayReference, retainedGatewayDeployment, retainedGatewayOwner])
+        beforeFolderUpgrade = await credentialRows(migrationClient)
+        assert.equal(beforeFolderUpgrade.length, 1)
+        assert.deepEqual(beforeFolderUpgrade[0].row.capabilities, ['crm.product.read'])
+        assert.equal(beforeFolderUpgrade[0].row.enabled, true)
+        assert.equal(beforeFolderUpgrade[0].row.revoked_at, null)
+      }
       await applyMigrationSqlForTest(migrationClient, filename, sql, { checksum })
       ledger.push({ filename, checksum, applied: true })
+      if (filename === FOLDER_CAPABILITY) assert.deepEqual(await credentialRows(migrationClient), beforeFolderUpgrade)
     }
   } finally { migrationClient.release() }
   const readLedger = async () => (await query(`SELECT filename,checksum,applied_at IS NOT NULL AS applied
     FROM schema_migrations ORDER BY filename COLLATE "C"`)).rows
   assert.deepEqual(await readLedger(), ledger)
+  assert.ok(beforeFolderUpgrade)
+  assert.deepEqual(await credentialRows(pool), beforeFolderUpgrade)
   const checks = ['full_migration_checksum_ledger']
 
   const owner = 'retained-v20@example.invalid'
@@ -245,5 +289,32 @@ export async function checkRetainedV20({ pool, read, migrationPaths, loadCrmPers
   const capability = one(await query("SELECT current_setting('clawpilot.crm_shared_write_v1',true) AS flag")).flag
   assert.notEqual(capability, 'on', 'Current writer capability must be transaction-local')
   checks.push('retained_native_authority_and_recovery_controls_unchanged')
+
+  const product = one(await query(`INSERT INTO crm_products(pipeline_id,source_key,name,product_type,price,currency,active,source_hash)
+    VALUES($1,$2,'Synthetic retained Fractional service','Service',12.34,'USD',true,$3) RETURNING id,reference_code`,
+  [retainedGatewayPipeline, randomUUID(), fixtureDigest]))
+  const { auth, gateway } = loadFractionalGateway(query, transaction)
+  const origin = 'https://clawpilot.example.invalid'
+  const authenticate = capability => auth.authenticateFractionalCrmGateway(new Request(`${origin}/api/integrations/fractional-crm/v1/products`, {
+    headers: { authorization: `Bearer ${retainedToken}` },
+  }), { origin, sourceInstanceId: retainedGatewayInstance }, gateway.readFractionalCrmCredential, capability)
+  const gatewayEffects = async () => one(await query(`SELECT (SELECT count(*) FROM fractional_crm_gateway_operations) AS operations,
+    (SELECT count(*) FROM crm_fractional_customer_folders) AS folders,(SELECT count(*) FROM sync_outbox) AS outbox`))
+  const effectsBeforeRead = await gatewayEffects()
+  const principal = await authenticate('crm.product.read')
+  assert.deepEqual([principal.credentialId, principal.pipelineId, principal.sourceInstanceId, principal.capabilities],
+    [retainedCredential, retainedGatewayPipeline, retainedGatewayInstance, ['crm.product.read']])
+  const catalogProduct = await gateway.readFractionalCrmProduct(principal, product.reference_code)
+  assert.equal(catalogProduct.recordId, product.id)
+  assert.equal(catalogProduct.scope.workspaceOrganizationId, retainedGatewayWorkspace)
+  assert.equal(catalogProduct.invoiceDefaultVerified, false)
+  assert.deepEqual((await gateway.listFractionalCrmProducts(principal, { limit: 10 })).items.map(item => item.globalId), [product.reference_code])
+  await assert.rejects(() => authenticate('crm.customer-folder.write'), denied('CAPABILITY_DENIED'))
+  await assert.rejects(() => gateway.readFractionalCrmCustomerFolder(principal, retainedGatewayReference, 'synthetic-retained-customer'),
+    denied('CAPABILITY_DENIED'))
+  assert.deepEqual(await credentialRows(pool), beforeFolderUpgrade)
+  assert.deepEqual(await gatewayEffects(), effectsBeforeRead)
+  assert.deepEqual(await readLedger(), ledger)
+  checks.push('retained_fractional_product_credential_and_scope_unchanged')
   return { migrationCount: ledger.length, lastMigration: migrationPaths.at(-1), checks }
 }
