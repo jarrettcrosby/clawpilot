@@ -22,6 +22,22 @@ const targetKeys=['projectId','environmentId','serviceId','deploymentId','deploy
   'database','databasePrincipal','mariaStoreFingerprint','serviceUserId','oauthClientId','cliSourceHash','imagePackageHash'] as const
 const matches=(v:unknown,re:RegExp):v is string=>typeof v==='string'&&re.test(v)
 function need(v:unknown,code:string):asserts v{requireNativeEmail(v,'legacy_dispatch_transport_'+code)}
+const authenticatedTerminalReceipts=new WeakMap<object,string>()
+function freezeReceipt(value:unknown) {
+  if(value&&typeof value==='object'){
+    for(const child of Object.values(value))freezeReceipt(child)
+    Object.freeze(value)
+  }
+}
+/** Check provenance, not just a receipt's shape. Copies and injected runners
+ * can never supply evidence for independent settlement attestation. */
+export function assertAuthenticatedNativeEmailRecoveryReceipt(request:NativeEmailPublicationRequest,value:unknown):void {
+  need(value&&typeof value==='object'&&authenticatedTerminalReceipts.has(value),'receipt_not_authenticated')
+  const exact=prepareNativeEmailPublication({command:request.command,nativePolicyFingerprint:request.nativePolicyFingerprint,
+    allowedReaderSuiteCrmUserIds:request.allowedReaderSuiteCrmUserIds})
+  need(exact.commandHash===request.commandHash&&exact.requestFingerprint===request.requestFingerprint
+    &&authenticatedTerminalReceipts.get(value)===exact.requestFingerprint,'receipt_request_changed')
+}
 type Action='prepare'|'publish'|'resolve'
 type Packet=Readonly<{request:NativeEmailPublicationRequest;permit:NativeEmailRecoveryDispatchPermit}>
 export type NativeEmailRecoveryDeferredPublish=Readonly<{request:NativeEmailPublicationRequest;fence:NativeEmailRecoveryWriterFence;
@@ -48,12 +64,14 @@ export function nativeEmailRecoveryCliTargetFingerprint(target:NativeEmailRecove
  * signing key or attestation key. The explicit pre-registered identity
  * avoids interactive key registration. Neither opens a window nor retries. */
 export function createNativeEmailRecoveryCliTransport(options:Options,
-  run:NativeEmailRecoveryDuplexCommandRunner=createNativeEmailRecoveryDuplexCommandRunner()) {
+  run?:NativeEmailRecoveryDuplexCommandRunner) {
   const {railwayBinary,railwayBinarySha256,railwayIdentityFile,transportAttestationKey}=options, t=checkedTarget(options.target)
   need(typeof railwayBinary==='string'&&isAbsolute(railwayBinary)&&matches(railwayBinarySha256,HASH)
     &&typeof railwayIdentityFile==='string'&&isAbsolute(railwayIdentityFile)&&!railwayIdentityFile.includes('\0')
-    &&typeof run==='function','binary_config')
+    &&(run===undefined||typeof run==='function'),'binary_config')
   need(Buffer.isBuffer(transportAttestationKey)&&transportAttestationKey.length===32,'ready_key')
+  const executeCommand=run??createNativeEmailRecoveryDuplexCommandRunner()
+  const authenticateResults=run===undefined
   const attestationKey=Buffer.from(transportAttestationKey)
   const targetFingerprint=nativeEmailRecoveryCliTargetFingerprint(t)
   const checkedRequest=(request:NativeEmailPublicationRequest)=>{
@@ -74,7 +92,8 @@ export function createNativeEmailRecoveryCliTransport(options:Options,
     need(Buffer.byteLength(stdin,'utf8')<=650_000,'packet_bound')
     return stdin
   }
-  const execute=async(action:Action,fenceEpoch:string,expiresAt:number,stdin:string|(()=>Promise<string>),exactFence=false)=>{
+  const execute=async(verified:NativeEmailPublicationRequest,action:Action,fenceEpoch:string,expiresAt:number,
+    stdin:string|(()=>Promise<string>),exactFence=false)=>{
     const stat=lstatSync(railwayBinary)
     need(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o022)===0&&stat.size<=268435456
       &&createHash('sha256').update(readFileSync(railwayBinary)).digest('hex')===railwayBinarySha256,'binary_changed')
@@ -90,7 +109,7 @@ export function createNativeEmailRecoveryCliTransport(options:Options,
       authorizationRequested=true
       return stdin()
     }
-    const output=await run({program:railwayBinary,args:['ssh','--project',t.projectId,'--environment',t.environmentId,
+    const output=await executeCommand({program:railwayBinary,args:['ssh','--project',t.projectId,'--environment',t.environmentId,
       '--service',t.serviceId,'--deployment-instance',t.deploymentInstanceId,'--identity-file',railwayIdentityFile,
       '--','php',CLI,action,challenge.nonce],stdin:gatedInput,verifyReady:line=>{
       if(readyVerified)return false
@@ -101,16 +120,29 @@ export function createNativeEmailRecoveryCliTransport(options:Options,
     let value:unknown
     try{value=JSON.parse(output)}catch{need(false,'output_json')}
     need(value&&typeof value==='object'&&!Array.isArray(value)&&output===nativeEmailCanonicalJson(value)+'\n','output_canonical')
+    if(authenticateResults&&action!=='prepare'){
+      const {verifyNativeEmailPublicationReceipt}=await import('./nativeEmailPublicationTransport')
+      try {
+        verifyNativeEmailPublicationReceipt(verified,value)
+      } catch {
+        // Keep the existing exchange contract: the caller classifies an invalid
+        // result as uncertain. Never give that result settlement provenance.
+        return value
+      }
+      freezeReceipt(value)
+      authenticatedTerminalReceipts.set(value,verified.requestFingerprint)
+    }
     return value
   }
   return Object.freeze({targetFingerprint,async exchange({request,permit}:Packet){
     const action=permit?.proof?.action
     need(action==='prepare'||action==='publish'||action==='resolve','packet_scope')
     need(action!=='publish','publish_requires_readiness')
-    return execute(action,permit.proof.fenceEpoch,permit.proof.expiresAt,encode(checkedRequest(request),permit,action))
+    const verified=checkedRequest(request)
+    return execute(verified,action,permit.proof.fenceEpoch,permit.proof.expiresAt,encode(verified,permit,action))
   },async exchangePublish({request,fence:input,authorize}:NativeEmailRecoveryDeferredPublish){
     const verified=checkedRequest(request),fence=Object.freeze({...input})
     need(fence.targetFingerprint===targetFingerprint&&matches(fence.fenceEpoch,UUID)&&typeof authorize==='function','packet_scope')
-    return execute('publish',fence.fenceEpoch,fence.expiresAt,async()=>encode(verified,await authorize(),'publish',fence),true)
+    return execute(verified,'publish',fence.fenceEpoch,fence.expiresAt,async()=>encode(verified,await authorize(),'publish',fence),true)
   }})
 }

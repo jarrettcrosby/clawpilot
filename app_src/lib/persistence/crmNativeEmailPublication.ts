@@ -3,7 +3,7 @@ import { query, withTransaction } from './postgres'
 import { enqueuePipelineSyncOutboxWithClient } from './pipeline'
 import { reviewedEmailAudienceUnderNativeControlWithClient, type CrmOutboxItem } from './crm'
 import { crmSourceHash } from '../crm/stableId'
-import { nativeEmailDigest, prepareNativeEmailPublication, requireNativeEmail,
+import { nativeEmailCanonicalJson, nativeEmailDigest, prepareNativeEmailPublication, requireNativeEmail,
   type NativeEmailAdmission, type NativeEmailPublicationRequest, type NativeEmailCapabilityPins } from '../crm/nativeEmailPublication'
 import { prepareNativeEmailCapabilityContract, type NativeEmailCapabilityContract } from '../crm/nativeEmailCapabilityContract'
 import { prepareNativeEmailAuthorityTransition, prepareNativeEmailAuthorityCommand, verifyNativeEmailAuthorityReceipt,
@@ -14,6 +14,7 @@ import { assertNativeEmailPublicationWorkLease, claimNativeEmailPublicationResol
   type NativeEmailPublicationWorkContext, type NativeEmailPublicationWorkLease } from '../crm/nativeEmailPublicationWorkContext'
 import { verifyNativeEmailPublicationReceipt } from '../crm/nativeEmailPublicationTransport'
 import { assertVerifiedLegacyEmailRecoveryReleaseApproval, type LegacyEmailRecoveryReleaseApproval } from '../crm/legacyEmailRecoveryReleaseApproval'
+import { assertVerifiedLegacyHeldEmailRecoveryApproval, type LegacyHeldEmailRecoveryApproval } from '../crm/legacyHeldEmailRecoveryApproval'
 import { assertNativeEmailRecoveryDispatchSigner, type NativeEmailRecoveryDispatchPermit,
   type NativeEmailRecoveryMaintenanceDispatch, type NativeEmailRecoveryWriterFence } from '../crm/nativeEmailRecoveryDispatchPermit'
 import type { NativeEmailWorkerCandidate, NativeEmailWorkerMode, NativeEmailWorkerPersistence,
@@ -415,7 +416,11 @@ export function createPostgresNativeEmailWorkerPersistence(options: { maxAttempt
 
 type LegacyReleaseSelection = Pick<LegacyEmailRecoveryReleaseApproval,'holdId'|'outboxId'|'nativeOperationId'|'requestFingerprint'>
 type LegacyReleaseOptions = { selection: LegacyReleaseSelection; transaction: typeof withTransaction;
-  initialApproval?: Readonly<LegacyEmailRecoveryReleaseApproval>; maintenanceDispatch?: NativeEmailRecoveryMaintenanceDispatch }
+  maintenanceDispatch?: NativeEmailRecoveryMaintenanceDispatch } & (
+  { initialApproval?: Readonly<LegacyEmailRecoveryReleaseApproval>; heldOriginal?: never }
+  | { initialApproval?: never; heldOriginal: Readonly<{stageReceiptHash:string; nativeAuthorityInstanceId:string;
+    initialApproval?: LegacyHeldEmailRecoveryApproval;
+    receiptAttestor: Readonly<{user:string; transaction:typeof withTransaction}>}> })
 type MaintenanceDispatchSelection = {action:'prepare';item:CrmOutboxItem}
   | {action:'publish'|'resolve';request:NativeEmailPublicationRequest;lease:NativeEmailPublicationWorkLease}
 type MaintenancePublishAuthorization = Readonly<{request:NativeEmailPublicationRequest;fence:NativeEmailRecoveryWriterFence;
@@ -466,9 +471,13 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
   withMaintenanceInitialPublish<T>(item:CrmOutboxItem,expected:NativeEmailWorkerCandidate,owner:string,
     run:MaintenanceInitialPublishRun<T>):Promise<T>
   maintenancePublishState(request:NativeEmailPublicationRequest):Promise<NativeEmailAdmission['state']|'not_admitted'>
+  allowsExistingAdmissionFirstPublish?: boolean
 } {
   const { holdId,outboxId,nativeOperationId,requestFingerprint } = options.selection
   const { transaction: privateTransaction,initialApproval } = options
+  const heldOriginal=options.heldOriginal&&Object.freeze({...options.heldOriginal,
+    receiptAttestor:Object.freeze({...options.heldOriginal.receiptAttestor})})
+  const heldApproval=heldOriginal?.initialApproval
   const maintenance=options.maintenanceDispatch && Object.freeze({...options.maintenanceDispatch})
   requireNativeEmail([holdId,outboxId].every(v=>typeof v==='string' && UUID.test(v))
     && [nativeOperationId,requestFingerprint].every(v=>typeof v==='string' && HASH.test(v))
@@ -489,6 +498,20 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
       && initialApproval.nativeOperationId===nativeOperationId && initialApproval.requestFingerprint===requestFingerprint,
     'legacy_release_approval_selection_changed')
   }
+  if (heldOriginal) {
+    requireNativeEmail(maintenance && HASH.test(heldOriginal.stageReceiptHash)
+      && /^[A-Za-z0-9][A-Za-z0-9-]{0,35}(?![\s\S])/u.test(heldOriginal.nativeAuthorityInstanceId)
+      && typeof heldOriginal.receiptAttestor.transaction==='function' && heldOriginal.receiptAttestor.transaction!==privateTransaction
+      && /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}(?![\s\S])/u.test(heldOriginal.receiptAttestor.user),
+    'legacy_held_recovery_private_boundary')
+    if (heldApproval) {
+      assertVerifiedLegacyHeldEmailRecoveryApproval(heldApproval)
+      requireNativeEmail(heldApproval.holdBatchId===holdId && heldApproval.outboxId===outboxId
+        && heldApproval.nativeAuthorityInstanceId===heldOriginal.nativeAuthorityInstanceId
+        && heldApproval.nativeOperationId===nativeOperationId && heldApproval.requestFingerprint===requestFingerprint,
+      'legacy_release_approval_selection_changed')
+    }
+  }
   const store = new PostgresNativeEmailPublicationStore(transaction)
   const selected = (request: NativeEmailPublicationRequest) => requireNativeEmail(
     request.command.operationId===nativeOperationId && request.requestFingerprint===requestFingerprint
@@ -500,22 +523,34 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     return second
   }
   const approval = async (tx: PoolClient) => {
-    requireNativeEmail(initialApproval,'legacy_release_approval_required')
+    const verified=heldOriginal?heldApproval:initialApproval
+    requireNativeEmail(verified,'legacy_release_approval_required')
     const second=await databaseSecond(tx)
-    requireNativeEmail(second>=initialApproval.issuedAt && second<initialApproval.expiresAt,
+    requireNativeEmail(second>=verified.issuedAt && second<verified.expiresAt,
       'legacy_release_approval_expired')
-    return initialApproval
+    return verified
   }
   const lockedHold = async (tx: PoolClient) => {
     const c = await control(tx)
     requireNativeEmail(c.enabled===true && c.active_transition_id===null,'legacy_release_control_changed')
-    const result = await tx.query(`SELECT h.*,p.workspace_organization_id::text AS workspace_id
+    const result = heldOriginal?await tx.query(`SELECT h.local_id,h.native_id,h.global_id,h.pipeline_id,h.workspace_id,s.intent_hash
+      FROM crm_legacy_email_terminal_hold.held h JOIN crm_legacy_email_terminal_hold.staged s USING(outbox_id)
+      JOIN crm_legacy_email_terminal_hold.verified_batch b ON b.batch=h.batch
+      WHERE h.batch=$1::uuid AND h.outbox_id=$2::uuid AND s.receipt_hash=$3 AND b.manifest#>>'{scope,nativeAuthorityInstanceId}'=$4`,
+      [holdId,outboxId,heldOriginal.stageReceiptHash,heldOriginal.nativeAuthorityInstanceId])
+      :await tx.query(`SELECT h.*,p.workspace_organization_id::text AS workspace_id
       FROM crm_legacy_email_recovery_holds h JOIN pipeline_spaces p ON p.id=h.pipeline_id
       WHERE h.operation_id=$1::uuid AND h.outbox_id=$2::uuid`,[holdId,outboxId])
     requireNativeEmail(result.rows.length===1,'legacy_release_hold_missing')
     return { c,h:result.rows[0] }
   }
-  const findRegistration = async (tx: PoolClient) => (await tx.query(`SELECT * FROM crm_legacy_email_recovery_releases
+  const findRegistration = async (tx: PoolClient) => (heldOriginal?await tx.query(`SELECT r.request_fingerprint,r.approval_hash,
+      v.proof->>'generation' AS generation,v.proof->>'activationReceiptHash' AS activation_receipt_hash,
+      v.proof->>'sourceFingerprint' AS source_fingerprint,v.intent_hash
+      FROM crm_legacy_email_terminal_hold.released r JOIN crm_legacy_email_terminal_hold.verified_recovery v
+        ON v.approval_hash=r.approval_hash AND v.outbox_id=r.outbox_id
+      WHERE r.outbox_id=$1::uuid AND r.native_operation_id=$2 AND r.stage_receipt_hash=$3`,[outboxId,nativeOperationId,heldOriginal.stageReceiptHash])
+    :await tx.query(`SELECT * FROM crm_legacy_email_recovery_releases
       WHERE hold_id=$1::uuid AND outbox_id=$2::uuid AND native_operation_id=$3`,[holdId,outboxId,nativeOperationId])).rows[0]
   const registration = async (tx: PoolClient) => {
     const r=await findRegistration(tx)
@@ -537,16 +572,18 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     if (registered) {
       const r = await registration(tx)
       requireNativeEmail(Number(r.generation)===cmd.generation && r.activation_receipt_hash===c.activation_receipt_hash
-        && r.intent_hash===h.release_intent_hash && r.source_fingerprint===source,'legacy_release_registration_changed')
+        && r.intent_hash===(heldOriginal?h.intent_hash:h.release_intent_hash) && r.source_fingerprint===source,'legacy_release_registration_changed')
       return
     }
     // An expired envelope cannot authorize new writes. Its previously verified
     // intent can still identify an untouched parked hold for read-only status.
-    const a=readOnlyStatus?initialApproval:await approval(tx)
+    const a=readOnlyStatus?(heldOriginal?heldApproval:initialApproval):await approval(tx)
     requireNativeEmail(a,'legacy_release_approval_required')
     requireNativeEmail(a.localId===cmd.localId && a.nativeId===cmd.suiteCrmId && a.globalId===cmd.globalId
-      && a.pipelineId===cmd.pipelineId && a.workspaceId===cmd.workspaceId && a.retiredOutboxId===h.retired_outbox_id
-      && a.intentHash===h.release_intent_hash && a.retirementReceiptHash===h.retirement_receipt_hash
+      && a.pipelineId===cmd.pipelineId && a.workspaceId===cmd.workspaceId
+      && (heldOriginal?'holdBatchId' in a && a.intentHash===h.intent_hash:
+        'retiredOutboxId' in a && a.retiredOutboxId===h.retired_outbox_id && a.intentHash===h.release_intent_hash
+        && a.retirementReceiptHash===h.retirement_receipt_hash)
       && a.activationReceiptHash===c.activation_receipt_hash && a.sourceFingerprint===source,
     'legacy_release_approval_preimage_changed')
   }
@@ -571,11 +608,12 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     const tx=client as PoolClient
     const current=await makeCandidate(tx,item)
     requireNativeEmail(same(current.request,request) && same(current.context,expected.context),'legacy_release_candidate_changed')
+    const a=await approval(tx)
+    if (heldOriginal) await tx.query('SELECT crm_legacy_email_terminal_hold.register_release($1::uuid,$2)',[outboxId,a.approvalHash])
     setLease(await registerNativeEmailPublicationWork(tx,request,current.context,owner,async (_tx,_request,context,action) => {
       requireNativeEmail(action==='register' && same(context,current.context),'legacy_release_registration_changed')
     }))
-    const a=await approval(tx)
-    await tx.query('SELECT clawpilot_crm_legacy_email_register_release($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8)',
+    if (!heldOriginal) await tx.query('SELECT clawpilot_crm_legacy_email_register_release($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8)',
       [holdId,outboxId,nativeOperationId,requestFingerprint,a.activationReceiptHash,a.intentHash,a.approvalHash,a.sourceFingerprint])
   }
   const approveDispatch=async(tx:PoolClient,request:NativeEmailPublicationRequest)=>{
@@ -624,6 +662,15 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
       FROM crm_native_email_publication_work WHERE operation_id=$1`,[nativeOperationId])).rows[0]
     return {approvalHash:String(registered.approval_hash),leaseExpiresAt:Number(work?.expiry)}
   }
+  const heldReleaseState=async(tx:PoolClient)=>{
+    requireNativeEmail(heldOriginal,'legacy_held_recovery_private_boundary')
+    const rows=(await tx.query('SELECT crm_legacy_email_terminal_hold.resolve_release($1::uuid,$2,$3,$4) AS value',
+      [outboxId,heldOriginal.stageReceiptHash,nativeOperationId,requestFingerprint])).rows
+    const state=rows[0]?.value?.state
+    requireNativeEmail(rows.length===1 && (state==='staged'||state==='dispatched'||state==='committed'||state==='cancelled'||state==='unknown'),
+    'legacy_release_registration_changed')
+    return state as 'staged'|'dispatched'|'committed'|'cancelled'|'unknown'
+  }
   const signFirstPublish=async(tx:PoolClient,request:NativeEmailPublicationRequest,lease:NativeEmailPublicationWorkLease,
     fence:NativeEmailRecoveryWriterFence,assertAuthorizing:()=>void)=>{
     requireNativeEmail(maintenance,'legacy_dispatch_unconfigured')
@@ -671,6 +718,7 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     })
   }
   return {
+    allowsExistingAdmissionFirstPublish:!heldOriginal,
     async loadItem() {
       return transaction(async tx => {
         const item=await loadParkedItem(tx)
@@ -685,6 +733,7 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     }),
     candidate: item => transaction(tx=>makeCandidate(tx,item)),
     async admit(item,expected,owner) {
+      requireNativeEmail(!heldOriginal,'legacy_dispatch_publish_requires_readiness')
       selected(expected.request)
       let lease: NativeEmailPublicationWorkLease | undefined
       const admission=await store.admit(input(expected.request),admissionAuthorizer(item,expected,owner,value=>{lease=value}))
@@ -692,7 +741,7 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
       return {admission,lease}
     },
     markDispatched: (request,lease) => transaction(async tx => {
-      requireNativeEmail(!maintenance,'legacy_dispatch_permit_required')
+      requireNativeEmail(!maintenance && !heldOriginal,'legacy_dispatch_permit_required')
       selected(request)
       const context=await assertNativeEmailPublicationWorkLease(tx,request,lease)
       await resolveAuthority(tx,request,context)
@@ -726,6 +775,7 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     },
     async withMaintenancePublish<T>(request:NativeEmailPublicationRequest,lease:NativeEmailPublicationWorkLease,
       run:(input:MaintenancePublishAuthorization)=>Promise<T>) {
+      requireNativeEmail(!heldOriginal,'legacy_dispatch_resolution_required')
       const exactRequest=freezeMaintenanceValue(structuredClone(request)),exactLease=freezeMaintenanceValue(structuredClone(lease))
       selected(exactRequest)
       // Compatibility only for an existing admission with its original live
@@ -753,7 +803,7 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
         // Migration 0405 checks the exact newly inserted release while its
         // admission is still `admitted`. Fire only that existing constraint
         // before advancing the row; any later failure still rolls it all back.
-        await tx.query('SET CONSTRAINTS public.crm_legacy_email_release_binding IMMEDIATE')
+        if (!heldOriginal) await tx.query('SET CONSTRAINTS public.crm_legacy_email_release_binding IMMEDIATE')
         return {permit:await signFirstPublish(tx,request,lease,fence,assertAuthorizing),lease}
       }),run)
     },
@@ -761,6 +811,10 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
       const exactRequest=structuredClone(request)
       selected(exactRequest)
       requireNativeEmail(same(prepareNativeEmailPublication(input(exactRequest)),exactRequest),'legacy_release_operation_changed')
+      if (heldOriginal) {
+        const state=await transaction(heldReleaseState)
+        return state==='staged'?'not_admitted':state
+      }
       return transaction(async tx=>{
         const c=await control(tx)
         requireNativeEmail(c.enabled===true && c.active_transition_id===null && c.active_initial_enrollment_id===null
@@ -788,6 +842,13 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     },
     async markUnknown(id) {
       requireNativeEmail(id===nativeOperationId,'legacy_release_operation_changed')
+      if (heldOriginal) {
+        // The original durable dispatch is already resolution-only. Never
+        // rewrite it or reopen first publish to classify an ambiguous result.
+        const state=await transaction(heldReleaseState)
+        requireNativeEmail(state==='dispatched'||state==='committed'||state==='cancelled','native_outcome_unknown')
+        return
+      }
       await transaction(registration)
       const admission=await store.get(id)
       selected(admission.request)
@@ -798,6 +859,21 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
       const admission=await store.get(id)
       selected(admission.request)
       requireNativeEmail(!admission.receipt,'reconciliation_required')
+      if (heldOriginal) {
+        requireNativeEmail(admission.state==='dispatched'||admission.state==='unknown','legacy_dispatch_resolution_required')
+        const lease=await transaction(async tx=>{
+          const claimed=(await tx.query('SELECT crm_legacy_email_terminal_hold.claim_resolution($1::uuid,$2,$3::uuid) AS value',
+            [outboxId,nativeOperationId,owner])).rows[0]?.value
+          const work=(await tx.query('SELECT context FROM crm_native_email_publication_work WHERE operation_id=$1',[nativeOperationId])).rows[0]
+          requireNativeEmail(claimed?.owner===owner && Number.isSafeInteger(claimed.fence) && claimed.fence>0
+            && typeof claimed.expiresAt==='string' && work?.context,'work_lease_not_owned')
+          const result:NativeEmailPublicationWorkLease={operationId:id,owner,fence:claimed.fence,expiresAt:claimed.expiresAt,context:work.context}
+          const context=await assertNativeEmailPublicationWorkLease(tx,admission.request,result)
+          await resolveAuthority(tx,admission.request,context)
+          return result
+        })
+        return {admission,lease}
+      }
       const lease=await transaction(tx=>claimNativeEmailPublicationResolution(tx,admission.request,owner,
         (client,request,context)=>resolveAuthority(client as PoolClient,request,context)))
       return {admission,lease}
@@ -805,6 +881,28 @@ export function createPrivateLegacyEmailRecoveryPersistence(options: LegacyRelea
     async settle(request,lease,value) {
       selected(request)
       const receipt=verifyNativeEmailPublicationReceipt(request,value)
+      if (heldOriginal) {
+        const {assertAuthenticatedNativeEmailRecoveryReceipt}=await import('../crm/nativeEmailRecoveryCliTransport')
+        assertAuthenticatedNativeEmailRecoveryReceipt(request,value)
+        const serialized=nativeEmailCanonicalJson(receipt)
+        await heldOriginal.receiptAttestor.transaction(async tx=>{
+          const role=await tx.query('SELECT session_user AS login,current_user AS role')
+          requireNativeEmail(role.rows.length===1 && role.rows[0].login===heldOriginal.receiptAttestor.user
+            && role.rows[0].role===role.rows[0].login,'legacy_held_recovery_attestor_login_changed')
+          const witness=await tx.query(`INSERT INTO crm_legacy_email_terminal_hold.verified_receipts(native_operation_id,receipt_hash,lease_fence)
+            VALUES($1,encode(public.digest($2::jsonb::text,'sha256'),'hex'),$3::bigint) ON CONFLICT DO NOTHING`,
+          [nativeOperationId,serialized,lease.fence])
+          requireNativeEmail(witness.rowCount===0||witness.rowCount===1,'legacy_held_recovery_attestation_changed')
+        })
+        await transaction(async tx=>{
+          const context=await assertNativeEmailPublicationWorkLease(tx,request,lease)
+          await resolveAuthority(tx,request,context)
+          const result=await tx.query('SELECT crm_legacy_email_terminal_hold.settle_release($1::uuid,$2,$3::uuid,$4::bigint,$5::jsonb) AS state',
+            [outboxId,nativeOperationId,lease.owner,lease.fence,serialized])
+          requireNativeEmail(result.rows.length===1 && result.rows[0].state===receipt.state,'legacy_release_settlement_changed')
+        })
+        return {synchronized:receipt.state==='committed',pipelineId:request.command.pipelineId,outboxId}
+      }
       // The store can short-circuit a terminal replay without its callbacks.
       // Pin that read to this immutable hold as well, not just the request ID.
       await transaction(registration)

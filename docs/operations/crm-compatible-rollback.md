@@ -273,19 +273,21 @@ node scripts/build-crm-compatible-rollback.mjs --verify /PRIVATE_OUTPUT/rollback
 
 `--check-transition` exercises the working-tree SQL against a disposable fixture
 but deliberately emits no certification receipt. `--check-retained-transition`
-also rehearses the full working-tree migration chain through v21/0412 in a
+also rehearses the full working-tree migration chain through v22/0417 in a
 second database on that same disposable instance. The rehearsal checks the
 checksum ledger, shared email identity and links across a writer reload,
 calendar occurrence claims, retained disabled native controls, and the original
-Fractional product-read credential across the folder migration. It still
-emits no receipt. Only the clean, pinned `--commit` invocation can qualify the
+Fractional product-read credential across the folder migration. It also checks
+that the same-job recovery migrations leave existing email and queue state
+unchanged, install no approvals or grants, and keep the new controls private.
+It emits no receipt. Only the clean, pinned `--commit` invocation can qualify the
 rollback artifact; its receipt binds that full rehearsal to the committed
 migration inventory and the observed strict catalog digest on the tested
 PostgreSQL major. Select the production major explicitly for this proof; source
 pins for other majors are not evidence that their writer reload was tested.
-An older transition receipt cannot certify v21.
+An older transition receipt cannot certify v22.
 Previously pinned archives remain independently verifiable and are not a
-writable fallback for the v21 schema or evidence of an attended live canary.
+writable fallback for the v22 schema or evidence of an attended live canary.
 
 Use the bundled Node 24 runtime or its verified equivalent. The build wrapper
 exports only committed source into a new private temporary directory, omits env

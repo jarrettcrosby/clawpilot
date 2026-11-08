@@ -18,6 +18,9 @@ const entries = Object.freeze({
   retirementApproval: 'app_src/lib/crm/legacyEmailRetirementApproval.ts',
   accountRepair: 'app_src/lib/persistence/crmLegacyEmailAccountRepair.ts',
   recoveryStage: 'app_src/lib/persistence/crmLegacyEmailRecoveryStage.ts',
+  heldStage: 'app_src/lib/persistence/crmHeldOriginalRecoveryStage.ts',
+  terminalHold: 'app_src/lib/persistence/crmLegacyEmailTerminalHold.ts',
+  heldApproval: 'app_src/lib/crm/legacyHeldEmailRecoveryApproval.ts',
   releaseApproval: 'app_src/lib/crm/legacyEmailRecoveryReleaseApproval.ts',
   maintenanceSigner: 'app_src/lib/crm/nativeEmailRecoveryDispatchPermit.ts',
   maintenanceOperator: 'app_src/lib/crm/nativeEmailRecoveryMaintenanceOperator.ts',
@@ -157,7 +160,7 @@ const exactSignature=(protocol,proof,key)=>sign('sha256',Buffer.from(protocol.na
 /** Exercise the actual private operator through the bounded exchange supplied
  * by the parent. It owns the real CLI, independently observed writer fence,
  * target binding and public-route denial checks, not this helper. */
-function createNativeJointRecoveryMaintenanceClient({app,maintenance,target,deadline,assertOutsideTransaction,inspectNative}) {
+export function createNativeJointRecoveryMaintenanceClient({app,maintenance,target,deadline,assertOutsideTransaction,inspectNative}) {
   assert.ok(maintenance&&typeof maintenance.withVerifiedFence==='function'&&typeof maintenance.exchange==='function'
     &&typeof maintenance.exchangePublish==='function')
   const signer=app.maintenanceSigner.createNativeEmailRecoveryDispatchSigner(maintenance.signer)
@@ -284,7 +287,8 @@ async function repairNativeJointLegacyEmail({app,query,withTransaction,getPostgr
 /** Synthetic source construction before RootA; exercise the real archive
  * controller using two restricted logins. The isolated container check is not
  * an attestation that any production writer is paused. */
-export async function archiveNativeJointLegacyEmail({query,withTransaction,getPostgresPool,authority,assertNativeAbsent,related,repairFirst=false}) {
+export async function archiveNativeJointLegacyEmail({query,withTransaction,getPostgresPool,authority,assertNativeAbsent,related,repairFirst=false,seedOnly=false}) {
+  assert.ok(!seedOnly||!repairFirst,'The same-original fixture must begin with already reviewed links')
   const {actorEmail,pipelineId,workspaceId,ownerNativeId}=authority
   assert.match(actorEmail,/^[^@]+@[^@]+\.invalid$/u)
   assert.ok([pipelineId,workspaceId].every(x=>typeof x==='string'&&uuid.test(x)))
@@ -378,6 +382,11 @@ export async function archiveNativeJointLegacyEmail({query,withTransaction,getPo
     return {generation,row:{outboxId:retiredOutboxId,localId,pipelineId,workspaceId,nativeId:suiteCrmId,
       globalId,attempts:8,...fingerprints}}
   })
+  if(seedOnly){
+    await assertNativeAbsent()
+    return {beforeQueue,selected,localId,retiredOutboxId,accounts,contacts,localPairs,related,
+      originalFingerprint:reviewedOriginal.row.rowFingerprint}
+  }
   let repaired=null
   if(repairFirst) {
     repaired=await repairNativeJointLegacyEmail({app,query,withTransaction,getPostgresPool,assertNativeAbsent,

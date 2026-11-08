@@ -474,6 +474,7 @@ async function completeTargetSchemaLockFixture(target) {
   )
   const before = await inspect()
   await target.query('CREATE SCHEMA IF NOT EXISTS crm_legacy_email_retirement')
+  await target.query('CREATE SCHEMA IF NOT EXISTS crm_legacy_email_terminal_hold')
   for (const { relation_name: relation, present } of before.rows) {
     assert.ok(isProductionRebindSchemaLockRelation(relation), `Unreviewed fixture relation ${relation}`)
     if (!present) {

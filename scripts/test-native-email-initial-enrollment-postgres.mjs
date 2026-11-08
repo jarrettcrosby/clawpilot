@@ -4,15 +4,19 @@
 // not native execution, cryptographic authentication or production activation.
 import assert from 'node:assert/strict'
 import {execFileSync} from 'node:child_process'
-import {randomUUID} from 'node:crypto'
+import {randomBytes,randomUUID} from 'node:crypto'
 import {createRequire} from 'node:module'
 import {readFileSync,readdirSync} from 'node:fs'
 import {disposablePostgresDockerArgs,disposablePostgresDockerCleanupArgs} from './lib/disposable-postgres-docker.mjs'
+import {startDisposableNativePostgres} from './lib/disposable-native-postgres.mjs'
 import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
+import {loadNativeJointLegacyEmailRecoveryApp} from './lib/native-joint-legacy-email-recovery.mjs'
 
 const args=process.argv.slice(2)
-assert.ok(args.length===0||(args.length===1&&/^--postgres-major=(16|18)$/.test(args[0])),'Only --postgres-major=16|18 is supported')
-const major=args[0]?.split('=')[1]??'16',require=createRequire(new URL('../app_src/package.json',import.meta.url))
+assert.ok(new Set(args).size===args.length&&args.every(arg=>arg==='--native-postgres'||/^--postgres-major=(16|18)$/u.test(arg))
+ &&args.filter(arg=>arg.startsWith('--postgres-major')).length<=1,'Only --postgres-major=16|18 and --native-postgres are supported')
+const major=args.find(arg=>arg.startsWith('--postgres-major'))?.split('=')[1]??'16'
+const nativePostgres=args.includes('--native-postgres'),require=createRequire(new URL('../app_src/package.json',import.meta.url))
 const {Pool}=require('pg'),ts=require('typescript'),cache=new Map()
 function load(path){if(cache.has(path))return cache.get(path);const module={exports:{}}
  const source=ts.transpileModule(readFileSync(new URL('../'+path,import.meta.url),'utf8'),
@@ -23,17 +27,27 @@ const protocol=load('app_src/lib/crm/nativeEmailPublication.ts'),capability=load
 const lineageProtocol=load('app_src/lib/crm/nativeEmailInitialInstallationLineage.ts')
 const canonical=protocol.nativeEmailCanonicalJson,hash=protocol.nativeEmailDigest,copy=value=>JSON.parse(JSON.stringify(value))
 const owner='initial.owner@example.invalid',outsider='initial.outsider@example.invalid',root=randomUUID(),account=randomUUID()
+const authorityInstance=randomUUID()
 const pipelines=[randomUUID(),randomUUID()].sort(),container=`clawpilot-native-initial-pg${major}-${process.pid}-${randomUUID().slice(0,8)}`
-let pool,started=false,checks=0
+let pool,started=false,checks=0,nativeFixture
 const check=async(label,run)=>{await run();checks++;console.log('PASS '+label)}
 try{
- execFileSync('docker',disposablePostgresDockerArgs(['run','--rm','-d','--name',container,'--pull','never',
-  '-e','POSTGRES_PASSWORD=initial_fixture','-e','POSTGRES_DB=initial_fixture','-p','127.0.0.1::5432',`pgvector/pgvector:pg${major}`]),{stdio:'pipe',timeout:60000});started=true
- const port=execFileSync('docker',['port',container,'5432/tcp'],{encoding:'utf8',timeout:10000}).match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
- assert.ok(port,'Fixture must bind loopback only')
- const localPoolOptions={host:'127.0.0.1',port:Number(port),database:'initial_fixture',user:'postgres',password:'initial_fixture',ssl:false,max:4,statement_timeout:20000}
+ let connection
+ if(nativePostgres){
+  nativeFixture=await startDisposableNativePostgres({major,fixturePrefix:'clawpilot-initial-pg-'})
+  connection=nativeFixture.connection
+ }else{
+  execFileSync('docker',disposablePostgresDockerArgs(['run','--rm','-d','--name',container,'--pull','never',
+   '-e','POSTGRES_PASSWORD=initial_fixture','-e','POSTGRES_DB=initial_fixture','-p','127.0.0.1::5432',`pgvector/pgvector:pg${major}`]),{stdio:'pipe',timeout:60000});started=true
+  const port=execFileSync('docker',['port',container,'5432/tcp'],{encoding:'utf8',timeout:10000}).match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1]
+  assert.ok(port,'Fixture must bind loopback only')
+  connection={host:'127.0.0.1',port:Number(port),database:'initial_fixture',user:'postgres',password:'initial_fixture',
+   ssl:false,options:'-c timezone=UTC'}
+ }
+ const localPoolOptions={...connection,max:4,connectionTimeoutMillis:1000,statement_timeout:20000}
  pool=new Pool(localPoolOptions)
  const until=Date.now()+30000;for(;;){try{await pool.query('SELECT 1');break}catch(error){if(Date.now()>until)throw error;await new Promise(r=>setTimeout(r,100))}}
+ if(nativeFixture)await nativeFixture.assertOwned(pool)
  const query=(sql,params)=>pool.query(sql,params)
  const tx=async fn=>{const c=await pool.connect();try{await c.query('BEGIN');const result=await fn(c);await c.query('COMMIT');return result}
   catch(error){await c.query('ROLLBACK');throw error}finally{c.release()}}
@@ -77,7 +91,7 @@ try{
   VALUES($1,'suitecrm','crm_interactions',$2,'upsert_record','{"body":"PRIVATE_EMAIL_BODY_SENTINEL","amount":123}')`,[queuedId,randomUUID()])
  const snapshot=async(queryable=pool)=>{const {rows}=await queryable.query(`SELECT s,encode(digest(s::text,'sha256'),'hex') AS fingerprint
   FROM (SELECT clawpilot_crm_native_initial_source_snapshot() AS s) q`);return rows[0]}
- const reservation=async(queryable=pool)=>{const live=await snapshot(queryable);return {live,generation:Number(live.s.generation),operationId:hash(randomUUID()),nativeInstanceId:'synthetic-native-fixture'}}
+ const reservation=async(queryable=pool)=>{const live=await snapshot(queryable);return {live,generation:Number(live.s.generation),operationId:hash(randomUUID()),nativeInstanceId:authorityInstance}}
  const reserve=async(f,actor=owner,queryable=pool)=>queryable.query(`INSERT INTO crm_native_email_initial_reservations(operation_id,actor_email,operator_account_id,root_workspace_id,
   native_instance_id,generation,source_snapshot,source_fingerprint) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
   [f.operationId,actor,account,root,f.nativeInstanceId,f.generation,f.live.s,f.live.fingerprint])
@@ -121,7 +135,7 @@ try{
    installedRuntimeFingerprint:result.installedRuntimeFingerprint,installationJournalFingerprint:hash('synthetic-journal')},signature:'A'.repeat(512)}
   return {plan,delta,approval,live,planHash,operationId:plan.operationId,generation}
  }
- const insert=async(f,actor=owner)=>query(`INSERT INTO crm_native_email_initial_enrollments(operation_id,plan,plan_canonical,plan_hash,native_delta,native_delta_canonical,
+ const insert=async(f,actor=owner,queryable=pool)=>queryable.query(`INSERT INTO crm_native_email_initial_enrollments(operation_id,plan,plan_canonical,plan_hash,native_delta,native_delta_canonical,
   delta_fingerprint,approval_envelope,approval_canonical,approval_hash,actor_email,operator_account_id,root_workspace_id,native_instance_id,generation,source_snapshot,source_fingerprint)
   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,[f.operationId,f.plan,canonical(f.plan),hash(f.plan),f.delta,canonical(f.delta),hash(f.delta),
    f.approval,canonical(f.approval),hash(f.approval),actor,account,root,f.plan.nativeInstanceId,f.generation,f.live.s,f.live.fingerprint])
@@ -379,6 +393,125 @@ try{
    await assert.rejects(stale.query('UPDATE sync_outbox SET available_at=now() WHERE id=$1',[queuedId]),e=>e.code==='40001')
   }finally{try{await stale.query('ROLLBACK')}finally{stale.release()}}
  })
+ const holdSchema='crm_legacy_email_terminal_hold'
+ const heldOutbox=randomUUID(),heldInteraction=randomUUID(),heldNative=randomUUID(),heldSourceHash=hash('synthetic initial hold source')
+ const heldAccounts=Array.from({length:2},()=>({local:randomUUID(),native:randomUUID(),contact:randomUUID(),nativeContact:randomUUID()}))
+ const heldPrimary=heldAccounts[0],heldAccountIds=heldAccounts.map(a=>a.native).sort(),heldContactIds=heldAccounts.map(a=>a.nativeContact).sort()
+ const heldContactAccounts=heldContactIds.map(contactId=>({contactId,accountId:heldAccounts.find(a=>a.nativeContact===contactId).native}))
+ const heldRows=async(queryable=pool)=>(await queryable.query(`SELECT o.id,to_jsonb(o)::text AS retained,to_jsonb(i)::text AS source,
+   encode(digest(to_jsonb(o)::text,'sha256'),'hex') AS fingerprint
+   FROM sync_outbox o JOIN crm_interactions i ON i.id::text=o.aggregate_id WHERE o.id=$1`,[heldOutbox])).rows
+ let heldBefore,heldReceipt,heldManifestRow
+ await check('an independently attested live terminal hold joins the existing demo evidence without changing either',async()=>{
+  const pipeline=pipelines[0]
+  for(const [index,a] of heldAccounts.entries()){
+   await query(`INSERT INTO crm_organizations(id,pipeline_id,suitecrm_id,source_key,identity_key,name,account_type,
+      relationship_type,source_hash,sync_status,suitecrm_synced_at,reference_code)
+     VALUES($1,$2,$3,$4,$4,$4,$5,'customer',$6,'synced',now(),allocate_crm_reference('ga'))`,
+    [a.local,pipeline,a.native,`synthetic held account ${index}`,index===0?'Customer':'Supplier',hash(a.native)])
+   await query(`INSERT INTO crm_contacts(id,pipeline_id,organization_id,suitecrm_id,source_key,identity_key,full_name,last_name,
+      source_hash,sync_status,suitecrm_synced_at,reference_code)
+     VALUES($1,$2,$3,$4,$5,$5,$5,'Contact',$6,'synced',now(),allocate_crm_reference('gc'))`,
+    [a.contact,pipeline,a.local,a.nativeContact,`synthetic held contact ${index}`,hash(a.nativeContact)])
+  }
+  const global=await tx(async c=>{
+   await c.query("SELECT set_config('clawpilot.crm_shared_write_v1','on',true)")
+   const record=(await c.query(`INSERT INTO crm_interactions(id,pipeline_id,source_key,subject,source_hash,suitecrm_id,suitecrm_module,
+     reference_code,source_payload,sync_status,provider_message_id,organization_id,contact_id) VALUES($1,$2,'fixture-live-hold','Synthetic held Email',$3,$4,
+     'Emails',allocate_crm_reference('gi'),'{}','failed',$5,$6,$7) RETURNING reference_code`,
+   [heldInteraction,pipeline,heldSourceHash,heldNative,'ac'+randomUUID().replaceAll('-',''),heldPrimary.local,heldPrimary.contact])).rows[0]
+   for(const [index,a] of heldAccounts.entries()){
+    await c.query('INSERT INTO crm_interaction_organizations(pipeline_id,interaction_id,organization_id,is_primary,sort_order) VALUES($1,$2,$3,$4,$5)',
+     [pipeline,heldInteraction,a.local,index===0,index])
+    await c.query('INSERT INTO crm_interaction_contacts(pipeline_id,interaction_id,contact_id,is_primary,sort_order) VALUES($1,$2,$3,$4,$5)',
+     [pipeline,heldInteraction,a.contact,index===0,index])
+   }
+   return record.reference_code
+  })
+  await query(`INSERT INTO sync_outbox(id,target_system,aggregate_type,aggregate_id,operation,payload,status,attempts,last_error,processed_at,idempotency_key)
+    VALUES($1,'suitecrm','crm_interactions',$2,'upsert_record',$3,'dead',8,'native_projection_proof_unavailable',now(),$4)`,
+  [heldOutbox,heldInteraction,{entity:'interactions',localId:heldInteraction,pipelineId:pipeline,suiteCrmId:heldNative,
+    suiteCrmModule:'Emails',attributes:{global_id_c:global,name:'Synthetic held Email',date_sent_received:'2026-10-30 13:00:00',
+     type:'archived',status:'read',description:'SYNTHETIC_BODY_NOT_IN_ENROLLMENT_PROOF',description_html:'',
+     parent_type:'Accounts',parent_id:heldPrimary.native,assigned_user_id:'1'},
+    relationships:[...heldAccountIds.map(relatedBeanId=>({linkFieldName:'accounts',relatedModuleName:'Accounts',relatedBeanId})),
+     ...heldContactIds.map(relatedBeanId=>({linkFieldName:'contacts',relatedModuleName:'Contacts',relatedBeanId}))],
+    emailProjection:{version:1,accounts:heldAccountIds,contacts:heldContactIds,contactAccounts:heldContactAccounts,
+     previousManaged:{accounts:[],contacts:[]},audience:{policy:'legacy-fixture-not-approved'}}},
+   `crm:interactions:v4:${heldInteraction}:Emails:${heldSourceHash}`])
+  heldBefore=await heldRows();assert.equal(heldBefore.length,1)
+  const blocked=await reservation()
+  await assert.rejects(reserve(blocked),error=>error?.code==='55000'&&/unresolved writers/u.test(error.message))
+  const pin=(await query(`SELECT ${holdSchema}.gate_fingerprint() AS gate,
+    encode(digest(to_jsonb(i)::text,'sha256'),'hex') AS source,encode(digest(o.payload::text,'sha256'),'hex') AS payload,
+    encode(digest(o.idempotency_key,'sha256'),'hex') AS key,${holdSchema}.relationship_fingerprint(i.id) AS relationships,
+    ${holdSchema}.provider_identity_fingerprint(i.id) AS provider
+    FROM sync_outbox o JOIN crm_interactions i ON i.id::text=o.aggregate_id WHERE o.id=$1`,[heldOutbox])).rows[0]
+  const operationId=randomUUID(),expectedManifest={version:1,action:'hold_exact_legacy_terminal_rows_in_place',
+    publicationDisposition:'hold_without_publication',operationId,scope:{projectId:randomUUID(),environmentId:randomUUID(),
+      postgresDatabaseFingerprint:hash('synthetic initial database'),appCommit:'a'.repeat(40),nativeDeploymentId:randomUUID(),
+      nativeReplicaId:randomUUID(),nativeCommit:'b'.repeat(40),nativeDatabaseFingerprint:hash('synthetic initial native database'),
+      nativeAuthorityInstanceId:authorityInstance},actorEmail:owner,operatorAccountId:account,rootWorkspaceId:root,
+    appGeneration:blocked.generation,gateFingerprint:pin.gate,appSourceFingerprint:blocked.live.fingerprint,fenceEpoch:randomUUID(),
+    fenceEvidenceFingerprint:hash('synthetic initial writer fence'),nativeAbsenceFingerprint:hash('synthetic initial native absence'),
+    historicalProviderOutcome:'unknown',rows:[{outboxId:heldOutbox,localId:heldInteraction,pipelineId:pipeline,workspaceId:root,
+      nativeId:heldNative,globalId:global,attempts:8,rowFingerprint:heldBefore[0].fingerprint,sourceFingerprint:pin.source,
+      payloadFingerprint:pin.payload,keyFingerprint:pin.key,relationshipFingerprint:pin.relationships,providerIdentityFingerprint:pin.provider}]}
+  heldManifestRow=expectedManifest.rows[0]
+  const crypto=require('node:crypto'),approvalApi=load('app_src/lib/crm/legacyEmailRetirementApproval.ts')
+  const fenceKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),operatorKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
+  const wrap=(proof,key)=>({proof,signature:crypto.sign('sha256',Buffer.from(canonical(proof),'ascii'),
+   {key,padding:crypto.constants.RSA_PKCS1_PADDING}).toString('base64')})
+  const nowSeconds=Number((await query('SELECT floor(extract(epoch FROM clock_timestamp())) AS n')).rows[0].n)
+  const manifestDigest=approvalApi.legacyEmailTerminalHoldManifestDigest(expectedManifest)
+  const common={version:1,audience:'clawpilot-private-legacy-email-hold-controller',operationId,manifestDigest,
+   issuedAt:nowSeconds,expiresAt:nowSeconds+110}
+  const fenceEnvelope=wrap({...common,keyId:'fixture-fence',issuer:'clawpilot-crm-hold-fence-attestor',
+   purpose:'clawpilot-legacy-email-hold-fenced-absence-v1'},fenceKey.privateKey)
+  const operatorEnvelope=wrap({...common,keyId:'fixture-operator',issuer:'clawpilot-crm-hold-operator',
+   purpose:'clawpilot-legacy-email-hold-review-v1',fenceEnvelopeDigest:hash(fenceEnvelope)},operatorKey.privateKey)
+  const permit=approvalApi.verifyLegacyEmailTerminalHoldApproval({expectedManifest,nowSeconds,fenceEnvelope,operatorEnvelope,
+   fenceAnchor:{keyId:'fixture-fence',key:fenceKey.publicKey},operatorAnchor:{keyId:'fixture-operator',key:operatorKey.publicKey}})
+  assert.equal(permit.liveFenceProven,false)
+  const fixtureLogins=[]
+  try{
+   for(const role of ['crm_fixture_initial_hold_attestor','crm_fixture_initial_hold_controller']){
+    const password=randomBytes(32).toString('hex')
+    await query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD '${password}'`)
+    await query(`GRANT USAGE ON SCHEMA ${holdSchema} TO ${role}`)
+    fixtureLogins.push(new Pool({...localPoolOptions,user:role,password,max:1}))
+   }
+   const [attest,hold]=fixtureLogins
+   await query(`GRANT INSERT ON ${holdSchema}.verified_batch TO crm_fixture_initial_hold_attestor;
+     GRANT EXECUTE ON FUNCTION ${holdSchema}.hold(uuid,uuid[],text) TO crm_fixture_initial_hold_controller`)
+   await attest.query(`INSERT INTO ${holdSchema}.verified_batch(batch,manifest,manifest_canonical,manifest_hash,fence_hash,approval_hash,valid_until)
+     VALUES($1,$2,$3,$4,$5,$6,to_timestamp($7))`,[operationId,expectedManifest,canonical(expectedManifest),manifestDigest,
+    permit.fenceEnvelopeDigest,permit.approvalEnvelopeDigest,permit.expiresAt])
+   const exact=(await hold.query(`SELECT ${holdSchema}.hold($1::uuid,$2::uuid[],$3::text) AS n`,
+    [operationId,[heldOutbox],permit.approvalEnvelopeDigest])).rows[0]
+   assert.equal(exact.n,1)
+  }finally{await Promise.all(fixtureLogins.map(db=>db.end()))}
+  heldReceipt=(await query(`SELECT ${holdSchema}.resolve($1::uuid,$2::text,$3::text) AS receipt`,
+    [operationId,manifestDigest,permit.approvalEnvelopeDigest])).rows[0].receipt
+  assert.equal(heldReceipt.state,'committed');assert.equal(heldReceipt.rows,1)
+  assert.deepEqual(await heldRows(),heldBefore)
+  assert.deepEqual(await quarantineRows(),quarantineBefore)
+  assert.deepEqual((await snapshot()).s,blocked.live.s,'Holding must not change the enrollment inventory')
+ })
+ await check('unrelated terminal jobs and competing held identities still block; a different native scope cannot reserve',async()=>{
+  const mismatch=await reservation();mismatch.nativeInstanceId=randomUUID()
+  const unresolved=error=>error?.code==='55000'&&/unresolved writers/u.test(error.message)
+  await assert.rejects(tx(async c=>{
+   await reserve(mismatch,owner,c);throw new Error('Wrong authority instance unexpectedly reserved')
+  }),unresolved)
+  await assert.rejects(tx(async c=>{
+   await c.query("UPDATE sync_outbox SET status='dead',attempts=8,last_error='synthetic unheld job',processed_at=now() WHERE id=$1",[queuedId])
+   await reserve(await reservation(c),owner,c);throw new Error('Unheld terminal job unexpectedly permitted reservation')
+  }),unresolved)
+  await assert.rejects(query(`INSERT INTO sync_outbox(target_system,aggregate_type,aggregate_id,operation,payload)
+    VALUES('suitecrm','crm_interactions',$1,'upsert_record','{}')`,[heldInteraction]),
+  error=>error?.code==='55000'&&/Terminal Email hold/u.test(error.message))
+ })
  const reserved=await reservation()
  await check('reservation installs the disabled durable fence before any final plan, native forecast or signature exists',async()=>{
   await reserve(reserved)
@@ -400,6 +533,20 @@ try{
   await assert.rejects(query(`INSERT INTO crm_native_email_capability_policies(pipeline_id,generation,policy,fingerprint)
    VALUES($1,$2,'{}',$3)`,[pipelines[0],reserved.generation,hash('unbound-policy')]),refusal)
  })
+ await check('admission independently requires the exact consumed hold even with an unchanged reserved source',async()=>{
+  const candidate=await fixture(reserved)
+  await assert.rejects(tx(async c=>{
+   // Simulate private evidence loss only inside an always-rolled-back
+   // synthetic transaction; do not change the enrolled source or gate.
+   await c.query(`ALTER TABLE ${holdSchema}.consumed DISABLE TRIGGER crm_terminal_hold_immutable`)
+   assert.equal((await c.query(`DELETE FROM ${holdSchema}.consumed WHERE batch=$1`,[heldReceipt.operationId])).rowCount,1)
+   assert.deepEqual(await snapshot(c),reserved.live)
+   await insert(candidate,owner,c)
+   throw new Error('Admission unexpectedly accepted a missing consumed hold receipt')
+  }),error=>error?.code==='55000'&&/unresolved writers/u.test(error.message))
+  assert.equal((await query(`SELECT count(*)::int AS n FROM ${holdSchema}.consumed WHERE batch=$1`,[heldReceipt.operationId])).rows[0].n,1)
+  assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_initial_enrollments')).rows[0].n,0)
+ })
  // Native installation/project/signing belong AFTER the committed reservation.
  // This fixture only constructs synthetic data and does not run those steps.
  const selected=await fixture(reserved,2)
@@ -416,8 +563,11 @@ try{
   assert.equal(c.enabled,false);assert.equal(c.active_initial_enrollment_id,selected.operationId)
   const e=(await query('SELECT * FROM crm_native_email_initial_enrollments')).rows[0]
   assert.equal(e.plan_hash,selected.planHash);assert.deepEqual(e.native_delta,selected.delta);assert.equal(e.native_receipt,null)
-  assert.equal(e.source_snapshot.pendingOutbox.length,3)
-  assert.deepEqual(await quarantineRows(),quarantineBefore,'Initial admission retains the original dead jobs instead of replaying or discarding them')
+  assert.equal(e.source_snapshot.pendingOutbox.length,4)
+  assert.equal(e.source_snapshot.pendingOutbox.find(row=>row.id===heldOutbox)?.rowFingerprint,heldBefore[0].fingerprint)
+  assert.ok(!e.source_snapshot.emails.some(row=>row.localId===heldInteraction),'Unpublished held Email must stay outside the native published inventory')
+  assert.deepEqual(await heldRows(),heldBefore,'Initial admission leaves the live terminal row untouched')
+  assert.deepEqual(await quarantineRows(),quarantineBefore,'Initial admission retains the original demo jobs instead of replaying or discarding them')
   await assert.rejects(insert(selected),e=>e.code==='23505')
  })
  await check('pending barrier fences sources, identity/publication jobs, all authority ledgers and native policies even while disabled',async()=>{
@@ -565,14 +715,446 @@ try{
   assert.equal((await query('SELECT count(*) FROM crm_native_email_initial_reservations')).rows[0].count,'2')
   assert.equal((await query('SELECT count(*) FROM crm_native_email_initial_enrollments')).rows[0].count,'2')
   assert.equal((await query('SELECT count(*) FROM crm_native_email_capability_policies')).rows[0].count,'2')
+  assert.deepEqual(await heldRows(),heldBefore,'Activation must not change the original held row or mark it synced')
   assert.deepEqual(await quarantineRows(),quarantineBefore,'Replan and activation preserve every terminal demo quarantine row byte-for-byte')
   const retainedSources=(await query('SELECT source_snapshot FROM crm_native_email_initial_reservations ORDER BY operation_id')).rows
-  for(const source of retainedSources)for(const row of quarantineBefore)
+  for(const source of retainedSources)for(const row of [...quarantineBefore,...heldBefore])
    assert.equal(source.source_snapshot.pendingOutbox.find(p=>p.id===row.id)?.rowFingerprint,row.fingerprint)
+  await assert.rejects(query("UPDATE sync_outbox SET status='queued',attempts=0 WHERE id=$1",[heldOutbox]),
+    error=>error?.code==='55000'&&/Terminal Email hold/u.test(error.message))
+  assert.deepEqual((await query('SELECT public.clawpilot_crm_legacy_email_stage_source($1::uuid,$2::text) AS value',
+    [heldOutbox,heldReceipt.receiptHash])).rows[0].value,{state:'unknown'},'Activation is not permission to stage or publish a held source')
+  assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_work')).rows[0].n,0)
   await assert.rejects(query("UPDATE crm_native_email_initial_enrollments SET state='unknown',native_receipt=NULL,receipt_canonical=NULL,receipt_hash=NULL,settling_xid=NULL"),refusal)
   await assert.rejects(query('UPDATE crm_native_email_publication_control SET enabled=false'),refusal)
   await query('UPDATE crm_native_email_publication_control SET updated_at=clock_timestamp()')
   await assert.rejects(query("UPDATE app_users SET suitecrm_user_id='rebound' WHERE email=$1",[owner]),refusal)
  })
+ const recoveryAttestor='crm_fixture_held_recovery_attestor',recoveryController='crm_fixture_held_recovery_controller'
+ const recoveryRolePools=[]
+ try{
+  await check('held recovery stage and exact resolution are private; enrollment alone cannot create a staged claim',async()=>{
+   await query('CREATE ROLE crm_fixture_unprivileged_recovery NOLOGIN')
+   const privileges=(await query(`SELECT has_schema_privilege('crm_fixture_unprivileged_recovery',$1,'USAGE') AS schema,
+     has_table_privilege('crm_fixture_unprivileged_recovery',$2,'INSERT') AS attest,
+     has_function_privilege('crm_fixture_unprivileged_recovery',$3,'EXECUTE') AS stage,
+     has_function_privilege('crm_fixture_unprivileged_recovery',$4,'EXECUTE') AS resolve`,[holdSchema,
+    `${holdSchema}.verified_recovery`,`${holdSchema}.stage_recovery(uuid,text,jsonb)`,`${holdSchema}.resolve_recovery(uuid,text,text)`])).rows[0]
+   assert.deepEqual(privileges,{schema:false,attest:false,stage:false,resolve:false})
+   assert.deepEqual((await query(`SELECT ${holdSchema}.resolve_recovery($1::uuid,$2,$3) AS value`,
+    [heldOutbox,hash('unstaged intent'),hash('unstaged approval')])).rows[0].value,{state:'unknown'})
+   assert.deepEqual(await heldRows(),heldBefore)
+  })
+  for(const role of [recoveryAttestor,recoveryController]){
+   const password=randomBytes(32).toString('hex')
+   await query(`CREATE ROLE ${role} LOGIN NOINHERIT PASSWORD '${password}'`)
+   await query(`GRANT USAGE ON SCHEMA ${holdSchema} TO ${role}`)
+   recoveryRolePools.push(new Pool({...localPoolOptions,user:role,password,max:1}))
+  }
+  const [attest,stage]=recoveryRolePools
+  await query(`GRANT INSERT ON ${holdSchema}.verified_recovery TO ${recoveryAttestor};
+    GRANT EXECUTE ON FUNCTION ${holdSchema}.stage_recovery(uuid,text,jsonb),
+      ${holdSchema}.resolve_recovery(uuid,text,text) TO ${recoveryController}`)
+  const {heldStage,heldApproval:recoveryApproval}=loadNativeJointLegacyEmailRecoveryApp({query,withTransaction:tx,getPostgresPool:()=>pool})
+  // Disposable fixture reads the actual source, mappings and current audience
+  // through separate direct logins. These grants are not a production role.
+  await query(`GRANT SELECT (outbox_id,batch,local_id,pipeline_id,workspace_id,native_id,global_id,row_fingerprint,original)
+      ON ${holdSchema}.held TO ${recoveryController};
+    GRANT SELECT (batch,manifest,valid_until) ON ${holdSchema}.verified_batch TO ${recoveryController};
+    GRANT SELECT (batch,consumed_at,held_rows,receipt_hash) ON ${holdSchema}.consumed TO ${recoveryController};
+    GRANT SELECT ON crm_interactions,sync_outbox,crm_native_email_publication_control,crm_native_email_publication_admissions TO ${recoveryController};
+    GRANT UPDATE (updated_at) ON crm_interactions,crm_native_email_publication_control TO ${recoveryController};
+    GRANT SELECT (id,workspace_organization_id,owner_email,reference_access_disabled) ON pipeline_spaces TO ${recoveryController};
+    GRANT SELECT (id,parent_id,organization_type,is_demo) ON workspace_organizations TO ${recoveryController};
+    GRANT SELECT (email,role,status,suitecrm_user_id) ON app_users TO ${recoveryController};
+    GRANT SELECT (user_email,organization_id,role,status,permissions,trashed_at) ON app_user_organization_memberships TO ${recoveryController};
+    GRANT SELECT (pipeline_id,user_email,access_role) ON pipeline_space_members TO ${recoveryController};
+    GRANT SELECT (id,root_workspace_id,owner_email,enabled) ON crm_operator_accounts TO ${recoveryController};
+    GRANT SELECT (operator_account_id,workspace_id,owner_email,enabled) ON crm_operator_workspace_bindings TO ${recoveryController};
+    GRANT SELECT (id,operator_account_id) ON crm_root_employee_access_grants TO ${recoveryController};
+    GRANT SELECT (pipeline_id,generation,policy,fingerprint) ON crm_native_email_capability_policies TO ${recoveryController};
+    GRANT SELECT (pipeline_id,id,suitecrm_id,source_payload) ON crm_organizations TO ${recoveryController};
+    GRANT SELECT (pipeline_id,id,suitecrm_id,organization_id,source_payload) ON crm_contacts TO ${recoveryController};
+    GRANT SELECT ON crm_interaction_organizations,crm_interaction_contacts TO ${recoveryController};
+    GRANT EXECUTE ON FUNCTION ${holdSchema}.relationship_fingerprint(uuid),${holdSchema}.provider_identity_fingerprint(uuid),
+      public.clawpilot_crm_legacy_email_live_relationships(uuid,uuid),
+      public.clawpilot_crm_legacy_email_provider_identity_unambiguous(uuid,uuid) TO ${recoveryController}`)
+  const roleTransaction=db=>async action=>{
+   const client=await db.connect()
+   try{
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED')
+    const result=await action(client)
+    await client.query('COMMIT');return result
+   }catch(error){await client.query('ROLLBACK');throw error}finally{client.release()}
+  }
+  const controllerTransaction=roleTransaction(stage),attestTransaction=roleTransaction(attest)
+  const crypto=require('node:crypto')
+  const operatorKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),keyId='fixture-recovery-operator'
+  const dbTime=async()=>Number((await query('SELECT floor(extract(epoch FROM clock_timestamp())) AS n')).rows[0].n)
+  const control=(await query(`SELECT generation,activation_receipt_hash,native_policy_fingerprint
+    FROM crm_native_email_publication_control WHERE singleton`)).rows[0]
+  const expected=(await query(`SELECT payload,encode(digest(payload::text,'sha256'),'hex') AS payload_hash,
+    idempotency_key,policy,fingerprint AS policy_fingerprint FROM (
+    SELECT jsonb_set(o.payload,'{emailProjection,audience}',jsonb_build_object('policy','pipeline-internal',
+     'pipelineId',p.pipeline_id,'workspaceId',p.policy->>'workspaceId','ownerSuiteCrmId',p.policy->>'ownerSuiteCrmId',
+     'allowedSuiteCrmUserIds',p.policy#>'{futureCreate,view}','fingerprint',p.policy->>'audienceFingerprint'),true) AS payload,
+     o.idempotency_key,p.policy,p.fingerprint
+    FROM sync_outbox o JOIN crm_native_email_capability_policies p ON p.pipeline_id::text=o.payload->>'pipelineId'
+    WHERE o.id=$1) q`,[heldOutbox])).rows[0]
+  assert.ok(expected?.payload?.emailProjection?.audience)
+  // The worker hashes parsed JSONB (JSON.stringify), while the stage pins
+  // SQL's jsonb::text bytes. Both must be exact, and the hashes differ.
+  const workerPayloadHash=crypto.createHash('sha256').update(JSON.stringify(expected.payload)).digest('hex')
+  const workContext={kind:'outbox',outboxId:heldOutbox,idempotencyKey:expected.idempotency_key,
+   sourceHash:heldSourceHash,payloadHash:workerPayloadHash,attempt:1}
+  const exactRequest=lockToken=>{
+   const generation=Number(control.generation),projection=expected.payload.emailProjection
+   const operationId=hash({outboxId:heldOutbox,idempotencyKey:expected.idempotency_key,payloadHash:workerPayloadHash,
+    attempt:1,claim:lockToken,generation})
+   return protocol.prepareNativeEmailPublication({command:{version:2,mode:'publish',operationId,workspaceId:root,
+    pipelineId:pipelines[0],generation,audienceFingerprint:projection.audience.fingerprint,suiteCrmId:heldNative,
+    globalId:heldManifestRow.globalId,localId:heldInteraction,expectedRecordFingerprint:null,
+    projection:{attributes:expected.payload.attributes,accounts:projection.accounts,contacts:projection.contacts,
+     contactAccounts:projection.contactAccounts,previousManaged:projection.previousManaged},
+    capabilityPolicyFingerprint:expected.policy_fingerprint,principalSuiteCrmUserIds:expected.policy.principalSuiteCrmUserIds,
+    expectedCapabilities:expected.policy.futureCreate},nativePolicyFingerprint:control.native_policy_fingerprint,
+    allowedReaderSuiteCrmUserIds:projection.audience.allowedSuiteCrmUserIds})
+  }
+  const baselineOther=(await query('SELECT to_jsonb(o)::text AS row FROM sync_outbox o WHERE id<>$1 ORDER BY id',[heldOutbox])).rows
+  const proofFor=async (overrides={},now)=>{
+   const verifiedAt=now??await dbTime(),lockToken=overrides.lockToken??randomUUID(),request=exactRequest(lockToken)
+   const proof={version:1,purpose:'clawpilot-private-legacy-held-email-recovery-v1',keyId,
+    issuedAt:verifiedAt,expiresAt:verifiedAt+110,holdBatchId:heldReceipt.operationId,outboxId:heldOutbox,
+    localId:heldInteraction,nativeId:heldNative,pipelineId:pipelines[0],workspaceId:root,nativeAuthorityInstanceId:authorityInstance,
+    lockToken,holdReceiptHash:heldReceipt.receiptHash,originalFingerprint:heldManifestRow.rowFingerprint,
+    sourceFingerprint:heldManifestRow.sourceFingerprint,relationshipFingerprint:heldManifestRow.relationshipFingerprint,
+    providerIdentityFingerprint:heldManifestRow.providerIdentityFingerprint,activationReceiptHash:control.activation_receipt_hash,
+    stagedPayloadFingerprint:expected.payload_hash,requestFingerprint:request.requestFingerprint,
+    nativeOperationId:request.command.operationId,globalId:heldManifestRow.globalId,
+    generation:Number(control.generation),primaryAccountId:heldPrimary.native,accountIds:heldAccountIds,...overrides}
+   const proofText=canonical(proof)
+   const envelope={proof,signature:crypto.sign('sha256',Buffer.from(proofText,'ascii'),
+    {key:operatorKey.privateKey,padding:crypto.constants.RSA_PKCS1_PADDING}).toString('base64')}
+   const verified=recoveryApproval.verifyLegacyHeldEmailRecoveryApproval({envelope,nowSeconds:verifiedAt,
+    operatorAnchor:{keyId,key:operatorKey.publicKey}})
+   recoveryApproval.assertVerifiedLegacyHeldEmailRecoveryApproval(verified)
+   return {proof,proofText,verified,request}
+  }
+  const register=({proof,proofText,verified},queryable=attest,approvalHash=verified.approvalHash)=>queryable.query(`INSERT INTO ${holdSchema}.verified_recovery
+   (outbox_id,proof,proof_canonical,proof_hash,intent_hash,approval_hash,valid_until) VALUES($1,$2,$3,$4,$5,$6,to_timestamp($7))`,
+  [proof.outboxId,proof,proofText,hash(proof),verified.intentHash,approvalHash,proof.expiresAt])
+  const stageWith=async (approvalHash,payload=expected.payload,queryable=stage,id=heldOutbox)=>(await queryable.query(
+   `SELECT ${holdSchema}.stage_recovery($1::uuid,$2,$3::jsonb) AS value`,[id,approvalHash,payload])).rows[0].value
+  const resolveWith=async (intentHash,approvalHash)=>(await stage.query(
+   `SELECT ${holdSchema}.resolve_recovery($1::uuid,$2,$3) AS value`,[heldOutbox,intentHash,approvalHash])).rows[0].value
+  const stageRefused=error=>error?.code==='55000'
+  let valid=await proofFor(),{verified}=valid
+  let stageReceipt
+  await check('stage refuses a missing, same-login, expired or substituted approval without changing the terminal row',async()=>{
+   await assert.rejects(stageWith(verified.approvalHash),stageRefused)
+   await assert.rejects(register(valid,stage),error=>error?.code==='42501')
+   await assert.rejects(stageWith(verified.approvalHash,expected.payload,attest),error=>error?.code==='42501')
+   await assert.rejects(tx(async c=>{
+    await c.query(`SET LOCAL ROLE ${recoveryAttestor}`);await register(valid,c)
+   }),stageRefused)
+   await register(valid)
+   await assert.rejects(tx(async c=>{
+    await c.query(`SET LOCAL ROLE ${recoveryController}`);await stageWith(verified.approvalHash,expected.payload,c)
+   }),stageRefused)
+   await query(`GRANT EXECUTE ON FUNCTION ${holdSchema}.stage_recovery(uuid,text,jsonb) TO ${recoveryAttestor}`)
+   await assert.rejects(stageWith(verified.approvalHash,expected.payload,attest),stageRefused)
+   await query(`REVOKE EXECUTE ON FUNCTION ${holdSchema}.stage_recovery(uuid,text,jsonb) FROM ${recoveryAttestor}`)
+   await assert.rejects(stageWith(verified.approvalHash,expected.payload,stage,queuedId),stageRefused)
+   const expired=await proofFor({},await dbTime()-150);await register(expired)
+   await assert.rejects(stageWith(expired.verified.approvalHash),stageRefused)
+   for(const changed of [{nativeAuthorityInstanceId:randomUUID()},{activationReceiptHash:hash('stale activation')},
+    {generation:verified.generation+1},{holdReceiptHash:hash('unrelated hold')},{originalFingerprint:hash('other original')},
+    {sourceFingerprint:hash('other source')},{relationshipFingerprint:hash('other relationship')},
+    {providerIdentityFingerprint:hash('other provider identity')},{primaryAccountId:heldAccounts[1].native},
+    {accountIds:[heldPrimary.native]}]){
+    const candidate=await proofFor(changed);await register(candidate)
+    await assert.rejects(stageWith(candidate.verified.approvalHash),stageRefused)
+   }
+   const altered=copy(expected.payload);altered.attributes.description='not reviewed'
+   await assert.rejects(stageWith(verified.approvalHash,altered),stageRefused)
+   const alteredHash=(await query("SELECT encode(digest($1::jsonb::text,'sha256'),'hex') AS digest",[altered])).rows[0].digest
+   const signedWrongPayload=await proofFor({stagedPayloadFingerprint:alteredHash});await register(signedWrongPayload)
+   await assert.rejects(stageWith(signedWrongPayload.verified.approvalHash,altered),stageRefused)
+   // Native authority 0397 rejects a direct binding edit after activation.
+   // Do not disable that fence merely to manufacture a stale stage fixture.
+   await assert.rejects(query(`UPDATE crm_operator_workspace_bindings SET enabled=false,revision=revision+1
+     WHERE operator_account_id=$1 AND workspace_id=$2`,[account,root]),stageRefused)
+   assert.equal((await query('SELECT enabled FROM crm_operator_workspace_bindings WHERE operator_account_id=$1 AND workspace_id=$2',
+    [account,root])).rows[0].enabled,true)
+   const contact=heldAccounts[1]
+   await query('UPDATE crm_contacts SET suitecrm_id=$2 WHERE id=$1',[contact.contact,randomUUID()])
+   try{await assert.rejects(stageWith(verified.approvalHash),stageRefused)}
+   finally{await query('UPDATE crm_contacts SET suitecrm_id=$2 WHERE id=$1',[contact.contact,contact.nativeContact])}
+   assert.deepEqual(await heldRows(),heldBefore)
+   assert.deepEqual(await resolveWith(verified.intentHash,verified.approvalHash),{state:'unknown'})
+  })
+  await check('actual held preview and signed stage match the independent SQL pins, park the same job and write no native work',async()=>{
+   // Keep the already-registered raw SQL negative fixture separate from the
+   // actual adapter's independent approval registration and stage transaction.
+   valid=await proofFor();verified=valid.verified
+   const target={holdId:heldReceipt.operationId,outboxId:heldOutbox,holdReceiptHash:heldReceipt.receiptHash,lockToken:verified.lockToken}
+   const {version,purpose,keyId:reviewKey,issuedAt,expiresAt,...expectedPins}=valid.proof
+   const preview=await heldStage.previewHeldOriginalRecovery(controllerTransaction,target)
+   assert.deepEqual(preview,{pins:expectedPins})
+   assert.ok(!JSON.stringify(preview).includes('SYNTHETIC_BODY_NOT_IN_ENROLLMENT_PROOF'))
+   assert.deepEqual(await heldRows(),heldBefore,'Actual preview must not park the outbox')
+   const receipt=await heldStage.stageHeldOriginalRecovery({transaction:controllerTransaction,attestTransaction,
+    attestorUser:recoveryAttestor,target,approval:verified})
+   stageReceipt=receipt.receiptHash
+   assert.deepEqual(receipt,{state:'staged',holdBatchId:heldReceipt.operationId,outboxId:heldOutbox,intentHash:verified.intentHash,
+    approvalHash:verified.approvalHash,receiptHash:receipt?.receiptHash})
+   assert.match(receipt.receiptHash,/^[a-f0-9]{64}$/u)
+   assert.deepEqual(await resolveWith(verified.intentHash,verified.approvalHash),receipt)
+   assert.deepEqual(await heldStage.inspectHeldOriginalRecovery(controllerTransaction,{
+    outboxId:heldOutbox,intentHash:verified.intentHash,approvalHash:verified.approvalHash}),receipt)
+   assert.deepEqual(await resolveWith(hash('other intent'),verified.approvalHash),{state:'unknown'})
+   assert.deepEqual(await resolveWith(verified.intentHash,hash('other approval')),{state:'unknown'})
+   assert.deepEqual((await query(`SELECT ${holdSchema}.resolve($1::uuid,$2,$3) AS value`,
+    [heldReceipt.operationId,heldReceipt.manifestDigest,heldReceipt.approvalDigest])).rows[0].value,{state:'unknown'},
+   'The live terminal-byte receipt does not claim the source is still terminal after stage')
+   const retained=(await query(`SELECT original::text AS row FROM ${holdSchema}.held WHERE outbox_id=$1`,[heldOutbox])).rows[0].row
+   assert.equal(retained,heldBefore[0].retained,'Retain the original terminal row independently and byte-for-byte')
+   const [parked]=await heldRows(),old=JSON.parse(retained),post=JSON.parse(parked.retained)
+   assert.equal(parked.source,heldBefore[0].source)
+   for(const key of ['id','idempotency_key','created_at','target_system','operation','aggregate_type','aggregate_id'])
+    assert.equal(post[key],old[key],`${key} must remain unchanged`)
+   assert.equal(post.status,'processing');assert.equal(post.attempts,1);assert.equal(post.available_at,'infinity')
+   assert.equal(post.lock_token,verified.lockToken);assert.ok(post.locked_at);assert.deepEqual(post.payload,expected.payload)
+   assert.deepEqual((await query('SELECT to_jsonb(o)::text AS row FROM sync_outbox o WHERE id<>$1 ORDER BY id',[heldOutbox])).rows,baselineOther)
+   assert.deepEqual(await quarantineRows(),quarantineBefore)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_work')).rows[0].n,0)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_admissions')).rows[0].n,0)
+   await assert.rejects(query("UPDATE sync_outbox SET status='queued',available_at=now() WHERE id=$1",[heldOutbox]),stageRefused)
+   await assert.rejects(query("DELETE FROM sync_outbox WHERE id=$1",[heldOutbox]),stageRefused)
+   const another=await proofFor();await register(another)
+   await assert.rejects(stageWith(another.verified.approvalHash),stageRefused)
+   assert.deepEqual(await heldRows(),[parked]);assert.deepEqual(await resolveWith(verified.intentHash,verified.approvalHash),receipt)
+  })
+  const releaseName=`${holdSchema}.register_release`
+  const releaseReadName=`${holdSchema}.resolve_release`
+  const request=valid.request,command=request.command,operationId=command.operationId,leaseOwner=randomUUID()
+  const registerRelease=(db,approvalHash=verified.approvalHash,id=heldOutbox)=>db.query(
+   `SELECT ${releaseName}($1::uuid,$2::text)`,[id,approvalHash])
+  const readRelease=async ({id=heldOutbox,receipt=stageReceipt,operation=operationId,fingerprint=request.requestFingerprint}={},db=stage)=>
+   (await db.query(`SELECT ${releaseReadName}($1::uuid,$2::text,$3::text,$4::text) AS value`,[id,receipt,operation,fingerprint])).rows[0].value
+  const assertUnreadableRelease=async()=>{
+   for(const wrong of [{id:randomUUID()},{receipt:hash('wrong stage receipt')},{operation:hash('wrong native operation')},
+    {fingerprint:hash('wrong request fingerprint')}])assert.deepEqual(await readRelease(wrong),{state:'unknown'})
+  }
+  const addWork=(db,context=workContext)=>db.query(`INSERT INTO crm_native_email_publication_work
+   (operation_id,request_fingerprint,work_kind,context,context_hash,lease_owner,lease_fence,lease_until)
+   VALUES($1,$2,'outbox',$3::jsonb,$4,$5,1,clock_timestamp()+interval '120 seconds')`,
+  [operationId,request.requestFingerprint,canonical(context),hash(context),leaseOwner])
+  const addAdmission=(db,projected=command)=>db.query(`INSERT INTO crm_native_email_publication_admissions
+   (operation_id,pipeline_id,local_id,native_id,global_id,generation,native_policy_fingerprint,command_hash,
+    audience_fingerprint,command,allowed_reader_ids,request_fingerprint)
+   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`,[operationId,command.pipelineId,
+   command.localId,command.suiteCrmId,command.globalId,command.generation,request.nativePolicyFingerprint,
+   hash(projected),command.audienceFingerprint,canonical(projected),canonical(request.allowedReaderSuiteCrmUserIds),request.requestFingerprint])
+  const directControllerTx=async action=>{
+   const c=await stage.connect();try{await c.query('BEGIN ISOLATION LEVEL READ COMMITTED');const value=await action(c)
+    await c.query('COMMIT');return value}catch(error){await c.query('ROLLBACK');throw error}finally{c.release()}
+  }
+  const makeActive=(db)=>db.query(`UPDATE crm_native_email_publication_control SET active_operation_id=$1,updated_at=clock_timestamp()
+   WHERE singleton AND active_operation_id IS NULL RETURNING active_operation_id`,[operationId])
+  const dispatch=(db)=>db.query(`UPDATE crm_native_email_publication_admissions SET state='dispatched',updated_at=clock_timestamp()
+   WHERE operation_id=$1 AND state='admitted' RETURNING operation_id`,[operationId])
+  const assertNoRelease=async parked=>{
+   assert.equal((await query('SELECT active_operation_id FROM crm_native_email_publication_control WHERE singleton')).rows[0].active_operation_id,null)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_work')).rows[0].n,0)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_admissions')).rows[0].n,0)
+   assert.deepEqual(await heldRows(),parked)
+  }
+  await check('private held release requires complete exact same-transaction work, admission and first-dispatch CAS',async()=>{
+   assert.deepEqual((await query(`SELECT has_function_privilege('crm_fixture_unprivileged_recovery',$1,'EXECUTE') AS register,
+     has_function_privilege('crm_fixture_unprivileged_recovery',$2,'EXECUTE') AS resolve`,
+    [`${releaseName}(uuid,text)`,`${releaseReadName}(uuid,text,text,text)`])).rows[0],{register:false,resolve:false})
+   await query(`GRANT EXECUTE ON FUNCTION ${releaseName}(uuid,text),${releaseReadName}(uuid,text,text,text) TO ${recoveryController};
+    GRANT SELECT ON crm_native_email_publication_control,crm_native_email_publication_work,crm_native_email_publication_admissions TO ${recoveryController};
+    GRANT INSERT (operation_id,request_fingerprint,work_kind,context,context_hash,lease_owner,lease_fence,lease_until)
+     ON crm_native_email_publication_work TO ${recoveryController};
+    GRANT INSERT (operation_id,pipeline_id,local_id,native_id,global_id,generation,native_policy_fingerprint,command_hash,
+     audience_fingerprint,command,allowed_reader_ids,request_fingerprint)
+     ON crm_native_email_publication_admissions TO ${recoveryController};
+    GRANT UPDATE (active_operation_id,updated_at) ON crm_native_email_publication_control TO ${recoveryController};
+    GRANT UPDATE (state,updated_at) ON crm_native_email_publication_admissions TO ${recoveryController}`)
+   const parked=await heldRows()
+   await assert.rejects(registerRelease(attest),error=>error?.code==='42501')
+   await assert.rejects(readRelease({},attest),error=>error?.code==='42501')
+   assert.deepEqual(await readRelease(),{state:'staged'})
+   await assertUnreadableRelease()
+   await assert.rejects(tx(async c=>{await c.query(`SET LOCAL ROLE ${recoveryController}`);await registerRelease(c)}),stageRefused)
+   await assert.rejects(registerRelease(stage,hash('unknown release approval')),stageRefused)
+   await assert.rejects(registerRelease(stage,verified.approvalHash,queuedId),stageRefused)
+   await assert.rejects(addWork(stage),stageRefused)
+   await assert.rejects(addAdmission(stage),stageRefused)
+   await assert.rejects(directControllerTx(c=>registerRelease(c)),error=>stageRefused(error)||error?.code==='23503')
+   await assert.rejects(directControllerTx(async c=>{
+    await registerRelease(c);await addWork(c);await addAdmission(c);await makeActive(c)
+   }),stageRefused,'A transaction leaving the admission only admitted must roll back')
+   for(const alteredContext of [{...workContext,outboxId:queuedId},{...workContext,payloadHash:hash('wrong work payload')}])
+    await assert.rejects(directControllerTx(async c=>{
+     await registerRelease(c);await addWork(c,alteredContext);await addAdmission(c);await makeActive(c);await dispatch(c)
+    }),stageRefused)
+   const altered=copy(command);altered.projection.attributes.description='not staged'
+   await assert.rejects(directControllerTx(async c=>{
+    await registerRelease(c);await addWork(c);await addAdmission(c,altered);await makeActive(c);await dispatch(c)
+   }),stageRefused)
+   await assertNoRelease(parked)
+   assert.deepEqual(await readRelease(),{state:'staged'})
+  })
+  await check('exact private release commits one work/admission on the original UUID and fences selected relationship mappings',async()=>{
+   const parked=await heldRows()
+   await directControllerTx(async c=>{
+    await registerRelease(c);assert.equal((await addWork(c)).rowCount,1);assert.equal((await addAdmission(c)).rowCount,1)
+    assert.equal((await makeActive(c)).rows[0].active_operation_id,operationId)
+    assert.equal((await dispatch(c)).rows[0].operation_id,operationId)
+   })
+   const r=(await query(`SELECT c.active_operation_id,a.state,a.native_receipt,a.command,a.request_fingerprint,w.context,w.context_hash,
+     w.lease_owner,w.lease_fence FROM crm_native_email_publication_control c JOIN crm_native_email_publication_admissions a
+     ON a.operation_id=c.active_operation_id JOIN crm_native_email_publication_work w USING(operation_id) WHERE c.singleton`)).rows[0]
+   assert.equal(r.active_operation_id,operationId);assert.equal(r.state,'dispatched');assert.equal(r.native_receipt,null)
+   assert.deepEqual(r.command,command);assert.equal(r.request_fingerprint,request.requestFingerprint)
+   assert.deepEqual(r.context,workContext);assert.equal(r.context_hash,hash(workContext));assert.equal(r.lease_owner,leaseOwner)
+   assert.equal(Number(r.lease_fence),1)
+   assert.deepEqual(await heldRows(),parked)
+   assert.deepEqual(await readRelease(),{state:'dispatched'})
+   await assertUnreadableRelease()
+   assert.deepEqual((await query('SELECT to_jsonb(o)::text AS row FROM sync_outbox o WHERE id<>$1 ORDER BY id',[heldOutbox])).rows,baselineOther)
+   await assert.rejects(registerRelease(stage),stageRefused)
+   await assert.rejects(query('UPDATE crm_contacts SET suitecrm_id=$2 WHERE id=$1',[heldPrimary.contact,randomUUID()]),stageRefused)
+   await assert.rejects(query('UPDATE crm_organizations SET suitecrm_id=$2 WHERE id=$1',[heldPrimary.local,randomUUID()]),stageRefused)
+   await assert.rejects(query("UPDATE crm_native_email_publication_control SET active_operation_id=NULL WHERE singleton"),stageRefused)
+   assert.deepEqual(await heldRows(),parked)
+  })
+  const settlementName=`${holdSchema}.settle_release`
+  const claimName=`${holdSchema}.claim_resolution`
+  const receiptTable=`${holdSchema}.verified_receipts`
+  const transport=load('app_src/lib/crm/nativeEmailPublicationTransport.ts')
+  const recordFingerprint=hash('synthetic native record fingerprint; not provider evidence')
+  const receipt={version:2,operationId,commandHash:request.commandHash,state:'committed',replayed:false,result:{
+   version:2,mode:'publish',suiteCrmId:heldNative,globalId:command.globalId,pipelineId:command.pipelineId,generation:command.generation,
+   audienceFingerprint:command.audienceFingerprint,recordFingerprint,readerSuiteCrmUserIds:request.allowedReaderSuiteCrmUserIds,
+   capabilityPolicyFingerprint:command.capabilityPolicyFingerprint,principalSuiteCrmUserIds:command.principalSuiteCrmUserIds,
+   expectedCapabilities:command.expectedCapabilities,projection:{version:2,suiteCrmId:heldNative,
+    sourceAttributes:command.projection.attributes,attributes:{...command.projection.attributes,created_by:'1',deleted:'0',
+     description_html:'<p>SYNTHETIC_BODY_NOT_IN_ENROLLMENT_PROOF</p>',from_addr_name:'',to_addrs_names:'',cc_addrs_names:'',bcc_addrs_names:'',reply_to_addrs_names:''},
+    accounts:command.projection.accounts,contacts:command.projection.contacts,contactAccounts:command.projection.contactAccounts,
+    snapshotFingerprint:recordFingerprint,dateSentReceivedUtc:'2026-10-30T13:00:00Z'}}}
+  assert.deepEqual(transport.verifyNativeEmailPublicationReceipt(request,receipt),receipt)
+  const settleWith=async ({id=heldOutbox,operation=operationId,owner=leaseOwner,fence=1,native=receipt}={},db=stage)=>
+   (await db.query(`SELECT ${settlementName}($1::uuid,$2::text,$3::uuid,$4::bigint,$5::jsonb) AS value`,
+    [id,operation,owner,fence,canonical(native)])).rows[0].value
+  const receiptDigest=async native=>(await query("SELECT encode(digest($1::jsonb::text,'sha256'),'hex') AS value",[canonical(native)])).rows[0].value
+  const attestReceipt=async (native=receipt,db=attest)=>db.query(`INSERT INTO ${receiptTable}(native_operation_id,receipt_hash,lease_fence)
+    VALUES($1,$2,1)`,[operationId,await receiptDigest(native)])
+  const claimResolution=async ({id=heldOutbox,operation=operationId,owner=leaseOwner}={},db=stage)=>(await db.query(
+   `SELECT ${claimName}($1::uuid,$2::text,$3::uuid) AS value`,[id,operation,owner])).rows[0].value
+  const heldAdmission=async()=>(await query(`SELECT a.state,a.native_receipt,c.active_operation_id,w.lease_owner,w.lease_fence
+   FROM crm_native_email_publication_admissions a JOIN crm_native_email_publication_work w USING(operation_id)
+   CROSS JOIN crm_native_email_publication_control c WHERE a.operation_id=$1 AND c.singleton`,[operationId])).rows[0]
+  await check('the exact private resolver reads its live lease without extending it; wrong owners and roles cannot claim it',async()=>{
+   assert.equal((await query(`SELECT has_function_privilege('crm_fixture_unprivileged_recovery',$1,'EXECUTE') AS allowed`,
+    [`${claimName}(uuid,text,uuid)`])).rows[0].allowed,false)
+   await query(`GRANT EXECUTE ON FUNCTION ${claimName}(uuid,text,uuid) TO ${recoveryController}`)
+   await assert.rejects(claimResolution({},attest),error=>error?.code==='42501')
+   for(const wrong of [{owner:randomUUID()},{id:queuedId},{operation:hash('wrong resolution operation')}])
+    await assert.rejects(claimResolution(wrong),stageRefused)
+   const exact=await claimResolution()
+   assert.deepEqual(exact,{owner:leaseOwner,fence:1,expiresAt:exact?.expiresAt});assert.ok(Number.isFinite(Date.parse(exact.expiresAt)))
+   assert.deepEqual(await claimResolution(),exact);assert.deepEqual(await readRelease(),{state:'dispatched'})
+  })
+  await check('private settlement refuses wrong roles, lease and forged receipt without releasing the held original',async()=>{
+   const before=await heldRows(),admitted=await heldAdmission()
+   assert.deepEqual((await query(`SELECT has_function_privilege('crm_fixture_unprivileged_recovery',$1,'EXECUTE') AS settle,
+     has_table_privilege('crm_fixture_unprivileged_recovery',$2,'INSERT') AS attest`,
+    [`${settlementName}(uuid,text,uuid,bigint,jsonb)`,receiptTable])).rows[0],{settle:false,attest:false})
+   await query(`GRANT EXECUTE ON FUNCTION ${settlementName}(uuid,text,uuid,bigint,jsonb) TO ${recoveryController};
+    GRANT INSERT (native_operation_id,receipt_hash,lease_fence) ON ${receiptTable} TO ${recoveryAttestor}`)
+   await assert.rejects(settleWith({},attest),error=>error?.code==='42501')
+   await assert.rejects(tx(async c=>{await c.query(`SET LOCAL ROLE ${recoveryController}`);await settleWith({},c)}),stageRefused)
+   await assert.rejects(attestReceipt(receipt,stage),error=>error?.code==='42501')
+   await assert.rejects(tx(async c=>{await c.query(`SET LOCAL ROLE ${recoveryAttestor}`);await attestReceipt(receipt,c)}),stageRefused)
+   await assert.rejects(settleWith(),stageRefused,'A valid synthetic receipt without independent attestation is not authority')
+   assert.equal((await attestReceipt()).rowCount,1)
+   for(const wrong of [{id:queuedId},{operation:hash('wrong settlement operation')},{owner:randomUUID()},{fence:2}])
+    await assert.rejects(settleWith(wrong),stageRefused)
+   for(const alter of [r=>{r.commandHash=hash('forged command hash')},r=>{r.operationId=hash('forged receipt operation')},
+    r=>{r.result.readerSuiteCrmUserIds=['native-outsider']},r=>{r.result.projection.accounts=[heldPrimary.native]},
+    r=>{r.result.projection.sourceAttributes.parent_id=heldAccounts[1].native}]){
+    const forged=copy(receipt);alter(forged)
+    assert.throws(()=>transport.verifyNativeEmailPublicationReceipt(request,forged))
+    await assert.rejects(settleWith({native:forged}),stageRefused)
+   }
+   await assert.rejects(query(`UPDATE crm_native_email_publication_admissions SET state='committed',native_receipt=$2::jsonb
+    WHERE operation_id=$1`,[operationId,canonical(receipt)]),stageRefused)
+   const abort=new Error('synthetic rollback after exact settlement')
+   await assert.rejects(directControllerTx(async c=>{assert.equal(await settleWith({},c),'committed');throw abort}),err=>err===abort)
+   assert.deepEqual(await heldRows(),before);assert.deepEqual(await heldAdmission(),admitted)
+   assert.deepEqual(await readRelease(),{state:'dispatched'})
+  })
+  await check('independently attested cancellation leaves the interaction failed and can be rolled back in the fixture',async()=>{
+   const cancelled={version:2,operationId,commandHash:request.commandHash,state:'cancelled',replayed:false,result:null}
+   assert.deepEqual(transport.verifyNativeEmailPublicationReceipt(request,cancelled),cancelled)
+   assert.equal((await attestReceipt(cancelled)).rowCount,1)
+   const [before]=await heldRows(),source=JSON.parse(before.source),beforeAdmission=await heldAdmission()
+   await query(`GRANT SELECT (id,sync_status,sync_error,suitecrm_synced_at,metadata) ON crm_interactions TO ${recoveryController};
+    GRANT SELECT (id,status,last_error,locked_at,lock_token,available_at,idempotency_key) ON sync_outbox TO ${recoveryController}`)
+   const abort=new Error('synthetic rollback after cancelled settlement')
+   await assert.rejects(directControllerTx(async c=>{
+    assert.equal(await settleWith({native:cancelled},c),'cancelled')
+    assert.deepEqual(await readRelease({},c),{state:'cancelled'})
+    const i=(await c.query('SELECT sync_status,sync_error,suitecrm_synced_at,metadata FROM crm_interactions WHERE id=$1',[heldInteraction])).rows[0]
+    assert.deepEqual(i,{sync_status:source.sync_status,sync_error:source.sync_error,suitecrm_synced_at:null,metadata:source.metadata})
+    const o=(await c.query('SELECT status,last_error,locked_at,lock_token,available_at::text,idempotency_key FROM sync_outbox WHERE id=$1',[heldOutbox])).rows[0]
+    assert.deepEqual(o,{status:'dead',last_error:'Native Email cancelled before write',locked_at:null,lock_token:null,
+     available_at:'infinity',idempotency_key:expected.idempotency_key})
+    throw abort
+   }),err=>err===abort)
+   assert.deepEqual(await heldRows(),[before]);assert.deepEqual(await heldAdmission(),beforeAdmission)
+   assert.deepEqual(await readRelease(),{state:'dispatched'})
+  })
+  await check('one exact native receipt settles the original job once without replacing its identity or disturbing other jobs',async()=>{
+   const [parked]=await heldRows()
+   assert.equal(await settleWith(),'committed')
+   const terminal=await heldAdmission()
+   assert.equal(terminal.state,'committed');assert.equal(terminal.active_operation_id,null);assert.deepEqual(terminal.native_receipt,receipt)
+   assert.equal(terminal.lease_owner,leaseOwner);assert.equal(Number(terminal.lease_fence),1)
+   assert.deepEqual(await readRelease(),{state:'committed'});await assertUnreadableRelease()
+   assert.deepEqual(await resolveWith(verified.intentHash,verified.approvalHash),{state:'unknown'})
+   const [finished]=await heldRows(),oldOutbox=JSON.parse(parked.retained),outbox=JSON.parse(finished.retained)
+   const oldSource=JSON.parse(parked.source),source=JSON.parse(finished.source)
+   for(const key of Object.keys(oldOutbox).filter(key=>!['status','last_error','locked_at','lock_token','processed_at','updated_at'].includes(key)))
+    assert.deepEqual(outbox[key],oldOutbox[key],`${key} remains the original staged job`)
+   assert.equal(outbox.status,'succeeded');assert.equal(outbox.available_at,'infinity');assert.ok(outbox.processed_at)
+   assert.equal(outbox.lock_token,null);assert.equal(outbox.locked_at,null);assert.equal(outbox.last_error,null)
+   for(const key of Object.keys(oldSource).filter(key=>!['sync_status','sync_error','suitecrm_synced_at','updated_at','metadata'].includes(key)))
+    assert.deepEqual(source[key],oldSource[key],`${key} remains the original CRM interaction`)
+   assert.equal(source.sync_status,'synced');assert.equal(source.sync_error,null);assert.ok(source.suitecrm_synced_at)
+   assert.equal(source.metadata.suiteCrmEmailProjection.operationId,operationId)
+   assert.deepEqual(source.metadata.suiteCrmEmailProjection.accounts,heldAccountIds)
+   assert.deepEqual(source.metadata.suiteCrmEmailProjection.contactAccounts,heldContactAccounts)
+   assert.equal((await query(`SELECT original::text AS row FROM ${holdSchema}.held WHERE outbox_id=$1`,[heldOutbox])).rows[0].row,heldBefore[0].retained)
+   assert.deepEqual((await query('SELECT to_jsonb(o)::text AS row FROM sync_outbox o WHERE id<>$1 ORDER BY id',[heldOutbox])).rows,baselineOther)
+   assert.deepEqual(await quarantineRows(),quarantineBefore)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_admissions')).rows[0].n,1)
+   assert.equal((await query('SELECT count(*)::int AS n FROM crm_native_email_publication_work')).rows[0].n,1)
+   await assert.rejects(settleWith(),stageRefused)
+   await assert.rejects(claimResolution(),stageRefused)
+   await assert.rejects(registerRelease(stage),stageRefused)
+   await assert.rejects(query(`INSERT INTO sync_outbox(target_system,aggregate_type,aggregate_id,operation,payload)
+    VALUES('suitecrm','crm_interactions',$1,'upsert_record','{}')`,[heldInteraction]),stageRefused)
+   await assert.rejects(addAdmission(stage),stageRefused)
+   assert.deepEqual(await heldRows(),[finished]);assert.deepEqual(await readRelease(),{state:'committed'})
+  })
+ }finally{await Promise.all(recoveryRolePools.map(db=>db.end()))}
  console.log(`PASS ${checks} actual PostgreSQL ${major} initial-enrollment groups; synthetic native approval/forecast/receipt only, no native execution or production proof`)
-}finally{try{if(pool)await pool.end()}finally{if(started)execFileSync('docker',disposablePostgresDockerCleanupArgs(container),{stdio:'pipe',timeout:30000})}}
+}finally{try{if(pool)await pool.end()}finally{
+ if(nativeFixture)nativeFixture.cleanup()
+ else if(started)execFileSync('docker',disposablePostgresDockerCleanupArgs(container),{stdio:'pipe',timeout:30000})
+}}

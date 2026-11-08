@@ -98,11 +98,14 @@ function fixture(){
   if(sql.includes('FROM crm_native_email_initial_reservations r'))return {rows:[sqlCopy(state.reservation)]}
   if(sql.includes('clawpilot_crm_native_initial_source_snapshot()'))return {rows:[{snapshot:sqlCopy(state.snapshot),fingerprint:fp,
    snapshot_matches_reservation:isDeepStrictEqual(state.snapshot,state.reservation.source_snapshot)}]}
-  if(sql.includes('clawpilot_crm_native_initial_demo_quarantine(')){
+  if(sql.includes('clawpilot_crm_native_initial_pending_quarantine(')){
    assert.match(sql,/FROM unnest\(\$1::uuid\[\],\$2::text\[\]\)/)
+   assert.match(sql,/\$3::uuid,\$4::uuid,\$5::text,\$6::bigint\)/)
    const pending=state.snapshot.pendingOutbox.filter(row=>!(row.status==='queued'&&row.attempts===0&&row.lockedAt===null
     &&row.lockToken===null&&row.hasError===false&&row.processedAt===null))
-   assert.deepEqual(values,[pending.map(row=>row.id),pending.map(row=>row.rowFingerprint)],'Batch lookup must use the exact retained IDs and full-row hashes')
+   assert.deepEqual(values,[pending.map(row=>row.id),pending.map(row=>row.rowFingerprint),
+    selection.operatorAccountId,selection.rootWorkspaceId,selection.nativeInstanceId,Number(state.control.generation)],
+    'Batch lookup must use exact IDs, full-row hashes and current reservation scope')
    return {rows:state.quarantineResult??values[0].map((rowId,index)=>({id:rowId,quarantined:state.quarantineEvidence.get(rowId)===values[1][index]}))}
   }
   if(sql.includes('FROM pipeline_spaces p JOIN workspace_organizations'))return {rows:copy(state.pipelines)}
@@ -266,7 +269,7 @@ await check('exact terminal quarantine is independently batch-verified while all
  const f=withQuarantine(),before=sqlCopy(f.state.snapshot)
  const value=await f.operator.collectReservedSource(op,fp)
  assert.deepEqual(value.mappings,before.emails)
- assert.equal(f.state.sql.filter(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')).length,1,
+ assert.equal(f.state.sql.filter(row=>row.sql.includes('clawpilot_crm_native_initial_pending_quarantine(')).length,1,
   'Two retained dead rows require one bounded batch, not one query per row')
  assert.deepEqual(f.state.nativeCalls,[])
  assert.deepEqual(f.state.snapshot,before);assert.deepEqual(f.state.reservation.source_snapshot,before)
@@ -306,7 +309,7 @@ await check('ordinary dead, failed, processing and retried work cannot inherit d
  const f=fixture();f.state.snapshot.pendingOutbox=[{operation:'upsert_record',status:'queued',attempts:0,
   lockedAt:null,lockToken:null,hasError:false,processedAt:null}];f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
  assert.equal((await f.operator.collectReservedSource(op,fp)).mappings.length,2)
- assert.equal(f.state.sql.some(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')),false)
+ assert.equal(f.state.sql.some(row=>row.sql.includes('clawpilot_crm_native_initial_pending_quarantine(')),false)
 })
 await check('source artifact bytes and native complete inventory must match independently; no completeness JSON accepted',async()=>{
  for(const mutate of [f=>{f.state.nativeSource.emails.pop()},f=>{f.state.nativeSource.emails[0].archived=false},f=>{f.state.nativeSource.emails[0].pipelineId=id(99)},
@@ -468,7 +471,7 @@ if(postgresMajor){
    assert.ok(current.memberships.some(m=>m.user_email===selection.actorEmail&&Object.keys(m.permissions).length===0),'Real source must contain the seeded legitimate empty membership permissions object')
    assert.deepEqual(source.mappings.map(m=>m.nativeId),[id(40),id(41)]);assert.ok(statements.every(queries=>queries[0].includes('crm_native_email_publication_control')&&queries[0].includes('FOR UPDATE')))
    assert.equal(current.pendingOutbox.length,2)
-   const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_demo_quarantine('))
+   const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_pending_quarantine('))
    assert.equal(batches.length,1,'Actual SQL collector independently verifies both retained demo rows in one batch')
    assert.deepEqual(await retainedDemoJobs(),demoJobsBefore)
    assert.ok(current.pipelines.some(p=>p.id===unmanagedPipeline),'Unmanaged app pipeline remains in immutable global source')
