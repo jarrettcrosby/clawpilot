@@ -383,6 +383,8 @@ async function assertRetainedSameJobRecoveryPrivate(query, transaction, outboxId
   await emptyLedgers()
   // Include table and column ACLs: an INSERT-only witness grant may be column
   // scoped. The pending-quarantine helper lives in public but is private too.
+  // NULL or empty column ACLs have no separate grants. Do not materialize
+  // a zero-dimensional empty array: PostgreSQL's aclexplode rejects it.
   const acl = (await query(`WITH protected_schema AS (SELECT * FROM pg_namespace WHERE nspname=$1),
     protected_relations AS (
       SELECT c.* FROM pg_class c JOIN protected_schema n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','S')
@@ -397,7 +399,8 @@ async function assertRetainedSameJobRecoveryPrivate(query, transaction, outboxId
       WHERE a.grantee<>c.relowner
     UNION ALL SELECT c.relname::text||'.'||att.attname,a.grantee,a.privilege_type
       FROM protected_relations c JOIN pg_attribute att ON att.attrelid=c.oid,
-      LATERAL aclexplode(COALESCE(att.attacl,'{}'::aclitem[])) a WHERE a.grantee<>c.relowner
+      LATERAL aclexplode(CASE WHEN cardinality(att.attacl)>0 THEN att.attacl END) a
+      WHERE a.grantee<>c.relowner
     UNION ALL SELECT p.proname::text,a.grantee,a.privilege_type FROM protected_routines p,
       LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE a.grantee<>p.proowner`, [schema])).rows
   assert.deepEqual(acl, [], 'The retained upgrade grants no schema, table, column or function access to PUBLIC or other roles')
