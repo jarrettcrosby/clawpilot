@@ -422,13 +422,22 @@ if(postgresMajor){
    const artifacts=join(privateRoot,'artifacts');mkdirSync(artifacts,{mode:0o700})
    cliKeys=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
    const binary=realpathSync('/usr/bin/false'),publicKey=cliKeys.publicKey.export({type:'spki',format:'pem'})
+   const railwayIdentityFile=join(privateRoot,'fixture-identity')
+   writeFileSync(railwayIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
+   const databaseIdentity=(await q(`SELECT c.system_identifier::pg_catalog.text AS "systemIdentifier",
+     d.oid::pg_catalog.text AS "databaseOid",SESSION_USER::pg_catalog.text AS "sessionRole",
+     CURRENT_USER::pg_catalog.text AS "effectiveRole"
+     FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() c
+     WHERE d.datname=pg_catalog.current_database()`)).rows[0]
    const config={version:1,purpose:'clawpilot-native-email-initial-private-operator',selection,
     native:{railwayBinary:binary,railwayBinarySha256:byteHash(readFileSync(binary)),projectId:id(101),environmentId:id(102),serviceId:id(103),
+     deploymentInstanceId:id(104),railwayIdentityFile,
      nativeInstanceId:selection.nativeInstanceId,database:'synthetic_native_never_called',serviceUserId:'admin',oauthClientId:id(80),
      cliSourceHash:hash('synthetic-native-cli-not-called'),imagePackageHash:hash('synthetic-native-image-not-called')},
-    databaseName:'initial_operator_fixture',artifactDirectory:artifacts,issuer:{keyId:'operator-real-sql-fixture',publicKey}}
+    databaseName:'initial_operator_fixture',databaseIdentity,artifactDirectory:artifacts,issuer:{keyId:'operator-real-sql-fixture',publicKey}}
    const configFile=(value,name)=>{const path=join(privateRoot,name),bytes=JSON.stringify(value)+'\n';writeFileSync(path,bytes,{flag:'wx',mode:0o600});return {path,pin:byteHash(bytes)}}
    const selected=configFile(config,'operator.json'),wrongActor=configFile({...config,selection:{...selection,actorEmail:'viewer@example.invalid'}},'wrong-actor.json')
+   const wrongPhysical=configFile({...config,databaseIdentity:{...databaseIdentity,systemIdentifier:'1'}},'wrong-physical.json')
    const url='postgresql://postgres:initial_operator_fixture@127.0.0.1:'+port+'/initial_operator_fixture'
    const invoke=(action,extra=[],selectedConfig=selected,success=true)=>{
     const args=['--conditions=react-server',compiledBuild.entry,'--action='+action,'--config='+selectedConfig.path,'--config-sha256='+selectedConfig.pin,...extra]
@@ -450,16 +459,17 @@ if(postgresMajor){
     assert.deepEqual((await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0],row)
     assert.deepEqual(invoke('preview'),{action:'preview',...preview,activeOperationId:op})
    })
-   await check('REAL compiled private CLI denies wrong root actor and source pins without changing PG reservation or enabling publication',async()=>{
+   await check('REAL compiled private CLI denies wrong root actor, physical database and source pins without changing PG reservation or enabling publication',async()=>{
     const before=(await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0]
     assert.equal(invoke('preview',[],wrongActor,false).code,'initial_pg_operator_denied')
+    assert.equal(invoke('preview',[],wrongPhysical,false).code,'initial_private_operator_database_identity_unproven')
     const refused=invoke('reserve',['--operation='+op,'--source-sha256='+hash('wrong-reviewed-sql-source'),'--approve-operation='+op],selected,false)
     assert.equal(refused.code,'initial_pg_reservation_pin_changed')
     assert.deepEqual((await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0],before)
     assert.equal((await q('SELECT enabled FROM crm_native_email_publication_control WHERE singleton')).rows[0].enabled,false)
    })
    compiledCliProof={actualPool:true,actualPrivateCliPreview:true,actualPrivateCliReservation:true,approvedRetryImmutable:true,
-    wrongActorDenied:true,wrongSourcePinDenied:true,nativeCommandConfigured:'/usr/bin/false',nativeCommandExercised:false}
+    wrongActorDenied:true,wrongPhysicalDatabaseDenied:true,wrongSourcePinDenied:true,nativeCommandConfigured:'/usr/bin/false',nativeCommandExercised:false}
   }
   await realStore.reserve(op,preview.sourceFingerprint)
   const current=(await q('SELECT clawpilot_crm_native_initial_source_snapshot() AS snapshot')).rows[0].snapshot,f=fixture()

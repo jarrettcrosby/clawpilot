@@ -7,6 +7,7 @@ import {execFileSync} from 'node:child_process'
 import {randomBytes,randomUUID} from 'node:crypto'
 import {createRequire} from 'node:module'
 import {readFileSync,readdirSync} from 'node:fs'
+import {posix as path} from 'node:path'
 import {disposablePostgresDockerArgs,disposablePostgresDockerCleanupArgs} from './lib/disposable-postgres-docker.mjs'
 import {startDisposableNativePostgres} from './lib/disposable-native-postgres.mjs'
 import {applyMigrationSqlForTest} from './lib/postgres-test-migrations.mjs'
@@ -22,7 +23,12 @@ function load(path){if(cache.has(path))return cache.get(path);const module={expo
  const source=ts.transpileModule(readFileSync(new URL('../'+path,import.meta.url),'utf8'),
   {compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
  new Function('require','module','exports',source)(name=>name==='server-only'?{}:name.startsWith('node:')?require(name):
-  load('app_src/lib/crm/'+name.slice(2)+'.ts'),module,module.exports);cache.set(path,module.exports);return module.exports}
+  loadLocal(path,name),module,module.exports);cache.set(path,module.exports);return module.exports}
+function loadLocal(importer,name){
+ const target=path.normalize(path.join(path.dirname(importer),name+'.ts'))
+ assert.ok(name.startsWith('.')&&/^app_src\/lib\/(?:crm|persistence)\/[A-Za-z0-9]+\.ts$/u.test(target),'Fixture source boundary')
+ return load(target)
+}
 const protocol=load('app_src/lib/crm/nativeEmailPublication.ts'),capability=load('app_src/lib/crm/nativeEmailCapabilityContract.ts')
 const lineageProtocol=load('app_src/lib/crm/nativeEmailInitialInstallationLineage.ts')
 const canonical=protocol.nativeEmailCanonicalJson,hash=protocol.nativeEmailDigest,copy=value=>JSON.parse(JSON.stringify(value))
@@ -458,6 +464,30 @@ try{
       nativeId:heldNative,globalId:global,attempts:8,rowFingerprint:heldBefore[0].fingerprint,sourceFingerprint:pin.source,
       payloadFingerprint:pin.payload,keyFingerprint:pin.key,relationshipFingerprint:pin.relationships,providerIdentityFingerprint:pin.provider}]}
   heldManifestRow=expectedManifest.rows[0]
+  const physical=(await query(`SELECT current_database() AS database,d.oid::text AS "databaseOid",
+    system_identifier::text AS "systemIdentifier",SESSION_USER::text AS "observerRole"
+    FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() WHERE d.datname=current_database()`)).rows[0]
+  const {createLegacyEmailTerminalHoldAppObserver}=load('app_src/lib/persistence/crmLegacyEmailTerminalHoldAppObserver.ts')
+  const appObserver=createLegacyEmailTerminalHoldAppObserver(physical,async(_signal,run)=>{
+   const observer=await pool.connect()
+   try {
+    await observer.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    await observer.query("SET LOCAL TIME ZONE 'UTC'")
+    return await run(observer.query.bind(observer))
+   } finally {try{await observer.query('ROLLBACK')}finally{observer.release()}}
+  })
+  const appRequest={phase:'appBefore',observationId:randomUUID(),candidateFingerprint:hash('fixture candidate'),
+   target:{...expectedManifest,scope:{...expectedManifest.scope,postgresDatabaseFingerprint:appObserver.storeFingerprint},
+    outboxIds:[heldOutbox],postgresObserverFingerprint:appObserver.observerFingerprint}}
+  const signal=new AbortController().signal
+  const observed=await appObserver.observeApp(appRequest,signal)
+  assert.deepEqual(observed.rows,[heldManifestRow],'Read-only application observer pins the same complete row as the SQL hold')
+  assert.equal(observed.appGeneration,expectedManifest.appGeneration)
+  assert.equal(observed.gateFingerprint,expectedManifest.gateFingerprint)
+  assert.equal(observed.appSourceFingerprint,expectedManifest.appSourceFingerprint)
+  await assert.rejects(appObserver.observeApp({...appRequest,target:{...appRequest.target,outboxIds:[randomUUID()]}},signal),
+   error=>error?.code==='legacy_terminal_hold_app_observer_reviewed_set')
+  assert.deepEqual(await heldRows(),heldBefore,'Read-only preview does not modify the original queue or interaction')
   const crypto=require('node:crypto'),approvalApi=load('app_src/lib/crm/legacyEmailRetirementApproval.ts')
   const fenceKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072}),operatorKey=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
   const wrap=(proof,key)=>({proof,signature:crypto.sign('sha256',Buffer.from(canonical(proof),'ascii'),

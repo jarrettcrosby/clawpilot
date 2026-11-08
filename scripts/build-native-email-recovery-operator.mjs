@@ -42,6 +42,13 @@ const output=mkdtempSync(join(outputParent,'native-email-recovery-operator-'))
 const entry='ops/native-email-recovery.js',entrySource=join(app,'ops/native-email-recovery.ts')
 const custodianLibraryEntry='lib/crm/nativeEmailRecoveryCustodian.js'
 const custodianSource=join(app,'lib/crm/nativeEmailRecoveryCustodian.ts')
+const terminalHoldLibraryEntries=[
+  'lib/crm/legacyEmailTerminalHoldPreview.js',
+  'lib/crm/legacyEmailTerminalHoldPrivateOperator.js',
+  'lib/crm/legacyEmailTerminalHoldStockNativeObserver.js',
+  'lib/persistence/crmLegacyEmailTerminalHoldAppObserver.js',
+]
+const terminalHoldSources=terminalHoldLibraryEntries.map(path=>join(app,path.replace(/\.js$/u,'.ts')))
 const compilerOptions={target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS,moduleResolution:ts.ModuleResolutionKind.Node10,
   strict:true,esModuleInterop:true,skipLibCheck:true,noEmitOnError:true,rootDir:app,outDir:output,types:['node'],
   typeRoots:[join(app,'node_modules/@types')],resolveJsonModule:true,allowJs:true,baseUrl:app,paths:{'@/*':['./*']}}
@@ -61,9 +68,10 @@ host.readFile=(file)=>{
 // Check the controller on its own before adding the independently operated
 // signing library as another root. Do not let a shared artifact add a signer
 // dependency to the controller's module graph (even a type-only import).
-const controllerProgram=ts.createProgram([entrySource],compilerOptions,host)
+const controllerSources=[entrySource,...terminalHoldSources]
+const controllerProgram=ts.createProgram(controllerSources,compilerOptions,host)
 assert.ok(!controllerProgram.getSourceFile(custodianSource),'The recovery controller must not import the custody signer')
-const program=ts.createProgram({rootNames:[entrySource,custodianSource],options:compilerOptions,host,oldProgram:controllerProgram})
+const program=ts.createProgram({rootNames:[...controllerSources,custodianSource],options:compilerOptions,host,oldProgram:controllerProgram})
 const before=ts.getPreEmitDiagnostics(program)
 if(before.length){
   process.stderr.write(ts.formatDiagnosticsWithColorAndContext(before,{getCurrentDirectory:()=>app,getCanonicalFileName:x=>x,getNewLine:()=> '\n'}))
@@ -74,6 +82,7 @@ if(before.length){
   const sources=pinSources(files,file=>consumed.get(file))
   assert.ok(Object.hasOwn(sources,'ops/native-email-recovery.ts'))
   assert.ok(Object.hasOwn(sources,'lib/crm/nativeEmailRecoveryCustodian.ts'))
+  for(const path of terminalHoldSources)assert.ok(Object.hasOwn(sources,relative(app,path)))
   for(const path of ['nativeEmailRecoveryCustodyProof','nativeEmailRecoveryCustodySocket','nativeEmailRecoveryStoreBinding','nativeEmailRecoveryPrivatePostgres','nativeEmailRecoveryMaintenanceOperator',
     'nativeEmailAccountRepairOperator','nativeEmailAccountRepairJournal','nativeEmailArchiveOperator','nativeEmailArchiveJournal'])
     assert.ok(Object.hasOwn(sources,`lib/crm/${path}.ts`),'Missing private operator dependency: '+path)
@@ -151,14 +160,27 @@ if(before.length){
   assert.equal(custodianWithCondition.status,0)
   assert.equal(custodianWithCondition.stdout,'')
   assert.equal(custodianWithCondition.stderr,'')
+  // The batch-hold tools are private libraries, not executable operations.
+  for(const path of terminalHoldLibraryEntries){
+    const defaultImport=smoke([join(output,path)])
+    assert.equal(defaultImport.error,undefined)
+    assert.equal(defaultImport.status,1)
+    assert.match(defaultImport.stderr,/cannot be imported from a Client Component module/)
+    const privateImport=smoke(['--conditions=react-server',join(output,path)])
+    assert.equal(privateImport.error,undefined)
+    assert.equal(privateImport.status,0)
+    assert.equal(privateImport.stdout,'')
+    assert.equal(privateImport.stderr,'')
+  }
 
   const outputs=Object.fromEntries(emittedFiles(output).map(file=>[relative(output,file),sha(readFileSync(file))]).sort(([a],[b])=>a.localeCompare(b)))
   const manifest={version:1,purpose:'clawpilot-native-email-recovery-private-operator-build',typescriptVersion:ts.version,
-    nodeMajor:24,entry,custodianLibraryEntry,requiredNodeCondition:'react-server',buildScriptSha256:sha(readFileSync(script)),
+    nodeMajor:24,entry,custodianLibraryEntry,terminalHoldLibraryEntries,requiredNodeCondition:'react-server',buildScriptSha256:sha(readFileSync(script)),
     appPackageLockSha256:sha(readFileSync(join(app,'package-lock.json'))),rewrittenAliases,sources,outputs}
   const manifestFile=join(output,'build-manifest.json')
   writeFileSync(manifestFile,JSON.stringify(manifest,null,2)+'\n',{flag:'wx',mode:0o600})
   process.stdout.write(JSON.stringify({built:true,output,entry:join(output,entry),custodianLibraryEntry:join(output,custodianLibraryEntry),sourceCount:files.length,
     outputCount:Object.keys(outputs).length,rewrittenAliases,manifestSha256:sha(readFileSync(manifestFile)),
-    emittedEarlyGuardSmokePassed:true,defaultServerOnlyRefusalPassed:true,custodianLibrarySmokePassed:true,runtimeProof:false})+'\n')
+    emittedEarlyGuardSmokePassed:true,defaultServerOnlyRefusalPassed:true,custodianLibrarySmokePassed:true,
+    terminalHoldLibrarySmokePassed:true,runtimeProof:false})+'\n')
 }

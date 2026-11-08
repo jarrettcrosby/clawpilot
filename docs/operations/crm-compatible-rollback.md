@@ -215,6 +215,37 @@ the exact separately approved live permission change, five-message recovery,
 authenticated calendar/deletion/Drive readback and the Fractional sender handoff.
 Nothing in this runbook activates permissions, enables publication or deploys.
 
+## Initial enrollment and terminal-hold execution boundary
+
+The private initial operator's SHA-pinned configuration now requires the
+exact Railway deployment instance and reviewed private SSH identity path,
+plus the PostgreSQL cluster identifier, database OID and both database
+roles. The private executable verifies the database identity on each actual
+transaction connection before application SQL. Missing visibility fails
+closed; these checks do not grant access, prove writer drain, or make a
+retained deployment an acceptable fallback.
+
+The separate private terminal-hold preview accepts an explicit reviewed ID
+set and brackets the native absence observation with two matching app
+observations. It emits an unsigned draft with no live fence evidence.
+Rebuild the full manifest under independent retained writer closure before
+requesting exact approval; never sign or apply a preview draft. A native
+absence observer must account for all exact identity surfaces, including
+deleted or orphaned rows and the managed identity and operation ledgers.
+Missing tables or unavailable visibility are not a substitute for a
+verified installation-state and absence readback.
+On a Mac with MariaDB 11.4 already installed, the opt-in
+`npm run test:native-email-terminal-hold-mariadb:local` rehearses the stock
+readback against a private temporary server with networking disabled.
+
+The hold coordinator is a private library, not an application route or a
+production command with default connections. It requires separately
+authenticated custody and reviewed role-specific direct connections.
+Its one-use journal retains only the exact operation and resolution pins;
+an uncertain commit must be inspected, never automatically replayed.
+None of this source preparation authorizes live setup, role grants,
+permission activation, or email recovery.
+
 ## What the artifact is
 
 The artifact is an immutable, hash-pinned **source application snapshot** that

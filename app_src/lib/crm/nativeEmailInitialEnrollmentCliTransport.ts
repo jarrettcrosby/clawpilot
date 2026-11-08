@@ -1,7 +1,7 @@
 import 'server-only'
 import {createHash} from 'node:crypto'
 import {spawn} from 'node:child_process'
-import {lstatSync,readFileSync} from 'node:fs'
+import {lstatSync,readFileSync,realpathSync} from 'node:fs'
 import {isAbsolute} from 'node:path'
 import {nativeEmailCanonicalJson as json,requireNativeEmail} from './nativeEmailPublication'
 import type {NativeEmailInitialSourceCollector,NativeEmailInitialReservedSource,NativeEmailInitialPreparationSource,
@@ -13,7 +13,8 @@ import {prepareNativeEmailInitialReplanContext,nativeEmailInitialReplanContextFr
   type NativeEmailInitialReplanContext} from './nativeEmailInitialInstallationLineage'
 
 type Row=Record<string,unknown>
-export type NativeEmailInitialCliTarget={railwayBinary:string;railwayBinarySha256:string;projectId:string;environmentId:string;serviceId:string;
+export type NativeEmailInitialCliTarget={railwayBinary:string;railwayBinarySha256:string;railwayIdentityFile:string;
+  projectId:string;environmentId:string;serviceId:string;deploymentInstanceId:string;
   nativeInstanceId:string;database:string;serviceUserId:string;oauthClientId:string;cliSourceHash:string;imagePackageHash:string}
 type Command={program:string;args:string[];stdin?:string}
 /** This injectable command boundary is for acceptance tests. Production uses
@@ -31,6 +32,12 @@ const hash=(bytes:string|Buffer)=>createHash('sha256').update(bytes).digest('hex
 function need(value:unknown,code:string):asserts value{requireNativeEmail(value,'initial_cli_transport_'+code)}
 function exact(value:unknown,keys:string[]):asserts value is Row{need(value&&typeof value==='object'&&!Array.isArray(value)
   &&JSON.stringify(Object.keys(value).sort())===JSON.stringify([...keys].sort()),'shape')}
+function identityFile(path:string){
+  let stat:ReturnType<typeof lstatSync>,canonicalPath:string
+  try{stat=lstatSync(path);canonicalPath=realpathSync(path)}catch{need(false,'identity_file')}
+  need(canonicalPath===path&&stat.isFile()&&!stat.isSymbolicLink()&&stat.uid===process.geteuid?.()&&stat.nlink===1
+    &&[0o400,0o600].includes(Number(stat.mode)&0o7777)&&stat.size>0&&stat.size<=131072,'identity_file')
+}
 // Transport metadata has fixed filesystem-path keys in bootstrapPins. It is
 // NOT the native permission wire grammar; do not relax that shared validator.
 function artifactJson(value:unknown):string{
@@ -88,17 +95,25 @@ export const runNativeEmailInitialCliCommand=createNativeEmailInitialCliCommandR
 export class NativeEmailInitialEnrollmentCliTransport implements NativeEmailInitialSourceCollector,NativeEmailInitialOperatorTransport{
   private readonly target:Readonly<NativeEmailInitialCliTarget>
   constructor(target:NativeEmailInitialCliTarget,private readonly run:NativeEmailInitialCliCommandRunner=runNativeEmailInitialCliCommand){
-    exact(target,['railwayBinary','railwayBinarySha256','projectId','environmentId','serviceId','nativeInstanceId','database','serviceUserId','oauthClientId','cliSourceHash','imagePackageHash'])
-    need(isAbsolute(target.railwayBinary)&&HASH.test(target.railwayBinarySha256)&&[target.projectId,target.environmentId,target.serviceId].every(id=>UUID.test(id)),'target')
+    exact(target,['railwayBinary','railwayBinarySha256','railwayIdentityFile','projectId','environmentId','serviceId','deploymentInstanceId',
+      'nativeInstanceId','database','serviceUserId','oauthClientId','cliSourceHash','imagePackageHash'])
+    need(typeof target.railwayBinary==='string'&&isAbsolute(target.railwayBinary)&&HASH.test(target.railwayBinarySha256)
+      &&typeof target.railwayIdentityFile==='string'&&isAbsolute(target.railwayIdentityFile)&&!target.railwayIdentityFile.includes('\0')
+      &&[target.projectId,target.environmentId,target.serviceId,target.deploymentInstanceId].every(id=>typeof id==='string'&&UUID.test(id)),'target')
     need([target.nativeInstanceId,target.serviceUserId,target.oauthClientId].every(id=>ID.test(id))
       &&/^[A-Za-z0-9_]{1,64}(?![\s\S])/.test(target.database)&&HASH.test(target.cliSourceHash)&&HASH.test(target.imagePackageHash),'native_identity')
+    // The SHA-pinned operator configuration approves this exact path. Verify
+    // filesystem metadata without reading the credential or choosing a default.
+    identityFile(target.railwayIdentityFile)
     this.target=Object.freeze({...target})
   }
   private command(script:string,args:string[],stdin?:string){
     const t=this.target,stat=lstatSync(t.railwayBinary)
     need(stat.isFile()&&!stat.isSymbolicLink()&&(stat.mode&0o022)===0&&stat.size<=268435456
       &&hash(readFileSync(t.railwayBinary))===t.railwayBinarySha256,'railway_binary_changed')
+    identityFile(t.railwayIdentityFile)
     return this.run({program:t.railwayBinary,args:['ssh','--project',t.projectId,'--environment',t.environmentId,'--service',t.serviceId,
+      '--deployment-instance',t.deploymentInstanceId,'--identity-file',t.railwayIdentityFile,
       '--','php',script,...args],...(stdin===undefined?{}:{stdin})})
   }
   private async bootstrap(operationId:string){need(HASH.test(operationId),'operation')

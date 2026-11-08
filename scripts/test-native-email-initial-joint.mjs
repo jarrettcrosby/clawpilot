@@ -157,6 +157,7 @@ const fromBuild=file=>compiled(join(build,'lib/crm',file+'.js'))
 const {NativeEmailInitialEnrollmentOperator:Operator}=fromBuild('nativeEmailInitialEnrollmentOperator')
 const {PostgresNativeEmailInitialEnrollmentStore:Store}=fromBuild('nativeEmailInitialEnrollmentPostgres')
 const {NativeEmailInitialEnrollmentCliTransport:Transport}=fromBuild('nativeEmailInitialEnrollmentCliTransport')
+const {createNativeEmailInitialOperatorTransaction:createPinnedTransaction}=compiled(join(build,manifest.entry))
 const {NativeEmailInitialEnrollmentCoordinator:Coordinator}=fromBuild('nativeEmailInitialEnrollmentCoordinator')
 const {createNativeEmailInitialApprovalIssuer:createIssuer}=fromBuild('nativeEmailInitialEnrollmentApproval')
 const {createNativeEmailInitialStartupOriginIssuer:createOriginIssuer}=fromBuild('nativeEmailInitialStartupOrigin')
@@ -351,9 +352,13 @@ try{
   pool=new Pool({host:'127.0.0.1',port:Number(port),database:'initial_joint_fixture',user:'postgres',password:'initial_joint_fixture',ssl:false,max:3,statement_timeout:10000})
   let until=Date.now()+30000;for(;;){try{await pool.query('SELECT 1');break}catch(e){if(Date.now()>until)throw e;await new Promise(r=>setTimeout(r,100))}}
   const q=(sql,values=[])=>pool.query(sql,values)
-  const transaction=async fn=>{const client=await pool.connect();activeTransactions++
-    try{await client.query('BEGIN');const value=await fn({query:(sql,values=[])=>client.query(sql,values)});await client.query('COMMIT');return value}
-    catch(e){await client.query('ROLLBACK');throw e}finally{activeTransactions--;client.release()}}
+  const databaseIdentity=(await q(`SELECT c.system_identifier::pg_catalog.text AS "systemIdentifier",
+    d.oid::pg_catalog.text AS "databaseOid",SESSION_USER::pg_catalog.text AS "sessionRole",
+    CURRENT_USER::pg_catalog.text AS "effectiveRole"
+    FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() c
+    WHERE d.datname=pg_catalog.current_database()`)).rows[0]
+  const pinnedTransaction=createPinnedTransaction(pool,'initial_joint_fixture',databaseIdentity)
+  const transaction=async fn=>{activeTransactions++;try{return await pinnedTransaction(fn)}finally{activeTransactions--}}
   await check('actual PostgreSQL migrations through retained initial enrollment on the guarded primary',async()=>{
     const client=await pool.connect();try{for(const p of candidates.filter(p=>p.includes('/db/migrations/')))
       await applyMigrationSqlForTest(client,p.split('/').at(-1),readFileSync(p,'utf8'))}finally{client.release()}})
@@ -568,7 +573,10 @@ try{
   const invoke=(script,args,extra={})=>run('docker',['exec',...(extra.input!==undefined?['--interactive']:[]),...nativeEnv.flatMap(x=>['--env',x]),names.app,
     'php','-d','memory_limit=384M',script,...args],{timeout:45000,...extra})
   const packet=JSON.parse(invoke('/opt/clawpilot/install-native-email-runtime.php',['check','--app-root='+nativePaths.app,'--state-root='+nativePaths.runtime]))
+  const initialIdentityFile=join(root,'initial-fixture-identity')
+  writeFileSync(initialIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
   const binary=realpathSync('/usr/bin/true'),target={railwayBinary:binary,railwayBinarySha256:sha(readFileSync(binary)),projectId:id(),environmentId:id(),serviceId:id(),
+    deploymentInstanceId:id(),railwayIdentityFile:initialIdentityFile,
     nativeInstanceId:selection.nativeInstanceId,database:'suitecrm_native_test',serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId,
     cliSourceHash:sha(readFileSync(join(source,'native-email-initial-cli.php'))),imagePackageHash:packet.packageHash}
   let loseNativeCommitResponse=true,nativeExecutionCount=0,nativeResolutionBeforePgActivation=false,activationOperationId=operationId
@@ -576,8 +584,9 @@ try{
   const actualCommand=async command=>{
     assert.equal(activeTransactions,0,'Native I/O occurred under a PG transaction')
     assert.equal(command.program,binary)
-    assert.deepEqual(command.args.slice(0,9),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,'--','php'])
-    const script=command.args[9],args=command.args.slice(10),action=args[0],commandOperation=args.find(arg=>arg.startsWith('--operation='))?.slice('--operation='.length)
+    assert.deepEqual(command.args.slice(0,13),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,
+      '--deployment-instance',target.deploymentInstanceId,'--identity-file',initialIdentityFile,'--','php'])
+    const script=command.args[13],args=command.args.slice(14),action=args[0],commandOperation=args.find(arg=>arg.startsWith('--operation='))?.slice('--operation='.length)
     assert.ok(['/opt/clawpilot/native-email-initial-cli.php','/opt/clawpilot/native-email-initial-artifacts.php'].includes(script))
     const isExecute=script.endsWith('/native-email-initial-cli.php')&&action==='execute',isCancel=script.endsWith('/native-email-initial-cli.php')&&action==='cancel-expired'
     if(isCancel)assert.ok(expectedCancellations.has(commandOperation),'Only the exact deliberately expired fixture operation may cancel')
