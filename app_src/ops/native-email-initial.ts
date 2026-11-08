@@ -24,6 +24,7 @@ const HASH=/^[a-f0-9]{64}(?![\s\S])/
 const DATABASE_NAME=/^[A-Za-z0-9_]{1,64}(?![\s\S])/
 const ROLE_NAME=/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}(?![\s\S])/
 const POSITIVE_DECIMAL=/^[1-9][0-9]{0,19}(?![\s\S])/
+const UINT32=BigInt('4294967295'),UINT64=BigInt('18446744073709551615')
 const hash=(bytes:string|Buffer)=>createHash('sha256').update(bytes).digest('hex')
 function need(value:unknown,code:string):asserts value{requireNativeEmail(value,'initial_private_operator_'+code)}
 function exact(value:unknown,keys:string[]):asserts value is Row{need(value&&typeof value==='object'&&!Array.isArray(value)
@@ -32,7 +33,7 @@ function databaseIdentity(input:unknown):DatabaseIdentity{
   exact(input,['systemIdentifier','databaseOid','sessionRole','effectiveRole'])
   const {systemIdentifier,databaseOid,sessionRole,effectiveRole}=input
   const decimal=(v:unknown,max:bigint):v is string=>typeof v==='string'&&POSITIVE_DECIMAL.test(v)&&BigInt(v)<=max
-  need(decimal(systemIdentifier,18446744073709551615n)&&decimal(databaseOid,4294967295n)
+  need(decimal(systemIdentifier,UINT64)&&decimal(databaseOid,UINT32)
     &&typeof sessionRole==='string'&&ROLE_NAME.test(sessionRole)&&typeof effectiveRole==='string'&&ROLE_NAME.test(effectiveRole),'database_identity_pin')
   return Object.freeze({systemIdentifier,databaseOid,sessionRole,effectiveRole})
 }
