@@ -25,6 +25,8 @@ export type FractionalCrmGatewayServices = {
   resolveOrCreateFractionalCrmOnboarding: (principal: FractionalCrmPrincipal, input: Fields, idempotencyKey: string) => Promise<unknown>
   readFractionalCrmCustomerFolder: (principal: FractionalCrmPrincipal, ga: string, customerId: string) => Promise<unknown>
   updateFractionalCrmCustomerFolder: (principal: FractionalCrmPrincipal, ga: string, input: FractionalCrmFolderPatch) => Promise<unknown>
+  readFractionalCrmProduct: (principal: FractionalCrmPrincipal, gp: string) => Promise<unknown>
+  listFractionalCrmProducts: (principal: FractionalCrmPrincipal, page: { limit: number; cursor?: string }) => Promise<unknown>
 }
 const responseHeaders = {
   'Cache-Control': 'private, no-store', Vary: 'Authorization', 'X-Content-Type-Options': 'nosniff',
@@ -160,16 +162,24 @@ export async function handleFractionalCrmGateway(
     if (!isFractionalCrmGatewayPath(url.pathname, request.method)) invalid(404, 'RECORD_NOT_FOUND')
     const parts = url.pathname.slice(basePath.length).split('/')
     const isOnboarding = parts[0] === 'onboarding'
+    const isProduct = parts[0] === 'products'
     const isFolder = parts.length === 3 && parts[2] === 'customer-folder'
     const isContact = !isFolder && parts.length >= 3
-    const isList = isContact && parts.length === 3
-    const capability: FractionalCrmCapabilityRequirement = isOnboarding ? 'crm.onboarding.write'
+    const isList = isProduct ? parts.length === 1 : isContact && parts.length === 3
+    const capability: FractionalCrmCapabilityRequirement = isProduct ? 'crm.product.read' : isOnboarding ? 'crm.onboarding.write'
       : request.method === 'PATCH' ? (isFolder ? fractionalCrmFolderWriteCapabilities : isContact ? 'crm.contact.write' : 'crm.company.write')
         : isFolder ? fractionalCrmFolderReadCapabilities : isContact ? 'crm.contact.read' : 'crm.company.read'
     const principal = await authenticateFractionalCrmGateway(request, fractionalCrmGatewayConfiguration(env), services.readFractionalCrmCredential, capability)
     exactScope(url, principal, isList, isFolder)
     let result: unknown
-    if (isOnboarding) {
+    if (isProduct) {
+      if (isList) {
+        const limit = url.searchParams.get('limit') ?? '50'
+        const cursor = url.searchParams.get('cursor') ?? undefined
+        if (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,1024}$/.test(cursor))) invalid()
+        result = await services.listFractionalCrmProducts(principal, { limit: Number(limit), ...(cursor ? { cursor } : {}) })
+      } else result = await services.readFractionalCrmProduct(principal, parts[1])
+    } else if (isOnboarding) {
       const key = idempotency(request)
       result = await services.resolveOrCreateFractionalCrmOnboarding(principal, onboarding(await readJson(request), principal), key)
     } else if (isFolder) {

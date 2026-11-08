@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT =
-  'clawpilot-production-rebind-target-schema-attestation-v20'
+  'clawpilot-production-rebind-target-schema-attestation-v21'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION =
   '0349_operations_commerce_order_history_policy.sql'
 export const PRODUCTION_REBIND_HISTORY_SCHEMA_MIGRATION_CHECKSUM =
@@ -152,11 +152,23 @@ const THROUGH_0411_SCHEMA_MIGRATIONS = Object.freeze([
   Object.freeze({ filename: '0411_crm_legacy_email_archive_disposition.sql',
     checksum: '0f7d41a3ebb11901af0c575165cd48632d8b25eb351777a41413b21b1e2c9fd3' }),
 ])
-export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+const THROUGH_0412_V20_SCHEMA_MIGRATIONS = Object.freeze([
   ...THROUGH_0411_SCHEMA_MIGRATIONS,
   Object.freeze({ filename: '0412_crm_calendar_occurrence_claims.sql',
     checksum: 'dcd430b14721d3267bef4ce39f84d6fac490deb9cf55f7f0cf0a55ba6859a8c3' }),
 ])
+const FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS = Object.freeze([
+  Object.freeze({ filename: '0373_fractional_crm_product_read.sql',
+    checksum: '0e01f96a2862c22e785cd16a49a5079d0e9492f7503e155941b45e111b64a764' }),
+  Object.freeze({ filename: '0403_fractional_crm_customer_folder_capability.sql',
+    checksum: 'b40bc79b04e010ac354f8cf2c79e4eec9419f6746a4184c6ae424c8ccae8568f' }),
+])
+const FRACTIONAL_PRODUCT_COMPATIBILITY_FILENAMES = new Set(
+  FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS.map(({ filename }) => filename))
+export const PRODUCTION_REBIND_SCHEMA_MIGRATIONS = Object.freeze([
+  ...THROUGH_0412_V20_SCHEMA_MIGRATIONS.filter(({ filename }) => !FRACTIONAL_PRODUCT_COMPATIBILITY_FILENAMES.has(filename)),
+  ...FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS,
+].sort((a, b) => a.filename < b.filename ? -1 : Number(a.filename > b.filename)))
 
 // The rebind caller can take ACCESS SHARE locks on this exact, static list
 // before the in-transaction attestation. ACCESS SHARE allows ordinary DML but
@@ -473,8 +485,8 @@ export const PRE_CALENDAR_OCCURRENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.fr
 // Enrollment requires independent full-catalog PG16/18 diagnostics followed by
 // the tamper gate. Never learn replacement pins from a live runtime.
 const EXPECTED_SCHEMA_DIGEST_BY_POSTGRES_MAJOR = Object.freeze({
-  16: '7a302187e1c5082cb8bcb33dee6717667b8f26ee3a28a715f7ffb7cd04660ad6',
-  18: '8dff7fb7b1e42d8878a3920838cb03851049426b0b1d54f1cf20a76e3ed03cca',
+  16: 'deb3985e8215284d5de69a2b5966a3740e452070a9b1ebe14fac46370718b2fc',
+  18: '7006803ee42ade78f36c565b60549f8c2aeb118ca5d33484a6bf17e0f6f0d65a',
 })
 
 const TARGET_SCHEMA_CATALOG_SQL = String.raw`
@@ -1293,6 +1305,16 @@ export async function inspectPreCalendarOccurrenceProductionRebindSchemaMetadata
   return Object.freeze({ ...result, format:'clawpilot-production-rebind-v19-metadata-only' })
 }
 
+/** Frozen pre-product-compatibility v20 metadata, never a current-attestation fallback. */
+export async function inspectPreFractionalProductCompatibilityProductionRebindSchemaMetadata(client) {
+  const result = await inspectSchemaWithFunctions(client,
+    PRODUCTION_REBIND_CRITICAL_FUNCTIONS,
+    PRODUCTION_REBIND_CRITICAL_RELATIONS,
+    THROUGH_0412_V20_SCHEMA_MIGRATIONS,
+    THROUGH_0411_ADDITIONAL_SCHEMAS)
+  return Object.freeze({ ...result, format:'clawpilot-production-rebind-v20-metadata-only' })
+}
+
 export async function attestProductionRebindHistorySchema(client) {
   const inspection = await inspectProductionRebindHistorySchema(client)
   if (inspection.migrations.some(
@@ -1300,7 +1322,7 @@ export async function attestProductionRebindHistorySchema(client) {
   )) {
     throw new ProductionRebindHistorySchemaAttestationError(
       'migration_checksum_mismatch',
-      'expected one exact ledger row for migrations 0349, 0353 through 0359, and 0370 through 0412',
+      'expected one exact ledger row for each current schema migration',
     )
   }
   if (

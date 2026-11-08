@@ -3,6 +3,7 @@ import {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
   readFractionalCrmCustomerFolder, updateFractionalCrmCustomerFolder,
+  readFractionalCrmProduct, listFractionalCrmProducts,
 } from '@/lib/persistence/fractionalCrmGateway'
 import { reconcileCrmBoardProjectionsForPipeline } from '@/lib/crm/boardProjection'
 
@@ -12,6 +13,7 @@ export const dynamic = 'force-dynamic'
 const services = {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
+  readFractionalCrmProduct, listFractionalCrmProducts,
   readFractionalCrmCustomerFolder,
   updateFractionalCrmCustomerFolder: (...args: Parameters<FractionalCrmGatewayServices['updateFractionalCrmCustomerFolder']>) =>
     updateFractionalCrmCustomerFolder(...args, reconcileCrmBoardProjectionsForPipeline),

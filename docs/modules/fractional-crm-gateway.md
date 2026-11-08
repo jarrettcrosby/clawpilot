@@ -29,7 +29,7 @@ Apply migration `0372_fractional_crm_gateway.sql` through the existing migration
 
 Use a fresh independent token in the `fcg_<32-hex-credential-UUID>_<43-base64url-secret>` format. Store only the domain-separated SHA-256 digest produced by `hashFractionalCrmGatewayToken`; store the raw token only in Fractional's protected secret configuration. Never reuse browser cookies, worker tokens, native CRM credentials, databases, or sessions. Do not put token values in command arguments, logs, docs, or receipts. Credential identity, digest, actor, source, and scope cannot be rebound: rotate with a new row and revoke the old row. Revocation, expiry, capabilities, company grants, and enabled state are checked again under a transaction lock before each operation or historical receipt replay.
 
-Capabilities are independent: `crm.company.read`, `crm.contact.read`, `crm.company.write`, `crm.contact.write`, `crm.onboarding.write`, and `crm.customer-folder.write`. Provision only those reviewed for the caller. Newly created onboarding companies are added to that credential's allowlist transactionally. This is not a wildcard grant to the pipeline. Migration `0403_fractional_crm_customer_folder_capability.sql` adds the folder capability to the accepted vocabulary without granting or modifying any credential.
+Capabilities are independent: `crm.company.read`, `crm.contact.read`, `crm.product.read`, `crm.company.write`, `crm.contact.write`, `crm.onboarding.write`, and `crm.customer-folder.write`. Provision only those reviewed for the caller. Newly created onboarding companies are added to that credential's allowlist transactionally. This is not a wildcard grant to the pipeline. The historical `0373_fractional_crm_product_read.sql` is retained byte for byte. Migration `0403_fractional_crm_customer_folder_capability.sql` adds the folder capability without removing product-read from the accepted vocabulary or modifying any credential. Before using the revised `0403` on a retained database, verify that the earlier version is not recorded as applied; never rewrite the database ledger to bypass a checksum mismatch.
 
 ## HTTP and canonical fields
 
@@ -40,6 +40,8 @@ All paths start with `/api/integrations/fractional-crm/v1`. Each request require
 | `GET /companies/{ga}` | Pure canonical company read. |
 | `GET /companies/{ga}/contacts` | Company-scoped contact list, default 50, maximum 100, opaque scoped cursor. |
 | `GET /companies/{ga}/contacts/{gc}` | Pure contact read with exact parent validation. |
+| `GET /products` | Active canonical products in the credential's exact pipeline; default 50, maximum 100, scoped cursor. |
+| `GET /products/{gp}` | Canonical product read, with exact pipeline and retired-record checks. |
 | `PATCH /companies/{ga}` | Conditional allowlisted company-field update. |
 | `PATCH /companies/{ga}/contacts/{gc}` | Conditional contact-field update without reparenting. |
 | `GET /companies/{ga}/customer-folder?customerId={id}` | Read the exact mapped Fractional customer's folder-reference state and opaque version. |
@@ -51,6 +53,8 @@ Bodies are limited to 64 KiB and a ten-second read deadline. PATCH requires a st
 Company fields are `companyName`, `website`, `email`, `phone`, `addressLine1`, `addressLine2`, `city`, `region`, `postalCode`, and `countryCode`. Contact fields are `displayName`, `email`, `phone`, and `jobTitle`. Only work phone is mapped; mobile, notes, opt-outs, ownership, and unrelated native fields remain unchanged. A structured first/last name cannot be silently reconstructed from a changed display name. Emails normalize only case and surrounding whitespace during matching; writes require canonical input. No plus-address or dot rewriting occurs.
 
 Raw canonical PostgreSQL text is retained, including apostrophes and literal entities. Missing data is `null`; an address that cannot map losslessly to at most two lines or a non-ISO stored country is explicitly unavailable with retained source text. Unavailable fields must not clear known Fractional fields. Requested fields must match the committed canonical readback exactly or the transaction rolls back.
+
+The product routes require `crm.product.read`; company, contact and folder capabilities do not imply it. Responses label prices as `stored_catalog_value` and `invoiceDefaultVerified: false`: a catalog value is not a verified invoice rate.
 
 ### Fractional customer-folder reference
 
