@@ -2,7 +2,7 @@
 // Real migrations and production gateway/staging SQL; no .env/provider access.
 import assert from 'node:assert/strict'
 import {execFileSync} from 'node:child_process'
-import {randomUUID} from 'node:crypto'
+import {createHash,randomUUID} from 'node:crypto'
 import {readdirSync,readFileSync} from 'node:fs'
 import {createRequire} from 'node:module'
 import vm from 'node:vm'
@@ -38,7 +38,16 @@ try{
  const port=execFileSync('docker',['port',container,'5432/tcp'],{encoding:'utf8',timeout:10000}).match(/^127\.0\.0\.1:(\d+)\s*$/u)?.[1];assert.ok(port)
  pool=new Pool({host:'127.0.0.1',port:Number(port),user:'postgres',password:'fractional_gateway_fixture',database:'fractional_gateway_fixture',ssl:false,max:6,connectionTimeoutMillis:1000,statement_timeout:15000})
  const deadline=Date.now()+30000;for(;;){try{await pool.query('SELECT 1');break}catch(error){if(Date.now()>deadline)throw error;await new Promise(resolve=>setTimeout(resolve,100))}}
- const client=await pool.connect();try{for(const file of readdirSync(new URL('../db/migrations/',import.meta.url)).filter(f=>/^\d+_.+\.sql$/u.test(f)).sort())await applyMigrationSqlForTest(client,file,read(`db/migrations/${file}`))}finally{client.release()}
+ const historicalProductMigration='0373_fractional_crm_product_read.sql',folderCapabilityMigration='0403_fractional_crm_customer_folder_capability.sql'
+ const migrationFiles=readdirSync(new URL('../db/migrations/',import.meta.url)).filter(f=>/^\d+_.+\.sql$/u.test(f)).sort()
+ const folderUpgrade=migrationFiles.indexOf(folderCapabilityMigration),historicalProduct=migrationFiles.indexOf(historicalProductMigration)
+ assert.ok(historicalProduct>=0&&folderUpgrade>historicalProduct,'The published product-capability migration must precede the folder upgrade')
+ assert.equal(createHash('sha256').update(read(`db/migrations/${historicalProductMigration}`)).digest('hex'),
+  '0e01f96a2862c22e785cd16a49a5079d0e9492f7503e155941b45e111b64a764','Do not rewrite the published 0373 migration')
+ const applyMigrations=async files=>{const c=await pool.connect();try{
+  for(const file of files)await applyMigrationSqlForTest(c,file,read(`db/migrations/${file}`))
+ }finally{c.release()}}
+ await applyMigrations(migrationFiles.slice(0,folderUpgrade))
  let beforeCommit=null
  const query=(sql,args)=>pool.query(sql,args),withTransaction=async fn=>{const c=await pool.connect();try{await c.query('BEGIN');const result=await fn(c);if(beforeCommit)await beforeCommit();await c.query('COMMIT');return result}catch(error){await c.query('ROLLBACK');throw error}finally{c.release()}}
  const auth=load('app_src/lib/fractionalCrmGatewayAuth.ts'),model=load('app_src/lib/crm/fractionalGatewayModel.ts'),stable=load('app_src/lib/crm/stableId.ts')
@@ -58,6 +67,55 @@ try{
  const ga=(await pool.query('SELECT reference_code FROM workspace_organizations WHERE id=$1',[org])).rows[0].reference_code
  await pool.query(`INSERT INTO crm_organizations(id,pipeline_id,suitecrm_id,source_key,identity_key,reference_code,name,source_hash,workspace_organization_id,relationship_type,created_by,updated_by)
  VALUES($1::uuid,$2,$1::text,'gateway-root','gateway-root',$3,'Gateway root','root',$4,'workspace_root',$5,$5)`,[root,pipeline,ga,org,owner])
+ let checks=0
+ const check=(condition,message)=>{assert.ok(condition,message);checks++},denied=async(fn,code)=>{await assert.rejects(fn,error=>error.code===code);checks++}
+ const historicalProductCredentialId=randomUUID(),folderOnlyCredentialId=randomUUID()
+ const tokenFor=id=>`fcg_${id.replaceAll('-','')}_${'F'.repeat(43)}`
+ const insertCompatibilityCredential=(db,id,capabilities)=>db.query(`INSERT INTO fractional_crm_gateway_credentials
+  (id,token_hash,source_instance_id,workspace_organization_id,pipeline_id,root_company_global_id,capabilities,
+   fractional_deployment_id,fractional_organization_id,actor_email,expires_at,enabled)
+  VALUES($1,$2,$3,$4,$5,$6,$7,$8,'fractional-fixture',$9,now()+interval '1 hour',true)`,
+ [id,auth.hashFractionalCrmGatewayToken(tokenFor(id)),instance,org,pipeline,ga,capabilities,deployment,owner])
+ const isCapabilityCheck=error=>error.code==='23514'&&error.constraint==='fractional_crm_gateway_credentials_capabilities_check'
+ const allCompatibilityCredentials=async()=> (await pool.query('SELECT to_jsonb(c) AS credential FROM fractional_crm_gateway_credentials c ORDER BY c.id')).rows
+ const authenticateCompatibilityCredential=(id,capability)=>auth.authenticateFractionalCrmGateway(
+  new Request('https://clawpilot.example.invalid/api/integrations/fractional-crm/v1/products',{headers:{authorization:`Bearer ${tokenFor(id)}`}}),
+  {origin:'https://clawpilot.example.invalid',sourceInstanceId:instance},gateway.readFractionalCrmCredential,capability)
+ await insertCompatibilityCredential(pool,historicalProductCredentialId,['crm.product.read'])
+ await assert.rejects(insertCompatibilityCredential(pool,folderOnlyCredentialId,['crm.customer-folder.write']),isCapabilityCheck);checks++
+ const historicalRows=await allCompatibilityCredentials()
+ check(historicalRows.length===1&&historicalRows[0].credential.enabled&&historicalRows[0].credential.revoked_at===null,
+  'historical schema has an enabled, unrevoked product-only credential')
+ const historicalPrincipal=await authenticateCompatibilityCredential(historicalProductCredentialId,'crm.product.read')
+ await applyMigrations([folderCapabilityMigration])
+ assert.deepEqual(await allCompatibilityCredentials(),historicalRows,'0403 changes only the allowed capability vocabulary, not existing rows or grants');checks++
+ assert.deepEqual(await authenticateCompatibilityCredential(historicalProductCredentialId,'crm.product.read'),historicalPrincipal,
+  'the original token and exact product scope still authenticate after 0403');checks++
+ await denied(()=>authenticateCompatibilityCredential(historicalProductCredentialId,'crm.customer-folder.write'),'CAPABILITY_DENIED')
+ await insertCompatibilityCredential(pool,folderOnlyCredentialId,['crm.customer-folder.write'])
+ const vocabularyProbe=await pool.connect();try{
+  await vocabularyProbe.query('BEGIN')
+  await insertCompatibilityCredential(vocabularyProbe,randomUUID(),['crm.product.read','crm.customer-folder.write']);checks++
+  await assert.rejects(insertCompatibilityCredential(vocabularyProbe,randomUUID(),['crm.unreviewed.write']),isCapabilityCheck);checks++
+ }finally{try{await vocabularyProbe.query('ROLLBACK')}finally{vocabularyProbe.release()}}
+ check((await allCompatibilityCredentials()).length===2,'only two explicitly provisioned compatibility fixture credentials exist')
+ await applyMigrations(migrationFiles.slice(folderUpgrade+1))
+ const inheritedProductPrincipal=await authenticateCompatibilityCredential(historicalProductCredentialId,'crm.product.read')
+ const folderOnlyPrincipal=await authenticateCompatibilityCredential(folderOnlyCredentialId,'crm.customer-folder.write')
+ const product=(await pool.query(`INSERT INTO crm_products(pipeline_id,source_key,name,product_type,price,currency,active,source_hash)
+  VALUES($1,$2,'Retained catalog service','Service',12.34,'USD',true,'fixture') RETURNING id,reference_code`,[pipeline,randomUUID()])).rows[0]
+ const readProduct=await gateway.readFractionalCrmProduct(inheritedProductPrincipal,product.reference_code)
+ check(readProduct.recordId===product.id&&readProduct.scope.pipelineId===pipeline&&readProduct.sourceInstanceId===instance
+  &&readProduct.pricingAuthority==='stored_catalog_value'&&readProduct.invoiceDefaultVerified===false,
+  'the preserved credential reads the same scoped catalog without certifying a default invoice price')
+ const listProduct=await gateway.listFractionalCrmProducts(inheritedProductPrincipal,{limit:10})
+ assert.deepEqual(Array.from(listProduct.items,item=>item.globalId),[product.reference_code]);checks++
+ await denied(()=>gateway.readFractionalCrmProduct(folderOnlyPrincipal,product.reference_code),'CAPABILITY_DENIED')
+ await denied(()=>gateway.listFractionalCrmProducts(folderOnlyPrincipal,{limit:10}),'CAPABILITY_DENIED')
+ await denied(()=>gateway.readFractionalCrmProduct({...inheritedProductPrincipal,pipelineId:randomUUID()},product.reference_code),'CAPABILITY_DENIED')
+ await denied(()=>gateway.readFractionalCrmCustomerFolder(inheritedProductPrincipal,ga,'compatibility-fixture-customer'),'CAPABILITY_DENIED')
+ check((await allCompatibilityCredentials()).some(row=>JSON.stringify(row)===JSON.stringify(historicalRows[0])),
+  'all migrations and scoped reads preserve the full historical credential')
  const stage=fields=>withTransaction(c=>crm.stageCrmRecordWithClient(c,{entity:'organizations',pipelineId:pipeline,sourceKey:`seed:${randomUUID()}`,createOnly:true,identityKeyOverride:`seed:${randomUUID()}`,actorEmail:owner,fields:{name:fields.name,parentOrganizationId:root,...fields}}))
  const a=await stage({name:'Existing A',website:'https://existing-a.example.invalid',accountType:'Customer',description:'Customer notes\nBPO Supply Chain Drive: https://bposupplychain.com/s/customer'}),b=await stage({name:'Existing B'}),hidden=await stage({name:'Ungrant company'})
  const stageContact=(parent,name,email,extra={})=>withTransaction(c=>crm.stageCrmRecordWithClient(c,{entity:'contacts',pipelineId:pipeline,sourceKey:`seed:${randomUUID()}`,actorEmail:owner,fields:{organizationId:parent.id,organizationSuiteCrmId:parent.suiteCrmId,fullName:name,email,...extra}}))
@@ -66,8 +124,7 @@ try{
  const fixtureToken=`fcg_${credentialId.replaceAll('-','')}_${'F'.repeat(43)}`
  await pool.query(`INSERT INTO fractional_crm_gateway_credentials(id,token_hash,source_instance_id,workspace_organization_id,pipeline_id,root_company_global_id,allowed_company_global_ids,capabilities,fractional_deployment_id,fractional_organization_id,actor_email,expires_at,enabled)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'fractional-fixture',$10,now()+interval '1 hour',true)`,[credentialId,auth.hashFractionalCrmGatewayToken(fixtureToken),instance,org,pipeline,ga,[a.referenceCode,b.referenceCode],capabilities,deployment,owner])
- let principal=await gateway.readFractionalCrmCredential(credentialId),checks=0
- const check=(condition,message)=>{assert.ok(condition,message);checks++},denied=async(fn,code)=>{await assert.rejects(fn,error=>error.code===code);checks++}
+ let principal=await gateway.readFractionalCrmCredential(credentialId)
  const organization=await gateway.readFractionalCrmOrganization(principal)
  check(organization.entity==='organization'&&organization.recordId===root&&organization.globalId===ga&&organization.name==='Gateway root','organization read returns only the bound workspace root')
  check(Object.keys(organization).length===8&&!('fields' in organization)&&!('actorEmail' in organization),'organization metadata has no private or writable company fields')

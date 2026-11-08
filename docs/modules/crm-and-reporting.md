@@ -350,9 +350,10 @@ backend PID and start time. Installing and proving the real custody capability,
 the direct observer identities and the Railway connection are separate release
 gates; the library has no default custody implementation or listener.
 
-The forward release uses production-rebind schema attestation v20 for the
+The forward release uses production-rebind schema attestation v21 for the
 reviewed migrations through `0412`. It includes the recovery evidence,
-private-schema authority, and Calendar occurrence claims and guards. Earlier v9–v19 catalogs
+private-schema authority, Calendar occurrence claims and guards, and preserves the
+existing Fractional product-read capability while adding the folder capability. Earlier v9–v20 catalogs
 remain frozen historical evidence, never a fallback for current acceptance;
 their existing receipts and source artifacts are not relabeled.
 

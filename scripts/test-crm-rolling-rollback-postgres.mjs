@@ -9,7 +9,7 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import { assertExternalRollbackOutput, canonicalJson, committedRollbackIdentity, LEGACY_WRITER_COMMIT,
-  REQUIRED_RETAINED_V20_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV20MigrationInventory,
+  REQUIRED_RETAINED_V21_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV21MigrationInventory,
   rollbackReceiptSource, sha256 } from './lib/crm-compatible-rollback-artifact.mjs'
 import { attestProductionRebindHistorySchema } from './production-rebind-history-schema-attestation.mjs'
 
@@ -75,7 +75,7 @@ if (sourceCheckOnly) {
 
 const identity = checkoutCheckOnly ? null : committedRollbackIdentity(repository, args[1])
 const receiptPath = identity ? assertExternalRollbackOutput(repository, args[3]) : null
-const inventory = identity ? retainedV20MigrationInventory(identity.sourceTree) : null
+const inventory = identity ? retainedV21MigrationInventory(identity.sourceTree) : null
 const container = `clawpilot-crm-rolling-${process.pid}-${randomUUID().slice(0, 8)}`
 const image = process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16'
 assert.match(image, /^pgvector\/pgvector:pg(?:16|18)$/u, 'Use an already installed approved PostgreSQL image')
@@ -206,21 +206,39 @@ try {
   if (transitionCheckOnly) {
     console.log(`PASS ${checks.length} working-tree rolling transition checks; NON-CERTIFYING, no receipt or rollback artifact created`)
   } else {
-    const { checkRetainedV20 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
+    const { checkRetainedV21 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
     const migrationPaths = inventory?.paths ?? readdirSync(new URL('../db/migrations/', import.meta.url))
       .filter(file => /^\d+_.+\.sql$/u.test(file)).sort().map(file => `db/migrations/${file}`)
     // Same loopback-only disposable instance. Keep the legacy bridge fixture
     // and full retained-schema fixture in separate, empty databases.
-    await query('CREATE DATABASE crm_rolling_retained_v20')
-    const retainedPool = new Pool({ ...connection, database: 'crm_rolling_retained_v20', statement_timeout: 15000 })
+    await query('CREATE DATABASE crm_rolling_retained_v21')
+    const retainedPool = new Pool({ ...connection, database: 'crm_rolling_retained_v21', statement_timeout: 15000 })
     let retained, catalog
     try {
-      retained = await checkRetainedV20({ pool: retainedPool, read, migrationPaths,
+      const load = fixture.loadModule
+      function loadFractionalGateway(query, withTransaction) {
+        const auth = load('app_src/lib/fractionalCrmGatewayAuth.ts')
+        const model = load('app_src/lib/crm/fractionalGatewayModel.ts')
+        const crm = fixture.loadCrmPersistence(query, withTransaction)
+        const folderLinks = load('app_src/lib/crm/customerFolderLinks.ts')
+        const folder = load('app_src/lib/crm/fractionalCustomerFolder.ts', { './customerFolderLinks': folderLinks })
+        const board = load('app_src/lib/crm/fractionalFolderBoardProjection.ts', {
+          '@/lib/fractionalCrmGatewayAuth': auth, '@/lib/persistence/crm': crm,
+        })
+        const gateway = load('app_src/lib/persistence/fractionalCrmGateway.ts', {
+          '@/lib/fractionalCrmGatewayAuth': auth, '@/lib/crm/fractionalGatewayModel': model,
+          '@/lib/crm/fractionalCustomerFolder': folder, '@/lib/crm/fractionalFolderBoardProjection': board,
+          '@/lib/persistence/crmNativeEmailAuthority': load('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
+          '@/lib/persistence/crm': crm, '@/lib/persistence/postgres': { query, withTransaction },
+        })
+        return { auth, gateway }
+      }
+      retained = await checkRetainedV21({ pool: retainedPool, read, migrationPaths, loadFractionalGateway,
         loadCrmPersistence: fixture.loadCrmPersistence,
         loadOccurrenceClaims: () => fixture.loadModule('app_src/lib/crm/calendarOccurrenceClaims.ts', { 'server-only': {} }) })
       catalog = await attestProductionRebindHistorySchema(retainedPool)
     } finally { await retainedPool.end() }
-    assert.deepEqual(retained.checks, [...REQUIRED_RETAINED_V20_CHECKS])
+    assert.deepEqual(retained.checks, [...REQUIRED_RETAINED_V21_CHECKS])
     assert.equal(retained.migrationCount, migrationPaths.length)
     assert.equal(retained.lastMigration, migrationPaths.at(-1))
     if (!identity) {
