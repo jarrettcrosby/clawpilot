@@ -1,3 +1,14 @@
+---
+id: cp-ops-bpo-shared-suitecrm-email-repair
+title: BPO Gmail Repair with Shared SuiteCRM Readership
+summary: Scoped recovery and release checks for BPO Gmail interactions with standard SuiteCRM sign-in.
+status: draft
+kind: operations-runbook
+area: operations
+tags: [crm, gmail, suitecrm, recovery]
+app_visible: false
+---
+
 # BPO Gmail repair with shared SuiteCRM readership
 
 ClawPilot keeps workspace and pipeline access separate. In SuiteCRM the boundary is an explicitly approved login: approved users can read the five reviewed emails. No new SuiteCRM roles, security groups, user mappings, or per-record denial rules are needed to express that decision. Do not provision a special excluded SuiteCRM user.
@@ -6,7 +17,7 @@ ClawPilot keeps workspace and pipeline access separate. In SuiteCRM the boundary
 
 - Leave the unshipped scoped SuiteCRM ACL/filter, sole-reader publisher, installer/Apache changes, and migration `0418` from the prior candidate out of this release. Preserve the original worktree for reference. Do not delete or rewrite applied migrations or retained recovery evidence.
 - ClawPilot's normal publisher calls `EmailAudience.php` through its V8 route even when native authority activation is off. Production Railway readback on November 9 verified that the live SuiteCRM deployment is older than ClawPilot's and has neither the route nor its helper installed. The retained role package, write-scope helper and enrollment journals are also absent. Keep the stock login boundary and replace the app's unavailable proof with exact shared-login publication and readback. Do not install the superseded role package to make the queue pass.
-- If retiring the old native route from the installed image, account for its files on the persistent SuiteCRM volume. Remove only exact managed files/registration after proving that no deployed worker or retained recovery depends on them. Preserve native sign-in, service API authentication, ClawPilot membership checks, startup lineage checks, and existing failure holds.
+- Follow-up acceptance for removing custom SuiteCRM role code: verify normal publishing and retry behavior in every live workspace (including Suburbia and EPISCS), and confirm no live authority transitions or enrolled native journals still need the old runtime. Then remove the old role-mutation and audience paths from the runtime and build, without removing stock SuiteCRM sign-in/API authentication, existing identity links, or ClawPilot workspace and pipeline access controls. Check the persistent SuiteCRM volume separately: remove only exact managed route/helper bytes after proving no deployed worker or retained recovery uses them. Preserve migration history, audit evidence, and existing failure holds.
 
 ## Keep the repair and recovery separate
 
