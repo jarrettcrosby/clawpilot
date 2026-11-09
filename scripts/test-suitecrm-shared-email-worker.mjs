@@ -86,7 +86,8 @@ function persistence(state = {}, databaseClient) {
   const script=ts.createSourceFile('crm.ts',read('app_src/lib/persistence/crm.ts'),ts.ScriptTarget.Latest,true)
   const wanted=['activeCrmRecordSql','sharedSuiteCrmEmailScopeWithClient','sameSharedSuiteCrmEmailLinks',
     'withVerifiedSuiteCrmEmailPublication','verifySharedSuiteCrmEmailDispatch','reviewedEmailAudienceModeUnderControlWithClient','reviewedEmailAudienceWithClient',
-    'completeSuiteCrmOutboxInPostgres','lockNativeEmailPublicationModeWithClient','nativeEmailOutboxTouchesEmail','nativeEmailOutboxUnresolvedGuardSql','tableForAggregate']
+    'completeSuiteCrmOutboxInPostgres','completeSuiteCrmOutboxInTransaction','lockNativeEmailPublicationModeWithClient',
+    'nativeEmailOutboxTouchesEmail','nativeEmailOutboxUnresolvedGuardSql','tableForAggregate']
   const declarations=wanted.map(name=>{
     const fn=script.statements.find(statement=>ts.isFunctionDeclaration(statement)&&statement.name?.text===name&&statement.body)
     assert.ok(fn,name); return fn.getText(script)
@@ -128,32 +129,35 @@ test('shared App admission uses the current workspace and control first; stale j
   assert.deepEqual(copy(await h.exports.audience(h.client,pipelineId,mode)),{policy:'suitecrm-shared-login',workspaceId,pipelineId})
   h.queries.length=0
   const item=job()
+  const proof=await transport().projectSuiteCrmSharedEmail(item.payload,async()=>nativeReadback())
   let writes=0
-  await h.exports.withVerifiedSuiteCrmEmailPublication(item,async()=>{writes++})
+  const settle=emailProjection=>({emailProjection})
+  await h.exports.withVerifiedSuiteCrmEmailPublication(item,async()=>{writes++; return proof},settle)
   assert.equal(writes,1)
-  assert.match(h.queries[0].sql,/active_initial_enrollment_id IS NULL FOR SHARE/)
-  const dispatch=h.queries.at(-1)
+  assert.match(h.queries[0].sql,/active_initial_enrollment_id IS NULL FOR UPDATE/)
+  const dispatch=h.queries.find(query=>query.sql.includes('WITH selected AS MATERIALIZED'))
+  assert.match(dispatch.sql,/FOR UPDATE OF i,o/)
   assert.equal(dispatch.args[3],item.lockToken)
   assert.equal(dispatch.args[6],suiteCrmId)
   assert.equal(dispatch.args[7],globalId)
   for(const state of [{mode:'busy'},{badWorkspace:true},{badLease:true},{staleRevision:true},{staleLinks:true},{wrongPrimary:true}]) {
-    await assert.rejects(persistence(state).exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('must not publish stale App state')),
+    await assert.rejects(persistence(state).exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('must not publish stale App state'),settle),
       /not idle|binding changed|lease or revision changed/)
   }
+  await assert.rejects(persistence().exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('must not publish outside settlement fence')),
+    /under the publication fence/)
 })
 
 test('completion preserves the provider receipt only for the current revision and exact outbox lease', async () => {
   const item=job()
   const proof=await transport().projectSuiteCrmSharedEmail(item.payload,async()=>nativeReadback())
   const h=persistence()
-  await h.exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:proof})
+  const settle=emailProjection=>({emailProjection})
+  await h.exports.withVerifiedSuiteCrmEmailPublication(item,async()=>proof,settle)
   assert.ok(h.queries.some(query=>query.sql.includes("jsonb_build_object('suiteCrmEmailProjection'")))
   assert.equal(h.queries.find(query=>query.sql.includes("UPDATE sync_outbox SET status = 'succeeded'")).args[2],true)
-  const stale=persistence({staleRevision:true})
-  await stale.exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:proof})
-  assert.ok(stale.queries.every(query=>!query.sql.includes('UPDATE crm_interactions')))
-  await assert.rejects(persistence({badLease:true}).exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:proof}),/lease/)
-  await assert.rejects(persistence().exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:{...proof,contacts:[]}}),/proof is missing or changed/)
+  await assert.rejects(persistence().exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:proof}),/under the publication fence/)
+  await assert.rejects(persistence().exports.withVerifiedSuiteCrmEmailPublication(item,async()=>({...proof,contacts:[]}),settle),/proof is missing or changed/)
 })
 
 const pgBin=process.env.CLAWPILOT_TEST_LOCAL_PG_BIN
@@ -161,7 +165,7 @@ test('shared App dispatch and completion execute against an isolated PostgreSQL 
   const dir=mkdtempSync(join(tmpdir(),'cp-shared-worker-pg.')), data=join(dir,'data')
   const run=(binary,...args)=>execFileSync(join(pgBin,binary),args,{stdio:['ignore','pipe','pipe']})
   const {Client}=createRequire(new URL('../app_src/package.json',import.meta.url))('pg')
-  let client, started=false
+  let client, editor, started=false, competingEdit
   try {
     run('initdb','-D',data,'--no-locale','--encoding=UTF8','--auth=trust')
     run('pg_ctl','-D',data,'-l',join(dir,'postgres.log'),'-o',`-h '' -k ${dir} -p 55432`,'-w','start'); started=true
@@ -199,18 +203,41 @@ test('shared App dispatch and completion execute against an isolated PostgreSQL 
       VALUES ($1,$2,'crm_interactions','suitecrm','upsert_record','processing',$3,$4,$5,now())`,[item.id,localId,item.lockToken,item.payload,item.idempotencyKey])
     const h=persistence({},client)
     const published=()=>transport().projectSuiteCrmSharedEmail(item.payload,async()=>nativeReadback())
-    const proof=await h.exports.withVerifiedSuiteCrmEmailPublication(item,published)
+    const settle=emailProjection=>({emailProjection})
     await client.query('UPDATE crm_contacts SET organization_id=$1 WHERE id=$2',[localOrgIds[0],localContactIds[1]])
-    await assert.rejects(h.exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('wrong company must not publish')),/relationships/)
+    await assert.rejects(h.exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('wrong company must not publish'),settle),/relationships/)
     await client.query('UPDATE crm_contacts SET organization_id=$1 WHERE id=$2',[localOrgIds[1],localContactIds[1]])
-    await h.exports.completeSuiteCrmOutboxInPostgres(item,{emailProjection:proof})
+    editor=new Client({host:dir,port:55432,database:'postgres',user:process.env.USER})
+    await editor.connect()
+    await editor.query('BEGIN')
+    await editor.query("SET LOCAL lock_timeout='3s'")
+    const proof=await h.exports.withVerifiedSuiteCrmEmailPublication(item,async()=>{
+      // Staging edits take this same control row first. Demonstrate a real
+      // contender arriving after native write starts but before App settlement.
+      competingEdit=editor.query('SELECT 1 FROM crm_native_email_publication_control WHERE singleton FOR UPDATE')
+      competingEdit.catch(()=>{})
+      const until=Date.now()+1000
+      for (;;) {
+        const {rows:[row]}=await client.query('SELECT $1::int=ANY(pg_blocking_pids($2)) AS blocked',[client.processID,editor.processID])
+        if(row.blocked) break
+        assert.ok(Date.now()<until,'The competing edit must wait on the publisher singleton')
+        await new Promise(resolve=>setTimeout(resolve,5))
+      }
+      return published()
+    },settle)
+    await competingEdit
+    const {rows:[nextPredecessor]}=await editor.query(`SELECT metadata->'suiteCrmEmailProjection'->>'snapshotFingerprint' AS expected
+      FROM crm_interactions WHERE id=$1`,[localId])
+    assert.equal(nextPredecessor.expected,snapshotFingerprint,'The next staged edit must see the new committed native predecessor')
+    await editor.query('ROLLBACK')
     const {rows:[saved]}=await client.query(`SELECT j.status,i.sync_status,i.metadata->'suiteCrmEmailProjection' AS receipt
       FROM sync_outbox j JOIN crm_interactions i ON i.id::text=j.aggregate_id WHERE j.id=$1`,[item.id])
     assert.equal(saved.status,'succeeded')
     assert.equal(saved.sync_status,'synced')
     assert.deepEqual(saved.receipt,copy(proof))
-    await assert.rejects(h.exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('settled job is not a new write')),/lease/)
+    await assert.rejects(h.exports.withVerifiedSuiteCrmEmailPublication(item,()=>assert.fail('settled job is not a new write'),settle),/lease/)
   } finally {
+    await editor?.end()
     await client?.end()
     if(started) run('pg_ctl','-D',data,'-m','immediate','-w','stop')
     rmSync(dir,{recursive:true,force:true})

@@ -1106,19 +1106,19 @@ const reviewedGmailBatch = crmFunctionSource(
   'stageReviewedGmailInteractionsInPostgres', 'stageReviewedGmailInteractionInPostgres',
 )
 const reviewedGmailValidation = reviewedGmailBatch.indexOf(
-  'plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceMode))',
+  'plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceModes.get(message.pipelineId)!))',
 )
 assert.ok(
   reviewedGmailValidation >= 0
     && reviewedGmailBatch.indexOf('results.push(await applyReviewedGmailInteractionWithClient(') > reviewedGmailValidation,
   'reviewed Gmail preview and apply must both prepare all quarantined-pipeline gates before staging',
 )
-assert.ok(reviewedGmailBatch.indexOf('await lockCrmNativeEmailAuthorityWithClient(client)')
-  < reviewedGmailBatch.indexOf('await reviewedEmailAudienceModeUnderControlWithClient(client)')
-  && reviewedGmailBatch.indexOf('await reviewedEmailAudienceModeUnderControlWithClient(client)')
-    < reviewedGmailBatch.indexOf("await client.query('SELECT pg_advisory_xact_lock"),
+const heldControlIndex=reviewedGmailBatch.indexOf('await lockCrmNativeEmailAuthorityWithClient(client)')
+const perPipelineModeIndex=reviewedGmailBatch.indexOf('emailAudienceModes.set(pipelineId, await reviewedEmailAudienceModeUnderControlWithClient(client, pipelineId))')
+assert.ok(heldControlIndex>=0&&heldControlIndex<perPipelineModeIndex
+  &&perPipelineModeIndex<reviewedGmailBatch.indexOf("await client.query('SELECT pg_advisory_xact_lock"),
 'reviewed preview/apply must establish the same held-control mode before participant/source locks')
-assertIncludes(reviewedGmailBatch, 'applyReviewedGmailInteractionWithClient(client, plans.get(message)!, emailAudienceMode)',
+assertIncludes(reviewedGmailBatch, 'applyReviewedGmailInteractionWithClient(client, plans.get(message)!, emailAudienceModes.get(message.pipelineId)!)',
   'reviewed apply must retain its preview authority mode for the decision audience')
 const reviewedGmailApply = crmFunctionSource(
   'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',

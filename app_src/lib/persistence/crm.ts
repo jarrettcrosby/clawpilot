@@ -927,6 +927,19 @@ async function enqueueSuiteCrmRecord(
     const receipt = previous.rows[0]?.receipt
     const contactAccounts = bindings.rows.map(row => ({ contactId: row.contact_id, accountId: row.account_id }))
     if (audience.policy === 'suitecrm-shared-login') {
+      if (!payload.attributes.assigned_user_id && input.fields.agentEmail) {
+        // Canonical interaction edits keep the historic App author. Resolve
+        // only that exact email's existing native identity, never a name or
+        // the current editor. The native CAS still disallows reassignment.
+        const mapped = await client.query<{ suitecrm_user_id: string | null }>(`SELECT app_user.suitecrm_user_id
+          FROM app_users app_user JOIN pipeline_spaces pipeline ON pipeline.id=$1::uuid
+          WHERE app_user.email=$2 AND app_user.status='active' AND app_user.crm_user_enabled
+            AND app_user.reference_code IS NOT NULL AND app_user.suitecrm_user_id IS NOT NULL
+            AND (pipeline.owner_email=app_user.email OR EXISTS (SELECT 1 FROM pipeline_space_members member
+              WHERE member.pipeline_id=pipeline.id AND member.user_email=app_user.email))
+          FOR SHARE OF app_user`, [input.pipelineId, clean(input.fields.agentEmail).toLowerCase()])
+        if (mapped.rows.length === 1) payload.attributes.assigned_user_id = mapped.rows[0].suitecrm_user_id
+      }
       const priorShared = Boolean(receipt?.sharedPublication || receipt?.sharedRepair)
       if (priorShared && (!receipt || receipt.version !== 2 || receipt.suiteCrmId !== suiteCrmId || receipt.globalId !== referenceCode
         || typeof receipt.snapshotFingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/u.test(receipt.snapshotFingerprint)
@@ -7702,7 +7715,8 @@ export async function withVerifiedSuiteCrmRecordLifecycle<T>(item: CrmOutboxItem
 /** Serialize native publication for a canonical local Email and retain current
  * tenant/membership read locks across the bounded provider operation. The worker
  * still rechecks the exact lease/payload and current revision on completion. */
-export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxItem, publish: () => Promise<T>): Promise<T> {
+export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxItem, publish: () => Promise<T>,
+  completeShared?: (result: T) => SuiteCrmOutboxCompletion): Promise<T> {
   if (item.operation !== 'upsert_record' || item.payload.entity !== 'interactions' || item.payload.suiteCrmModule !== 'Emails') {
     throw new Error('An exact native Email publication is required')
   }
@@ -7710,16 +7724,21 @@ export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxIte
   return withTransaction(async client => {
     const shared = payload.sharedEmailProjection
     if (shared !== undefined) {
-      // Managed-role enrollment and shared stock publication must never run
-      // concurrently. Take this in the established control-first lock order.
+      if (!completeShared) throw new Error('Shared SuiteCRM Email requires completion under the publication fence')
+      // The exact native receipt and App job commit before releasing the
+      // singleton. A concurrent edit therefore captures the new native
+      // snapshot, never the older (or empty) CAS predecessor. Take the
+      // completion lock first; do not upgrade a shared singleton lock.
       const idle = await client.query(`SELECT 1 FROM crm_native_email_publication_control WHERE singleton AND NOT enabled
-        AND active_operation_id IS NULL AND active_transition_id IS NULL AND active_initial_enrollment_id IS NULL FOR SHARE`)
+        AND active_operation_id IS NULL AND active_transition_id IS NULL AND active_initial_enrollment_id IS NULL FOR UPDATE`)
       if (idle.rows.length !== 1) throw new Error('Managed SuiteCRM Email authority is not idle')
     }
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`crm-native-email:${item.aggregateId}`])
     if (shared !== undefined) {
       await verifySharedSuiteCrmEmailDispatch(client, item, payload, shared)
-      return publish()
+      const result = await publish()
+      await completeSuiteCrmOutboxInTransaction(item, completeShared!(result), callback => callback(client))
+      return result
     }
     const current = await client.query<{ source_hash: string }>(`SELECT interaction.source_hash FROM crm_interactions interaction
       JOIN sync_outbox outbox ON outbox.id=$3::uuid AND outbox.aggregate_id=interaction.id::text
@@ -7752,7 +7771,7 @@ async function verifySharedSuiteCrmEmailDispatch(client: PoolClient, item: CrmOu
         AND o.target_system='suitecrm' AND o.operation='upsert_record' AND o.status='processing'
         AND o.lock_token=$4 AND o.payload=$5::jsonb AND o.idempotency_key=$6
       WHERE i.id=$1::uuid AND i.pipeline_id=$2::uuid AND i.suitecrm_id=$7 AND i.reference_code=$8
-        AND i.suitecrm_module='Emails' AND ${activeCrmRecordSql('i')} FOR SHARE OF i,o
+        AND i.suitecrm_module='Emails' AND ${activeCrmRecordSql('i')} FOR UPDATE OF i,o
     ), org_ids AS (
       SELECT s.organization_id AS id FROM selected s WHERE s.organization_id IS NOT NULL
       UNION
@@ -7787,23 +7806,31 @@ function sameSharedSuiteCrmEmailLinks(left: SuiteCrmSharedEmailProjection, right
   return crmSourceHash(canonical(left)) === crmSourceHash(canonical(right))
 }
 
-export async function completeSuiteCrmOutboxInPostgres(
-  item: CrmOutboxItem,
-  completion: {
-    emailProjection?: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback | null
-    meetingProjection?: SuiteCrmMeetingProjectionReadback | null
-    productImageProjection?: {
-      action: 'disabled' | 'unchanged' | 'attached' | 'cleared'
-      mediaId: string | null
-    } | null
-  } = {},
+type SuiteCrmOutboxCompletion = {
+  emailProjection?: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback | null
+  meetingProjection?: SuiteCrmMeetingProjectionReadback | null
+  productImageProjection?: {
+    action: 'disabled' | 'unchanged' | 'attached' | 'cleared'
+    mediaId: string | null
+  } | null
+}
+
+export async function completeSuiteCrmOutboxInPostgres(item: CrmOutboxItem, completion: SuiteCrmOutboxCompletion = {}) {
+  if ('sharedEmailProjection' in item.payload && item.payload.sharedEmailProjection !== undefined) {
+    throw new Error('Shared SuiteCRM Email requires completion under the publication fence')
+  }
+  return completeSuiteCrmOutboxInTransaction(item, completion, withTransaction)
+}
+
+async function completeSuiteCrmOutboxInTransaction(item: CrmOutboxItem, completion: SuiteCrmOutboxCompletion,
+  transaction: typeof withTransaction,
 ) {
   const accountDescriptionPatch = item.operation === 'patch_account_description'
   if (accountDescriptionPatch !== ('accountDescriptionPatch' in item.payload)
     || (accountDescriptionPatch && item.payload.entity !== 'organizations')) {
     throw new Error('CRM Account description publication scope changed')
   }
-  return withTransaction(async (client) => {
+  return transaction(async (client) => {
     // Even disabled-mode completion eventually updates pipeline_spaces, whose
     // authority trigger locks control. Acquire it before any source/outbox row
     // so a concurrent control-first lease recycle cannot deadlock completion.

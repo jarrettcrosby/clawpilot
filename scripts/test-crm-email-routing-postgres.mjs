@@ -82,7 +82,7 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject)
     'nativeEmailOutboxUnresolvedGuardSql', 'lockNativeEmailPublicationModeWithClient', 'nativeEmailOutboxTouchesEmail',
     'suiteCrmDateTime', 'suiteCrmAttributes', 'suiteCrmRelationships', 'enqueueSuiteCrmRecord',
     'claimSuiteCrmOutboxInPostgres', 'tableForAggregate', 'withVerifiedSuiteCrmEmailPublication',
-    'completeSuiteCrmOutboxInPostgres', 'failSuiteCrmOutboxInPostgres',
+    'completeSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInTransaction', 'failSuiteCrmOutboxInPostgres',
     'stageInteraction', 'stageCrmRecordWithClient', 'stageCrmRecordInPostgres',
     'enrichCrmEmailInteractionParticipantsInPostgres',
     'REVIEWED_GMAIL_RELATIONSHIPS', 'reviewedGmailContentFingerprint',

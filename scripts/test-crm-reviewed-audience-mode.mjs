@@ -70,7 +70,7 @@ const rootReader = () => ({ pipeline_id: pipeline, workspace_id: workspace, gran
   email: 'root-employee@example.test', suitecrm_user_id: 'native-root', native_identity_count: 1,
   source_fingerprint: 'a'.repeat(64), registry_fingerprint: 'b'.repeat(64), allowed: true })
 
-function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot = null } = {}) {
+function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot = null, preservedAgent = null } = {}) {
   const pipeline = shared ? sharedPipelineId : id(1), workspace = shared ? sharedWorkspaceId : id(2)
   const env = shared ? { CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID: workspace,
     CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID: pipeline } : {}
@@ -122,6 +122,11 @@ function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot
       owner_email: owner, owner_native_id: 'native-owner', is_demo: false }] }
     if (sql.includes('JOIN LATERAL')) return { rows: copy(state.readers) }
     if (sql.startsWith('SELECT user_email,access_role')) return { rows: [] }
+    if (sql.startsWith('SELECT app_user.suitecrm_user_id') && sql.includes('app_user.email=$2')) {
+      assert.deepEqual(copy(params),[pipeline,preservedAgent])
+      return { rows: state.readers.filter(reader=>reader.email===preservedAgent && reader.suitecrm_user_id)
+        .map(reader=>({suitecrm_user_id:reader.suitecrm_user_id})) }
+    }
     if (sql.startsWith('SELECT app_user.suitecrm_user_id')) return { rows: state.readers.map(reader => ({ suitecrm_user_id: reader.suitecrm_user_id })) }
     if (sql.startsWith('SELECT workspace_organization_id::text AS workspace_id')) return { rows: [{ workspace_id: workspace }] }
     if (sql.startsWith('SELECT id::text, suitecrm_id, reference_code, source_hash')) return { rows: state.row ? [copy(state.row)] : [] }
@@ -176,7 +181,7 @@ function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot
     interactionSuiteCrmModule: () => 'Emails',
     suiteCrmRelationships: async () => [...companies.map((company, index) => ({ linkFieldName: 'accounts', relatedModuleName: 'Accounts', relatedBeanId: `native-company-${index}` })),
       ...contacts.map((contact, index) => ({ linkFieldName: 'contacts', relatedModuleName: 'Contacts', relatedBeanId: `native-contact-${index}` }))],
-    suiteCrmAttributes: () => ({ name: evidence.subject, assigned_user_id: 'native-owner' }),
+    suiteCrmAttributes: () => ({ name: evidence.subject, ...(preservedAgent ? {} : { assigned_user_id: 'native-owner' }) }),
     ensureCrmReferenceShortLink: async () => 'https://example.test/s/gi1234567', recordAuditEvent: async () => {},
   }
   vm.runInNewContext(compiled, runtime)
@@ -188,7 +193,8 @@ function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot
     contactTargets: contacts.map(contact => ({ id: contact.id, referenceCode: contact.reference_code, email: contact.email, organizationId: contact.organization_id })),
     interaction: { entity: 'interactions', pipelineId: pipeline, actorEmail: owner, sourceKey: 'fixture:reviewed-d1',
       sourcePayload: { retained: true }, fields: { interactionType: 'email', subject: evidence.subject, description: evidence.bodyText,
-        occurredAt: evidence.receivedAt, providerMessageId: 'd1', providerThreadId: 'thread-d1', metadata: { source: 'gmail-inbound' } } } })
+        ...(preservedAgent ? { agentEmail: preservedAgent } : {}), occurredAt: evidence.receivedAt, providerMessageId: 'd1',
+        providerThreadId: 'thread-d1', metadata: { source: 'gmail-inbound' } } } })
   const preview = () => runtime.exports.stageReviewedGmailInteractionsInPostgres({ messages: [selection()] })
   const apply = targetFingerprint => runtime.exports.stageReviewedGmailInteractionsInPostgres({ apply: true,
     messages: [{ ...selection(), expectedExistingInteractionId: null, expectedTargetFingerprint: targetFingerprint }] })
@@ -280,6 +286,16 @@ test('shared review does not broaden either exact historical recovery batch', as
     selected('unreviewed-extra',{legacyAdoption:{kind:'reviewed-legacy-adoption-v1'}}),
   ]}),/limited to the three selected messages/)
   assert.deepEqual(h.state.queries,[])
+})
+
+test('shared staging resolves only the preserved historic agent’s exact native identity', async () => {
+  const assigned=harness({enabled:false,shared:true,priorSnapshot:'d'.repeat(64),preservedAgent:memberEmail})
+  const [preview]=await assigned.preview()
+  assert.equal((await assigned.apply(preview.targetFingerprint))[0].applied,true)
+  assert.equal(assigned.state.outbox[0].attributes.assigned_user_id,'native-reader','The editor and historic agent differ')
+  const appOnly=harness({enabled:false,shared:true,preservedAgent:'app-only@example.test'})
+  assert.equal((await appOnly.apply((await appOnly.preview())[0].targetFingerprint))[0].applied,true)
+  assert.equal(Object.hasOwn(appOnly.state.outbox[0].attributes,'assigned_user_id'),false,'Never invent an assignment for an App-only author')
 })
 
 test('audience dispatch requires an explicit mode and never acquires control implicitly', async () => {

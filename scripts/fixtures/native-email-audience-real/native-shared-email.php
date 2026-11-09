@@ -9,6 +9,7 @@ define('CLAWPILOT_NATIVE_HELPERS_ONLY',true);
 require '/fixture/acceptance.php';
 require '/source/email-audience/SharedBpoEmailCreatePermit.php';
 require '/source/email-audience/SharedBpoEmailWorker.php';
+require '/source/native-email-shared-repair-cli.php';
 
 function sharedFixturePolicy(mysqli $db,array $profile): string
 {
@@ -208,6 +209,52 @@ function sharedFixtureHttpWorker(mysqli $db,User $admin,bool $templates,array $p
     fwrite(STDOUT,"PASS real stock OAuth rejects anonymous and wrong-client requests, allows one shared projection, and reuses the original on HTTP retry\n");
 }
 
+function sharedFixtureRepairCli(mysqli $db,array $profile,User $admin,bool $templates,array $projection): void
+{
+    selectUser($admin);
+    $origin=$db->query('SELECT CURRENT_USER() AS principal,DATABASE() AS database_name,@@GLOBAL.hostname AS hostname,
+        CAST(@@GLOBAL.server_id AS CHAR) AS server_id,@@GLOBAL.version AS server_version,@@GLOBAL.server_uid AS server_uid')->fetch_assoc();
+    $nativeOrigin=ClawPilotNativeEmailAuthorityContract::digest(['version'=>1,'purpose'=>'clawpilot-native-email-custody-maria-store-v1',
+        'database'=>$origin['database_name'],'hostname'=>$origin['hostname'],'serverId'=>$origin['server_id'],
+        'serverVersion'=>$origin['server_version'],'serverUid'=>$origin['server_uid']]);
+    $key=openssl_pkey_new(['private_key_type'=>OPENSSL_KEYTYPE_RSA,'private_key_bits'=>3072]);
+    must($key instanceof OpenSSLAsymmetricKey,'Fixture CLI issuer');
+    $pins=['keyId'=>'isolated-cli-fixture','publicKeyPem'=>openssl_pkey_get_details($key)['key'],'expectEmailTemplates'=>$templates,
+        'target'=>['database'=>$profile['database'],'databasePrincipal'=>$origin['principal'],
+            'oauthClientId'=>getenv('SUITECRM_CLIENT_ID'),'serviceUserId'=>$admin->id],
+        'bindings'=>['nativeOriginFingerprint'=>$nativeOrigin]];
+    $prior=[];
+    foreach(CP_SHARED_REPAIR_RAILWAY as $field=>$name){
+        $prior[$name]=getenv($name);$pins['target'][$field]=$field==='gitCommit'?str_repeat('a',40):create_guid();
+        putenv($name.'='.$pins['target'][$field]);
+    }
+    foreach(CP_SHARED_REPAIR_BINDINGS as $name)$pins['bindings'][$name]??=hash('sha256','isolated-cli-'.$name);
+    $projection['suiteCrmId']=create_guid();$projection['attributes']['global_id_c']='gi9800005';
+    $projection=ClawPilotNativeEmailProjection::validate($projection);
+    $slot=['localId'=>create_guid(),'nativeId'=>$projection['suiteCrmId'],'globalId'=>$projection['attributes']['global_id_c'],
+        'projectionFingerprint'=>ClawPilotNativeEmailAuthorityContract::digest($projection),
+        'slotFingerprint'=>hash('sha256','isolated-cli-slot'),'nonce'=>hash('sha256','isolated-cli-nonce')];
+    try {
+        $inspect=cp_shared_repair_read($db,$pins,$slot,$projection,'inspect',null);
+        must($inspect['state']==='absent'&&$inspect['journalReady']===true
+            &&strlen($inspect['evidenceFingerprint'])===64&&str_ends_with($inspect['observedAt'],'Z'),'Actual CLI locked absence evidence');
+        $epoch=(int)$db->query('SELECT UNIX_TIMESTAMP()')->fetch_row()[0];
+        $proof=['version'=>1,'purpose'=>'clawpilot-shared-bpo-email-create-v1',
+            'scope'=>cp_shared_repair_trusted_scope($pins,$slot,$inspect['policyStateFingerprint']),'issuedAt'=>$epoch,'expiresAt'=>$epoch+60];
+        must(openssl_sign(ClawPilotNativeEmailAuthorityContract::canonical($proof),$signature,$key,OPENSSL_ALGO_SHA256),'Actual CLI signed permit');
+        $permit=['proof'=>$proof,'signature'=>base64_encode($signature)];
+        $created=cp_shared_repair_read($db,$pins,$slot,$projection,'create',$permit);
+        $observed=cp_shared_repair_read($db,$pins,$slot,$projection,'readback',null);
+        must($created['state']==='created'&&$created['kind']==='created'&&$observed['state']==='exact'&&$observed['kind']==='created'
+            &&$observed['receiptFingerprint']===$created['receiptFingerprint']&&$observed['snapshotFingerprint']===$created['snapshotFingerprint'],
+            'Actual CLI readback resolves same committed Email with no renewed permit');
+        try{cp_shared_repair_read($db,$pins,$slot,$projection,'create',$permit);throw new LogicException('Repeated create was allowed');}
+        catch(RuntimeException $held){must($held->getMessage()==='shared_repair_create_requires_absent_ready_journal','Actual CLI no-replay guard');}
+        must(rows("SELECT id_c FROM emails_cstm WHERE global_id_c='gi9800005'")===[['id_c'=>$slot['nativeId']]],'Exactly one CLI-repaired Email');
+        fwrite(STDOUT,"PASS shared repair CLI locked inspect, one atomic create, exact readback without permit and repeated create refusal\n");
+    } finally {foreach($prior as $name=>$value)putenv($value===false?$name:$name.'='.$value);}
+}
+
 (static function () use ($sugar_config): void {
 try {
     $profile=['database'=>'suitecrm_native_test','profile'=>'suitecrm-8.10.1-mariadb-11.4.13-v1'];
@@ -309,6 +356,7 @@ try {
     }
     fwrite(STDOUT,"PASS stock non-admin view and both company and contact Email histories show the same ID\n");
     sharedFixtureWorker($db,$profile,$admin,$templates,$command);
+    sharedFixtureRepairCli($db,$profile,$admin,$templates,$command);
     sharedFixtureHttpWorker($db,$admin,$templates,$command);
     fwrite(STDOUT,"NATIVE_SHARED_EMAIL_ACCEPTANCE_PASSED=1\n");
 } catch (Throwable $failure) {

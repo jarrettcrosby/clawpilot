@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import test from 'node:test'
 import { createBpoFailedEmailAppSettler } from './lib/bpo-failed-email-app-settlement.mjs'
+import { createBpoFailedEmailAppHandoff, prepareBpoFailedEmailCandidate } from './lib/bpo-failed-email-app-handoff.mjs'
 import { describeBpoFailedEmailRepairInventory } from './lib/bpo-failed-email-repair-plan.mjs'
 import { prepareBpoSharedEmailProjection, sharedEmailCanonicalJson } from './lib/bpo-shared-email-projection.mjs'
 import { createSharedBpoEmailReceiptVerifier } from './lib/bpo-shared-email-receipt-proof.mjs'
@@ -131,8 +132,32 @@ test('actual local PostgreSQL rolls back unexpected changes and settles one exac
     const receiptEnvelope={proof,signature:sign('RSA-SHA256',Buffer.from(sharedEmailCanonicalJson(proof)),keys.privateKey).toString('base64')}
     const verifyNativeReceipt=createSharedBpoEmailReceiptVerifier({publicKeyPem:keys.publicKey.export({type:'spki',format:'pem'}),keyId})
     const settler=createBpoFailedEmailAppSettler(settings(review,{verifyNativeReceipt})),input={client,interactionId:first.interactionId,receiptEnvelope}
+    const {attestAppDeployment,expectedInventoryFingerprint}=settings(review)
+    const toCandidate=({projectionFingerprint:_,...row})=>row
+    const candidateManifestJson=JSON.stringify({version:1,readOnly:true,purpose:'clawpilot-bpo-terminal-email-candidate-inventory',
+      originFingerprint:review.app.originFingerprint,original11:review.original11.map(toCandidate),later8:review.later8.map(toCandidate)})
+    const candidate=await prepareBpoFailedEmailCandidate({client,interactionId:first.interactionId,candidateManifestJson,
+      expectedManifestFingerprint:sha(candidateManifestJson),appDeploymentFingerprint:review.app.deploymentFingerprint,attestAppDeployment})
+    assert.equal(candidate.projectionFingerprint,first.projectionFingerprint)
+    const handoff=createBpoFailedEmailAppHandoff({review,expectedInventoryFingerprint,attestAppDeployment,
+      verifyNativeAbsence:async(_,target)=>({...target,version:1,state:'absent',evidenceFingerprint:sha('synthetic absence'),
+        observedAt:new Date(Date.now()-1000).toISOString()})})
+    assert.equal((await handoff.inspect({client,interactionId:first.interactionId})).state,'ready')
+    const contender=new Client({host:dir,port:55433,database:'postgres',user:process.env.USER})
+    await contender.connect()
+    let dispatch
+    try {
+      const claimed=await Promise.all([client,contender].map(connection=>handoff.claim({client:connection,interactionId:first.interactionId,absenceEvidence:{}})))
+      assert.deepEqual(claimed.map(result=>result.state).sort(),['dispatch-once','reconcile-only'])
+      dispatch=claimed.find(result=>result.state==='dispatch-once')
+    } finally {await contender.end()}
+    assert.deepEqual(dispatch.projection,candidate.projection)
+    assert.equal((await handoff.claim({client,interactionId:first.interactionId,absenceEvidence:{}})).state,'reconcile-only')
+    assert.equal((await client.query(`SELECT count(*)::int AS n FROM audit_events WHERE event_type='system.crm.bpo_shared_email_dispatch_claimed'`)).rows[0].n,1)
+    assert.equal((await client.query(`SELECT count(*)::int AS n FROM sync_outbox WHERE status='dead' AND attempts=8`)).rows[0].n,19)
     const counts=async()=> (await client.query(`SELECT (SELECT count(*)::int FROM sync_outbox WHERE status='succeeded') AS jobs,
-      (SELECT count(*)::int FROM crm_interactions WHERE sync_status='synced') AS interactions,(SELECT count(*)::int FROM audit_events) AS audit`)).rows[0]
+      (SELECT count(*)::int FROM crm_interactions WHERE sync_status='synced') AS interactions,
+      (SELECT count(*)::int FROM audit_events WHERE event_type='system.crm.bpo_shared_email_settled') AS audit`)).rows[0]
     assert.equal((await settler.resolve(input)).state,'unsettled')
     assert.deepEqual(await counts(),{jobs:0,interactions:0,audit:0})
     await client.query(`INSERT INTO crm_contact_merge_outbox_dependencies VALUES($1,$2)`,[reviewed[1].jobId,first.jobId])

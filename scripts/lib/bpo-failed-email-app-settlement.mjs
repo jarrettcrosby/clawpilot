@@ -16,7 +16,7 @@ const fingerprint = row => `pg_catalog.encode(pg_catalog.sha256(pg_catalog.conve
 // Relies on the 0398/0408/0406/0413 statement fences for App relationship,
 // identity and outbox writers. Reuse the relationship semantics of 0408, but
 // not its retired/held-only provider predicate; the slot check below covers it.
-const relationshipsSql = `WITH target AS (
+export const relationshipsSql = `WITH target AS (
   SELECT id,pipeline_id,organization_id,contact_id FROM public.crm_interactions WHERE id=$1::uuid AND pipeline_id=$2::uuid
 ), selected_accounts AS (
   SELECT t.organization_id AS id FROM target t WHERE t.organization_id IS NOT NULL
