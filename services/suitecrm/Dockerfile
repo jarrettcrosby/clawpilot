@@ -41,6 +41,7 @@ COPY bootstrap-global-id.php /opt/clawpilot/bootstrap-global-id.php
 COPY install-email-search.php /opt/clawpilot/install-email-search.php
 COPY email-search /opt/clawpilot/email-search
 COPY install-email-audience.php /opt/clawpilot/install-email-audience.php
+COPY install-shared-email-worker.php /opt/clawpilot/install-shared-email-worker.php
 COPY email-audience /opt/clawpilot/email-audience
 COPY install-native-email-scope.php install-native-email-runtime.php native-email-startup-check.php /opt/clawpilot/
 COPY install-native-email-initial-state.php native-email-initial-cli.php native-email-initial-install-profile.json /opt/clawpilot/

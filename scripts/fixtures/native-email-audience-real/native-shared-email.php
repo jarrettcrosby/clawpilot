@@ -8,6 +8,7 @@ if (PHP_SAPI !== 'cli' || getenv('CLAWPILOT_NATIVE_FIXTURE_SHARED_EMAIL_ONLY') !
 define('CLAWPILOT_NATIVE_HELPERS_ONLY',true);
 require '/fixture/acceptance.php';
 require '/source/email-audience/SharedBpoEmailCreatePermit.php';
+require '/source/email-audience/SharedBpoEmailWorker.php';
 
 function sharedFixturePolicy(mysqli $db,array $profile): string
 {
@@ -48,6 +49,163 @@ function sharedFixtureExpectHold(callable $run,string $expected): void
         return;
     }
     throw new RuntimeException('Exact observer did not hold: '.$expected);
+}
+
+function sharedFixtureWorker(mysqli $db,array $profile,User $admin,bool $templates,array $projection): void
+{
+    selectUser($admin);
+    $client=native('OAuth2Clients');$client->name='Disposable shared stock worker fixture';
+    $client->allowed_grant_type='client_credentials';$client->is_confidential=1;$client->assigned_user_id=$admin->id;
+    $_REQUEST=['new_secret'=>'synthetic-only-'.bin2hex(random_bytes(24)),'duration_amount'=>1,'duration_unit'=>'hour'];
+    try {must(is_string($client->save(false))&&$client->id!=='','Synthetic shared OAuth client must save');}
+    finally {$_REQUEST=[];}
+    $token=native('OAuth2Tokens');$token->access_token=bin2hex(random_bytes(40));
+    $token->access_token_expires=gmdate('Y-m-d H:i:s',time()+3600);$token->token_is_revoked=0;
+    $token->client=$client->id;$token->assigned_user_id=$admin->id;
+    must((bool)$token->save(false),'Synthetic shared OAuth token must save');
+    putenv('SUITECRM_CLIENT_ID='.$client->id);
+    putenv('CLAWPILOT_SHARED_BPO_EMAIL_ENABLED=1');
+    putenv('CLAWPILOT_SHARED_BPO_EMAIL_TEMPLATES='.($templates?'1':'0'));
+    $worker=new ClawPilotSharedBpoEmailWorker($db,$profile,(string)$admin->id,(string)$client->id,(string)$token->access_token,$templates);
+    $projection['suiteCrmId']=create_guid();$projection['attributes']['global_id_c']='gi9800008';
+    $projection['attributes']['name']='Synthetic ordinary BPO worker Email';
+    $command=['version'=>1,'workspaceId'=>'c6c49765-9bf6-4223-9261-7553499f5d92',
+        'pipelineId'=>'587c8746-ecf6-40ae-8c50-e456f99ad555','localId'=>create_guid(),
+        'sourceRevision'=>hash('sha256','synthetic routine first revision'),'projection'=>$projection];
+    $nativeId=$projection['suiteCrmId'];$idSql="'".quote($nativeId)."'";
+    $policy=sharedFixturePolicy($db,$profile);
+    $wrongWorkspace=$command;$wrongWorkspace['workspaceId']=create_guid();
+    sharedFixtureExpectHold(static fn()=>$worker->publish($wrongWorkspace),'shared_worker_command_scope');
+    putenv('CLAWPILOT_NATIVE_EMAIL_AUTHORITY_ENABLED=1');
+    try{sharedFixtureExpectHold(static fn()=>$worker->publish($command),'shared_worker_legacy_mode');}
+    finally{putenv('CLAWPILOT_NATIVE_EMAIL_AUTHORITY_ENABLED');}
+    $wrongSubject=new ClawPilotSharedBpoEmailWorker($db,$profile,(string)$admin->id,(string)$client->id,(string)$token->access_token,$templates,create_guid());
+    sharedFixtureExpectHold(static fn()=>$wrongSubject->publish($command),'shared_worker_unauthorized');
+    $tokenSql="'".quote((string)$token->id)."'";
+    $db->query("UPDATE oauth2tokens SET token_is_revoked=1 WHERE id=$tokenSql");
+    try{sharedFixtureExpectHold(static fn()=>$worker->publish($command),'shared_worker_unauthorized');}
+    finally{$db->query("UPDATE oauth2tokens SET token_is_revoked=0 WHERE id=$tokenSql");}
+    must(rows("SELECT id FROM emails WHERE id=$idSql")===[],'Denied actor and scope must not create the Email');
+    $caseAlias=$command;$caseAlias['projection']['suiteCrmId']=create_guid();$caseAlias['projection']['attributes']['global_id_c']='gi9800007';
+    $caseAlias['projection']['contacts']=array_map('strtoupper',$projection['contacts']);
+    $caseAlias['projection']['contactAccounts']=array_map(static fn(array $binding): array=>
+        ['contactId'=>strtoupper($binding['contactId']),'accountId'=>$binding['accountId']],$projection['contactAccounts']);
+    must($caseAlias['projection']['contacts']!==$projection['contacts'],'Synthetic casing alias is distinct');
+    sharedFixtureExpectHold(static fn()=>$worker->publish($caseAlias),'related_record_unavailable');
+
+    $first=$worker->publish($command);
+    must($first['suiteCrmId']===$nativeId&&$first['globalId']==='gi9800008'&&$worker->publish($command)===$first,
+        'Missing-response create retry must return the same fingerprint without another Email');
+    $update=$command;$update['sourceRevision']=hash('sha256','synthetic routine second revision');
+    $update['projection']['attributes']['description']='Synthetic exact compare-and-swap update';
+    unset($update['projection']['attributes']['to_addrs_names']);
+    $update['projection']['previousManaged']=['accounts'=>$projection['accounts'],'contacts'=>$projection['contacts']];
+    $update['projection']['expectedBeforeFingerprint']=$first['snapshotFingerprint'];
+    $update['projection']['contacts']=[$projection['contacts'][0]];
+    $update['projection']['contactAccounts']=[$projection['contactAccounts'][0]];
+    $second=$worker->publish($update);
+    must($second['snapshotFingerprint']!==$first['snapshotFingerprint']&&$second['contacts']===$update['projection']['contacts']
+        &&$worker->publish($update)===$second,'Missing-response update retry must recover the same exact projection');
+    must(rows("SELECT to_addrs FROM emails_text WHERE email_id=$idSql")
+        ===[['to_addrs'=>$projection['attributes']['to_addrs_names']]],'Omitted optional header does not clear prior evidence');
+    sharedFixtureExpectHold(static fn()=>$worker->publish($command),'shared_existing_preimage_changed');
+    $conflict=$update;$conflict['projection']['attributes']['description']='Synthetic delayed stale compare-and-swap';
+    sharedFixtureExpectHold(static fn()=>$worker->publish($conflict),'shared_existing_preimage_changed');
+    $globalAlias=$command;$globalAlias['projection']['suiteCrmId']=create_guid();
+    try{$worker->publish($globalAlias);throw new RuntimeException('A second native ID must not claim the same Global ID');}
+    catch(ClawPilotNativeEmailTransactionRefused $held){must(str_starts_with($held->holdCode,'shared_bpo_email_absence_'),'Duplicate alias hold expected');}
+    must(rows("SELECT id FROM emails WHERE id=$idSql")===[['id'=>$nativeId]]
+        &&rows("SELECT id_c FROM emails_cstm WHERE global_id_c='gi9800008'")===[['id_c'=>$nativeId]]
+        &&sharedFixturePolicy($db,$profile)===$policy,'Worker retries preserve one identity and unchanged policy');
+    fwrite(STDOUT,"PASS stock worker authenticates original token, confines workspace, performs exact CAS, and does not duplicate on retry\n");
+}
+
+function sharedFixtureHttpRequest(string $path,string $body,string $contentType,?string $token=null): array
+{
+    $handle=curl_init('http://127.0.0.1:8099'.$path);must($handle instanceof CurlHandle,'Synthetic HTTP client required');
+    $headers=['Accept: application/vnd.api+json','Content-Type: '.$contentType];
+    if($token!==null)$headers[]='Authorization: Bearer '.$token;
+    $response='';$cache='';
+    curl_setopt_array($handle,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$body,CURLOPT_HTTPHEADER=>$headers,
+        CURLOPT_PROXY=>'',CURLOPT_CONNECTTIMEOUT=>2,CURLOPT_TIMEOUT=>12,CURLOPT_PROTOCOLS=>CURLPROTO_HTTP,CURLOPT_FOLLOWLOCATION=>false,
+        CURLOPT_WRITEFUNCTION=>static function($curl,string $chunk)use(&$response):int {
+            if(strlen($response)+strlen($chunk)>262144)return 0;$response.=$chunk;return strlen($chunk);
+        },CURLOPT_HEADERFUNCTION=>static function($curl,string $line)use(&$cache):int {
+            if(str_starts_with(strtolower($line),'cache-control:'))$cache=trim(substr($line,strlen('cache-control:')));
+            return strlen($line);
+        }]);
+    try{
+        must(curl_exec($handle)!==false,'Synthetic loopback OAuth/worker request failed');
+        return [(int)curl_getinfo($handle,CURLINFO_RESPONSE_CODE),json_decode($response,true),$cache];
+    }finally{curl_close($handle);}
+}
+
+function sharedFixtureHttpWorker(mysqli $db,User $admin,bool $templates,array $projection): void
+{
+    selectUser($admin);$clients=[];
+    foreach(['authorized','wrong'] as $label){
+        $client=native('OAuth2Clients');$client->name='Disposable stock route '.$label;
+        $client->allowed_grant_type='client_credentials';$client->is_confidential=1;$client->assigned_user_id=$admin->id;
+        $secret='synthetic-only-'.bin2hex(random_bytes(24));
+        $_REQUEST=['new_secret'=>$secret,'duration_amount'=>1,'duration_unit'=>'hour'];
+        try{must((bool)$client->save(false),'Synthetic stock HTTP client required');}finally{$_REQUEST=[];}
+        $clients[$label]=[(string)$client->id,$secret];
+    }
+    $key=openssl_pkey_new(['private_key_type'=>OPENSSL_KEYTYPE_RSA,'private_key_bits'=>2048]);
+    must($key instanceof OpenSSLAsymmetricKey&&openssl_pkey_export($key,$private),'Disposable native HTTP keys required');
+    foreach(['private.key'=>$private,'public.key'=>openssl_pkey_get_details($key)['key']] as $file=>$bytes){
+        $path='/app/public/legacy/Api/V8/OAuth2/'.$file;
+        must(file_put_contents($path,$bytes,LOCK_EX)===strlen($bytes)&&chmod($path,0600),'Stage isolated signing material');
+    }
+    unset($private,$key,$bytes);
+    $override='/app/public/legacy/config_override.php';$base=is_file($override)?file_get_contents($override):"<?php\n";
+    must(is_string($base)&&str_starts_with(ltrim($base),'<?php'),'Synthetic config source required');
+    $config=preg_replace('/\?>\s*$/','',$base)."\n\$sugar_config['site_url'] = 'http://127.0.0.1:8099';\n"
+        .'$sugar_config[\'trusted_hosts\'] = [\'^127\\\\.0\\\\.0\\\\.1$\'];'."\n"
+        .'$sugar_config[\'oauth2_encryption_key\'] = '.var_export(bin2hex(random_bytes(32)),true).";\n";
+    must(file_put_contents($override,$config,LOCK_EX)===strlen($config),'Stage isolated HTTP origin');
+    $router='/app/public/legacy/custom/application/Ext/Api/V8/Config/routes.php';$directory=dirname($router);
+    must((is_dir($directory)||mkdir($directory,0755,true))&&!file_exists($router),'Fresh synthetic custom route only');
+    $route="<?php\nrequire '/opt/clawpilot/email-audience/shared-worker-routes.php';\n";
+    must(file_put_contents($router,$route,LOCK_EX)===strlen($route),'Mount exact worker route under stock V8');
+    putenv('SUITECRM_CLIENT_ID='.$clients['authorized'][0]);
+    putenv('CLAWPILOT_SHARED_BPO_EMAIL_ENABLED=1');
+    putenv('CLAWPILOT_SHARED_BPO_EMAIL_TEMPLATES='.($templates?'1':'0'));
+    $process=proc_open([PHP_BINARY,'-d','display_errors=0','-S','127.0.0.1:8099','-t','/app/public/legacy','/fixture/native-shared-email-router.php'],
+        [0=>['file','/dev/null','r'],1=>['file','/tmp/native-shared-email-http.log','a'],2=>['file','/tmp/native-shared-email-http.log','a']],$pipes);
+    must(is_resource($process),'Start isolated stock HTTP listener');
+    try{
+        $ready=false;
+        for($i=0;$i<40;$i++){
+            $socket=@fsockopen('127.0.0.1',8099,$errno,$error,0.1);
+            if(is_resource($socket)){fclose($socket);$ready=true;break;}usleep(50000);
+        }
+        must($ready,'Isolated stock HTTP listener ready');
+        $tokens=[];
+        foreach($clients as $label=>[$client,$secret]){
+            [$status,$result]=sharedFixtureHttpRequest('/Api/access_token',http_build_query([
+                'grant_type'=>'client_credentials','client_id'=>$client,'client_secret'=>$secret]),'application/x-www-form-urlencoded');
+            must($status===200&&is_string($result['access_token']??null),'Stock OAuth client credentials token required, HTTP '.$status);
+            $tokens[$label]=$result['access_token'];
+        }
+        $projection['suiteCrmId']=create_guid();$projection['attributes']['global_id_c']='gi9800006';
+        $projection['attributes']['name']='Synthetic stock OAuth shared worker Email';
+        $wire=json_encode(['version'=>1,'workspaceId'=>'c6c49765-9bf6-4223-9261-7553499f5d92',
+            'pipelineId'=>'587c8746-ecf6-40ae-8c50-e456f99ad555','localId'=>create_guid(),
+            'sourceRevision'=>hash('sha256','synthetic authenticated HTTP projection'),'projection'=>$projection],JSON_THROW_ON_ERROR);
+        $path='/Api/V8/custom/clawpilot-email-shared';$media='application/vnd.api+json';
+        [$anonymous]=sharedFixtureHttpRequest($path,$wire,$media);
+        [$wrong,$refusal,$noStore]=sharedFixtureHttpRequest($path,$wire,$media,$tokens['wrong']);
+        must($anonymous===401&&$wrong===403&&$refusal===['ok'=>false,'code'=>'SHARED_EMAIL_UNAUTHORIZED']
+            &&$noStore==='private, no-store','Stock middleware denies anonymous and wrong-client publication');
+        [$success,$first,$cache]=sharedFixtureHttpRequest($path,$wire,$media,$tokens['authorized']);
+        [$replay,$second]=sharedFixtureHttpRequest($path,$wire,$media,$tokens['authorized']);
+        must($success===200&&$replay===200&&$first===$second&&$first['suiteCrmId']===$projection['suiteCrmId']
+            &&$first['globalId']==='gi9800006'&&$cache==='private, no-store','OAuth route writes and reuses the same Email: HTTP '.$success.'/'.$replay);
+        must(rows("SELECT id_c FROM emails_cstm WHERE global_id_c='gi9800006'")===[['id_c'=>$projection['suiteCrmId']]],
+            'Exactly one authenticated stock route Email');
+    }finally{proc_terminate($process);proc_close($process);}
+    fwrite(STDOUT,"PASS real stock OAuth rejects anonymous and wrong-client requests, allows one shared projection, and reuses the original on HTTP retry\n");
 }
 
 (static function () use ($sugar_config): void {
@@ -149,7 +307,10 @@ try {
         $history=$module==='Accounts'?sharedFixtureAccountHistory($related):linkedIds($related,'emails');
         must($related->ACLAccess('view') && $history===[$id], 'Stock related Email history must show the same ID: '.$module);
     }
-    fwrite(STDOUT,"PASS stock non-admin view and both company and contact Email histories show the same ID\nNATIVE_SHARED_EMAIL_ACCEPTANCE_PASSED=1\n");
+    fwrite(STDOUT,"PASS stock non-admin view and both company and contact Email histories show the same ID\n");
+    sharedFixtureWorker($db,$profile,$admin,$templates,$command);
+    sharedFixtureHttpWorker($db,$admin,$templates,$command);
+    fwrite(STDOUT,"NATIVE_SHARED_EMAIL_ACCEPTANCE_PASSED=1\n");
 } catch (Throwable $failure) {
     // A failure is not a receipt. Diagnostics are confined to synthetic data.
     $detail=isset($failure->diagnostic)?' '.$failure->diagnostic:'';

@@ -14,8 +14,8 @@ import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
 import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
 import { suiteCrmOpportunitySalesStage } from '@/lib/crm/suiteCrmOpportunityStage'
 import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
-import type { SuiteCrmEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
-import { suiteCrmEmailAudienceFingerprint } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import type { SuiteCrmEmailProjectionReadback, SuiteCrmSharedEmailProjection, SuiteCrmSharedEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import { sharedSuiteCrmEmailScope, suiteCrmEmailAudienceFingerprint } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import { nativeEmailPrincipalIsEligible, nativeEmailEffectivePipelinePrincipals } from '@/lib/crm/nativeEmailEligibility'
 import { collectNativeEmailRootSourcesWithClient, projectNativeEmailRootReaders } from '@/lib/crm/nativeEmailRootReaders'
 import { assertSameRetainedGmailEvidence, retainedGmailMessageEvidence, gmailEvidenceHash, gmailMessageSourceKey,
@@ -802,6 +802,9 @@ async function enqueueSuiteCrmRecord(
   const moduleTransition = input.entity === 'interactions'
     && previousSuiteCrmModule !== undefined
     && previousSuiteCrmModule !== suiteCrmModule
+  if (moduleTransition && previousSuiteCrmModule && emailAudienceMode === 'shared' && suiteCrmModule === 'Emails') {
+    throw new Error('Shared Email cannot replace another native record type without exact review')
+  }
   if (moduleTransition) {
     await client.query(
       `DELETE FROM sync_outbox
@@ -886,7 +889,7 @@ async function enqueueSuiteCrmRecord(
         input.fields.providerMessageId, input.fields.providerThreadId || null, clean(input.actorEmail).toLowerCase()],
     )
     if (retained.rows.length === 1) {
-      emailAddressAttributes = suiteCrmEmailAddressAttributes(retained.rows[0].email_address_headers)
+      emailAddressAttributes = suiteCrmEmailAddressAttributes(retained.rows[0].email_address_headers, { stockNative: emailAudienceMode === 'shared' })
     }
   }
   const payload: SuiteCrmOutboxRecord = {
@@ -918,12 +921,23 @@ async function enqueueSuiteCrmRecord(
       JOIN crm_contacts contact ON contact.id=related.contact_id AND contact.pipeline_id=related.pipeline_id
       JOIN crm_organizations company ON company.id=contact.organization_id AND company.pipeline_id=contact.pipeline_id
       WHERE related.interaction_id=$1::uuid AND related.pipeline_id=$2::uuid ORDER BY contact.suitecrm_id`, [localId, input.pipelineId])
-    const previous = await client.query<{ receipt: SuiteCrmEmailProjectionReadback }>(`SELECT metadata->'suiteCrmEmailProjection' AS receipt
+    const previous = await client.query<{ receipt: (Pick<SuiteCrmEmailProjectionReadback, 'accounts' | 'contacts' | 'suiteCrmId'>
+      & { version?: number; globalId?: string; snapshotFingerprint?: string; sharedPublication?: unknown; sharedRepair?: unknown }) | null }>(`SELECT metadata->'suiteCrmEmailProjection' AS receipt
       FROM crm_interactions WHERE id=$1::uuid AND pipeline_id=$2::uuid`, [localId, input.pipelineId])
     const receipt = previous.rows[0]?.receipt
-    payload.emailProjection = { version: 1, accounts, contacts,
-      contactAccounts: bindings.rows.map(row => ({ contactId: row.contact_id, accountId: row.account_id })),
-      previousManaged: { accounts: receipt?.accounts || [], contacts: receipt?.contacts || [] }, audience }
+    const contactAccounts = bindings.rows.map(row => ({ contactId: row.contact_id, accountId: row.account_id }))
+    if (audience.policy === 'suitecrm-shared-login') {
+      const priorShared = Boolean(receipt?.sharedPublication || receipt?.sharedRepair)
+      if (priorShared && (!receipt || receipt.version !== 2 || receipt.suiteCrmId !== suiteCrmId || receipt.globalId !== referenceCode
+        || typeof receipt.snapshotFingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/u.test(receipt.snapshotFingerprint)
+        || !Array.isArray(receipt.accounts) || !Array.isArray(receipt.contacts))) throw new Error('Shared SuiteCRM Email prior receipt changed')
+      payload.sharedEmailProjection = { version: 1, workspaceId: audience.workspaceId, sourceRevision: sourceHash,
+        accounts, contacts, contactAccounts, expectedBeforeFingerprint: priorShared ? receipt!.snapshotFingerprint! : null,
+        previousManaged: priorShared ? { accounts: receipt!.accounts, contacts: receipt!.contacts } : { accounts: [], contacts: [] } }
+    } else {
+      payload.emailProjection = { version: 1, accounts, contacts, contactAccounts,
+        previousManaged: { accounts: receipt?.accounts || [], contacts: receipt?.contacts || [] }, audience }
+    }
   }
   const operation = moduleTransition && previousSuiteCrmModule
     ? 'reproject_record'
@@ -949,6 +963,7 @@ async function enqueueSuiteCrmRecord(
         lock_token = NULL,
         updated_at = now()
       WHERE sync_outbox.status IN ('succeeded', 'dead')
+        AND (NOT (EXCLUDED.payload ? 'sharedEmailProjection') OR sync_outbox.status <> 'dead')
         AND ${nativeEmailOutboxUnresolvedGuardSql()}
       RETURNING idempotency_key
     `,
@@ -2666,7 +2681,8 @@ export async function stageCrmRecordWithClient(client: PoolClient, rawInput: Sta
   // The DB guard compares actual inventory changes, so content edits stay live.
   if (['interactions', 'organizations', 'contacts'].includes(rawInput.entity)) await lockCrmNativeEmailAuthorityWithClient(client)
   const emailAudienceMode = rawInput.entity === 'interactions'
-    ? await reviewedEmailAudienceModeUnderControlWithClient(client) : undefined
+    ? await reviewedEmailAudienceModeUnderControlWithClient(client,
+      interactionSuiteCrmModule(rawInput.fields) === 'Emails' ? rawInput.pipelineId : undefined) : undefined
   if (rawInput.entity === 'organizations' || rawInput.entity === 'contacts') {
     await lockCrmMutation(client, `crm-record-lifecycle:${rawInput.pipelineId}`)
     const retained = await retainedCrmIdentityTombstone(client, rawInput)
@@ -3064,19 +3080,30 @@ export type ReviewedGmailInteractionInput = {
   correctionReason?: string
 }
 
-type ReviewedEmailAudienceMode = 'legacy' | 'native'
+type ReviewedEmailAudienceMode = 'legacy' | 'native' | 'shared'
 
 /** Caller already owns the control singleton before any authority/source locks.
  * Never acquire control here: legacy publication holds row locks over provider
  * I/O and must keep using the separate legacy audience without this dispatch. */
-async function reviewedEmailAudienceModeUnderControlWithClient(client: PoolClient): Promise<ReviewedEmailAudienceMode> {
+async function reviewedEmailAudienceModeUnderControlWithClient(client: PoolClient, pipelineId?: string): Promise<ReviewedEmailAudienceMode> {
   const result = await client.query<{ enabled: boolean }>(
     'SELECT enabled FROM crm_native_email_publication_control WHERE singleton',
   )
   if (result.rows.length !== 1 || typeof result.rows[0].enabled !== 'boolean') {
     throw new Error('Native Email audience control mode is missing or inconsistent')
   }
-  return result.rows[0].enabled ? 'native' : 'legacy'
+  if (result.rows[0].enabled) return 'native'
+  // Service configuration is consulted only for the one opted-in pipeline;
+  // ordinary legacy or native-mode preview semantics do not change.
+  if (pipelineId && typeof process !== 'undefined'
+    && (process.env.CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID || process.env.CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID)
+    && sharedSuiteCrmEmailScope(pipelineId)) {
+    const idle = await client.query(`SELECT 1 FROM crm_native_email_publication_control WHERE singleton AND NOT enabled
+      AND active_operation_id IS NULL AND active_transition_id IS NULL AND active_initial_enrollment_id IS NULL`)
+    if (idle.rows.length !== 1) throw new Error('Managed SuiteCRM Email authority is not idle')
+    return 'shared'
+  }
+  return 'legacy'
 }
 
 /** Explicit mode is transaction-owned, never an API input or a fallback when
@@ -3084,7 +3111,18 @@ async function reviewedEmailAudienceModeUnderControlWithClient(client: PoolClien
 async function reviewedEmailAudienceWithClient(client: PoolClient, pipelineId: string, mode: ReviewedEmailAudienceMode | undefined) {
   if (mode === 'native') return reviewedEmailAudienceUnderNativeControlWithClient(client, pipelineId)
   if (mode === 'legacy') return legacyReviewedEmailAudienceWithClient(client, pipelineId)
+  if (mode === 'shared') return sharedSuiteCrmEmailScopeWithClient(client, pipelineId)
   throw new Error('An explicit held-control Email audience mode is required')
+}
+
+async function sharedSuiteCrmEmailScopeWithClient(client: PoolClient, pipelineId: string) {
+  const scope = sharedSuiteCrmEmailScope(pipelineId)
+  if (!scope) throw new Error('Shared SuiteCRM Email publication is not enabled for this pipeline')
+  const binding = await client.query(`SELECT 1 FROM pipeline_spaces p JOIN workspace_organizations w ON w.id=p.workspace_organization_id
+    WHERE p.id=$1::uuid AND w.id=$2::uuid AND NOT w.is_demo AND NOT p.reference_access_disabled FOR SHARE OF p,w`,
+  [pipelineId,scope.workspaceId])
+  if (binding.rows.length !== 1) throw new Error('Shared SuiteCRM Email workspace binding changed')
+  return scope
 }
 
 /** Existing pipeline readers are the content audience. Companies and contacts
@@ -3567,7 +3605,9 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     // This must precede participant/source locks: enabled audience derivation
     // reads root and membership authority under the caller-owned control fence.
     await lockCrmNativeEmailAuthorityWithClient(client)
-    const emailAudienceMode = await reviewedEmailAudienceModeUnderControlWithClient(client)
+    const pipelineIds = [...new Set(input.messages.map(message => message.pipelineId))].sort()
+    const emailAudienceModes = new Map<string, ReviewedEmailAudienceMode>()
+    for (const pipelineId of pipelineIds) emailAudienceModes.set(pipelineId, await reviewedEmailAudienceModeUnderControlWithClient(client, pipelineId))
     // Deterministic per-owner/email fences are also acquired by the DB contact
     // and lead triggers, including imports. Unrelated identities remain writable.
     const identityKeys = [...new Set(input.messages.flatMap(message => message.participantEmails.map(email =>
@@ -3577,13 +3617,13 @@ export async function stageReviewedGmailInteractionsInPostgres(input: {
     for (const key of intakeKeys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
     const plans = new Map<ReviewedGmailInteractionInput, Awaited<ReturnType<typeof prepareReviewedGmailInteractionWithClient>>>()
     for (const message of [...input.messages].sort((a, b) => `${a.pipelineId}:${a.providerMessageId}`.localeCompare(`${b.pipelineId}:${b.providerMessageId}`))) {
-      plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceMode))
+      plans.set(message, await prepareReviewedGmailInteractionWithClient(client, { ...message, apply: input.apply === true }, emailAudienceModes.get(message.pipelineId)!))
     }
     if (firstSeen && new Set([...plans.values()].map(plan => plan.missingIntake)).size !== 1) {
       throw new Error('The Casey pair cannot mix newly observed and already imported messages')
     }
     const results = []
-    for (const message of input.messages) results.push(await applyReviewedGmailInteractionWithClient(client, plans.get(message)!, emailAudienceMode))
+    for (const message of input.messages) results.push(await applyReviewedGmailInteractionWithClient(client, plans.get(message)!, emailAudienceModes.get(message.pipelineId)!))
     return results
   })
 }
@@ -7668,7 +7708,19 @@ export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxIte
   }
   const payload = item.payload
   return withTransaction(async client => {
+    const shared = payload.sharedEmailProjection
+    if (shared !== undefined) {
+      // Managed-role enrollment and shared stock publication must never run
+      // concurrently. Take this in the established control-first lock order.
+      const idle = await client.query(`SELECT 1 FROM crm_native_email_publication_control WHERE singleton AND NOT enabled
+        AND active_operation_id IS NULL AND active_transition_id IS NULL AND active_initial_enrollment_id IS NULL FOR SHARE`)
+      if (idle.rows.length !== 1) throw new Error('Managed SuiteCRM Email authority is not idle')
+    }
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`crm-native-email:${item.aggregateId}`])
+    if (shared !== undefined) {
+      await verifySharedSuiteCrmEmailDispatch(client, item, payload, shared)
+      return publish()
+    }
     const current = await client.query<{ source_hash: string }>(`SELECT interaction.source_hash FROM crm_interactions interaction
       JOIN sync_outbox outbox ON outbox.id=$3::uuid AND outbox.aggregate_id=interaction.id::text
         AND outbox.status='processing' AND outbox.lock_token=$4 AND outbox.payload=$5::jsonb
@@ -7683,10 +7735,62 @@ export async function withVerifiedSuiteCrmEmailPublication<T>(item: CrmOutboxIte
   })
 }
 
+async function verifySharedSuiteCrmEmailDispatch(client: PoolClient, item: CrmOutboxItem, payload: SuiteCrmOutboxRecord,
+  shared: SuiteCrmSharedEmailProjection) {
+  const fail = () => new Error('Shared SuiteCRM Email workspace, relationships, lease or revision changed')
+  const scope = await sharedSuiteCrmEmailScopeWithClient(client, payload.pipelineId)
+  if (shared.version !== 1 || shared.workspaceId !== scope.workspaceId || payload.emailProjection !== undefined
+    || payload.previousSuiteCrmModule !== undefined || item.aggregateType !== 'crm_interactions' || payload.localId !== item.aggregateId
+    || !/^[a-f0-9]{64}(?![\s\S])/u.test(shared.sourceRevision)
+    || item.idempotencyKey !== `crm:interactions:v4:${item.aggregateId}:Emails:${shared.sourceRevision}`) throw fail()
+  const current = await client.query<{
+    source_hash: string; primary_id: string | null; accounts: Array<string | null>;
+    contacts: Array<{ contactId: string | null; accountId: string | null }>
+  }>(`WITH selected AS MATERIALIZED (
+      SELECT i.id,i.pipeline_id,i.source_hash,i.organization_id FROM crm_interactions i
+      JOIN sync_outbox o ON o.id=$3::uuid AND o.aggregate_id=i.id::text AND o.aggregate_type='crm_interactions'
+        AND o.target_system='suitecrm' AND o.operation='upsert_record' AND o.status='processing'
+        AND o.lock_token=$4 AND o.payload=$5::jsonb AND o.idempotency_key=$6
+      WHERE i.id=$1::uuid AND i.pipeline_id=$2::uuid AND i.suitecrm_id=$7 AND i.reference_code=$8
+        AND i.suitecrm_module='Emails' AND ${activeCrmRecordSql('i')} FOR SHARE OF i,o
+    ), org_ids AS (
+      SELECT s.organization_id AS id FROM selected s WHERE s.organization_id IS NOT NULL
+      UNION
+      SELECT r.organization_id FROM selected s JOIN crm_interaction_organizations r
+        ON r.pipeline_id=s.pipeline_id AND r.interaction_id=s.id
+    ), accounts AS (
+      SELECT org_ids.id,o.suitecrm_id FROM org_ids LEFT JOIN crm_organizations o
+        ON o.id=org_ids.id AND o.pipeline_id=$2::uuid AND ${activeCrmRecordSql('o')}
+    ), contacts AS (
+      SELECT c.suitecrm_id,a.suitecrm_id AS account_id FROM selected s JOIN crm_interaction_contacts r
+        ON r.pipeline_id=s.pipeline_id AND r.interaction_id=s.id
+      LEFT JOIN crm_contacts c ON c.pipeline_id=s.pipeline_id AND c.id=r.contact_id AND ${activeCrmRecordSql('c')}
+      LEFT JOIN accounts a ON a.id=c.organization_id
+    ) SELECT s.source_hash,(SELECT a.suitecrm_id FROM accounts a WHERE a.id=s.organization_id) AS primary_id,
+      ARRAY(SELECT a.suitecrm_id FROM accounts a ORDER BY a.suitecrm_id COLLATE "C") AS accounts,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('contactId',c.suitecrm_id,'accountId',c.account_id)
+        ORDER BY c.suitecrm_id COLLATE "C") FROM contacts c),'[]'::jsonb) AS contacts
+    FROM selected s`, [item.aggregateId,payload.pipelineId,item.id,item.lockToken,JSON.stringify(payload),item.idempotencyKey,
+    payload.suiteCrmId,payload.attributes.global_id_c])
+  const row = current.rows[0]
+  if (current.rows.length !== 1 || row.source_hash !== shared.sourceRevision
+    || row.primary_id !== (payload.attributes.parent_id || null)
+    || row.accounts.some(account => !account) || row.contacts.some(contact => !contact.contactId || !contact.accountId)
+    || !sameSharedSuiteCrmEmailLinks(shared, { accounts: row.accounts, contacts: row.contacts.map(contact => contact.contactId), contactAccounts: row.contacts })) throw fail()
+}
+
+function sameSharedSuiteCrmEmailLinks(left: SuiteCrmSharedEmailProjection, right: {
+  accounts: Array<string | null>; contacts: Array<string | null>; contactAccounts: Array<{ contactId: string | null; accountId: string | null }>
+}) {
+  const canonical = (value: typeof right) => ({ accounts: [...value.accounts].sort(), contacts: [...value.contacts].sort(),
+    contactAccounts: value.contactAccounts.map(entry => [entry.contactId,entry.accountId]).sort() })
+  return crmSourceHash(canonical(left)) === crmSourceHash(canonical(right))
+}
+
 export async function completeSuiteCrmOutboxInPostgres(
   item: CrmOutboxItem,
   completion: {
-    emailProjection?: SuiteCrmEmailProjectionReadback | null
+    emailProjection?: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback | null
     meetingProjection?: SuiteCrmMeetingProjectionReadback | null
     productImageProjection?: {
       action: 'disabled' | 'unchanged' | 'attached' | 'cleared'
@@ -7712,18 +7816,32 @@ export async function completeSuiteCrmOutboxInPostgres(
     if (item.operation === 'upsert_record' && item.payload.entity === 'interactions' && item.payload.suiteCrmModule === 'Emails') {
       const proof = completion.emailProjection
       const expected = item.payload.emailProjection
-      if (!proof || !expected || proof.version !== 1 || proof.suiteCrmId !== item.payload.suiteCrmId
-        || !Number.isFinite(Date.parse(proof.capturedAt)) || proof.audience.fingerprint !== expected.audience.fingerprint
-        || crmSourceHash(proof.attributes) !== crmSourceHash(item.payload.attributes)
-        || crmSourceHash([...proof.contactAccounts].sort((a,b) => a.contactId.localeCompare(b.contactId)))
-          !== crmSourceHash([...expected.contactAccounts].sort((a,b) => a.contactId.localeCompare(b.contactId)))
-        || crmSourceHash([...proof.accounts].sort()) !== crmSourceHash([...expected.accounts].sort())
-        || crmSourceHash([...proof.contacts].sort()) !== crmSourceHash([...expected.contacts].sort())
-        || crmSourceHash([...proof.audience.readerSuiteCrmUserIds].sort()) !== crmSourceHash([...expected.audience.allowedSuiteCrmUserIds].sort())) {
-        throw new Error('SuiteCRM Email readback proof is missing or changed')
+      const shared = item.payload.sharedEmailProjection
+      if (shared !== undefined) {
+        const idle = await client.query(`SELECT 1 FROM crm_native_email_publication_control WHERE singleton AND NOT enabled
+          AND active_operation_id IS NULL AND active_transition_id IS NULL AND active_initial_enrollment_id IS NULL`)
+        if (idle.rows.length !== 1) throw new Error('Managed SuiteCRM Email authority is not idle')
+        const scope = await sharedSuiteCrmEmailScopeWithClient(client, item.payload.pipelineId)
+        if (!proof || proof.version !== 2 || expected !== undefined || scope.workspaceId !== shared.workspaceId
+          || proof.suiteCrmId !== item.payload.suiteCrmId || proof.globalId !== item.payload.attributes.global_id_c
+          || !Number.isFinite(Date.parse(proof.capturedAt)) || !/^[a-f0-9]{64}(?![\s\S])/u.test(proof.snapshotFingerprint)
+          || proof.sharedPublication?.version !== 1 || proof.sharedPublication.sourceRevision !== shared.sourceRevision
+          || item.idempotencyKey !== `crm:interactions:v4:${item.aggregateId}:Emails:${shared.sourceRevision}`
+          || !sameSharedSuiteCrmEmailLinks(shared, proof)) throw new Error('Shared SuiteCRM Email readback proof is missing or changed')
+      } else {
+        if (!proof || !expected || proof.version !== 1 || proof.suiteCrmId !== item.payload.suiteCrmId
+          || !Number.isFinite(Date.parse(proof.capturedAt)) || proof.audience.fingerprint !== expected.audience.fingerprint
+          || crmSourceHash(proof.attributes) !== crmSourceHash(item.payload.attributes)
+          || crmSourceHash([...proof.contactAccounts].sort((a,b) => a.contactId.localeCompare(b.contactId)))
+            !== crmSourceHash([...expected.contactAccounts].sort((a,b) => a.contactId.localeCompare(b.contactId)))
+          || crmSourceHash([...proof.accounts].sort()) !== crmSourceHash([...expected.accounts].sort())
+          || crmSourceHash([...proof.contacts].sort()) !== crmSourceHash([...expected.contacts].sort())
+          || crmSourceHash([...proof.audience.readerSuiteCrmUserIds].sort()) !== crmSourceHash([...expected.audience.allowedSuiteCrmUserIds].sort())) {
+          throw new Error('SuiteCRM Email readback proof is missing or changed')
+        }
+        const audience = await legacyReviewedEmailAudienceWithClient(client, item.payload.pipelineId)
+        if (audience.fingerprint !== expected.audience.fingerprint) throw new Error('Email audience changed before sync completion')
       }
-      const audience = await legacyReviewedEmailAudienceWithClient(client, item.payload.pipelineId)
-      if (audience.fingerprint !== expected.audience.fingerprint) throw new Error('Email audience changed before sync completion')
       const current = await client.query<{ source_hash: string }>(`SELECT source_hash FROM crm_interactions
         WHERE id=$1::uuid AND pipeline_id=$2::uuid AND suitecrm_id=$3 FOR UPDATE`,
       [item.aggregateId, item.payload.pipelineId, item.payload.suiteCrmId])
@@ -7776,6 +7894,7 @@ export async function completeSuiteCrmOutboxInPostgres(
          ))
        RETURNING aggregate_type, aggregate_id`,
       [item.id, item.lockToken, isMeetingProjection || ('emailProjection' in item.payload && Boolean(item.payload.emailProjection))
+        || ('sharedEmailProjection' in item.payload && Boolean(item.payload.sharedEmailProjection))
         || (item.operation !== 'upsert_user_identity' && ['organizations','contacts'].includes(item.payload.entity)), item.aggregateType, item.aggregateId,
         item.idempotencyKey, JSON.stringify(item.payload), item.operation],
     )

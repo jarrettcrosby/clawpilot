@@ -75,7 +75,7 @@ export function captureEmailAddressHeaders(
 }
 
 /** Positive-only native Email fields; absence must not clear an existing projection. */
-export function suiteCrmEmailAddressAttributes(evidence: unknown): Record<string, string> {
+export function suiteCrmEmailAddressAttributes(evidence: unknown, { stockNative = false } = {}): Record<string, string> {
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return {}
   const stored = evidence as Record<string, unknown>
   if (stored.version !== 1) return {}
@@ -93,10 +93,15 @@ export function suiteCrmEmailAddressAttributes(evidence: unknown): Record<string
       if (seen.has(email)) continue
       seen.add(email)
       const label = displayName(entry.displayName)
-      values.push(label ? `${label} <${email}>` : email)
+      const formatted = label ? `${label} <${email}>` : email
+      // The stock writer cannot round-trip these display labels; retaining
+      // the verified address is exact, whereas inventing a label is not.
+      const unsupportedLabel = stockNative && label && (/["'\\]/u.test(label)
+        || (name === 'from' && Buffer.byteLength(formatted, 'utf8') > 255))
+      values.push(unsupportedLabel ? email : formatted)
     }
     const value = values.join(', ')
-    if (valid && value && value.length <= MAX_HEADER_LENGTH) {
+    if (valid && value && (stockNative ? Buffer.byteLength(value, 'utf8') : value.length) <= MAX_HEADER_LENGTH) {
       result[name === 'from' ? 'from_addr_name' : `${name}_addrs_names`] = value
     }
   }

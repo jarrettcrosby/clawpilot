@@ -246,7 +246,9 @@ try {
     '--mount', `type=bind,source=${join(root, 'suitecrm')},target=/source/suitecrm,readonly`,
     '--mount', `type=bind,source=${fixture},target=/fixture,readonly`, '--mount', `type=bind,source=${verifier},target=/source/email-audience,readonly`,
     ...(options['shared-email-only'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_SHARED_EMAIL_ONLY=1',
-      '--mount', `type=bind,source=${scopePackage},target=/source/native-email-scope,readonly`] : []),
+      '--mount', `type=bind,source=${scopePackage},target=/source/native-email-scope,readonly`,
+      '--mount', `type=bind,source=${verifier},target=/opt/clawpilot/email-audience,readonly`,
+      '--mount', `type=bind,source=${scopePackage},target=/opt/clawpilot/native-email-scope,readonly`] : []),
     ...(options['remediation-candidate'] ? [
       '--mount', `type=bind,source=${join(root, 'authority-issuer.json')},target=/fixture-authority-issuer.json,readonly`,
       '--mount', `type=bind,source=${join(root, 'capability-contract.json')},target=/fixture-capability-contract.json,readonly`,

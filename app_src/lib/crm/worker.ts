@@ -9,7 +9,7 @@ import {
 import type {
   SuiteCrmNativeProductImageResult,
 } from '@/lib/crm/suiteCrmNativeProductImageClient'
-import { SuiteCrmEmailProjectionHeldError, type SuiteCrmEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import { SuiteCrmEmailProjectionHeldError, type SuiteCrmEmailProjectionReadback, type SuiteCrmSharedEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import {
   claimSuiteCrmOutboxInPostgres,
   completeSuiteCrmOutboxInPostgres,
@@ -64,7 +64,7 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       nativeEmailHandled = false
       let productImageProjection: SuiteCrmNativeProductImageResult | null = null
       let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
-      let emailProjection: SuiteCrmEmailProjectionReadback | null = null
+      let emailProjection: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback | null = null
       if (item.operation === 'upsert_user_identity') {
         // Recheck a previously claimed identity at dispatch. It must never
         // mutate the native policy behind the authority/publication protocol.

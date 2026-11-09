@@ -31,6 +31,35 @@ export type SuiteCrmEmailProjectionReadback = {
   }
 }
 
+export type SuiteCrmSharedEmailProjection = Pick<SuiteCrmEmailProjection, 'version' | 'accounts' | 'contacts' | 'contactAccounts' | 'previousManaged'> & {
+  workspaceId: string
+  sourceRevision: string
+  expectedBeforeFingerprint: string | null
+}
+
+export type SuiteCrmSharedEmailProjectionReadback = Pick<SuiteCrmEmailProjectionReadback, 'suiteCrmId' | 'capturedAt' | 'accounts' | 'contacts' | 'contactAccounts'> & {
+  version: 2
+  globalId: string
+  snapshotFingerprint: string
+  sharedPublication: { version: 1; sourceRevision: string }
+}
+
+const SHARED_WORKSPACE_ID = 'c6c49765-9bf6-4223-9261-7553499f5d92'
+const SHARED_PIPELINE_ID = '587c8746-ecf6-40ae-8c50-e456f99ad555'
+const EXACT_UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?![\s\S])/u
+const EXACT_HASH = /^[a-f0-9]{64}(?![\s\S])/u
+
+/** A deliberate opt-in for the one approved workspace and pipeline. Flags
+ * do not grant App access and never imply a SuiteCRM user or role change. */
+export function sharedSuiteCrmEmailScope(pipelineId: string, environment: Record<string, string | undefined> = process.env) {
+  if (pipelineId !== SHARED_PIPELINE_ID) return null
+  const workspaceId = environment.CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID
+  const configuredPipelineId = environment.CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID
+  if (!workspaceId && !configuredPipelineId) return null
+  if (workspaceId !== SHARED_WORKSPACE_ID || configuredPipelineId !== SHARED_PIPELINE_ID) return refuse()
+  return { policy: 'suitecrm-shared-login' as const, workspaceId, pipelineId }
+}
+
 type EmailRecord = {
   pipelineId: string
   suiteCrmId: string
@@ -191,6 +220,76 @@ function emailAttributes(value: unknown): Record<string, string> {
     || !['read', 'sent'].includes(result.status) || result.description_html !== ''
     || !Number.isFinite(Date.parse(result.date_sent_received))) return refuse()
   return result
+}
+
+type SharedEmailRecord = EmailRecord & {
+  localId: string
+  sharedEmailProjection?: SuiteCrmSharedEmailProjection
+  previousSuiteCrmModule?: string
+}
+
+function sharedNativeIds(value: unknown): string[] {
+  const result = ids(value, 25)
+  if (result.some(entry => entry.length > 36) || new Set(result.map(entry => entry.toLowerCase())).size !== result.length) return refuse()
+  return result
+}
+
+function sharedBindings(value: unknown, accounts: string[], contacts: string[]) {
+  if (!Array.isArray(value) || value.length !== contacts.length) return refuse()
+  const result = value.map(entry => {
+    const binding = object(entry)
+    exactKeys(binding, ['contactId','accountId'])
+    return { contactId: id(binding.contactId), accountId: id(binding.accountId) }
+  }).sort((a,b) => a.contactId < b.contactId ? -1 : a.contactId > b.contactId ? 1 : 0)
+  if (!same(result.map(entry => entry.contactId), contacts) || result.some(entry => !accounts.includes(entry.accountId))) return refuse()
+  return result
+}
+
+/** One guarded native operation, not separate save/link requests. The native
+ * route must settle an exact already committed copy without creating another. */
+export async function projectSuiteCrmSharedEmail(record: SharedEmailRecord, request: Request): Promise<SuiteCrmSharedEmailProjectionReadback> {
+  try {
+    const scope = sharedSuiteCrmEmailScope(record.pipelineId)
+    const raw = object(record.sharedEmailProjection)
+    exactKeys(raw, ['version','workspaceId','sourceRevision','expectedBeforeFingerprint','accounts','contacts','contactAccounts','previousManaged'])
+    if (!scope || scope.workspaceId !== raw.workspaceId || raw.version !== 1 || record.emailProjection !== undefined
+      || record.previousSuiteCrmModule !== undefined || !EXACT_UUID.test(record.suiteCrmId) || !EXACT_UUID.test(record.localId)
+      || typeof raw.sourceRevision !== 'string' || !EXACT_HASH.test(raw.sourceRevision)
+      || (raw.expectedBeforeFingerprint !== null && (typeof raw.expectedBeforeFingerprint !== 'string' || !EXACT_HASH.test(raw.expectedBeforeFingerprint)))) return refuse()
+    const attributes = emailAttributes(record.attributes)
+    if (!attributes.assigned_user_id || id(attributes.assigned_user_id).length > 36 || !attributes.from_addr_name
+      || Buffer.byteLength(attributes.description, 'utf8') > 100_000 || Buffer.byteLength(attributes.name, 'utf8') > 255) return refuse()
+    const accounts = sharedNativeIds(raw.accounts), contacts = sharedNativeIds(raw.contacts)
+    const contactAccounts = sharedBindings(raw.contactAccounts, accounts, contacts)
+    const previous = object(raw.previousManaged)
+    exactKeys(previous, ['accounts','contacts'])
+    const previousManaged = { accounts: sharedNativeIds(previous.accounts), contacts: sharedNativeIds(previous.contacts) }
+    if (raw.expectedBeforeFingerprint === null && (previousManaged.accounts.length || previousManaged.contacts.length)) return refuse()
+    if ((attributes.parent_type !== '' || attributes.parent_id !== '')
+      && (attributes.parent_type !== 'Accounts' || !accounts.includes(attributes.parent_id))) return refuse()
+    const related = record.relationships || []
+    if (related.some(entry => !['accounts','contacts'].includes(entry.linkFieldName)
+      || entry.relatedModuleName !== (entry.linkFieldName === 'accounts' ? 'Accounts' : 'Contacts'))) return refuse()
+    for (const [link, desired] of [['accounts', accounts], ['contacts', contacts]] as const) {
+      if (!same(sharedNativeIds(related.filter(entry => entry.linkFieldName === link).map(entry => entry.relatedBeanId)), desired)) return refuse()
+    }
+    const deadline = AbortSignal.timeout(20_000)
+    const response = object(await request('/Api/V8/custom/clawpilot-email-shared', { method: 'POST', signal: deadline, body: JSON.stringify({
+      version: 1, workspaceId: scope.workspaceId, pipelineId: scope.pipelineId, localId: record.localId,
+      projection: { suiteCrmId: record.suiteCrmId, attributes, accounts, contacts, contactAccounts, previousManaged,
+        expectedBeforeFingerprint: raw.expectedBeforeFingerprint },
+      sourceRevision: raw.sourceRevision,
+    }) }))
+    deadline.throwIfAborted()
+    exactKeys(response, ['version','suiteCrmId','globalId','snapshotFingerprint','accounts','contacts','contactAccounts'])
+    if (response.version !== 1 || response.suiteCrmId !== record.suiteCrmId || response.globalId !== attributes.global_id_c
+      || typeof response.snapshotFingerprint !== 'string' || !EXACT_HASH.test(response.snapshotFingerprint)
+      || !same(sharedNativeIds(response.accounts), accounts) || !same(sharedNativeIds(response.contacts), contacts)
+      || !same(sharedBindings(response.contactAccounts, accounts, contacts), contactAccounts)) return refuse()
+    return { version: 2, suiteCrmId: record.suiteCrmId, globalId: attributes.global_id_c, capturedAt: new Date().toISOString(),
+      snapshotFingerprint: response.snapshotFingerprint, accounts, contacts, contactAccounts,
+      sharedPublication: { version: 1, sourceRevision: raw.sourceRevision } }
+  } catch { return refuse() }
 }
 
 /** No permission writes. Unknown native policy/extra unmanaged links hold before content publication. */

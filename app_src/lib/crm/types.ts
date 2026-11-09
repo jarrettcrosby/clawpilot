@@ -1,4 +1,4 @@
-import type { SuiteCrmEmailProjection } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import type { SuiteCrmEmailProjection, SuiteCrmSharedEmailProjection } from '@/lib/crm/suiteCrmNativeEmailProjection'
 
 export const CRM_ENTITIES = [
   'organizations',
@@ -452,6 +452,7 @@ export type SuiteCrmOutboxRecord = {
   /** Existing Account only; never use the generic native create/upsert. */
   accountDescriptionPatch?: { previousDescription: string }
   emailProjection?: SuiteCrmEmailProjection
+  sharedEmailProjection?: SuiteCrmSharedEmailProjection
   currencyCode?: string
   productImage?: {
     referenceCode: string

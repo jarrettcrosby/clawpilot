@@ -60,6 +60,13 @@ assert.deepEqual(capture([null, 7, { name: 1, value: 'first@example.test' }, hea
 assert.deepEqual(capture({ from: 'first@example.test' }), { version: 1 })
 assert.deepEqual(project(capture([header('From', '"Alias Name" <alias@example.test>')])), { from_addr_name: 'Alias Name <alias@example.test>' })
 assert.deepEqual(project(capture([header('From', '"Last, First" <alias@example.test>')])), { from_addr_name: 'alias@example.test' }, 'SuiteCRM cleanEmails splits quoted commas: preserve exact address without inventing recipients')
+const stockEvidence=capture([header('From', "Pat O'Neil <sender@example.test>"),header('To','Recipient <to@example.test>')])
+assert.deepEqual(project(stockEvidence),{from_addr_name:"Pat O'Neil <sender@example.test>",to_addrs_names:'Recipient <to@example.test>'})
+assert.deepEqual(plain(headers.suiteCrmEmailAddressAttributes(stockEvidence,{stockNative:true})),
+  {from_addr_name:'sender@example.test',to_addrs_names:'Recipient <to@example.test>'})
+assert.equal(stockEvidence.from[0].displayName,"Pat O'Neil",'Shared projection must not rewrite retained Gmail evidence')
+assert.deepEqual(plain(headers.suiteCrmEmailAddressAttributes({version:1,from:[{address:'from@example.test',displayName:'é'.repeat(140)}]},
+  {stockNative:true})),{from_addr_name:'from@example.test'},'Stock From field uses a UTF-8 byte cap')
 assert.deepEqual(project(capture([header('To', 'First <first@example.test>,\r\n\tSecond <second@example.test>')])), { to_addrs_names: 'First <first@example.test>, Second <second@example.test>' })
 
 for (const invalid of [

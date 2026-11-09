@@ -40,7 +40,7 @@ const participants = load('app_src/lib/crm/participantEligibility.ts')
 const projection = load('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
 const names = ['activeCrmRecordSql', 'clean', 'nullable', 'uniqueUuidList', 'isoTimestamp',
   'reviewedEmailAudienceModeUnderControlWithClient', 'reviewedEmailAudienceWithClient',
-  'legacyReviewedEmailAudienceWithClient', 'reviewedEmailAudienceUnderNativeControlWithClient',
+  'legacyReviewedEmailAudienceWithClient', 'reviewedEmailAudienceUnderNativeControlWithClient', 'sharedSuiteCrmEmailScopeWithClient',
   'readReviewedGmailInteractionWithClient', 'reviewedGmailContentFingerprint',
   'prepareReviewedGmailInteractionWithClient', 'applyReviewedGmailInteractionWithClient',
   'stageReviewedGmailInteractionsInPostgres', 'stagedCrmSourceHash', 'stageCrmRecordWithClient',
@@ -55,6 +55,7 @@ const compiled = ts.transpileModule(source, {
 }).outputText
 const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const pipeline = id(1), workspace = id(2), mailbox = id(3), sourceId = id(4), localId = id(5), cacheId = id(6)
+const sharedPipelineId = '587c8746-ecf6-40ae-8c50-e456f99ad555', sharedWorkspaceId = 'c6c49765-9bf6-4223-9261-7553499f5d92'
 const owner = 'owner@example.test', memberEmail = 'reader@example.test'
 const companies = [{ id: id(10), reference_code: 'ga1234567', active: true },
   { id: id(11), reference_code: 'ga2345678', active: true }]
@@ -69,7 +70,10 @@ const rootReader = () => ({ pipeline_id: pipeline, workspace_id: workspace, gran
   email: 'root-employee@example.test', suitecrm_user_id: 'native-root', native_identity_count: 1,
   source_fingerprint: 'a'.repeat(64), registry_fingerprint: 'b'.repeat(64), allowed: true })
 
-function harness({ enabled = true, appOnly = true } = {}) {
+function harness({ enabled = true, appOnly = true, shared = false, priorSnapshot = null } = {}) {
+  const pipeline = shared ? sharedPipelineId : id(1), workspace = shared ? sharedWorkspaceId : id(2)
+  const env = shared ? { CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID: workspace,
+    CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID: pipeline } : {}
   const evidence = identity.normalizeGmailMessageEvidence({ externalMessageId: 'd1', externalThreadId: 'thread-d1',
     senderEmail: contacts[1].email, recipientEmails: [owner, contacts[0].email], subject: 'Reviewed customer email',
     receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Known snippet', bodyText: 'Known full body', markerReferences: [],
@@ -87,6 +91,10 @@ function harness({ enabled = true, appOnly = true } = {}) {
     if (sql === controlSql) { state.controlHeld = true; return { rows: [{ singleton: true }] } }
     assert.equal(state.controlHeld, true, 'Authority/source reads occur after the transaction-entry control lock')
     if (sql === modeSql) return { rows: [{ enabled: state.enabled }] }
+    if (sql.includes('SELECT 1 FROM crm_native_email_publication_control')) return { rows: [{}] }
+    if (sql.includes('p.id=$1::uuid AND w.id=$2::uuid')) {
+      assert.deepEqual(copy(params),[pipeline,workspace]); return { rows:[{}] }
+    }
     if (sql.startsWith('SELECT pg_advisory_xact_lock')) return { rows: [] }
     if (sql.includes('connection.connection_id, connection.account_email')) return { rows: [{ id: pipeline,
       workspace_organization_id: workspace, owner_email: owner, connection_id: 'selected-connection', account_email: owner }] }
@@ -120,7 +128,11 @@ function harness({ enabled = true, appOnly = true } = {}) {
     if (sql.includes('SELECT COALESCE(wo.is_demo')) return { rows: [{ is_demo: false }] }
     if (sql.includes("SELECT message.raw_metadata->'emailAddressHeaders'")) return { rows: [{ email_address_headers: evidence.emailAddressHeaders }] }
     if (sql.includes('SELECT contact.suitecrm_id AS contact_id')) return { rows: contacts.map((contact, index) => ({ contact_id: `native-contact-${index}`, account_id: `native-company-${index}` })) }
-    if (sql.startsWith("SELECT metadata->'suiteCrmEmailProjection'")) return { rows: [] }
+    if (sql.startsWith("SELECT metadata->'suiteCrmEmailProjection'")) return { rows: priorSnapshot ? [{ receipt: {
+      version:2,suiteCrmId:state.row.suitecrm_id,globalId:state.row.reference_code,capturedAt:'2026-11-09T20:15:01.234Z',
+      accounts:['native-company-0','native-company-1'],contacts:['native-contact-0','native-contact-1'],contactAccounts:[],
+      snapshotFingerprint:priorSnapshot,sharedRepair:{version:1,kind:'created',receiptDigest:'0'.repeat(64),projectionFingerprint:'1'.repeat(64)},
+    } }] : [] }
     if (sql.includes('INSERT INTO sync_outbox')) {
       state.writes.push('outbox'); state.outbox.push(JSON.parse(params[2])); return { rows: [{ idempotency_key: params[3] }] }
     }
@@ -136,6 +148,7 @@ function harness({ enabled = true, appOnly = true } = {}) {
     throw new Error(`Unexpected synthetic SQL: ${sql}`)
   } }
   const runtime = { exports: {}, Buffer, ...identity, ...caseyPolicy, ...stable, ...headers, ...participants, ...projection,
+    process:{env},sharedSuiteCrmEmailScope: id=>projection.sharedSuiteCrmEmailScope(id,env),
     requireNativeEmail: (condition, code) => { if (!condition) throw new Error(code) },
     crmSourceHash: value => {
       if (value?.audience) state.audiences.push(copy(value.audience))
@@ -236,6 +249,37 @@ test('disabled reviewed mode keeps its strict legacy audience and excludes inher
   await h.apply(preview.targetFingerprint)
   assert.deepEqual(h.state.outbox[0].emailProjection.audience.allowedSuiteCrmUserIds, ['native-owner', 'native-reader'])
   assert.deepEqual(h.state.decisions[0], h.state.outbox[0].emailProjection.audience)
+})
+
+test('BPO shared review preserves both companies and App-only readers do not require SuiteCRM identities', async () => {
+  const priorSnapshot='d'.repeat(64), h=harness({enabled:false,shared:true,priorSnapshot}), [before]=await h.preview()
+  h.state.readers.push(principal('another-app-only@example.test', null))
+  assert.equal((await h.preview())[0].targetFingerprint,before.targetFingerprint)
+  assert.equal((await h.apply(before.targetFingerprint))[0].applied,true)
+  const outbox=h.state.outbox[0]
+  assert.equal(Object.hasOwn(outbox,'emailProjection'),false)
+  assert.equal(outbox.sharedEmailProjection.workspaceId,sharedWorkspaceId)
+  assert.deepEqual(outbox.sharedEmailProjection.accounts,['native-company-0','native-company-1'])
+  assert.deepEqual(outbox.sharedEmailProjection.contacts,['native-contact-0','native-contact-1'])
+  assert.equal(outbox.sharedEmailProjection.expectedBeforeFingerprint,priorSnapshot,'Retains the exact receipt from the terminal-job repair')
+  assert.deepEqual(h.state.decisions[0],{policy:'suitecrm-shared-login',workspaceId:sharedWorkspaceId,pipelineId:sharedPipelineId})
+  assert.ok(h.state.queries.every(sql=>!sql.includes('owner_user.suitecrm_user_id AS owner_native_id')
+    && !sql.startsWith('SELECT app_user.suitecrm_user_id')))
+})
+
+test('shared review does not broaden either exact historical recovery batch', async () => {
+  const h=harness({enabled:false,shared:true})
+  const legacy=['1a17e730c78d319c','1a17f5004f29592c','1a17f5d46a224e0a']
+  const casey=caseyPolicy.CASEY_PAIR
+  const selected=(providerMessageId,extra)=>({ownerEmail:casey.ownerEmail,connectionId:casey.connectionId,pipelineId:sharedPipelineId,providerMessageId,...extra})
+  await assert.rejects(h.api.stageReviewedGmailInteractionsInPostgres({messages:[
+    ...legacy.map(id=>selected(id,{})),...casey.messageIds.map(id=>selected(id,{admissionScope:caseyPolicy.CASEY_FIRST_SEEN_SCOPE,firstSeenLabelIds:[]})),
+  ]}),/exact separately reviewed two-message scope/)
+  await assert.rejects(h.api.stageReviewedGmailInteractionsInPostgres({messages:[
+    ...legacy.slice(0,2).map(id=>selected(id,{legacyAdoption:{kind:'reviewed-legacy-adoption-v1'}})),
+    selected('unreviewed-extra',{legacyAdoption:{kind:'reviewed-legacy-adoption-v1'}}),
+  ]}),/limited to the three selected messages/)
+  assert.deepEqual(h.state.queries,[])
 })
 
 test('audience dispatch requires an explicit mode and never acquires control implicitly', async () => {
