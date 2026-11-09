@@ -20,6 +20,8 @@ const work=load('app_src/lib/crm/nativeEmailPublicationWorkContext.ts',{'./nativ
 const transport=load('app_src/lib/crm/nativeEmailPublicationTransport.ts',{'./nativeEmailPublication':protocol})
 const releaseApproval=load('app_src/lib/crm/legacyEmailRecoveryReleaseApproval.ts',{'server-only':{},'node:crypto':crypto,
   'node:util':util,'./nativeEmailPublication':protocol})
+const heldRecoveryApproval=load('app_src/lib/crm/legacyHeldEmailRecoveryApproval.ts',{'server-only':{},'node:crypto':crypto,
+  'node:util':util,'./nativeEmailPublication':protocol})
 const dispatchPermit=load('app_src/lib/crm/nativeEmailRecoveryDispatchPermit.ts',{'server-only':{},'node:crypto':crypto,
   'node:util':util,'./nativeEmailPublication':protocol})
 const maintenanceOperator=load('app_src/lib/crm/nativeEmailRecoveryMaintenanceOperator.ts',{'server-only':{},
@@ -147,6 +149,7 @@ try {
     '../crm/nativeEmailPublicationWorkContext':work,'../crm/nativeEmailPublicationTransport':transport,
     '../crm/nativeEmailCapabilityContract':capabilityApi,
     '../crm/nativeEmailAuthorityTransition':authorityApi,'../crm/legacyEmailRecoveryReleaseApproval':releaseApproval,
+    '../crm/legacyHeldEmailRecoveryApproval':heldRecoveryApproval,
     '../crm/nativeEmailRecoveryDispatchPermit':dispatchPermit,
   })
   const adapter=adapterApi.createPostgresNativeEmailWorkerPersistence({maxAttempts:8})

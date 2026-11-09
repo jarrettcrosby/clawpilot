@@ -3,6 +3,7 @@
 // authorization, runtime deployment, native receipt fidelity or migration proof.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
+import * as util from 'node:util'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 const require=createRequire(new URL('../app_src/package.json',import.meta.url)),ts=require('typescript')
@@ -14,6 +15,8 @@ function load(path,deps){
   return module.exports
 }
 const protocol=load('app_src/lib/crm/nativeEmailPublication.ts',{'node:crypto':crypto})
+const heldRecoveryApproval=load('app_src/lib/crm/legacyHeldEmailRecoveryApproval.ts',{'server-only':{},'node:crypto':crypto,
+  'node:util':util,'./nativeEmailPublication':protocol})
 const capability=load('app_src/lib/crm/nativeEmailCapabilityContract.ts',{'node:crypto':crypto,'./nativeEmailPublication':protocol})
 const authority=load('app_src/lib/crm/nativeEmailAuthorityTransition.ts',{'./nativeEmailPublication':protocol,'./nativeEmailCapabilityContract':capability,
   './suiteCrmNativeEmailProjection':load('app_src/lib/crm/suiteCrmNativeEmailProjection.ts',{'node:crypto':crypto})})
@@ -261,6 +264,7 @@ await check('actual adapter transition mode fails closed and candidate rechecks 
     '../crm/nativeEmailPublicationPostgres':{PostgresNativeEmailPublicationStore:class{}},
     '../crm/nativeEmailPublicationWorkContext':{},'../crm/nativeEmailPublicationTransport':{},
     '../crm/legacyEmailRecoveryReleaseApproval':{},
+    '../crm/legacyHeldEmailRecoveryApproval':heldRecoveryApproval,
     '../crm/nativeEmailRecoveryDispatchPermit':{},
   })
   const adapter=adapterApi.createPostgresNativeEmailWorkerPersistence()
