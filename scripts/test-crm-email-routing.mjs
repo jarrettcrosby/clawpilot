@@ -1147,12 +1147,30 @@ await check('reviewed preview and apply reject mismatched provider identity, thr
   }
 })
 
+await check('reviewed Gmail preview survives read-state and provider history changes without changing the selected activity', async () => {
+  for (const change of ['history-id', 'label-order', 'read-status']) {
+    const fixture = await reviewedFixture({ rawOptions: { labels: ['UNREAD', 'INBOX'] } })
+    fixture.raw.historyId = '101'
+    const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
+    if (change === 'history-id') fixture.raw.historyId = '102'
+    if (change === 'label-order') fixture.raw.labelIds.reverse()
+    if (change === 'read-status') fixture.raw.labelIds = ['INBOX']
+    const result = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ apply: true, expectedDigest: preview.digest }))
+    assert.equal(result.digest, preview.digest, change)
+    assert.equal(result.interactions, 1, change)
+    assert.equal(result.links, 4, change)
+    assert.equal(fixture.h.reviewedStages[0].fields.direction, 'inbound', change)
+  }
+})
+
 await check('reviewed apply rechecks raw content, Contact email/account, membership and selected connection before staging', async () => {
-  for (const change of ['body', 'raw-header', 'contact-email', 'contact-account', 'account-reference', 'membership', 'connection', 'mailbox-account']) {
+  for (const change of ['body', 'raw-header', 'sent-label', 'trash-label', 'contact-email', 'contact-account', 'account-reference', 'membership', 'connection', 'mailbox-account']) {
     const fixture = await reviewedFixture()
     const preview = await fixture.h.ingestion.reconcileGmailMessages(fixture.selection())
     if (change === 'body') fixture.raw.payload.body.data = Buffer.from('Changed reviewed content').toString('base64url')
     if (change === 'raw-header') fixture.raw.payload.headers.push(header('Reply-To', 'changed@example.test'))
+    if (change === 'sent-label') fixture.raw.labelIds = ['SENT']
+    if (change === 'trash-label') fixture.raw.labelIds = ['TRASH']
     if (change === 'contact-email') fixture.partner.email = 'changed@example.test'
     if (change === 'contact-account') fixture.partner.organizationId = customerOrganization
     if (change === 'account-reference') fixture.organizations[1].referenceCode = 'ga3456789'
@@ -1160,7 +1178,7 @@ await check('reviewed apply rechecks raw content, Contact email/account, members
     if (change === 'connection') fixture.selectedMailboxes[0].connection_id = 'changed-connection'
     if (change === 'mailbox-account') fixture.selectedMailboxes[0].account_email = 'renamed@example.test'
     await assert.rejects(fixture.h.ingestion.reconcileGmailMessages(fixture.selection({ apply: true, expectedDigest: preview.digest })),
-      /changed after preview|unambiguous current participants|unavailable|not active|Retained Gmail content|does not match the selected account/, change)
+      /changed after preview|unambiguous current participants|unavailable|not active|not eligible|Retained Gmail content|does not match the selected account/, change)
     assert.equal(fixture.h.reviewedBatches.some(batch => batch.apply), false, change)
     assert.equal(fixture.h.reviewedStages.length, 0, change)
     assert.equal(fixture.h.audits.length, 0, change)
@@ -1388,8 +1406,13 @@ const CASEY_PRODUCER = { owner: 'jarrett@suburbiasandwichco.com', connection: 'e
     { id: '1a18e03ea586cd7e', cacheId: '756e4e17-2458-470b-b00c-129c85ee821a' },
     { id: '1a18f01749eb87a6', cacheId: '78a5b2cc-ba50-4a71-a17c-adaf0c1041c2' },
   ] }
-function caseyProducerFixture({ firstSeen = false, subjectId } = {}) {
-  const pins = CASEY_PRODUCER, account = firstSeen ? 'jarrett@bposupplychain.com' : 'synthetic-casey-mailbox@example.invalid'
+const HISTORICAL_TRIO_PRODUCER = { ...CASEY_PRODUCER, messages: ['1a17e730c78d319c', '1a17f5004f29592c', '1a17f5d46a224e0a'].map((id, index) => ({
+  id, cacheId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+})) }
+function caseyProducerFixture({ firstSeen = false, historicalTrio = false, subjectId } = {}) {
+  assert.ok(!(firstSeen && historicalTrio), 'The historical trio is not a first-seen admission')
+  const pins = historicalTrio ? HISTORICAL_TRIO_PRODUCER : CASEY_PRODUCER
+  const account = firstSeen ? 'jarrett@bposupplychain.com' : 'synthetic-casey-mailbox@example.invalid'
   const identity = { ...mailboxIdentity, providerAccountId: subjectId || (firstSeen ? fixtureCaseyProviderSubject : 'synthetic-casey-google-subject'), accountEmail: account,
     verifiedConnectionId: pins.connection }
   const contacts = [{ ...fixtureContact('gc7654321', firstSeen ? 'jcook@globusmedical.com' : 'adrian@globus.example.invalid', pins.pipeline, customerOrganization), name: 'Fixture customer contact' },
@@ -1417,9 +1440,32 @@ function caseyProducerFixture({ firstSeen = false, subjectId } = {}) {
     primaryOrganizationReference: 'gagmco24va588e', contactReferences: contacts.map(contact => contact.referenceCode).sort() }))
   const selection = overrides => ({ ownerEmail: pins.owner, connectionId: pins.connection, pipelineId: pins.pipeline,
     messageIds: pins.messages.map(row => row.id), reviewedAssociations: associations, decisionKind: 'review',
-    admissionScope: firstSeen ? 'casey-reviewed-two-first-seen-v1' : 'casey-reviewed-two-v1', ...overrides })
+    ...(historicalTrio ? {} : { admissionScope: firstSeen ? 'casey-reviewed-two-first-seen-v1' : 'casey-reviewed-two-v1' }), ...overrides })
   return { h, pins, identity, contacts, organizations, activePipelines, selectedMailboxes, raws, associations, selection }
 }
+
+await check('exact historical trio and retained Casey pair tolerate Gmail read-state drift in separate reviewed batches', async () => {
+  for (const historicalTrio of [true, false]) {
+    const f = caseyProducerFixture({ historicalTrio })
+    f.raws[0].labelIds = ['UNREAD', 'INBOX']
+    f.raws[0].historyId = '101'
+    const preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
+    assert.equal(preview.messages.length, historicalTrio ? 3 : 2)
+    assert.equal(f.h.reviewedStages.length, 0)
+    f.raws[0].labelIds = ['INBOX']
+    f.raws[0].historyId = '102'
+    const approved = f.selection({ apply: true, expectedDigest: preview.digest })
+    const applied = await f.h.ingestion.reconcileGmailMessages(approved)
+    assert.equal(applied.interactions, historicalTrio ? 3 : 2)
+    assert.deepEqual(f.h.reviewedBatches.find(batch => batch.apply).messages.map(message => message.providerMessageId), f.pins.messages.map(row => row.id))
+    assert.ok(f.h.reviewedBatches.find(batch => batch.apply).messages.every(message => message.legacyAdoption.kind === (historicalTrio
+      ? 'bounded-legacy-adoption' : 'reviewed-casey-two-adoption-v1')))
+    const replay = await f.h.ingestion.reconcileGmailMessages(approved)
+    assert.equal(replay.interactions, 0)
+    assert.equal(replay.links, 0)
+    assert.equal(f.h.reviewedStages.length, historicalTrio ? 3 : 2)
+  }
+})
 
 await check('first-seen Casey discovery and preview use only the pinned verified mailbox and direct two-ID GETs', async () => {
   const f = caseyProducerFixture({ firstSeen: true })
