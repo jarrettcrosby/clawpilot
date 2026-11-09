@@ -16,6 +16,10 @@ final class ClawPilotNativeEmailRuntime
      * This profile is never accepted by the publisher/authority runtime. */
     public static function attestInitialSource(mysqli $db): string
     {return self::attestProfile($db,'initial_source');}
+    /** The ordinary, unmodified SuiteCRM login boundary. This is not an
+     * enrollment stage and does not enable the managed role or write scope. */
+    public static function attestSharedLoginSource(mysqli $db): string
+    {return self::attestProfile($db,'shared_login_source');}
     /** Actual installed-but-not-enrolled state. The config journal must have
      * enabled managed writes while traffic remains stopped; SQL defaults are
      * still the exact original ALL rows. This is not the old source profile. */
@@ -29,7 +33,7 @@ final class ClawPilotNativeEmailRuntime
     {
         global $sugar_config;
         self::requireTrue(is_bool($sugar_config['clawpilot_managed_email_write_scope']??false),'managed_write_scope_config');
-        self::requireTrue(in_array($stage,['ordinary','initial_source','initial_installed'],true)
+        self::requireTrue(in_array($stage,['ordinary','initial_source','initial_installed','shared_login_source'],true)
             && (!$projectAfter || $stage==='initial_installed'),'unknown_initial_runtime_stage');
         if($stage!=='ordinary')self::requireTrue(($sugar_config['clawpilot_managed_email_write_scope']??false)
             ===($stage==='initial_installed'),'initial_managed_write_stage');
@@ -101,8 +105,10 @@ final class ClawPilotNativeEmailRuntime
         'modules/AOP_Case_Updates/util.php' => '77eabac1a935f33924f08ac69ab6c4066e9786a733fdee2fb5afed602e5684d7',
     ];
     foreach ($pins as $path => $hash) self::requireTrue(hash_equals($hash, hash_file('sha256', $path)), 'Unreviewed native source: '.$path);
-    $pins += $stage==='initial_source'?clawpilot_native_scope_input_hashes():clawpilot_native_scope_output_hashes();
-    if($stage==='initial_source')self::requireTrue(!file_exists('custom/ClawPilotNativeEmailScope.php'),'initial_source_helper_present');
+    $stockSource=in_array($stage,['initial_source','shared_login_source'],true);
+    $pins += $stockSource?clawpilot_native_scope_input_hashes():clawpilot_native_scope_output_hashes();
+    if($stockSource)self::requireTrue(!file_exists('custom/ClawPilotNativeEmailScope.php')&&!is_link('custom/ClawPilotNativeEmailScope.php'),
+        $stage==='initial_source'?'initial_source_helper_present':'shared_login_scope_helper_present');
     else $pins['custom/ClawPilotNativeEmailScope.php'] = 'ba26057190771c47cf18c829cf5fef09f93d6dde071b4856c62ca943704059a7';
     foreach ($pins as $path => $hash) self::requireTrue(is_file($path) && !is_link($path) && hash_equals($hash, hash_file('sha256', $path)), 'runtime_changed:'.$path);
     require_once 'data/Relationships/SugarRelationship.php';

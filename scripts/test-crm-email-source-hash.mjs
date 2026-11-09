@@ -12,7 +12,7 @@ const authorityHelperSource = readFileSync(new URL('../app_src/lib/persistence/c
 const ast = ts.createSourceFile('crm.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 // Execute the real hash, staging and completion functions. SQL and adjacent
 // normalization/provider helpers are synthetic; this is not database acceptance.
-const functions = ['activeCrmRecordSql', 'stagedCrmSourceHash', 'stageCrmRecordWithClient', 'completeSuiteCrmOutboxInPostgres',
+const functions = ['activeCrmRecordSql', 'stagedCrmSourceHash', 'stageCrmRecordWithClient', 'completeSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInTransaction',
   'reviewedEmailAudienceModeUnderControlWithClient',
   'lockNativeEmailPublicationModeWithClient', 'nativeEmailOutboxTouchesEmail', 'nativeEmailOutboxUnresolvedGuardSql']
   .map(name => {

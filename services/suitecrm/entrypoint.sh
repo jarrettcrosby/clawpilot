@@ -21,6 +21,10 @@ cd /
 # Observe retained offline journals before URL config, OAuth/bootstrap or cache
 # writers can run. Never auto-apply a patch/package or release an initial hold.
 CLAWPILOT_NATIVE_RUNTIME_MODE="$(php /opt/clawpilot/native-email-startup-check.php)"
+if [[ "${CLAWPILOT_SHARED_BPO_EMAIL_ENABLED:-}" == "1" ]]; then
+  [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == "legacy" ]] || { echo '[suitecrm] shared Email worker requires stock startup' >&2; exit 1; }
+  [[ "${CLAWPILOT_SHARED_BPO_EMAIL_TEMPLATES:-}" =~ ^[01]$ ]] || { echo '[suitecrm] shared Email worker requires the reviewed template-table setting' >&2; exit 1; }
+fi
 case "$CLAWPILOT_NATIVE_RUNTIME_MODE" in
   enrolled)
     # The fixed root startup verifier already checked immutable Apache bytes,
@@ -222,6 +226,9 @@ fi
 if [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == "legacy" ]]; then
   if [[ "${CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED:-}" == "1" ]]; then
     su -s /bin/bash www-data -c "php /opt/clawpilot/install-record-lifecycle.php --apply '$APP_ROOT/public/legacy'"
+  fi
+  if [[ "${CLAWPILOT_SHARED_BPO_EMAIL_ENABLED:-}" == "1" ]]; then
+    su -s /bin/bash www-data -c "php /opt/clawpilot/install-shared-email-worker.php '$APP_ROOT/public/legacy'"
   fi
 fi
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"

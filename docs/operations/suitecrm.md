@@ -14,6 +14,9 @@ app_visible: false
 See [CRM record deletion synchronization](crm-record-deletion.md) for scoped
 Account/Contact Trash actions, native deletion inspection, and activation.
 
+See the draft [BPO shared-email repair runbook](bpo-shared-suitecrm-email-repair.md)
+for the scoped Gmail recovery and standard SuiteCRM readership release checks.
+
 ### Combining deletion sync with native Email enrollment
 
 Select `CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED=1` on SuiteCRM **before**
