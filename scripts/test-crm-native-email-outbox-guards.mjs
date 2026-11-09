@@ -12,7 +12,7 @@ const ast = ts.createSourceFile('crm.ts', source, ts.ScriptTarget.Latest, true, 
 const names = ['activeCrmRecordSql', 'nativeEmailOutboxUnresolvedGuardSql', 'lockNativeEmailPublicationModeWithClient',
   'nativeEmailOutboxTouchesEmail', 'claimSuiteCrmOutboxInPostgres', 'tableForAggregate',
   'mayDispatchSuiteCrmUserIdentityInPostgres',
-  'failSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInPostgres', 'enqueueSuiteCrmRecord']
+  'failSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInTransaction', 'enqueueSuiteCrmRecord']
 const functions = names.map(name => {
   const node = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name && node.body)
   assert.ok(node, `Real ${name} must exist`)

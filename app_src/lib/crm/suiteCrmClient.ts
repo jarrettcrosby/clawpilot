@@ -8,7 +8,9 @@ import {
 import { appPublicUrl } from '@/lib/publicUrl'
 import {
   projectSuiteCrmNativeEmail,
+  projectSuiteCrmSharedEmail,
   type SuiteCrmEmailProjectionReadback,
+  type SuiteCrmSharedEmailProjectionReadback,
 } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import { nativeEmailPublicationBridge, verifyNativeEmailPreparation } from '@/lib/crm/nativeEmailPublicationTransport'
 import type { NativeEmailCommand } from '@/lib/crm/nativeEmailPublication'
@@ -438,7 +440,7 @@ export type SuiteCrmUpsertResult = {
   suiteCrmId: string
   productImageProjection: SuiteCrmNativeProductImageResult | null
   meetingProjection?: SuiteCrmMeetingProjectionReadback
-  emailProjection?: SuiteCrmEmailProjectionReadback
+  emailProjection?: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback
 }
 
 export type SuiteCrmMeetingProjectionAttributes = {
@@ -560,6 +562,12 @@ export async function upsertSuiteCrmRecordWithResult(
     throw new Error('SuiteCRM Account description patches require their dedicated outbox operation')
   }
   const moduleName = suiteCrmRecordModule(record)
+  if (record.sharedEmailProjection !== undefined) {
+    if (moduleName !== 'Emails' || record.entity !== 'interactions') throw new Error('Shared SuiteCRM Email projection scope changed')
+    const emailProjection = await projectSuiteCrmSharedEmail(record,
+      (path, init) => request(path, init, fetchImpl))
+    return { suiteCrmId: emailProjection.suiteCrmId, productImageProjection: null, emailProjection }
+  }
   if (moduleName === 'Emails') {
     const emailProjection = await projectSuiteCrmNativeEmail(record,
       (path, init, allowNotFound) => request(path, init, fetchImpl, allowNotFound))

@@ -41,11 +41,13 @@ COPY bootstrap-global-id.php /opt/clawpilot/bootstrap-global-id.php
 COPY install-email-search.php /opt/clawpilot/install-email-search.php
 COPY email-search /opt/clawpilot/email-search
 COPY install-email-audience.php /opt/clawpilot/install-email-audience.php
+COPY install-shared-email-worker.php /opt/clawpilot/install-shared-email-worker.php
 COPY email-audience /opt/clawpilot/email-audience
 COPY install-native-email-scope.php install-native-email-runtime.php native-email-startup-check.php /opt/clawpilot/
 COPY install-native-email-initial-state.php native-email-initial-cli.php native-email-initial-install-profile.json /opt/clawpilot/
 COPY native-email-initial-artifacts.php native-email-enrolled-startup.php /opt/clawpilot/
 COPY native-email-recovery-cli.php /opt/clawpilot/native-email-recovery-cli.php
+COPY native-email-shared-repair-cli.php /opt/clawpilot/native-email-shared-repair-cli.php
 COPY native-email-maintenance.py native-email-liveness.json /opt/clawpilot/
 COPY native-email-scope /opt/clawpilot/native-email-scope
 COPY install-record-lifecycle.php /opt/clawpilot/install-record-lifecycle.php

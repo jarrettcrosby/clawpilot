@@ -9,7 +9,7 @@ import {
 import type {
   SuiteCrmNativeProductImageResult,
 } from '@/lib/crm/suiteCrmNativeProductImageClient'
-import { SuiteCrmEmailProjectionHeldError, type SuiteCrmEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
+import { SuiteCrmEmailProjectionHeldError, type SuiteCrmEmailProjectionReadback, type SuiteCrmSharedEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import {
   claimSuiteCrmOutboxInPostgres,
   completeSuiteCrmOutboxInPostgres,
@@ -64,7 +64,8 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       nativeEmailHandled = false
       let productImageProjection: SuiteCrmNativeProductImageResult | null = null
       let meetingProjection: SuiteCrmMeetingProjectionReadback | null = null
-      let emailProjection: SuiteCrmEmailProjectionReadback | null = null
+      let emailProjection: SuiteCrmEmailProjectionReadback | SuiteCrmSharedEmailProjectionReadback | null = null
+      let sharedCompleted = false
       if (item.operation === 'upsert_user_identity') {
         // Recheck a previously claimed identity at dispatch. It must never
         // mutate the native policy behind the authority/publication protocol.
@@ -107,8 +108,10 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
       else {
         const payload = item.payload
         const projection = payload.suiteCrmModule === 'Emails'
-          ? await withVerifiedSuiteCrmEmailPublication(item, () => upsertSuiteCrmRecordWithResult(payload))
+          ? await withVerifiedSuiteCrmEmailPublication(item, () => upsertSuiteCrmRecordWithResult(payload),
+            payload.sharedEmailProjection === undefined ? undefined : result => ({ emailProjection: result.emailProjection }))
           : await withVerifiedSuiteCrmRecordLifecycle(item, () => upsertSuiteCrmRecordWithResult(payload))
+        sharedCompleted = payload.suiteCrmModule === 'Emails' && payload.sharedEmailProjection !== undefined
         productImageProjection = projection.productImageProjection
         meetingProjection = projection.meetingProjection || null
         emailProjection = projection.emailProjection || null
@@ -117,11 +120,13 @@ export async function processSuiteCrmOutbox(input: { limit?: number; maxAttempts
         && item.payload.suiteCrmModule === 'Emails' && !emailProjection) {
         throw new SuiteCrmEmailProjectionHeldError()
       }
-      await completeSuiteCrmOutboxInPostgres(item, {
-        productImageProjection,
-        ...(meetingProjection ? { meetingProjection } : {}),
-        ...(emailProjection ? { emailProjection } : {}),
-      })
+      if (!sharedCompleted) {
+        await completeSuiteCrmOutboxInPostgres(item, {
+          productImageProjection,
+          ...(meetingProjection ? { meetingProjection } : {}),
+          ...(emailProjection ? { emailProjection } : {}),
+        })
+      }
       if (item.operation !== 'upsert_user_identity') projectedPipelines.set(item.payload.pipelineId, item.id)
       results.push({ id: item.id, status: 'succeeded' })
     } catch (error) {
