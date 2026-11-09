@@ -101,9 +101,128 @@ final class ClawPilotNativeEmailProjection
 
     public static function upsert(mysqli $db, ClawPilotNativeEmailTransaction $transaction, array $command): array
     {
+        return self::upsertInternal($db,$transaction,$command,false);
+    }
+
+    /** Recovery creates only. One transaction owns absence, Email, links and
+     * the receipt. No role, group, ACL, account or contact is edited. This is
+     * not registered on a public route; only a private caller may verify a
+     * permit using independently observed origin/release and login pins. */
+    public static function createShared(mysqli $db, array $databaseProfile, array $command,
+        ClawPilotSharedBpoEmailCreatePermit $permit, array $trustedScope, bool $expectEmailTemplates): array
+    {
+        require_once __DIR__.'/SharedBpoEmailReceipt.php';
+        require_once __DIR__.'/SharedBpoEmailNativeAbsence.php';
+        $transaction=ClawPilotNativeEmailTransaction::begin($db,$databaseProfile);
+        try {
+            $command=self::validate($command);
+            $policyState=self::sharedLoginPolicyState($db,$transaction);
+            self::need(hash_equals($policyState,(string)($trustedScope['policyStateFingerprint']??'')), 'shared_login_policy_changed');
+            $permit->assertCurrent($trustedScope,$command,self::sharedClock($db));
+            $receipt=ClawPilotSharedBpoEmailReceipt::lock($db,$transaction,$permit);
+            if($receipt!==null){
+                $before=self::snapshot($db,$transaction,$command['suiteCrmId']);
+                $id=$command['suiteCrmId'];$globalId=$command['attributes']['global_id_c'];
+                self::need($before['exists']&&hash_equals($receipt['snapshot_fingerprint'],$before['fingerprint'])
+                    && self::rows($db,'SELECT id_c,global_id_c FROM emails_cstm FORCE INDEX (PRIMARY) WHERE global_id_c=? ORDER BY id_c FOR UPDATE',
+                        [$globalId],2)===[['id_c'=>$id,'global_id_c'=>$globalId]], 'shared_receipt_projection_changed');
+                ClawPilotSharedBpoEmailNativeAbsence::assertNoExtraSidecars($db,$transaction,$id,$expectEmailTemplates);
+                $transaction->rollback();
+                return $receipt;
+            }
+            ClawPilotSharedBpoEmailNativeAbsence::assertAbsent($db,$transaction,$command['suiteCrmId'],
+                $command['attributes']['global_id_c'],$expectEmailTemplates);
+            $permit->assertCurrent($trustedScope,$command,self::sharedClock($db));
+            $result=self::upsertInternal($db,$transaction,$command,true);
+            ClawPilotSharedBpoEmailNativeAbsence::assertNoExtraSidecars($db,$transaction,$command['suiteCrmId'],$expectEmailTemplates);
+            $receipt=ClawPilotSharedBpoEmailReceipt::record($db,$transaction,$permit,$result['snapshotFingerprint']);
+            $permit->assertCurrent($trustedScope,$command,self::sharedClock($db));
+            $transaction->commit();
+            return $receipt;
+        } catch(Throwable $error){
+            try{$transaction->rollback();}catch(Throwable $ignored){}
+            throw $error;
+        }
+    }
+
+    /** Native policy lock is for observing drift, not for granting access. */
+    public static function sharedLoginPolicyState(mysqli $db, ClawPilotNativeEmailTransaction $transaction): string
+    {
+        self::connection($db,$transaction);
+        return self::digest(['clawpilot-shared-login-source-v1',$transaction->policyFingerprint(),
+            ClawPilotNativeEmailRuntime::attestSharedLoginSource($db)]);
+    }
+
+    /** Independent native observation for settlement. An exact existing copy
+     * can be reused without a create receipt. Unknown/different copies hold;
+     * no account, email, link, permission or receipt is written. */
+    public static function observeSharedExact(mysqli $db, array $databaseProfile, array $command,
+        string $expectedPolicyState, bool $expectEmailTemplates, ?string $nativeOriginFingerprint=null): array
+    {
+        require_once __DIR__.'/SharedBpoEmailNativeAbsence.php';
+        $command=self::validate($command);
+        self::need($command['expectedBeforeFingerprint']===null&&$command['previousManaged']===['accounts'=>[],'contacts'=>[]],
+            'shared_recovery_projection');
+        $transaction=ClawPilotNativeEmailTransaction::begin($db,$databaseProfile);
+        try {
+            $state=self::sharedLoginPolicyState($db,$transaction);
+            self::need(hash_equals($state,$expectedPolicyState),'shared_login_policy_changed');
+            $id=$command['suiteCrmId'];$expected=$command['attributes'];$globalId=$expected['global_id_c'];
+            $snapshot=self::snapshot($db,$transaction,$id);$raw=$snapshot['raw'];
+            self::need($snapshot['exists']&&self::rows($db,'SELECT id_c,global_id_c FROM emails_cstm FORCE INDEX (PRIMARY)
+                WHERE global_id_c=? ORDER BY id_c FOR UPDATE',[$globalId],2)===[['id_c'=>$id,'global_id_c'=>$globalId]],
+                'shared_existing_identity');
+            $actual=self::attributes($snapshot);
+            self::need($actual['deleted']==='0'&&(string)$raw['emails_text'][0]['deleted']==='0'
+                && (string)($raw['emails_text'][0]['raw_source']??'')===''&&$raw['emails_email_addr_rel']===[], 'shared_existing_sidecar');
+            $bean=BeanFactory::newBean('Emails');
+            self::need($bean instanceof Email&&get_class($bean)==='Email','unknown_email_bean');
+            $expected['date_sent_received']=self::utc($expected['date_sent_received']);
+            $expected['description_html']=self::derivedHtml($expected['description']);
+            foreach(self::HEADERS as $field=>$_)$expected[$field]=self::header($bean,$expected[$field]??'',$field);
+            self::need($expected['from_addr_name']!=='','from_header_unavailable');
+            foreach($expected as $field=>$value)self::need(($actual[$field]??null)===$value,'shared_existing_content_changed');
+            $links=self::links($raw['emails_beans']);
+            self::need($links===['accounts'=>$command['accounts'],'contacts'=>$command['contacts']]
+                && count($raw['emails_beans'])===count($links['accounts'])+count($links['contacts']), 'shared_existing_links_changed');
+            self::lockRelated($db,$command,$links);
+            ClawPilotSharedBpoEmailNativeAbsence::assertNoExtraSidecars($db,$transaction,$id,$expectEmailTemplates);
+            self::need(hash_equals($state,self::sharedLoginPolicyState($db,$transaction)),'shared_login_policy_changed');
+            $observedAt=self::rows($db,"SELECT DATE_FORMAT(UTC_TIMESTAMP(3),'%Y-%m-%dT%H:%i:%s.%fZ') AS observed_at",[],1)[0]['observed_at']??'';
+            self::need(is_string($observedAt)&&preg_match('/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}000Z\z/',$observedAt)===1,'shared_database_clock');
+            $proof=['nativeId'=>$id,'globalId'=>$globalId,'snapshotFingerprint'=>$snapshot['fingerprint'],
+                'observedAt'=>substr($observedAt,0,-4).'Z'];
+            if($nativeOriginFingerprint!==null){
+                require_once __DIR__.'/SharedBpoEmailReceipt.php';
+                $projectionFingerprint=ClawPilotNativeEmailAuthorityContract::digest($command);
+                $receipt=ClawPilotSharedBpoEmailReceipt::observe($db,$transaction,$nativeOriginFingerprint,$id,$globalId,
+                    $projectionFingerprint,$snapshot['fingerprint']);
+                $proof['projectionFingerprint']=$projectionFingerprint;
+                $proof['kind']=$receipt===null?'exact-existing':'created';
+                $proof['receiptFingerprint']=ClawPilotNativeEmailAuthorityContract::digest($receipt??[
+                    'clawpilot-shared-bpo-exact-existing-v1',$nativeOriginFingerprint,$id,$globalId,$projectionFingerprint,$snapshot['fingerprint']]);
+            }
+            $transaction->rollback();
+            return $proof;
+        }catch(Throwable $error){
+            try{$transaction->rollback();}catch(Throwable $ignored){}
+            throw $error;
+        }
+    }
+
+    private static function sharedClock(mysqli $db): int
+    {
+        $value=self::rows($db,'SELECT UNIX_TIMESTAMP() AS epoch',[],1)[0]['epoch']??null;
+        self::need(is_int($value)||(is_string($value)&&ctype_digit($value)), 'shared_database_clock');
+        return (int)$value;
+    }
+
+    private static function upsertInternal(mysqli $db, ClawPilotNativeEmailTransaction $transaction, array $command, bool $sharedLogin): array
+    {
         try {
             $command=self::validate($command); self::connection($db,$transaction);
-            $runtime=ClawPilotNativeEmailRuntime::attest($db);
+            if($sharedLogin)self::need($command['expectedBeforeFingerprint']===null,'shared_create_only');
+            $runtime=$sharedLogin?ClawPilotNativeEmailRuntime::attestSharedLoginSource($db):ClawPilotNativeEmailRuntime::attest($db);
             $before=self::snapshot($db,$transaction,$command['suiteCrmId']); $id=$command['suiteCrmId']; $attributes=$command['attributes'];
             $writer=$GLOBALS['current_user'] ?? null;
             self::need($writer instanceof User && $writer->isAdmin() && is_string($writer->id) && $writer->id !== '', 'native_writer_unproven');
@@ -149,10 +268,7 @@ final class ClawPilotNativeEmailProjection
             foreach (['from_addr','to_addrs','cc_addrs','bcc_addrs'] as $field) $email->{$field}='';
             $email->raw_source='';
             $plain=$attributes['description'];
-            $expectedHtml=from_html(SugarCleaner::cleanHtml(nl2br(SugarCleaner::cleanHtml($plain)),true));
-            self::need(is_string($expectedHtml) && from_html(SugarCleaner::cleanHtml($expectedHtml,true)) === $expectedHtml,
-                'unstable_native_html_normalization');
-            self::need($plain === '' || $expectedHtml !== '', 'empty_derived_html');
+            $expectedHtml=self::derivedHtml($plain);
             self::connection($db,$transaction);
             // Stock retrieve/save normalizes untouched NULL booleans and ID
             // columns. Its own DBManager update whitelist preserves those raw
@@ -194,7 +310,7 @@ final class ClawPilotNativeEmailProjection
             $links=self::links($after['raw']['emails_beans']);
             self::need($links === ['accounts'=>$command['accounts'],'contacts'=>$command['contacts']], 'native_relationship_readback_mismatch');
             self::need(self::lockRelated($db,$command,$current) === $related, 'contact_or_account_changed');
-            self::need(hash_equals($runtime,ClawPilotNativeEmailRuntime::attest($db)), 'runtime_changed_during_save');
+            self::need(hash_equals($runtime,$sharedLogin?ClawPilotNativeEmailRuntime::attestSharedLoginSource($db):ClawPilotNativeEmailRuntime::attest($db)), 'runtime_changed_during_save');
             self::connection($db,$transaction);
             // Source attributes are attached ONLY after raw database proof.
             return ['version'=>2,'suiteCrmId'=>$id,'attributes'=>$actual,'sourceAttributes'=>$attributes,
@@ -216,6 +332,13 @@ final class ClawPilotNativeEmailProjection
         foreach (['description','description_html'] as $field) $result[$field]=(string)($text[$field] ?? '');
         foreach (self::HEADERS as $field=>$column) $result[$field]=(string)($text[$column] ?? '');
         return $result;
+    }
+    private static function derivedHtml(string $plain): string
+    {
+        $expected=from_html(SugarCleaner::cleanHtml(nl2br(SugarCleaner::cleanHtml($plain)),true));
+        self::need(is_string($expected)&&from_html(SugarCleaner::cleanHtml($expected,true))===$expected,'unstable_native_html_normalization');
+        self::need($plain===''||$expected!=='','empty_derived_html');
+        return $expected;
     }
     private static function header(Email $email, string $value, string $field): string
     {

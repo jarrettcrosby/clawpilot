@@ -25,13 +25,15 @@ const options = Object.fromEntries(process.argv.slice(2).map(argument => {
   const scale=argument.match(/^--scale-email-count=(318|334)$/)
   if(scale)return ['scale-email-count',Number(scale[1])]
   if (argument === '--golden-only') return ['golden-only', true]
+  if (argument === '--shared-email-only') return ['shared-email-only', true]
   if (argument === '--remediation-candidate') return ['remediation-candidate', true]
   if (argument === '--require-authority-scale') return ['require-authority-scale', true]
   if (argument === '--app-postgres') return ['app-postgres', true]
-  throw new Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip [--runtime-php=8.3.35|8.3.36] [--output=/absolute/result.json] [--golden-only | --remediation-candidate [--scale-email-count=318|334] [--require-authority-scale] [--app-postgres]]')
+  throw new Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip [--runtime-php=8.3.35|8.3.36] [--output=/absolute/result.json] [--shared-email-only | --golden-only | --remediation-candidate [--scale-email-count=318|334] [--require-authority-scale] [--app-postgres]]')
 }))
 const runtimeProfile=nativeRuntimeFixtureProfile(options['runtime-php']),RUNTIME=runtimeProfile.image
 const scaleEmailCount=nativeFixtureScaleEmailCount(options['scale-email-count'])
+assert.ok(!(options['shared-email-only'] && (options['golden-only'] || options['remediation-candidate'])), 'Shared Email runs on a fresh stock install only')
 assert.ok(!(options['golden-only'] && options['remediation-candidate']), 'Remediation requires the complete unchanged baseline first')
 assert.ok(!options['require-authority-scale'] || options['remediation-candidate'], 'Scale release gate requires the full remediation candidate')
 assert.ok(!options['app-postgres'] || options['remediation-candidate'], 'Combined application/PostgreSQL proof requires the full native candidate')
@@ -90,6 +92,7 @@ const fixtureHashes = Object.fromEntries(readdirSync(fixture).filter(path => /\.
 const candidateFiles = [
   resolve('scripts/test-suitecrm-native-acceptance.mjs'),resolve('scripts/lib/native-runtime-fixture-profile.mjs'),
   ...readdirSync(verifier).filter(path => /\.(php|sql)$/.test(path)).sort().map(path => join(verifier, path)),
+  ...(options['shared-email-only'] ? [join(scopePackage, 'Patch.php')] : []),
   ...(options['remediation-candidate'] ? [scopeInstaller, scopeInstallerFixture,
     ...['app_src/lib/crm/nativeEmailAuthorityApproval.ts','app_src/lib/crm/nativeEmailAuthorityTransition.ts',
       'app_src/lib/crm/nativeEmailPublication.ts','app_src/lib/crm/nativeEmailPublicationTransport.ts','app_src/lib/crm/nativeEmailCapabilityContract.ts',
@@ -242,6 +245,8 @@ try {
     '--tmpfs', '/app:rw,nosuid,size=640m', '--tmpfs', '/tmp:rw,nosuid,size=32m',
     '--mount', `type=bind,source=${join(root, 'suitecrm')},target=/source/suitecrm,readonly`,
     '--mount', `type=bind,source=${fixture},target=/fixture,readonly`, '--mount', `type=bind,source=${verifier},target=/source/email-audience,readonly`,
+    ...(options['shared-email-only'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_SHARED_EMAIL_ONLY=1',
+      '--mount', `type=bind,source=${scopePackage},target=/source/native-email-scope,readonly`] : []),
     ...(options['remediation-candidate'] ? [
       '--mount', `type=bind,source=${join(root, 'authority-issuer.json')},target=/fixture-authority-issuer.json,readonly`,
       '--mount', `type=bind,source=${join(root, 'capability-contract.json')},target=/fixture-capability-contract.json,readonly`,
@@ -298,8 +303,12 @@ try {
   // Full output (including the synthetic wire receipt) remains in the private
   // result artifact. Console output is a compact stage-by-stage result only.
   process.stdout.write(output.split('\n').filter(line => /^(?:PASS |[A-Z_]+PASSED=)/.test(line)).join('\n') + '\n')
-  assert.match(output, /CLAWPILOT_NATIVE_EMAIL_GOLDEN=/, 'Actual native save/readback golden must execute')
-  if (!options['golden-only']) assert.match(output, /REAL_SUITECRM_ACCEPTANCE_PASSED=/, 'No mocked or partial run counts as native acceptance')
+  if (options['shared-email-only']) {
+    assert.match(output, /^NATIVE_SHARED_EMAIL_ACCEPTANCE_PASSED=1$/m, 'Stock write, relationship histories, permissions and retry must all pass')
+  } else {
+    assert.match(output, /CLAWPILOT_NATIVE_EMAIL_GOLDEN=/, 'Actual native save/readback golden must execute')
+    if (!options['golden-only']) assert.match(output, /REAL_SUITECRM_ACCEPTANCE_PASSED=/, 'No mocked or partial run counts as native acceptance')
+  }
   if (options['remediation-candidate']) {
     assert.match(output, /NATIVE_SCOPE_INSTALLER_TEST_PASSED=/, 'Candidate needs offline installation and exact recovery acceptance')
     assert.match(output, /NATIVE_REMEDIATION_CANDIDATE_PASSED=/, 'A passing baseline is not a passing remediation candidate')
@@ -345,7 +354,7 @@ try {
     postgresEndpoint: options['app-postgres'] ? 'ephemeral-loopback-only-default-docker-bridge' : null,
     combinedAppPostgres,requiredAuthorityScale: Boolean(options['require-authority-scale']),
     scaleEmailCount: options['remediation-candidate'] ? scaleEmailCount : null,
-    mode: options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
+    mode: options['shared-email-only'] ? 'shared-email-only' : options['remediation-candidate'] ? 'remediation-candidate' : options['golden-only'] ? 'golden-only' : 'acceptance',
     capturedAt: new Date().toISOString(), output }
   if (options.output) writeFileSync(options.output, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
   console.log(`Real SuiteCRM ${VERSION} ${receipt.mode} completed; exact images/source recorded, no production access`)

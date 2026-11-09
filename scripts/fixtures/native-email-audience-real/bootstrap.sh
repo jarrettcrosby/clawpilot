@@ -10,6 +10,10 @@ php -d memory_limit=384M bin/console suitecrm:app:install --no-interaction \
     tail -n 70 /tmp/native-install.log
     exit 1
   }
+if [ "${CLAWPILOT_NATIVE_FIXTURE_SHARED_EMAIL_ONLY:-0}" = "1" ]; then
+  php -d memory_limit=384M /fixture/native-shared-email.php
+  exit 0
+fi
 php -d memory_limit=384M /fixture/acceptance.php
 if [ "${CLAWPILOT_NATIVE_FIXTURE_REMEDIATION:-0}" = "1" ]; then
   # Exercise the actual offline installer against private copies before any PHP
