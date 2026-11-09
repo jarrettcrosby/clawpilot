@@ -1408,6 +1408,20 @@ function stableEvidence(value: unknown): unknown {
     : value
 }
 
+function historicalReviewProviderEvidence(raw: GmailMessage): GmailMessage {
+  const evidence = { ...raw }
+  // Reading a message can change its Gmail history cursor and UNREAD label.
+  // Neither participates in historical CRM eligibility, direction or placement.
+  // Keep the full message payload, all other label membership (including SENT),
+  // and the separate locked CRM target fingerprint in the reviewed digest.
+  delete evidence.historyId
+  if (raw.labelIds === undefined) evidence.labelIds = []
+  else if (Array.isArray(raw.labelIds) && raw.labelIds.every(label => typeof label === 'string')) {
+    evidence.labelIds = [...new Set(raw.labelIds.filter(label => label !== 'UNREAD'))].sort()
+  }
+  return evidence
+}
+
 async function reviewedParticipantTargets(routing: MessageRoutingInput, association: ReviewedGmailAssociation) {
   const unavailable = () => new SafeEmailIngestionError('Reviewed contacts must be unambiguous current participants in the owned pipeline')
   if (routing.message.externalThreadId !== association.threadId) throw unavailable()
@@ -1641,14 +1655,15 @@ async function reconcileReviewedGmailMessages(input: {
   const snapshots = await stageReviewedGmailInteractionsInPostgres({ messages: planned.map((plan) => plan.persistence), apply: false })
     .catch(() => { throw new SafeEmailIngestionError('Reviewed Gmail association evidence is unavailable or has changed') })
   const digest = crypto.createHash('sha256').update(JSON.stringify(stableEvidence({
-    version: 3, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
+    version: firstSeen ? 3 : 4, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
     decisionKind: input.decisionKind || 'review', correctionReason: input.correctionReason || null,
     lateContactEmail: input.lateContactEmail || null,
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
     pipelineId: input.pipelineId, mailboxEmail: input.mailbox.account_email,
     selfAddresses: [...input.selfAddresses].sort(),
     messages: planned.map((plan, index) => ({ association: plan.association, raw: firstSeen
-      ? { evidence: plan.persistence.messageEvidence, labelIds: plan.persistence.firstSeenLabelIds } : plan.raw,
+      ? { evidence: plan.persistence.messageEvidence, labelIds: plan.persistence.firstSeenLabelIds }
+      : historicalReviewProviderEvidence(plan.raw),
       targets: plan.resolved.targets.map((target) => ({ id: target.record.id,
         reference: target.record.referenceCode, email: target.matchedEmail, organization: target.record.organizationId })),
       organizationReferences: plan.resolved.organizationReferences, targetFingerprint: snapshots[index].targetFingerprint,
