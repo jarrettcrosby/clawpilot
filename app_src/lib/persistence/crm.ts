@@ -3289,7 +3289,9 @@ async function prepareReviewedGmailInteractionWithClient(client: PoolClient, inp
   )
   if (scope.rows.length !== 1) throw refuse()
   if (firstSeen) {
-    if (emailAudienceMode !== 'native' || !input.firstSeenLabelIds) throw refuse()
+    // Mode is bound to this pipeline under the publication control lock.
+    // The exact BPO stock path is also protected; ordinary legacy mode is not.
+    if ((emailAudienceMode !== 'native' && emailAudienceMode !== 'shared') || !input.firstSeenLabelIds) throw refuse()
     assertCaseyFirstSeenMailbox(input.mailboxIdentity)
     assertCaseyFirstSeenEvidence({ evidence: input.messageEvidence, labelIds: input.firstSeenLabelIds })
     if (input.messageEvidence.messageId !== input.providerMessageId || input.messageEvidence.threadId !== input.providerThreadId) throw refuse()

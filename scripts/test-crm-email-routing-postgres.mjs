@@ -72,7 +72,7 @@ function loadModule(path, dependencies = {}, extraSource = '') {
 // are left out. The routing runner uses real is_demo suppression; the reviewed
 // fixture can enable the actual enqueue/lease/publication guards without ever
 // invoking a provider. Neither fixture pretends to prove SuiteCRM delivery.
-function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject) {
+function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject, fixtureEnvironment = {}) {
   const path = 'app_src/lib/persistence/crm.ts'
   const parsed = ts.createSourceFile(path, read(path), ts.ScriptTarget.Latest, true)
   const names = [
@@ -87,6 +87,7 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject)
     'enrichCrmEmailInteractionParticipantsInPostgres',
     'REVIEWED_GMAIL_RELATIONSHIPS', 'reviewedGmailContentFingerprint',
     'reviewedEmailAudienceModeUnderControlWithClient', 'reviewedEmailAudienceWithClient', 'legacyReviewedEmailAudienceWithClient',
+    'sharedSuiteCrmEmailScopeWithClient',
     'reviewedEmailAudienceUnderNativeControlWithClient',
     'readReviewedGmailInteractionWithClient', 'prepareReviewedGmailInteractionWithClient',
     'applyReviewedGmailInteractionWithClient', 'stageReviewedGmailInteractionsInPostgres',
@@ -135,6 +136,7 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject)
     ...loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
     crypto: nodeRequire('node:crypto'), Buffer,
     suiteCrmEmailAddressAttributes: loadModule('app_src/lib/crm/emailAddressHeaders.ts').suiteCrmEmailAddressAttributes,
+    process: { env: fixtureEnvironment }, sharedSuiteCrmEmailScope: pipelineId => nativeEmail.sharedSuiteCrmEmailScope(pipelineId, fixtureEnvironment),
     suiteCrmEmailAudienceFingerprint: nativeEmail.suiteCrmEmailAudienceFingerprint, URL, Error,
     crmParticipantEmailCandidatesSql: loadModule('app_src/lib/crm/participantEligibility.ts').crmParticipantEmailCandidatesSql,
     isPostgresStorageEnabled: () => true,
