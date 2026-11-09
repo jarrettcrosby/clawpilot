@@ -3,6 +3,7 @@
 // readbacks are explicitly synthetic; no production/provider authorization proof.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
+import * as util from 'node:util'
 import {readFileSync} from 'node:fs'
 import {createRequire} from 'node:module'
 import {execFileSync} from 'node:child_process'
@@ -14,6 +15,8 @@ function load(path,deps){const module={exports:{}}
   new Function('module','exports','require',code)(module,module.exports,name=>{assert.ok(Object.hasOwn(deps,name),name);return deps[name]})
   return module.exports}
 const protocol=load('app_src/lib/crm/nativeEmailPublication.ts',{'node:crypto':crypto})
+const heldRecoveryApproval=load('app_src/lib/crm/legacyHeldEmailRecoveryApproval.ts',{'server-only':{},'node:crypto':crypto,
+  'node:util':util,'./nativeEmailPublication':protocol})
 const eligibility=load('app_src/lib/crm/nativeEmailEligibility.ts',{'./nativeEmailPublication':protocol})
 const userEligibility=load('app_src/lib/crm/nativeEmailWorkspaceUserEligibility.ts',{'./nativeEmailPublication':protocol})
 const identityLink=load('app_src/lib/crm/nativeEmailIdentityLinkChange.ts',{'./nativeEmailPublication':protocol,'./nativeEmailWorkspaceUserEligibility':userEligibility})
@@ -46,6 +49,7 @@ const publication=load('app_src/lib/persistence/crmNativeEmailPublication.ts',{
   '../crm/nativeEmailPublicationWorkContext':load('app_src/lib/crm/nativeEmailPublicationWorkContext.ts',{'./nativeEmailPublication':protocol}),
   '../crm/nativeEmailPublicationTransport':load('app_src/lib/crm/nativeEmailPublicationTransport.ts',{'./nativeEmailPublication':protocol}),
   '../crm/legacyEmailRecoveryReleaseApproval':{},
+  '../crm/legacyHeldEmailRecoveryApproval':heldRecoveryApproval,
   '../crm/nativeEmailRecoveryDispatchPermit':{},
 })
 const id=n=>`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,hash=protocol.nativeEmailDigest,clone=value=>JSON.parse(JSON.stringify(value))

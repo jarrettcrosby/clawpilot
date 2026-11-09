@@ -32,6 +32,7 @@ import {
 } from '../app_src/lib/integrations/integrationCredentialKeyAttestation.mjs'
 import {
   PRODUCTION_REBIND_CRITICAL_RELATIONS,
+  PRODUCTION_REBIND_HELD_ORIGINAL_RELATIONS,
   PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
   PRODUCTION_REBIND_RECOVERY_RELATIONS,
   PRODUCTION_REBIND_SCHEMA_MIGRATIONS,
@@ -2039,7 +2040,9 @@ export function isProductionRebindSchemaLockRelation(relation) {
     && PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation)
     && (/^public\.[a-z][a-z0-9_]*$/u.test(relation)
       || (/^crm_legacy_email_retirement\.[a-z][a-z0-9_]*$/u.test(relation)
-        && PRODUCTION_REBIND_RECOVERY_RELATIONS.includes(relation)))
+        && PRODUCTION_REBIND_RECOVERY_RELATIONS.includes(relation))
+      || (/^crm_legacy_email_terminal_hold\.[a-z][a-z0-9_]*$/u.test(relation)
+        && PRODUCTION_REBIND_HELD_ORIGINAL_RELATIONS.includes(relation)))
 }
 
 async function lockProductionRebindSchemaRelations(client) {

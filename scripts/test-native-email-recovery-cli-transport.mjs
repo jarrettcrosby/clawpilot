@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Focused wire/argv tests. The injected runner records commands without
-// spawning a process, contacting Railway, or asserting native receipt validity.
+// Focused wire/argv and receipt-provenance tests. All runners are fixtures;
+// nothing here spawns a process or contacts Railway.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
@@ -25,9 +25,15 @@ const protocol=load('nativeEmailPublication',{'node:crypto':crypto})
 const permitApi=load('nativeEmailRecoveryDispatchPermit',{'server-only':{},'node:crypto':crypto,'node:util':util,
   './nativeEmailPublication':protocol})
 const readyApi=load('nativeEmailRecoveryReadyProof',{'node:crypto':crypto})
+const receiptApi=load('nativeEmailPublicationTransport',{'./nativeEmailPublication':protocol})
+let defaultRunnerFixture
 const api=load('nativeEmailRecoveryCliTransport',{'server-only':{},'node:crypto':crypto,'node:fs':fs,'node:path':path,
-  './nativeEmailPublication':protocol,'./nativeEmailRecoveryReadyProof':readyApi,'./nativeEmailRecoveryDuplexRunner':{
-    createNativeEmailRecoveryDuplexCommandRunner:()=>assert.fail('test must not instantiate the real SSH runner'),
+  './nativeEmailPublication':protocol,'./nativeEmailPublicationTransport':receiptApi,'./nativeEmailRecoveryReadyProof':readyApi,
+  './nativeEmailRecoveryDuplexRunner':{
+    createNativeEmailRecoveryDuplexCommandRunner:()=>{
+      assert.ok(defaultRunnerFixture,'test must not instantiate the real SSH runner')
+      return defaultRunnerFixture
+    },
   }})
 
 const id=n=>`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`
@@ -76,9 +82,9 @@ function ready(value, changes={}, key=transportAttestationKey){
     purpose:'clawpilot-native-email-recovery-ready-v1',targetFingerprint,version:1,...changes}
   return json({mac:crypto.createHmac('sha256',key).update(json(proof),'ascii').digest('hex'),proof})
 }
-const make=({replyBytes=replyText,runError,overrides={},withoutReady=false,eagerAuthorization=false}={})=>{
+const make=({replyBytes=replyText,runError,overrides={},withoutReady=false,eagerAuthorization=false,useDefaultRunner=false}={})=>{
   const calls=[], payloads=[]
-  const transport=api.createNativeEmailRecoveryCliTransport({...options,...overrides},async value=>{
+  const runner=async value=>{
     calls.push(value)
     if(runError)throw runError
     if(eagerAuthorization)await value.stdin()
@@ -93,8 +99,14 @@ const make=({replyBytes=replyText,runError,overrides={},withoutReady=false,eager
       payloads.push(typeof value.stdin==='function'?await value.stdin():value.stdin)
     }
     return replyBytes
-  })
-  return {transport,calls,payloads}
+  }
+  if(useDefaultRunner)defaultRunnerFixture=runner
+  try {
+    const transport=api.createNativeEmailRecoveryCliTransport({...options,...overrides},useDefaultRunner?undefined:runner)
+    return {transport,calls,payloads}
+  } finally {
+    defaultRunnerFixture=undefined
+  }
 }
 function held(code){return error=>error instanceof protocol.NativeEmailPublicationHeld&&error.code===`legacy_dispatch_transport_${code}`}
 
@@ -192,6 +204,66 @@ console.log('PASS tampered permit or request, repair/update commands, and oversi
   assert.equal(authorized,1)
 }
 console.log('PASS only same-process verified readiness can request the one-time publish authorization')
+
+{
+  const at='2026-11-08 15:00:00',recordFingerprint=hash('native stored record')
+  const source={name:'Verified fixture',date_sent_received:at,type:'archived',status:'read',parent_type:'',parent_id:'',
+    assigned_user_id:readers[0],global_id_c:command.globalId,description:'Fixture body',description_html:''}
+  const requestFor=attributes=>prepare({command:{...command,projection:{...command.projection,attributes}},
+    nativePolicyFingerprint:request.nativePolicyFingerprint,allowedReaderSuiteCrmUserIds:readers})
+  const verifiedRequest=requestFor(source)
+  const identity={version:2,operationId:command.operationId,commandHash:verifiedRequest.commandHash,replayed:false}
+  const committed={...identity,state:'committed',result:{
+    version:2,mode:'publish',suiteCrmId:command.suiteCrmId,globalId:command.globalId,pipelineId:command.pipelineId,
+    generation:command.generation,audienceFingerprint:command.audienceFingerprint,recordFingerprint,
+    readerSuiteCrmUserIds:readers,capabilityPolicyFingerprint:command.capabilityPolicyFingerprint,
+    principalSuiteCrmUserIds:command.principalSuiteCrmUserIds,expectedCapabilities:command.expectedCapabilities,
+    projection:{version:2,suiteCrmId:command.suiteCrmId,sourceAttributes:source,
+      attributes:{...source,created_by:source.assigned_user_id,deleted:'0',description_html:'<p>Fixture body</p>',
+        from_addr_name:'',to_addrs_names:'',cc_addrs_names:'',bcc_addrs_names:'',reply_to_addrs_names:''},
+      accounts:[],contacts:[],contactAccounts:[],snapshotFingerprint:recordFingerprint,dateSentReceivedUtc:'2026-11-08T15:00:00Z'},
+  }}
+  const cancelled={...identity,state:'cancelled',result:null}
+  const exchange=(f,action)=>{
+    const permit=sign(action,verifiedRequest)
+    return action==='publish'?f.transport.exchangePublish({request:verifiedRequest,fence:publishFence,authorize:async()=>permit})
+      :f.transport.exchange({request:verifiedRequest,permit})
+  }
+  const builtIn=value=>make({useDefaultRunner:true,replyBytes:json(value)+'\n'})
+  for(const [action,terminal] of [['publish',committed],['resolve',committed],['resolve',cancelled]]){
+    const exact=await exchange(builtIn(terminal),action)
+    assert.deepEqual(exact,terminal)
+    assert.doesNotThrow(()=>api.assertAuthenticatedNativeEmailRecoveryReceipt(verifiedRequest,exact))
+    for(const counterfeit of [terminal,structuredClone(exact),{...exact},new Proxy(exact,{})])
+      assert.throws(()=>api.assertAuthenticatedNativeEmailRecoveryReceipt(verifiedRequest,counterfeit),held('receipt_not_authenticated'))
+    assert.throws(()=>api.assertAuthenticatedNativeEmailRecoveryReceipt(requestFor({...source,name:'another request'}),exact),
+      held('receipt_request_changed'))
+    assert.throws(()=>api.assertAuthenticatedNativeEmailRecoveryReceipt({...verifiedRequest,command:request.command},exact),
+      held('receipt_request_changed'))
+    assert.ok(Object.isFrozen(exact))
+    if(exact.state==='committed'){
+      assert.ok(Object.isFrozen(exact.result.projection.attributes))
+      assert.ok(Object.isFrozen(exact.result.projection.accounts))
+      assert.throws(()=>{exact.result.projection.attributes.name='tampered'},TypeError)
+      assert.throws(()=>exact.result.projection.accounts.push('tampered'),TypeError)
+    }
+  }
+  const wrongProjection=structuredClone(committed)
+  wrongProjection.result.projection.attributes.name='wrong'
+  for(const [subject,action,value] of [
+    [make({replyBytes:json(committed)+'\n'}),'resolve',committed],
+    [builtIn(committed),'prepare',committed],
+    [builtIn(wrongProjection),'resolve',wrongProjection],
+    [builtIn(reply),'resolve',reply],
+  ]){
+    const result=await exchange(subject,action)
+    assert.deepEqual(result,value,'the wire contract remains unchanged for unbranded output')
+    assert.throws(()=>api.assertAuthenticatedNativeEmailRecoveryReceipt(verifiedRequest,result),held('receipt_not_authenticated'))
+  }
+  await assert.rejects(()=>exchange(make({useDefaultRunner:true,withoutReady:true,replyBytes:json(committed)+'\n'}),'resolve'),
+    held('destination_unverified'))
+}
+console.log('PASS only exact verified terminal replies from the pinned default-runner path carry immutable request-bound provenance')
 
 {
   for(const [replyBytes,code] of [['not JSON','output_json'],['[]\n','output_canonical'],[replyText.trimEnd(),'output_canonical'],

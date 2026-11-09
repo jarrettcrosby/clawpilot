@@ -110,22 +110,24 @@ export class NativeEmailInitialEnrollmentOperator{
       const mappings=snapshot.emails as NativeEmailInitialMapping[],locals=new Set<string>(),globals=new Set<string>();let previous=''
       for(const row of mappings){mapping(row);need(row.nativeId>previous&&!locals.has(row.localId)&&!globals.has(row.globalId),'duplicate_mapping');previous=row.nativeId;locals.add(row.localId);globals.add(row.globalId)}
       list(snapshot.pendingOutbox,10000)
-      const demoQuarantines:Array<{id:string;rowFingerprint:string}>=[],pendingIds=new Set<string>()
+      const pendingQuarantines:Array<{id:string;rowFingerprint:string}>=[],pendingIds=new Set<string>()
       for(const pending of snapshot.pendingOutbox){need(pending&&typeof pending==='object'&&!Array.isArray(pending),'pending_writer');const p=pending as Row
         need(p.operation!=='upsert_user_identity','pending_writer')
         if(p.status==='queued'&&p.attempts===0&&p.lockedAt===null&&p.lockToken===null&&p.hasError===false&&p.processedAt===null)continue
-        // Retain exact terminal demo rows in the original immutable snapshot.
-        // SQL independently checks their full preimage and current demo binding;
-        // neither this metadata nor an is_demo flag alone authorizes a bypass.
+        // Retain every terminal row in the original immutable snapshot. SQL
+        // verifies either the original demo exception or an exact live hold
+        // under this same operator root, native instance and generation.
         need(p.targetSystem==='suitecrm'&&typeof p.id==='string'&&UUID.test(p.id)&&!pendingIds.has(p.id),'pending_writer')
-        hash(p.rowFingerprint);pendingIds.add(p.id);demoQuarantines.push({id:p.id,rowFingerprint:p.rowFingerprint})}
-      if(demoQuarantines.length){
+        hash(p.rowFingerprint);pendingIds.add(p.id);pendingQuarantines.push({id:p.id,rowFingerprint:p.rowFingerprint})}
+      if(pendingQuarantines.length){
         const rows=(await tx.query(`SELECT expected.id::text AS id,
-          public.clawpilot_crm_native_initial_demo_quarantine(expected.id,expected.row_fingerprint) AS quarantined
+          public.clawpilot_crm_native_initial_pending_quarantine(expected.id,expected.row_fingerprint,
+            $3::uuid,$4::uuid,$5::text,$6::bigint) AS quarantined
           FROM unnest($1::uuid[],$2::text[]) AS expected(id,row_fingerprint) ORDER BY expected.id`,
-        [demoQuarantines.map(row=>row.id),demoQuarantines.map(row=>row.rowFingerprint)])).rows
+        [pendingQuarantines.map(row=>row.id),pendingQuarantines.map(row=>row.rowFingerprint),
+          s.operatorAccountId,s.rootWorkspaceId,s.nativeInstanceId,generation])).rows
         const verified=new Set<string>()
-        need(rows.length===demoQuarantines.length,'pending_writer')
+        need(rows.length===pendingQuarantines.length,'pending_writer')
         for(const row of rows){need(typeof row.id==='string'&&pendingIds.has(row.id)&&!verified.has(row.id)&&row.quarantined===true,'pending_writer');verified.add(row.id)}
       }
       const pipelines=(await tx.query(`SELECT p.id::text,p.owner_email,p.workspace_organization_id::text,p.reference_access_disabled

@@ -98,11 +98,14 @@ function fixture(){
   if(sql.includes('FROM crm_native_email_initial_reservations r'))return {rows:[sqlCopy(state.reservation)]}
   if(sql.includes('clawpilot_crm_native_initial_source_snapshot()'))return {rows:[{snapshot:sqlCopy(state.snapshot),fingerprint:fp,
    snapshot_matches_reservation:isDeepStrictEqual(state.snapshot,state.reservation.source_snapshot)}]}
-  if(sql.includes('clawpilot_crm_native_initial_demo_quarantine(')){
+  if(sql.includes('clawpilot_crm_native_initial_pending_quarantine(')){
    assert.match(sql,/FROM unnest\(\$1::uuid\[\],\$2::text\[\]\)/)
+   assert.match(sql,/\$3::uuid,\$4::uuid,\$5::text,\$6::bigint\)/)
    const pending=state.snapshot.pendingOutbox.filter(row=>!(row.status==='queued'&&row.attempts===0&&row.lockedAt===null
     &&row.lockToken===null&&row.hasError===false&&row.processedAt===null))
-   assert.deepEqual(values,[pending.map(row=>row.id),pending.map(row=>row.rowFingerprint)],'Batch lookup must use the exact retained IDs and full-row hashes')
+   assert.deepEqual(values,[pending.map(row=>row.id),pending.map(row=>row.rowFingerprint),
+    selection.operatorAccountId,selection.rootWorkspaceId,selection.nativeInstanceId,Number(state.control.generation)],
+    'Batch lookup must use exact IDs, full-row hashes and current reservation scope')
    return {rows:state.quarantineResult??values[0].map((rowId,index)=>({id:rowId,quarantined:state.quarantineEvidence.get(rowId)===values[1][index]}))}
   }
   if(sql.includes('FROM pipeline_spaces p JOIN workspace_organizations'))return {rows:copy(state.pipelines)}
@@ -266,7 +269,7 @@ await check('exact terminal quarantine is independently batch-verified while all
  const f=withQuarantine(),before=sqlCopy(f.state.snapshot)
  const value=await f.operator.collectReservedSource(op,fp)
  assert.deepEqual(value.mappings,before.emails)
- assert.equal(f.state.sql.filter(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')).length,1,
+ assert.equal(f.state.sql.filter(row=>row.sql.includes('clawpilot_crm_native_initial_pending_quarantine(')).length,1,
   'Two retained dead rows require one bounded batch, not one query per row')
  assert.deepEqual(f.state.nativeCalls,[])
  assert.deepEqual(f.state.snapshot,before);assert.deepEqual(f.state.reservation.source_snapshot,before)
@@ -306,7 +309,7 @@ await check('ordinary dead, failed, processing and retried work cannot inherit d
  const f=fixture();f.state.snapshot.pendingOutbox=[{operation:'upsert_record',status:'queued',attempts:0,
   lockedAt:null,lockToken:null,hasError:false,processedAt:null}];f.state.reservation.source_snapshot=sqlCopy(f.state.snapshot)
  assert.equal((await f.operator.collectReservedSource(op,fp)).mappings.length,2)
- assert.equal(f.state.sql.some(row=>row.sql.includes('clawpilot_crm_native_initial_demo_quarantine(')),false)
+ assert.equal(f.state.sql.some(row=>row.sql.includes('clawpilot_crm_native_initial_pending_quarantine(')),false)
 })
 await check('source artifact bytes and native complete inventory must match independently; no completeness JSON accepted',async()=>{
  for(const mutate of [f=>{f.state.nativeSource.emails.pop()},f=>{f.state.nativeSource.emails[0].archived=false},f=>{f.state.nativeSource.emails[0].pipelineId=id(99)},
@@ -419,13 +422,22 @@ if(postgresMajor){
    const artifacts=join(privateRoot,'artifacts');mkdirSync(artifacts,{mode:0o700})
    cliKeys=crypto.generateKeyPairSync('rsa',{modulusLength:3072})
    const binary=realpathSync('/usr/bin/false'),publicKey=cliKeys.publicKey.export({type:'spki',format:'pem'})
+   const railwayIdentityFile=join(privateRoot,'fixture-identity')
+   writeFileSync(railwayIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
+   const databaseIdentity=(await q(`SELECT c.system_identifier::pg_catalog.text AS "systemIdentifier",
+     d.oid::pg_catalog.text AS "databaseOid",SESSION_USER::pg_catalog.text AS "sessionRole",
+     CURRENT_USER::pg_catalog.text AS "effectiveRole"
+     FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() c
+     WHERE d.datname=pg_catalog.current_database()`)).rows[0]
    const config={version:1,purpose:'clawpilot-native-email-initial-private-operator',selection,
     native:{railwayBinary:binary,railwayBinarySha256:byteHash(readFileSync(binary)),projectId:id(101),environmentId:id(102),serviceId:id(103),
+     deploymentInstanceId:id(104),railwayIdentityFile,
      nativeInstanceId:selection.nativeInstanceId,database:'synthetic_native_never_called',serviceUserId:'admin',oauthClientId:id(80),
      cliSourceHash:hash('synthetic-native-cli-not-called'),imagePackageHash:hash('synthetic-native-image-not-called')},
-    databaseName:'initial_operator_fixture',artifactDirectory:artifacts,issuer:{keyId:'operator-real-sql-fixture',publicKey}}
+    databaseName:'initial_operator_fixture',databaseIdentity,artifactDirectory:artifacts,issuer:{keyId:'operator-real-sql-fixture',publicKey}}
    const configFile=(value,name)=>{const path=join(privateRoot,name),bytes=JSON.stringify(value)+'\n';writeFileSync(path,bytes,{flag:'wx',mode:0o600});return {path,pin:byteHash(bytes)}}
    const selected=configFile(config,'operator.json'),wrongActor=configFile({...config,selection:{...selection,actorEmail:'viewer@example.invalid'}},'wrong-actor.json')
+   const wrongPhysical=configFile({...config,databaseIdentity:{...databaseIdentity,systemIdentifier:'1'}},'wrong-physical.json')
    const url='postgresql://postgres:initial_operator_fixture@127.0.0.1:'+port+'/initial_operator_fixture'
    const invoke=(action,extra=[],selectedConfig=selected,success=true)=>{
     const args=['--conditions=react-server',compiledBuild.entry,'--action='+action,'--config='+selectedConfig.path,'--config-sha256='+selectedConfig.pin,...extra]
@@ -447,16 +459,17 @@ if(postgresMajor){
     assert.deepEqual((await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0],row)
     assert.deepEqual(invoke('preview'),{action:'preview',...preview,activeOperationId:op})
    })
-   await check('REAL compiled private CLI denies wrong root actor and source pins without changing PG reservation or enabling publication',async()=>{
+   await check('REAL compiled private CLI denies wrong root actor, physical database and source pins without changing PG reservation or enabling publication',async()=>{
     const before=(await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0]
     assert.equal(invoke('preview',[],wrongActor,false).code,'initial_pg_operator_denied')
+    assert.equal(invoke('preview',[],wrongPhysical,false).code,'initial_private_operator_database_identity_unproven')
     const refused=invoke('reserve',['--operation='+op,'--source-sha256='+hash('wrong-reviewed-sql-source'),'--approve-operation='+op],selected,false)
     assert.equal(refused.code,'initial_pg_reservation_pin_changed')
     assert.deepEqual((await q('SELECT * FROM crm_native_email_initial_reservations WHERE operation_id=$1',[op])).rows[0],before)
     assert.equal((await q('SELECT enabled FROM crm_native_email_publication_control WHERE singleton')).rows[0].enabled,false)
    })
    compiledCliProof={actualPool:true,actualPrivateCliPreview:true,actualPrivateCliReservation:true,approvedRetryImmutable:true,
-    wrongActorDenied:true,wrongSourcePinDenied:true,nativeCommandConfigured:'/usr/bin/false',nativeCommandExercised:false}
+    wrongActorDenied:true,wrongPhysicalDatabaseDenied:true,wrongSourcePinDenied:true,nativeCommandConfigured:'/usr/bin/false',nativeCommandExercised:false}
   }
   await realStore.reserve(op,preview.sourceFingerprint)
   const current=(await q('SELECT clawpilot_crm_native_initial_source_snapshot() AS snapshot')).rows[0].snapshot,f=fixture()
@@ -468,7 +481,7 @@ if(postgresMajor){
    assert.ok(current.memberships.some(m=>m.user_email===selection.actorEmail&&Object.keys(m.permissions).length===0),'Real source must contain the seeded legitimate empty membership permissions object')
    assert.deepEqual(source.mappings.map(m=>m.nativeId),[id(40),id(41)]);assert.ok(statements.every(queries=>queries[0].includes('crm_native_email_publication_control')&&queries[0].includes('FOR UPDATE')))
    assert.equal(current.pendingOutbox.length,2)
-   const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_demo_quarantine('))
+   const batches=statements.flat().filter(sql=>sql.includes('clawpilot_crm_native_initial_pending_quarantine('))
    assert.equal(batches.length,1,'Actual SQL collector independently verifies both retained demo rows in one batch')
    assert.deepEqual(await retainedDemoJobs(),demoJobsBefore)
    assert.ok(current.pipelines.some(p=>p.id===unmanagedPipeline),'Unmanaged app pipeline remains in immutable global source')

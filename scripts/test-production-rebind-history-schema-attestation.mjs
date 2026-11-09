@@ -31,6 +31,7 @@ import {
   PRE_UNMANAGED_PIPELINE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_LEGACY_RECOVERY_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   PRE_CALENDAR_OCCURRENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
+  PRE_HELD_ORIGINAL_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,
   ProductionRebindHistorySchemaAttestationError,
   attestProductionRebindHistorySchema,
   inspectProductionRebindHistorySchema,
@@ -43,6 +44,8 @@ import {
   inspectPreLegacyRecoveryProductionRebindSchemaMetadata,
   inspectPreCalendarOccurrenceProductionRebindSchemaMetadata,
   inspectPreFractionalProductCompatibilityProductionRebindSchemaMetadata,
+  inspectPreHeldOriginalProductionRebindSchemaMetadata,
+  canonicalProductionRebindHistorySchemaCatalog,
   productionRebindHistorySchemaDigest,
 } from './production-rebind-history-schema-attestation.mjs'
 
@@ -103,6 +106,57 @@ const GATEWAY_BASE_CAPABILITIES = ['crm.company.read','crm.contact.read','crm.co
 const GATEWAY_CURRENT_CAPABILITIES = [...GATEWAY_BASE_CAPABILITIES,'crm.product.read','crm.customer-folder.write']
 const LEGACY_RECOVERY_MIGRATION = '0411_crm_legacy_email_archive_disposition.sql'
 const CALENDAR_OCCURRENCE_MIGRATION = '0412_crm_calendar_occurrence_claims.sql'
+const HELD_ORIGINAL_MIGRATIONS = [
+  ['0413_crm_legacy_email_terminal_hold.sql','4e2db01decaefc67669bf3f84b9ba9d9174c5a746df4343c26b846318db514d0'],
+  ['0414_crm_legacy_email_hold_enrollment.sql','acb9b5dc2eb51925a41763db3e5be85fd51432df96a9d0d2dadb3f2c54d3a058'],
+  ['0415_crm_legacy_held_email_recovery_stage.sql','91f9f6a5d1e6f620484209093df42644a5d80fd6faa199fa443a60a9383e7813'],
+  ['0416_crm_legacy_held_email_release.sql','d9d5d612b9d1e5fa32aff71bfe35c6c9904ce8979b4893aef479dfb8add02e30'],
+  ['0417_crm_legacy_held_email_settlement.sql','56f7e0e67ef8854b610d02a2d8496c575d4217b2731b49aa4f04c39b69bc82bf'],
+].map(([filename,checksum])=>({filename,checksum}))
+const HELD_ORIGINAL_SCHEMA = 'crm_legacy_email_terminal_hold'
+const HELD_ORIGINAL_RELATIONS = ['verified_batch','held','consumed','verified_recovery','staged','released','verified_receipts','settled']
+  .map(name=>`${HELD_ORIGINAL_SCHEMA}.${name}`)
+const HELD_ORIGINAL_CONTACT_MERGE_RELATION = 'public.crm_contact_merge_outbox_dependencies'
+const HELD_ORIGINAL_FUNCTIONS = [
+  ...['bind_attestor()','gate_fingerprint()','relationship_fingerprint(uuid)','provider_identity_fingerprint(uuid)',
+    'receipt_fingerprint(uuid)','hold(uuid,uuid[],text)','resolve(uuid,text,text)','protect_held()',
+    'stage_update_allowed(jsonb,jsonb)','resolve_recovery(uuid,text,text)','stage_recovery(uuid,text,jsonb)',
+    'wire_json(jsonb,integer)','register_release(uuid,text)','initial_release_write_allowed(text,text,jsonb,jsonb)',
+    'check_release_binding()','resolve_unsettled_release(uuid,text,text,text)','bind_receipt_attestor()',
+    'resolution_lease_write_allowed(jsonb,jsonb)','claim_resolution(uuid,text,uuid)','settlement_write_allowed(text,jsonb,jsonb)',
+    'settle_release(uuid,text,uuid,bigint,jsonb)','resolve_release(uuid,text,text,text)'].map(signature=>`${HELD_ORIGINAL_SCHEMA}.${signature}`),
+  'public.clawpilot_crm_native_initial_pending_quarantine(uuid,text,uuid,uuid,text,bigint)',
+]
+const HELD_ORIGINAL_CHANGED_FUNCTION_NAMES = [
+  'clawpilot_crm_native_initial_reserve','clawpilot_crm_native_initial_admit',
+  'clawpilot_crm_legacy_email_provider_identity_unambiguous','clawpilot_crm_legacy_email_relationship_guard',
+  'release_crm_contact_merge_outbox_dependents','clawpilot_guard_shared_email_write',
+]
+const HELD_ORIGINAL_GUARDS = [
+  ...['verified_batch','held','consumed'].flatMap(table=>[
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_terminal_hold_immutable',27,'crm_legacy_email_retirement.immutable_evidence()'],
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_terminal_hold_no_truncate',34,'crm_legacy_email_retirement.immutable_evidence()'],
+  ]),
+  ...['verified_recovery','staged','released'].flatMap(table=>[
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_held_recovery_'+(table==='released'?'release_':'')+'immutable',27,'crm_legacy_email_retirement.immutable_evidence()'],
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_held_recovery_'+(table==='released'?'release_':'')+'no_truncate',34,'crm_legacy_email_retirement.immutable_evidence()'],
+  ]),
+  ...['verified_receipts','settled'].flatMap(table=>[
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_held_receipt_immutable',27,'crm_legacy_email_retirement.immutable_evidence()'],
+    [`${HELD_ORIGINAL_SCHEMA}.${table}`,'crm_held_receipt_no_truncate',34,'crm_legacy_email_retirement.immutable_evidence()'],
+  ]),
+  [`${HELD_ORIGINAL_SCHEMA}.verified_batch`,'crm_terminal_hold_attestor',7,`${HELD_ORIGINAL_SCHEMA}.bind_attestor()`],
+  [`${HELD_ORIGINAL_SCHEMA}.verified_recovery`,'crm_held_recovery_direct_attestor',7,`${HELD_ORIGINAL_SCHEMA}.bind_attestor()`],
+  [`${HELD_ORIGINAL_SCHEMA}.verified_receipts`,'crm_held_receipt_attestor',7,`${HELD_ORIGINAL_SCHEMA}.bind_receipt_attestor()`],
+  [`${HELD_ORIGINAL_SCHEMA}.released`,'crm_held_recovery_release_binding',5,`${HELD_ORIGINAL_SCHEMA}.check_release_binding()`,true],
+  ...['sync_outbox','crm_interactions','crm_native_email_publication_admissions','crm_native_email_publication_work',
+    'crm_interaction_contacts','crm_interaction_organizations'].flatMap(table=>[
+    [`public.${table}`,'crm_terminal_email_held',31,`${HELD_ORIGINAL_SCHEMA}.protect_held()`],
+    [`public.${table}`,'crm_zzzz_terminal_email_held_no_truncate',34,`${HELD_ORIGINAL_SCHEMA}.protect_held()`],
+    ...(['crm_interaction_contacts','crm_interaction_organizations'].includes(table)
+      ?[[`public.${table}`,'crm_zz_legacy_email_terminal_hold_serial',62,'crm_legacy_email_retirement.serialize()']]:[]),
+  ]),
+]
 const CALENDAR_OCCURRENCE_CLAIMS = 'public.crm_calendar_occurrence_claims'
 const CALENDAR_OCCURRENCE_BINDINGS = 'public.crm_calendar_occurrence_bindings'
 const CALENDAR_OCCURRENCE_RELATIONS = [CALENDAR_OCCURRENCE_BINDINGS,CALENDAR_OCCURRENCE_CLAIMS]
@@ -236,7 +290,7 @@ export const NEW_REFERENCE_CONSTRAINTS = new Map([
 ])
 
 assert.equal(PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
-  'clawpilot-production-rebind-target-schema-attestation-v21')
+  'clawpilot-production-rebind-target-schema-attestation-v22')
 assert.deepEqual(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.filter(m=>m.filename===FRACTIONAL_PRODUCT_MIGRATION),
   [{filename:FRACTIONAL_PRODUCT_MIGRATION,checksum:FRACTIONAL_PRODUCT_MIGRATION_CHECKSUM}],
   'Current acceptance preserves exactly the already applied historical product grant migration')
@@ -272,8 +326,12 @@ assert.deepEqual(PRE_CALENDAR_OCCURRENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
   16:'1f65875ffecdbb7204d00daaaa9d3dc3864f25bdd3760b86195f7f5eed224fef',
   18:'283d8d6f0728bde8c19b73975ae71c2f2d08c41360195ee88d89a94f58cce1a4',
 },'Historical through-0411 v19 fingerprints remain independently frozen')
-assert.equal(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.at(-1).filename,CALENDAR_OCCURRENCE_MIGRATION,
-  'Current acceptance requires 0412, never a historical floor')
+assert.deepEqual(PRE_HELD_ORIGINAL_SCHEMA_DIGEST_BY_POSTGRES_MAJOR,{
+  16:'deb3985e8215284d5de69a2b5966a3740e452070a9b1ebe14fac46370718b2fc',
+  18:'7006803ee42ade78f36c565b60549f8c2aeb118ca5d33484a6bf17e0f6f0d65a',
+},'Historical through-0412 v21 fingerprints remain independently frozen')
+assert.deepEqual(PRODUCTION_REBIND_SCHEMA_MIGRATIONS.slice(-HELD_ORIGINAL_MIGRATIONS.length),HELD_ORIGINAL_MIGRATIONS,
+  'Current acceptance requires all five exact held-original migrations, never a historical floor')
 for(const helper of UNMANAGED_PIPELINE_HELPERS.keys())assert.ok(PRODUCTION_REBIND_CRM_GUARD_HELPERS.includes(helper),helper)
 for(const relation of UNMANAGED_PIPELINE_RELATIONS)assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.includes(relation),relation)
 for(const helper of ['public.clawpilot_crm_native_initial_lineage_digest(jsonb)',
@@ -338,7 +396,8 @@ for(const [inspect,lastMigration] of [
   [inspectPreLegacyRecoveryProductionRebindSchemaMetadata,UNMANAGED_PIPELINE_MIGRATION],
   [inspectPreCalendarOccurrenceProductionRebindSchemaMetadata,LEGACY_RECOVERY_MIGRATION],
   [inspectPreFractionalProductCompatibilityProductionRebindSchemaMetadata,CALENDAR_OCCURRENCE_MIGRATION],
-  [inspectProductionRebindHistorySchema,CALENDAR_OCCURRENCE_MIGRATION],
+  [inspectPreHeldOriginalProductionRebindSchemaMetadata,CALENDAR_OCCURRENCE_MIGRATION],
+  [inspectProductionRebindHistorySchema,HELD_ORIGINAL_MIGRATIONS.at(-1).filename],
 ]){
   let selectedMigrations,selectedRelations,selectedFunctions,selectedSchemas
   await inspect({query:async (_sql,values)=>{
@@ -350,8 +409,9 @@ for(const [inspect,lastMigration] of [
       additional_schemas:[],indexes:[],triggers:[],functions:[],migrations:[],missing_relations:[],missing_functions:[]}]}
   }})
   assert.equal(selectedMigrations.at(-1),lastMigration,`${inspect.name} retains its exact ledger floor`)
-  assert.equal(selectedMigrations.includes(FRACTIONAL_PRODUCT_MIGRATION),inspect===inspectProductionRebindHistorySchema,
-    'The product compatibility ledger belongs to the exact current profile only')
+  const isCurrent=inspect===inspectProductionRebindHistorySchema
+  assert.equal(selectedMigrations.includes(FRACTIONAL_PRODUCT_MIGRATION),isCurrent||inspect===inspectPreHeldOriginalProductionRebindSchemaMetadata,
+    'The product compatibility ledger belongs to frozen v21 and its current successor only')
   const floor=Number(lastMigration.slice(0,4))
   assert.equal(selectedMigrations.includes(INITIAL_ENROLLMENT_MIGRATION),floor>=398,
     'Every exact metadata reader retains its accepted 0398 ledger floor')
@@ -378,8 +438,13 @@ for(const [inspect,lastMigration] of [
     floor>=412,`Only v20+ profiles enroll ${helper}`)
   for(const relation of [...CALENDAR_OCCURRENCE_RELATIONS,...CALENDAR_OCCURRENCE_AUTHORITY_RELATIONS])
     assert.equal(selectedRelations.includes(relation),floor>=412,`Only v20+ profiles directly fingerprint ${relation}`)
-  assert.deepEqual(selectedSchemas,floor>=411?['crm_legacy_email_retirement']:[],
-    'Private schema ownership/ACLs remain v19+ evidence and never alter older frozen metadata shapes')
+  for(const {filename} of HELD_ORIGINAL_MIGRATIONS) assert.equal(selectedMigrations.includes(filename),isCurrent,filename)
+  for(const relation of HELD_ORIGINAL_RELATIONS) assert.equal(selectedRelations.includes(relation),isCurrent,relation)
+  assert.equal(selectedRelations.includes(HELD_ORIGINAL_CONTACT_MERGE_RELATION),isCurrent,
+    'Only v22 enrolls the existing contact-merge dependency relation')
+  for(const identity of HELD_ORIGINAL_FUNCTIONS) assert.equal(selectedFunctions.includes(identity),isCurrent,identity)
+  assert.deepEqual([...selectedSchemas].sort(),[...(floor>=411?['crm_legacy_email_retirement']:[]),...(isCurrent?[HELD_ORIGINAL_SCHEMA]:[])].sort(),
+    'Private schema ownership/ACLs remain exact evidence and never alter older frozen metadata shapes')
 }
 
 function command(executable, args, options = {}) {
@@ -667,7 +732,7 @@ async function forgeCurrentLedgerInDisposableTransaction(client) {
   }
 }
 
-async function verifyCalendarOccurrenceSchemaDelta(pool,currentBaseline,{pinsEnrolled=true}={}) {
+async function verifyCalendarOccurrenceSchemaDelta(pool,frozenV21Baseline) {
   const frozen=await inspectPreCalendarOccurrenceProductionRebindSchemaMetadata(pool)
   assert.equal(frozen.format,'clawpilot-production-rebind-v19-metadata-only')
   assert.equal(frozen.schemaDigest,PRE_CALENDAR_OCCURRENCE_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[frozen.postgresMajor],
@@ -724,35 +789,160 @@ async function verifyCalendarOccurrenceSchemaDelta(pool,currentBaseline,{pinsEnr
     &&t.foreignKey?.schema==='crm_legacy_email_retirement').map(t=>t.name)
   assert.equal(privateForeignKeyNames(after.catalog).length,16,
     'Exactly four private recovery FKs contribute both source and action trigger pairs')
-  assert.notDeepEqual(privateForeignKeyNames(after.catalog),privateForeignKeyNames(currentBaseline.catalog),
+  assert.notDeepEqual(privateForeignKeyNames(after.catalog),privateForeignKeyNames(frozenV21Baseline.catalog),
     'Real secondary database allocates different private recovery FK trigger OIDs')
   const occurrenceForeignKeyNames=catalog=>catalog.triggers.filter(t=>t.internal&&t.foreignKey?.schema==='public'
     &&CALENDAR_OCCURRENCE_FKS.some(([,name])=>name===t.foreignKey.name)).map(t=>t.name)
   assert.equal(occurrenceForeignKeyNames(after.catalog).length,8,'Both new composite FKs contribute all four guards')
-  assert.notDeepEqual(occurrenceForeignKeyNames(after.catalog),occurrenceForeignKeyNames(currentBaseline.catalog),
+  assert.notDeepEqual(occurrenceForeignKeyNames(after.catalog),occurrenceForeignKeyNames(frozenV21Baseline.catalog),
     'Real secondary database allocates different occurrence FK trigger OIDs')
   const historicalCapability=gatewayCapabilityConstraint(after.catalog)
-  const currentCapability=gatewayCapabilityConstraint(currentBaseline.catalog)
+  const currentCapability=gatewayCapabilityConstraint(frozenV21Baseline.catalog)
   assertGatewayCapabilityVocabulary(historicalCapability,[...GATEWAY_BASE_CAPABILITIES,'crm.customer-folder.write'])
   assertGatewayCapabilityVocabulary(currentCapability,GATEWAY_CURRENT_CAPABILITIES)
   assert.equal(productionRebindHistorySchemaDigest({ ...after.catalog,
     constraints:after.catalog.constraints.map(c=>c===historicalCapability?currentCapability:c) }),
-  currentBaseline.schemaDigest,'Exactly one validated gateway CHECK explains the current catalog change from frozen v20')
+  frozenV21Baseline.schemaDigest,'Exactly one validated gateway CHECK explains the frozen v20-to-v21 catalog change')
   await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
     error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
     'Frozen v20 cannot be accepted as the current product-compatible release')
-  if(pinsEnrolled){
-    const forgedComplete=await pool.connect()
-    try{
-      await forgedComplete.query('BEGIN')
-      await forgeCurrentLedgerInDisposableTransaction(forgedComplete)
-      await assert.rejects(attestProductionRebindHistorySchema(forgedComplete),error=>
-        error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='schema_catalog_mismatch',
-        'Forging the v21 ledger cannot replace the missing product capability in the v20 CHECK')
-    }finally{await forgedComplete.query('ROLLBACK');forgedComplete.release()}
-  }
+  const forgedComplete=await pool.connect()
+  try{
+    await forgedComplete.query('BEGIN')
+    await forgeCurrentLedgerInDisposableTransaction(forgedComplete)
+    await assert.rejects(attestProductionRebindHistorySchema(forgedComplete),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='schema_object_missing',
+      'Forging a current ledger cannot replace the new schema/guards or the v20 gateway CHECK')
+  }finally{await forgedComplete.query('ROLLBACK');forgedComplete.release()}
   console.log(`PG${after.postgresMajor}: frozen v19 and v20, exact additive 0412 delta, and exact gateway CHECK delta verified`)
   return {frozenV19Digest:frozen.schemaDigest,frozenV20Digest:after.schemaDigest,before,after}
+}
+
+function verifyHeldOriginalDefinitions(catalog) {
+  const heldSchema=catalog.additionalSchemas.find(schema=>schema.name===HELD_ORIGINAL_SCHEMA)
+  assert.ok(heldSchema?.ownerIsCurrentUser && !heldSchema.aclIsDefault)
+  assert.ok(!heldSchema.acl.some(acl=>acl.grantee==='PUBLIC'),'Private held-original schema has no PUBLIC privileges')
+  for(const expected of HELD_ORIGINAL_RELATIONS){
+    const relation=catalog.relations.find(row=>row.expected===expected)
+    assert.ok(relation?.present && relation.kind==='r' && relation.ownerIsCurrentUser,expected)
+    assert.ok(!relation.acl.some(acl=>acl.grantee==='PUBLIC'),expected)
+  }
+  const definerNames=new Set(['hold','resolve','protect_held','clawpilot_crm_native_initial_pending_quarantine','resolve_recovery',
+    'stage_recovery','register_release','check_release_binding','resolve_unsettled_release','claim_resolution','settle_release','resolve_release'])
+  for(const identity of HELD_ORIGINAL_FUNCTIONS){
+    const [schema,name]=identity.split('(')[0].split('.')
+    const funcs=catalog.functions.filter(fn=>fn.schema===schema&&fn.name===name)
+    assert.equal(funcs.length,1,identity)
+    const [fn]=funcs
+    assert.ok(fn.ownerIsCurrentUser && !fn.aclIsDefault,identity)
+    assert.equal(fn.securityDefiner,definerNames.has(name),identity)
+    assert.ok(fn.configuration.some(value=>/^search_path=pg_catalog,\s*pg_temp$/u.test(value)),identity)
+    assert.ok(!fn.acl.some(acl=>acl.grantee==='PUBLIC'),identity)
+  }
+  for(const [relation,name,typeMask,identity,deferred=false] of HELD_ORIGINAL_GUARDS){
+    const guards=catalog.triggers.filter(trigger=>trigger.relation===relation&&trigger.name===name)
+    assert.equal(guards.length,1,`${relation}.${name}`)
+    const [guard]=guards
+    assert.deepEqual([guard.enabled,guard.internal,guard.typeMask,guard.function,guard.deferrable,guard.initiallyDeferred],
+      ['O',false,typeMask,identity,deferred,deferred],`${relation}.${name} is exact`)
+  }
+}
+
+function verifyHeldOriginalCatalogDelta(before,after) {
+  verifyHeldOriginalDefinitions(after)
+  const newlyScopedRelations=[...HELD_ORIGINAL_RELATIONS,HELD_ORIGINAL_CONTACT_MERGE_RELATION]
+  const isNewRelation=row=>newlyScopedRelations.includes(row.relation??row.expected)
+  const isHeldGuard=row=>HELD_ORIGINAL_GUARDS.some(([relation,name])=>row.relation===relation&&row.name===name)
+  const isHeldFk=row=>row.internal&&row.foreignKey?.schema===HELD_ORIGINAL_SCHEMA
+  for(const key of ['relations','columns','indexes','constraints','triggers']) {
+    const exclude=key==='triggers'?row=>isNewRelation(row)||isHeldGuard(row)||isHeldFk(row)
+      :key==='constraints'?row=>isNewRelation(row)||isHeldGuard(row):isNewRelation
+    assert.deepEqual(after[key].filter(row=>!exclude(row)),before[key],`0413–0417 preserve the remaining v21 ${key}`)
+  }
+  assert.deepEqual(after.schema,before.schema)
+  assert.deepEqual(after.additionalSchemas.filter(schema=>schema.name!==HELD_ORIGINAL_SCHEMA),before.additionalSchemas)
+  const fnKey=fn=>`${fn.schema}.${fn.name}(${fn.identityArguments})`
+  const oldFunctions=new Map(before.functions.map(fn=>[fnKey(fn),fn]))
+  const currentFunctions=new Map(after.functions.map(fn=>[fnKey(fn),fn]))
+  const changed=[]
+  for(const [identity,old] of oldFunctions){
+    const current=currentFunctions.get(identity)
+    assert.ok(current,identity)
+    if(old.schema==='public'&&HELD_ORIGINAL_CHANGED_FUNCTION_NAMES.includes(old.name)){
+      assert.notEqual(current.source,old.source,identity)
+      const withoutBody=({source,definition,...metadata})=>metadata
+      assert.deepEqual(withoutBody(current),withoutBody(old),`0413–0417 preserve metadata and privileges of ${identity}`)
+      changed.push(old.name)
+    }else assert.deepEqual(current,old,`0413–0417 do not change unrelated ${identity}`)
+  }
+  assert.deepEqual(changed.sort(),[...HELD_ORIGINAL_CHANGED_FUNCTION_NAMES].sort())
+  const allowedNewlySelected=new Set([...HELD_ORIGINAL_FUNCTIONS.map(identity=>identity.split('(')[0]),
+    'public.validate_crm_contact_merge_outbox_dependency','public.protect_crm_contact_merge_evidence'])
+  for(const [identity,fn] of currentFunctions)if(!oldFunctions.has(identity)){
+    assert.ok(allowedNewlySelected.has(`${fn.schema}.${fn.name}`),`Unexpected newly selected function ${identity}`)
+  }
+}
+
+async function verifyHeldOriginalTamper(pool,catalog,frozenV21Catalog) {
+  verifyHeldOriginalDefinitions(catalog)
+  await expectFailure(pool,'schema_catalog_mismatch','v22 private schema PUBLIC USAGE drift',tx=>tx.query(
+    `GRANT USAGE ON SCHEMA ${HELD_ORIGINAL_SCHEMA} TO PUBLIC`))
+  for(const relation of [...HELD_ORIGINAL_RELATIONS,HELD_ORIGINAL_CONTACT_MERGE_RELATION]){
+    await expectFailure(pool,'schema_object_missing',`v22 missing ${relation}`,tx=>tx.query(`DROP TABLE ${relation} CASCADE`))
+    await expectFailure(pool,'schema_catalog_mismatch',`v22 ${relation} PUBLIC read drift`,tx=>tx.query(`GRANT SELECT ON ${relation} TO PUBLIC`))
+  }
+  for(const identity of HELD_ORIGINAL_FUNCTIONS){
+    await expectFailure(pool,'schema_object_missing',`v22 missing ${identity}`,tx=>tx.query(`DROP FUNCTION ${identity} CASCADE`))
+    await expectFailure(pool,'schema_catalog_mismatch',`v22 ${identity} PUBLIC execution drift`,tx=>tx.query(
+      `GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
+  }
+  for(const [relation,name] of HELD_ORIGINAL_GUARDS){
+    await expectFailure(pool,'schema_catalog_mismatch',`v22 ${relation}.${name} disabled`,tx=>tx.query(
+      `ALTER TABLE ${relation} DISABLE TRIGGER ${name}`))
+  }
+  for(const name of HELD_ORIGINAL_CHANGED_FUNCTION_NAMES){
+    const historical=frozenV21Catalog.functions.find(fn=>fn.schema==='public'&&fn.name===name)
+    assert.ok(historical?.definition,name)
+    await expectFailure(pool,'schema_catalog_mismatch',`v22 restored historical body of ${name}`,tx=>tx.query(historical.definition))
+  }
+  await expectFailure(pool,'schema_catalog_mismatch','0413 retained original column PUBLIC read drift',tx=>tx.query(
+    `GRANT SELECT (original) ON ${HELD_ORIGINAL_SCHEMA}.held TO PUBLIC`))
+  await expectFailure(pool,'schema_catalog_mismatch','0417 receipt attestation is no longer write-only by default',tx=>tx.query(
+    `GRANT INSERT ON ${HELD_ORIGINAL_SCHEMA}.verified_receipts TO PUBLIC`))
+  await expectFailure(pool,'schema_catalog_mismatch','0417 settlement loses exact definer boundary',tx=>tx.query(
+    `ALTER FUNCTION ${HELD_ORIGINAL_SCHEMA}.settle_release(uuid,text,uuid,bigint,jsonb) SECURITY INVOKER`))
+  for(const {filename} of HELD_ORIGINAL_MIGRATIONS){
+    await expectLedgerFailure(pool,filename)
+    await expectLedgerFailure(pool,filename,true)
+  }
+}
+
+function describeCatalogDifference(before,after) {
+  const clean=JSON.parse(canonicalProductionRebindHistorySchemaCatalog(before))
+  const upgrade=JSON.parse(canonicalProductionRebindHistorySchemaCatalog(after))
+  const differences=[]
+  const keyFor=(kind,row)=>kind==='triggers'&&row.internal&&row.foreignKey
+    ?[row.relation,row.foreignKey.schema,row.foreignKey.source,row.foreignKey.name,row.typeMask,row.function].join('/')
+    :[row.relation??row.expected??row.schema,row.name,row.identityArguments].filter(value=>typeof value==='string').join('/')
+  const equal=(a,b)=>JSON.stringify(a)===JSON.stringify(b)
+  for(const section of Object.keys(clean)){
+    if(equal(clean[section],upgrade[section]))continue
+    if(!Array.isArray(clean[section])||!Array.isArray(upgrade[section])){
+      differences.push({section,changed:true});continue
+    }
+    const left=new Map(clean[section].map(row=>[keyFor(section,row),row]))
+    const right=new Map(upgrade[section].map(row=>[keyFor(section,row),row]))
+    if(left.size!==clean[section].length||right.size!==upgrade[section].length){
+      differences.push({section,ambiguousKeys:true,cleanCount:clean[section].length,upgradeCount:upgrade[section].length});continue
+    }
+    for(const identity of new Set([...left.keys(),...right.keys()])){
+      const l=left.get(identity),r=right.get(identity)
+      if(equal(l,r))continue
+      differences.push({section,identity,fields:l&&r?Object.keys({...l,...r}).filter(k=>!equal(l[k],r[k])):
+        [l?'missing_in_upgrade':'added_in_upgrade']})
+    }
+  }
+  return {total:differences.length,first:differences.slice(0,36)}
 }
 
 async function verifyProductCompatibleUpgrade(databaseUrl,currentBaseline,{attestCurrent}) {
@@ -793,14 +983,42 @@ async function verifyProductCompatibleUpgrade(databaseUrl,currentBaseline,{attes
     assert.deepEqual(afterRefusal.migrations,pre.migrations,'Failed old 0403 records no migration ledger row')
     assert.deepEqual(await readCredential(),retainedCredential,'Failed old 0403 preserves the exact grant')
     await applyFixtureMigrationRange(pool,{after:UNMANAGED_PIPELINE_MIGRATION,through:CALENDAR_OCCURRENCE_MIGRATION,frozen:false})
-    const after=await inspectProductionRebindHistorySchema(pool)
+    const frozenV21=await inspectPreHeldOriginalProductionRebindSchemaMetadata(pool)
     assert.deepEqual(await readCredential(),retainedCredential,'Forward 0403 and the suffix preserve every credential field')
-    assertGatewayCapabilityVocabulary(gatewayCapabilityConstraint(after.catalog),GATEWAY_CURRENT_CAPABILITIES)
+    assertGatewayCapabilityVocabulary(gatewayCapabilityConstraint(frozenV21.catalog),GATEWAY_CURRENT_CAPABILITIES)
+    assert.equal(frozenV21.format,'clawpilot-production-rebind-v21-metadata-only')
+    assert.equal(frozenV21.schemaDigest,PRE_HELD_ORIGINAL_SCHEMA_DIGEST_BY_POSTGRES_MAJOR[frozenV21.postgresMajor],
+      'Product-compatible through-0412 keeps its independently enrolled v21 fingerprint')
+    assert.deepEqual(frozenV21.missingRelations,[])
+    assert.deepEqual(frozenV21.missingFunctions,[])
+    assert.ok(frozenV21.migrations.every(m=>m.rows===1&&m.matchingRows===1))
+    const beforeHeld=await inspectProductionRebindHistorySchema(pool)
+    assert.deepEqual([...beforeHeld.missingRelations].sort(),[...HELD_ORIGINAL_RELATIONS].sort())
+    assert.deepEqual([...beforeHeld.missingFunctions].sort(),[...HELD_ORIGINAL_FUNCTIONS].sort())
+    assert.deepEqual(beforeHeld.migrations.filter(m=>m.rows!==1||m.matchingRows!==1)
+      .map(({filename,rows,matchingRows})=>[filename,rows,matchingRows]),HELD_ORIGINAL_MIGRATIONS.map(({filename})=>[filename,0,0]))
+    await assert.rejects(attestProductionRebindHistorySchema(pool),error=>
+      error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='migration_checksum_mismatch',
+      'Exact v21 is not a fallback for the current held-original migration floor')
+    const forgedHeld=await pool.connect()
+    try{
+      await forgedHeld.query('BEGIN')
+      await forgeCurrentLedgerInDisposableTransaction(forgedHeld)
+      await assert.rejects(attestProductionRebindHistorySchema(forgedHeld),error=>
+        error instanceof ProductionRebindHistorySchemaAttestationError&&error.code==='schema_object_missing',
+        'Forged 0413–0417 ledger rows cannot substitute for the actual held-original schema and guards')
+    }finally{await forgedHeld.query('ROLLBACK');forgedHeld.release()}
+    await applyFixtureMigrationRange(pool,{after:CALENDAR_OCCURRENCE_MIGRATION,through:HELD_ORIGINAL_MIGRATIONS.at(-1).filename,frozen:false})
+    const after=await inspectProductionRebindHistorySchema(pool)
+    assert.deepEqual(await readCredential(),retainedCredential,'Held-original schema preserves the existing product credential byte-for-byte')
     assert.deepEqual(after.migrations,currentBaseline.migrations)
-    assert.equal(after.schemaDigest,currentBaseline.schemaDigest,'Exact clean and product-enabled predecessor upgrades converge')
+    assert.equal(after.schemaDigest,currentBaseline.schemaDigest,after.schemaDigest===currentBaseline.schemaDigest
+      ?'Exact clean and product-enabled predecessor upgrades converge at v22'
+      :`Exact clean and product-enabled predecessor upgrades must converge at v22: ${JSON.stringify(describeCatalogDifference(currentBaseline.catalog,after.catalog))}`)
+    verifyHeldOriginalCatalogDelta(frozenV21.catalog,after.catalog)
     if(attestCurrent)await attestProductionRebindHistorySchema(pool)
-    console.log(`PG${after.postgresMajor}: original 0403 refuses retained product scope; revised 0403 retains the grant and reaches exact v21`)
-    return after.schemaDigest
+    console.log(`PG${after.postgresMajor}: exact frozen v21 and additive held-original v22 catalog; retained product grant unchanged`)
+    return {frozenV21,upgradedSchemaDigest:after.schemaDigest}
   }finally{await pool.end()}
 }
 
@@ -1126,7 +1344,7 @@ async function verifyHistoricalCatalogCompatibility(currentUrl, currentBaseline)
   } finally {await pool.end()}
 }
 
-async function verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,currentBaseline,options) {
+async function verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,frozenV21Baseline) {
   const controlPool=new Pool({connectionString:databaseUrl,max:1})
   try{await controlPool.query('CREATE DATABASE clawpilot_rebind_v19_calendar_fixture')}
   finally{await controlPool.end()}
@@ -1134,18 +1352,18 @@ async function verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,currentBaselin
   const pool=new Pool({connectionString:url.toString(),max:1})
   try{
     await applyFixtureMigrationRange(pool,{through:LEGACY_RECOVERY_MIGRATION,bootstrap:true})
-    return await verifyCalendarOccurrenceSchemaDelta(pool,currentBaseline,options)
+    return await verifyCalendarOccurrenceSchemaDelta(pool,frozenV21Baseline)
   }finally{await pool.end()}
 }
 
-async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false}={}) {
+async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false,heldOriginalDeltaOnly=false}={}) {
   checkedTamperCases = 0
   const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
   const container = `clawpilot-target-schema-attestation-${suffix}`
   const password = `target-schema-attestation-${suffix}`
   let pool
   command('docker', disposablePostgresDockerArgs([
-    'run', '--detach', '--rm', '--name', container,
+    'run', '--detach', '--rm', '--pull', 'never', '--name', container,
     '--env', `POSTGRES_PASSWORD=${password}`,
     '--env', 'POSTGRES_DB=clawpilot_target_schema_attestation',
     '--publish', '127.0.0.1::5432',
@@ -1153,15 +1371,15 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
   ]))
   try {
     const portOutput = command('docker', ['port', container, '5432/tcp']).trim()
-    const port = portOutput.slice(portOutput.lastIndexOf(':') + 1)
-    assert.match(port, /^\d+$/u, 'Docker published a PostgreSQL port')
+    const port = portOutput.match(/^127\.0\.0\.1:(\d+)$/u)?.[1]
+    assert.ok(port,'Docker published an exact loopback-only PostgreSQL port')
     const databaseUrl =
       `postgresql://postgres:${password}@127.0.0.1:${port}/clawpilot_target_schema_attestation`
     await waitForPostgres(databaseUrl)
 
     // Use the production migration runner against a blank database. This is
     // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0412
+    // 0370 through 0417
     // migrations, their prerequisites, and their real ledger rows execute.
     const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
       env: {
@@ -1190,10 +1408,17 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
     assert.ok(applied.rows.every((row) => row.has_applied_at === true))
 
     const baseline = await inspectProductionRebindHistorySchema(pool)
-    if(diagnosticOnly||calendarDeltaOnly){
+    if(diagnosticOnly||calendarDeltaOnly||heldOriginalDeltaOnly){
       await pool.end(); pool=undefined
-      const proof=await verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,baseline,{pinsEnrolled:!diagnosticOnly})
-      const upgradedSchemaDigest=await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:!diagnosticOnly})
+      const {frozenV21,upgradedSchemaDigest}=await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:!diagnosticOnly})
+      if(heldOriginalDeltaOnly){
+        pool=new Pool({connectionString:databaseUrl,max:1})
+        await attestProductionRebindHistorySchema(pool)
+        await verifyHeldOriginalTamper(pool,baseline.catalog,frozenV21.catalog)
+        console.log(`${image}: ${checkedTamperCases} focused 0413–0417 tamper refusals passed; full historical matrix is a separate gate`)
+        return
+      }
+      const proof=await verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,frozenV21)
       if(calendarDeltaOnly){
         pool=new Pool({connectionString:databaseUrl,max:1})
         await attestProductionRebindHistorySchema(pool)
@@ -1204,7 +1429,7 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
       // This mode only inspects disposable migrated databases and never
       // attests or reports acceptance. Pins still require independent review
       // followed by the full normal historical/tamper acceptance run.
-      const directory=mkdtempSync(resolve(tmpdir(),'clawpilot-rebind-v21-diagnostic-'))
+      const directory=mkdtempSync(resolve(tmpdir(),'clawpilot-rebind-v22-diagnostic-'))
       const path=resolve(directory,`pg${baseline.postgresMajor}.json`)
       const manifest=JSON.stringify(baseline,null,2)+'\n'
       writeFileSync(path,manifest,{flag:'wx',mode:0o600})
@@ -1213,7 +1438,8 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
         currentProjection:proof.before},null,2)+'\n'
       writeFileSync(pre0412Path,pre0412Manifest,{flag:'wx',mode:0o600})
       console.log(JSON.stringify({diagnosticOnly:true,image,postgresMajor:baseline.postgresMajor,
-        schemaDigest:baseline.schemaDigest,upgradedSchemaDigest,manifestSha256:createHash('sha256').update(manifest).digest('hex'),path,
+        schemaDigest:baseline.schemaDigest,upgradedSchemaDigest,frozenV21Digest:frozenV21.schemaDigest,
+        manifestSha256:createHash('sha256').update(manifest).digest('hex'),path,
         pre0412Path,pre0412ManifestSha256:createHash('sha256').update(pre0412Manifest).digest('hex')}))
       return
     }
@@ -1225,8 +1451,8 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
     // This is serial acceptance; do not retain idle catalog-heavy backends in
     // both databases inside the deliberately bounded disposable container.
     await pool.end(); pool = undefined
-    const historical = await verifyHistoricalCatalogCompatibility(databaseUrl, baseline)
-    await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:true})
+    const {frozenV21}=await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:true})
+    const historical = await verifyHistoricalCatalogCompatibility(databaseUrl, frozenV21)
     pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
     await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog, CURRENT_CRM_REFERENCE_CONSTRAINTS)
@@ -1319,8 +1545,9 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
       assert.ok(source,`${identity} source is present in frozen 0402`)
       assert.equal(fn.source,source,`${identity} executes the exact frozen migration body`)
     }
-    assert.equal(baseline.catalog.additionalSchemas.length,1,'v19 enrolls the exact private recovery schema')
-    const privateSchema=baseline.catalog.additionalSchemas[0]
+    assert.deepEqual(baseline.catalog.additionalSchemas.map(schema=>schema.name).sort(),
+      ['crm_legacy_email_retirement',HELD_ORIGINAL_SCHEMA].sort(),'v22 enrolls both exact private schemas')
+    const privateSchema=baseline.catalog.additionalSchemas.find(schema=>schema.name==='crm_legacy_email_retirement')
     assert.equal(privateSchema.name,'crm_legacy_email_retirement')
     assert.equal(privateSchema.ownerIsCurrentUser,true)
     assert.equal(privateSchema.aclIsDefault,false)
@@ -1480,13 +1707,14 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
       "provider=ANYARRAY['shopify'::text,'faire'::text]ANDstate=ANYARRAY['processing'::text,'failed'::text]",
     )
 
-    console.log(`${image} candidate v21 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
+    console.log(`${image} candidate v22 semantic target schema digest ${baseline.schemaDigest} (diagnostic only until full tamper acceptance)`)
     const evidence = await attestProductionRebindHistorySchema(pool)
-    assert.equal(evidence.format,'clawpilot-production-rebind-target-schema-attestation-v21',
-      'Current evidence never reuses a historical v19 or v20 receipt format')
+    assert.equal(evidence.format,'clawpilot-production-rebind-target-schema-attestation-v22',
+      'Current evidence never reuses a historical v19, v20 or v21 receipt format')
     assert.equal(evidence.postgresMajor, baseline.postgresMajor)
     assert.equal(evidence.schemaDigest, baseline.schemaDigest)
     await verifyCalendarOccurrenceTamper(pool,baseline.catalog)
+    await verifyHeldOriginalTamper(pool,baseline.catalog,frozenV21.catalog)
 
     // The reviewed suffix is part of the complete current catalog, not an
     // exclusion by trigger name or a blanket acceptance of additive objects.
@@ -1499,7 +1727,8 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
       await expectFailure(pool,'schema_catalog_mismatch',`v19 ${identity} PUBLIC execution drift`,tx=>tx.query(`GRANT EXECUTE ON FUNCTION ${identity} TO PUBLIC`))
     }
     const recoveryTriggers=baseline.catalog.triggers.filter(t=>!t.internal&&(
-      t.name.includes('legacy_email')||t.name.startsWith('repair_')||narrowedControlColumns.has(t.name)))
+      t.name.includes('legacy_email')||t.name.startsWith('repair_')||narrowedControlColumns.has(t.name))
+      &&!HELD_ORIGINAL_GUARDS.some(([relation,name])=>t.relation===relation&&t.name===name))
     assert.equal(recoveryTriggers.length,55,'All exact reviewed recovery guards on old and new relations are directly enrolled')
     for(const trigger of recoveryTriggers){
       await expectFailure(pool,'schema_catalog_mismatch',`v19 ${trigger.relation}.${trigger.name} disabled`,tx=>tx.query(
@@ -1645,8 +1874,9 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
     await expectFailure(pool,'schema_catalog_mismatch','missing exact root registry ledger guard',tx=>tx.query(
       'ALTER TABLE public.crm_native_email_authority_root_changes DISABLE TRIGGER crm_native_root_change_guard'))
 
+    const focusedLedgerTamper=new Set([CALENDAR_OCCURRENCE_MIGRATION,...HELD_ORIGINAL_MIGRATIONS.map(m=>m.filename)])
     for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
-      if(expected.filename===CALENDAR_OCCURRENCE_MIGRATION) continue // Exercised by verifyCalendarOccurrenceTamper.
+      if(focusedLedgerTamper.has(expected.filename)) continue // Covered by focused tamper probes.
       await expectLedgerFailure(pool, expected.filename)
     }
     await expectLedgerFailure(pool, REVIEWED_COMPANY_MIGRATION, true)
@@ -1655,7 +1885,7 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
     await expectLedgerFailure(pool, INITIAL_DEMO_QUARANTINE_MIGRATION, true)
     await expectLedgerFailure(pool, ROOT_OWNER_SOURCE_FENCE_MIGRATION, true)
     for(const migration of PRODUCTION_REBIND_SCHEMA_MIGRATIONS.filter(m=>Number(m.filename.slice(0,4))>=403
-      &&m.filename!==CALENDAR_OCCURRENCE_MIGRATION))
+      &&!focusedLedgerTamper.has(m.filename)))
       await expectLedgerFailure(pool,migration.filename,true)
 
     for (const [constraint, expected] of REVIEWED_EMAIL_REFERENCE_CONSTRAINTS) {
@@ -1968,12 +2198,14 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args=process.argv.slice(2)
-  assert.ok(args.length===0||(args.length===1&&['--diagnostic-current-schema','--check-calendar-schema-delta'].includes(args[0])),
+  assert.ok(args.length===0||(args.length===1&&['--diagnostic-current-schema','--check-calendar-schema-delta','--check-held-original-schema-delta'].includes(args[0])),
     'Unknown schema test arguments')
   const diagnosticOnly=args[0]==='--diagnostic-current-schema'
   const calendarDeltaOnly=args[0]==='--check-calendar-schema-delta'
-  for (const image of images) await exerciseImage(image,{diagnosticOnly,calendarDeltaOnly})
-  console.log(diagnosticOnly?'Disposable v21 diagnostics only; no current schema acceptance performed'
+  const heldOriginalDeltaOnly=args[0]==='--check-held-original-schema-delta'
+  for (const image of images) await exerciseImage(image,{diagnosticOnly,calendarDeltaOnly,heldOriginalDeltaOnly})
+  console.log(diagnosticOnly?'Disposable v22 diagnostics only; no current schema acceptance performed'
     :calendarDeltaOnly?`0412 focused schema delta passed (${images.join(', ')})`
+    :heldOriginalDeltaOnly?`0413–0417 focused schema delta passed (${images.join(', ')})`
     :`production rebind target schema attestation passed (${images.join(', ')})`)
 }

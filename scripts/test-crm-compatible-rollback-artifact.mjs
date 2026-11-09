@@ -6,8 +6,8 @@ import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { buildRollbackArtifact, canonicalJson, committedRollbackIdentity, inspectRollbackSources,
-  LEGACY_WRITER_COMMIT, REQUIRED_RETAINED_V20_CHECKS, REQUIRED_RETAINED_V21_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, ROLLBACK_BUILD_FORMAT,
-  ROLLBACK_PROTECTED_PATHS, retainedV20MigrationInventory, retainedV21MigrationInventory, rollbackReceiptSource, sha256, validateRollbackReceipts,
+  LEGACY_WRITER_COMMIT, REQUIRED_RETAINED_V20_CHECKS, REQUIRED_RETAINED_V21_CHECKS, REQUIRED_RETAINED_V22_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, ROLLBACK_BUILD_FORMAT,
+  ROLLBACK_PROTECTED_PATHS, retainedV20MigrationInventory, retainedV21MigrationInventory, retainedV22MigrationInventory, rollbackReceiptSource, sha256, validateRollbackReceipts,
   verifyRollbackArtifact } from './lib/crm-compatible-rollback-artifact.mjs'
 
 const temporary = mkdtempSync(join(tmpdir(), 'clawpilot-rollback-artifact-test-'))
@@ -36,7 +36,7 @@ try {
   const enrollment = paths => paths.map(path => `{filename: '${path.split('/').at(-1)}', checksum: '${sha256(sources[path])}'}`).join(',')
   const oldFolderChecksum = sha256('historical 0403 fixture bytes')
   sources['scripts/production-rebind-history-schema-attestation.mjs'] = `
-    const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT = 'clawpilot-production-rebind-target-schema-attestation-v21';
+    const PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT = 'clawpilot-production-rebind-target-schema-attestation-v22';
     const manifest = [${enrollment(ROLLBACK_PROTECTED_PATHS.filter(path=>path.startsWith('db/migrations/')&&!compatibilityPaths.includes(path)))},
       {filename: '0403_fractional_crm_customer_folder_capability.sql', checksum: '${oldFolderChecksum}'}];
     const FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS = Object.freeze([${enrollment(compatibilityPaths)}]);
@@ -51,11 +51,11 @@ try {
   git(['add', '.']); git(['commit', '--quiet', '-m', 'Synthetic compatible floor'])
   const commit = git(['rev-parse', 'HEAD']).trim()
   const identity = committedRollbackIdentity(repository, commit)
-  const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV21MigrationInventory(identity.sourceTree)
+  const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV22MigrationInventory(identity.sourceTree)
   const acceptance = { format: ROLLBACK_ACCEPTANCE_FORMAT, status: 'passed', source: rollbackReceiptSource(identity),
     legacyWriterCommit: LEGACY_WRITER_COMMIT, postgresMajor: 16, checks: [...REQUIRED_ROLLING_CHECKS],
     retainedSchema: { migrationCount, lastMigration, sourceInventorySha256,
-      schemaDigest: identity.attestation.postgresDigests[16], checks: [...REQUIRED_RETAINED_V21_CHECKS] } }
+      schemaDigest: identity.attestation.postgresDigests[16], checks: [...REQUIRED_RETAINED_V22_CHECKS] } }
   const build = { format: ROLLBACK_BUILD_FORMAT, status: 'passed', source: rollbackReceiptSource(identity),
     command: ['npm', 'run', 'build'], nodeVersion: 'v24.19.0', environmentMode: 'isolated-committed-source-no-provider-credentials',
     outputFiles: Object.fromEntries(['app_src/.next/BUILD_ID', 'app_src/.next/build-manifest.json', 'app_src/.next/routes-manifest.json']
@@ -69,19 +69,19 @@ try {
   })
   check('actual checkout can be inspected with the current floor policy', () => {
     const inspected = inspectRollbackSources(path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8'))
-    assert.equal(inspected.attestation.format, 'clawpilot-production-rebind-target-schema-attestation-v21')
-    const protectedMigrationNames = Object.keys(inspected.protectedFiles).filter(path => /^db\/migrations\/04(?:0[3-9]|1[0-2])_/u.test(path))
+    assert.equal(inspected.attestation.format, 'clawpilot-production-rebind-target-schema-attestation-v22')
+    const protectedMigrationNames = Object.keys(inspected.protectedFiles).filter(path => /^db\/migrations\/04(?:0[3-9]|1[0-7])_/u.test(path))
     assert.deepEqual(protectedMigrationNames.map(path => path.slice(14, 18)),
-      Array.from({ length: 10 }, (_, offset) => String(403 + offset).padStart(4, '0')))
+      Array.from({ length: 15 }, (_, offset) => String(403 + offset).padStart(4, '0')))
     assert.equal(inspected.protectedFiles[productMigration], sha256(readFileSync(new URL(`../${productMigration}`, import.meta.url))))
   })
   check('historical or unknown future metadata cannot certify a new floor', () => {
-    for (const version of [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22]) {
+    for (const version of [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23]) {
       assert.throws(() => inspectRollbackSources(path => path === 'scripts/production-rebind-history-schema-attestation.mjs'
-        ? sources[path].replace('schema-attestation-v21', `schema-attestation-v${version}`) : sources[path]), /exact current catalog/)
+        ? sources[path].replace('schema-attestation-v22', `schema-attestation-v${version}`) : sources[path]), /exact current catalog/)
     }
   })
-  const laterMigrations = ROLLBACK_PROTECTED_PATHS.filter(path => path===productMigration || /^db\/migrations\/(?:0399|04(?:0[0-9]|1[0-2]))_/u.test(path))
+  const laterMigrations = ROLLBACK_PROTECTED_PATHS.filter(path => path===productMigration || /^db\/migrations\/(?:0399|04(?:0[0-9]|1[0-7]))_/u.test(path))
   check('later authority migration source must match the exact enrolled checksum',()=>{
     for(const migrationPath of laterMigrations){
       assert.throws(()=>inspectRollbackSources(path=>path===migrationPath
@@ -106,20 +106,36 @@ try {
     assert.throws(() => validateRollbackReceipts(identity, { ...acceptance, checks: acceptance.checks.slice(1) }, build))
     assert.throws(() => validateRollbackReceipts(identity, acceptance, { ...build, nodeVersion: 'v18.0.0' }))
   })
-  check('older narrow receipt, stale migration inventory and incomplete retained checks cannot certify v21', () => {
+  check('older narrow receipt, stale migration inventory and incomplete retained checks cannot certify v22', () => {
     const { retainedSchema, ...narrowReceipt } = acceptance
-    assert.throws(() => validateRollbackReceipts(identity, narrowReceipt, build), /retained v21 schema transition/)
+    assert.throws(() => validateRollbackReceipts(identity, narrowReceipt, build), /retained v22 schema transition/)
     for (const override of [{ migrationCount: migrationCount - 1 }, { sourceInventorySha256: '0'.repeat(64) }, { schemaDigest: '9'.repeat(64) },
-      { checks: [...REQUIRED_RETAINED_V20_CHECKS] }, { lastMigration: 'db/migrations/0402_stale.sql' }]) {
+      { checks: [...REQUIRED_RETAINED_V21_CHECKS] }, { lastMigration: 'db/migrations/0402_stale.sql' }]) {
       assert.throws(() => validateRollbackReceipts(identity, { ...narrowReceipt, retainedSchema: { ...retainedSchema, ...override } }, build),
-        /retained v21 schema transition/)
+        /retained v22 schema transition/)
     }
-    assert.throws(() => retainedV21MigrationInventory([...identity.sourceTree,
-      { path: 'db/migrations/0413_unknown.sql', gitBlob: '1'.repeat(40) }]), /unexpected final migration/)
+    assert.throws(() => retainedV22MigrationInventory([...identity.sourceTree,
+      { path: 'db/migrations/0418_unknown.sql', gitBlob: '1'.repeat(40) }]), /unexpected final migration/)
+    assert.throws(() => retainedV22MigrationInventory(identity.sourceTree.filter(({ path }) => !path.startsWith('db/migrations/0415_'))),
+      /exact ordered held-original migration suffix/)
     assert.throws(() => retainedV20MigrationInventory(identity.sourceTree), /retained v21 proof/)
   })
-  const historicalProtected = { ...identity.protectedFiles }; delete historicalProtected[productMigration]
-  const historicalSourceTree = identity.sourceTree.filter(({ path }) => path !== productMigration)
+  const isHeldMigration = path => /^db\/migrations\/041[3-7]_/u.test(path)
+  const preHeldProtected = Object.fromEntries(Object.entries(identity.protectedFiles).filter(([path]) => !isHeldMigration(path)))
+  const preHeldSourceTree = identity.sourceTree.filter(({ path }) => !isHeldMigration(path))
+  const v21 = { ...identity, protectedFiles: preHeldProtected, sourceTree: preHeldSourceTree,
+    attestation: { ...identity.attestation, format: 'clawpilot-production-rebind-target-schema-attestation-v21' } }
+  check('historical v21 receipt remains readable but cannot be substituted for v22', () => {
+    const source = rollbackReceiptSource(v21)
+    const { paths: _paths, ...v21Inventory } = retainedV21MigrationInventory(v21.sourceTree)
+    const v21Acceptance = { ...acceptance, source, retainedSchema: { ...v21Inventory,
+      schemaDigest: v21.attestation.postgresDigests[16], checks: [...REQUIRED_RETAINED_V21_CHECKS] } }
+    assert.doesNotThrow(() => validateRollbackReceipts(v21, v21Acceptance, { ...build, source }))
+    assert.throws(() => validateRollbackReceipts({ ...identity, attestation: v21.attestation }, acceptance, build), /different attestation/)
+    assert.throws(() => validateRollbackReceipts({ ...v21, attestation: identity.attestation }, v21Acceptance, { ...build, source }), /unexpected final migration/)
+  })
+  const historicalProtected = { ...preHeldProtected }; delete historicalProtected[productMigration]
+  const historicalSourceTree = preHeldSourceTree.filter(({ path }) => path !== productMigration)
   const historicalIdentity = { ...identity, protectedFiles: historicalProtected, sourceTree: historicalSourceTree }
   check('historical v20 receipt remains readable but cannot be substituted for v21', () => {
     const v20 = { ...historicalIdentity, attestation: { ...identity.attestation, format: 'clawpilot-production-rebind-target-schema-attestation-v20' } }
@@ -129,11 +145,12 @@ try {
       schemaDigest: v20.attestation.postgresDigests[16], checks: [...REQUIRED_RETAINED_V20_CHECKS] } }
     assert.doesNotThrow(() => validateRollbackReceipts(v20, v20Acceptance, { ...build, source }))
     assert.throws(() => validateRollbackReceipts({ ...identity, attestation: v20.attestation }, acceptance, build), /different attestation/)
-    assert.throws(() => validateRollbackReceipts({ ...v20, attestation: identity.attestation }, v20Acceptance, { ...build, source }), /v21 proof lacks/)
+    assert.throws(() => validateRollbackReceipts({ ...v20, attestation: v21.attestation }, v20Acceptance, { ...build, source }), /v21 proof lacks/)
   })
-  check('v21 receipt must protect the actual gateway route, authorization and persistence source', () => {
+  check('v22 receipt must protect the actual gateway and same-job authority sources', () => {
     for (const omitted of ['app_src/app/api/integrations/fractional-crm/v1/[...path]/route.ts',
-      'app_src/lib/fractionalCrmGatewayAuth.ts', 'app_src/lib/persistence/fractionalCrmGateway.ts']) {
+      'app_src/lib/fractionalCrmGatewayAuth.ts', 'app_src/lib/persistence/fractionalCrmGateway.ts',
+      'app_src/lib/persistence/crmLegacyEmailTerminalHold.ts', 'app_src/lib/persistence/crmHeldOriginalRecoveryStage.ts']) {
       const protectedFiles = { ...identity.protectedFiles }; delete protectedFiles[omitted]
       const incomplete = { ...identity, protectedFiles }, source = rollbackReceiptSource(incomplete)
       assert.throws(() => validateRollbackReceipts(incomplete, { ...acceptance, source }, { ...build, source }), /does not protect/)

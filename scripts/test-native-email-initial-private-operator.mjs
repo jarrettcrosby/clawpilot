@@ -5,7 +5,8 @@ import assert from 'node:assert/strict'
 import {constants,createHash,generateKeyPairSync,sign} from 'node:crypto'
 import {spawnSync} from 'node:child_process'
 import {createRequire} from 'node:module'
-import {readFileSync,realpathSync} from 'node:fs'
+import {chmodSync,mkdtempSync,readFileSync,realpathSync,rmSync,symlinkSync,writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
 import {isAbsolute,join,resolve} from 'node:path'
 assert.equal(process.versions.node.split('.')[0],'24')
 assert.equal(process.argv.length,3,'Use --build=/absolute/generated-operator-directory')
@@ -23,10 +24,17 @@ if(!process.execArgv.includes('--conditions=react-server')){
   process.stdout.write(child.stdout);process.stderr.write(child.stderr);process.exit(child.status??1)
 }
 const require=createRequire(entry),{NativeEmailInitialEnrollmentCliTransport:Transport,createNativeEmailInitialCliCommandRunner:createRunner}=require(join(root,'lib/crm/nativeEmailInitialEnrollmentCliTransport.js'))
-const {runNativeEmailInitialPrivateOperator:runOperator,reuseVerifiedNativeEmailInitialOrigin:reuseOrigin,nativeEmailInitialOperatorDatabaseConfig:databaseConfig}=require(entry)
+const {runNativeEmailInitialPrivateOperator:runOperator,reuseVerifiedNativeEmailInitialOrigin:reuseOrigin,
+  nativeEmailInitialOperatorDatabaseConfig:databaseConfig,createNativeEmailInitialOperatorTransaction:createTransaction}=require(entry)
 const op='1'.repeat(64),hash='2'.repeat(64),sourceDigest=sha('source\n'),binary=realpathSync('/usr/bin/true')
+const databaseIdentity={systemIdentifier:'7638853025209610328',databaseOid:'16384',sessionRole:'owner',effectiveRole:'operator'}
+const identityDirectory=realpathSync(mkdtempSync(join(tmpdir(),'clawpilot-initial-identity-fixture.')))
+process.once('exit',()=>rmSync(identityDirectory,{recursive:true,force:true}))
+const railwayIdentityFile=join(identityDirectory,'fixture-identity')
+writeFileSync(railwayIdentityFile,'Synthetic fixture only.\n',{flag:'wx',mode:0o600})
 const target={railwayBinary:binary,railwayBinarySha256:sha(readFileSync(binary)),projectId:'00000000-0000-4000-8000-000000000001',
-  environmentId:'00000000-0000-4000-8000-000000000002',serviceId:'00000000-0000-4000-8000-000000000003',nativeInstanceId:'synthetic-operator',
+  environmentId:'00000000-0000-4000-8000-000000000002',serviceId:'00000000-0000-4000-8000-000000000003',
+  deploymentInstanceId:'00000000-0000-4000-8000-000000000004',railwayIdentityFile,nativeInstanceId:'synthetic-operator',
   database:'synthetic_operator',serviceUserId:'1',oauthClientId:'client',cliSourceHash:hash,imagePackageHash:hash}
 function canonical(v){if(Array.isArray(v))return '['+v.map(canonical).join(',')+']'
   if(v&&typeof v==='object')return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}'
@@ -47,10 +55,11 @@ await check('compiled production marker still refuses ordinary Node import; reac
   for(const file of Object.keys(manifest.outputs).filter(f=>f.endsWith('.js')&&!f.includes('/node_modules/'))){
     const source=readFileSync(join(root,file),'utf8');assert.doesNotMatch(source,/new Function\(|transpileModule\(/)}
 })
-await check('fixed authenticated SSH argv stages actual path-keyed metadata without loosening permission JSON grammar',async()=>{
+await check('every SSH call pins the exact Railway instance and private identity before the fixed PHP command',async()=>{
   const calls=[];const runner=async command=>{calls.push(command);const args=command.args
-    assert.deepEqual(args.slice(0,8),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,'--'])
-    assert.equal(args[8],'php');assert.equal(command.program,binary);assert.ok(args.includes('--quiescent'))
+    assert.deepEqual(args.slice(0,13),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,
+      '--deployment-instance',target.deploymentInstanceId,'--identity-file',railwayIdentityFile,'--','php'])
+    assert.equal(command.program,binary);assert.ok(args.includes('--quiescent'))
     if(args.includes('bootstrap'))return canonical(bootstrap)+'\n'
     if(args.includes('stage-input')){const input=JSON.parse(command.stdin);assert.equal(input.operationId,op)
       assert.equal(args.find(a=>a.startsWith('--sha256=')),'--sha256='+sha(command.stdin));assert.ok(args.includes('--previous=none'))
@@ -60,6 +69,31 @@ await check('fixed authenticated SSH argv stages actual path-keyed metadata with
     throw Error('unexpected command')}
   const transport=new Transport(target,runner),source={operationId:op,nativeInstanceId:target.nativeInstanceId,appGeneration:1,appSourceFingerprint:hash,mappings:[]}
   const bytes=await transport.inspectSource(source);assert.equal(JSON.parse(bytes).purpose,'clawpilot-native-email-initial-source');assert.equal(calls.length,4)
+})
+await check('missing or malformed target pins and unsafe identities fail before invoking any remote command',async()=>{
+  const {deploymentInstanceId,railwayIdentityFile:identity,...legacy}=target
+  let calls=0;const runner=async()=>{calls++;return ''}
+  for(const invalid of [legacy,{...target,deploymentInstanceId:[]},{...target,deploymentInstanceId:'--latest'},
+    {...target,deploymentInstanceId:deploymentInstanceId+'\n'},{...target,railwayIdentityFile:'relative'},
+    {...target,railwayIdentityFile:identity+'\0'},{...target,railwayIdentityFile:identity+'-missing'},
+    {...target,railwayIdentityFile:identityDirectory}])assert.throws(()=>new Transport(invalid,runner),held)
+  const linked=join(identityDirectory,'fixture-link')
+  symlinkSync(identity,linked)
+  assert.throws(()=>new Transport({...target,railwayIdentityFile:linked},runner),held)
+  const transport=new Transport(target,runner)
+  chmodSync(identity,0o644)
+  try{
+    assert.throws(()=>new Transport(target,runner),held)
+    await assert.rejects(transport.originStatus(op),held)
+  }finally{chmodSync(identity,0o600)}
+  assert.equal(calls,0)
+  const legacyConfig=join(identityDirectory,'legacy-config.json')
+  const bytes=JSON.stringify({version:1,purpose:'clawpilot-native-email-initial-private-operator',
+    selection:{actorEmail:'fixture@example.invalid',operatorAccountId:op,rootWorkspaceId:op,nativeInstanceId:target.nativeInstanceId},
+    native:legacy,databaseName:'fixture',databaseIdentity,artifactDirectory:identityDirectory,issuer:{keyId:'fixture',publicKey:'fixture'}})
+  writeFileSync(legacyConfig,bytes,{flag:'wx',mode:0o600})
+  await assert.rejects(runOperator(['--action=preview','--config='+legacyConfig,'--config-sha256='+sha(bytes)]),
+    e=>e?.code==='initial_cli_transport_shape'||e?.message==='initial_cli_transport_shape')
 })
 await check('changed CLI package metadata, noncanonical responses and wrong instance fail closed before staging',async()=>{
   const source={operationId:op,nativeInstanceId:target.nativeInstanceId,appGeneration:1,appSourceFingerprint:hash,mappings:[]}
@@ -143,13 +177,58 @@ await check('private CLI rejects absent explicit operation approval before datab
     '--predecessor-operation='+replanContext.rootOperationId]),held)
 })
 await check('database parser rejects remote host and SSL overrides behind a loopback URL',()=>{
-  const valid=databaseConfig('postgresql://owner:private@localhost:5433/fixture','fixture')
+  const valid=databaseConfig('postgresql://owner:private@localhost:5433/fixture','fixture',databaseIdentity.sessionRole)
   assert.equal(valid.host,'localhost');assert.equal(valid.port,5433);assert.equal(valid.ssl,false);assert.equal(valid.database,'fixture')
   for(const url of ['postgresql://owner:private@localhost/fixture?host=remote.example&sslmode=disable',
     'postgresql://owner:private@localhost/fixture?host=remote.example','postgresql://owner:private@remote.example/fixture?sslmode=disable',
-    'postgresql://owner:private@remote.example/fixture?sslmode=verify-full&sslmode=disable','postgresql://owner:private@localhost/fixture?user=other'])
-    assert.throws(()=>databaseConfig(url,'fixture'),held)
-  assert.deepEqual(databaseConfig('postgresql://owner:private@remote.example/fixture?sslmode=verify-full','fixture').ssl,{rejectUnauthorized:true})
+    'postgresql://owner:private@remote.example/fixture?sslmode=verify-full&sslmode=disable','postgresql://owner:private@localhost/fixture?user=other',
+    'postgresql://other:private@localhost/fixture'])
+    assert.throws(()=>databaseConfig(url,'fixture',databaseIdentity.sessionRole),held)
+  assert.deepEqual(databaseConfig('postgresql://owner:private@remote.example/fixture?sslmode=verify-full','fixture',databaseIdentity.sessionRole).ssl,
+    {rejectUnauthorized:true})
+})
+await check('every checked-out transaction binds physical cluster, database and both roles before its application query',async()=>{
+  const identity={database_name:'fixture',database_oid:databaseIdentity.databaseOid,system_identifier:databaseIdentity.systemIdentifier,
+    session_role:databaseIdentity.sessionRole,effective_role:databaseIdentity.effectiveRole,primary_server:true}
+  const scripts=[[identity],[{...identity,system_identifier:'1'}],[identity]]
+  const events=[]
+  const pool={async connect(){const script=scripts.shift(),calls=[];events.push(calls)
+    return {async query(sql,values){calls.push(sql)
+      if(sql.includes('pg_catalog.pg_control_system()')){
+        for(const expected of ['pg_catalog.pg_database','pg_catalog.current_database()','pg_catalog.pg_is_in_recovery()','SESSION_USER','CURRENT_USER'])
+          assert.ok(sql.includes(expected))
+        return {rows:script}
+      }
+      if(sql==='SELECT fixture'){assert.deepEqual(values,[37]);return {rows:[{value:37}]}}
+      return {rows:[]}
+    },release(){calls.push('RELEASE')}}
+  }}
+  const transaction=createTransaction(pool,'fixture',databaseIdentity)
+  const work=async db=>(await db.query('SELECT fixture',[37])).rows[0].value
+  assert.equal(await transaction(work),37)
+  await assert.rejects(transaction(()=>assert.fail('Wrong cluster ran application SQL')),held)
+  assert.equal(await transaction(work),37)
+  for(const [index,steps]of events.entries()){
+    assert.equal(steps[0],'BEGIN');assert.match(steps[1],/pg_catalog\.pg_control_system\(\)/u)
+    assert.deepEqual(steps.slice(2),index===1?['ROLLBACK','RELEASE']:['SELECT fixture','COMMIT','RELEASE'])
+  }
+  for(const rows of [[],[identity,identity],[{...identity,database_name:'other'}],[{...identity,database_oid:'42'}],
+    [{...identity,session_role:'other'}],[{...identity,effective_role:'other'}],[{...identity,primary_server:false}],
+    new Error('postgres permission denied fixture private details')]){
+    const steps=[]
+    const tx=createTransaction({async connect(){return {async query(sql){steps.push(sql)
+      if(sql.includes('pg_catalog.pg_control_system()')){if(rows instanceof Error)throw rows;return {rows}}
+      return {rows:[]}
+    },release(){steps.push('RELEASE')}}}},'fixture',databaseIdentity)
+    await assert.rejects(tx(()=>assert.fail('Unproven session ran application SQL')),
+      e=>e?.code==='initial_private_operator_database_identity_unproven'&&!JSON.stringify(e).includes('private details'))
+    assert.deepEqual(steps.slice(2),['ROLLBACK','RELEASE'])
+  }
+  for(const pins of [null,{...databaseIdentity,systemIdentifier:42},{...databaseIdentity,systemIdentifier:'18446744073709551616'},
+    {...databaseIdentity,databaseOid:'4294967296'},{...databaseIdentity,databaseOid:'016384'},
+    {...databaseIdentity,sessionRole:'owner\n'},{...databaseIdentity,effectiveRole:''},{...databaseIdentity,unexpected:true}]){
+    assert.throws(()=>createTransaction({connect(){assert.fail('Invalid config attempted to connect')}},'fixture',pins),held)
+  }
 })
 await check('lost origin publication retries reuse original signed bytes after fresh immutable-origin verification',()=>{
   const keys=generateKeyPairSync('rsa',{modulusLength:3072}),publicKey=keys.publicKey.export({type:'spki',format:'pem'})

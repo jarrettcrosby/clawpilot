@@ -61,7 +61,7 @@ export function reserveNativeEmailAccountRepairJournal(path: string, input: unkn
 /** Internal filesystem primitive. Each caller must first parse and encode
  * its own exact journal domain. No fallback, overwrite, or removal. */
 export function writeNativeEmailPrivateJournalOnce(path: string, bytes: string,
-  codePrefix: 'legacy_email_account_repair_journal_' | 'legacy_email_archive_journal_'): void {
+  codePrefix: 'legacy_email_account_repair_journal_' | 'legacy_email_archive_journal_' | 'legacy_email_terminal_hold_journal_'): void {
   function requireFile(value: unknown, code: string): asserts value {
     requireNativeEmail(value, codePrefix + code)
   }

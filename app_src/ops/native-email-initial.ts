@@ -16,13 +16,27 @@ import {createNativeEmailInitialStartupOriginIssuer,type NativeEmailInitialStart
 import type {NativeEmailSqlTransaction} from '../lib/crm/nativeEmailPublicationPostgres'
 
 type Row=Record<string,unknown>
+type DatabaseIdentity=Readonly<{systemIdentifier:string;databaseOid:string;sessionRole:string;effectiveRole:string}>
 type Config={version:1;purpose:'clawpilot-native-email-initial-private-operator';selection:NativeEmailInitialOperatorSelection;
-  native:NativeEmailInitialCliTarget;databaseName:string;artifactDirectory:string;issuer:{keyId:string;publicKey:string}}
+  native:NativeEmailInitialCliTarget;databaseName:string;databaseIdentity:DatabaseIdentity;
+  artifactDirectory:string;issuer:{keyId:string;publicKey:string}}
 const HASH=/^[a-f0-9]{64}(?![\s\S])/
+const DATABASE_NAME=/^[A-Za-z0-9_]{1,64}(?![\s\S])/
+const ROLE_NAME=/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}(?![\s\S])/
+const POSITIVE_DECIMAL=/^[1-9][0-9]{0,19}(?![\s\S])/
+const UINT32=BigInt('4294967295'),UINT64=BigInt('18446744073709551615')
 const hash=(bytes:string|Buffer)=>createHash('sha256').update(bytes).digest('hex')
 function need(value:unknown,code:string):asserts value{requireNativeEmail(value,'initial_private_operator_'+code)}
 function exact(value:unknown,keys:string[]):asserts value is Row{need(value&&typeof value==='object'&&!Array.isArray(value)
   &&JSON.stringify(Object.keys(value).sort())===JSON.stringify([...keys].sort()),'shape')}
+function databaseIdentity(input:unknown):DatabaseIdentity{
+  exact(input,['systemIdentifier','databaseOid','sessionRole','effectiveRole'])
+  const {systemIdentifier,databaseOid,sessionRole,effectiveRole}=input
+  const decimal=(v:unknown,max:bigint):v is string=>typeof v==='string'&&POSITIVE_DECIMAL.test(v)&&BigInt(v)<=max
+  need(decimal(systemIdentifier,UINT64)&&decimal(databaseOid,UINT32)
+    &&typeof sessionRole==='string'&&ROLE_NAME.test(sessionRole)&&typeof effectiveRole==='string'&&ROLE_NAME.test(effectiveRole),'database_identity_pin')
+  return Object.freeze({systemIdentifier,databaseOid,sessionRole,effectiveRole})
+}
 function privateDirectory(path:string){need(isAbsolute(path)&&realpathSync(path)===path,'private_path')
   const meta=lstatSync(path);need(meta.isDirectory()&&!meta.isSymbolicLink()&&meta.uid===process.getuid?.()&&(meta.mode&0o777)===0o700,'directory_protection')}
 function privateRead(path:string,expectedHash?:string){need(isAbsolute(path),'private_path');privateDirectory(dirname(path))
@@ -56,13 +70,15 @@ function options(args:string[]){const out:Record<string,string>={}
   else need(out['approve-operation']===undefined,'unexpected_approval')
   return out}
 function readConfig(path:string,pin:string):Config{const value=JSON.parse(privateRead(path,pin))
-  exact(value,['version','purpose','selection','native','databaseName','artifactDirectory','issuer'])
+  exact(value,['version','purpose','selection','native','databaseName','databaseIdentity','artifactDirectory','issuer'])
   need(value.version===1&&value.purpose==='clawpilot-native-email-initial-private-operator','config_domain')
   exact(value.selection,['actorEmail','operatorAccountId','rootWorkspaceId','nativeInstanceId']);exact(value.issuer,['keyId','publicKey'])
-  need(typeof value.databaseName==='string'&&/^[A-Za-z0-9_]{1,64}(?![\s\S])/.test(value.databaseName)
+  need(typeof value.databaseName==='string'&&DATABASE_NAME.test(value.databaseName)
     &&typeof value.artifactDirectory==='string'&&typeof value.issuer.keyId==='string'&&typeof value.issuer.publicKey==='string','config_value')
+  const identity=databaseIdentity(value.databaseIdentity)
   privateDirectory(value.artifactDirectory)
-  const c=value as unknown as Config;need(c.selection.nativeInstanceId===c.native.nativeInstanceId,'instance_binding');return c}
+  const c=value as unknown as Config;need(c.selection.nativeInstanceId===c.native.nativeInstanceId,'instance_binding')
+  return {...c,databaseIdentity:identity}}
 
 /** Fresh SQL authorization/origin verification is still required on every
  * command. Reuse the original signed bytes after an unknown transport outcome;
@@ -84,7 +100,7 @@ export function reuseVerifiedNativeEmailInitialOrigin(fresh:NativeEmailInitialSt
 /** Parse connection intent once. pg's connectionString parser accepts query
  * host/user/ssl overrides, so never pass it a URL after checking only hostname.
  * This remains a private server credential object, never a browser DTO. */
-export function nativeEmailInitialOperatorDatabaseConfig(databaseUrl:string,expectedName:string){
+export function nativeEmailInitialOperatorDatabaseConfig(databaseUrl:string,expectedName:string,expectedSessionRole:string){
   const url=new URL(databaseUrl),entries=[...url.searchParams.entries()]
   need(['postgres:','postgresql:'].includes(url.protocol)&&url.hash===''
     &&decodeURIComponent(url.pathname.slice(1))===expectedName,'database_destination')
@@ -93,25 +109,50 @@ export function nativeEmailInitialOperatorDatabaseConfig(databaseUrl:string,expe
   need(loopback?(sslmode===null||sslmode==='disable'||sslmode==='verify-full'):sslmode==='verify-full','database_tls')
   const user=decodeURIComponent(url.username),password=decodeURIComponent(url.password),port=Number(url.port||5432)
   need(user.length>0&&password.length>0&&Number.isSafeInteger(port)&&port>0&&port<=65535,'database_credentials')
+  need(typeof expectedSessionRole==='string'&&ROLE_NAME.test(expectedSessionRole)&&user===expectedSessionRole,'database_login_pin')
   return {host:url.hostname==='[::1]'?'::1':url.hostname,port,user,password,database:expectedName,
     ssl:sslmode==='verify-full'?{rejectUnauthorized:true as const}:false as const}
+}
+
+// The effective login must already be able to read this built-in control
+// function. Do not request a superuser, make a grant, or substitute a second
+// connection or name-only lookup when its metadata is unavailable.
+const OBSERVE_DATABASE=`SELECT d.datname::pg_catalog.text AS database_name,
+  d.oid::pg_catalog.text AS database_oid, control.system_identifier::pg_catalog.text AS system_identifier,
+  SESSION_USER::pg_catalog.text AS session_role, CURRENT_USER::pg_catalog.text AS effective_role,
+  NOT pg_catalog.pg_is_in_recovery() AS primary_server
+  FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() control
+  WHERE d.datname=pg_catalog.current_database()`
+
+export function createNativeEmailInitialOperatorTransaction(pool:Pick<Pool,'connect'>,
+  expectedDatabase:string,expectedIdentity:DatabaseIdentity):NativeEmailSqlTransaction{
+  need(typeof expectedDatabase==='string'&&DATABASE_NAME.test(expectedDatabase),'database_destination')
+  const identity=databaseIdentity(expectedIdentity)
+  return async fn=>{const client=await pool.connect()
+    try{
+      await client.query('BEGIN')
+      let rows:Row[]
+      try{({rows}=await client.query<Row>(OBSERVE_DATABASE))}catch{need(false,'database_identity_unproven')}
+      const row=Array.isArray(rows)&&rows.length===1?rows[0]:null
+      need(row&&row.database_name===expectedDatabase&&row.database_oid===identity.databaseOid
+        &&row.system_identifier===identity.systemIdentifier&&row.session_role===identity.sessionRole
+        &&row.effective_role===identity.effectiveRole&&row.primary_server===true,'database_identity_unproven')
+      const value=await fn({query:async(sql,values=[])=>client.query(sql,values)})
+      await client.query('COMMIT');return value
+    }catch(e){try{await client.query('ROLLBACK')}catch{/* Unknown outcome remains held, never retry the write. */}throw e}
+    finally{client.release()}}
 }
 
 export async function runNativeEmailInitialPrivateOperator(args:string[]){
   need(process.versions.node.split('.')[0]==='24','node_runtime')
   const o=options(args),config=readConfig(o.config,o['config-sha256'])
+  const native=new NativeEmailInitialEnrollmentCliTransport(config.native)
   need(process.env.DATABASE_URL&&!Object.keys(process.env).some(k=>/^NEXT_PUBLIC_.*(?:INITIAL|ISSUER).*PRIVATE_KEY/.test(k)),'database_configuration')
-  const pool=new Pool({...nativeEmailInitialOperatorDatabaseConfig(process.env.DATABASE_URL,config.databaseName),
+  const pool=new Pool({...nativeEmailInitialOperatorDatabaseConfig(process.env.DATABASE_URL,config.databaseName,config.databaseIdentity.sessionRole),
     max:2,connectionTimeoutMillis:5000,query_timeout:10000})
   try{
-    const observed=await pool.query('SELECT current_database() AS database')
-    need(observed.rows.length===1&&observed.rows[0].database===config.databaseName,'database_readback')
-    const transaction:NativeEmailSqlTransaction=async fn=>{const client=await pool.connect()
-      try{await client.query('BEGIN');const value=await fn({query:async(sql,values=[])=>client.query(sql,values)})
-        await client.query('COMMIT');return value
-      }catch(e){try{await client.query('ROLLBACK')}catch{/* Unknown outcome remains held, never retry the write. */}throw e}
-      finally{client.release()}}
-    const native=new NativeEmailInitialEnrollmentCliTransport(config.native),collector=new NativeEmailInitialEnrollmentOperator(transaction,config.selection,native)
+    const transaction=createNativeEmailInitialOperatorTransaction(pool,config.databaseName,config.databaseIdentity)
+    const collector=new NativeEmailInitialEnrollmentOperator(transaction,config.selection,native)
     const verification={publicKey:config.issuer.publicKey,keyId:config.issuer.keyId,serviceUserId:config.native.serviceUserId,oauthClientId:config.native.oauthClientId}
     const bareStore=new PostgresNativeEmailInitialEnrollmentStore(transaction,config.selection,undefined,verification)
     if(o.action==='preview')return {action:o.action,...await bareStore.preview()}
