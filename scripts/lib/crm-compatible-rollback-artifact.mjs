@@ -11,7 +11,8 @@ export const LEGACY_WRITER_COMMIT = 'b61192200b6d990adb320fd7f941a619976bc4af'
 // A new floor must protect the current authority inventory. Verification of
 // already-pinned artifacts below remains independent of this build-time floor.
 const HISTORICAL_V20_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v20'
-const CURRENT_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v21'
+const HISTORICAL_V21_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v21'
+const CURRENT_ROLLBACK_ATTESTATION = 'clawpilot-production-rebind-target-schema-attestation-v22'
 const FRACTIONAL_PRODUCT_MIGRATION = 'db/migrations/0373_fractional_crm_product_read.sql'
 const FRACTIONAL_FOLDER_MIGRATION = 'db/migrations/0403_fractional_crm_customer_folder_capability.sql'
 const FRACTIONAL_GATEWAY_PROTECTED_PATHS = Object.freeze([
@@ -25,12 +26,46 @@ const FRACTIONAL_GATEWAY_PROTECTED_PATHS = Object.freeze([
   'scripts/test-fractional-crm-gateway-http.mjs', 'scripts/test-fractional-crm-gateway-postgres.mjs',
 ])
 export const RETAINED_V20_LAST_MIGRATION = 'db/migrations/0412_crm_calendar_occurrence_claims.sql'
+export const RETAINED_V22_LAST_MIGRATION = 'db/migrations/0417_crm_legacy_held_email_settlement.sql'
+const HELD_ORIGINAL_MIGRATIONS = Object.freeze([
+  'db/migrations/0413_crm_legacy_email_terminal_hold.sql',
+  'db/migrations/0414_crm_legacy_email_hold_enrollment.sql',
+  'db/migrations/0415_crm_legacy_held_email_recovery_stage.sql',
+  'db/migrations/0416_crm_legacy_held_email_release.sql',
+  RETAINED_V22_LAST_MIGRATION,
+])
+const HELD_ORIGINAL_PROTECTED_PATHS = Object.freeze([
+  ...HELD_ORIGINAL_MIGRATIONS,
+  'app_src/lib/crm/legacyHeldEmailRecoveryApproval.ts',
+  'app_src/lib/crm/legacyEmailTerminalHoldPreview.ts',
+  'app_src/lib/crm/legacyEmailTerminalHoldJournal.ts',
+  'app_src/lib/crm/legacyEmailTerminalHoldPrivateOperator.ts',
+  'app_src/lib/crm/legacyEmailTerminalHoldStockNativeObserver.ts',
+  'app_src/lib/crm/nativeEmailAccountRepairJournal.ts',
+  'app_src/lib/persistence/crmHeldOriginalRecoveryStage.ts',
+  'app_src/lib/persistence/crmLegacyEmailTerminalHold.ts',
+  'app_src/lib/persistence/crmLegacyEmailTerminalHoldAppObserver.ts',
+  'app_src/lib/persistence/crmNativeEmailPublication.ts',
+  'scripts/test-crm-legacy-email-terminal-hold-postgres.mjs',
+  'scripts/test-crm-legacy-email-terminal-hold-preview.mjs',
+  'scripts/test-crm-legacy-email-terminal-hold-journal.mjs',
+  'scripts/test-crm-legacy-email-terminal-hold-private-operator.mjs',
+  'scripts/test-crm-legacy-email-terminal-hold-stock-native-observer.mjs',
+  'scripts/test-crm-legacy-email-terminal-hold-stock-mariadb-local.mjs',
+  'scripts/test-native-email-initial-enrollment-postgres.mjs',
+  'scripts/lib/native-joint-held-original-postgres-role.mjs',
+  'scripts/lib/native-joint-held-original-recovery.mjs',
+  'scripts/lib/native-joint-held-original-stage.mjs',
+])
 export const REQUIRED_RETAINED_V20_CHECKS = Object.freeze([
   'full_migration_checksum_ledger', 'reloaded_email_preserves_single_identity_and_links',
   'reloaded_calendar_preserves_single_occurrence', 'retained_native_authority_and_recovery_controls_unchanged',
 ])
 export const REQUIRED_RETAINED_V21_CHECKS = Object.freeze([
   ...REQUIRED_RETAINED_V20_CHECKS, 'retained_fractional_product_credential_and_scope_unchanged',
+])
+export const REQUIRED_RETAINED_V22_CHECKS = Object.freeze([
+  ...REQUIRED_RETAINED_V21_CHECKS, 'retained_same_job_recovery_authority_inert_and_private',
 ])
 export const REQUIRED_ROLLING_CHECKS = Object.freeze([
   'legacy_scalar_insert_after_migration', 'legacy_scalar_primary_bridge',
@@ -76,10 +111,10 @@ const ROLLBACK_CRM_AUTHORITY_MIGRATIONS = Object.freeze([
   'db/migrations/0410_crm_legacy_email_exact_account_repair.sql',
   'db/migrations/0411_crm_legacy_email_archive_disposition.sql',
   RETAINED_V20_LAST_MIGRATION,
+  ...HELD_ORIGINAL_MIGRATIONS,
 ])
 export const ROLLBACK_PROTECTED_PATHS = Object.freeze([
-  ...ROLLBACK_CRM_AUTHORITY_MIGRATIONS,
-  ...FRACTIONAL_GATEWAY_PROTECTED_PATHS,
+  ...new Set([...ROLLBACK_CRM_AUTHORITY_MIGRATIONS, ...FRACTIONAL_GATEWAY_PROTECTED_PATHS, ...HELD_ORIGINAL_PROTECTED_PATHS]),
   'app_src/app/api/crm/email-recovery/route.ts', 'app_src/app/api/crm/email-review-candidates/route.ts',
   'app_src/app/api/crm/mailbox-identity/route.ts', 'app_src/components/crm/EmailReviewDialog.tsx',
   'app_src/app/api/crm/route.ts', 'app_src/app/api/crm/actions/route.ts',
@@ -165,15 +200,24 @@ export function retainedV21MigrationInventory(sourceTree) {
   }
   return retainedMigrationInventory(sourceTree)
 }
-function retainedMigrationInventory(sourceTree) {
+export function retainedV22MigrationInventory(sourceTree) {
+  const inventory = retainedMigrationInventory(sourceTree, RETAINED_V22_LAST_MIGRATION)
+  assert.deepEqual(inventory.paths.slice(-6), [RETAINED_V20_LAST_MIGRATION, ...HELD_ORIGINAL_MIGRATIONS],
+    'Retained v22 proof requires the exact ordered held-original migration suffix')
+  for (const required of [FRACTIONAL_PRODUCT_MIGRATION, FRACTIONAL_FOLDER_MIGRATION]) {
+    assert.ok(inventory.paths.includes(required), `Retained v22 proof lacks ${required}`)
+  }
+  return inventory
+}
+function retainedMigrationInventory(sourceTree, lastMigration = RETAINED_V20_LAST_MIGRATION) {
   const entries = sourceTree.filter(({ path }) => /^db\/migrations\/\d+_.+\.sql$/u.test(path))
     .map(({ path, gitBlob }) => ({ path, gitBlob })).sort((a, b) => a.path < b.path ? -1 : Number(a.path > b.path))
-  assert.equal(entries.at(-1)?.path, RETAINED_V20_LAST_MIGRATION,
+  assert.equal(entries.at(-1)?.path, lastMigration,
     'Current floor cannot certify an unexpected final migration')
   assert.ok(entries.every(({ gitBlob }) => /^[a-f0-9]{40}$/u.test(gitBlob)), 'Migration source must bind each committed Git blob')
   assert.equal(new Set(entries.map(entry => entry.path)).size, entries.length, 'Duplicate migration source path')
   return { paths: entries.map(entry => entry.path), migrationCount: entries.length,
-    lastMigration: RETAINED_V20_LAST_MIGRATION, sourceInventorySha256: sha256(canonicalJson(entries)) }
+    lastMigration, sourceInventorySha256: sha256(canonicalJson(entries)) }
 }
 const git = (repository, args, options = {}) => execFileSync('git', ['-C', repository, ...args], {
   encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], ...options,
@@ -226,7 +270,7 @@ export function inspectRollbackSources(readSource) {
     assert.equal(enrolled,sha256(files[path]),`Rollback floor must retain and attest ${filename}`)
   }
   // 0403 is named twice in the attester. The old entry is frozen metadata;
-  // only this dedicated compatibility block supplies the live v21 ledger.
+  // only this dedicated compatibility block supplies the current ledger.
   const compatibilityBlock = attester.match(/const FRACTIONAL_PRODUCT_COMPATIBILITY_SCHEMA_MIGRATIONS = Object\.freeze\(\[([\s\S]*?)\]\)/u)?.[1]
   assert.ok(compatibilityBlock, 'Rollback floor must retain the current Fractional capability enrollment')
   const compatibilityMigrations = [...compatibilityBlock.matchAll(/filename:\s*'([^']+)',\s*checksum:\s*'([a-f0-9]{64})'/gu)]
@@ -280,27 +324,23 @@ export function validateRollbackReceipts(identity, acceptance, build) {
   const containsRetainedV20 = identity.sourceTree?.some(({ path }) => path === RETAINED_V20_LAST_MIGRATION)
   const containsV21 = identity.sourceTree?.some(({ path }) => path === FRACTIONAL_PRODUCT_MIGRATION)
     || Object.hasOwn(identity.protectedFiles ?? {}, FRACTIONAL_PRODUCT_MIGRATION)
+  const containsV22 = HELD_ORIGINAL_MIGRATIONS.some(path => identity.sourceTree?.some(entry => entry.path === path)
+    || Object.hasOwn(identity.protectedFiles ?? {}, path))
   const format = identity.attestation?.format
-  if (containsV21 || format === CURRENT_ROLLBACK_ATTESTATION) {
+  if (containsV22 || format === CURRENT_ROLLBACK_ATTESTATION) {
     assert.equal(format, CURRENT_ROLLBACK_ATTESTATION,
+      'The retained v22 migration cannot be verified under a different attestation')
+    validateRetainedSchema(identity, acceptance, retainedV22MigrationInventory, REQUIRED_RETAINED_V22_CHECKS,
+      [...FRACTIONAL_GATEWAY_PROTECTED_PATHS, ...HELD_ORIGINAL_PROTECTED_PATHS], 'v22')
+  } else if (containsV21 || format === HISTORICAL_V21_ROLLBACK_ATTESTATION) {
+    assert.equal(format, HISTORICAL_V21_ROLLBACK_ATTESTATION,
       'The retained v21 migration cannot be verified under a different attestation')
-    const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV21MigrationInventory(identity.sourceTree)
-    for (const path of FRACTIONAL_GATEWAY_PROTECTED_PATHS) {
-      assert.ok(identity.sourceTree.some(entry => entry.path === path), `Retained v21 proof omits ${path}`)
-      assert.match(identity.protectedFiles[path] ?? '', /^[a-f0-9]{64}$/u, `Retained v21 proof does not protect ${path}`)
-    }
-    const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
-    assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Current floor lacks the catalog digest for the measured PostgreSQL major')
-    assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
-      schemaDigest, checks: [...REQUIRED_RETAINED_V21_CHECKS] }, 'New rollback floors require the exact retained v21 schema transition receipt')
+    validateRetainedSchema(identity, acceptance, retainedV21MigrationInventory, REQUIRED_RETAINED_V21_CHECKS,
+      FRACTIONAL_GATEWAY_PROTECTED_PATHS, 'v21')
   } else if (containsRetainedV20 || format === HISTORICAL_V20_ROLLBACK_ATTESTATION) {
     assert.equal(format, HISTORICAL_V20_ROLLBACK_ATTESTATION,
       'The retained v20 migration cannot be verified under a different attestation')
-    const { migrationCount, lastMigration, sourceInventorySha256 } = retainedV20MigrationInventory(identity.sourceTree)
-    const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
-    assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Current floor lacks the catalog digest for the measured PostgreSQL major')
-    assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
-      schemaDigest, checks: [...REQUIRED_RETAINED_V20_CHECKS] }, 'Historical rollback floors require the exact retained v20 schema transition receipt')
+    validateRetainedSchema(identity, acceptance, retainedV20MigrationInventory, REQUIRED_RETAINED_V20_CHECKS, [], 'v20')
   }
   assert.deepEqual(build.command, ['npm', 'run', 'build'])
   assert.match(build.nodeVersion, /^v24\./u, 'Rollback certification requires the supported Node 24 build')
@@ -312,6 +352,18 @@ export function validateRollbackReceipts(identity, acceptance, build) {
     assert.ok(path.startsWith('app_src/.next/'), 'Build evidence must identify local Next output')
     assert.match(digest, /^[a-f0-9]{64}$/u)
   }
+}
+
+function validateRetainedSchema(identity, acceptance, inventoryFor, checks, protectedPaths, version) {
+  const { migrationCount, lastMigration, sourceInventorySha256 } = inventoryFor(identity.sourceTree)
+  for (const path of protectedPaths) {
+    assert.ok(identity.sourceTree.some(entry => entry.path === path), `Retained ${version} proof omits ${path}`)
+    assert.match(identity.protectedFiles[path] ?? '', /^[a-f0-9]{64}$/u, `Retained ${version} proof does not protect ${path}`)
+  }
+  const schemaDigest = identity.attestation.postgresDigests[acceptance.postgresMajor]
+  assert.match(schemaDigest, /^[a-f0-9]{64}$/u, 'Rollback floor lacks the catalog digest for the measured PostgreSQL major')
+  assert.deepEqual(acceptance.retainedSchema, { migrationCount, lastMigration, sourceInventorySha256,
+    schemaDigest, checks: [...checks] }, `Rollback floor requires the exact retained ${version} schema transition receipt`)
 }
 
 export const rollbackReceiptSource = identity => ({ commit: identity.commit, tree: identity.tree,

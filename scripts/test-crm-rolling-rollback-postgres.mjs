@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// One guarded synthetic database. No application DATABASE_URL/env files, native
+// One guarded synthetic server. No application DATABASE_URL/env files, native
 // CRM calls, mailbox calls, migration of real data, or production authority.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -9,7 +9,7 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import { assertExternalRollbackOutput, canonicalJson, committedRollbackIdentity, LEGACY_WRITER_COMMIT,
-  REQUIRED_RETAINED_V21_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV21MigrationInventory,
+  REQUIRED_RETAINED_V22_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV22MigrationInventory,
   rollbackReceiptSource, sha256 } from './lib/crm-compatible-rollback-artifact.mjs'
 import { attestProductionRebindHistorySchema } from './production-rebind-history-schema-attestation.mjs'
 
@@ -75,7 +75,7 @@ if (sourceCheckOnly) {
 
 const identity = checkoutCheckOnly ? null : committedRollbackIdentity(repository, args[1])
 const receiptPath = identity ? assertExternalRollbackOutput(repository, args[3]) : null
-const inventory = identity ? retainedV21MigrationInventory(identity.sourceTree) : null
+const inventory = identity ? retainedV22MigrationInventory(identity.sourceTree) : null
 const container = `clawpilot-crm-rolling-${process.pid}-${randomUUID().slice(0, 8)}`
 const image = process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16'
 assert.match(image, /^pgvector\/pgvector:pg(?:16|18)$/u, 'Use an already installed approved PostgreSQL image')
@@ -206,13 +206,13 @@ try {
   if (transitionCheckOnly) {
     console.log(`PASS ${checks.length} working-tree rolling transition checks; NON-CERTIFYING, no receipt or rollback artifact created`)
   } else {
-    const { checkRetainedV21 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
+    const { checkRetainedV22 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
     const migrationPaths = inventory?.paths ?? readdirSync(new URL('../db/migrations/', import.meta.url))
       .filter(file => /^\d+_.+\.sql$/u.test(file)).sort().map(file => `db/migrations/${file}`)
     // Same loopback-only disposable instance. Keep the legacy bridge fixture
     // and full retained-schema fixture in separate, empty databases.
-    await query('CREATE DATABASE crm_rolling_retained_v21')
-    const retainedPool = new Pool({ ...connection, database: 'crm_rolling_retained_v21', statement_timeout: 15000 })
+    await query('CREATE DATABASE crm_rolling_retained_v22')
+    const retainedPool = new Pool({ ...connection, database: 'crm_rolling_retained_v22', statement_timeout: 15000 })
     let retained, catalog
     try {
       const load = fixture.loadModule
@@ -233,12 +233,12 @@ try {
         })
         return { auth, gateway }
       }
-      retained = await checkRetainedV21({ pool: retainedPool, read, migrationPaths, loadFractionalGateway,
+      retained = await checkRetainedV22({ pool: retainedPool, read, migrationPaths, loadFractionalGateway,
         loadCrmPersistence: fixture.loadCrmPersistence,
         loadOccurrenceClaims: () => fixture.loadModule('app_src/lib/crm/calendarOccurrenceClaims.ts', { 'server-only': {} }) })
       catalog = await attestProductionRebindHistorySchema(retainedPool)
     } finally { await retainedPool.end() }
-    assert.deepEqual(retained.checks, [...REQUIRED_RETAINED_V21_CHECKS])
+    assert.deepEqual(retained.checks, [...REQUIRED_RETAINED_V22_CHECKS])
     assert.equal(retained.migrationCount, migrationPaths.length)
     assert.equal(retained.lastMigration, migrationPaths.at(-1))
     if (!identity) {

@@ -10,6 +10,7 @@ import vm from 'node:vm'
 import { runStorageGuard } from './local-storage-guard.mjs'
 import { loadInteractionCompanyReader } from './lib/crm-interaction-company-fixture.mjs'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
+import { startDisposableNativePostgres } from './lib/disposable-native-postgres.mjs'
 
 const require = createRequire(import.meta.url)
 const appRequire = createRequire(new URL('../app_src/package.json', import.meta.url))
@@ -17,8 +18,9 @@ const ts = appRequire('typescript')
 const { Pool } = appRequire('pg')
 const read = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
 const args = process.argv.slice(2)
-assert.ok(args.length === 0 || args.length === 1, 'Only one optional private native socket is supported')
-const socket = args[0]?.slice('--native-socket='.length)
+assert.ok(args.length <= 1, 'Choose at most one private PostgreSQL fixture transport')
+const useNative = args[0] === '--native-postgres'
+const socket = useNative ? undefined : args[0]?.slice('--native-socket='.length)
 if (socket !== undefined) {
   assert.match(args[0], /^--native-socket=\/tmp\/clawpilot-bpo-crm-pg\.[A-Za-z0-9]+$/)
   const directory = lstatSync(socket)
@@ -51,9 +53,14 @@ vm.runInNewContext(ts.transpileModule(declarations('scripts/test-crm-email-routi
 }).outputText + '\nglobalThis.fixture = { loadModule, loadCrmPersistence, fixtureSchema };', fixtureContext)
 
 const container = `clawpilot-reviewed-email-test-${process.pid}-${randomUUID().slice(0, 8)}`
-let pool, started = false
+let pool, nativeFixture, started = false
 try {
-  if (socket) {
+  if (useNative) {
+    nativeFixture = await startDisposableNativePostgres({ major: '18', fixturePrefix: 'clawpilot-reviewed-email-' })
+    pool = new Pool({ ...nativeFixture.connection, max: 3, connectionTimeoutMillis: 1000, statement_timeout: 5000,
+      application_name: container })
+    await nativeFixture.assertOwned(pool)
+  } else if (socket) {
     pool = new Pool({ host: socket, port: 55473, user: process.env.USER, password: '',
       database: 'reviewed_email_test', ssl: false, max: 3, connectionTimeoutMillis: 1000, statement_timeout: 5000,
       application_name: container })
@@ -1238,5 +1245,8 @@ try {
   console.log(`PASS ${passed} reviewed Gmail persistence checks; actual SQL/readers/native payload producer; no provider writes`)
 } finally {
   try { if (pool) await pool.end() }
-  finally { if (started) execFileSync('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 30_000, stdio: 'pipe' }) }
+  finally {
+    if (nativeFixture) nativeFixture.cleanup()
+    else if (started) execFileSync('docker', disposablePostgresDockerCleanupArgs(container), { timeout: 30_000, stdio: 'pipe' })
+  }
 }

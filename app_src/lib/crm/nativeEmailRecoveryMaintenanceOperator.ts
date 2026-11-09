@@ -63,6 +63,7 @@ export function createNativeEmailRecoveryMaintenanceOperator(options:{persistenc
       const mode=await persistence.mode()
       requireNativeEmail(mode.enabled&&mode.activeTransitionId===null,'native_publication_not_available')
       if(mode.activeOperationId){
+        requireNativeEmail(persistence.allowsExistingAdmissionFirstPublish!==false,'legacy_dispatch_resolution_required')
         // A failed readiness proof leaves the exact original admission in
         // place; reclaim its lease, never repeat native prepare or create a
         // second admission. A committed dispatch is resolution-only.

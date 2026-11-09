@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { PRODUCTION_REBIND_CRITICAL_RELATIONS } from './production-rebind-history-schema-attestation.mjs'
 import {
   REBIND_PLAN_MAX_AGE_MS,
   REBIND_PLAN_MAX_FUTURE_SKEW_MS,
@@ -740,10 +741,17 @@ assert.ok(
   'the serializable transaction must own the migration lock before rechecking exact schema',
 )
 assert.match(source, /LOCK TABLE.*IN ACCESS SHARE MODE/u)
+assert.ok(PRODUCTION_REBIND_CRITICAL_RELATIONS.every(isProductionRebindSchemaLockRelation),
+  'Every reviewed relation must be admissible as an exact identifier in the locked catalog read')
 assert.equal(isProductionRebindSchemaLockRelation('public.crm_meetings'), true)
 assert.equal(isProductionRebindSchemaLockRelation('crm_legacy_email_retirement.account_repair_approvals'), true)
+for (const table of ['consumed','held','released','settled','staged','verified_batch','verified_receipts','verified_recovery']) {
+  assert.equal(isProductionRebindSchemaLockRelation(`crm_legacy_email_terminal_hold.${table}`), true)
+}
 for (const relation of ['arbitrary.review', 'crm_legacy_email_retirement.not_enrolled', 'public.not_enrolled',
-  'crm_legacy_email_retirement.review; SELECT 1', 'crm_legacy_email_retirement."review"', 'crm_legacy_email_retirement.review\n', null]) {
+  'crm_legacy_email_retirement.review; SELECT 1', 'crm_legacy_email_retirement."review"', 'crm_legacy_email_retirement.review\n',
+  'crm_legacy_email_terminal_hold.not_enrolled', 'crm_legacy_email_terminal_hold."held"', 'crm_legacy_email_terminal_hold.held\n',
+  'crm_legacy_email_terminal_hold.held; SELECT 1', 'crm_legacy_email_terminal_hold.held,public.app_users', null]) {
   assert.equal(isProductionRebindSchemaLockRelation(relation), false)
 }
 assert.match(

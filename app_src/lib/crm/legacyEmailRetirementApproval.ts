@@ -24,9 +24,33 @@ export type LegacyEmailRetirementManifest = {
   historicalProviderOutcome: 'unknown'; rows: LegacyEmailRetirementRow[]
 }
 
-const fenceDomain = 'clawpilot-legacy-email-fenced-absence-v1'
-const reviewDomain = 'clawpilot-legacy-email-retirement-review-v1'
-const audience = 'clawpilot-private-legacy-email-retirement-controller'
+/** An in-place hold preserves the terminal row. It is neither retirement nor
+ * approval to recover, edit, retry, or publish the held interaction. */
+export type LegacyEmailTerminalHoldRow = LegacyEmailRetirementRow & {
+  relationshipFingerprint: string; providerIdentityFingerprint: string
+}
+export type LegacyEmailTerminalHoldManifest = Omit<LegacyEmailRetirementManifest,
+  'action' | 'scope' | 'publicationDisposition' | 'rows'> & {
+  action: 'hold_exact_legacy_terminal_rows_in_place'
+  scope: LegacyEmailRetirementScope & { nativeAuthorityInstanceId: string }
+  publicationDisposition: 'hold_without_publication'
+  rows: LegacyEmailTerminalHoldRow[]
+}
+
+const retirementDomains = {
+  fencePurpose: 'clawpilot-legacy-email-fenced-absence-v1',
+  fenceIssuer: 'clawpilot-crm-fence-attestor',
+  reviewPurpose: 'clawpilot-legacy-email-retirement-review-v1',
+  reviewIssuer: 'clawpilot-crm-retirement-operator',
+  audience: 'clawpilot-private-legacy-email-retirement-controller',
+} as const
+const holdDomains = {
+  fencePurpose: 'clawpilot-legacy-email-hold-fenced-absence-v1',
+  fenceIssuer: 'clawpilot-crm-hold-fence-attestor',
+  reviewPurpose: 'clawpilot-legacy-email-hold-review-v1',
+  reviewIssuer: 'clawpilot-crm-hold-operator',
+  audience: 'clawpilot-private-legacy-email-hold-controller',
+} as const
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\s\S])/u
 const globalId = /^gi(?:[0-9]{7}|[0-9a-v]{12})(?![\s\S])/u
 const hash = /^[0-9a-f]{64}(?![\s\S])/u
@@ -56,22 +80,39 @@ const manifestKeys = ['version','action','operationId','scope','publicationDispo
   'historicalProviderOutcome','rows'] as const
 const scopeKeys = ['projectId','environmentId','postgresDatabaseFingerprint','appCommit','nativeDeploymentId',
   'nativeReplicaId','nativeCommit','nativeDatabaseFingerprint'] as const
+const holdScopeKeys = [...scopeKeys,'nativeAuthorityInstanceId'] as const
+const rowFingerprints = ['rowFingerprint','sourceFingerprint','payloadFingerprint','keyFingerprint'] as const
+const holdFingerprints = [...rowFingerprints,'relationshipFingerprint','providerIdentityFingerprint'] as const
 const rowKeys = ['outboxId','localId','pipelineId','workspaceId','nativeId','globalId','attempts',
-  'rowFingerprint','sourceFingerprint','payloadFingerprint','keyFingerprint'] as const
+  ...rowFingerprints] as const
+const holdRowKeys = [...rowKeys,'relationshipFingerprint','providerIdentityFingerprint'] as const
 
 export function legacyEmailRetirementManifestDigest(input: unknown) {
   exact(input, manifestKeys)
   need(input.version === 1 && input.action === 'archive_exact_legacy_terminal_rows_only'
     && input.historicalProviderOutcome === 'unknown'
     && (input.publicationDisposition === 'archive_only' || input.publicationDisposition === 'reviewed_recovery'), 'manifest_domain')
+  return exactManifestDigest(input, rowKeys, rowFingerprints, false)
+}
+
+export function legacyEmailTerminalHoldManifestDigest(input: unknown) {
+  exact(input, manifestKeys)
+  need(input.version === 1 && input.action === 'hold_exact_legacy_terminal_rows_in_place'
+    && input.historicalProviderOutcome === 'unknown' && input.publicationDisposition === 'hold_without_publication', 'manifest_domain')
+  return exactManifestDigest(input, holdRowKeys, holdFingerprints, true)
+}
+
+function exactManifestDigest(input: Record<string, unknown>, keys: readonly string[], fingerprints: readonly string[],
+  requiresAuthorityInstance: boolean) {
   need(matches(input.operationId, uuid) && matches(input.operatorAccountId, uuid) && matches(input.rootWorkspaceId, uuid)
     && matches(input.fenceEpoch, uuid) && matches(input.actorEmail, actor) && input.actorEmail.length <= 254
     && Number.isSafeInteger(input.appGeneration) && Number(input.appGeneration) > 0, 'manifest_identity')
   for (const k of ['gateFingerprint','appSourceFingerprint','fenceEvidenceFingerprint','nativeAbsenceFingerprint']) {
     need(matches(input[k], hash), 'manifest_fingerprint')
   }
-  exact(input.scope, scopeKeys)
+  exact(input.scope, requiresAuthorityInstance ? holdScopeKeys : scopeKeys)
   for (const k of ['projectId','environmentId','nativeDeploymentId','nativeReplicaId']) need(matches(input.scope[k], uuid), 'scope')
+  if (requiresAuthorityInstance) need(matches(input.scope.nativeAuthorityInstanceId, /^[A-Za-z0-9][A-Za-z0-9-]{0,35}(?![\s\S])/u), 'scope')
   for (const k of ['appCommit','nativeCommit']) need(matches(input.scope[k], commit), 'scope')
   for (const k of ['postgresDatabaseFingerprint','nativeDatabaseFingerprint']) need(matches(input.scope[k], hash), 'scope')
   need(Array.isArray(input.rows) && input.rows.length >= 1 && input.rows.length <= 25, 'exact_rows')
@@ -86,12 +127,12 @@ export function legacyEmailRetirementManifestDigest(input: unknown) {
     const d = Object.getOwnPropertyDescriptor(rows, String(index))
     need(d?.enumerable && 'value' in d, 'exact_rows')
     const row: unknown = d.value
-    exact(row, rowKeys)
+    exact(row, keys)
     need(matches(row.outboxId, uuid) && row.outboxId > previous, 'exact_row_order')
     previous = row.outboxId
     for (const k of ['localId','pipelineId','workspaceId','nativeId']) need(matches(row[k], uuid), 'row_identity')
     need(matches(row.globalId, globalId) && row.attempts === 8, 'row_identity')
-    for (const k of ['rowFingerprint','sourceFingerprint','payloadFingerprint','keyFingerprint']) need(matches(row[k], hash), 'row_fingerprint')
+    for (const k of fingerprints) need(matches(row[k], hash), 'row_fingerprint')
     for (const [k, seen] of identities) {
       const v = row[k] as string
       need(!seen.has(v), 'duplicate_row_identity')
@@ -118,7 +159,7 @@ function snapshotAnchor(anchor: TrustAnchor) {
 }
 const shared = ['version','purpose','issuer','audience','keyId','operationId','manifestDigest','issuedAt','expiresAt'] as const
 function verifiedProof(envelope: unknown, anchor: TrustAnchor, purpose: string, issuer: string, operationId: string,
-  digest: string, nowSeconds: number, fenceDigest?: string) {
+  digest: string, nowSeconds: number, audience: string, fenceDigest?: string) {
   exact(envelope, ['proof','signature'])
   const proof = envelope.proof
   exact(proof, fenceDigest ? [...shared, 'fenceEnvelopeDigest'] : shared)
@@ -135,29 +176,72 @@ function verifiedProof(envelope: unknown, anchor: TrustAnchor, purpose: string, 
   return { digest:nativeEmailDigest(envelope), issuedAt:Number(proof.issuedAt), expiresAt:Number(proof.expiresAt) }
 }
 
-export function verifyLegacyEmailRetirementApproval(input: {
-  expectedManifest: LegacyEmailRetirementManifest
+type ExactApprovalInput<Manifest> = {
+  expectedManifest: Manifest
   fenceEnvelope: unknown
   operatorEnvelope: unknown
   fenceAnchor: TrustAnchor
   operatorAnchor: TrustAnchor
   /** Trusted controller clock, ideally the observed database clock. */
   nowSeconds: number
-}) {
+}
+
+function verifyExactApproval<Manifest extends { operationId: string }>(input: ExactApprovalInput<Manifest>,
+  manifestDigestFor: (value: unknown) => string, domains: typeof retirementDomains | typeof holdDomains) {
   exact(input, ['expectedManifest','fenceEnvelope','operatorEnvelope','fenceAnchor','operatorAnchor','nowSeconds'])
   const { expectedManifest, fenceEnvelope, operatorEnvelope, fenceAnchor, operatorAnchor, nowSeconds } = input
   need(Number.isSafeInteger(nowSeconds) && nowSeconds > 0, 'clock')
   const fenceKey = snapshotAnchor(fenceAnchor), operatorKey = snapshotAnchor(operatorAnchor)
   need(fenceKey.fingerprint !== operatorKey.fingerprint && fenceKey.keyId !== operatorKey.keyId,
     'distinct_trust_anchors')
-  const manifestDigest = legacyEmailRetirementManifestDigest(expectedManifest)
+  const manifestDigest = manifestDigestFor(expectedManifest)
   const operationId = expectedManifest.operationId
-  const fence = verifiedProof(fenceEnvelope, fenceKey, fenceDomain, 'clawpilot-crm-fence-attestor',
-    operationId, manifestDigest, nowSeconds)
-  const approval = verifiedProof(operatorEnvelope, operatorKey, reviewDomain, 'clawpilot-crm-retirement-operator',
-    operationId, manifestDigest, nowSeconds, fence.digest)
+  const fence = verifiedProof(fenceEnvelope, fenceKey, domains.fencePurpose, domains.fenceIssuer,
+    operationId, manifestDigest, nowSeconds, domains.audience)
+  const approval = verifiedProof(operatorEnvelope, operatorKey, domains.reviewPurpose, domains.reviewIssuer,
+    operationId, manifestDigest, nowSeconds, domains.audience, fence.digest)
   need(approval.issuedAt >= fence.issuedAt && approval.expiresAt <= fence.expiresAt, 'approval_window')
   return Object.freeze({ manifestDigest, operationId, fenceEnvelopeDigest:fence.digest, approvalEnvelopeDigest:approval.digest,
     expiresAt:approval.expiresAt, historicalProviderOutcome:'unknown' as const, liveFenceProven:false as const,
     consumed:false as const })
+}
+
+export function verifyLegacyEmailRetirementApproval(input: ExactApprovalInput<LegacyEmailRetirementManifest>) {
+  return verifyExactApproval(input, legacyEmailRetirementManifestDigest, retirementDomains)
+}
+
+/** Verification only: the private hold controller must separately prove the
+ * live writer fence, rebuild the manifest, and consume this approval once in
+ * the same transaction that installs the hold. There is no dispatch permit. */
+export function verifyLegacyEmailTerminalHoldApproval(input: ExactApprovalInput<LegacyEmailTerminalHoldManifest>) {
+  const verified = verifyExactApproval(input, legacyEmailTerminalHoldManifestDigest, holdDomains)
+  return Object.freeze({ ...verified, kind:'legacy_email_terminal_hold_approval_v1' as const,
+    publicationDisposition:'hold_without_publication' as const })
+}
+
+export type LegacyEmailTerminalHoldReview = Omit<ExactApprovalInput<LegacyEmailTerminalHoldManifest>,'nowSeconds'>
+
+/** Own detached bytes and key references before the private adapter awaits a
+ * fence or a DB clock. This does not check the signatures or grant authority. */
+export function snapshotLegacyEmailTerminalHoldReview(input: LegacyEmailTerminalHoldReview) {
+  exact(input, ['expectedManifest','fenceEnvelope','operatorEnvelope','fenceAnchor','operatorAnchor'])
+  const manifestDigest=legacyEmailTerminalHoldManifestDigest(input.expectedManifest)
+  const canonical=nativeEmailCanonicalJson(input.expectedManifest)
+  const expectedManifest=JSON.parse(canonical) as LegacyEmailTerminalHoldManifest
+  Object.freeze(expectedManifest.scope)
+  for(const row of expectedManifest.rows) Object.freeze(row)
+  Object.freeze(expectedManifest.rows)
+  Object.freeze(expectedManifest)
+  const snapshotEnvelope=(value:unknown, reviewed:boolean)=>{
+    exact(value,['proof','signature'])
+    exact(value.proof,reviewed?[...shared,'fenceEnvelopeDigest']:shared)
+    for(const field of Object.values(value.proof)) need(typeof field==='string'||Number.isSafeInteger(field),'shape')
+    need(matches(value.signature,signature),'signature')
+    return Object.freeze({proof:Object.freeze({...value.proof}),signature:value.signature})
+  }
+  const anchor=(value:TrustAnchor)=>{const {keyId,key}=snapshotAnchor(value);return Object.freeze({keyId,key})}
+  const review=Object.freeze({expectedManifest,fenceEnvelope:snapshotEnvelope(input.fenceEnvelope,false),
+    operatorEnvelope:snapshotEnvelope(input.operatorEnvelope,true),fenceAnchor:anchor(input.fenceAnchor),
+    operatorAnchor:anchor(input.operatorAnchor)})
+  return Object.freeze({review,canonical,manifestDigest})
 }

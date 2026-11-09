@@ -22,9 +22,11 @@ const request={requestFingerprint:'synthetic-exact',command:{operationId:'exact-
 const lease={owner:'00000000-0000-4000-8000-000000000001',fence:1}
 const item=Object.freeze({id:'exact-job'})
 
-function fixture({active=false,state='not_admitted',publishError,commitWithoutAck=false,dropDuringCommit=false}={}) {
+function fixture({active=false,state='not_admitted',publishError,commitWithoutAck=false,dropDuringCommit=false,
+  allowsExistingAdmissionFirstPublish}={}) {
   const events=[]
   const persistence={
+    allowsExistingAdmissionFirstPublish,
     mode:async()=>({enabled:true,activeTransitionId:null,activeOperationId:active?request.command.operationId:null}),
     loadItem:async()=>item,
     candidate:async selected=>{assert.equal(selected,item);return {request}},
@@ -101,4 +103,15 @@ test('an uncertain dispatch cannot publish again and resolves through its exact 
   await assert.rejects(f.operator.publish(),/native_publication_not_available/u)
   assert.equal(await f.operator.resolve(),'settled')
   assert.deepEqual(f.events,['claim','claim','fence:resolve','native:resolve','settle'])
+})
+test('a held original cannot publish an existing admission and can only resolve a dispatched operation',async()=>{
+  for(const state of ['admitted','dispatched']){
+    const f=fixture({active:true,state,allowsExistingAdmissionFirstPublish:false})
+    await assert.rejects(f.operator.publish(),/legacy_dispatch_resolution_required/u)
+    assert.deepEqual(f.events,[],'Refuse before claiming a lease or contacting the native transport')
+    if(state==='dispatched'){
+      assert.equal(await f.operator.resolve(),'settled')
+      assert.deepEqual(f.events,['claim','fence:resolve','native:resolve','settle'])
+    }
+  }
 })

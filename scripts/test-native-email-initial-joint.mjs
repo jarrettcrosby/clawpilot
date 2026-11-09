@@ -109,12 +109,18 @@ for(const arg of process.argv.slice(2)){
   else if(arg==='--with-record-lifecycle'){assert.equal(options.withRecordLifecycle,undefined);options.withRecordLifecycle=true}
   else if(arg==='--with-meeting-roundtrip'){assert.equal(options.withMeetingRoundtrip,undefined);options.withMeetingRoundtrip=true}
   else if(arg==='--with-legacy-recovery'){assert.equal(options.withLegacyRecovery,undefined);options.withLegacyRecovery=true}
+  else if(arg==='--with-held-original-recovery'){assert.equal(options.withHeldOriginalRecovery,undefined);options.withHeldOriginalRecovery=true}
   else if(arg==='--with-legacy-account-repair'){assert.equal(options.withLegacyAccountRepair,undefined);options.withLegacyAccountRepair=true}
   else if(arg==='--with-private-maintenance-dispatch'){assert.equal(options.withPrivateMaintenanceDispatch,undefined);options.withPrivateMaintenanceDispatch=true}
   else if(arg==='--with-scoped-recovery-postgres'){assert.equal(options.withScopedRecoveryPostgres,undefined);options.withScopedRecoveryPostgres=true}
   else if(arg==='--with-unmanaged-app-only'){assert.equal(options.withUnmanagedAppOnly,undefined);options.withUnmanagedAppOnly=true}
   else if(arg==='--zip-preflight-only'){assert.equal(options.zipPreflightOnly,undefined);options.zipPreflightOnly=true}
-  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip] [--with-legacy-recovery] [--with-legacy-account-repair] [--with-private-maintenance-dispatch] [--with-scoped-recovery-postgres] [--with-unmanaged-app-only]')
+  else throw Error('Use --source-zip=/absolute/SuiteCRM-8.10.1.zip --build=/absolute/emitted-build --output=/absolute/new.json [--postgres-major=16|18] [--zip-preflight-only] [--service-image=sha256:immutable-image-id] [--replan-after-expiry] [--with-record-lifecycle] [--with-meeting-roundtrip] [--with-legacy-recovery|--with-held-original-recovery] [--with-legacy-account-repair] [--with-private-maintenance-dispatch] [--with-scoped-recovery-postgres] [--with-unmanaged-app-only]')
+}
+if(options.withHeldOriginalRecovery){
+  assert.ok(!options.withLegacyRecovery&&!options.withLegacyAccountRepair&&options.withPrivateMaintenanceDispatch&&options.withScopedRecoveryPostgres,
+    'The same-original run is isolated and requires private maintenance plus scoped PostgreSQL roles')
+  options.withLegacyRecovery=true
 }
 assert.ok(!(options.serviceImage&&options.zipPreflightOnly),'Archive-only preflight does not exercise the service image')
 assert.ok(!options.replanAfterExpiry||options.serviceImage,'Expiry/replan proof requires the actual service image and true container restart')
@@ -151,6 +157,7 @@ const fromBuild=file=>compiled(join(build,'lib/crm',file+'.js'))
 const {NativeEmailInitialEnrollmentOperator:Operator}=fromBuild('nativeEmailInitialEnrollmentOperator')
 const {PostgresNativeEmailInitialEnrollmentStore:Store}=fromBuild('nativeEmailInitialEnrollmentPostgres')
 const {NativeEmailInitialEnrollmentCliTransport:Transport}=fromBuild('nativeEmailInitialEnrollmentCliTransport')
+const {createNativeEmailInitialOperatorTransaction:createPinnedTransaction}=compiled(join(build,manifest.entry))
 const {NativeEmailInitialEnrollmentCoordinator:Coordinator}=fromBuild('nativeEmailInitialEnrollmentCoordinator')
 const {createNativeEmailInitialApprovalIssuer:createIssuer}=fromBuild('nativeEmailInitialEnrollmentApproval')
 const {createNativeEmailInitialStartupOriginIssuer:createOriginIssuer}=fromBuild('nativeEmailInitialStartupOrigin')
@@ -158,6 +165,7 @@ const {nativeEmailCanonicalJson:json}=fromBuild('nativeEmailPublication')
 const source=resolve('services/suitecrm'),fixture=resolve('scripts/fixtures/native-email-audience-real'),startupFixture=resolve('scripts/fixtures/native-email-initial-joint-startup.php')
 const meetingModule=options.withMeetingRoundtrip?await import('./lib/native-joint-meeting-roundtrip.mjs'):null
 const legacyRecoveryModule=options.withLegacyRecovery?await import('./lib/native-joint-legacy-email-recovery.mjs'):null
+const heldRecoveryModule=options.withHeldOriginalRecovery?await import('./lib/native-joint-held-original-recovery.mjs'):null
 if(meetingModule){assert.equal(typeof meetingModule.runNativeJointMeetingRoundtrip,'function')
   assert.equal(typeof meetingModule.prepareNativeJointMeetingFixture,'function')
   assert.ok(Array.isArray(meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS)&&meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.length>0)
@@ -186,7 +194,8 @@ const candidates=[resolve('scripts/test-native-email-initial-joint.mjs'),resolve
   ...readdirSync('db/migrations').filter(p=>/^\d+_.+\.sql$/.test(p)).sort().map(p=>resolve('db/migrations',p)),
   ...(options.serviceImage?[join(source,'Dockerfile'),...Object.keys(imageSourceMap)]:[]),
   ...(meetingModule?[resolve('scripts/lib/native-joint-meeting-roundtrip.mjs'),...meetingModule.MEETING_ROUNDTRIP_SOURCE_PATHS.map(path=>resolve(path))]:[]),
-  ...(legacyRecoveryModule?legacyRecoveryModule.nativeJointLegacyEmailRecoverySources().map(path=>resolve(path)):[])]
+  ...(legacyRecoveryModule?legacyRecoveryModule.nativeJointLegacyEmailRecoverySources().map(path=>resolve(path)):[]),
+  ...(heldRecoveryModule?heldRecoveryModule.HELD_ORIGINAL_FIXTURE_SOURCES.map(path=>resolve(path)):[])]
 const sourceHashes=Object.fromEntries(candidates.map(p=>[p,sha(readFileSync(p))]))
 const root=realpathSync(mkdtempSync(join(tmpdir(),'clawpilot-initial-joint.'))),owner=id(),label='com.clawpilot.native-initial-joint'
 writeFileSync(join(root,'owner.json'),JSON.stringify({owner,pid:process.pid})+'\n',{flag:'wx',mode:0o600})
@@ -343,9 +352,13 @@ try{
   pool=new Pool({host:'127.0.0.1',port:Number(port),database:'initial_joint_fixture',user:'postgres',password:'initial_joint_fixture',ssl:false,max:3,statement_timeout:10000})
   let until=Date.now()+30000;for(;;){try{await pool.query('SELECT 1');break}catch(e){if(Date.now()>until)throw e;await new Promise(r=>setTimeout(r,100))}}
   const q=(sql,values=[])=>pool.query(sql,values)
-  const transaction=async fn=>{const client=await pool.connect();activeTransactions++
-    try{await client.query('BEGIN');const value=await fn({query:(sql,values=[])=>client.query(sql,values)});await client.query('COMMIT');return value}
-    catch(e){await client.query('ROLLBACK');throw e}finally{activeTransactions--;client.release()}}
+  const databaseIdentity=(await q(`SELECT c.system_identifier::pg_catalog.text AS "systemIdentifier",
+    d.oid::pg_catalog.text AS "databaseOid",SESSION_USER::pg_catalog.text AS "sessionRole",
+    CURRENT_USER::pg_catalog.text AS "effectiveRole"
+    FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() c
+    WHERE d.datname=pg_catalog.current_database()`)).rows[0]
+  const pinnedTransaction=createPinnedTransaction(pool,'initial_joint_fixture',databaseIdentity)
+  const transaction=async fn=>{activeTransactions++;try{return await pinnedTransaction(fn)}finally{activeTransactions--}}
   await check('actual PostgreSQL migrations through retained initial enrollment on the guarded primary',async()=>{
     const client=await pool.connect();try{for(const p of candidates.filter(p=>p.includes('/db/migrations/')))
       await applyMigrationSqlForTest(client,p.split('/').at(-1),readFileSync(p,'utf8'))}finally{client.release()}})
@@ -519,7 +532,8 @@ try{
       appOnlyIdentitiesPreserved:unmanagedAppOnly?2:0}
     console.log('PASS actual configured owner normalization prepared before RootA without bypassing user or scope authorization')
   }
-  const legacyArchive=legacyRecoveryModule?await check('exact failed original is retained before native activation with a durable archive receipt',async()=>{
+  const legacyArchive=legacyRecoveryModule?await check(heldRecoveryModule?'exact failed original remains in its original outbox before native activation':
+    'exact failed original is retained before native activation with a durable archive receipt',async()=>{
     const {suiteCrmId,globalId}=legacyRecoveryModule.JOINT_LEGACY_EMAIL_NATIVE_IDENTITY
     assert.match(suiteCrmId,/^[a-f0-9-]{36}$/u);assert.match(globalId,/^gi[0-9]{7}$/u)
     const policy=observed.pipelines[0].policy
@@ -538,7 +552,8 @@ try{
         +(SELECT count(*) FROM emails_email_addr_rel WHERE email_id='${suiteCrmId}')
         +(SELECT count(*) FROM securitygroups_records WHERE record_id='${suiteCrmId}')`).trim(),'0')
     }
-    return legacyRecoveryModule.archiveNativeJointLegacyEmail({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+    const initialize=heldRecoveryModule?heldRecoveryModule.holdNativeJointOriginalEmail:legacyRecoveryModule.archiveNativeJointLegacyEmail
+    return initialize({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
       authority:{...selection,pipelineId:policy.pipelineId,workspaceId:policy.workspaceId,ownerNativeId:observed.serviceUserId},
       assertNativeAbsent,related,repairFirst:options.withLegacyAccountRepair===true})
   }):null
@@ -558,7 +573,10 @@ try{
   const invoke=(script,args,extra={})=>run('docker',['exec',...(extra.input!==undefined?['--interactive']:[]),...nativeEnv.flatMap(x=>['--env',x]),names.app,
     'php','-d','memory_limit=384M',script,...args],{timeout:45000,...extra})
   const packet=JSON.parse(invoke('/opt/clawpilot/install-native-email-runtime.php',['check','--app-root='+nativePaths.app,'--state-root='+nativePaths.runtime]))
+  const initialIdentityFile=join(root,'initial-fixture-identity')
+  writeFileSync(initialIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
   const binary=realpathSync('/usr/bin/true'),target={railwayBinary:binary,railwayBinarySha256:sha(readFileSync(binary)),projectId:id(),environmentId:id(),serviceId:id(),
+    deploymentInstanceId:id(),railwayIdentityFile:initialIdentityFile,
     nativeInstanceId:selection.nativeInstanceId,database:'suitecrm_native_test',serviceUserId:observed.serviceUserId,oauthClientId:observed.oauthClientId,
     cliSourceHash:sha(readFileSync(join(source,'native-email-initial-cli.php'))),imagePackageHash:packet.packageHash}
   let loseNativeCommitResponse=true,nativeExecutionCount=0,nativeResolutionBeforePgActivation=false,activationOperationId=operationId
@@ -566,8 +584,9 @@ try{
   const actualCommand=async command=>{
     assert.equal(activeTransactions,0,'Native I/O occurred under a PG transaction')
     assert.equal(command.program,binary)
-    assert.deepEqual(command.args.slice(0,9),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,'--','php'])
-    const script=command.args[9],args=command.args.slice(10),action=args[0],commandOperation=args.find(arg=>arg.startsWith('--operation='))?.slice('--operation='.length)
+    assert.deepEqual(command.args.slice(0,13),['ssh','--project',target.projectId,'--environment',target.environmentId,'--service',target.serviceId,
+      '--deployment-instance',target.deploymentInstanceId,'--identity-file',initialIdentityFile,'--','php'])
+    const script=command.args[13],args=command.args.slice(14),action=args[0],commandOperation=args.find(arg=>arg.startsWith('--operation='))?.slice('--operation='.length)
     assert.ok(['/opt/clawpilot/native-email-initial-cli.php','/opt/clawpilot/native-email-initial-artifacts.php'].includes(script))
     const isExecute=script.endsWith('/native-email-initial-cli.php')&&action==='execute',isCancel=script.endsWith('/native-email-initial-cli.php')&&action==='cancel-expired'
     if(isCancel)assert.ok(expectedCancellations.has(commandOperation),'Only the exact deliberately expired fixture operation may cancel')
@@ -1201,7 +1220,7 @@ try{
       assert.equal(sql(`SELECT group_id FROM clawpilot_email_bindings WHERE pipeline_id='${pipelineId}'`).trim(),groupId,
         'Native binding must match the approved enrollment plan before recovery')
       const recoveryUntil=Math.min(deadline,Date.now()+90000)
-      let maintenance,maintenanceFixture
+      let maintenance,maintenanceFixture,recoveryApp
       if(options.withPrivateMaintenanceDispatch){
         const role='fixture_recovery_dispatch',password='Synthetic-maintenance-'+crypto.randomBytes(18).toString('hex')
         const transportAttestationKey=crypto.randomBytes(32),transportAttestationKeyBase64=transportAttestationKey.toString('base64')
@@ -1278,7 +1297,8 @@ try{
         run('docker',['exec','--interactive',names.app,'php','-r',
           '$p=$argv[1];$b=stream_get_contents(STDIN);$f=fopen($p,"x");if(!$f||!chmod($p,0600)||fwrite($f,$b)!==strlen($b)||!fflush($f)||!fsync($f))exit(2);fclose($f);',
           nativePaths.state+'/dispatch-fence.json'],{input:stable(config)+'\n'})
-        const {maintenanceCli,maintenanceDuplex}=legacyRecoveryModule.loadNativeJointLegacyEmailRecoveryApp({query:q,withTransaction:transaction,getPostgresPool:()=>pool})
+        recoveryApp=legacyRecoveryModule.loadNativeJointLegacyEmailRecoveryApp({query:q,withTransaction:transaction,getPostgresPool:()=>pool})
+        const {maintenanceCli,maintenanceDuplex}=recoveryApp
         const localBinary=realpathSync('/usr/bin/true'),railwayIdentityFile=join(root,'synthetic-recovery-identity')
         writeFileSync(railwayIdentityFile,'Synthetic fixture; never sent to SSH.\n',{flag:'wx',mode:0o600})
         // The production argv is inspected, not executed. The replacement
@@ -1297,7 +1317,10 @@ try{
           {env:{...process.env,DOCKER_HOST:'',DOCKER_CONTEXT:''}}))
         assert.equal(dockerApp.Id,started.Id);assert.equal(dockerApp.Config.Labels?.[label],owner)
         const attestedActions=[];let rejectedBeforeAuthentication=false
-        const bridge=maintenanceCli.createNativeEmailRecoveryCliTransport({target:nativeTarget,railwayBinary:localBinary,
+        const bridge=heldRecoveryModule?heldRecoveryModule.createNativeJointHeldOriginalTransport({maintenanceCli,target:nativeTarget,
+          root,dockerBinary,dockerSocket,containerId:started.Id,railwayIdentityFile,transportAttestationKey,
+          assertOutsideTransaction:()=>assert.equal(activeTransactions,0)})
+          :maintenanceCli.createNativeEmailRecoveryCliTransport({target:nativeTarget,railwayBinary:localBinary,
           railwayBinarySha256:sha(readFileSync(localBinary)),railwayIdentityFile,transportAttestationKey},async spec=>{
           assert.equal(activeTransactions,0);assert.equal(spec.program,localBinary)
           const script='/opt/clawpilot/native-email-recovery-cli.php'
@@ -1342,7 +1365,8 @@ try{
           distinctNativeDatabasePrincipal:true,deniedUnrelatedReadsAndWrites:true,nonAuditNativeConnectionsDrained:true,
           eventSchedulerOff:true,roleTableReadGrants:readTables.length,roleTableInsertGrants:insertTables.length,
           roleTableUpdateGrants:updateTables.length,roleSchemaEventTriggerMetadataPrivileges:true,
-          actualLocalSameProcessReadiness:true,attestedActions,get firstPublishRejectedBeforeAuthentication(){return rejectedBeforeAuthentication},
+          actualLocalSameProcessReadiness:true,attestedActions:heldRecoveryModule?bridge.attestedActions:attestedActions,
+          get firstPublishRejectedBeforeAuthentication(){return heldRecoveryModule?bridge.firstPublishRejectedBeforeAuthentication:rejectedBeforeAuthentication},
           postgresLeastPrivilegeProven:false,externalProductionDrainProven:false}
       }
       const inspectNative=async op=>{
@@ -1368,9 +1392,11 @@ try{
       const invokeNative=(action,body)=>JSON.parse(run('docker',['exec','--interactive','--env','CLAWPILOT_NATIVE_JOINT_LEGACY_RECOVERY=1',
         names.app,'php','-d','memory_limit=384M','-d','display_errors=0','/fixture/native-joint-legacy-email-recovery.php',action],
         {input:body,timeout:Math.max(1,Math.min(12000,recoveryUntil-Date.now()))}))
-      const result=await legacyRecoveryModule.runNativeJointLegacyEmailRecovery({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
+      const recover=heldRecoveryModule?heldRecoveryModule.runNativeJointHeldOriginalRecovery:legacyRecoveryModule.runNativeJointLegacyEmailRecovery
+      const result=await recover({query:q,withTransaction:transaction,getPostgresPool:()=>pool,
         authority:{actorEmail:selection.actorEmail,pipelineId:policy.pipelineId,workspaceId:policy.workspaceId,ownerNativeId:observed.serviceUserId},
-        deadline:recoveryUntil,invokeNative,assertOutsideTransaction:()=>assert.equal(activeTransactions,0),inspectNative,archive:legacyArchive,maintenance,
+        deadline:recoveryUntil,invokeNative,assertOutsideTransaction:()=>assert.equal(activeTransactions,0),inspectNative,archive:legacyArchive,
+        held:heldRecoveryModule?legacyArchive:undefined,app:heldRecoveryModule?recoveryApp:undefined,maintenance,
         scopedRecoveryPostgres:options.withScopedRecoveryPostgres===true})
       assert.equal(result.passed,true);appDataBudget('after-joined-private-held-email-recovery')
       if(maintenanceFixture){assert.equal(maintenanceFixture.firstPublishRejectedBeforeAuthentication,true)

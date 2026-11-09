@@ -334,4 +334,28 @@ await check('demo quarantine preserves historical migrations, snapshot and every
   assert.doesNotMatch(quarantine, /(?:UPDATE|DELETE FROM|INSERT INTO) (?:public\.)?sync_outbox\b/i)
   assert.match(quarantine, /REVOKE ALL ON FUNCTION clawpilot_crm_native_initial_demo_quarantine\(uuid,text\) FROM PUBLIC/)
 })
+await check('scoped live hold changes exactly the existing demo predicate in reserve and admit, with no queue mutation', async () => {
+  const read = name => readFileSync(new URL(`../db/migrations/${name}`, import.meta.url), 'utf8')
+  const demo = read('0400_crm_native_email_demo_quarantine.sql'), live = read('0414_crm_legacy_email_hold_enrollment.sql')
+  const predicate = (sql, name) => sql.match(new RegExp(`${name}_predicate text:=\\$${name==='old'?'before':'after'}\\$([\\s\\S]*?)\\$${name==='old'?'before':'after'}\\$`))?.[1]
+  const oldDemo=predicate(demo,'old'),newDemo=predicate(demo,'new'),oldLive=predicate(live,'old'),newLive=predicate(live,'new')
+  assert.ok(oldDemo&&newDemo&&oldLive&&newLive)
+  assert.ok(newDemo.includes(oldLive))
+  assert.match(newLive,/NEW\.operator_account_id,NEW\.root_workspace_id,NEW\.native_instance_id,NEW\.generation\)/)
+  const pins=[...live.matchAll(/\('public\.(clawpilot_crm_native_initial_(?:reserve|admit))\(\)','([a-f0-9]{64})'\)/g)]
+  assert.equal(pins.length,2)
+  for(const [,name,pin] of pins){
+    const source=read(name.endsWith('_reserve')?'0398_crm_native_email_initial_enrollment.sql':'0399_crm_native_email_initial_replan_lineage.sql')
+    const old=source.match(new RegExp(`FUNCTION ${name}\\(\\)[\\s\\S]*? AS \\$\\$([\\s\\S]*?)\\$\\$;`))?.[1]
+    assert.ok(old)
+    const body=old.replace(oldDemo,newDemo)
+    assert.equal(hash(body),pin)
+    assert.equal(body.split(oldLive).length,2)
+    assert.equal(body.replace(oldLive,newLive).replace(newLive,oldLive),body)
+  }
+  assert.match(live,/digest\(replace\(body,new_predicate,old_predicate\),'sha256'\)/)
+  assert.match(live,/REVOKE ALL ON FUNCTION clawpilot_crm_native_initial_pending_quarantine\(uuid,text,uuid,uuid,text,bigint\) FROM PUBLIC/)
+  assert.doesNotMatch(live,/CREATE (?:OR REPLACE )?FUNCTION clawpilot_crm_native_initial_source_snapshot\(/)
+  assert.doesNotMatch(live,/(?:UPDATE|DELETE FROM|INSERT INTO) (?:public\.)?sync_outbox\b/i)
+})
 console.log(`PASS ${checks} replan DAL contract groups; real RSA and actual DAL/pure helpers, synthetic SQL evidence/context only; no database/native/installer/activation proof`)

@@ -4,6 +4,13 @@ import { basename } from 'node:path'
 import { applyMigrationSqlForTest } from './postgres-test-migrations.mjs'
 
 const LAST = '0412_crm_calendar_occurrence_claims.sql'
+const RETAINED_V22_SUFFIX = [
+  '0413_crm_legacy_email_terminal_hold.sql',
+  '0414_crm_legacy_email_hold_enrollment.sql',
+  '0415_crm_legacy_held_email_recovery_stage.sql',
+  '0416_crm_legacy_held_email_release.sql',
+  '0417_crm_legacy_held_email_settlement.sql',
+].map(filename => `db/migrations/${filename}`)
 const PRODUCT_CAPABILITY = '0373_fractional_crm_product_read.sql'
 const PRODUCT_CHECKSUM = '0e01f96a2862c22e785cd16a49a5079d0e9492f7503e155941b45e111b64a764'
 const FOLDER_CAPABILITY = '0403_fractional_crm_customer_folder_capability.sql'
@@ -16,7 +23,15 @@ const one = result => {
 
 // Called only with the rolling runner's second blank owned database, not a
 // connection string or an environment-selected target. The caller owns it.
-export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPersistence, loadOccurrenceClaims, loadFractionalGateway }) {
+export function checkRetainedV21(input) {
+  return checkRetained(input, [])
+}
+
+export function checkRetainedV22(input) {
+  return checkRetained(input, RETAINED_V22_SUFFIX)
+}
+
+async function checkRetained({ pool, read, migrationPaths, loadCrmPersistence, loadOccurrenceClaims, loadFractionalGateway }, suffix) {
   const query = (sql, values) => pool.query(sql, values)
   async function transaction(fn) {
     const client = await pool.connect()
@@ -35,7 +50,9 @@ export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPers
   assert.ok(Array.isArray(migrationPaths) && migrationPaths.length > 1)
   assert.ok(migrationPaths.every(path => /^db\/migrations\/\d{4}_[a-z0-9_]+\.sql$/u.test(path)))
   assert.deepEqual(migrationPaths, [...new Set(migrationPaths)].sort())
-  assert.equal(basename(migrationPaths.at(-1)), LAST)
+  const priorMigrationPaths = suffix.length ? migrationPaths.slice(0, -suffix.length) : migrationPaths
+  assert.equal(basename(priorMigrationPaths.at(-1)), LAST)
+  assert.deepEqual(migrationPaths.slice(priorMigrationPaths.length), suffix, 'Only the exact retained v22 suffix may follow v21')
   assert.ok(migrationPaths.includes(`db/migrations/${PRODUCT_CAPABILITY}`))
   assert.ok(migrationPaths.includes(`db/migrations/${FOLDER_CAPABILITY}`))
   const ledger = []
@@ -50,7 +67,7 @@ export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPers
   try {
     await migrationClient.query(`CREATE TABLE schema_migrations (
       filename text PRIMARY KEY, checksum text, applied_at timestamptz NOT NULL DEFAULT now())`)
-    for (const path of migrationPaths) {
+    for (const path of priorMigrationPaths) {
       const filename = basename(path), sql = read(path), checksum = hash(sql)
       assert.ok(sql.trim(), `Empty fixture migration: ${filename}`)
       if (filename === PRODUCT_CAPABILITY) assert.equal(checksum, PRODUCT_CHECKSUM, 'Do not rewrite the published product migration')
@@ -224,6 +241,28 @@ export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPers
   assert.equal(expected.canonical.id, canonical)
   assert.equal(savedTerminal.job.status, 'dead')
   assert.equal(savedTerminal.job.attempts, 8)
+  const originalRetirementSerial = suffix.length
+    ? one(await query('SELECT to_jsonb(s) AS row FROM crm_legacy_email_retirement.serial s WHERE singleton')).row : null
+  if (suffix.length) {
+    // Establish the previous retained floor, including one existing shared
+    // message and one terminal original job, before applying the upgrade.
+    assert.equal(one(await query("SELECT to_regnamespace('crm_legacy_email_terminal_hold') AS schema")).schema, null)
+    const client = await pool.connect()
+    try {
+      for (const path of suffix) {
+        const filename = basename(path), sql = read(path), checksum = hash(sql)
+        assert.ok(sql.trim(), `Empty fixture migration: ${filename}`)
+        await applyMigrationSqlForTest(client, filename, sql, { checksum })
+        ledger.push({ filename, checksum, applied: true })
+      }
+    } finally { client.release() }
+    assert.deepEqual(await readLedger(), ledger)
+    assert.deepEqual(await controlState(), retainedControl)
+    assert.deepEqual(await terminalSnapshot(), savedTerminal)
+    assert.deepEqual(await emailSnapshot(), expected)
+    assert.deepEqual(await queue(), savedQueue)
+    assert.deepEqual(await credentialRows(pool), beforeFolderUpgrade)
+  }
 
   const currentWriter = loadCrmPersistence(query, transaction)
   const currentClaims = loadOccurrenceClaims()
@@ -316,5 +355,93 @@ export async function checkRetainedV21({ pool, read, migrationPaths, loadCrmPers
   assert.deepEqual(await gatewayEffects(), effectsBeforeRead)
   assert.deepEqual(await readLedger(), ledger)
   checks.push('retained_fractional_product_credential_and_scope_unchanged')
+  if (suffix.length) {
+    await assertRetainedSameJobRecoveryPrivate(query, transaction, deadJob, savedTerminal.job.payload)
+    assert.deepEqual(await terminalSnapshot(), savedTerminal)
+    assert.deepEqual(await emailSnapshot(), reopenedEmail)
+    assert.deepEqual(await queue(), savedQueue)
+    assert.deepEqual(await calendarSnapshot(), originalCalendar)
+    assert.deepEqual(await controlState(), retainedControl)
+    assert.deepEqual(one(await query('SELECT to_jsonb(s) AS row FROM crm_legacy_email_retirement.serial s WHERE singleton')).row,
+      originalRetirementSerial)
+    assert.deepEqual(await credentialRows(pool), beforeFolderUpgrade)
+    assert.deepEqual(await readLedger(), ledger)
+    checks.push('retained_same_job_recovery_authority_inert_and_private')
+  }
   return { migrationCount: ledger.length, lastMigration: migrationPaths.at(-1), checks }
+}
+
+async function assertRetainedSameJobRecoveryPrivate(query, transaction, outboxId, payload) {
+  const schema = 'crm_legacy_email_terminal_hold'
+  const tables = ['consumed', 'held', 'released', 'settled', 'staged', 'verified_batch', 'verified_receipts', 'verified_recovery']
+  const catalogTables = (await query(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname COLLATE "C"`, [schema])).rows
+  assert.deepEqual(catalogTables.map(row => row.relname), tables)
+  const emptyLedgers = async () => {
+    for (const table of tables) assert.equal(one(await query(`SELECT count(*)::int AS count FROM ${schema}.${table}`)).count, 0)
+  }
+  await emptyLedgers()
+  // Include table and column ACLs: an INSERT-only witness grant may be column
+  // scoped. The pending-quarantine helper lives in public but is private too.
+  // NULL or empty column ACLs have no separate grants. Do not materialize
+  // a zero-dimensional empty array: PostgreSQL's aclexplode rejects it.
+  const acl = (await query(`WITH protected_schema AS (SELECT * FROM pg_namespace WHERE nspname=$1),
+    protected_relations AS (
+      SELECT c.* FROM pg_class c JOIN protected_schema n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p','S')
+    ), protected_routines AS (
+      SELECT p.* FROM pg_proc p WHERE p.pronamespace IN(SELECT oid FROM protected_schema)
+      OR p.oid='public.clawpilot_crm_native_initial_pending_quarantine(uuid,text,uuid,uuid,text,bigint)'::regprocedure
+    )
+    SELECT n.nspname::text AS object,a.grantee,a.privilege_type FROM protected_schema n,
+      LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE a.grantee<>n.nspowner
+    UNION ALL SELECT c.relname::text,a.grantee,a.privilege_type FROM protected_relations c,
+      LATERAL aclexplode(COALESCE(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S' ELSE 'r' END::"char",c.relowner))) a
+      WHERE a.grantee<>c.relowner
+    UNION ALL SELECT c.relname::text||'.'||att.attname,a.grantee,a.privilege_type
+      FROM protected_relations c JOIN pg_attribute att ON att.attrelid=c.oid,
+      LATERAL aclexplode(CASE WHEN cardinality(att.attacl)>0 THEN att.attacl END) a
+      WHERE a.grantee<>c.relowner
+    UNION ALL SELECT p.proname::text,a.grantee,a.privilege_type FROM protected_routines p,
+      LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE a.grantee<>p.proowner`, [schema])).rows
+  assert.deepEqual(acl, [], 'The retained upgrade grants no schema, table, column or function access to PUBLIC or other roles')
+  const definers = (await query(`SELECT p.proname,p.proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE p.prosecdef AND (n.nspname=$1
+      OR p.oid='public.clawpilot_crm_native_initial_pending_quarantine(uuid,text,uuid,uuid,text,bigint)'::regprocedure)
+    ORDER BY p.proname COLLATE "C"`, [schema])).rows
+  assert.deepEqual(definers.map(row => row.proname), ['check_release_binding', 'claim_resolution',
+    'clawpilot_crm_native_initial_pending_quarantine', 'hold', 'protect_held', 'register_release', 'resolve', 'resolve_recovery',
+    'resolve_release', 'resolve_unsettled_release', 'settle_release', 'stage_recovery'])
+  for (const fn of definers) assert.ok(fn.proconfig?.some(value => value.replaceAll(' ', '') === 'search_path=pg_catalog,pg_temp'))
+
+  const unknown = hash('unapproved retained v22 selection'), operationOwner = randomUUID(), absentBatch = randomUUID()
+  const probes = [
+    [`SELECT ${schema}.hold($1::uuid,ARRAY[$2::uuid],$3)`, [absentBatch, outboxId, unknown]],
+    [`SELECT ${schema}.stage_recovery($1::uuid,$2,$3::jsonb)`, [outboxId, unknown, payload]],
+    [`SELECT ${schema}.register_release($1::uuid,$2)`, [outboxId, unknown]],
+    [`SELECT ${schema}.claim_resolution($1::uuid,$2,$3::uuid)`, [outboxId, unknown, operationOwner]],
+    [`SELECT ${schema}.settle_release($1::uuid,$2,$3::uuid,1,'{}'::jsonb)`, [outboxId, unknown, operationOwner]],
+  ]
+  for (const [sql, parameters] of probes) await assert.rejects(() => query(sql, parameters), denied('55000'))
+  assert.deepEqual(one(await query(`SELECT ${schema}.resolve_recovery($1::uuid,$2,$2) AS state`, [outboxId, unknown])).state,
+    { state: 'unknown' })
+  assert.deepEqual(one(await query(`SELECT ${schema}.resolve_release($1::uuid,$2,$2,$2) AS state`, [outboxId, unknown])).state,
+    { state: 'unknown' })
+
+  const ordinary = `fixture_retained_v22_${randomUUID().replaceAll('-', '')}`
+  await query(`CREATE ROLE ${ordinary} NOLOGIN NOINHERIT`)
+  try {
+    for (const [sql, parameters] of [
+      ...probes,
+      [`SELECT ${schema}.resolve_recovery($1::uuid,$2,$2)`, [outboxId, unknown]],
+      [`SELECT public.clawpilot_crm_native_initial_pending_quarantine($1::uuid,$2,NULL,NULL,NULL,1)`, [outboxId, unknown]],
+      [`SELECT * FROM ${schema}.verified_batch`], [`INSERT INTO ${schema}.verified_recovery DEFAULT VALUES`],
+      [`UPDATE ${schema}.held SET row_fingerprint=$1`, [unknown]], [`DELETE FROM ${schema}.settled`],
+    ]) {
+      await assert.rejects(() => transaction(async client => {
+        await client.query(`SET LOCAL ROLE ${ordinary}`)
+        await client.query(sql, parameters)
+      }), denied('42501'))
+    }
+  } finally { await query(`DROP ROLE ${ordinary}`) }
+  await emptyLedgers()
 }

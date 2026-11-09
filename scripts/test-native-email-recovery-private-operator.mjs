@@ -22,6 +22,7 @@ const protocol=load('lib/crm/nativeEmailPublication')
 const storeBinding=load('lib/crm/nativeEmailRecoveryStoreBinding',{'./nativeEmailPublication':protocol})
 const verify=load('lib/crm/nativeEmailRecoveryCustodyProof',{'./nativeEmailPublication':protocol})
 const release=load('lib/crm/legacyEmailRecoveryReleaseApproval',{'./nativeEmailPublication':protocol})
+const heldRelease=load('lib/crm/legacyHeldEmailRecoveryApproval',{'./nativeEmailPublication':protocol})
 const json=value=>protocol.nativeEmailCanonicalJson(value)+'\n'
 const digest=value=>crypto.createHash('sha256').update(value).digest('hex')
 const hash=n=>digest(String(n)),id=n=>`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`
@@ -34,8 +35,13 @@ const now=()=>Math.floor(Date.now()/1000)
 const targetFingerprint=hash('native-target')
 
 function fixture({rejectPhase,wrongReceipt=false,badInspect=false,wrongKey=false,wrongCa=false,stageAction,
-  extraStageSecrets=false,extraStageConfig=false,wrongStageIntent=false}={}){
-  const folder=fs.mkdtempSync(path.join(root,'case-')),events=[],nonces=new Set()
+  extraStageSecrets=false,extraStageConfig=false,wrongStageIntent=false,heldOriginal=false,heldState='committed',
+  heldApprovalPatch={},heldPurpose='clawpilot-private-held-original-email-recovery',sameReceiptRole=false,
+  sameReceiptPassword=false,archiveProofForHeld=false,heldStageAction,heldStageReceiptState='staged',
+  heldStageIntentOverride,heldStageApprovalOverride,heldStageReceiptPatch={},heldStagePreviewPatch={}}={}){
+  const folder=fs.mkdtempSync(path.join(root,'case-')),events=[],nonces=new Set(),connections=[]
+  const anyStage=stageAction||heldStageAction
+  const heldStageWrite=heldStageAction==='held-stage'||heldStageAction==='held-stage-attest'
   const actualSelection={holdId:id(1),outboxId:id(2),nativeOperationId:hash(3),requestFingerprint:hash(4)}
   const [custody,dispatch,approvalKey]=keys
   const target={selected:{ownerEmail:'synthetic@example.invalid',workspaceId:id(13),pipelineId:id(12),
@@ -45,9 +51,30 @@ function fixture({rejectPhase,wrongReceipt=false,badInspect=false,wrongKey=false
     pipelineId:id(12),workspaceId:id(13),sourceFingerprint:hash('source'),retirementReceiptHash:hash('retired'),activationReceiptHash:hash('activation')}
   const stageProof={version:1,purpose:'clawpilot-private-legacy-email-release-v1',keyId:'release',...stagePins,
     issuedAt:now(),expiresAt:now()+110}
-  const approval=sign(stageProof,approvalKey.privateKey)
-  const signed=release.verifyLegacyEmailRecoveryReleaseApproval({envelope:approval,
+  const archiveApproval=sign(stageProof,approvalKey.privateKey)
+  const signed=release.verifyLegacyEmailRecoveryReleaseApproval({envelope:archiveApproval,
     operatorAnchor:{keyId:'release',key:approvalKey.publicKey},nowSeconds:now()})
+  const heldProof={version:1,purpose:'clawpilot-private-legacy-held-email-recovery-v1',keyId:'release',
+    holdBatchId:actualSelection.holdId,outboxId:actualSelection.outboxId,nativeOperationId:actualSelection.nativeOperationId,
+    requestFingerprint:actualSelection.requestFingerprint,issuedAt:now(),expiresAt:now()+110,
+    localId:id(10),nativeId:id(11),pipelineId:id(12),workspaceId:id(13),nativeAuthorityInstanceId:id(17),lockToken:id(14),
+    holdReceiptHash:hash('hold receipt'),originalFingerprint:hash('original job'),sourceFingerprint:hash('source'),
+    relationshipFingerprint:hash('relationships'),providerIdentityFingerprint:hash('provider'),activationReceiptHash:hash('activation'),
+    stagedPayloadFingerprint:hash('staged payload'),globalId:'gi1234567',generation:1,primaryAccountId:id(16),accountIds:[id(15),id(16)]}
+  const verifiedHeld=envelope=>heldRelease.verifyLegacyHeldEmailRecoveryApproval({
+    envelope,operatorAnchor:{keyId:'release',key:approvalKey.publicKey},nowSeconds:now()})
+  const correctHeldApproval=sign(heldProof,approvalKey.privateKey)
+  const signedHeld=verifiedHeld(correctHeldApproval)
+  const priorHeld=verifiedHeld(sign({...heldProof,issuedAt:heldProof.issuedAt-10,expiresAt:heldProof.expiresAt-10},approvalKey.privateKey))
+  const approval=(heldOriginal||heldStageAction)&&!archiveProofForHeld
+    ?Object.keys(heldApprovalPatch).length?sign({...heldProof,...heldApprovalPatch},approvalKey.privateKey):correctHeldApproval
+    :archiveApproval
+  const heldStageTarget={holdId:heldProof.holdBatchId,outboxId:heldProof.outboxId,holdReceiptHash:heldProof.holdReceiptHash,
+    lockToken:heldProof.lockToken}
+  const stageReceiptApproval=heldStageAction==='held-stage-attest'?priorHeld:signedHeld
+  const heldStageReceipt=heldStageReceiptState==='staged'?{state:'staged',outboxId:heldStageTarget.outboxId,
+    holdBatchId:heldStageTarget.holdId,intentHash:stageReceiptApproval.intentHash,approvalHash:stageReceiptApproval.approvalHash,
+    receiptHash:hash('exact held stage receipt'),...heldStageReceiptPatch}:{state:heldStageReceiptState}
   const stageReceipt={state:'staged',holdId:id(1),outboxId:id(2),retiredOutboxId:id(9),intentHash:signed.intentHash,receiptHash:hash('staged')}
   const stageApi=load('lib/crm/nativeEmailRecoveryPrivateStage',{'./nativeEmailPublication':protocol,
     './legacyEmailRecoveryReleaseApproval':release,'../persistence/crmLegacyEmailRecoveryStage':{
@@ -65,27 +92,70 @@ function fixture({rejectPhase,wrongReceipt=false,badInspect=false,wrongKey=false
         events.push('db:stage-inspect');return stageReceipt
       },
     }})
-  const selection=stageAction==='stage-preview'?{holdId:id(1),outboxId:id(2),...stageApi.nativeEmailRecoveryStagePreviewPins(target)}:actualSelection
-  const native={fixture:true,mariaStoreFingerprint:hash('native database')}
-  const cfg={version:1,purpose:stageAction?'clawpilot-private-native-email-staging':'clawpilot-private-native-email-recovery',selection,native,
+  const previewFingerprint=suffix=>protocol.nativeEmailDigest({version:1,purpose:'clawpilot-held-original-stage-preview-'+suffix+'-v1',
+    target:heldStageTarget})
+  const selection=stageAction==='stage-preview'?{holdId:id(1),outboxId:id(2),...stageApi.nativeEmailRecoveryStagePreviewPins(target)}
+    :heldStageAction==='held-stage-preview'?{holdId:id(1),outboxId:id(2),nativeOperationId:previewFingerprint('operation'),
+      requestFingerprint:previewFingerprint('request')}:actualSelection
+  const native={fixture:true,mariaStoreFingerprint:hash('native database'),...((heldOriginal||heldStageAction)?{nativeInstanceId:id(17)}:{})}
+  const cfg={version:1,purpose:stageAction?'clawpilot-private-native-email-staging':
+    heldStageAction?'clawpilot-private-held-original-email-staging':heldOriginal?heldPurpose:
+    'clawpilot-private-native-email-recovery',selection,native,
     postgres:{host:'127.0.0.1',port:5432,database:'fixture',user:'fixture_recovery',systemIdentifier:'12345678',databaseOid:'16',tlsCaSha256:hash('synthetic-ca')},
     ...(stageAction?{target,intentHash:stageAction==='stage-preview'?null:wrongStageIntent?hash('wrong stage intent'):signed.intentHash,
       ...(extraStageConfig?{dispatch:{keyId:'unexpected-dispatch',publicKey:pem(dispatch.publicKey)}}:{})}:
+      heldStageAction?{target:heldStageTarget,receiptAttestorUser:sameReceiptRole?'fixture_recovery':'fixture_receipts',
+        intentHash:heldStageIntentOverride??(heldStageAction==='held-stage-preview'?null:signedHeld.intentHash),
+        approvalHash:heldStageApprovalOverride??(heldStageAction==='held-stage-preview'?null:stageReceiptApproval.approvalHash),
+        ...(extraStageConfig?{dispatch:{keyId:'unexpected-dispatch',publicKey:pem(dispatch.publicKey)}}:{})}:
       {leaseOwner:id(7),railway:{binary:'/usr/bin/true',binarySha256:hash('binary'),identityFile:'/tmp/synthetic-identity'},
-        dispatch:{keyId:'dispatch',publicKey:pem(dispatch.publicKey)}}),
+        dispatch:{keyId:'dispatch',publicKey:pem(dispatch.publicKey)},
+        ...(heldOriginal?{stageReceiptHash:hash('held stage receipt'),receiptAttestorUser:sameReceiptRole?'fixture_recovery':'fixture_receipts'}:{})}),
     release:{keyId:'release',publicKey:pem(approvalKey.publicKey)},
     custody:{keyId:'custody',publicKey:pem(custody.publicKey),socketPath:'/tmp/not-connected/custody.sock',uid:0,
       fenceEpoch:id(8),expiresAt:now()+180,producerInventoryHash:hash('producer-set')}}
   const write=(name,data)=>{const target=path.join(folder,name);fs.writeFileSync(target,json(data),{flag:'wx',mode:0o600});return target}
   const config=write('config',cfg),secrets=write('secrets',{postgresPassword:'synthetic-only',postgresTlsCa:wrongCa?'wrong-ca':'synthetic-ca',
-    ...(!stageAction||extraStageSecrets?{dispatchPrivateKey:pem((wrongKey?custody:dispatch).privateKey),
-      transportAttestationKey:Buffer.alloc(32,3).toString('base64')}:{})})
-  const reviewed=stageAction==='stage-preview'||stageAction==='stage-inspect'?path.join(folder,'absent-approval'):write('approval',approval)
+    ...(!anyStage||extraStageSecrets?{dispatchPrivateKey:pem((wrongKey?custody:dispatch).privateKey),
+      transportAttestationKey:Buffer.alloc(32,3).toString('base64')}:{}),
+    ...(heldOriginal||heldStageWrite?{receiptAttestorPassword:sameReceiptPassword?'synthetic-only':'synthetic-attestor-only'}:{})})
+  const reviewed=['stage-preview','stage-inspect','held-stage-preview','held-stage-inspect'].includes(anyStage)
+    ?path.join(folder,'absent-approval'):write('approval',approval)
   const configHash=digest(json(cfg))
   const mocks={
     '../lib/crm/nativeEmailRecoveryStoreBinding':storeBinding,
     '../lib/crm/nativeEmailPublication':protocol,'../lib/crm/nativeEmailRecoveryCustodyProof':verify,
-    '../lib/crm/legacyEmailRecoveryReleaseApproval':release,'../lib/crm/nativeEmailRecoveryPrivateStage':stageApi,
+    '../lib/crm/legacyEmailRecoveryReleaseApproval':release,'../lib/crm/legacyHeldEmailRecoveryApproval':heldRelease,
+    '../lib/crm/nativeEmailRecoveryPrivateStage':stageApi,
+    '../lib/persistence/crmHeldOriginalRecoveryStage':{
+      async previewHeldOriginalRecovery(transaction,selected){
+        assert.equal(transaction,connections[0].connection.transaction);assert.deepEqual(selected,heldStageTarget)
+        events.push('db:held-stage-preview')
+        const {version,purpose,keyId,issuedAt,expiresAt,...pins}=heldProof
+        assert.ok(version&&purpose&&keyId&&issuedAt&&expiresAt)
+        return {pins:{...pins,...heldStagePreviewPatch}}
+      },
+      async inspectHeldOriginalRecovery(transaction,pins){
+        assert.equal(transaction,connections[0].connection.transaction)
+        assert.deepEqual(pins,{outboxId:heldStageTarget.outboxId,intentHash:cfg.intentHash,approvalHash:cfg.approvalHash})
+        events.push('db:held-stage-inspect');return heldStageReceipt
+      },
+      async stageHeldOriginalRecovery({transaction,attestTransaction,attestorUser,target:stagedTarget,approval:review}){
+        assert.equal(transaction,connections[0].connection.transaction);assert.equal(attestTransaction,connections[1].connection.transaction)
+        assert.equal(attestorUser,cfg.receiptAttestorUser);assert.deepEqual(stagedTarget,heldStageTarget)
+        heldRelease.assertVerifiedLegacyHeldEmailRecoveryApproval(review);assert.deepEqual(review,signedHeld)
+        events.push('db:held-stage');return heldStageReceipt
+      },
+      async attestHeldOriginalRecoveryApproval({attestTransaction,attestorUser,approval:review}){
+        assert.equal(attestTransaction,connections[1].connection.transaction)
+        assert.equal(attestorUser,cfg.receiptAttestorUser)
+        heldRelease.assertVerifiedLegacyHeldEmailRecoveryApproval(review);assert.deepEqual(review,signedHeld)
+        assert.equal(review.intentHash,priorHeld.intentHash)
+        assert.notEqual(review.approvalHash,priorHeld.approvalHash)
+        events.push('db:held-stage-attest')
+        return {intentHash:review.intentHash,approvalHash:review.approvalHash}
+      },
+    },
     '../lib/crm/nativeEmailAccountRepairOperator':{
       isNativeEmailAccountRepairAction:action=>['repair-preview','repair','repair-inspect'].includes(action),
       runNativeEmailAccountRepairPrivateOperator:async input=>{
@@ -102,20 +172,35 @@ function fixture({rejectPhase,wrongReceipt=false,badInspect=false,wrongKey=false
           approval:input.action==='archive'?input.readApproval():undefined}
       },
     },
-    '../lib/crm/nativeEmailRecoveryPrivatePostgres':{createNativeEmailRecoveryPrivatePostgres:()=>({
-      close:async()=>events.push('db:closed'),transaction:async fn=>{events.push('db:read');return fn({query:async()=>({rows:[{
-        enabled:true,active_operation_id:null,active_transition_id:null,active_initial_enrollment_id:null,
-        state:badInspect?'unknown':'committed',released_operation_id:selection.nativeOperationId,release_fingerprint:selection.requestFingerprint,
-        admission_fingerprint:selection.requestFingerprint,has_receipt:true}]})})}})},
+    '../lib/crm/nativeEmailRecoveryPrivatePostgres':{createNativeEmailRecoveryPrivatePostgres:options=>{
+      const attestor=options.target.user===cfg.receiptAttestorUser
+      const connection={close:async()=>events.push(attestor?'attestor:closed':'db:closed'),
+        transaction:async fn=>{
+          events.push('db:read')
+          return fn({query:async(sql,params)=>{
+            if(heldOriginal){
+              assert.equal(attestor,false,'held inspection must use only the controller')
+              assert.match(sql,/^SELECT crm_legacy_email_terminal_hold\.resolve_release\(/u)
+              assert.deepEqual(params,[selection.outboxId,cfg.stageReceiptHash,selection.nativeOperationId,selection.requestFingerprint])
+              return {rows:[{value:{state:heldState,receiptBody:'synthetic-private-content'}}]}
+            }
+            return {rows:[{enabled:true,active_operation_id:null,active_transition_id:null,active_initial_enrollment_id:null,
+              state:badInspect?'unknown':'committed',released_operation_id:selection.nativeOperationId,release_fingerprint:selection.requestFingerprint,
+              admission_fingerprint:selection.requestFingerprint,has_receipt:true}]}
+          }})
+        }}
+      connections.push({options,connection})
+      return connection
+    }},
     '../lib/crm/nativeEmailRecoveryCliTransport':{
       nativeEmailRecoveryCliTargetFingerprint:target=>{assert.deepEqual(target,native);return targetFingerprint},
-      createNativeEmailRecoveryCliTransport:()=>{assert.equal(stageAction,undefined,'stage must not initialize transport');return {targetFingerprint}},
+      createNativeEmailRecoveryCliTransport:()=>{assert.equal(anyStage,undefined,'stage must not initialize transport');return {targetFingerprint}},
     },
     '../lib/crm/nativeEmailRecoveryDispatchPermit':{createNativeEmailRecoveryDispatchSigner:()=>{
-      assert.equal(stageAction,undefined,'stage must not initialize a dispatch signer');return {}
+      assert.equal(anyStage,undefined,'stage must not initialize a dispatch signer');return {}
     }},
     '../lib/persistence/crmNativeEmailPublication':{createPrivateLegacyEmailRecoveryPersistence:options=>{
-      assert.equal(stageAction,undefined,'stage must not initialize publication persistence');return options
+      assert.equal(anyStage,undefined,'stage must not initialize publication persistence');return options
     }},
     '../lib/crm/nativeEmailRecoveryCustodySocket':{requestNativeEmailRecoveryCustody:async({challenge})=>{
       assert.equal(challenge.controllerConfigHash,configHash);assert.equal(challenge.operationId,selection.nativeOperationId)
@@ -133,15 +218,23 @@ function fixture({rejectPhase,wrongReceipt=false,badInspect=false,wrongKey=false
     '../lib/crm/nativeEmailRecoveryMaintenanceOperator':{createNativeEmailRecoveryMaintenanceOperator:({persistence})=>{
       const run=action=>persistence.maintenanceDispatch.withVerifiedFence(async fence=>{
         assert.equal(fence.targetFingerprint,targetFingerprint);assert.deepEqual(persistence.selection,selection)
-        assert.equal(!!persistence.initialApproval,action==='publish');events.push(`native:${action}`);return {synchronized:true}
+        if(heldOriginal){
+          assert.equal(persistence.initialApproval,undefined)
+          const held=persistence.heldOriginal
+          assert.equal(held.stageReceiptHash,cfg.stageReceiptHash)
+          assert.deepEqual(held.receiptAttestor,{user:cfg.receiptAttestorUser,transaction:connections[1].connection.transaction})
+          if(action==='publish')heldRelease.assertVerifiedLegacyHeldEmailRecoveryApproval(held.initialApproval)
+          else assert.equal(held.initialApproval,undefined)
+        }else assert.equal(!!persistence.initialApproval,action==='publish')
+        events.push(`native:${action}`);return {synchronized:true}
       });return {publish:()=>run('publish'),resolve:()=>run('resolve')}
     }},
   }
   const {runNativeEmailRecoveryPrivateOperator:run}=load('ops/native-email-recovery',mocks)
   const args=action=>[`--action=${action}`,`--config=${config}`,`--config-sha256=${configHash}`,`--secrets=${secrets}`,
-    ...(['publish','resolve','stage'].includes(action)?[`--approve-operation=${selection.nativeOperationId}`]:[]),
-    ...(['publish','stage'].includes(action)?[`--approval=${reviewed}`,`--approval-sha256=${digest(json(approval))}`]:[])]
-  return {run,args,events,config,reviewed,stagePins,stageReceipt,selection,cfg}
+    ...(['publish','resolve','stage','held-stage','held-stage-attest'].includes(action)?[`--approve-operation=${selection.nativeOperationId}`]:[]),
+    ...(['publish','stage','held-stage','held-stage-attest'].includes(action)?[`--approval=${reviewed}`,`--approval-sha256=${digest(json(approval))}`]:[])]
+  return {run,args,events,config,reviewed,stagePins,stageReceipt,selection,cfg,connections,heldStageReceipt,signedHeld,heldProof}
 }
 
 test('repair CLI routes only its three named actions and separates UUID approval from normal SHA pins',async()=>{
@@ -200,6 +293,55 @@ test('operation approval, protected files, signer binding and inconsistent termi
   assert.deepEqual(inspect.events,['custody:before','db:read','custody:after','db:closed'])
 })
 
+test('held-original inspection reads only exact pins and returns redacted durable state',async()=>{
+  for(const state of ['staged','dispatched','committed','cancelled','unknown']){
+    const f=fixture({heldOriginal:true,heldState:state})
+    const result=await f.run(f.args('inspect'))
+    assert.deepEqual(result.result,{state,hasReceipt:state==='committed'||state==='cancelled'})
+    assert.equal(result.successfulObservations,2)
+    assert.deepEqual(f.events,['custody:before','db:read','custody:after','db:closed'])
+    assert.deepEqual(f.connections.map(({options})=>options.target.user),['fixture_recovery'])
+  }
+  const invalid=fixture({heldOriginal:true,heldState:'forged-state'})
+  await assert.rejects(invalid.run(invalid.args('inspect')),/inspect_scope/u)
+  assert.deepEqual(invalid.events,['custody:before','db:read','custody:after','db:closed'])
+})
+
+test('held-original publish and resolve keep the attestor on a separate pinned connection',async()=>{
+  for(const action of ['publish','resolve']){
+    const f=fixture({heldOriginal:true})
+    const result=await f.run(f.args(action))
+    assert.deepEqual(result.result,{synchronized:true})
+    assert.equal(result.successfulObservations,4)
+    const [controller,attestor]=f.connections.map(({options})=>options)
+    assert.equal(controller.target.user,'fixture_recovery')
+    assert.deepEqual(attestor.target,{...controller.target,user:'fixture_receipts'})
+    assert.equal(attestor.tlsCa,controller.tlsCa)
+    assert.notEqual(attestor.password,controller.password)
+    assert.deepEqual(f.events,['custody:before','custody:before',`native:${action}`,'custody:after','custody:after',
+      'attestor:closed','db:closed'])
+  }
+})
+
+test('held-original mismatched purpose, attestor, or signed scope fails before any connections',async()=>{
+  for(const [options,reason] of [
+    [{sameReceiptRole:true},/receipt_attestor_scope/u],
+    [{sameReceiptPassword:true},/receipt_attestor_secret/u],
+    [{heldPurpose:'clawpilot-private-native-email-recovery'},/shape|config_scope/u],
+    [{archiveProofForHeld:true},/legacy_held_email_recovery_shape/u],
+    [{heldApprovalPatch:{holdBatchId:id(90)}},/approval_selection/u],
+    [{heldApprovalPatch:{outboxId:id(90)}},/approval_selection/u],
+    [{heldApprovalPatch:{nativeOperationId:hash('unreviewed operation')}},/approval_selection/u],
+    [{heldApprovalPatch:{requestFingerprint:hash('unreviewed request')}},/approval_selection/u],
+    [{heldApprovalPatch:{nativeAuthorityInstanceId:id(90)}},/approval_selection/u],
+  ]){
+    const f=fixture({heldOriginal:true,...options})
+    await assert.rejects(f.run(f.args('publish')),reason)
+    assert.deepEqual(f.connections,[])
+    assert.deepEqual(f.events,[])
+  }
+})
+
 test('exact staging actions use separate DB-only configuration, one fenced action and no native dispatch',async()=>{
   for(const stageAction of ['stage-preview','stage','stage-inspect']){
     const f=fixture({stageAction})
@@ -232,4 +374,94 @@ test('a stage write requires both the explicit operation and signed retained int
   assert.deepEqual(wrong.events,[])
   const lost=fixture({stageAction:'stage',rejectPhase:'after'});await assert.rejects(lost.run(lost.args('stage')),/fixture_custody_lost/u)
   assert.deepEqual(lost.events,['custody:before','custody:before','db:stage','custody:after','custody:after','db:closed'])
+})
+
+test('held-original stage preview and inspect use exact pins, one controller and no approval or native access',async()=>{
+  for(const heldStageAction of ['held-stage-preview','held-stage-inspect']){
+    const f=fixture({heldStageAction})
+    assert.equal(fs.existsSync(f.reviewed),false)
+    assert.equal(f.args(heldStageAction).some(arg=>arg.startsWith('--approve-operation=')||arg.startsWith('--approval=')),false)
+    const result=await f.run(f.args(heldStageAction))
+    assert.equal(result.action,heldStageAction);assert.equal(result.operationId,f.selection.nativeOperationId)
+    assert.match(result.observationsDigest,/^[0-9a-f]{64}$/u)
+    if(heldStageAction==='held-stage-preview'){
+      assert.equal(result.result.pins.holdBatchId,f.selection.holdId)
+      assert.equal(result.result.pins.outboxId,f.selection.outboxId)
+      assert.equal(result.result.pins.nativeOperationId,f.heldProof.nativeOperationId)
+      assert.notEqual(result.result.pins.nativeOperationId,result.operationId,'preview custody pins are not write approval')
+      assert.equal(result.result.pins.approvalHash,undefined)
+    }else assert.deepEqual(result.result,f.heldStageReceipt)
+    assert.deepEqual(f.connections.map(({options})=>options.target.user),['fixture_recovery'])
+    assert.deepEqual(f.events.filter(event=>event.startsWith('db:')&&event!=='db:closed'),[`db:${heldStageAction}`])
+    assert.ok(f.events.indexOf('custody:before')<f.events.indexOf(`db:${heldStageAction}`))
+    assert.ok(f.events.lastIndexOf('custody:after')>f.events.indexOf(`db:${heldStageAction}`))
+    assert.ok(!f.events.some(event=>event.startsWith('native:')))
+  }
+})
+
+test('held-original stage mutates once; refresh only attests after inspecting the exact prior stage',async()=>{
+  for(const heldStageAction of ['held-stage','held-stage-attest']){
+    const f=fixture({heldStageAction})
+    const result=await f.run(f.args(heldStageAction))
+    const calls=f.events.filter(event=>event.startsWith('db:')&&event!=='db:closed')
+    assert.deepEqual(f.connections.map(({options})=>options.target.user),['fixture_recovery','fixture_receipts'])
+    assert.notEqual(f.connections[0].options.password,f.connections[1].options.password)
+    if(heldStageAction==='held-stage'){
+      assert.deepEqual(calls,['db:held-stage'])
+      assert.deepEqual(result.result,f.heldStageReceipt)
+    }else {
+      assert.deepEqual(calls,['db:held-stage-inspect','db:held-stage-attest'])
+      assert.notEqual(f.cfg.approvalHash,f.signedHeld.approvalHash)
+      assert.equal(result.result.approvalHash,f.signedHeld.approvalHash)
+      assert.equal(result.result.intentHash,f.cfg.intentHash)
+    }
+    assert.ok(!f.events.some(event=>event.startsWith('native:')))
+  }
+})
+
+test('held-original staging rejects cross-scope, reused roles, and nonmatching signed intent before database access',async()=>{
+  for(const [options,reason] of [
+    [{sameReceiptRole:true},/receipt_attestor_scope/u],
+    [{sameReceiptPassword:true},/receipt_attestor_secret/u],
+    [{extraStageConfig:true},/shape/u],
+    [{extraStageSecrets:true},/shape|secret_shape/u],
+    [{archiveProofForHeld:true},/legacy_held_email_recovery_shape/u],
+    [{heldStageIntentOverride:hash('wrong intent')},/held_stage_approval_scope/u],
+    [{heldStageApprovalOverride:hash('wrong approval')},/held_stage_approval_scope/u],
+    [{heldApprovalPatch:{holdReceiptHash:hash('wrong hold receipt')}},/held_stage_approval_scope/u],
+    [{heldApprovalPatch:{lockToken:id(90)}},/held_stage_approval_scope/u],
+  ]){
+    const f=fixture({heldStageAction:'held-stage',...options})
+    await assert.rejects(f.run(f.args('held-stage')),reason)
+    assert.deepEqual(f.connections,[])
+    assert.deepEqual(f.events,[])
+  }
+  const f=fixture({heldStageAction:'held-stage-attest'})
+  await assert.rejects(f.run(f.args('held-stage-attest').filter(arg=>!arg.startsWith('--approve-operation='))),/explicit_operation_approval/u)
+  await assert.rejects(f.run(f.args('held-stage-attest').filter(arg=>!arg.startsWith('--approval='))),/release_approval_pin/u)
+  await assert.rejects(f.run(f.args('publish')),/shape|config_scope/u)
+  assert.deepEqual(f.connections,[])
+  assert.deepEqual(f.events,[])
+})
+
+test('held-original refresh cannot attest without a matching durable stage; lost custody does not restage',async()=>{
+  for(const options of [{heldStageReceiptState:'unknown'},{heldStageReceiptPatch:{holdBatchId:id(90)}}]){
+    const uncertain=fixture({heldStageAction:'held-stage-attest',...options})
+    await assert.rejects(uncertain.run(uncertain.args('held-stage-attest')),/held_stage_receipt_scope/u)
+    assert.deepEqual(uncertain.events.filter(event=>event.startsWith('db:held-stage')),['db:held-stage-inspect'])
+    assert.deepEqual(uncertain.connections.map(({options})=>options.target.user),['fixture_recovery'])
+  }
+  const lost=fixture({heldStageAction:'held-stage',rejectPhase:'after'})
+  await assert.rejects(lost.run(lost.args('held-stage')),/fixture_custody_lost/u)
+  assert.deepEqual(lost.events.filter(event=>event.startsWith('db:held-stage')),['db:held-stage'])
+})
+
+test('held-original preview refuses database pins for a different job, lock or native instance',async()=>{
+  for(const heldStagePreviewPatch of [{outboxId:id(90)},{holdBatchId:id(90)},{lockToken:id(90)},
+    {holdReceiptHash:hash('different hold')},{nativeAuthorityInstanceId:id(90)}]){
+    const f=fixture({heldStageAction:'held-stage-preview',heldStagePreviewPatch})
+    await assert.rejects(f.run(f.args('held-stage-preview')),/held_stage_native_scope/u)
+    assert.deepEqual(f.events.filter(event=>event.startsWith('db:held-stage')),['db:held-stage-preview'])
+    assert.deepEqual(f.connections.map(({options})=>options.target.user),['fixture_recovery'])
+  }
 })
