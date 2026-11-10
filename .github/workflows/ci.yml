@@ -28,6 +28,10 @@ jobs:
           node-version: 24
       - name: SuiteCRM Email search PHP and Smarty behavioral tests
         run: npm run test:suitecrm-email-search
+      - name: Preload PHP for SuiteCRM router tests
+        run: docker pull php:8.2-cli-alpine
+      - name: SuiteCRM installer and legacy router upgrade tests
+        run: npm run test:suitecrm-email-audience-php
 
   validate-postgres-catalog:
     name: PostgreSQL ${{ matrix.postgres }} catalog attestation

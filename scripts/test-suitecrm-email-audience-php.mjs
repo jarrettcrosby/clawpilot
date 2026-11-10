@@ -13,10 +13,9 @@ const output = execFileSync('docker', ['run', '--rm', '--pull=never', '--network
   '--memory', '128m', '--cpus', '0.5', '--pids-limit', '64', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
   '--log-driver', 'json-file', '--log-opt', 'max-size=1m', '--log-opt', 'max-file=1',
   '--tmpfs', '/tmp:rw,nosuid,noexec,size=16m',
-  '--mount', `type=bind,source=${resolve('services/suitecrm/email-audience')},target=/source/email-audience,readonly`,
-  '--mount', `type=bind,source=${resolve('services/suitecrm/install-email-audience.php')},target=/source/install-email-audience.php,readonly`,
+  '--mount', `type=bind,source=${resolve('services/suitecrm')},target=/source,readonly`,
   '--mount', `type=bind,source=${resolve('scripts/fixtures/native-email-audience')},target=/fixture,readonly`,
   image, 'sh', '-c', 'php -l /source/email-audience/EmailAudience.php && php -l /source/email-audience/routes.php && php -l /source/install-email-audience.php && cp -R /fixture /tmp/kernel && cd /tmp/kernel && php kernel.php',
 ], { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })
 process.stdout.write(output)
-assert.match(output, /Native Email audience PHP kernel passed 16 controlled-stub checks/)
+assert.match(output, /Native Email audience PHP kernel passed 17 controlled-stub checks/)

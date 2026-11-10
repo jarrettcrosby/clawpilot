@@ -138,6 +138,43 @@ check_kernel('oversized and fabricated-subject commands return fixed held error 
     $response=($app->handler)(new FixtureRequest($command),new FixtureResponse());must($response->status===409,'Exact command shape');
     must($response->body['error']==='Native Email audience proof is unavailable','No private diagnostics');
 });
+check_kernel('installer upgrades the exact standalone lifecycle router and composes the stock boot routes on restart',function(){
+    require_once '/source/install-shared-email-worker.php';
+    $create = static function (string $name): array {
+        $root=getcwd().'/'.$name;
+        mkdir($root,0755);
+        install_clawpilot_record_lifecycle('/source/record-lifecycle',$root,true);
+        $route=$root.'/custom/application/Ext/Api/V8/Config/routes.php';
+        $helper=$root.'/custom/include/ClawPilot/EmailAudience.php';
+        $before=file_get_contents($route);
+        must(strlen($before)===224&&hash('sha256',$before)==='8a755a54097499fa3ddaa8bc7550d578c249475e5b8c0b2c575a1c6e89a909ed',
+            'Fixture must match the released standalone router exactly');
+        must(!file_exists($helper),'Standalone installation did not install an audience helper');
+        return [$root,$route,$helper,$before];
+    };
+    [$root,$route,$helper,$before]=$create('standalone-upgrade');
+    $source=file_get_contents('/source/email-audience/routes.php');
+    $expected=$source.CLAWPILOT_RECORD_LIFECYCLE_ROUTE_BLOCK.CP_SHARED_EMAIL_ROUTE_BLOCK;
+    $lifecycleHelper=$root.'/custom/include/ClawPilot/record-lifecycle-routes.php';
+    $existingLifecycleHelper=file_get_contents($lifecycleHelper);
+    for($boot=0;$boot<2;$boot++){
+        install_clawpilot_email_audience('/source/email-audience',$root);
+        install_clawpilot_record_lifecycle('/source/record-lifecycle',$root,true);
+        cp_install_shared_email_worker('/source/email-audience',$root);
+        must(file_get_contents($route)===$expected,'Each boot composes all three routes once');
+        must(file_get_contents($lifecycleHelper)===$existingLifecycleHelper,'Preserve the previously installed lifecycle helper');
+        must(file_get_contents($helper)===file_get_contents('/source/email-audience/EmailAudience.php'),'Audience helper has exact managed source');
+    }
+    [$root,$route,$helper,$before]=$create('standalone-unknown');
+    $lookalike=substr($before,0,-1).' ';
+    file_put_contents($route,$lookalike);
+    refuses(fn()=>install_clawpilot_email_audience('/source/email-audience',$root));
+    must(file_get_contents($route)===$lookalike&&!file_exists($helper),'Never alter a one-byte router lookalike or partially install');
+    file_put_contents($route,$before);
+    file_put_contents($helper,$before);
+    refuses(fn()=>install_clawpilot_email_audience('/source/email-audience',$root));
+    must(file_get_contents($route)===$before&&file_get_contents($helper)===$before,'Router exception does not apply to other files');
+});
 check_kernel('installer is idempotent and refuses unmanaged route or symlink without overwriting it',function(){
     install_clawpilot_email_audience('/source/email-audience',getcwd());
     $path='custom/application/Ext/Api/V8/Config/routes.php';file_put_contents($path,'<?php // operator-owned route');
