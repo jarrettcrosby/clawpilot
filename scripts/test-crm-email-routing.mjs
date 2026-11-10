@@ -14,7 +14,7 @@ const ts = createRequire(new URL('../app_src/package.json', import.meta.url))('t
 const plain = value => JSON.parse(JSON.stringify(value))
 const sourcePath = 'app_src/lib/crm/emailIngestion.ts'
 const fixtureCaseyProviderSubject = 'synthetic-casey-first-seen-google-subject'
-function loadModule(path, mocks = {}, extraExports = '') {
+function loadModule(path, mocks = {}, extraExports = '', environment = {}) {
   const source = readFileSync(new URL(`../${path}`, import.meta.url), 'utf8') + extraExports
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
@@ -23,7 +23,7 @@ function loadModule(path, mocks = {}, extraExports = '') {
   const module = { exports: {} }
   vm.runInNewContext(output, {
     Buffer, Error, TextDecoder, URL, URLSearchParams, Response, AbortSignal,
-    process: { env: { CLAWPILOT_ARCHIVE_EMAIL: 'archive@example.test' } },
+    process: { env: { CLAWPILOT_ARCHIVE_EMAIL: 'archive@example.test', ...environment } },
     module, exports: module.exports,
     require(name) {
       if (Object.hasOwn(mocks, name)) return mocks[name]
@@ -49,6 +49,12 @@ const businessPipeline = '22222222-2222-4222-8222-222222222222'
 const unrelatedPipeline = '33333333-3333-4333-8333-333333333333'
 const customerOrganization = '44444444-4444-4444-8444-444444444444'
 const otherOrganization = '55555555-5555-4555-8555-555555555555'
+const sharedWorkspace = 'c6c49765-9bf6-4223-9261-7553499f5d92'
+const sharedPipeline = '587c8746-ecf6-40ae-8c50-e456f99ad555'
+const sharedEnvironment = {
+  CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID: sharedWorkspace,
+  CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID: sharedPipeline,
+}
 const ownedPipelines = [
   { id: primaryPipeline, is_default: true },
   { id: businessPipeline, is_default: true },
@@ -116,12 +122,12 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
   polledMessages = [], onAudit, beforeEnrichment, beforeReferenceRead, beforeReviewedBatch,
   verifiedIdentity = mailboxIdentity, intakeIdentityStatus = 'verified', retainCaseyHistoricalMarker = false,
   fixtureOwnerEmail = ownerEmail, fixtureMailboxEmail = mailboxEmail, fixtureConnectionId = 'fixture-connection',
-  fixturePrimaryPipeline = primaryPipeline, fixtureBusinessPipeline = businessPipeline } = {}) {
+  fixturePrimaryPipeline = primaryPipeline, fixtureBusinessPipeline = businessPipeline, environment = {} } = {}) {
   const ownerEmail = fixtureOwnerEmail, mailboxEmail = fixtureMailboxEmail
   const primaryPipeline = fixturePrimaryPipeline, businessPipeline = fixtureBusinessPipeline
   const queries = [], staged = [], providerCalls = [], audits = [], messages = new Map(), links = new Map()
   const initialProviderMessageIds = polledMessages.map(message => message.id)
-  const persistedInteractions = [], enrichments = []
+  const persistedInteractions = [], enrichments = [], ordinarySharedStages = []
   const reviewedBatches = [], reviewedStages = [], reviewedInteractions = new Map()
   const result = rows => ({ rows, rowCount: rows.length })
   const enrichmentQuery = async (sql, values = []) => {
@@ -168,11 +174,25 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
       contact_ids: plain(input.fields.contactIds), lead_id: input.fields.leadId })
     return { id: input.localId }
   })
+  const persistStage = input => {
+    staged.push(plain(input))
+    const id = `interaction-${staged.length}`
+    const retained = messages.get(input.fields.providerMessageId)
+    persistedInteractions.push({ ...knownProviderInteraction(id), id, pipeline_id: input.pipelineId, source_key: input.sourceKey,
+      canonical_source_id: input.fields.metadata?.canonicalSourceId || null,
+      source_message_id: retained?.external_message_id, source_thread_id: retained?.external_thread_id,
+      canonical_evidence: { emailAddressHeaders: retained?.raw_metadata.emailAddressHeaders },
+      provider_message_id: input.fields.providerMessageId, provider_thread_id: input.fields.providerThreadId,
+      organization_id: input.fields.organizationId, contact_id: input.fields.contactId || null,
+      organization_ids: input.fields.organizationIds || [], contact_ids: input.fields.contactIds || [], lead_id: input.fields.leadId || null })
+    return { id }
+  }
   const ingestion = loadModule(sourcePath, {
     '@/lib/crm/emailAddressHeaders': headers,
     '@/lib/crm/participantEligibility': participantEligibility,
     '@/lib/crm/emailIdentity': emailIdentity,
     '@/lib/crm/emailReconciliation': emailReconciliation,
+    '@/lib/crm/suiteCrmNativeEmailProjection': loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts', {}, '', environment),
     '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', {
       '@/lib/crm/emailIdentity': { ...emailIdentity, gmailMailboxKey: identity => identity.providerAccountId === fixtureCaseyProviderSubject
         ? loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }).CASEY_PAIR.mailboxKey
@@ -257,6 +277,17 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
         const row = messages.get(values[1])
         return result(row && (!row.owner_email || row.owner_email === values[0]) ? [row] : [])
       }
+      if (sql.includes('FROM crm_organizations company')) {
+        assert.match(sql, /company\.account_type/)
+        assert.match(sql, /pipeline\.workspace_organization_id\s*=\s*\$2::uuid/)
+        assert.match(sql, /company\.id\s*=\s*ANY\(\$3::uuid\[\]\)/)
+        assert.match(sql, /company\.source_payload->>'archived'/)
+        const [pipelineId, workspaceId, organizationIds] = values
+        if (!activePipelines.some(pipeline => pipeline.id === pipelineId && pipeline.workspaceOrganizationId === workspaceId)) return result([])
+        return result(organizations.filter(record => record.pipelineId === pipelineId
+          && organizationIds.includes(record.id) && !record.archived)
+          .map(record => ({ id: record.id, account_type: record.accountType })))
+      }
       if (sql.includes('SELECT id::text, reference_code FROM crm_organizations')) {
         assert.equal(values[0], businessPipeline)
         assert.match(sql, /id = ANY\(\$2::uuid\[\]\)/)
@@ -331,6 +362,14 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
     } },
     '@/lib/persistence/crm': {
       enrichCrmEmailInteractionParticipantsInPostgres: enrich,
+      stageOrdinarySharedGmailInteractionInPostgres: async input => {
+        ordinarySharedStages.push(plain(input))
+        const existing = persistedInteractions.find(row => row.pipeline_id === input.interaction.pipelineId
+          && row.canonical_source_id === input.interaction.fields.metadata.canonicalSourceId)
+        assert.equal(input.expectedExistingInteractionId ?? null, existing?.id ?? null)
+        if (existing) return { id: existing.id, inserted: false }
+        return { ...persistStage(input.interaction), inserted: true }
+      },
       // Only orchestration is simulated here. The PostgreSQL suite exercises
       // production locking, target validation, and atomic multi-message staging.
       stageReviewedGmailInteractionsInPostgres: async input => {
@@ -383,21 +422,9 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
         if (!record) throw new Error('CRM record not found')
         return record
       },
-      stageCrmRecordInPostgres: async input => {
-        staged.push(plain(input))
-        const id = `interaction-${staged.length}`
-        const retained = messages.get(input.fields.providerMessageId)
-        persistedInteractions.push({ ...knownProviderInteraction(id), id, pipeline_id: input.pipelineId, source_key: input.sourceKey,
-          canonical_source_id: input.fields.metadata?.canonicalSourceId || null,
-          source_message_id: retained?.external_message_id, source_thread_id: retained?.external_thread_id,
-          canonical_evidence: { emailAddressHeaders: retained?.raw_metadata.emailAddressHeaders },
-          provider_message_id: input.fields.providerMessageId, provider_thread_id: input.fields.providerThreadId,
-          organization_id: input.fields.organizationId, contact_id: input.fields.contactId || null,
-          contact_ids: input.fields.contactIds || [], lead_id: input.fields.leadId || null })
-        return { id }
-      },
+      stageCrmRecordInPostgres: async input => persistStage(input),
     },
-  }, '\nexport { participantEmailTargets, referenceTargets, groupReferenceTargets, stageInboundInteraction, processMessage, listGmailPage, ownedPipelines, configuredMailboxAddresses, storeInboundMessage }\n')
+  }, '\nexport { participantEmailTargets, referenceTargets, groupReferenceTargets, stageInboundInteraction, processMessage, listGmailPage, ownedPipelines, configuredMailboxAddresses, storeInboundMessage }\n', environment)
   const input = (raw = rawMessage(), overrides = {}) => {
     const parsed = ingestion.parseGmailMessage(raw)
     // Malformed-header cases exercise the pure routing selector, not intake.
@@ -405,12 +432,12 @@ function harness({ records = [adrian], organizations = [], providerInteractions 
     try { messageEvidence = emailIdentity.normalizeGmailMessageEvidence(parsed) } catch {}
     return {
     ownerEmail, mailboxEmail, selfAddresses: [ownAlias],
-    defaultPipelineId: primaryPipeline, ownedPipelines,
+    defaultPipelineId: primaryPipeline, ownedPipelines: activePipelines,
     message: parsed, mailboxIdentity: verifiedIdentity,
     connectionId: fixtureConnectionId, observedAccountEmail: mailboxEmail,
     messageEvidence, ...overrides,
   } }
-  return { ingestion, input, queries, staged, enrichments, providerCalls, audits, messages, links, persistedInteractions,
+  return { ingestion, input, queries, staged, enrichments, providerCalls, audits, messages, links, persistedInteractions, ordinarySharedStages,
     reviewedBatches, reviewedStages, reviewedInteractions }
 }
 
@@ -558,6 +585,82 @@ await check('cross-pipeline and cross-organization participant matches fail clos
     const h = harness({ records: [adrian, other] })
     const targets = await h.ingestion.participantEmailTargets(h.input(rawMessage('ambiguous', { cc: secondContact.email })))
     assert.equal(targets.length, 0)
+  }
+})
+
+const sharedCustomer = { ...fixtureContact('gc1234567', 'client@customer.example.test', sharedPipeline, customerOrganization),
+  id: '67777777-7777-4777-8777-777777777777' }
+const sharedSupplier = { ...fixtureContact('gc2345678', 'sender@supplier.example.test', sharedPipeline, otherOrganization),
+  id: '69999999-9999-4999-8999-999999999999' }
+const sharedSupplierContact = { ...fixtureContact('gc3456789', 'second@supplier.example.test', sharedPipeline, otherOrganization),
+  id: '68888888-8888-4888-8888-888888888888' }
+const sharedCompanies = [
+  { entity: 'organizations', id: customerOrganization, pipelineId: sharedPipeline, accountType: ' Customer ' },
+  { entity: 'organizations', id: otherOrganization, pipelineId: sharedPipeline, accountType: 'Supplier' },
+]
+function ordinarySharedHarness(overrides = {}) {
+  return harness({ records: [sharedSupplier, sharedSupplierContact, sharedCustomer], organizations: sharedCompanies,
+    activePipelines: [{ id: primaryPipeline, is_default: true },
+      { id: sharedPipeline, is_default: true, workspaceOrganizationId: sharedWorkspace }],
+    fixtureBusinessPipeline: sharedPipeline, environment: sharedEnvironment, ...overrides })
+}
+const sharedOrdinaryMessage = () => rawMessage('ordinary-shared-bpo', { from: sharedSupplier.email,
+  to: `${sharedCustomer.email}, ${ownerEmail}`, cc: `${sharedSupplierContact.email}, ${sharedCustomer.email}` })
+
+await check('verified ordinary BPO message keeps one interaction, both companies and every exact participant on replay', async () => {
+  const h = ordinarySharedHarness()
+  const input = h.input(sharedOrdinaryMessage())
+  const first = await h.ingestion.processMessage(input)
+  assert.equal(first.unmatched, false)
+  assert.equal(first.interactions, 1)
+  assert.equal(first.links, 3)
+  assert.equal(h.ordinarySharedStages.length, 1)
+  assert.equal(h.staged.length, 1)
+  const { interaction, mailboxId, targets, expectedExistingInteractionId } = h.ordinarySharedStages[0]
+  assert.equal(interaction.pipelineId, sharedPipeline)
+  assert.equal(mailboxId, mailboxIdentity.mailboxId)
+  assert.equal(expectedExistingInteractionId ?? null, null)
+  assert.equal(interaction.fields.organizationId, customerOrganization, 'Customer outranks the supplier who sent the message')
+  assert.deepEqual(interaction.fields.organizationIds, [customerOrganization, otherOrganization])
+  assert.equal(interaction.fields.contactId, sharedCustomer.id)
+  assert.deepEqual(interaction.fields.contactIds, [sharedCustomer.id, sharedSupplierContact.id, sharedSupplier.id])
+  assert.deepEqual(new Set(targets.map(target => [target.id, target.organizationId].join(':'))), new Set([
+    `${sharedCustomer.id}:${customerOrganization}`, `${sharedSupplier.id}:${otherOrganization}`, `${sharedSupplierContact.id}:${otherOrganization}`,
+  ]))
+  assert.equal(interaction.sourceKey, emailIdentity.gmailMessageSourceKey(mailboxIdentity, input.message.externalMessageId))
+  const [retained] = h.persistedInteractions
+  const links = [...h.links.values()][0]
+  assert.deepEqual(new Set(links.keys()), new Set([sharedCustomer.referenceCode, sharedSupplier.referenceCode, sharedSupplierContact.referenceCode]))
+  assert.deepEqual(new Set(links.values()), new Set([retained.id]))
+
+  const replay = await h.ingestion.processMessage(input)
+  assert.equal(replay.unmatched, false)
+  assert.equal(replay.inserted, false)
+  assert.equal(replay.interactions + replay.links, 0)
+  assert.equal(h.staged.length, 1, 'Replay must not mint another interaction')
+  assert.equal(h.ordinarySharedStages.length, 2)
+  assert.equal(h.ordinarySharedStages[1].expectedExistingInteractionId, retained.id)
+  assert.equal(h.ordinarySharedStages[1].interaction.sourceKey, interaction.sourceKey)
+})
+
+await check('shared ordinary BPO routing holds outside the exact scope or with ambiguous/inactive participant evidence', async () => {
+  for (const options of [
+    { environment: {} },
+    { activePipelines: [{ id: primaryPipeline, is_default: true },
+      { id: sharedPipeline, is_default: true, workspaceOrganizationId: otherOrganization }] },
+    { records: [sharedCustomer, { ...sharedSupplier, pipelineId: primaryPipeline }] },
+    { records: [sharedCustomer, sharedSupplier, { ...sharedSupplierContact, email: sharedSupplier.email }] },
+    { records: [sharedCustomer, { ...sharedSupplier, organizationId: null }] },
+    { records: [sharedCustomer, { ...sharedSupplier, entity: 'leads' }] },
+    { organizations: sharedCompanies.map(company => ({ ...company, archived: company.id === otherOrganization })) },
+    { verifiedIdentity: null },
+  ]) {
+    const h = ordinarySharedHarness(options)
+    const result = await h.ingestion.processMessage(h.input(sharedOrdinaryMessage()))
+    assert.equal(result.unmatched, true)
+    assert.equal(result.interactions + result.links, 0)
+    assert.equal(h.staged.length + h.ordinarySharedStages.length + h.links.size, 0)
+    assert.equal(h.messages.size, 1, 'Keep Gmail acquisition separate from unproven CRM links')
   }
 })
 

@@ -85,6 +85,7 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject,
     'completeSuiteCrmOutboxInPostgres', 'completeSuiteCrmOutboxInTransaction', 'failSuiteCrmOutboxInPostgres',
     'stageInteraction', 'stageCrmRecordWithClient', 'stageCrmRecordInPostgres',
     'enrichCrmEmailInteractionParticipantsInPostgres',
+    'stageOrdinarySharedGmailInteractionInPostgres', 'lockCrmMutation',
     'REVIEWED_GMAIL_RELATIONSHIPS', 'reviewedGmailContentFingerprint',
     'reviewedEmailAudienceModeUnderControlWithClient', 'reviewedEmailAudienceWithClient', 'legacyReviewedEmailAudienceWithClient',
     'sharedSuiteCrmEmailScopeWithClient',
@@ -126,6 +127,7 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject,
     '@/lib/persistence/crmNativeEmailAuthority': loadModule('app_src/lib/persistence/crmNativeEmailAuthority.ts'),
   })
   const nativeEmail = loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts')
+  const participantEligibility = loadModule('app_src/lib/crm/participantEligibility.ts')
   const protocol = loadModule('app_src/lib/crm/nativeEmailPublication.ts')
   const eligibility = loadModule('app_src/lib/crm/nativeEmailEligibility.ts', { './nativeEmailPublication': protocol })
   const roots = loadModule('scripts/lib/native-root-reader-fixture-modules.mjs')
@@ -138,13 +140,14 @@ function loadCrmPersistence(query, withTransaction, fixtureCaseyProviderSubject,
     suiteCrmEmailAddressAttributes: loadModule('app_src/lib/crm/emailAddressHeaders.ts').suiteCrmEmailAddressAttributes,
     process: { env: fixtureEnvironment }, sharedSuiteCrmEmailScope: pipelineId => nativeEmail.sharedSuiteCrmEmailScope(pipelineId, fixtureEnvironment),
     suiteCrmEmailAudienceFingerprint: nativeEmail.suiteCrmEmailAudienceFingerprint, URL, Error,
-    crmParticipantEmailCandidatesSql: loadModule('app_src/lib/crm/participantEligibility.ts').crmParticipantEmailCandidatesSql,
+    ...participantEligibility,
     isPostgresStorageEnabled: () => true,
     appPublicUrl: () => 'http://localhost:4002',
     shortLinkUrl: code => `https://example.test/s/${code}`,
   }
   vm.runInNewContext(`${output}\nglobalThis.persistence = {
     stageCrmRecordInPostgres, readCrmRecordByReference, enrichCrmEmailInteractionParticipantsInPostgres,
+    stageOrdinarySharedGmailInteractionInPostgres,
     stageReviewedGmailInteractionsInPostgres, stageReviewedGmailInteractionInPostgres,
     reviewedEmailAudienceUnderNativeControlWithClient,
     claimSuiteCrmOutboxInPostgres, withVerifiedSuiteCrmEmailPublication,
@@ -231,7 +234,7 @@ const fixtureSchema = `
   CREATE TABLE crm_organizations (
     id uuid PRIMARY KEY, pipeline_id uuid REFERENCES pipeline_spaces(id),
     name text, suitecrm_id text, reference_code text, source_key text,
-    email text, source_payload jsonb DEFAULT '{}', UNIQUE (pipeline_id,id)
+    email text, account_type text, source_payload jsonb DEFAULT '{}', UNIQUE (pipeline_id,id)
   );
   CREATE TABLE crm_contacts (
     id uuid PRIMARY KEY, pipeline_id uuid REFERENCES pipeline_spaces(id),
@@ -315,6 +318,7 @@ async function run(pool) {
     '@/lib/globalIds.mjs': { globalIdFragment },
     '@/lib/crm/emailAddressHeaders': addressHeaders,
     '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts'),
+    '@/lib/crm/suiteCrmNativeEmailProjection': loadModule('app_src/lib/crm/suiteCrmNativeEmailProjection.ts'),
     '@/lib/crm/emailIdentity': emailIdentity,
     '@/lib/crm/emailReconciliation': emailReconciliation,
     '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }),

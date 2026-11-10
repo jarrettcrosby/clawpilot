@@ -116,6 +116,8 @@ const mailboxIdentity = { version: 1, provider: 'gmail', mailboxId: '66666666-66
   verifiedConnectionId: 'synthetic-connection', verifiedAt: '2026-09-01T00:00:00.000Z' }
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': headers,
+  '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts'),
+  '@/lib/crm/suiteCrmNativeEmailProjection': nativeEmail,
   '@/lib/htmlEntities.mjs': { decodeHtmlEntities },
   '@/lib/globalIds.mjs': { globalIdFragment },
   '@/lib/crm/emailIdentity': emailIdentity,
