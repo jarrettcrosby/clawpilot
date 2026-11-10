@@ -11,7 +11,7 @@ import {
 } from '@/lib/crm/stableId'
 import { crmDateOnly } from '@/lib/crm/dateOnly.mjs'
 import { suiteCrmEmailAddressAttributes } from '@/lib/crm/emailAddressHeaders'
-import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
+import { crmParticipantEmailCandidatesSql, orderOrdinarySharedGmailContacts, ordinaryGmailArchiveAddress } from '@/lib/crm/participantEligibility'
 import { suiteCrmOpportunitySalesStage } from '@/lib/crm/suiteCrmOpportunityStage'
 import type { SuiteCrmMeetingProjectionReadback } from '@/lib/crm/suiteCrmClient'
 import type { SuiteCrmEmailProjectionReadback, SuiteCrmSharedEmailProjection, SuiteCrmSharedEmailProjectionReadback } from '@/lib/crm/suiteCrmNativeEmailProjection'
@@ -2919,6 +2919,225 @@ export async function stageCrmRecordInPostgres(input: StageCrmRecordInput) {
     })
   }
   return staged
+}
+
+/** A verified ordinary Gmail message can have several CRM companies, but only
+ * in the opted-in BPO workspace. The generic CRM stage API cannot grant this
+ * authority. Recompute the complete scope under the same transaction that
+ * binds the one canonical interaction and queues its native projection. */
+export async function stageOrdinarySharedGmailInteractionInPostgres(input: {
+  interaction: StageInteractionInput
+  mailboxId: string
+  targets: Array<{ id: string; referenceCode: string; email: string; organizationId: string }>
+  expectedExistingInteractionId: string | null
+}): Promise<{ id: string; inserted: boolean }> {
+  const { interaction, mailboxId, targets, expectedExistingInteractionId } = input
+  const { pipelineId, actorEmail, fields } = interaction
+  const sourceId = clean(fields.metadata?.canonicalSourceId), inboundId = clean(fields.metadata?.inboundMessageId)
+  const messageId = fields.providerMessageId, threadId = fields.providerThreadId || null
+  const refuse = () => new Error('Ordinary shared Gmail participant evidence is unavailable or conflicts with retained CRM records')
+  const targetIds = uniqueUuidList(targets.map(target => target.id))
+  const accountIds = uniqueUuidList(targets.map(target => target.organizationId))
+  if (!messageId || !sharedSuiteCrmEmailScope(pipelineId) || interaction.entity !== 'interactions'
+    || interaction.localId || interaction.emitSuiteCrmOutbox === false
+    || fields.interactionType !== 'email' || interactionSuiteCrmModule(fields) !== 'Emails'
+    || fields.leadId || fields.opportunityId || fields.meetingId || fields.campaignId
+    || fields.metadata?.reviewedGmailRecovery !== undefined || fields.metadata?.suiteCrmEmailProjection !== undefined
+    || interaction.sourcePayload?.source !== 'gmail-inbound' || interaction.sourcePayload?.matchedBy !== 'participant-email'
+    || fields.metadata?.source !== 'gmail-inbound' || fields.metadata?.matchedBy !== 'participant-email'
+    || fields.agentEmail !== actorEmail || targets.length > 25 || targetIds.length !== targets.length
+    || accountIds.length < 2 || targets.some(target => !accountIds.includes(target.organizationId))
+    || uniqueUuidList([sourceId, inboundId, mailboxId]).length !== 3) throw refuse()
+
+  return withTransaction(async client => {
+    await lockCrmNativeEmailAuthorityWithClient(client)
+    if (await reviewedEmailAudienceModeUnderControlWithClient(client, pipelineId) !== 'shared') throw refuse()
+    await sharedSuiteCrmEmailScopeWithClient(client, pipelineId)
+    // The same owner must still have an active membership in the target
+    // workspace. Other workspaces are included only in ambiguity detection.
+    const eligible = await client.query<{ id: string }>(`SELECT pipeline.id::text
+      FROM pipeline_spaces pipeline JOIN app_users owner_user ON owner_user.email=pipeline.owner_email AND owner_user.status='active'
+      JOIN app_user_organization_memberships membership ON membership.organization_id=pipeline.workspace_organization_id
+        AND membership.user_email=pipeline.owner_email AND membership.status='active'
+      WHERE pipeline.owner_email=$1 AND NOT pipeline.reference_access_disabled
+      ORDER BY pipeline.id FOR SHARE OF pipeline,owner_user,membership`, [actorEmail])
+    if (!eligible.rows.some(row => row.id === pipelineId)) throw refuse()
+    // Keep the ordinary source-intake and canonical-placement serialization
+    // fences. No legacy row is upgraded or adopted by this path.
+    await lockCrmMutation(client, `crm-email-intake:${actorEmail}:${messageId}`)
+    await lockCrmMutation(client, `crm-email-source:${mailboxId}:${messageId}`)
+    await lockCrmMutation(client, `crm-canonical-email-placement:${sourceId}`)
+    const sources = await client.query<{ id: string; mailbox_id: string; owner_email: string; provider_message_id: string
+      provider_thread_id: string | null; intake_pipeline_id: string; intake_workspace_id: string; evidence_hash: string
+      observed_connection_id: string; observed_account_email: string }>(
+      `SELECT id::text,mailbox_id::text,owner_email,provider_message_id,provider_thread_id,
+         intake_pipeline_id::text,intake_workspace_id::text,evidence_hash,observed_connection_id,observed_account_email FROM crm_email_sources
+       WHERE lower(btrim(provider_message_id))=lower($1::text) AND (owner_email=$2 OR mailbox_id=$3::uuid)
+       ORDER BY id LIMIT 2 FOR SHARE`, [messageId, actorEmail, mailboxId])
+    const source = sources.rows[0]
+    if (sources.rows.length !== 1 || source.id !== sourceId || source.mailbox_id !== mailboxId
+      || source.owner_email !== actorEmail || source.provider_message_id !== messageId || source.provider_thread_id !== threadId) throw refuse()
+    const mailbox = await client.query<{ provider_account_id: string; account_email: string; connection_id: string; verified_at: string }>(
+      `SELECT mailbox.provider_account_id,binding.account_email,binding.connection_id,
+         to_char(binding.verified_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS verified_at
+       FROM crm_email_mailboxes mailbox JOIN crm_email_mailbox_bindings binding
+         ON binding.mailbox_id=mailbox.id AND binding.owner_email=mailbox.owner_email
+       JOIN user_maton_connections connection ON connection.owner_email=binding.owner_email
+         AND connection.connection_id=binding.connection_id AND connection.app='google-mail'
+         AND connection.source='maton' AND connection.status='ACTIVE' AND connection.is_selected
+       WHERE mailbox.id=$1::uuid AND mailbox.owner_email=$2 AND mailbox.provider='gmail'
+         AND lower(btrim(binding.account_email))=lower(btrim(connection.account_email))
+         AND COALESCE((to_jsonb(connection)->>'remote_updated_at')::timestamptz,'-infinity')<=binding.verified_at
+       ORDER BY binding.connection_id LIMIT 2 FOR SHARE OF mailbox,binding,connection`, [mailboxId, actorEmail])
+    if (mailbox.rows.length !== 1) throw refuse()
+    const binding = mailbox.rows[0]
+    if (interaction.sourceKey !== gmailMessageSourceKey({ version: 1, provider: 'gmail', mailboxId,
+      providerAccountId: binding.provider_account_id, accountEmail: binding.account_email,
+      verifiedAt: binding.verified_at, verifiedConnectionId: binding.connection_id }, messageId)) throw refuse()
+    const cache = await client.query<Record<string, unknown>>(`SELECT message.*,
+        intake.workspace_organization_id::text AS retained_intake_workspace FROM crm_inbound_messages message
+      JOIN pipeline_spaces intake ON intake.id=message.pipeline_id AND intake.owner_email=message.owner_email
+      WHERE message.owner_email=$1 AND lower(btrim(message.external_message_id))=lower($2::text)
+      ORDER BY message.id LIMIT 2 FOR UPDATE OF message FOR SHARE OF intake`, [actorEmail, messageId])
+    const cached = cache.rows[0]
+    if (cache.rows.length !== 1 || cached.id !== inboundId || cached.external_message_id !== messageId
+      || cached.external_thread_id !== threadId || cached.mailbox_id !== mailboxId || cached.canonical_source_id !== sourceId
+      || cached.pipeline_id !== source.intake_pipeline_id || cached.retained_intake_workspace !== source.intake_workspace_id) throw refuse()
+    const raw = cached.raw_metadata as Record<string, unknown> | undefined
+    const provenance = raw?.intakeProvenance as Record<string, unknown> | undefined
+    if (raw?.provider !== 'gmail' || raw.identityStatus !== 'verified' || raw.archiveIntake !== false
+      || !Array.isArray(raw.labelIds) || raw.labelIds.some(label => typeof label !== 'string'
+        || ['DRAFT', 'SPAM', 'TRASH'].includes(label))
+      || provenance?.provider !== 'gmail' || provenance.ownerEmail !== actorEmail
+      || provenance.providerAccountId !== binding.provider_account_id || provenance.evidenceHash !== source.evidence_hash
+      || provenance.intakePipelineId !== source.intake_pipeline_id || provenance.intakeWorkspaceOrganizationId !== source.intake_workspace_id
+      || provenance.observedConnectionId !== source.observed_connection_id || provenance.accountEmail !== source.observed_account_email) throw refuse()
+    const evidence = retainedGmailMessageEvidence(cached), headers = evidence.emailAddressHeaders
+    const sender = headers.from?.[0]?.address
+    const sent = raw.labelIds.includes('SENT')
+    if (source.evidence_hash !== gmailEvidenceHash(evidence) || headers.from?.length !== 1 || sender !== evidence.senderEmail
+      || evidence.markerReferences.length || isoTimestamp(fields.occurredAt) !== evidence.receivedAt
+      || fields.direction !== (sent ? 'outbound' : 'inbound') || fields.deliveryStatus !== (sent ? 'sent' : 'received')) throw refuse()
+    const aliases = await client.query<{ account_email: string; identity_email: string }>(`SELECT account_email,identity_email
+      FROM organization_communication_bindings WHERE credential_owner_email=$1 AND maton_connection_id=$2
+        AND app='google-mail' AND status='active' AND verified_at IS NOT NULL FOR SHARE`, [actorEmail, binding.connection_id])
+    const excluded = new Set([actorEmail, binding.account_email, ordinaryGmailArchiveAddress(), ...(sent ? [sender] : []),
+      ...aliases.rows.flatMap(row => [row.account_email,row.identity_email])].map(value => clean(value).toLowerCase()))
+    const participants = [...new Set(['from','to','cc','bcc'].flatMap(kind =>
+      (headers[kind as 'from' | 'to' | 'cc' | 'bcc'] || []).map(address => address.address.toLowerCase())))].filter(email => !excluded.has(email)).sort()
+    for (const email of participants) await lockCrmMutation(client, `crm-participant:${actorEmail}:${email}`)
+    const candidates = await client.query<{ id: string; pipeline_id: string; organization_id: string | null;
+      reference_code: string; email: string; entity: string }>(
+      crmParticipantEmailCandidatesSql(), [eligible.rows.map(row => row.id), participants])
+    if (candidates.rows.length !== targets.length || new Set(candidates.rows.map(row => row.email)).size !== targets.length
+      || candidates.rows.some(row => row.pipeline_id !== pipelineId || row.entity !== 'contacts'
+        || !targets.some(target => target.id === row.id && target.referenceCode === row.reference_code
+          && target.organizationId === row.organization_id && target.email === row.email))) throw refuse()
+    const contacts = await client.query<{ id: string; organization_id: string | null; reference_code: string; email: string;
+      suitecrm_id: string | null; active: boolean }>(`SELECT id::text,organization_id::text,reference_code,
+        lower(btrim(email)) AS email,suitecrm_id,${activeCrmRecordSql('contact')} AS active
+      FROM crm_contacts contact WHERE pipeline_id=$1::uuid AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE`, [pipelineId, targetIds])
+    const accounts = await client.query<{ id: string; reference_code: string; account_type: string | null; suitecrm_id: string | null; active: boolean }>(
+      `SELECT id::text,reference_code,account_type,suitecrm_id,${activeCrmRecordSql('organization')} AS active
+       FROM crm_organizations organization WHERE pipeline_id=$1::uuid AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE`, [pipelineId, accountIds])
+    const distinctNative = (rows: Array<{ suitecrm_id: string | null; active: boolean }>) => rows.every(row =>
+      row.active && /^[a-z0-9][a-z0-9-]{0,35}$/i.test(row.suitecrm_id || ''))
+      && new Set(rows.map(row => row.suitecrm_id?.toLowerCase())).size === rows.length
+    if (contacts.rows.length !== targetIds.length || accounts.rows.length !== accountIds.length
+      || !distinctNative(contacts.rows) || !distinctNative(accounts.rows) || targets.some(target =>
+        !contacts.rows.some(row => row.id === target.id && row.reference_code === target.referenceCode
+          && row.email === target.email && row.organization_id === target.organizationId))) throw refuse()
+    const primary = orderOrdinarySharedGmailContacts(targets, new Map(accounts.rows.map(row => [row.id,row.account_type])), sender || '')[0]
+    if (!primary) throw refuse()
+    const orgs = [primary.organizationId, ...accountIds.filter(id => id !== primary.organizationId).sort()]
+    const people = [primary.id, ...targetIds.filter(id => id !== primary.id).sort()]
+    if (fields.organizationId !== primary.organizationId || fields.organizationIds?.join() !== orgs.join()
+      || fields.contactIds?.join() !== people.join() || (fields.contactId != null && fields.contactId !== primary.id)) throw refuse()
+
+    const previous = await client.query<Record<string, unknown> & { id: string; organization_ids: string[]; contact_ids: string[] }>(
+      `SELECT existing.*,existing.occurred_at::text AS retained_occurred_at,
+         ARRAY(SELECT related.organization_id::text FROM crm_interaction_organizations related
+           WHERE related.pipeline_id=existing.pipeline_id AND related.interaction_id=existing.id
+           ORDER BY related.sort_order,related.organization_id) AS organization_ids,
+         ARRAY(SELECT related.contact_id::text FROM crm_interaction_contacts related
+           WHERE related.pipeline_id=existing.pipeline_id AND related.interaction_id=existing.id
+           ORDER BY related.sort_order,related.contact_id) AS contact_ids
+       FROM crm_interactions existing JOIN pipeline_spaces placement ON placement.id=existing.pipeline_id
+       WHERE existing.canonical_source_id=$3::uuid
+         OR (existing.pipeline_id=$1::uuid AND existing.source_key=$5)
+         OR (placement.owner_email=$2 AND lower(btrim(existing.provider_message_id))=lower($4::text))
+       ORDER BY existing.id LIMIT 2 FOR UPDATE OF existing`, [pipelineId, actorEmail, sourceId, messageId, interaction.sourceKey])
+    const current = previous.rows[0]
+    if (previous.rows.length > 1 || (expectedExistingInteractionId && current?.id !== expectedExistingInteractionId)
+      || (cached.interaction_id && current?.id !== cached.interaction_id)) throw refuse()
+    const retainedLinks = await client.query<{ reference_code: string; aggregate_type: string; aggregate_id: string; interaction_id: string | null }>(
+      `SELECT reference_code,aggregate_type,aggregate_id::text,interaction_id::text FROM crm_inbound_message_links
+       WHERE inbound_message_id=$1::uuid ORDER BY reference_code FOR UPDATE`, [inboundId])
+    if (retainedLinks.rows.some(link => link.interaction_id !== current?.id || !(
+      (link.aggregate_type === 'crm_contacts' && targets.some(target => target.referenceCode === link.reference_code && target.id === link.aggregate_id))
+      || (link.aggregate_type === 'crm_organizations' && accounts.rows.some(account => account.reference_code === link.reference_code && account.id === link.aggregate_id))
+    ))) throw refuse()
+    const relatedReferences = targets.map(target => target.referenceCode).sort()
+    if (!current) {
+      // Use the locked provider evidence, not caller-supplied message text.
+      // Preserve the Gmail import boundary and SuiteCRM's UTF-8 field limits.
+      const nativeText = (value: string, bytes: number) => {
+        const raw = Buffer.from(value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim(), 'utf8')
+        let end = Math.min(raw.length, bytes)
+        while (end < raw.length && (raw[end] & 0xc0) === 0x80) end--
+        return raw.subarray(0,end).toString('utf8').trimEnd()
+      }
+      const subject = nativeText(evidence.subject, 255) || 'Inbound email'
+      const description = nativeText((evidence.bodyText.split(/%xx/i, 1)[0] || evidence.snippet
+        || 'Inbound email received.').slice(0,50_000), 100_000)
+      const routing = { source: 'gmail-inbound', matchedBy: 'participant-email',
+        referenceCode: primary.referenceCode, relatedReferences, canonicalSourceId: sourceId }
+      const created = await stageCrmRecordWithClient(client, {
+        entity: 'interactions', pipelineId, actorEmail, sourceKey: interaction.sourceKey, sourcePayload: routing,
+        fields: {
+          subject, description, contactId: people[0], contactIds: people, organizationId: orgs[0], organizationIds: orgs,
+          interactionType: 'email', suiteCrmModule: 'Emails', agentEmail: actorEmail, agentName: actorEmail,
+          occurredAt: evidence.receivedAt, direction: sent ? 'outbound' : 'inbound', deliveryStatus: sent ? 'sent' : 'received',
+          providerMessageId: messageId, providerThreadId: threadId, metadata: { ...routing, inboundMessageId: inboundId },
+        },
+      }, { reviewedGmailRelationships: REVIEWED_GMAIL_RELATIONSHIPS })
+      return { id: created.id, inserted: true }
+    }
+    const retainedPayload = current.source_payload as Record<string, unknown> | undefined
+    const retainedMetadata = current.metadata as Record<string, unknown> | undefined
+    if (current.pipeline_id !== pipelineId || current.canonical_source_id !== sourceId || current.source_key !== interaction.sourceKey
+      || current.provider_message_id !== messageId || current.provider_thread_id !== threadId
+      || current.interaction_type !== 'email' || current.suitecrm_module !== 'Emails'
+      || current.organization_id !== orgs[0] || current.contact_id !== people[0]
+      || current.lead_id || current.opportunity_id || current.meeting_id || current.campaign_id
+      || retainedPayload?.source !== 'gmail-inbound' || retainedPayload.matchedBy !== 'participant-email'
+      || ['true','1','yes'].includes(clean(retainedPayload.archived).toLowerCase())
+      || retainedMetadata?.canonicalSourceId !== sourceId || retainedMetadata.inboundMessageId !== inboundId
+      || retainedMetadata.reviewedGmailRecovery !== undefined
+      || current.organization_ids[0] !== orgs[0] || current.contact_ids[0] !== people[0]
+      || current.organization_ids.some(id => !orgs.includes(id)) || current.contact_ids.some(id => !people.includes(id))) throw refuse()
+    if (current.organization_ids.length === orgs.length && current.contact_ids.length === people.length) {
+      return { id: current.id, inserted: false }
+    }
+    // Do not overwrite a prior native copy from before shared CAS support, or
+    // change a pending/unproven projection while its native result is unknown.
+    const receipt = retainedMetadata.suiteCrmEmailProjection as Record<string, unknown> | undefined
+    if (current.sync_status !== 'synced' || receipt?.version !== 2 || (!receipt.sharedPublication && !receipt.sharedRepair)
+      || receipt.suiteCrmId !== current.suitecrm_id || receipt.globalId !== current.reference_code
+      || typeof receipt.snapshotFingerprint !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/u.test(receipt.snapshotFingerprint)
+      || !Array.isArray(receipt.accounts) || !Array.isArray(receipt.contacts)
+      || [...receipt.accounts].sort().join() !== accounts.rows.filter(row => current.organization_ids.includes(row.id)).map(row => row.suitecrm_id).sort().join()
+      || [...receipt.contacts].sort().join() !== contacts.rows.filter(row => current.contact_ids.includes(row.id)).map(row => row.suitecrm_id).sort().join()) throw refuse()
+    const staged = await stageCrmRecordWithClient(client, {
+      entity: 'interactions', pipelineId, localId: current.id, sourceKey: interaction.sourceKey, actorEmail,
+      sourcePayload: retainedPayload, fields: { organizationId: orgs[0], organizationIds: orgs,
+        contactId: people[0], contactIds: people, interactionType: 'email', suiteCrmModule: 'Emails',
+        subject: String(current.subject ?? ''), description: String(current.description ?? ''),
+        metadata: { ...retainedMetadata, relatedReferences },
+      },
+    }, { preserveInteractionAgent: true, reviewedGmailRelationships: REVIEWED_GMAIL_RELATIONSHIPS })
+    return { id: staged.id, inserted: false }
+  })
 }
 
 /** Add positively identified participants to one existing email, without

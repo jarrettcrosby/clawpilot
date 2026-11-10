@@ -170,7 +170,7 @@ try {
   const counts = async () => (await query(`SELECT (SELECT count(*) FROM crm_interactions)::int AS interactions,
     (SELECT count(*) FROM crm_interaction_contacts)::int AS contacts,
     (SELECT count(*) FROM crm_interaction_organizations)::int AS organizations`)).rows[0]
-  const durableState = async () => (await query(`SELECT jsonb_build_object(
+  const durableState = async (readQuery = query) => (await readQuery(`SELECT jsonb_build_object(
     'interactions',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY id),'[]') FROM crm_interactions row),
     'contacts',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY interaction_id,contact_id),'[]') FROM crm_interaction_contacts row),
     'companies',(SELECT coalesce(jsonb_agg(to_jsonb(row) ORDER BY interaction_id,organization_id),'[]') FROM crm_interaction_organizations row),
@@ -829,6 +829,127 @@ try {
     subject: `Synthetic exact-two ${message}`, receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Synthetic Casey snippet',
     bodyText: 'Synthetic exact-two retained body', markerReferences: [], emailAddressHeaders: { version: 1,
       from: [{ address: caseyTargets[1].email }], to: [{ address: CASEY.owner }, { address: caseyTargets[0].email }], cc: [], bcc: [] } })
+
+  await check('ordinary shared Gmail stages one canonical Email and job, preserving all verified companies and contacts', async () => {
+    const client = await pool.connect()
+    let sequence = 0
+    const scopedQuery = (sql, values) => client.query(sql, values)
+    const scopedTransaction = async callback => {
+      const name = `ordinary_shared_gmail_${++sequence}`
+      await client.query(`SAVEPOINT ${name}`)
+      try { const result = await callback(client); await client.query(`RELEASE SAVEPOINT ${name}`); return result }
+      catch (error) { await client.query(`ROLLBACK TO SAVEPOINT ${name}`); await client.query(`RELEASE SAVEPOINT ${name}`); throw error }
+    }
+    const shared = fixtureContext.fixture.loadCrmPersistence(scopedQuery, scopedTransaction, undefined,
+      { CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID: CASEY.workspace, CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID: CASEY.pipeline })
+    const unscoped = fixtureContext.fixture.loadCrmPersistence(scopedQuery, scopedTransaction)
+    const stage = input => shared.stageOrdinarySharedGmailInteractionInPostgres(input)
+    const snapshot = () => durableState(scopedQuery)
+    const rejectUnchanged = async (action, message = /Ordinary shared Gmail participant evidence is unavailable or conflicts/u) => {
+      const before = await snapshot()
+      await assert.rejects(action, message)
+      assert.deepEqual(await snapshot(), before)
+    }
+    try {
+      await client.query('BEGIN')
+      const nativeGlobus = id(741), nativeAirspace = id(742), nativeCustomer = id(743), nativeSupplier = id(744)
+      await client.query('UPDATE crm_organizations SET account_type=$2,suitecrm_id=$3 WHERE id=$1', [CASEY.globus, 'Customer', nativeGlobus])
+      await client.query('UPDATE crm_organizations SET account_type=$2,suitecrm_id=$3 WHERE id=$1', [CASEY.airspace, 'Supplier', nativeAirspace])
+      await client.query('UPDATE crm_contacts SET suitecrm_id=$2 WHERE id=$1', [CASEY.globusContact, nativeCustomer])
+      await client.query('UPDATE crm_contacts SET suitecrm_id=$2 WHERE id=$1', [CASEY.airspaceContact, nativeSupplier])
+      const prepare = async messageId => {
+        const current = caseyEvidence(messageId)
+        const cache = await shared.recordGmailMessageIntakeInPostgres({ ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+          intakePipelineId: CASEY.intake, mailboxIdentity: caseyIdentity, observedAccountEmail: caseyMailboxEmail,
+          observedAt: new Date().toISOString(), messageEvidence: current, rawMetadata: { archiveIntake: false, labelIds: ['INBOX'] } })
+        assert.equal(cache.identityStatus, 'verified'); assert.ok(cache.sourceId)
+        const sourcePayload = { source: 'gmail-inbound', matchedBy: 'participant-email', referenceCode: caseyTargets[0].referenceCode,
+          relatedReferences: caseyTargets.map(target => target.referenceCode), canonicalSourceId: cache.sourceId }
+        const interaction = { entity: 'interactions', pipelineId: CASEY.pipeline, actorEmail: CASEY.owner,
+          sourceKey: emailIdentity.gmailMessageSourceKey(caseyIdentity, messageId), sourcePayload,
+          fields: { organizationId: CASEY.globus, organizationIds: [CASEY.globus, CASEY.airspace],
+            contactId: CASEY.globusContact, contactIds: [CASEY.globusContact, CASEY.airspaceContact],
+            interactionType: 'email', agentEmail: CASEY.owner, agentName: CASEY.owner, direction: 'inbound', deliveryStatus: 'received',
+            subject: current.subject, description: current.bodyText, occurredAt: current.receivedAt,
+            providerMessageId: messageId, providerThreadId: current.threadId, metadata: { ...sourcePayload, inboundMessageId: cache.id } } }
+        return { interaction, mailboxId: caseyIdentity.mailboxId, targets: caseyTargets, expectedExistingInteractionId: null }
+      }
+      const input = await prepare('1a19900000000001')
+      await rejectUnchanged(() => shared.stageCrmRecordInPostgres(input.interaction), /Additional interaction organizations require reviewed Gmail recovery/u)
+      await rejectUnchanged(() => unscoped.stageOrdinarySharedGmailInteractionInPostgres(input))
+      await rejectUnchanged(() => stage({ ...input, interaction: { ...input.interaction, pipelineId: CASEY.intake } }))
+      await rejectUnchanged(() => stage({ ...input, mailboxId: id(745) }))
+      await rejectUnchanged(() => stage({ ...input, expectedExistingInteractionId: id(746) }))
+      await rejectUnchanged(() => stage({ ...input, targets: [caseyTargets[0], { ...caseyTargets[1], email: 'wrong-participant@example.invalid' }] }))
+      await rejectUnchanged(() => stage({ ...input, interaction: { ...input.interaction, fields: { ...input.interaction.fields,
+        organizationId: CASEY.airspace, organizationIds: [CASEY.airspace, CASEY.globus],
+        contactId: CASEY.airspaceContact, contactIds: [CASEY.airspaceContact, CASEY.globusContact],
+      } } }))
+      // The participant lookup may have occurred before this account change.
+      // The locked persistence read still refuses the stale chosen primary.
+      await client.query("UPDATE crm_organizations SET account_type='Prospect' WHERE id=$1", [CASEY.globus])
+      await rejectUnchanged(() => stage(input))
+      await client.query("UPDATE crm_organizations SET account_type='Customer' WHERE id=$1", [CASEY.globus])
+
+      const result = await stage({ ...input, interaction: { ...input.interaction,
+        sourcePayload: { ...input.interaction.sourcePayload, unverifiedMarker: 'source payload' }, fields: { ...input.interaction.fields,
+        subject: 'Unverified caller subject', description: 'Unverified caller description',
+        metadata: { ...input.interaction.fields.metadata, unverifiedMarker: 'metadata' },
+      } } })
+      assert.equal(result.inserted, true); assert.ok(result.id)
+      const { rows } = await client.query(`SELECT i.organization_id,i.contact_id,i.suitecrm_id,i.reference_code,i.canonical_source_id,
+        i.subject,i.description,i.source_payload,i.metadata,
+        (SELECT count(*)::int FROM crm_email_sources s WHERE s.mailbox_id=$2 AND s.provider_message_id=$3) AS sources,
+        (SELECT count(*)::int FROM crm_inbound_messages m WHERE m.owner_email=$4 AND m.external_message_id=$3) AS caches,
+        (SELECT count(*)::int FROM crm_interactions a WHERE a.provider_message_id=$3) AS interactions,
+        (SELECT count(*)::int FROM crm_email_review_decisions d WHERE d.interaction_id=i.id) AS decisions,
+        j.payload,j.idempotency_key FROM crm_interactions i JOIN sync_outbox j ON j.aggregate_id=i.id::text WHERE i.id=$1`,
+      [result.id, caseyIdentity.mailboxId, input.interaction.fields.providerMessageId, CASEY.owner])
+      assert.equal(rows.length, 1, 'Exactly one outbox job for the interaction')
+      const row = rows[0]
+      assert.deepEqual([row.sources, row.caches, row.interactions, row.decisions], [1, 1, 1, 0])
+      assert.equal(row.canonical_source_id, input.interaction.sourcePayload.canonicalSourceId)
+      assert.equal(row.organization_id, CASEY.globus, 'Customer remains primary although the sender belongs to the supplier')
+      assert.equal(row.contact_id, CASEY.globusContact)
+      assert.equal(row.subject, input.interaction.fields.subject)
+      assert.equal(row.description, input.interaction.fields.description)
+      assert.equal(Object.hasOwn(row.source_payload, 'unverifiedMarker'), false)
+      assert.equal(Object.hasOwn(row.metadata, 'unverifiedMarker'), false)
+      assert.equal(row.payload.suiteCrmId, row.suitecrm_id)
+      assert.equal(row.payload.attributes.global_id_c, row.reference_code)
+      assert.equal(row.payload.attributes.parent_id, nativeGlobus)
+      assert.equal(row.payload.attributes.name, row.subject)
+      assert.equal(row.payload.attributes.description, row.description)
+      assert.equal(row.payload.emailProjection, undefined)
+      assert.equal(row.payload.sharedEmailProjection.workspaceId, CASEY.workspace)
+      assert.deepEqual(row.payload.sharedEmailProjection.accounts, [nativeGlobus, nativeAirspace])
+      assert.deepEqual(row.payload.sharedEmailProjection.contacts, [nativeCustomer, nativeSupplier])
+      assert.deepEqual(row.payload.sharedEmailProjection.contactAccounts, [
+        { contactId: nativeCustomer, accountId: nativeGlobus }, { contactId: nativeSupplier, accountId: nativeAirspace },
+      ])
+      const companies = (await client.query('SELECT organization_id,is_primary FROM crm_interaction_organizations WHERE interaction_id=$1 ORDER BY is_primary DESC', [result.id])).rows
+      assert.deepEqual(companies, [{ organization_id: CASEY.globus, is_primary: true }, { organization_id: CASEY.airspace, is_primary: false }])
+      const contacts = (await client.query('SELECT contact_id,is_primary FROM crm_interaction_contacts WHERE interaction_id=$1 ORDER BY is_primary DESC', [result.id])).rows
+      assert.deepEqual(contacts, [{ contact_id: CASEY.globusContact, is_primary: true }, { contact_id: CASEY.airspaceContact, is_primary: false }])
+      const beforeReplay = await snapshot()
+      const replay = await stage({ ...input, expectedExistingInteractionId: result.id })
+      assert.equal(replay.id, result.id); assert.equal(replay.inserted, false)
+      const competingReplay = await stage(input)
+      assert.equal(competingReplay.id, result.id); assert.equal(competingReplay.inserted, false)
+      assert.deepEqual(await snapshot(), beforeReplay, 'The same mailbox message must not create a new outbox revision')
+
+      const prior = await prepare('1a19900000000002')
+      const priorKey = prior.interaction.sourceKey
+      const priorRow = (await client.query(`INSERT INTO crm_interactions
+        (pipeline_id,source_key,interaction_type,suitecrm_module,subject,provider_message_id,provider_thread_id,canonical_source_id)
+        VALUES($1,$2,'email','Emails','Held prior placement',$3,$4,$5) RETURNING id`,
+      [CASEY.intake, priorKey, prior.interaction.fields.providerMessageId,
+        prior.interaction.fields.providerThreadId, prior.interaction.sourcePayload.canonicalSourceId])).rows[0]
+      await rejectUnchanged(() => stage(prior))
+      await rejectUnchanged(() => stage({ ...prior, expectedExistingInteractionId: priorRow.id }))
+    } finally { await client.query('ROLLBACK'); client.release() }
+  })
+
   for (const row of CASEY.messages) {
     const current = caseyEvidence(row.message)
     await query(`INSERT INTO crm_inbound_messages(id,owner_email,pipeline_id,external_message_id,external_thread_id,

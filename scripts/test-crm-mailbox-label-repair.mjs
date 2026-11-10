@@ -198,7 +198,13 @@ await check('a current different canonical subject cannot even preview and no su
 
 function observationFixture({ drift = false, oversized = false } = {}) {
   const source = read('app_src/lib/crm/emailIngestion.ts'), parsed = ts.createSourceFile('emailIngestion.ts', source, ts.ScriptTarget.Latest, true)
-  const names = ['GMAIL_APP','EMAIL_PATTERN','SafeEmailIngestionError','asRecord','selectedMailboxes','gmailJson','gmailMailboxProfile',
+  const eligibility = { exports: {} }
+  vm.runInNewContext(ts.transpileModule(read('app_src/lib/crm/participantEligibility.ts'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText, { exports: eligibility.exports })
+  const EMAIL_PATTERN = eligibility.exports.CRM_EMAIL_PATTERN
+  assert.equal(typeof EMAIL_PATTERN?.test, 'function')
+  const names = ['GMAIL_APP','SafeEmailIngestionError','asRecord','selectedMailboxes','gmailJson','gmailMailboxProfile',
     'readGmailMailboxProfileForOwner','readGmailMailboxLabelRepairObservationForOwner']
   const declarations = names.map(name => {
     const declaration = parsed.statements.find(statement => (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement))
@@ -207,7 +213,7 @@ function observationFixture({ drift = false, oversized = false } = {}) {
     assert.ok(declaration, name); return declaration.getText(parsed).replace(/^export\s+/u, '')
   }).join('\n')
   let captures = 0, gets = 0
-  const context = { Buffer, Date, Error, AbortSignal, setTimeout, clearTimeout,
+  const context = { Buffer, Date, Error, AbortSignal, setTimeout, clearTimeout, EMAIL_PATTERN,
     query: async () => ({ rows: [{ owner_email: ownerEmail, connection_id: connectionId, account_email: oldEmail }] }),
     readGmailMailboxLabelRepairSnapshotInPostgres: async value => { assert.deepEqual(value, scope); captures++
       return { ...scope, accountEmail: oldEmail, version: drift && captures > 1 ? 2 : 1 } },

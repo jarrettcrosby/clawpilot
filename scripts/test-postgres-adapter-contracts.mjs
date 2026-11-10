@@ -930,7 +930,7 @@ assertIncludes(crmEmailIngestion, 'ownedPipelines', 'cross-owned-pipeline marker
 assertIncludes(crmEmailIngestion, 'pipelineId: input.target.pipelineId', 'matched-pipeline interaction staging')
 assertIncludes(crmEmailIngestion, "organizations: 'Accounts'", 'organization marker SuiteCRM relationship')
 assertIncludes(crmEmailIngestion, "contacts: 'Contacts'", 'contact marker SuiteCRM relationship')
-assertIncludes(crmEmailIngestion, "DEFAULT_ARCHIVE_EMAIL = 'archive@eigenracing.com'", 'archive mailbox default')
+assertIncludes(read('app_src/lib/crm/participantEligibility.ts'), "DEFAULT_ARCHIVE_EMAIL = 'archive@eigenracing.com'", 'archive mailbox default')
 assertIncludes(crmEmailIngestion, 'archiveCandidateAddresses', 'forwarded archive body address matching')
 assertIncludes(crmEmailIngestion, "matchedBy: 'archive-email'", 'archive match attribution')
 assertIncludes(crmEmailIngestion, 'groupReferenceTargets', 'related marker interaction consolidation')

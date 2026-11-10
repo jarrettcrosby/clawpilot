@@ -93,8 +93,14 @@ try{
   senderEmail:'sender@example.invalid',recipientEmails:[OLD],subject:'Synthetic retained historical message',receivedAt:'2026-01-01T00:00:00.123Z',
   snippet:'Synthetic snippet',bodyText:'Synthetic full body',markerReferences:[],emailAddressHeaders:{version:1,
    from:[{address:'sender@example.invalid'}],to:[{address:OLD}]}})
- const intake=async(message,accountEmail)=>api.recordGmailMessageIntakeInPostgres({ownerEmail:OWNER,connectionId:connection,intakePipelineId:pipeline,
-  mailboxIdentity:await verified(accountEmail),observedAccountEmail:accountEmail,observedAt:new Date().toISOString(),messageEvidence:evidence(message),rawMetadata:{synthetic:true}})
+ const intake=async(message,accountEmail)=>{
+  const mailboxIdentity=await verified(accountEmail)
+  // This synthetic observation follows the database-assigned binding on the
+  // same clock, even when the disposable Docker VM differs from its host.
+  const [{observed_at:observedAt}]=(await query("SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at")).rows
+  return api.recordGmailMessageIntakeInPostgres({ownerEmail:OWNER,connectionId:connection,intakePipelineId:pipeline,
+   mailboxIdentity,observedAccountEmail:accountEmail,observedAt,messageEvidence:evidence(message),rawMetadata:{synthetic:true}})
+ }
  const first=await intake('a001',OLD);assert.equal(first.identityStatus,'verified')
  const retained=(await query('SELECT * FROM crm_email_sources WHERE id=$1',[first.sourceId])).rows[0]
  const originalCredential=(await query('SELECT * FROM user_maton_credentials WHERE owner_email=$1',[OWNER])).rows[0]

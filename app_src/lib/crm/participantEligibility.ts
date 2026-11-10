@@ -1,3 +1,11 @@
+const DEFAULT_ARCHIVE_EMAIL = 'archive@eigenracing.com'
+export const CRM_EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
+
+export function ordinaryGmailArchiveAddress(): string {
+  const configured = String(process.env.CLAWPILOT_ARCHIVE_EMAIL || '').trim().toLowerCase()
+  return CRM_EMAIL_PATTERN.test(configured) ? configured : DEFAULT_ARCHIVE_EMAIL
+}
+
 /**
  * Exact-email CRM participant lookup shared by automatic communication intake.
  * Parameters are $1: eligible owned pipeline UUIDs and $2: normalized emails.
@@ -55,4 +63,18 @@ export function crmParticipantEmailCandidatesSql(): string {
   )
   ORDER BY candidate.reference_code ASC
   LIMIT 101`
+}
+
+/** Choose one primary contact without dropping the remaining participants.
+ * Commercial account type, not the hierarchy relationship, identifies a customer. */
+export function orderOrdinarySharedGmailContacts<T extends { organizationId: string; email: string; referenceCode: string }>(
+  targets: readonly T[], accountTypes: ReadonlyMap<string, string | null>, senderEmail: string,
+): T[] {
+  const customer = (target: T) => accountTypes.get(target.organizationId)?.trim().toLowerCase() === 'customer'
+  return [...targets].sort((left, right) => (
+    Number(customer(right)) - Number(customer(left))
+    || Number(right.email.toLowerCase() === senderEmail.toLowerCase())
+      - Number(left.email.toLowerCase() === senderEmail.toLowerCase())
+    || left.referenceCode.localeCompare(right.referenceCode)
+  ))
 }

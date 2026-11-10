@@ -25,10 +25,20 @@ function install_clawpilot_email_audience(string $sourceRoot, string $legacyRoot
                 throw new RuntimeException('Refusing symlinked Email audience directory');
             }
         }
-        if (is_link($path) || (file_exists($path) && strpos((string) file_get_contents($path), $marker) === false)) {
+        if (is_link($path)) {
             throw new RuntimeException('Unmanaged native API route/helper requires review');
         }
-        if (!file_exists($path) || !hash_equals($contents, (string) file_get_contents($path))) {
+        $current = file_exists($path) && is_file($path) ? file_get_contents($path) : null;
+        // The prior production image can leave the exact standalone lifecycle
+        // aggregate on its persistent volume. Accept only that shipped router,
+        // never an arbitrary file with its marker or an audience helper.
+        $stockLifecyclePredecessor = $source === 'routes.php' && is_string($current) && strlen($current) === 224
+            && hash_equals('8a755a54097499fa3ddaa8bc7550d578c249475e5b8c0b2c575a1c6e89a909ed', hash('sha256', $current))
+            && (lstat($path)['nlink'] ?? 0) === 1;
+        if (file_exists($path) && (!is_string($current) || (strpos($current, $marker) === false && !$stockLifecyclePredecessor))) {
+            throw new RuntimeException('Unmanaged native API route/helper requires review');
+        }
+        if ($current !== $contents) {
             $pending[$path] = $contents;
         }
     }
