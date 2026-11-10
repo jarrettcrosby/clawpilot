@@ -136,6 +136,7 @@ const verifiedIdentity = { version: 1, provider: 'gmail', mailboxId: '22222222-2
 const ingestion = loadModule('app_src/lib/crm/emailIngestion.ts', {
   '@/lib/crm/emailAddressHeaders': loadModule('app_src/lib/crm/emailAddressHeaders.ts', {}),
   '@/lib/crm/participantEligibility': loadModule('app_src/lib/crm/participantEligibility.ts', {}),
+  '@/lib/crm/suiteCrmNativeEmailProjection': { sharedSuiteCrmEmailScope: () => null },
   '@/lib/crm/emailIdentity': emailIdentity,
   '@/lib/crm/emailReconciliation': loadModule('app_src/lib/crm/emailReconciliation.ts', { '@/lib/crm/emailIdentity': emailIdentity }),
   '@/lib/crm/caseyGmailReview': loadModule('app_src/lib/crm/caseyGmailReview.ts', { '@/lib/crm/emailIdentity': emailIdentity }),

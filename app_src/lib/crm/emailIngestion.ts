@@ -2,7 +2,9 @@ import crypto from 'node:crypto'
 import { decodeHtmlEntities } from '@/lib/htmlEntities.mjs'
 import { globalIdFragment } from '@/lib/globalIds.mjs'
 import { captureEmailAddressHeaders, type EmailAddressHeaders } from '@/lib/crm/emailAddressHeaders'
-import { crmParticipantEmailCandidatesSql } from '@/lib/crm/participantEligibility'
+import { CRM_EMAIL_PATTERN as EMAIL_PATTERN, crmParticipantEmailCandidatesSql, ordinaryGmailArchiveAddress,
+  orderOrdinarySharedGmailContacts } from '@/lib/crm/participantEligibility'
+import { sharedSuiteCrmEmailScope } from '@/lib/crm/suiteCrmNativeEmailProjection'
 import {
   assertSameRetainedGmailEvidence, gmailMessageSourceKey, normalizeGmailMessageEvidence,
   retainedGmailMessageEvidence, verifyGmailMailboxBinding,
@@ -18,6 +20,7 @@ import {
   enrichCrmEmailInteractionParticipantsInPostgres,
   readCrmRecordByReference,
   stageCrmRecordInPostgres,
+  stageOrdinarySharedGmailInteractionInPostgres,
   stageReviewedGmailInteractionsInPostgres,
   type StageInteractionInput,
 } from '@/lib/persistence/crm'
@@ -36,8 +39,6 @@ const POLL_OVERLAP_MS = 5 * 60 * 1000
 const MAX_INTERACTION_DESCRIPTION_CHARS = 50_000
 const MAX_SUBJECT_CHARS = 500
 const MAX_SNIPPET_CHARS = 2_000
-const DEFAULT_ARCHIVE_EMAIL = 'archive@eigenracing.com'
-const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 export type GmailHeader = {
   name?: string
@@ -147,6 +148,7 @@ type ReferenceTarget = {
   pipelineId: string
   matchedBy: 'marker' | 'sender-email' | 'archive-email' | 'participant-email'
   matchedEmail?: string
+  ordinaryShared?: { organizationId: string; email: string }
 }
 
 type MessageProcessResult = {
@@ -183,8 +185,7 @@ function cleanSingleLine(value: unknown, maxLength: number): string {
 }
 
 export function archiveMailboxEmail(): string {
-  const configured = String(process.env.CLAWPILOT_ARCHIVE_EMAIL || '').trim().toLowerCase()
-  return EMAIL_PATTERN.test(configured) ? configured : DEFAULT_ARCHIVE_EMAIL
+  return ordinaryGmailArchiveAddress()
 }
 
 function safeIdentifier(value: unknown, required: boolean): string | null {
@@ -787,9 +788,29 @@ async function participantEmailTargets(input: MessageRoutingInput): Promise<Refe
       matchedEmail: row.email,
     })
   }
-  // A conversation spanning unrelated customer accounts needs explicit markers
-  // or archive review, not an implicit copy into every matched CRM account.
-  if (new Set(targets.map((target) => target.record.organizationId || target.record.id)).size !== 1) return []
+  const organizationIds = [...new Set(targets.map((target) => target.record.organizationId || target.record.id))]
+  if (organizationIds.length > 1) {
+    // One owned pipeline is still mandatory. Only the explicit BPO shared
+    // scope may automatically link more than one company to a single Email.
+    const scope = sharedSuiteCrmEmailScope(targets[0].pipelineId)
+    if (!scope || targets.some((target) => target.record.entity !== 'contacts'
+      || !target.record.organizationId || !target.matchedEmail)) return []
+    const companies = await query<{ id: string; account_type: string | null }>(
+      `SELECT company.id::text, company.account_type FROM crm_organizations company
+       JOIN pipeline_spaces pipeline ON pipeline.id = company.pipeline_id
+       WHERE pipeline.id = $1::uuid AND pipeline.workspace_organization_id = $2::uuid
+         AND company.id = ANY($3::uuid[])
+         AND COALESCE(lower(company.source_payload->>'archived'), 'false') NOT IN ('true', '1', 'yes')`,
+      [scope.pipelineId, scope.workspaceId, organizationIds],
+    )
+    const accountTypes = new Map(companies.rows.map((company) => [company.id, company.account_type]))
+    if (accountTypes.size !== organizationIds.length || organizationIds.some((id) => !accountTypes.has(id))) return []
+    return orderOrdinarySharedGmailContacts(targets.map((target) => ({
+      target, organizationId: target.record.organizationId!, email: target.matchedEmail!, referenceCode: target.record.referenceCode,
+    })), accountTypes, input.message.senderEmail).map(({ target, organizationId, email }) => ({
+      ...target, ordinaryShared: { organizationId, email },
+    }))
+  }
   return targets.sort((left, right) => (
     Number(right.record.email?.toLowerCase() === input.message.senderEmail)
     - Number(left.record.email?.toLowerCase() === input.message.senderEmail)
@@ -1092,7 +1113,9 @@ async function existingProviderInteraction(input: {
   if (candidate && candidate.provider_thread_id !== input.message.externalThreadId) {
     throw new SafeEmailIngestionError('Gmail message has a conflicting CRM thread identity')
   }
-  if (candidate) await enrichExistingParticipantInteraction({ ...input, interactionId: candidate.id, apply: false })
+  if (candidate && !input.group.primary.ordinaryShared) {
+    await enrichExistingParticipantInteraction({ ...input, interactionId: candidate.id, apply: false })
+  }
   return candidate?.id
 }
 
@@ -1125,20 +1148,21 @@ async function enrichExistingParticipantInteraction(input: {
   }
 }
 
-async function stageInboundInteraction(input: {
+function inboundInteractionInput(input: {
   ownerEmail: string
   inboundMessage: StoredInboundMessage
   message: ParsedGmailMessage
   target: ReferenceTarget
   relatedReferences: string[]
   contactIds?: string[]
+  organizationIds?: string[]
   mailboxIdentity?: VerifiedGmailMailboxIdentity | null
-}): Promise<string> {
+}): StageInteractionInput {
   const referenceCode = input.target.record.referenceCode
   const relations = interactionRelations(input.target.record)
   const description = (input.message.bodyText || input.message.snippet || 'Inbound email received.')
     .slice(0, MAX_INTERACTION_DESCRIPTION_CHARS)
-  const staged = await stageCrmRecordInPostgres({
+  return {
     entity: 'interactions',
     pipelineId: input.target.pipelineId,
     sourceKey: input.mailboxIdentity && input.target.matchedBy === 'participant-email'
@@ -1154,6 +1178,7 @@ async function stageInboundInteraction(input: {
     },
     fields: {
       ...relations,
+      ...(input.organizationIds?.length ? { organizationIds: input.organizationIds } : {}),
       ...(input.contactIds?.length ? { contactIds: input.contactIds } : {}),
       interactionType: 'email',
       subject: input.message.subject || 'Inbound email',
@@ -1174,8 +1199,11 @@ async function stageInboundInteraction(input: {
         canonicalSourceId: input.inboundMessage.sourceId || null,
       },
     },
-  })
+  }
+}
 
+async function stageInboundInteraction(input: Parameters<typeof inboundInteractionInput>[0]): Promise<string> {
+  const staged = await stageCrmRecordInPostgres(inboundInteractionInput(input))
   return staged.id
 }
 
@@ -1238,11 +1266,14 @@ async function updateInboundMessagePrimary(input: {
 }
 
 function routingFingerprint(targets: ReferenceTarget[]): string {
-  return JSON.stringify(targets.map((target) => ({
-    pipeline: target.pipelineId, reference: target.record.referenceCode,
-    id: target.record.id, entity: target.record.entity,
-    organization: target.record.organizationId, matchedBy: target.matchedBy,
-  })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))))
+  return JSON.stringify({
+    sharedPrimary: targets[0]?.ordinaryShared ? targets[0].record.id : null,
+    targets: targets.map((target) => ({
+      pipeline: target.pipelineId, reference: target.record.referenceCode,
+      id: target.record.id, entity: target.record.entity,
+      organization: target.record.organizationId, matchedBy: target.matchedBy,
+    })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+  })
 }
 
 async function processMessage(
@@ -1312,12 +1343,13 @@ async function processMessage(
     if (linkedInteractionIds.some((interactionId) => interactionId !== existingInteractionId)) {
       throw new SafeEmailIngestionError('Gmail message has conflicting existing CRM links')
     }
-    if (existingInteractionId) await enrichExistingParticipantInteraction({
+    const sharedPrimary = group.primary.ordinaryShared
+    if (existingInteractionId && !sharedPrimary) await enrichExistingParticipantInteraction({
       group, message: input.message, ownerEmail: input.ownerEmail,
       mailboxIdentity: input.mailboxIdentity,
       interactionId: existingInteractionId, apply: true,
     })
-    const interactionId = existingInteractionId || await stageInboundInteraction({
+    const staging = {
       ownerEmail: input.ownerEmail,
       inboundMessage,
       message: input.message,
@@ -1325,8 +1357,26 @@ async function processMessage(
       relatedReferences,
       contactIds: group.targets.filter((target) => target.record.entity === 'contacts').map((target) => target.record.id),
       mailboxIdentity: input.mailboxIdentity,
-    })
-    if (!existingInteractionId) interactions += 1
+    }
+    let interactionId: string
+    if (sharedPrimary) {
+      const targets = group.targets.map(({ record, ordinaryShared }) => {
+        if (!ordinaryShared) throw new SafeEmailIngestionError('Gmail message has incomplete shared participant evidence')
+        return { id: record.id, referenceCode: record.referenceCode, ...ordinaryShared }
+      })
+      const organizationIds = [sharedPrimary.organizationId, ...[...new Set(targets.map((target) => target.organizationId))]
+        .filter((id) => id !== sharedPrimary.organizationId).sort()]
+      const contactIds = [group.primary.record.id, ...staging.contactIds.filter((id) => id !== group.primary.record.id).sort()]
+      const result = await stageOrdinarySharedGmailInteractionInPostgres({
+        interaction: inboundInteractionInput({ ...staging, organizationIds, contactIds }),
+        mailboxId: input.mailboxIdentity.mailboxId, targets, expectedExistingInteractionId: existingInteractionId || null,
+      })
+      interactionId = result.id
+      if (result.inserted) interactions += 1
+    } else {
+      interactionId = existingInteractionId || await stageInboundInteraction(staging)
+      if (!existingInteractionId) interactions += 1
+    }
     await updateInboundMessagePrimary({
       inboundMessageId: inboundMessage.id,
       interactionId,
