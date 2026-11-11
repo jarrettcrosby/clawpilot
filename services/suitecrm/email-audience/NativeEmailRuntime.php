@@ -10,6 +10,19 @@ require_once __DIR__.'/../native-email-scope/Patch.php';
 final class ClawPilotNativeEmailRuntime
 {
     private const WRITE_SCOPE_HASH='e5acae3f23ff7c2c46ea28d01968fb3aac7f9d842aa2c5903eb5f49391113e0a';
+    // Only changed bytes from the official 8.10.2 regular release ZIP. Every
+    // other source pin and all runtime/schema guards still apply to the worker.
+    private const SHARED_WORKER_8_10_2_PINS=[
+        'data/Relationships/SugarRelationship.php'=>'a64c455a4a0751cb888235980189788412e05f5eaedf8b0683a0642751d18af2',
+        'include/utils.php'=>'80bdeec6d9f86c5f125d8f50989188c187ba29beec5bc52a084e7f9aafbe5289',
+        'include/SugarEmailAddress/SugarEmailAddress.php'=>'ff2fd4e3f86bbf32aab9df1cb1c35d059d5162c03a8096c93aea2059bc940ae5',
+        'modules/Emails/vardefs.php'=>'e0bcddbcbf10e2be44b695cc09656f1f1619a7ef1b219023d9fadf80b82bd3f3',
+        'modules/Contacts/vardefs.php'=>'f97b9924aafa71266f0dba37bea44c8016adc201d573e744940d3fdd7abdf97c',
+        'data/SugarBean.php'=>'9203e27556c9ed097cd8f46c3f2212afa95e5a4817802080b34d9ffb98181057',
+        'Api/V8/Service/ModuleService.php'=>'78d10d3726f6d2a945a2c7ce7853ead4eb9efccdb4a4c01c49f3abaab17adc79',
+        'Api/V8/Service/RelationshipService.php'=>'accfbbaf07a3743ca428de149c53f22ce1afabba86fc26cfa44768bf8b2c0919',
+        'include/SugarFolders/SugarFolders.php'=>'2f5572dcdc346f3d90f5cf2690bb5ceb1f301ac167a19d9ec8583523a8953a17',
+    ];
     public static function attest(mysqli $db): string
     {return self::attestProfile($db,'ordinary');}
     /** Actual stock-source observation before the separate offline installer.
@@ -20,6 +33,20 @@ final class ClawPilotNativeEmailRuntime
      * enrollment stage and does not enable the managed role or write scope. */
     public static function attestSharedLoginSource(mysqli $db): string
     {return self::attestProfile($db,'shared_login_source');}
+    /** Ordinary OAuth worker only. Historical operator permits still bind to
+     * the original stock profile; managed enrollment never uses this path. */
+    public static function attestSharedWorkerSource(mysqli $db): string
+    {return self::attestProfile($db,'shared_login_source',false,self::sharedWorkerStockUpgrade());}
+    private static function sharedWorkerStockUpgrade(): bool
+    {
+        // The legacy root is independently verified against the loaded Email
+        // bean. Observe the installed package, not a caller or image env flag.
+        $file='../../VERSION';
+        self::requireTrue(is_file($file)&&!is_link($file),'shared_worker_stock_version');
+        $version=file_get_contents($file,false,null,0,8);
+        self::requireTrue(in_array($version,["8.10.1\n","8.10.2\n"],true),'shared_worker_stock_version');
+        return $version==="8.10.2\n";
+    }
     /** Actual installed-but-not-enrolled state. The config journal must have
      * enabled managed writes while traffic remains stopped; SQL defaults are
      * still the exact original ALL rows. This is not the old source profile. */
@@ -29,12 +56,13 @@ final class ClawPilotNativeEmailRuntime
      * Execution MUST call ordinary attest() after actual SQL default changes. */
     public static function projectInitialAfter(mysqli $db): string
     {return self::attestProfile($db,'initial_installed',true);}
-    private static function attestProfile(mysqli $db,string $stage,bool $projectAfter=false): string
+    private static function attestProfile(mysqli $db,string $stage,bool $projectAfter=false,bool $sharedWorker8102=false): string
     {
         global $sugar_config;
         self::requireTrue(is_bool($sugar_config['clawpilot_managed_email_write_scope']??false),'managed_write_scope_config');
         self::requireTrue(in_array($stage,['ordinary','initial_source','initial_installed','shared_login_source'],true)
-            && (!$projectAfter || $stage==='initial_installed'),'unknown_initial_runtime_stage');
+            && (!$projectAfter || $stage==='initial_installed')
+            && (!$sharedWorker8102 || $stage==='shared_login_source'),'unknown_initial_runtime_stage');
         if($stage!=='ordinary')self::requireTrue(($sugar_config['clawpilot_managed_email_write_scope']??false)
             ===($stage==='initial_installed'),'initial_managed_write_stage');
         self::requireTrue(is_file(__DIR__.'/NativeEmailWriteScope.php')&&!is_link(__DIR__.'/NativeEmailWriteScope.php')
@@ -104,9 +132,9 @@ final class ClawPilotNativeEmailRuntime
         'modules/AOP_Case_Updates/CaseUpdatesHook.php' => '3e9843dd66b23c051d22ed835dbf4ad9e3b5c222441aebba59e4e1339bbd1cd7',
         'modules/AOP_Case_Updates/util.php' => '77eabac1a935f33924f08ac69ab6c4066e9786a733fdee2fb5afed602e5684d7',
     ];
-    foreach ($pins as $path => $hash) self::requireTrue(hash_equals($hash, hash_file('sha256', $path)), 'Unreviewed native source: '.$path);
     $stockSource=in_array($stage,['initial_source','shared_login_source'],true);
     $pins += $stockSource?clawpilot_native_scope_input_hashes():clawpilot_native_scope_output_hashes();
+    if($sharedWorker8102)$pins=array_replace($pins,self::SHARED_WORKER_8_10_2_PINS);
     if($stockSource)self::requireTrue(!file_exists('custom/ClawPilotNativeEmailScope.php')&&!is_link('custom/ClawPilotNativeEmailScope.php'),
         $stage==='initial_source'?'initial_source_helper_present':'shared_login_scope_helper_present');
     else $pins['custom/ClawPilotNativeEmailScope.php'] = 'ba26057190771c47cf18c829cf5fef09f93d6dde071b4856c62ca943704059a7';
@@ -193,6 +221,7 @@ final class ClawPilotNativeEmailRuntime
         ksort($pins, SORT_STRING);
         $profile='stock-inheritance-no-default-groups-no-workflows-no-external-index';
         if($stage!=='ordinary'&&!$projectAfter)$profile.='-'.$stage;
+        if($sharedWorker8102)$profile.='-suitecrm-8.10.2';
         return hash('sha256', json_encode(['version'=>1,'pins'=>$pins,'profile'=>$profile,
             'defaults'=>$projectAfter?$safeDefaults:$expected,'siteUrl'=>(string)($sugar_config['site_url'] ?? ''),'htmlAllowObjects'=>false,'charset'=>'UTF-8','mapsLogicHooksEnabled'=>false,
             'managedEmailWriteScope'=>($sugar_config['clawpilot_managed_email_write_scope']??false),
