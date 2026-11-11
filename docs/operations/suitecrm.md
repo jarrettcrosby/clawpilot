@@ -44,7 +44,7 @@ The sole Railway production environment has a `suitecrm` service, a dedicated Ma
 
 `SUITECRM_BASE_URL` is backend-only and must remain on Railway's private network. Never place it in a browser response or public environment variable. `SUITECRM_PUBLIC_URL` is the only browser destination and must be the exact canonical production origin, with no trailing slash, path, credentials, query, or fragment. ClawPilot uses `https://crm.eigenracing.com`. The former `https://dev.crm.eigenracing.com` origin is retired migration history, not an active service or deployment target. SuiteCRM is a standalone service and must not be nested under the ClawPilot `aiapp` hostname.
 
-The image is built from `services/suitecrm/`. It verifies the official SuiteCRM 8.10.1 release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
+The image is built from `services/suitecrm/`. It verifies the pinned official SuiteCRM release digest, serves `public/` with Apache, runs the legacy scheduler every minute, and continuously restarts the Symfony Messenger worker.
 
 Container boot also idempotently installs the ClawPilot `Global ID` custom field on Accounts, Contacts, AOS Products, Leads, Opportunities, Meetings, Calls, Notes, Campaigns, and Users. The field is named `global_id_c` in SuiteCRM metadata, labeled `Global ID`, and added to native detail and list layouts. Business-record modules are available to reporting and unified search; boot fails if any managed module or its Global ID search field remains unavailable. AOS Products is also kept enabled in SuiteCRM's persisted global-search module selection so Product Global ID lookup works without an administrator repair, while other module visibility remains administrator-controlled. Users retain their administrator-module search boundary. Notes also receive a reportable, audited `Occurred At` DateTime field named `occurred_at_c` on native edit, detail, and list layouts; it stores the interaction's business timestamp separately from SuiteCRM's system creation time. AOS Products receive the native non-database image field `clawpilot_image_c`, backed by SuiteCRM's `private-images` media store and shown on native detail and edit layouts. Boot verifies the field type, storage metadata, 2 MiB limit, thumbnail configuration, and layout placement before reporting readiness.
 
@@ -245,7 +245,56 @@ After a public-domain change, update `SUITECRM_PUBLIC_URL` on both services and 
 
 ## Upgrade Rule
 
-The service never upgrades a persisted SuiteCRM application implicitly. A version mismatch fails closed. Take a MariaDB snapshot and SuiteCRM volume snapshot, follow the official SuiteCRM upgrade procedure, verify the API and workers, then update the version marker deliberately.
+The service never upgrades a persisted SuiteCRM application implicitly. Without the target installed marker, it refuses to start on an already configured volume. Take paired backups, follow the official SuiteCRM upgrade procedure, confirm the installed versions, and update the marker deliberately before the fenced boot and integration checks.
+
+### 8.10.1 to 8.10.2 rehearsal
+
+Use the [official SuiteCRM 8 upgrade procedure](https://docs.suitecrm.com/8.x/admin/upgrading/running-the-upgrade/)
+and the standard `SuiteCRM-8.10.2.zip` release asset (SHA-256
+`ac4693d10ea2d6cd20b3256098781d134599d88878fb24e8dc127038d624f5a8`).
+Keep PHP 8.3 and MariaDB 11.4 unchanged. The new image does not upgrade a mounted app tree.
+
+Rehearse both `suitecrm:app:upgrade -t SuiteCRM-8.10.2` and
+`suitecrm:app:upgrade-finalize -t SuiteCRM-8.10.2` on an isolated app tree and
+database, as the app user in `APP_ENV=prod`. Check the actual application version,
+managed routes, stock shared-email compatibility, and native V8 API before a cold
+boot check. Verify from a signed-in browser that normal clicks on the two account
+links of a shared email navigate the main tab to their respective account pages.
+
+The disposable local rehearsal is `scripts/rehearse-suitecrm-8-10-2.mjs` with
+absolute paths to both official ZIPs. Use `--loopback-ui` for a signed-in browser
+check or `--oauth-smoke` for a real OAuth write, exact retry, and both account
+histories. Neither mode uses production data or exposes a Docker port.
+`--cold-boot` exercises the packaged image's private canary and normal boot on
+the upgraded fixture; the native Linux CI job is authoritative for the process
+identity check. `--normal-boot` checks the packaged normal path independently.
+
+For production, confirm stock mode. On a ClawPilot release containing the
+CRM maintenance fence, set `CLAWPILOT_CRM_SYNC_MAINTENANCE=1` and confirm that
+the old App instance has exited and `/api/health` reports CRM `paused` without
+failing App readiness. This pauses both periodic CRM sync workers, manual exact
+Email Apply, and direct SuiteCRM API/media calls before they can acquire a new
+claim or session. Other ClawPilot features and the independent customer Drive
+folder queue continue. Explicit `/api/crm/actions` Google sends or calendar
+updates remain normal; those can enqueue local projections but do not contact
+SuiteCRM directly. `CRM_ENABLED=0` alone does not stop the outbox processor.
+
+Confirm in-flight SuiteCRM work is drained without resetting or retrying rows.
+Fence SuiteCRM itself with `CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=1`; verify that
+the prior instance, Apache, scheduler, Messenger, and writer DB sessions are
+gone. Retain the ClawPilot outbox and take a coordinated app-volume and
+database-consistent MariaDB checkpoint. Record both backup IDs and verify the
+paired restore path. Separate scheduled backups are not a paired checkpoint.
+
+After both commands succeed, verify the application and database version, retire
+the old installed marker and deliberately write `/var/lib/suitecrm/.installed-8.10.2`
+while still fenced. Cold boot the pinned image and test real login, the native
+API, and managed integrations before resuming writers. Confirm the upgraded
+database still matches the shared Email worker's reviewed template-table
+setting. A liveness response alone is not readiness. A redeploy of the old
+image does not roll back the migrated database; restore the paired checkpoint
+before starting the old image. Clear the ClawPilot CRM maintenance flag only
+after the intended native version is healthy and the paused App is verified.
 
 ## Rollback
 
@@ -254,4 +303,4 @@ floor. See the draft [CRM shared-email rollback certification](crm-compatible-ro
 before treating an older ClawPilot application as a writable rollback target;
 that draft does not authorize a release or production recovery.
 
-Disable `CRM_ENABLED` or stop CRM writes in ClawPilot, retain the Postgres outbox, and restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.
+Keep the ClawPilot CRM maintenance fence active and retain the Postgres outbox. Restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.

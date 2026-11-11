@@ -1,0 +1,47 @@
+name: SuiteCRM packaged upgrade
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - 'services/suitecrm/**'
+      - 'scripts/rehearse-suitecrm-8-10-2.mjs'
+      - '.github/workflows/suitecrm-upgrade.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/suitecrm/**'
+      - 'scripts/rehearse-suitecrm-8-10-2.mjs'
+      - '.github/workflows/suitecrm-upgrade.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  suitecrm-packaged-upgrade:
+    # The dev-to-main promotion gets the authoritative check on the main push.
+    if: github.event_name != 'pull_request' || github.base_ref != 'main' || github.head_ref != 'dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Build the exact candidate on native Linux amd64
+        run: docker build --platform linux/amd64 --tag clawpilot-suitecrm:upgrade-8.10.2-local services/suitecrm
+      - name: Prepare public fixture dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull mariadb:11.4.13
+          mkdir "$RUNNER_TEMP/suitecrm-archive"
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.1.zip" \
+            https://github.com/SuiteCRM/SuiteCRM-Core/releases/download/v8.10.1/SuiteCRM-8.10.1.zip
+          curl --fail --location --retry 4 --output "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.2.zip" \
+            https://github.com/SuiteCRM/SuiteCRM-Core/releases/download/v8.10.2/SuiteCRM-8.10.2.zip
+      - name: Upgrade an isolated volume, run the private canary and cold boot
+        run: >-
+          node scripts/rehearse-suitecrm-8-10-2.mjs
+          "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.1.zip"
+          "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.2.zip" --cold-boot

@@ -167,6 +167,10 @@ async function request(
   fetchImpl: typeof fetch,
   allowNotFound = false,
 ) {
+  // Fence even direct reads: acquiring their OAuth token can write in SuiteCRM.
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    throw new Error('CRM sync is temporarily paused for maintenance')
+  }
   const token = await accessToken(fetchImpl, init.signal || undefined)
   init.signal?.throwIfAborted()
   const response = await fetchImpl(`${suiteCrmBaseUrl()}${pathname}`, {

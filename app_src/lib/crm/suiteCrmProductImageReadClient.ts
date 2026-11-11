@@ -953,5 +953,8 @@ class SuiteCrmProductImageReader implements SuiteCrmProductImageReadClient {
 export function createSuiteCrmProductImageReadClient(
   fetchImpl: typeof fetch = fetch,
 ): SuiteCrmProductImageReadClient {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    throw new Error('CRM sync is temporarily paused for maintenance')
+  }
   return new SuiteCrmProductImageReader(configuredBaseUrl(), fetchImpl)
 }

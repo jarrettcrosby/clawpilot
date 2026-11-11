@@ -1,17 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly CANARY_PORT=18080
+readonly CANARY_ENTRY=/usr/local/bin/entrypoint.sh
+readonly CANARY_LOCK=/run/clawpilot-suitecrm-upgrade-canary.lock
+canary=0
+
+canary_hold() {
+  printf '[suitecrm] upgrade canary held: %s\n' "$1" >&2
+  exit 1
+}
+
+require_canary_maintenance() {
+  local port="${PORT:-8080}"
+  [[ "$EUID" == 0 && "$$" != 1 && "${CLAWPILOT_NATIVE_INITIAL_MAINTENANCE:-0}" == 1 ]] \
+    || canary_hold 'requires a root exec in the maintenance container'
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 && port != CANARY_PORT )) \
+    || canary_hold 'maintenance port must be distinct'
+  cmp -s /proc/1/cmdline <(printf '%s\0' python3 -B /opt/clawpilot/native-email-maintenance.py) \
+    && [[ "$(readlink -f /proc/1/exe)" == "$(readlink -f /usr/bin/python3)" \
+      && "$(< /proc/1/comm)" == python3 ]] \
+    || canary_hold 'PID 1 is not the fixed maintenance responder'
+  cmp -s <(curl --noproxy '*' --proto '=http' --silent --fail --max-time 2 \
+    "http://127.0.0.1:${port}/_clawpilot/liveness") \
+    <(printf '%s\n' '{"service":"suitecrm","mode":"maintenance","live":true,"ready":false}') \
+    || canary_hold 'maintenance listener did not attest'
+}
+
 # Restriction only: this branch cannot install, enroll, activate or release
 # anything. It runs before PHP, version/config validation or bootstrap writers.
 # Clearing the flag still reaches the unchanged fail-closed startup checker.
-case "${CLAWPILOT_NATIVE_INITIAL_MAINTENANCE:-0}" in
-  1) cd /; exec python3 -B /opt/clawpilot/native-email-maintenance.py ;;
-  0|'') ;;
-  *) echo '[suitecrm] maintenance selector must be 0 or 1' >&2; exit 1 ;;
-esac
+if (( $# == 0 )); then
+  case "${CLAWPILOT_NATIVE_INITIAL_MAINTENANCE:-0}" in
+    1) cd /; exec python3 -B /opt/clawpilot/native-email-maintenance.py ;;
+    0|'') ;;
+    *) echo '[suitecrm] maintenance selector must be 0 or 1' >&2; exit 1 ;;
+  esac
+else
+  [[ "$#" == 1 && "$1" == '--upgrade-canary' ]] || canary_hold 'unexpected arguments'
+  require_canary_maintenance
+  # No argument or environment value can select an unbounded worker. The
+  # exec-only entry repeats under the exact timer and nonblocking lock.
+  canary_timer=(/usr/bin/timeout --signal=TERM --kill-after=5s 300s "$CANARY_ENTRY" --upgrade-canary)
+  canary_lock=(/usr/bin/flock --exclusive --nonblock "$CANARY_LOCK" "${canary_timer[@]}")
+  if cmp -s "/proc/$PPID/cmdline" <(printf '%s\0' "${canary_timer[@]}"); then
+    canary_lock_pid="$(awk '$1 == "PPid:" {print $2}' "/proc/$PPID/status")"
+    [[ "$canary_lock_pid" =~ ^[1-9][0-9]*$ ]] \
+      && cmp -s "/proc/$canary_lock_pid/cmdline" <(printf '%s\0' "${canary_lock[@]}") \
+      || canary_hold 'exact serialization wrapper absent'
+  else
+    exec "${canary_lock[@]}"
+  fi
+  canary=1
+fi
 
 APP_ROOT=/var/lib/suitecrm/app
 VERSION_MARKER="/var/lib/suitecrm/.installed-${SUITECRM_VERSION}"
+if (( canary )); then
+  [[ "$SUITECRM_VERSION" == '8.10.2' && ! -L "$APP_ROOT" && -f "$VERSION_MARKER" && ! -L "$VERSION_MARKER" \
+    && ! -e /var/lib/suitecrm/.installed-8.10.1 && ! -L /var/lib/suitecrm/.installed-8.10.1 \
+    && -f "$APP_ROOT/public/legacy/config.php" && ! -L "$APP_ROOT/public/legacy/config.php" ]] \
+    || canary_hold 'requires the deliberately upgraded installed volume'
+  for version_file in /opt/suitecrm/VERSION "$APP_ROOT/VERSION"; do
+    [[ -f "$version_file" && ! -L "$version_file" ]] \
+      && cmp -s "$version_file" <(printf '8.10.2\n') \
+      || canary_hold 'exact packaged and mounted SuiteCRM 8.10.2 required'
+  done
+fi
 
 # The image workdir lives on a persistent volume and may be replaced during the
 # first install. Move out of it before bootstrapping so child processes inherit
@@ -21,6 +76,9 @@ cd /
 # Observe retained offline journals before URL config, OAuth/bootstrap or cache
 # writers can run. Never auto-apply a patch/package or release an initial hold.
 CLAWPILOT_NATIVE_RUNTIME_MODE="$(php /opt/clawpilot/native-email-startup-check.php)"
+if (( canary )); then
+  [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == 'legacy' ]] || canary_hold 'only the reviewed stock runtime may use this mode'
+fi
 if [[ "${CLAWPILOT_SHARED_BPO_EMAIL_ENABLED:-}" == "1" ]]; then
   [[ "$CLAWPILOT_NATIVE_RUNTIME_MODE" == "legacy" ]] || { echo '[suitecrm] shared Email worker requires stock startup' >&2; exit 1; }
   [[ "${CLAWPILOT_SHARED_BPO_EMAIL_TEMPLATES:-}" =~ ^[01]$ ]] || { echo '[suitecrm] shared Email worker requires the reviewed template-table setting' >&2; exit 1; }
@@ -234,6 +292,46 @@ fi
 su -s /bin/bash www-data -c "cd '$APP_ROOT/public/legacy' && php /opt/clawpilot/bootstrap-image-principals.php"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:clear --no-warmup"
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && APP_ENV=prod php bin/console cache:warmup"
+if (( canary )); then
+  require_canary_maintenance
+  # Work in a private Apache ServerRoot, leaving the normal container config
+  # and the PID 1 responder intact. Never start Supervisor or any workers.
+  canary_root="$(mktemp -d /run/clawpilot-suitecrm-canary.XXXXXXXX)"
+  trap 'rm -r -- "$canary_root"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  mkdir "$canary_root/apache" "$canary_root/pid" "$canary_root/lock" "$canary_root/log"
+  cp -a /etc/apache2/. "$canary_root/apache/"
+  printf 'Listen 127.0.0.1:%s\n' "$CANARY_PORT" > "$canary_root/apache/ports.conf"
+  sed -ri "s/<VirtualHost \*:[0-9]+>/<VirtualHost 127.0.0.1:${CANARY_PORT}>/" \
+    "$canary_root/apache/sites-available/000-default.conf"
+  [[ -f "$canary_root/apache/mods-enabled/mpm_prefork.load" \
+    && ! -e "$canary_root/apache/mods-enabled/mpm_event.load" \
+    && ! -e "$canary_root/apache/mods-enabled/mpm_worker.load" ]] || canary_hold 'unexpected Apache MPM'
+  # Apache's Debian configuration uses these variables. Distinct paths keep
+  # its lifetime and ownership entirely separate from normal startup.
+  . /etc/apache2/envvars
+  export APACHE_RUN_DIR="$canary_root/pid" APACHE_PID_FILE="$canary_root/pid/apache2.pid"
+  export APACHE_LOCK_DIR="$canary_root/lock" APACHE_LOG_DIR="$canary_root/log"
+  apache_canary=(/usr/sbin/apache2 -d "$canary_root/apache" -f "$canary_root/apache/apache2.conf")
+  # Prove the active include list contains exactly one Listen directive, from
+  # our private ports file. Reject unexpected config instead of guessing.
+  included="$("${apache_canary[@]}" -t -D DUMP_INCLUDES 2>&1)"
+  includes=()
+  include_line='^[[:space:]]*\([^)]*\)[[:space:]]+(/[^[:space:]]+)$'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $include_line ]]; then
+      includes+=("${BASH_REMATCH[1]}")
+    fi
+  done <<< "$included"
+  (( ${#includes[@]} > 0 )) || canary_hold 'Apache include list unavailable'
+  listen_lines="$(grep -iEh '^[[:space:]]*Listen[[:space:]]' -- "${includes[@]}")"
+  [[ "$listen_lines" == "Listen 127.0.0.1:${CANARY_PORT}" ]] \
+    || canary_hold 'Apache listener is not exactly loopback'
+  cd "$APP_ROOT"
+  "${apache_canary[@]}" -DFOREGROUND
+  exit $?
+fi
 su -s /bin/bash www-data -c "cd '$APP_ROOT' && php bin/console messenger:setup-transports --no-interaction" || true
 
 touch "$VERSION_MARKER"

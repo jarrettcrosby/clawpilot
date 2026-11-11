@@ -2,8 +2,10 @@
 # tag could silently change that runtime during the cutover image build.
 FROM php:8.3.36-apache-bookworm@sha256:96f820bf68a6e443521586cdd29b9efa1b990df6105b0f8c5524a49492752676
 
-ARG SUITECRM_VERSION=8.10.1
-ARG SUITECRM_SHA256=b72da32ca7702452537cdd11e1157bc41a283accdadca66ef88f42684a571ef7
+# Updating this pin does not migrate an existing Railway volume. Release it
+# only with the paired-backup and explicit upgrade procedure in the runbook.
+ARG SUITECRM_VERSION=8.10.2
+ARG SUITECRM_SHA256=ac4693d10ea2d6cd20b3256098781d134599d88878fb24e8dc127038d624f5a8
 
 # Keep extension compilation bounded on local and hosted builders; CPU-count
 # fan-out can exhaust memory and grow swap before the image is available.

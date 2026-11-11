@@ -1,6 +1,6 @@
 # ClawPilot SuiteCRM service
 
-This service packages the official SuiteCRM 8.10.1 release for Railway. It uses a dedicated MariaDB service and a persistent volume mounted at `/var/lib/suitecrm`.
+This service packages the official SuiteCRM 8.10.2 release for Railway. It uses a dedicated MariaDB service and a persistent volume mounted at `/var/lib/suitecrm`. The image does not upgrade an existing volume; use the [upgrade runbook](../../docs/operations/suitecrm.md#upgrade-rule).
 
 The image runs Apache, the SuiteCRM scheduler, and the Symfony Messenger worker. Startup installs an empty database once, generates OAuth signing keys, upserts the ClawPilot client-credentials record, and idempotently installs the searchable `Global ID` field used by ClawPilot. When Product-image credentials are supplied, the same boot creates or repairs the separate forward media and reverse reader principals, assigns their exact deny-by-default ACLs, upserts the reader's dedicated OAuth client, and verifies every postcondition before Apache starts. An existing persisted application is never upgraded implicitly.
 

@@ -1458,18 +1458,31 @@ function stableEvidence(value: unknown): unknown {
     : value
 }
 
-function historicalReviewProviderEvidence(raw: GmailMessage): GmailMessage {
-  const evidence = { ...raw }
-  // Reading a message can change its Gmail history cursor and UNREAD label.
-  // Neither participates in historical CRM eligibility, direction or placement.
-  // Keep the full message payload, all other label membership (including SENT),
-  // and the separate locked CRM target fingerprint in the reviewed digest.
-  delete evidence.historyId
-  if (raw.labelIds === undefined) evidence.labelIds = []
-  else if (Array.isArray(raw.labelIds) && raw.labelIds.every(label => typeof label === 'string')) {
-    evidence.labelIds = [...new Set(raw.labelIds.filter(label => label !== 'UNREAD'))].sort()
-  }
-  return evidence
+const HISTORICAL_REVIEW_POLICY_LABELS = new Set(['SENT', 'DRAFT', 'SPAM', 'TRASH'])
+
+function historicalReviewMimeEvidence(part: GmailMessagePart): GmailMessagePart {
+  // A provider may serialize unrelated header names in a different order.
+  // Preserve every value, the count and order of repeated same-name headers,
+  // and the order of MIME parts (which can change body interpretation).
+  const headers = Array.isArray(part.headers) ? part.headers.map((header) => ({
+    name: typeof header?.name === 'string' ? header.name.toLowerCase() : header?.name,
+    value: header?.value,
+  })).sort((a, b) => (a.name || '') < (b.name || '') ? -1 : (a.name || '') > (b.name || '') ? 1 : 0) : part.headers
+  const body = part.body
+  return { partId: part.partId, mimeType: part.mimeType, filename: part.filename, headers,
+    body: body && { attachmentId: body.attachmentId, size: body.size, data: body.data },
+    parts: Array.isArray(part.parts) ? part.parts.map(historicalReviewMimeEvidence) : part.parts }
+}
+
+function historicalReviewProviderEvidence(raw: GmailMessage, parsed: ParsedGmailMessage): GmailMessage {
+  // Bind exact message identity, material provider content and labels that
+  // affect historical eligibility/direction. Do not hash mailbox decoration,
+  // approximate size, history cursors, or gateway-added response properties.
+  // The separate locked CRM target fingerprint still binds the full retained
+  // evidence, verified mailbox, selected contacts, placement and audience.
+  return { id: raw.id, threadId: raw.threadId, internalDate: raw.internalDate, snippet: raw.snippet,
+    labelIds: [...new Set(parsed.labelIds.filter(label => HISTORICAL_REVIEW_POLICY_LABELS.has(label)))].sort(),
+    payload: raw.payload && historicalReviewMimeEvidence(raw.payload) }
 }
 
 async function reviewedParticipantTargets(routing: MessageRoutingInput, association: ReviewedGmailAssociation) {
@@ -1705,7 +1718,7 @@ async function reconcileReviewedGmailMessages(input: {
   const snapshots = await stageReviewedGmailInteractionsInPostgres({ messages: planned.map((plan) => plan.persistence), apply: false })
     .catch(() => { throw new SafeEmailIngestionError('Reviewed Gmail association evidence is unavailable or has changed') })
   const digest = crypto.createHash('sha256').update(JSON.stringify(stableEvidence({
-    version: firstSeen ? 3 : 4, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
+    version: firstSeen ? 3 : 5, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
     decisionKind: input.decisionKind || 'review', correctionReason: input.correctionReason || null,
     lateContactEmail: input.lateContactEmail || null,
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
@@ -1713,7 +1726,7 @@ async function reconcileReviewedGmailMessages(input: {
     selfAddresses: [...input.selfAddresses].sort(),
     messages: planned.map((plan, index) => ({ association: plan.association, raw: firstSeen
       ? { evidence: plan.persistence.messageEvidence, labelIds: plan.persistence.firstSeenLabelIds }
-      : historicalReviewProviderEvidence(plan.raw),
+      : historicalReviewProviderEvidence(plan.raw, plan.routing.message),
       targets: plan.resolved.targets.map((target) => ({ id: target.record.id,
         reference: target.record.referenceCode, email: target.matchedEmail, organization: target.record.organizationId })),
       organizationReferences: plan.resolved.organizationReferences, targetFingerprint: snapshots[index].targetFingerprint,

@@ -41,6 +41,9 @@ export async function POST(req: NextRequest) {
       { status: 409 },
     )
   }
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: true, paused: true })
+  }
   try {
     const body = await req.json().catch(() => ({})) as { limit?: unknown }
     const suiteCrmAccountContactIngestion = await processSuiteCrmAccountContactIngestion()

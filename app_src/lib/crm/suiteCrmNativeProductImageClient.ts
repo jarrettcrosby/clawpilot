@@ -619,6 +619,9 @@ export async function projectSuiteCrmNativeProductImage(
   if (record.productImage === undefined) {
     return { action: 'unchanged', mediaId: null }
   }
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    throw new Error('CRM sync is temporarily paused for maintenance')
+  }
   const configuration = suiteCrmNativeProductImageProjectionConfiguration()
   if (!configuration.enabled) {
     if (record.productImageProjectionRequired === true) {
