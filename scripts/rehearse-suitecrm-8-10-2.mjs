@@ -4,12 +4,10 @@
 import assert from 'node:assert/strict'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { once } from 'node:events'
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs'
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statfsSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createDisposablePostgresRuntime, DISPOSABLE_POSTGRES_LABEL, DISPOSABLE_POSTGRES_OWNER_LABEL } from './lib/disposable-postgres-docker.mjs'
@@ -306,16 +304,38 @@ async function testPackagedBoot() {
   checkHostDisk(root)
   const volume = coldVolume, installedApp = join(volume, 'app')
   mkdirSync(installedApp, { recursive: true })
-  // Docker's copy API does not reliably traverse the synthetic tmpfs. Stream
-  // the archive from inside the running container, without buffering it.
-  const archiveSignal = AbortSignal.timeout(120_000)
-  const pack = spawn('docker', ['exec', appId, 'tar', '-C', '/app', '-cf', '-', '.'],
-    { signal: archiveSignal, stdio: ['ignore', 'pipe', 'inherit'] })
-  const unpack = spawn('tar', ['--no-same-owner', '-xf', '-', '-C', installedApp],
-    { signal: archiveSignal, stdio: ['pipe', 'ignore', 'inherit'] })
-  const exits = await Promise.all([once(pack, 'exit'), once(unpack, 'exit'), pipeline(pack.stdout, unpack.stdin)])
-  assert.deepEqual(exits[0], [0, null], 'Synthetic volume archive must finish')
-  assert.deepEqual(exits[1], [0, null], 'Synthetic volume restore must finish')
+  // Docker's copy API does not reliably traverse the synthetic tmpfs. Use a
+  // private, seekable spool: GNU tar can close stdin after the end markers
+  // while the producer still has padding to send. Check both child statuses.
+  const spoolRoot = lstatSync(root)
+  assert.ok(spoolRoot.isDirectory() && spoolRoot.uid === process.getuid() && (spoolRoot.mode & 0o077) === 0)
+  assert.equal(readFileSync(join(root, 'owner'), 'utf8'), token)
+  const archivePath = join(root, 'cold-fixture.tar')
+  const archiveFd = openSync(archivePath, 'wx', 0o600)
+  try {
+    try {
+      execute('docker', ['exec', appId, 'tar', '-C', '/app', '-cf', '-', '.'], {
+        stdio: ['ignore', archiveFd, 'pipe'], timeout: 120_000, killSignal: 'SIGKILL',
+      })
+    } catch (cause) {
+      throw new Error('Synthetic volume archive failed', { cause })
+    } finally {
+      closeSync(archiveFd)
+    }
+    const saved = lstatSync(archivePath)
+    assert.ok(saved.isFile() && saved.uid === process.getuid() && saved.nlink === 1
+      && saved.size >= 1024 && saved.size <= 1500 * 1024 * 1024, 'Synthetic volume archive must be a bounded regular file')
+    checkHostDisk(root)
+    try {
+      execute('tar', ['--no-same-owner', '-xf', archivePath, '-C', installedApp], {
+        stdio: ['ignore', 'ignore', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL',
+      })
+    } catch (cause) {
+      throw new Error('Synthetic volume restore failed', { cause })
+    }
+  } finally {
+    unlinkSync(archivePath)
+  }
   assert.equal(readFileSync(join(installedApp, 'VERSION'), 'utf8'), '8.10.2\n')
   docker('stop', '--time', '2', appId)
   checkHostDisk(root)
