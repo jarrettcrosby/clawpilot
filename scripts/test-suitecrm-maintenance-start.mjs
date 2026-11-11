@@ -30,7 +30,7 @@ wrapper('php',`printf '%s\\n' php-startup-check >> ${quote(sentinel)}\nexit 73`)
 for(const name of ['su','cp','chown','chmod','touch','openssl','sed','supervisord'])wrapper(name,
  `printf '%s\\n' ${quote('unexpected-'+name)} >> ${quote(sentinel)}\nexit 74`)
 const children=new Set()
-const start=(env)=>{const child=spawn('/bin/bash',[entry],{cwd:root,env:{PATH:temp+':'+process.env.PATH,...env},stdio:['ignore','pipe','pipe']})
+const start=(env,args=[])=>{const child=spawn('/bin/bash',[entry,...args],{cwd:root,env:{PATH:temp+':'+process.env.PATH,...env},stdio:['ignore','pipe','pipe']})
  children.add(child);child.exit=once(child,'exit');child.exit.finally(()=>children.delete(child))
  let out='',err='';child.stdout.on('data',b=>{out+=b;if(out.length>10000)child.kill('SIGTERM')});child.stderr.on('data',b=>{err+=b;if(err.length>10000)child.kill('SIGTERM')})
  return {child,output:()=>({out,err})}}
@@ -55,6 +55,14 @@ try{
   }
   assert.equal(existsSync(sentinel),false,'no PHP or bootstrap writer may have run')
   assert.equal(running.output().out,'')
+ })
+ await check('canary arguments never release or bootstrap a nonmaintenance process',async()=>{
+  for(const args of [['--upgrade-canary'],['--upgrade-canary','--port=8080'],['--release']]){
+   const run=start({SUITECRM_VERSION:'8.10.2',CLAWPILOT_NATIVE_INITIAL_MAINTENANCE:'0'},args)
+   assert.equal((await run.child.exit)[0],1)
+   assert.match(run.output().err,/upgrade canary held/)
+  }
+  assert.equal(existsSync(sentinel),false)
  })
  await check('actual maintenance HTTP distinguishes liveness from readiness and closes every app path',async()=>{
   for(const [path,status]of [['/_clawpilot/liveness',200],['/_clawpilot/liveness?probe=1',200],['/',503],['/ready',503],['/api/health',503],['/Api/V8/custom/clawpilot-email-publish',503]]){

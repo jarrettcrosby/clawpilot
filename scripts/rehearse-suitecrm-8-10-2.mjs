@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict'
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
@@ -15,9 +15,10 @@ import { assessHeadroom, readThresholds, runStorageGuard } from './local-storage
 
 const [, , oldInput, newInput, mode, ...extra] = process.argv
 assert.ok(isAbsolute(oldInput || '') && isAbsolute(newInput || '') && !extra.length
-  && (!mode || ['--loopback-ui', '--oauth-smoke'].includes(mode)),
-  'Usage: node scripts/rehearse-suitecrm-8-10-2.mjs /absolute/8.10.1.zip /absolute/8.10.2.zip [--loopback-ui | --oauth-smoke]')
+  && (!mode || ['--loopback-ui', '--oauth-smoke', '--cold-boot', '--normal-boot'].includes(mode)),
+  'Usage: node scripts/rehearse-suitecrm-8-10-2.mjs /absolute/8.10.1.zip /absolute/8.10.2.zip [--loopback-ui | --oauth-smoke | --cold-boot | --normal-boot]')
 const uiOption = mode === '--loopback-ui', oauthSmoke = mode === '--oauth-smoke'
+const coldBoot = mode === '--cold-boot' || mode === '--normal-boot'
 const archive = (input, hash) => {
   const path = realpathSync(input), metadata = lstatSync(path)
   assert.ok(metadata.isFile() && metadata.uid === process.getuid() && metadata.size < 180_000_000 && !path.includes(','))
@@ -39,8 +40,18 @@ const dockerOptions = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], tim
 const execute = (command, args, extraOptions = {}) => execFileSync(command, args, { ...dockerOptions, ...extraOptions })
 const docker = (...args) => execute('docker', args)
 const inspect = (kind, tag) => JSON.parse(docker(kind, 'inspect', tag))[0]
-const appImage = inspect('image', 'clawpilot-suitecrm-native-acceptance:8.10.1-php83-8.3.36')
 const dbImage = inspect('image', 'mariadb:11.4.13')
+const candidateImage = coldBoot ? inspect('image', 'clawpilot-suitecrm:upgrade-8.10.2-local') : null
+// Native Linux CI can use the packaged PHP runtime for both steps; the old
+// application still comes solely from the separately pinned 8.10.1 archive.
+const appImage = candidateImage && process.platform === 'linux'
+  ? candidateImage : inspect('image', 'clawpilot-suitecrm-native-acceptance:8.10.1-php83-8.3.36')
+if (candidateImage) {
+  assert.equal(candidateImage.Architecture, 'amd64')
+  assert.ok(candidateImage.Config.Env.includes('SUITECRM_VERSION=8.10.2'))
+  assert.deepEqual(candidateImage.Config.Entrypoint, ['/usr/local/bin/entrypoint.sh'])
+  assert.deepEqual(Object.keys(candidateImage.Config.Volumes || {}), [])
+}
 assert.ok(appImage.Config.Env.includes('PHP_VERSION=8.3.36'))
 assert.deepEqual(Object.keys(appImage.Config.Volumes || {}), [])
 assert.deepEqual(Object.keys(dbImage.Config.Volumes || {}), ['/var/lib/mysql'])
@@ -50,6 +61,7 @@ const db = stem + '-db', app = stem + '-app', network = stem + '-net'
 const ownerLabel = 'com.clawpilot.suitecrm-upgrade-rehearsal.owner'
 const lease = createDisposablePostgresRuntime({ environment: localEnvironment })
 const fixtureRoot = join(root, 'fixture')
+const coldVolume = join(root, 'persisted')
 mkdirSync(fixtureRoot, { mode: 0o755 })
 const writeFixture = (name, source) => writeFileSync(join(fixtureRoot, name), source, { flag: 'wx', mode: 0o644 })
 writeFileSync(join(root, 'owner'), token, { flag: 'wx', mode: 0o600 })
@@ -174,6 +186,7 @@ if [ "$FIXTURE_LOOPBACK_UI" = 1 ]; then
   touch /tmp/ui-ready
   exec php -d display_errors=0 -S 127.0.0.1:8099 -t /app/public /fixture/router.php
 fi
+if [ "$FIXTURE_COLD_BOOT" = 1 ]; then exec sleep 420; fi
 `
 // Mirrors public/.htaccess's front-controller fallback in the PHP CLI server.
 // The local relay cannot select a destination other than this exact listener.
@@ -222,7 +235,7 @@ if (oauthSmoke) {
   }
 }
 
-let admitted = false, networkId = null, appId = null, ready = false, stopped = false
+let admitted = false, networkId = null, appId = null, bootId = null, ready = false, stopped = false
 const connections = new Set()
 const server = createServer(socket => {
   if (!ready || connections.size >= 16) return socket.destroy()
@@ -244,9 +257,9 @@ function cleanup() {
   if (server.listening) server.close()
   const failures = []
   const attempt = action => { try { action() } catch (error) { failures.push(error) } }
-  if (appId) attempt(() => {
+  for (const containerId of [bootId, appId].filter(Boolean)) attempt(() => {
     let metadata
-    try { metadata = inspect('container', appId) } catch (error) {
+    try { metadata = inspect('container', containerId) } catch (error) {
       if (/No such (?:object|container)/i.test(String(error.stderr))) return
       throw error
     }
@@ -263,6 +276,14 @@ function cleanup() {
   attempt(() => {
     assert.equal(readFileSync(join(root, 'owner'), 'utf8'), token)
     assert.match(root, /\/clawpilot-suitecrm-upgrade-rehearsal\.[A-Za-z0-9]+$/)
+    if (coldBoot && process.platform === 'linux' && existsSync(coldVolume)) {
+      assert.equal(realpathSync(coldVolume), coldVolume)
+      // On native Linux the exact startup sets UID 33 on the bind mount.
+      // Restore ownership only on the isolated fixture after all writers exit.
+      docker('run', '--rm', '--pull=never', '--network', 'none', '--memory', '128m', '--memory-swap', '128m',
+        '--pids-limit', '32', '--cpus', '0.5', '--mount', `type=bind,source=${coldVolume},target=/cold-fixture`,
+        '--entrypoint', '/bin/chown', candidateImage.Id, '-R', `${process.getuid()}:${process.getgid()}`, '/cold-fixture')
+    }
     rmSync(root, { recursive: true })
   })
   if (failures.length) throw new AggregateError(failures, 'Disposable rehearsal cleanup incomplete')
@@ -278,6 +299,86 @@ const expectPrivate = metadata => {
   assert.deepEqual(Object.keys(metadata.HostConfig.PortBindings || {}), [])
   assert.deepEqual(Object.keys(metadata.NetworkSettings.Networks), [network])
   assert.ok(metadata.Mounts.every(mount => mount.Type !== 'volume'))
+}
+async function testPackagedBoot() {
+  checkHostDisk(root)
+  const volume = coldVolume, installedApp = join(volume, 'app')
+  mkdirSync(installedApp, { recursive: true })
+  execute('docker', ['cp', `${app}:/app/.`, installedApp], { timeout: 120_000 })
+  assert.equal(readFileSync(join(installedApp, 'VERSION'), 'utf8'), '8.10.2\n')
+  docker('stop', '--time', '2', appId)
+  checkHostDisk(root)
+  writeFileSync(join(volume, '.installed-8.10.2'), '', { flag: 'wx' })
+  const syntheticEnv = {
+    SUITECRM_DB_HOST: 'db', SUITECRM_DB_PORT: '3306', SUITECRM_DB_NAME: 'suitecrm_upgrade_fixture',
+    SUITECRM_DB_USER: 'fixture', SUITECRM_DB_PASSWORD: 'Synthetic-native-db-password-only',
+    SUITECRM_PUBLIC_URL: 'https://suitecrm-upgrade.invalid', SUITECRM_ADMIN_USER: 'fixture-admin',
+    SUITECRM_ADMIN_PASSWORD: 'Synthetic-native-admin-password-only',
+    SUITECRM_CLIENT_ID: 'd4358189-2122-4843-8117-7bf63278b64f', SUITECRM_CLIENT_SECRET: 'Synthetic-cold-boot-oauth-secret-only',
+    CLAWPILOT_SHARED_BPO_EMAIL_ENABLED: '1', CLAWPILOT_SHARED_BPO_EMAIL_TEMPLATES: '0',
+    CLAWPILOT_NATIVE_RECORD_LIFECYCLE_ENABLED: '1', PORT: '8080',
+  }
+  const startBoot = mode => {
+    bootId = docker('create', '--pull=never', '--name', stem + '-' + mode, '--network', network,
+      ...limits('2g', '1.75').filter(arg => arg !== '--read-only'),
+      ...['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID', 'KILL', 'SYS_CHROOT'].flatMap(cap => ['--cap-add', cap]),
+      '--mount', `type=bind,source=${volume},target=/var/lib/suitecrm`,
+      ...Object.entries(syntheticEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+      '--env', `CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=${mode === 'maintenance' ? '1' : '0'}`,
+      '--entrypoint', '/bin/bash', candidateImage.Id, '-ec',
+      'chown -R www-data:www-data /var/lib/suitecrm/app; exec /usr/local/bin/entrypoint.sh').trim()
+    expectPrivate(inspect('container', bootId))
+    docker('start', bootId)
+  }
+  const http = (port, path, ...args) => docker('exec', bootId, 'curl', '--noproxy', '*', '--max-time', '5', '-sS',
+    '-H', 'Host: suitecrm.railway.internal', ...args, `http://127.0.0.1:${port}${path}`)
+  const status = (port, path, ...args) => http(port, path, '-o', '/dev/null', '-w', '%{http_code}', ...args)
+  const waitMode = async (port, mode) => {
+    const limit = Date.now() + 220_000
+    for (;;) {
+      checkHostDisk(root)
+      if (!inspect('container', bootId).State.Running || Date.now() > limit) {
+        throw new Error(`Candidate ${mode} did not become ready:\n${docker('logs', '--tail', '45', bootId)}`)
+      }
+      try { if (JSON.parse(http(port, '/_clawpilot/liveness')).mode === mode) return } catch { /* still starting */ }
+      await delay(3000)
+    }
+  }
+  const verifyApache = port => {
+    assert.equal(status(port, '/'), '200', 'Packaged Apache must serve the installed SuiteCRM login')
+    docker('exec', bootId, 'sh', '-ec', 'test "$(cat /var/lib/suitecrm/app/VERSION)" = 8.10.2; grep -q "ClawPilot shared Email worker route" /var/lib/suitecrm/app/public/legacy/custom/application/Ext/Api/V8/Config/routes.php')
+    assert.equal(status(port, '/Api/V8/custom/clawpilot-email-shared', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '{}'),
+      '401', 'Installed Email route must reject anonymous writes')
+  }
+  if (mode === '--cold-boot') {
+    startBoot('maintenance')
+    await waitMode(8080, 'maintenance')
+    const canary = spawn('docker', ['exec', bootId, '/usr/local/bin/entrypoint.sh', '--upgrade-canary'], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let canaryOutput = '', canaryExit = false
+    canary.on('exit', () => { canaryExit = true })
+    for (const stream of [canary.stdout, canary.stderr]) stream.on('data', chunk => { canaryOutput = (canaryOutput + chunk.toString()).slice(-6000) })
+    const canaryDeadline = Date.now() + 220_000
+    for (;;) {
+      checkHostDisk(root)
+      if (canaryExit || Date.now() > canaryDeadline) throw new Error(`Packaged loopback canary did not become ready:\n${canaryOutput}`)
+      try { if (JSON.parse(http(18080, '/_clawpilot/liveness')).mode === 'normal') break } catch { /* still starting */ }
+      await delay(3000)
+    }
+    assert.equal(status(8080, '/'), '503', 'The main service port must stay fenced during the canary')
+    const ip = inspect('container', bootId).NetworkSettings.Networks[network].IPAddress
+    assert.match(ip, /^\d+\.\d+\.\d+\.\d+$/)
+    assert.throws(() => docker('exec', bootId, 'curl', '--noproxy', '*', '--max-time', '2', '-fsS', `http://${ip}:18080/_clawpilot/liveness`),
+      error => error.status === 7 || error.status === 28, 'Canary listener must not accept private-network ingress')
+    verifyApache(18080)
+    console.log('PASS packaged canary served login on loopback only; public port stayed fenced; anonymous Email write rejected')
+    assert.equal(inspect('container', bootId).Config.Labels[ownerLabel], token)
+    docker('rm', '--force', '--volumes', bootId)
+    bootId = null
+  }
+  startBoot('normal')
+  await waitMode(8080, 'normal')
+  verifyApache(8080)
+  console.log('PASS packaged amd64 cold boot reopened the upgraded volume with managed Apache routes')
 }
 try {
   let origin = 'http://suitecrm-upgrade.invalid'
@@ -318,6 +419,7 @@ try {
     '--mount', `type=bind,source=${newArchive},target=/upgrade/SuiteCRM-8.10.2.zip,readonly`,
     '--env', `FIXTURE_ORIGIN=${origin}`, '--env', `FIXTURE_LOOPBACK_UI=${uiOption ? '1' : '0'}`,
     '--env', `CLAWPILOT_UPGRADE_OAUTH_FIXTURE=${oauthSmoke ? '1' : '0'}`,
+    '--env', `FIXTURE_COLD_BOOT=${coldBoot ? '1' : '0'}`,
     '--entrypoint', '/bin/sh', appImage.Id, '/fixture/bootstrap.sh').trim()
   docker('start', appId)
   expectPrivate(inspect('container', appId))
@@ -335,6 +437,7 @@ try {
     if (!metadata.State.Running || Date.now() > appDeadline) throw new Error(`Rehearsal did not finish (status=${metadata.State.Status}, code=${metadata.State.ExitCode}):\n${output.slice(-10_000)}`)
     await delay(3_000)
   }
+  if (coldBoot) await testPackagedBoot()
   if (uiOption) {
     await delay(1_500)
     ready = true

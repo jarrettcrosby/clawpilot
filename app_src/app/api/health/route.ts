@@ -3284,12 +3284,13 @@ export async function GET(request: NextRequest) {
       errors.push('Railway database fallback must be disabled.')
     }
     const crmEnabled = process.env.CRM_ENABLED === '1'
+    const crmSyncPaused = process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1'
     if (crmEnabled) {
       try {
         suiteCrmBaseUrl()
         if (String(process.env.SUITECRM_CLIENT_ID || '').length < 16) throw new Error('SuiteCRM client ID is missing or too short.')
         if (String(process.env.SUITECRM_CLIENT_SECRET || '').length < 32) throw new Error('SuiteCRM client secret is missing or too short.')
-        crm = { status: 'configured' }
+        crm = { status: crmSyncPaused ? 'paused' : 'configured' }
       } catch (error) {
         crm = { status: 'misconfigured' }
         errors.push(error instanceof Error ? error.message : 'SuiteCRM configuration is invalid.')
@@ -9854,7 +9855,7 @@ export async function GET(request: NextRequest) {
             errors.push('Pipeline outbox worker heartbeat is missing or stale.')
           }
 
-          if (crmEnabled) {
+          if (crmEnabled && !crmSyncPaused) {
             const crmHeartbeat = await readSuiteCrmWorkerHeartbeat()
             const crmHeartbeatAt = Date.parse(String(crmHeartbeat?.checkedAt || ''))
             const crmAgeMs = Number.isFinite(crmHeartbeatAt) ? checkedAt - crmHeartbeatAt : null

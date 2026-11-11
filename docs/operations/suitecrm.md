@@ -265,13 +265,26 @@ The disposable local rehearsal is `scripts/rehearse-suitecrm-8-10-2.mjs` with
 absolute paths to both official ZIPs. Use `--loopback-ui` for a signed-in browser
 check or `--oauth-smoke` for a real OAuth write, exact retry, and both account
 histories. Neither mode uses production data or exposes a Docker port.
+`--cold-boot` exercises the packaged image's private canary and normal boot on
+the upgraded fixture; the native Linux CI job is authoritative for the process
+identity check. `--normal-boot` checks the packaged normal path independently.
 
-For production, confirm stock mode and fence both applications' CRM writes,
-including the ClawPilot outbox dispatcher and SuiteCRM's scheduler and Messenger.
-`CRM_ENABLED=0` alone does not stop the outbox processor. Drain in-flight work,
-retain the outbox, and take a coordinated app-volume and database-consistent
-MariaDB checkpoint. Record both backup IDs and verify the paired restore path.
-Separate scheduled backups are not a paired checkpoint.
+For production, confirm stock mode. On a ClawPilot release containing the
+CRM maintenance fence, set `CLAWPILOT_CRM_SYNC_MAINTENANCE=1` and confirm that
+the old App instance has exited and `/api/health` reports CRM `paused` without
+failing App readiness. This pauses both periodic CRM sync workers, manual exact
+Email Apply, and direct SuiteCRM API/media calls before they can acquire a new
+claim or session. Other ClawPilot features and the independent customer Drive
+folder queue continue. Explicit `/api/crm/actions` Google sends or calendar
+updates remain normal; those can enqueue local projections but do not contact
+SuiteCRM directly. `CRM_ENABLED=0` alone does not stop the outbox processor.
+
+Confirm in-flight SuiteCRM work is drained without resetting or retrying rows.
+Fence SuiteCRM itself with `CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=1`; verify that
+the prior instance, Apache, scheduler, Messenger, and writer DB sessions are
+gone. Retain the ClawPilot outbox and take a coordinated app-volume and
+database-consistent MariaDB checkpoint. Record both backup IDs and verify the
+paired restore path. Separate scheduled backups are not a paired checkpoint.
 
 After both commands succeed, verify the application and database version, retire
 the old installed marker and deliberately write `/var/lib/suitecrm/.installed-8.10.2`
@@ -280,7 +293,8 @@ API, and managed integrations before resuming writers. Confirm the upgraded
 database still matches the shared Email worker's reviewed template-table
 setting. A liveness response alone is not readiness. A redeploy of the old
 image does not roll back the migrated database; restore the paired checkpoint
-before starting the old image.
+before starting the old image. Clear the ClawPilot CRM maintenance flag only
+after the intended native version is healthy and the paused App is verified.
 
 ## Rollback
 
@@ -289,4 +303,4 @@ floor. See the draft [CRM shared-email rollback certification](crm-compatible-ro
 before treating an older ClawPilot application as a writable rollback target;
 that draft does not authorize a release or production recovery.
 
-Disable `CRM_ENABLED` or stop CRM writes in ClawPilot, retain the Postgres outbox, and restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.
+Keep the ClawPilot CRM maintenance fence active and retain the Postgres outbox. Restore the MariaDB and SuiteCRM volume snapshots as one checkpoint. The source workbook remains intact during import, so it is the migration fallback until reconciliation and controlled-workbook cutover are accepted.
