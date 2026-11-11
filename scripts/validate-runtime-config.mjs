@@ -309,6 +309,8 @@ function validateExactHttpsOrigin(name) {
 }
 
 function validateSuiteCrmConfiguration() {
+  const maintenance = process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE ?? ''
+  if (!['', '0', '1'].includes(maintenance)) fail('CLAWPILOT_CRM_SYNC_MAINTENANCE must be unset, 0, or 1')
   const enabled = String(process.env.CRM_ENABLED || '0')
   if (enabled !== '0' && enabled !== '1') fail('CRM_ENABLED must be 0 or 1')
   if (enabled === '0') return 'disabled'

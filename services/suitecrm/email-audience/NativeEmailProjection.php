@@ -147,10 +147,13 @@ final class ClawPilotNativeEmailProjection
 
     /** Native policy lock is for observing drift, not for granting access. */
     public static function sharedLoginPolicyState(mysqli $db, ClawPilotNativeEmailTransaction $transaction): string
+    {return self::sharedPolicyState($db,$transaction,false);}
+
+    private static function sharedPolicyState(mysqli $db, ClawPilotNativeEmailTransaction $transaction, bool $sharedWorker): string
     {
         self::connection($db,$transaction);
         return self::digest(['clawpilot-shared-login-source-v1',$transaction->policyFingerprint(),
-            ClawPilotNativeEmailRuntime::attestSharedLoginSource($db)]);
+            $sharedWorker?ClawPilotNativeEmailRuntime::attestSharedWorkerSource($db):ClawPilotNativeEmailRuntime::attestSharedLoginSource($db)]);
     }
 
     /** Stock-login worker only. The caller owns the authenticated and locked
@@ -162,7 +165,7 @@ final class ClawPilotNativeEmailProjection
         require_once __DIR__.'/SharedBpoEmailNativeAbsence.php';
         $command=self::validate($command);
         $id=$command['suiteCrmId'];$globalId=$command['attributes']['global_id_c'];
-        $policyState=self::sharedLoginPolicyState($db,$transaction);
+        $policyState=self::sharedPolicyState($db,$transaction,true);
         $before=self::snapshot($db,$transaction,$id);
         if($before['exists']){
             self::assertSharedExistingIdentity($db,$id,$globalId,$before);
@@ -170,7 +173,7 @@ final class ClawPilotNativeEmailProjection
             $links=self::links($before['raw']['emails_beans']);
             try{
                 self::assertSharedExistingProjection($db,$before,$command,$links,false);
-                self::need(hash_equals($policyState,self::sharedLoginPolicyState($db,$transaction)),'shared_login_policy_changed');
+                self::need(hash_equals($policyState,self::sharedPolicyState($db,$transaction,true)),'shared_login_policy_changed');
                 return ['snapshotFingerprint'=>$before['fingerprint'],'wrote'=>false];
             }catch(ClawPilotNativeEmailProjectionRefused $held){
                 // Not all refusal codes are a writable difference: ownership,
@@ -281,7 +284,9 @@ final class ClawPilotNativeEmailProjection
         try {
             $command=self::validate($command); self::connection($db,$transaction);
             if($sharedLogin&&!$sharedWorker)self::need($command['expectedBeforeFingerprint']===null,'shared_create_only');
-            $runtime=$sharedLogin?ClawPilotNativeEmailRuntime::attestSharedLoginSource($db):ClawPilotNativeEmailRuntime::attest($db);
+            $attestRuntime=static fn(): string => $sharedWorker?ClawPilotNativeEmailRuntime::attestSharedWorkerSource($db)
+                :($sharedLogin?ClawPilotNativeEmailRuntime::attestSharedLoginSource($db):ClawPilotNativeEmailRuntime::attest($db));
+            $runtime=$attestRuntime();
             $before=self::snapshot($db,$transaction,$command['suiteCrmId']); $id=$command['suiteCrmId']; $attributes=$command['attributes'];
             $writer=$GLOBALS['current_user'] ?? null;
             self::need($writer instanceof User && $writer->isAdmin() && is_string($writer->id) && $writer->id !== '', 'native_writer_unproven');
@@ -369,7 +374,7 @@ final class ClawPilotNativeEmailProjection
             $links=self::links($after['raw']['emails_beans']);
             self::need($links === ['accounts'=>$command['accounts'],'contacts'=>$command['contacts']], 'native_relationship_readback_mismatch');
             self::need(self::lockRelated($db,$command,$current,$sharedLogin) === $related, 'contact_or_account_changed');
-            self::need(hash_equals($runtime,$sharedLogin?ClawPilotNativeEmailRuntime::attestSharedLoginSource($db):ClawPilotNativeEmailRuntime::attest($db)), 'runtime_changed_during_save');
+            self::need(hash_equals($runtime,$attestRuntime()), 'runtime_changed_during_save');
             self::connection($db,$transaction);
             // Source attributes are attached ONLY after raw database proof.
             return ['version'=>2,'suiteCrmId'=>$id,'attributes'=>$actual,'sourceAttributes'=>$attributes,

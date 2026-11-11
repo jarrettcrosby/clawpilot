@@ -86,6 +86,9 @@ export async function POST(req:NextRequest) {
       || !apply && Object.hasOwn(body,'expectedDigest')) {
       throw new CommandError('Apply requires the digest from the reviewed publication preview')
     }
+    if(apply && process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE==='1') {
+      throw new CommandError('CRM sync is temporarily paused for maintenance',503)
+    }
     const pipeline=await resolvePipelineSpaceAccess({actorEmail:actor,pipelineId:body.pipelineId})
       .catch(()=>{throw new CommandError('Pipeline owner access is required',403)})
     if(pipeline.id!==body.pipelineId.toLowerCase() || pipeline.ownerEmail!==actor.email
