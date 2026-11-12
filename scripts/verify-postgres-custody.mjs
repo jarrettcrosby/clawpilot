@@ -42,6 +42,8 @@ const custodySql = `
       AND NOT pg_catalog.pg_has_role(runtime.oid, operator.oid, 'MEMBER')
       AND NOT pg_catalog.pg_has_role(runtime.oid, db.datdba, 'USAGE')
       AND NOT pg_catalog.has_database_privilege(db.oid, 'CREATE')
+      AND pg_catalog.current_setting('session_replication_role') = 'origin'
+      AND NOT pg_catalog.has_parameter_privilege('session_replication_role', 'SET, ALTER SYSTEM')
       AND NOT pg_catalog.has_schema_privilege('public', 'CREATE') AS restricted_login,
     ledger.relowner = operator.oid AND ledger.relkind = 'r'
       AND pg_catalog.has_table_privilege(ledger.oid, 'SELECT')

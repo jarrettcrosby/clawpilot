@@ -161,6 +161,8 @@ try {
     `REVOKE ${roles.operator} FROM ${roles.runtime}`, 'postgres_custody_unverified', admin)
   await rejectAndRestore(`ALTER ROLE ${roles.runtime} SUPERUSER`,
     `ALTER ROLE ${roles.runtime} NOSUPERUSER`, 'postgres_custody_unverified', admin)
+  await rejectAndRestore(`GRANT SET ON PARAMETER session_replication_role TO ${roles.runtime}`,
+    `REVOKE SET ON PARAMETER session_replication_role FROM ${roles.runtime}`, 'postgres_custody_unverified', admin)
   const filename = '0418_crm_maintenance_write_fence.sql'
   const checksum = expected.get(filename)
   const mismatch = 'postgres_custody_migration_ledger_mismatch'

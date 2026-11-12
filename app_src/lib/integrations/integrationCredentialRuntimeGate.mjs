@@ -658,6 +658,10 @@ export async function readIntegrationCredentialRuntimeAttestation(
                        AND NOT pg_catalog.has_schema_privilege(
                          runtime_role.oid, 'public'::regnamespace::oid, 'CREATE'
                        )
+                       AND pg_catalog.current_setting('session_replication_role') = 'origin'
+                       AND NOT pg_catalog.has_parameter_privilege(
+                         runtime_role.oid, 'session_replication_role', 'SET, ALTER SYSTEM'
+                       )
                        AND pg_catalog.has_table_privilege(runtime_role.oid, class_row.oid, 'SELECT')
                        AND NOT EXISTS (
                          SELECT 1

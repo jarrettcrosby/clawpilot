@@ -333,6 +333,10 @@ try {
         'ALTER ROLE fixture_runtime NOCREATEROLE',
       ],
       [
+        'GRANT SET ON PARAMETER session_replication_role TO fixture_runtime',
+        'REVOKE SET ON PARAMETER session_replication_role FROM fixture_runtime',
+      ],
+      [
         'GRANT fixture_runtime_group TO fixture_runtime WITH INHERIT FALSE',
         'REVOKE fixture_runtime_group FROM fixture_runtime',
       ],
