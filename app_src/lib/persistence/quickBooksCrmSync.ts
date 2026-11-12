@@ -47,6 +47,9 @@ export async function configureQuickBooksCrmSyncInPostgres(input: {
   productSyncEnabled: boolean
   actorEmail: string
 }) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    throw new Error('CRM sync is temporarily paused for maintenance')
+  }
   const updated = await query(
     `UPDATE organization_quickbooks_connections connection SET
        crm_pipeline_id = $2::uuid,
@@ -71,6 +74,9 @@ export async function reconcileQuickBooksCatalogToCrmInPostgres(input: {
   organizationId: string
   actorEmail?: string | null
 }) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return { configured: false, organizations: 0, contacts: 0, products: 0 }
+  }
   const configured = await configuration(input.organizationId)
   if (!configured?.pipeline_id || (!configured.customer_sync && !configured.product_sync)) {
     return { configured: false, organizations: 0, contacts: 0, products: 0 }

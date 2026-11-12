@@ -33,7 +33,7 @@ function includes(source, fragment, label) {
   assert.ok(source.includes(fragment), `${label} missing ${fragment}`)
 }
 
-function loadTypeScriptModule(path, mocks = {}) {
+function loadTypeScriptModule(path, mocks = {}, runtimeProcess = process) {
   const output = ts.transpileModule(read(path), {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
@@ -54,7 +54,7 @@ function loadTypeScriptModule(path, mocks = {}) {
     URLSearchParams,
     exports: module.exports,
     module,
-    process,
+    process: runtimeProcess,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
       return nodeRequire(specifier)
@@ -2187,6 +2187,100 @@ for (const fragment of [
   'completeQuickBooksCatalogSyncInPostgres',
   'failQuickBooksSyncJobInPostgres',
 ]) includes(worker, fragment, 'QuickBooks worker')
+
+const pausedQuickBooksProcess = { env: { CLAWPILOT_CRM_SYNC_MAINTENANCE: '1' } }
+const openQuickBooksProcess = { env: {} }
+const quickBooksMaintenanceCalls = []
+const quickBooksMaintenanceStub = name => async () => {
+  quickBooksMaintenanceCalls.push(name)
+  return name === 'import' ? 1 : {}
+}
+const quickBooksMaintenanceRouteMocks = {
+  'next/server': { NextResponse: { json: (payload, options) => ({ payload, ...options }) } },
+  '@/lib/integrations/quickBooksIntegrations': {
+    configureQuickBooksCrmSync: quickBooksMaintenanceStub('configure-crm'),
+    importQuickBooksProducts: quickBooksMaintenanceStub('import'),
+    getQuickBooksIntegrationState: quickBooksMaintenanceStub('state'),
+    queueQuickBooksCatalogSync: quickBooksMaintenanceStub('queue-catalog'),
+  },
+  '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+  '@/lib/persistence/quickBooksIntegrations': {},
+  '@/lib/requestUser': { requireRequestUser: async () => ({ email: 'owner@example.test', organizationId: 'org' }) },
+  '@/lib/tenancy': {
+    resolvePipelineSpaceAccess: async () => {
+      quickBooksMaintenanceCalls.push('pipeline')
+      return { id: 'pipe', workspaceOrganizationId: 'org' }
+    },
+    requireResourceEditor: () => undefined,
+  },
+  '@/lib/users': { effectiveAuthorizationRole: () => 'owner', effectiveUserPermissions: () => ({}) },
+}
+const quickBooksMaintenanceRequest = action => ({
+  text: async () => JSON.stringify({ action, ...(action === 'import-products' ? { itemIds: ['item'] } : {}) }),
+  cookies: { get: () => undefined },
+})
+const quickBooksPausedRoute = loadTypeScriptModule(
+  'app_src/app/api/integrations/quickbooks/route.ts', quickBooksMaintenanceRouteMocks, pausedQuickBooksProcess,
+)
+for (const action of ['configure-crm-sync', 'import-products']) {
+  const response = await quickBooksPausedRoute.PATCH(quickBooksMaintenanceRequest(action))
+  assert.equal(response.status, 503)
+  assert.equal(response.headers['Retry-After'], '60')
+  assert.match(response.payload.error, /temporarily paused/)
+}
+assert.deepEqual(quickBooksMaintenanceCalls, [], 'CRM routes must not resolve a pipeline or reach their service during maintenance')
+assert.equal((await quickBooksPausedRoute.GET()).status, 200)
+assert.equal((await quickBooksPausedRoute.PATCH(quickBooksMaintenanceRequest('refresh-catalog'))).status, 200)
+assert.deepEqual(quickBooksMaintenanceCalls.splice(0), ['state', 'queue-catalog'])
+
+const quickBooksOpenRoute = loadTypeScriptModule(
+  'app_src/app/api/integrations/quickbooks/route.ts', quickBooksMaintenanceRouteMocks, openQuickBooksProcess,
+)
+for (const action of ['configure-crm-sync', 'import-products']) {
+  assert.equal((await quickBooksOpenRoute.PATCH(quickBooksMaintenanceRequest(action))).status, 200)
+}
+assert.deepEqual(quickBooksMaintenanceCalls.splice(0), ['pipeline', 'configure-crm', 'pipeline', 'import', 'state'])
+
+const quickBooksMaintenanceWorkerMocks = {
+  '@/lib/integrations/quickBooksClient': { readQuickBooksCatalog: quickBooksMaintenanceStub('read-catalog') },
+  '@/lib/persistence/quickBooksIntegrations': {
+    queueAutomaticQuickBooksCatalogSyncsInPostgres: async () => 1,
+    claimQuickBooksSyncJobsInPostgres: async () => [{ organizationId: 'org', connectionId: 'connection', ownerEmail: 'owner@example.test' }],
+    completeQuickBooksCatalogSyncInPostgres: quickBooksMaintenanceStub('complete-catalog'),
+    failQuickBooksSyncJobInPostgres: quickBooksMaintenanceStub('fail-catalog'),
+  },
+  '@/lib/persistence/quickBooksCrmSync': {
+    reconcileQuickBooksCatalogToCrmInPostgres: async () => {
+      quickBooksMaintenanceCalls.push('reconcile-crm')
+      return { configured: true }
+    },
+  },
+}
+for (const [runtimeProcess, paused] of [[pausedQuickBooksProcess, true], [openQuickBooksProcess, false]]) {
+  const module = loadTypeScriptModule(
+    'app_src/lib/quickBooksSyncWorker.ts', quickBooksMaintenanceWorkerMocks, runtimeProcess,
+  )
+  const result = await module.processQuickBooksSyncOutbox({ workerId: 'worker' })
+  assert.equal(result.succeeded, 1)
+  assert.equal(result.crmFailed, 0)
+  assert.equal(result.crmReconciled, paused ? 0 : 1)
+  assert.deepEqual(quickBooksMaintenanceCalls.splice(0), paused
+    ? ['read-catalog', 'complete-catalog']
+    : ['read-catalog', 'complete-catalog', 'reconcile-crm'])
+}
+
+const pausedQuickBooksCrm = loadTypeScriptModule('app_src/lib/persistence/quickBooksCrmSync.ts', {
+  '@/lib/auditWriter': { recordAuditEvent: quickBooksMaintenanceStub('audit-crm') },
+  '@/lib/persistence/crm': { stageCrmRecordWithClient: quickBooksMaintenanceStub('stage-crm') },
+  '@/lib/persistence/pipeline': { syncPipelineProductDropdownCatalogInPostgres: quickBooksMaintenanceStub('project-crm') },
+  '@/lib/persistence/postgres': {
+    query: quickBooksMaintenanceStub('query-crm'),
+    withTransaction: quickBooksMaintenanceStub('transaction-crm'),
+  },
+}, pausedQuickBooksProcess)
+await assert.rejects(pausedQuickBooksCrm.configureQuickBooksCrmSyncInPostgres({ organizationId: 'org' }), /temporarily paused/)
+assert.equal((await pausedQuickBooksCrm.reconcileQuickBooksCatalogToCrmInPostgres({ organizationId: 'org' })).configured, false)
+assert.deepEqual(quickBooksMaintenanceCalls, [], 'direct reconciliation callers must not read or mutate CRM state while paused')
 
 const writeWorker = read('app_src/lib/quickBooksWriteWorker.ts')
 for (const fragment of [

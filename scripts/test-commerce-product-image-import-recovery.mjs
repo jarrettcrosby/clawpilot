@@ -52,7 +52,7 @@ function harness(options = {}) {
     module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022,
   } }).outputText
   vm.runInNewContext(output, { module, exports: module.exports, Error, Uint8Array,
-    TextDecoder, Object, String, Number, JSON, RegExp,
+    TextDecoder, Object, String, Number, JSON, RegExp, process: { env: {} },
     require: (name) => { assert.ok(name in mocks, `Unexpected dependency: ${name}`); return mocks[name] } })
   async function request(method = 'POST', body = command, headers = {}, selectedProduct = productId) {
     const req = new Request(`https://app.example.test/api/crm/products/${selectedProduct}/image-import-recovery`, {

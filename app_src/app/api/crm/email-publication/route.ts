@@ -55,6 +55,12 @@ async function boundedJson(req:NextRequest):Promise<Record<string,unknown>> {
 }
 
 export async function POST(req:NextRequest) {
+  // Preview also resolves pipeline access, which may provision CRM defaults.
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     if(!isBrowserSameOriginRequest({headers:req.headers,requestOrigin:req.nextUrl.origin,trustedOrigins:[appPublicUrl()]})) {
       throw new CommandError('Email publication requires a same-origin browser request',403)
@@ -85,9 +91,6 @@ export async function POST(req:NextRequest) {
     if(apply && (typeof body.expectedDigest!=='string' || !HASH.test(body.expectedDigest))
       || !apply && Object.hasOwn(body,'expectedDigest')) {
       throw new CommandError('Apply requires the digest from the reviewed publication preview')
-    }
-    if(apply && process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE==='1') {
-      throw new CommandError('CRM sync is temporarily paused for maintenance',503)
     }
     const pipeline=await resolvePipelineSpaceAccess({actorEmail:actor,pipelineId:body.pipelineId})
       .catch(()=>{throw new CommandError('Pipeline owner access is required',403)})

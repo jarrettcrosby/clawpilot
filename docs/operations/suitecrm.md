@@ -272,14 +272,39 @@ identity check. `--normal-boot` checks the packaged normal path independently.
 For production, confirm stock mode. On a ClawPilot release containing the
 CRM maintenance fence, set `CLAWPILOT_CRM_SYNC_MAINTENANCE=1` and confirm that
 the old App instance has exited and `/api/health` reports CRM `paused` without
-failing App readiness. This pauses both periodic CRM sync workers, manual exact
-Email Apply, and direct SuiteCRM API/media calls before they can acquire a new
-claim or session. Other ClawPilot features and the independent customer Drive
-folder queue continue. Explicit `/api/crm/actions` Google sends or calendar
-updates remain normal; those can enqueue local projections but do not contact
-SuiteCRM directly. `CRM_ENABLED=0` alone does not stop the outbox processor.
+failing App readiness. The switch rejects CRM actions that can write, including
+reads or previews that may provision defaults, CRM email recovery and
+publication, calendar and Google actions, workbook and product-image changes,
+pipeline catalog, opportunity and manual pull operations, and Fractional CRM
+writes. Those requests return a retryable 503 before route work starts. Projects
+also stops CRM card description edits after resolving the authorized card;
+ordinary project edits keep their normal path. The authorized outbox and
+integration processors report paused without starting SuiteCRM, Google Drive
+customer-folder, or other CRM queue
+work; folder completion can update CRM descriptions and projections. CRM
+read-only routes and unrelated ClawPilot features continue. Direct SuiteCRM
+API/media calls remain paused. `CRM_ENABLED=0` alone does not stop the outbox
+processor. These App ingress controls do not prove database exclusion or drain
+requests already in flight.
 
-Confirm in-flight SuiteCRM work is drained without resetting or retrying rows.
+The PostgreSQL CRM writer guard is installed open. Before starting Native
+maintenance, verify `clawpilot_crm_maintenance.coverage()` using the reviewed
+database operator identity. In a dedicated bounded transaction, activate with
+`clawpilot_crm_maintenance.transition(NULL, attempt_uuid)` and commit; it waits
+for transactions that were already admitted. Verify the exact attempt UUID
+from a fresh session and exercise denial with synthetic data in rehearsal,
+never with existing customer records in production. This is a CRM data guard,
+not a substitute for checking external workers, in-flight provider calls,
+or DDL/operator access. A timeout or uncertain commit is a hold until readback.
+Do not clear an attempt using a different UUID or based on health alone.
+The migration role owns the controls. If migration and runtime share a table
+owner or a superuser, this protects normal application DML but is not an ACL
+against that privileged identity; confirm role custody before live maintenance.
+CRM-linked membership changes, CRM short-link resolutions that record clicks,
+and CRM-related accounting projections can also be temporarily unavailable;
+ordinary project tasks, unrelated links and accounting catalog reads are not fenced.
+
+Confirm in-flight SuiteCRM and CRM workbook work is drained without resetting or retrying rows.
 Fence SuiteCRM itself with `CLAWPILOT_NATIVE_INITIAL_MAINTENANCE=1`; verify that
 the prior instance, Apache, scheduler, Messenger, and writer DB sessions are
 gone. Retain the ClawPilot outbox and take a coordinated app-volume and
@@ -288,13 +313,18 @@ paired restore path. Separate scheduled backups are not a paired checkpoint.
 
 After both commands succeed, verify the application and database version, retire
 the old installed marker and deliberately write `/var/lib/suitecrm/.installed-8.10.2`
-while still fenced. Cold boot the pinned image and test real login, the native
-API, and managed integrations before resuming writers. Confirm the upgraded
+while still fenced. The native Linux fixture verifies the maintenance responder
+cleans up exited children without changing its PID 1 identity; it does not
+authorize a hosted launcher or substitute for durable upgrade receipts. Cold
+boot the pinned image and test real login, the native API, and managed
+integrations before resuming writers. Confirm the upgraded
 database still matches the shared Email worker's reviewed template-table
 setting. A liveness response alone is not readiness. A redeploy of the old
 image does not roll back the migrated database; restore the paired checkpoint
-before starting the old image. Clear the ClawPilot CRM maintenance flag only
-after the intended native version is healthy and the paused App is verified.
+before starting the old image. After the intended Native version is healthy
+and the paused App and checkpoint are verified, clear the matching PostgreSQL
+fence with `transition(attempt_uuid, NULL)` and confirm the readback. Clear the
+ClawPilot CRM maintenance flag last.
 
 ## Rollback
 

@@ -185,6 +185,9 @@ export async function projectCrmWorkbook(input: {
   context: PipelineSheetContext
   actorEmail: string
 }) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    throw new Error('CRM workbook projection is temporarily paused for maintenance')
+  }
   const readiness = await readCrmWorkbookProjectionReadiness(input.context.pipelineId)
   if (!readiness.ready) {
     throw new Error(`CRM workbook projection is waiting for reconciliation (${readiness.unresolved} unresolved records)`)

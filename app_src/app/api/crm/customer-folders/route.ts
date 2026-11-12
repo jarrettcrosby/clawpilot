@@ -58,6 +58,11 @@ async function context(req:NextRequest,pipelineId:string,write=false) {
   return actor
 }
 export async function GET(req:NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const url=new URL(req.url),pipelineId=customerFolderUuid(url.searchParams.get('pipelineId')),
       accountId=customerFolderUuid(url.searchParams.get('accountId')),actor=await context(req,pipelineId)
@@ -66,6 +71,11 @@ export async function GET(req:NextRequest) {
   }catch(error){return errorResponse(error)}
 }
 export async function POST(req:NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     if(!isBrowserSameOriginRequest({headers:req.headers,requestOrigin:new URL(req.url).origin}))return json({ok:false,error:'Same-origin request required.'},403)
     const declared=Number(req.headers.get('content-length')||0)

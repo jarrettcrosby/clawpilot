@@ -112,6 +112,11 @@ function actorTimestamp(actor: AppUser) {
 }
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const context = await resolvePipelineContext(req)
     const { id } = await ctx.params
@@ -170,6 +175,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 }
 
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const context = await resolvePipelineContext(req)
     const { id } = await ctx.params

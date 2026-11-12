@@ -777,6 +777,11 @@ export async function PATCH(req: NextRequest) {
     || Object.prototype.hasOwnProperty.call(rawUpdates, 'desc')
   )
   if (hasCrmDescriptionUpdate) {
+    if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+      return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+        status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+      })
+    }
     if (!board) return NextResponse.json({ error: 'CRM board context is required' }, { status: 409 })
     try {
       const updated = await updateCrmBoardTaskDescription({

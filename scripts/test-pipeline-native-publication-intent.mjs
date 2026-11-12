@@ -25,11 +25,12 @@ const input = { pipelineId, sheetId, aggregateType: 'pipeline_crm_workbook', agg
   payload: { waitForCrmReadiness: true }, actor: 'system' }
 const copy = value => JSON.parse(JSON.stringify(value))
 
-function harness() {
+function harness(maintenance = false) {
   let durable = { rows: [], audits: [] }, transactions = 0
-  const observed = []
+  const observed = [], parameters = []
   const clientFor = state => ({ async query(sql, params = []) {
     observed.push(sql)
+    parameters.push(copy(params))
     if (sql.includes('FROM pipeline_spaces')) return { rows: params[0] === pipelineId && params[1] === sheetId ? [{ id: pipelineId }] : [] }
     if (sql.includes('SELECT id::text, status') && sql.includes('FROM sync_outbox')) {
       return { rows: state.rows.filter(row => row.key === params[0]) }
@@ -49,9 +50,10 @@ function harness() {
     return result
   }
   const runtime = { exports: {}, crypto, withTransaction: transaction,
+    process: { env: { CLAWPILOT_CRM_SYNC_MAINTENANCE: maintenance ? '1' : '0' } },
     UUID_PATTERN: /^[0-9a-f-]{36}$/, SHEET_ID_PATTERN: /^[A-Za-z0-9_-]{1,256}$/ }
   vm.runInNewContext(compiled, runtime)
-  return { api: runtime.exports, transaction, observed, state: () => durable, count: () => transactions }
+  return { api: runtime.exports, transaction, observed, parameters, state: () => durable, count: () => transactions }
 }
 
 test('native caller enqueues the real Sheets intent in its own transaction and rollback retains no partial intent', async () => {
@@ -92,4 +94,23 @@ test('claim SQL preserves initial gating and requires imported or verified manag
     assert.match(sql, new RegExp(`pipeline\\.${field} IS NOT NULL`))
   }
   assert.match(sql, /THEN 'succeeded' ELSE 'not_imported' END\) = 'succeeded'/)
+})
+
+test('CRM maintenance defers lease recovery and new claims only for CRM-coupled pipeline operations', async () => {
+  const deferred = [
+    'project_crm_workbook', 'append_interaction', 'update_opportunity',
+    'sync_pipeline_owner_profile_v1', 'provision_pipeline',
+    'reconcile_pipeline_hierarchy_v2', 'reconcile_pipeline_hierarchy_v3', 'reconcile_pipeline_hierarchy_v4',
+    'reconcile_pipeline_hierarchy_v5', 'reconcile_pipeline_hierarchy_v6',
+  ]
+  for (const maintenance of [true, false]) {
+    const h = harness(maintenance)
+    await h.api.claimPipelineSyncOutboxInPostgres()
+    const expired = h.observed.findIndex(value => value.includes('worker lease expired'))
+    const candidates = h.observed.findIndex(value => value.includes('WITH candidates AS'))
+    assert.match(h.observed[expired], /operation <> ALL\(\$3::text\[\]\)/)
+    assert.match(h.observed[candidates], /candidate\.operation <> ALL\(\$4::text\[\]\)/)
+    assert.deepEqual(h.parameters[expired][2], maintenance ? deferred : [])
+    assert.deepEqual(h.parameters[candidates][3], maintenance ? deferred : [])
+  }
 })

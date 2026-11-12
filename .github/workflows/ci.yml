@@ -58,6 +58,13 @@ jobs:
         run: |
           docker pull "$CLAWPILOT_TEST_POSTGRES_IMAGE"
           docker image inspect "$CLAWPILOT_TEST_POSTGRES_IMAGE" --format '{{json .RepoDigests}}'
+      - name: CRM maintenance transaction and writer isolation
+        env:
+          CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
+          CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: 256m
+          CLAWPILOT_TEST_POSTGRES_CPUS: '1'
+          CRM_FIXTURE_POSTGRES: ${{ matrix.postgres }}
+        run: node scripts/test-crm-maintenance-write-fence-postgres.mjs "--postgres-major=$CRM_FIXTURE_POSTGRES"
       - name: Full production rebind history and schema attestation
         run: node scripts/test-production-rebind-history-schema-attestation.mjs
 
@@ -116,6 +123,9 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: CRM maintenance ingress and unrelated pipeline queue isolation
+        run: node --test scripts/test-crm-sync-maintenance.mjs scripts/test-pipeline-native-publication-intent.mjs scripts/test-pipeline-workbook-bootstrap-safety.mjs
 
       - name: Build
         run: npm run build
