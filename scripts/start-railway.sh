@@ -109,6 +109,15 @@ case "${INTEGRATION_CREDENTIAL_ATTESTATION_MODE:-strict}" in
 esac
 node scripts/validate-runtime-config.mjs
 
+case "${CLAWPILOT_POSTGRES_CUSTODY:-}" in
+  '')
+    [[ -z "${CLAWPILOT_POSTGRES_RUNTIME_ROLE:-}${CLAWPILOT_POSTGRES_OPERATOR_ROLE:-}" ]] \
+      || fail 'PostgreSQL custody roles require split-v1'
+    ;;
+  split-v1) node scripts/verify-postgres-custody.mjs || fail 'split PostgreSQL custody was not verified' ;;
+  *) fail 'unknown PostgreSQL custody mode' ;;
+esac
+
 # This proof is inherited only by this application process. The verifier reads
 # and decrypts the immutable database sentinel after migrations have run. In
 # the explicit adoption mode an absent sentinel may boot the deployment, but

@@ -59,14 +59,16 @@ export async function POST(req: NextRequest) {
     }
 
     const actor = await requireWorkspaceAppUser(result.email, result.organizationId)
-    const resources = await ensureDefaultResourcesForUser(actor)
-    await syncAppUserProfileToOwnedPipelines(result.email).catch((error) => {
-      console.error('[auth] CRM profile projection deferred', error instanceof Error ? error.message : 'unknown error')
-    })
-    if (resources.pipelineProvisioningRequired) {
-      await queuePipelineProvisioning({ actorEmail: actor.email, pipelineId: resources.pipelineId }).catch((error) => {
-        console.error('[auth] Personal pipeline Sheet provisioning deferred', error instanceof Error ? error.message : 'unknown error')
+    if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE !== '1') {
+      const resources = await ensureDefaultResourcesForUser(actor)
+      await syncAppUserProfileToOwnedPipelines(result.email).catch((error) => {
+        console.error('[auth] CRM profile projection deferred', error instanceof Error ? error.message : 'unknown error')
       })
+      if (resources.pipelineProvisioningRequired) {
+        await queuePipelineProvisioning({ actorEmail: actor.email, pipelineId: resources.pipelineId }).catch((error) => {
+          console.error('[auth] Personal pipeline Sheet provisioning deferred', error instanceof Error ? error.message : 'unknown error')
+        })
+      }
     }
 
     const issued = await createBrowserSession({

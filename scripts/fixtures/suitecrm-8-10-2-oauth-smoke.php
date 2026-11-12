@@ -203,7 +203,9 @@ try {
             'global_id_c'=>$global,'name'=>$subject,'date_sent_received'=>'2026-11-09T13:00:00Z','type'=>'archived','status'=>'read',
             'parent_type'=>'Accounts','parent_id'=>$seed['accounts'][0],'assigned_user_id'=>$admin->id,
             'description'=>'Synthetic isolated shared-email smoke.', 'description_html'=>'',
-            'from_addr_name'=>'Fixture Sender <sender@example.test>', 'to_addrs_names'=>'Recipient <recipient@example.test>',
+            'from_addr_name'=>'Fixture Sender <sender@example.test>',
+            'to_addrs_names'=>'recipient@example.test <recipient@example.test>, second@example.test <second@example.test>',
+            'cc_addrs_names'=>'copy@example.test <copy@example.test>, Distinct Copy <other@example.test>',
         ], 'accounts'=>$seed['accounts'], 'contacts'=>$seed['contacts'], 'contactAccounts'=>$bindings,
             'previousManaged'=>['accounts'=>[],'contacts'=>[]], 'expectedBeforeFingerprint'=>null]);
         $wire = json_encode(['version'=>1,'workspaceId'=>'c6c49765-9bf6-4223-9261-7553499f5d92',
@@ -222,6 +224,10 @@ try {
         need(rows("SELECT id_c FROM emails_cstm WHERE global_id_c='$global'") === [['id_c'=>$id]]
             && rows("SELECT id,parent_id FROM emails WHERE name='$subject' AND deleted=0") === [['id'=>$id,'parent_id'=>$seed['accounts'][0]]],
             'OAuth replay did not preserve exactly one native email and its primary account');
+        need(rows("SELECT to_addrs,cc_addrs FROM emails_text WHERE email_id='$id' AND deleted=0")
+            === [['to_addrs'=>'recipient@example.test, second@example.test',
+                'cc_addrs'=>'copy@example.test, Distinct Copy <other@example.test>']],
+            'Stock shared Email must preserve recipients and distinct display labels on both To and Cc');
         $links = [];
         foreach (['Accounts'=>'accounts','Contacts'=>'contacts'] as $module=>$list) {
             foreach ($projection[$list] as $related) $links[] = ['bean_module'=>$module,'bean_id'=>$related];

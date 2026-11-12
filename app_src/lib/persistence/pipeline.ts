@@ -1800,6 +1800,16 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 5), 20))
   const leaseSeconds = Math.max(30, Math.min(Math.trunc(Number(input.leaseSeconds) || 300), 3600))
   const lockToken = crypto.randomUUID()
+  // These operations call CRM persistence or project CRM records to Sheets.
+  // Leave both queued rows and old CRM leases untouched during maintenance;
+  // permission, branding, notifications and ordinary pipeline work still run.
+  const deferredCrmOperations = process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1' ? [
+    'project_crm_workbook', 'append_interaction', 'update_opportunity',
+    'sync_pipeline_owner_profile_v1', 'provision_pipeline',
+    'reconcile_pipeline_hierarchy_v2', 'reconcile_pipeline_hierarchy_v3',
+    'reconcile_pipeline_hierarchy_v4', 'reconcile_pipeline_hierarchy_v5',
+    'reconcile_pipeline_hierarchy_v6',
+  ] : []
 
   return withTransaction(async (client) => {
     await client.query(
@@ -1814,13 +1824,14 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
             updated_at = now()
         WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
           AND aggregate_type LIKE 'pipeline%'
+          AND operation <> ALL($3::text[])
           AND status = 'processing'
           AND (
             locked_at IS NULL
             OR locked_at < now() - ($2::text || ' seconds')::interval
           )
       `,
-      [maxAttempts, leaseSeconds],
+      [maxAttempts, leaseSeconds, deferredCrmOperations],
     )
 
     const result = await client.query<OutboxClaimRow>(
@@ -1830,6 +1841,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
           FROM sync_outbox candidate
           WHERE target_system IN ('google_sheets', 'google_workspace', 'google_workspace_v2', 'google_workspace_v3', 'google_workspace_v4', 'google_workspace_v5', 'google_workspace_v6', 'pipeline_internal_v1')
             AND aggregate_type LIKE 'pipeline%'
+            AND candidate.operation <> ALL($4::text[])
             AND status IN ('queued', 'failed')
             AND attempts < $2
             AND available_at <= now()
@@ -1887,7 +1899,7 @@ export async function claimPipelineSyncOutboxInPostgres(input: {
           outbox.attempts,
           outbox.lock_token
       `,
-      [limit, maxAttempts, lockToken],
+      [limit, maxAttempts, lockToken, deferredCrmOperations],
     )
 
     return result.rows.map((row) => ({

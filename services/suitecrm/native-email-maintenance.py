@@ -103,6 +103,32 @@ class MaintenanceServer(ThreadingHTTPServer):
         # Disconnects and malformed clients must not log addresses/tracebacks.
         return
 
+    def service_actions(self):
+        # The maintenance start command may leave an already-authorized
+        # launcher as a child of this PID 1. Reap its exit (and any orphan
+        # adopted by PID 1) without blocking the HTTP loop or spawning work.
+        # Outside the container init role, the owning parent must wait.
+        if os.getpid() != 1:
+            return
+        for _ in range(32):
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except InterruptedError:
+                continue
+            if pid == 0:
+                return
+            # This exit observation is diagnostic, not a release receipt.
+            try:
+                print(json.dumps({"service": "suitecrm", "mode": "maintenance",
+                                  "event": "child_reaped", "pid": pid,
+                                  "exitCode": os.waitstatus_to_exitcode(status)},
+                                 separators=(",", ":")), file=sys.stderr, flush=True)
+            except OSError:
+                # Loss of the diagnostic stream must not clear maintenance.
+                pass
+
 
 def main():
     if len(sys.argv) != 1:

@@ -40,6 +40,11 @@ export async function GET(req:NextRequest){
   catch(error){return errorResponse(error)}
 }
 export async function POST(req:NextRequest){
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try{
     if(!isBrowserSameOriginRequest({headers:req.headers,requestOrigin:req.nextUrl.origin}))return json({ok:false,error:'Same-origin request required.'},403)
     const actor=await context(req),body=await boundedBody(req)

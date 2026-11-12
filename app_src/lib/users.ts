@@ -707,7 +707,8 @@ export async function ensureOwnerUser(): Promise<AppUser> {
 
 export async function getAppUser(emailValue: unknown): Promise<AppUser | null> {
   const email = normalizeUserEmail(emailValue)
-  await ensureOwnerUser()
+  // Existing-user authorization is a lookup, not owner/CRM provisioning.
+  // Only the explicitly authenticated operator bootstrap may repair the owner.
   const result = await query<AppUserRow>('SELECT * FROM app_users WHERE email = $1', [email])
   return result.rows[0] ? toAppUser(result.rows[0]) : null
 }

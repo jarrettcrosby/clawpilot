@@ -110,6 +110,12 @@ export async function PATCH(req: NextRequest) {
     const organization = organizationId(actor)
     const body = await requestBody(req)
     const action = String(body.action || '').trim()
+    if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1'
+      && (action === 'configure-crm-sync' || action === 'import-products')) {
+      return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+        status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+      })
+    }
     if (action === 'bind-selected-connection') {
       only(body, ['action'])
       return json({ ok: true, integration: await bindSelectedQuickBooksConnection({ organizationId: organization, actorEmail: actor.email }) })

@@ -18,13 +18,17 @@ function authorized(req: NextRequest) {
 export async function POST(req: NextRequest) {
   if (!authorized(req)) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
   if (!isPostgresStorageEnabled()) return NextResponse.json({ ok: false, error: 'CRM outbox requires Postgres storage' }, { status: 409 })
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    // Neither queue may claim/settle jobs during maintenance. Folder
+    // completion can update CRM descriptions, projections and outbox rows.
+    return NextResponse.json({
+      ok: true, paused: true, claimed: 0, succeeded: 0, failed: 0, dead: 0, held: 0,
+      nativeResolutionHeld: false, projectionsQueued: 0, items: [],
+      customerFolders: { claimed: 0, ready: 0, queued: 0, held: 0, leaseLost: 0 },
+    })
+  }
   const body = await req.json().catch(() => ({})) as { limit?: number }
-  // Stop before resume/claim, so a provider outage cannot consume retry budget.
-  // Drive folder work is independent and continues through this shared route.
-  const result = process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1'
-    ? { paused: true, claimed: 0, succeeded: 0, failed: 0, dead: 0, held: 0,
-      nativeResolutionHeld: false, projectionsQueued: 0, items: [] }
-    : await processSuiteCrmOutbox({ limit: body.limit })
+  const result = await processSuiteCrmOutbox({ limit: body.limit })
   const customerFolders = await processCustomerFolderJobs({ limit: 1 })
   return NextResponse.json({ ok: true, ...result, customerFolders })
 }

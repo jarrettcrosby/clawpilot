@@ -37,7 +37,7 @@ const snapshot = {
   counts: { organizations: 1, contacts: 1, opportunities: 2, interactions: 1 },
 }
 
-function loadProjection({ actual = [], priorProjection = false, importStatus = null, legacy = false, ready = true } = {}) {
+function loadProjection({ actual = [], priorProjection = false, importStatus = null, legacy = false, ready = true, maintenance = false } = {}) {
   const events = []
   const runtime = { serviceAccountEmail: 'managed@example.test' }
   const record = (kind, detail) => events.push({ kind, detail: plain(detail) })
@@ -111,6 +111,7 @@ function loadProjection({ actual = [], priorProjection = false, importStatus = n
   }
   vm.runInNewContext(output, {
     module, exports: module.exports, console,
+    process: { env: { CLAWPILOT_CRM_SYNC_MAINTENANCE: maintenance ? '1' : '0' } },
     require(specifier) {
       if (Object.hasOwn(dependencies, specifier)) return dependencies[specifier]
       throw new Error(`Unexpected bootstrap safety test import: ${specifier}`)
@@ -131,6 +132,11 @@ const assertPopulated = (events, mode) => {
   assert.deepEqual(payload.values, expectedRows)
   assert.equal(events.find(({ kind }) => kind === 'finish-run').detail.status, 'succeeded')
 }
+
+// Direct projection calls must not touch Sheets or the database while CRM is paused.
+const paused = loadProjection({ maintenance: true })
+await assert.rejects(paused.projection.projectCrmWorkbook({ context, actorEmail }), /temporarily paused/)
+assert.deepEqual(paused.events, [])
 
 // The actual projection entry point must reject user changes before beginning
 // a sync run, changing formatting, clearing rows, or recording a sync timestamp.

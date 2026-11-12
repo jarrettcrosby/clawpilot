@@ -115,6 +115,12 @@ function parseReviewedAssociations(value: unknown, messageIds: string[]): Review
 }
 
 export async function POST(req: NextRequest) {
+  // Preview also resolves pipeline access, which may provision CRM defaults.
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     if (!isBrowserSameOriginRequest({ headers: req.headers,
       requestOrigin: req.nextUrl.origin, trustedOrigins: [appPublicUrl()] })) {

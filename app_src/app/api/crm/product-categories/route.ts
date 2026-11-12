@@ -24,6 +24,11 @@ function errorResponse(error: unknown) {
 }
 
 export async function GET(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   if (!isPostgresStorageEnabled()) {
     return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   }
@@ -38,6 +43,11 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   if (!isPostgresStorageEnabled()) {
     return NextResponse.json({ ok: false, error: 'CRM requires Postgres storage' }, { status: 409 })
   }
