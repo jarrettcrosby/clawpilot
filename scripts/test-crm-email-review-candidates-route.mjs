@@ -40,7 +40,8 @@ function harness(options = {}) {
     } },
   }
   vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
-    { module, exports: module.exports, URL, require: name => { assert.ok(name in mocks, name); return mocks[name] } })
+    { module, exports: module.exports, URL, process: { env: options.env ?? {} },
+      require: name => { assert.ok(name in mocks, name); return mocks[name] } })
   return { queries, firstSeenCalls, async request(params = {}, extra = '', headers = { origin: 'https://app.example.invalid' }) {
     const nextUrl = new URL('https://app.example.invalid/api/crm/email-review-candidates?' + new URLSearchParams({ pipelineId, connectionId: 'selected-mailbox', ...params }) + extra)
     return module.exports.GET({ nextUrl, headers: new Headers(headers) })
@@ -48,6 +49,14 @@ function harness(options = {}) {
 }
 let checks = 0
 async function check(label, run) { await run(); checks++; console.log('PASS ' + label) }
+await check('maintenance returns retryable 503 before querying cached candidates or Gmail', async () => {
+  const h = harness({ env: { CLAWPILOT_CRM_SYNC_MAINTENANCE: '1' } })
+  const response = await h.request()
+  assert.equal(response.status, 503)
+  assert.equal(response.headers['Retry-After'], '60')
+  assert.deepEqual(h.queries, [])
+  assert.deepEqual(h.firstSeenCalls, [])
+})
 await check('owner-only bounded candidate metadata uses actual headers, verified mailbox and active source membership', async () => {
   const h = harness(), response = await h.request({ participantEmail: 'actual@example.test', messageIds: '19abcdef01234567' })
   assert.equal(response.status, 200); assert.equal(response.headers['Cache-Control'], 'private, no-store, max-age=0')

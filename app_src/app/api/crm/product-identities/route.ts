@@ -158,6 +158,11 @@ async function context(req: NextRequest) {
 }
 
 export async function GET(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const { pipeline } = await context(req)
     const resolveGlobalId = req.nextUrl.searchParams.get('resolve')
@@ -209,6 +214,11 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const { actor, pipeline } = await context(req)
     const body = await req.json() as Record<string, unknown>

@@ -3,19 +3,14 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "POS accounting controls and daily alert hardening",
-      "summary": "Expand QuickBooks product setup, preserve Toast accounting mappings, and send at most one combined posting-failure email per eligible recipient, POS location, and business date.",
+      "title": "Fractional staff contact integration",
+      "summary": "Let authorized Fractional administrators find staff contacts from their organization in CRM.",
       "features": [
-        "QuickBooks product and service drafts expose the supported accounting, tax, inventory, purchasing, sales, and classification fields",
-        "Toast-to-QuickBooks mappings remain bound to their exact source and QuickBooks company instead of being forgotten between reviews",
-        "Sales Receipt and Journal Entry posting failures for one POS location and business date are combined into one actionable email"
+        "Fractional can search existing organization contacts when preparing a staff invitation.",
+        "After a staff member accepts their invitation, Fractional can link their verified email to an existing contact or create a contact under the organization."
       ],
       "fixes": [
-        "Repeated checks, changed blockers, and same-day recurrence cannot create a second email slot for the same eligible recipient and POS location",
-        "Resolved, externally posted, cancelled, or unauthorized deliveries are suppressed immediately before send",
-        "Provider failures and ambiguous send outcomes are terminal and are not retried",
-        "Posting state changes and notification delivery are serialized so stale failures cannot be emailed after recovery",
-        "Runtime health requires the daily alert delivery-fence migration"
+        "An existing contact stays with its current company when an email matches outside the organization contact list."
       ]
     }
   }

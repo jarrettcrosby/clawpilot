@@ -3,6 +3,23 @@
 import assert from 'node:assert/strict'
 import {constants,createHash,generateKeyPairSync,randomUUID,sign,verify} from 'node:crypto'
 
+export async function readVerifiedRootCrmControlGuards(client){
+ const {rows}=await client.query(`SELECT t.tgname,t.tgenabled,t.tgtype::integer AS tgtype,
+  n.nspname AS function_schema,p.proname AS function_name
+  FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace
+  WHERE t.tgrelid='public.crm_native_email_publication_control'::regclass AND NOT t.tgisinternal
+  ORDER BY t.tgname`)
+ assert.deepEqual(rows.filter(row=>row.tgname==='clawpilot_crm_fence_write'),[{
+  tgname:'clawpilot_crm_fence_write',tgenabled:'A',tgtype:62,
+  function_schema:'clawpilot_crm_maintenance',function_name:'check_relation',
+ }])
+ const nativeGuards=rows.filter(row=>row.tgname!=='clawpilot_crm_fence_write')
+ assert.ok(nativeGuards.every(row=>row.tgenabled==='O'))
+ for(const name of ['crm_native_email_control_guard','crm_native_initial_control_guard'])
+  assert.ok(nativeGuards.some(row=>row.tgname===name))
+ return rows
+}
+
 /** Independent committed clients cannot observe an outer rollback fixture.
  * Clone only the caller's already guarded disposable DB, never a live URL or
  * another owner's connection. No sessions are killed to make TEMPLATE work. */
@@ -61,11 +78,8 @@ export async function withRootCrmSyntheticDatabase({Pool,getPool,setPool},run){
  * no native installation/receipt authentication or production proof is implied. */
 export async function enrollRootCrmSyntheticInitial({query,tx,protocol,capability,owner,root,inspection=null,readers=null}){
  const json=protocol.nativeEmailCanonicalJson,hash=protocol.nativeEmailDigest
- const guards=async c=>(await c.query(`SELECT tgname,tgenabled FROM pg_trigger
-  WHERE tgrelid='crm_native_email_publication_control'::regclass AND NOT tgisinternal ORDER BY tgname`)).rows
+ const guards=readVerifiedRootCrmControlGuards
  const beforeGuards=await guards({query})
- assert.ok(beforeGuards.some(row=>row.tgname==='crm_native_initial_control_guard'))
- assert.ok(beforeGuards.every(row=>row.tgenabled==='O'))
  const control=(await query('SELECT * FROM crm_native_email_publication_control WHERE singleton')).rows[0]
  assert.equal(control.enabled,false);assert.equal(control.active_operation_id,null)
  assert.equal(control.active_transition_id,null);assert.equal(control.active_initial_enrollment_id,null)

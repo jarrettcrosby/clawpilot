@@ -1144,6 +1144,10 @@ migration_catalog AS (
 )
 SELECT
   pg_catalog.current_setting('server_version_num')::integer AS server_version_num,
+  (pg_catalog.to_regnamespace('clawpilot_crm_maintenance') IS NOT NULL OR EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0418_crm_maintenance_write_fence.sql'
+  )) AS maintenance_fence_present,
   (SELECT value FROM migration_catalog) AS migrations,
   (SELECT value FROM schema_catalog WHERE name='public') AS schema,
   (SELECT COALESCE(pg_catalog.jsonb_agg(value ORDER BY name), '[]'::jsonb)
@@ -1316,6 +1320,7 @@ async function inspectSchemaWithFunctions(client, criticalFunctions,
   return Object.freeze({
     format: PRODUCTION_REBIND_HISTORY_SCHEMA_ATTESTATION_FORMAT,
     postgresMajor,
+    maintenanceFencePresent: row.maintenance_fence_present === true,
     migrations: Object.freeze(normalizeCatalog(row.migrations)),
     missingRelations: Object.freeze(normalizeCatalog(row.missing_relations || [])),
     missingFunctions: Object.freeze(normalizeCatalog(row.missing_functions || [])),
@@ -1430,6 +1435,14 @@ export async function inspectPreHeldOriginalProductionRebindSchemaMetadata(clien
 
 export async function attestProductionRebindHistorySchema(client) {
   const inspection = await inspectProductionRebindHistorySchema(client)
+  // The v22 receipt is bound to the through-0417 catalog. Do not silently
+  // enroll 0418 or certify a catalog from which its fence was removed.
+  if (inspection.maintenanceFencePresent) {
+    throw new ProductionRebindHistorySchemaAttestationError(
+      'maintenance_schema_unattested',
+      'CRM maintenance migration 0418 is outside the reviewed v22 rebind profile',
+    )
+  }
   if (inspection.migrations.some(
     (migration) => migration.rows !== 1 || migration.matchingRows !== 1,
   )) {

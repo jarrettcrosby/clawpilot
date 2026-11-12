@@ -345,6 +345,11 @@ export async function POST(
   req: NextRequest,
   context: { params: Promise<{ productId: string }> },
 ) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     assertSameOrigin(req)
     const { actor, organizationId, productId } =
@@ -370,6 +375,11 @@ export async function PATCH(
   req: NextRequest,
   context: { params: Promise<{ productId: string }> },
 ) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     assertSameOrigin(req)
     const { actor, organizationId, productId } =

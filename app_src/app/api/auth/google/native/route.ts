@@ -60,7 +60,9 @@ export async function POST(req: NextRequest) {
     // explicitly linked subject whose existing membership organization has
     // enabled Google sign-in. This route never creates users or memberships.
     const actor = await resolveLinkedGoogleIdentity(identity)
-    await ensureDefaultResourcesForUser(actor)
+    if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE !== '1') {
+      await ensureDefaultResourcesForUser(actor)
+    }
     const issued = await createBrowserSession({
       email: actor.email,
       authMethod: 'google_sso',

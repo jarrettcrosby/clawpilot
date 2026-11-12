@@ -113,6 +113,9 @@ const HELD_ORIGINAL_MIGRATIONS = [
   ['0416_crm_legacy_held_email_release.sql','d9d5d612b9d1e5fa32aff71bfe35c6c9904ce8979b4893aef479dfb8add02e30'],
   ['0417_crm_legacy_held_email_settlement.sql','56f7e0e67ef8854b610d02a2d8496c575d4217b2731b49aa4f04c39b69bc82bf'],
 ].map(([filename,checksum])=>({filename,checksum}))
+const CRM_MAINTENANCE_MIGRATION = '0418_crm_maintenance_write_fence.sql'
+const CRM_MAINTENANCE_SCHEMA = 'clawpilot_crm_maintenance'
+const CRM_MAINTENANCE_CHECKSUM = 'c08fde2f92b93f6920f9649d6cee280f17a09f7e01fe4920711558503a9e2829'
 const HELD_ORIGINAL_SCHEMA = 'crm_legacy_email_terminal_hold'
 const HELD_ORIGINAL_RELATIONS = ['verified_batch','held','consumed','verified_recovery','staged','released','verified_receipts','settled']
   .map(name=>`${HELD_ORIGINAL_SCHEMA}.${name}`)
@@ -945,7 +948,82 @@ function describeCatalogDifference(before,after) {
   return {total:differences.length,first:differences.slice(0,36)}
 }
 
-async function verifyProductCompatibleUpgrade(databaseUrl,currentBaseline,{attestCurrent}) {
+function runFixtureProductionMigrations(databaseUrl) {
+  return command(process.execPath, ['scripts/db-migrate.mjs'], {
+    env: { ...process.env, DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
+    timeout: 180_000,
+  })
+}
+
+async function verifyInstalledMaintenanceCatalog(pool, frozenV22) {
+  const state = await pool.query(`SELECT fence_id IS NULL AS open,
+      clawpilot_crm_maintenance.coverage() AS covered
+    FROM clawpilot_crm_maintenance.write_fence WHERE singleton`)
+  assert.deepEqual(state.rows, [{ open: true, covered: true }],
+    '0418 starts open with complete trigger coverage')
+  const ledger = await pool.query('SELECT filename, checksum FROM public.schema_migrations ORDER BY filename')
+  assert.deepEqual(ledger.rows.filter(row => row.filename === CRM_MAINTENANCE_MIGRATION),
+    [{ filename: CRM_MAINTENANCE_MIGRATION, checksum: CRM_MAINTENANCE_CHECKSUM }],
+    'The production runner records exactly one reviewed 0418 migration')
+  const inspection = await inspectProductionRebindHistorySchema(pool)
+  assert.equal(inspection.maintenanceFencePresent, true)
+  const { catalog } = inspection
+  const maintenanceTriggers = catalog.triggers.filter(trigger =>
+    trigger.function.startsWith(`${CRM_MAINTENANCE_SCHEMA}.`))
+  assert.ok(maintenanceTriggers.length > 0, 'Current catalog contains the new maintenance guards')
+  for (const trigger of maintenanceTriggers) {
+    assert.equal(trigger.enabled, 'A')
+    assert.equal(trigger.internal, false)
+    assert.ok([
+      ['clawpilot_crm_fence_write', 31, `${CRM_MAINTENANCE_SCHEMA}.check_mixed_row()`],
+      ['clawpilot_crm_fence_write', 62, `${CRM_MAINTENANCE_SCHEMA}.check_relation()`],
+      ['clawpilot_crm_fence_truncate', 34, `${CRM_MAINTENANCE_SCHEMA}.check_relation()`],
+    ].some(([name, mask, fn]) => trigger.name === name && trigger.typeMask === mask && trigger.function === fn),
+    'Every new guard on a rebind-enrolled relation uses an exact reviewed trigger contract')
+  }
+  // This exact delta assertion is test-only. The operator attester rejects the
+  // new schema; it does not project out the maintenance guards or issue v22.
+  const previousCatalog = {
+    ...catalog,
+    triggers: catalog.triggers.filter(trigger => !maintenanceTriggers.includes(trigger)),
+    functions: catalog.functions.filter(fn => fn.schema !== CRM_MAINTENANCE_SCHEMA),
+  }
+  assert.equal(productionRebindHistorySchemaDigest(previousCatalog), frozenV22.schemaDigest,
+    '0418 changes the rebind-enrolled catalog only by adding the exact maintenance guards')
+  await assert.rejects(attestProductionRebindHistorySchema(pool), error =>
+    error instanceof ProductionRebindHistorySchemaAttestationError && error.code === 'maintenance_schema_unattested',
+    'An installed 0418 cannot issue a v22 operator receipt')
+  return { catalog, schemaDigest: inspection.schemaDigest, ledger: ledger.rows }
+}
+
+async function verifyCleanMaintenanceCatalog(databaseUrl, frozenV22) {
+  const controlPool = new Pool({ connectionString: databaseUrl, max: 1 })
+  try { await controlPool.query('CREATE DATABASE clawpilot_rebind_current_clean_fixture') }
+  finally { await controlPool.end() }
+  const url = new URL(databaseUrl)
+  url.pathname = '/clawpilot_rebind_current_clean_fixture'
+  const migrationOutput = runFixtureProductionMigrations(url.toString())
+  for (const filename of [...PRODUCTION_REBIND_SCHEMA_MIGRATIONS.map(migration => migration.filename), CRM_MAINTENANCE_MIGRATION]) {
+    assert.ok(migrationOutput.includes(`apply ${filename}`), `${filename} executed through the real migration runner`)
+  }
+  const pool = new Pool({ connectionString: url.toString(), max: 1 })
+  try {
+    // Simulate catalog drift where the fence schema (and its attached guards)
+    // has been dropped, but the real migration ledger still proves 0418 ran.
+    const current = await verifyInstalledMaintenanceCatalog(pool, frozenV22)
+    const drift = await pool.connect()
+    try {
+      await drift.query('BEGIN')
+      await drift.query(`DROP SCHEMA ${CRM_MAINTENANCE_SCHEMA} CASCADE`)
+      await assert.rejects(attestProductionRebindHistorySchema(drift), error =>
+        error instanceof ProductionRebindHistorySchemaAttestationError && error.code === 'maintenance_schema_unattested',
+        'Dropping the 0418 guards cannot restore v22 eligibility')
+    } finally { await drift.query('ROLLBACK'); drift.release() }
+    return current
+  } finally { await pool.end() }
+}
+
+async function verifyProductCompatibleUpgrade(databaseUrl,currentBaseline,{attestCurrent,cleanMaintenance}) {
   const controlPool=new Pool({connectionString:databaseUrl,max:1})
   try{await controlPool.query('CREATE DATABASE clawpilot_rebind_product_upgrade_fixture')}
   finally{await controlPool.end()}
@@ -1018,6 +1096,17 @@ async function verifyProductCompatibleUpgrade(databaseUrl,currentBaseline,{attes
     verifyHeldOriginalCatalogDelta(frozenV21.catalog,after.catalog)
     if(attestCurrent)await attestProductionRebindHistorySchema(pool)
     console.log(`PG${after.postgresMajor}: exact frozen v21 and additive held-original v22 catalog; retained product grant unchanged`)
+    if (cleanMaintenance) {
+      assert.ok(runFixtureProductionMigrations(url.toString()).includes(`apply ${CRM_MAINTENANCE_MIGRATION}`),
+        'The real production runner applies the maintenance migration to the populated v22 predecessor')
+      const upgraded = await verifyInstalledMaintenanceCatalog(pool, after)
+      assert.deepEqual(upgraded.ledger, cleanMaintenance.ledger, 'Fresh and upgraded migration ledgers converge through 0418')
+      assert.equal(upgraded.schemaDigest, cleanMaintenance.schemaDigest,
+        upgraded.schemaDigest === cleanMaintenance.schemaDigest ? 'Fresh and upgraded current catalogs converge through 0418'
+          : `Fresh and upgraded current catalogs must converge through 0418: ${JSON.stringify(describeCatalogDifference(cleanMaintenance.catalog, upgraded.catalog))}`)
+      assert.deepEqual(await readCredential(), retainedCredential, 'The maintenance migration preserves the existing product credential')
+      console.log(`PG${after.postgresMajor}: exact 0418 clean/upgrade convergence, open fence and v22 rebind refusal verified`)
+    }
     return {frozenV21,upgradedSchemaDigest:after.schemaDigest}
   }finally{await pool.end()}
 }
@@ -1356,7 +1445,7 @@ async function verifyBoundedCalendarOccurrenceUpgrade(databaseUrl,frozenV21Basel
   }finally{await pool.end()}
 }
 
-async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false,heldOriginalDeltaOnly=false}={}) {
+async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false,heldOriginalDeltaOnly=false,maintenanceDeltaOnly=false}={}) {
   checkedTamperCases = 0
   const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
   const container = `clawpilot-target-schema-attestation-${suffix}`
@@ -1377,26 +1466,13 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
       `postgresql://postgres:${password}@127.0.0.1:${port}/clawpilot_target_schema_attestation`
     await waitForPostgres(databaseUrl)
 
-    // Use the production migration runner against a blank database. This is
-    // intentionally not a hand-built fixture: the real 0349, 0353-0359,
-    // 0370 through 0417
-    // migrations, their prerequisites, and their real ledger rows execute.
-    const migrationOutput = command(process.execPath, ['scripts/db-migrate.mjs'], {
-      env: {
-        ...process.env,
-        DATABASE_URL: databaseUrl,
-        PGSSLMODE: 'disable',
-      },
-      timeout: 180_000,
-    })
-    for (const expected of PRODUCTION_REBIND_SCHEMA_MIGRATIONS) {
-      assert.ok(
-        migrationOutput.includes(`apply ${expected.filename}`),
-        `${expected.filename} executed through the real migration runner`,
-      )
-    }
-
+    // Preserve genuine v22 history rather than running old tamper tests on a
+    // post-0418 catalog. The current clean/upgrade checks below run the real
+    // production migration runner with the entire, unfiltered migration tree.
     pool = new Pool({ connectionString: databaseUrl, max: 1 })
+    await applyFixtureMigrationRange(pool, {
+      through: HELD_ORIGINAL_MIGRATIONS.at(-1).filename, bootstrap: true, frozen: false,
+    })
     const applied = await pool.query(
       `SELECT filename, checksum, applied_at IS NOT NULL AS has_applied_at
        FROM public.schema_migrations
@@ -1451,7 +1527,9 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
     // This is serial acceptance; do not retain idle catalog-heavy backends in
     // both databases inside the deliberately bounded disposable container.
     await pool.end(); pool = undefined
-    const {frozenV21}=await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:true})
+    const cleanMaintenance = await verifyCleanMaintenanceCatalog(databaseUrl, baseline)
+    const {frozenV21}=await verifyProductCompatibleUpgrade(databaseUrl,baseline,{attestCurrent:true,cleanMaintenance})
+    if (maintenanceDeltaOnly) return
     const historical = await verifyHistoricalCatalogCompatibility(databaseUrl, frozenV21)
     pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const reviewedEmailTriggers = await verifyReviewedEmailReferenceTriggers(pool, baseline.catalog)
@@ -2198,14 +2276,17 @@ async function exerciseImage(image,{diagnosticOnly=false,calendarDeltaOnly=false
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args=process.argv.slice(2)
-  assert.ok(args.length===0||(args.length===1&&['--diagnostic-current-schema','--check-calendar-schema-delta','--check-held-original-schema-delta'].includes(args[0])),
+  assert.ok(args.length===0||(args.length===1&&['--diagnostic-current-schema','--check-calendar-schema-delta',
+    '--check-held-original-schema-delta','--check-maintenance-schema-delta'].includes(args[0])),
     'Unknown schema test arguments')
   const diagnosticOnly=args[0]==='--diagnostic-current-schema'
   const calendarDeltaOnly=args[0]==='--check-calendar-schema-delta'
   const heldOriginalDeltaOnly=args[0]==='--check-held-original-schema-delta'
-  for (const image of images) await exerciseImage(image,{diagnosticOnly,calendarDeltaOnly,heldOriginalDeltaOnly})
+  const maintenanceDeltaOnly=args[0]==='--check-maintenance-schema-delta'
+  for (const image of images) await exerciseImage(image,{diagnosticOnly,calendarDeltaOnly,heldOriginalDeltaOnly,maintenanceDeltaOnly})
   console.log(diagnosticOnly?'Disposable v22 diagnostics only; no current schema acceptance performed'
     :calendarDeltaOnly?`0412 focused schema delta passed (${images.join(', ')})`
     :heldOriginalDeltaOnly?`0413–0417 focused schema delta passed (${images.join(', ')})`
+    :maintenanceDeltaOnly?`0418 focused schema delta passed (${images.join(', ')})`
     :`production rebind target schema attestation passed (${images.join(', ')})`)
 }

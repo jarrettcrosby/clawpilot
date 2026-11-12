@@ -2,6 +2,7 @@
 // Native transport is an explicit test edge; this is not native ACL/UI proof.
 import assert from 'node:assert/strict'
 import * as crypto from 'node:crypto'
+import {readVerifiedRootCrmControlGuards} from './lib/root-crm-synthetic-initial-enrollment.mjs'
 
 export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,authority,rootRegistry,coreRuntime,root,peer,foreign,child,demo,owner,employee,admin,check}){
  const contract=load('app_src/lib/crm/rootEmployeeCrmSettings.ts',{})
@@ -92,9 +93,8 @@ export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,autho
   // Only the already-mocked coordinator dispatch is synthetic. Do not invent
   // activation evidence or turn off a database guard to select this branch.
   const before=(await client.query('SELECT * FROM crm_native_email_publication_control WHERE singleton')).rows
-  const guards=(await client.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgrelid='crm_native_email_publication_control'::regclass AND NOT tgisinternal ORDER BY tgname")).rows
-  assert.equal(before[0].enabled,false);assert.ok(guards.every(row=>row.tgenabled==='O'))
-  for(const name of ['crm_native_email_control_guard','crm_native_initial_control_guard'])assert.ok(guards.some(row=>row.tgname===name&&row.tgenabled==='O'))
+  const guards=await readVerifiedRootCrmControlGuards(client)
+  assert.equal(before[0].enabled,false)
   setNativeDispatchRead(true)
   await configure();assert.equal(calls.length,1)
   const [kind,actor,workspace,change]=calls[0];assert.equal(kind,'change');assert.equal(actor,owner);assert.equal(workspace,root)
@@ -103,7 +103,7 @@ export async function runRootCrmSettingsAcceptance({load,query,tx,protocol,autho
   setNativeResult(false);await assert.rejects(configure(),error=>error instanceof coreRuntime.NativeEmailAccessPendingError)
   assert.equal((await read()).configured,false,'A policy race never falls back to an unaudited legacy write')
   assert.deepEqual((await client.query('SELECT * FROM crm_native_email_publication_control WHERE singleton')).rows,before)
-  assert.deepEqual((await client.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgrelid='crm_native_email_publication_control'::regclass AND NOT tgisinternal ORDER BY tgname")).rows,guards)
+  assert.deepEqual(await readVerifiedRootCrmControlGuards(client),guards)
  }))
  await check('normal Resume accepts only its saved transition and rechecks source ownership',()=>isolated(async({dal,calls})=>{
   const request={action:'resume',transitionId:'a'.repeat(64)}

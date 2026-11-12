@@ -22,11 +22,15 @@ export async function processQuickBooksSyncOutbox(input: { limit?: number; worke
     try {
       const catalog = await readQuickBooksCatalog(job.ownerEmail, job.connectionId)
       await completeQuickBooksCatalogSyncInPostgres({ job, ...catalog })
-      try {
-        const crm = await reconcileQuickBooksCatalogToCrmInPostgres({ organizationId: job.organizationId })
-        if (crm.configured) crmReconciled += 1
-      } catch {
-        crmFailed += 1
+      // Accounting catalog updates remain live. Defer only the secondary CRM
+      // projection; a planned pause is not a reconciliation failure.
+      if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE !== '1') {
+        try {
+          const crm = await reconcileQuickBooksCatalogToCrmInPostgres({ organizationId: job.organizationId })
+          if (crm.configured) crmReconciled += 1
+        } catch {
+          crmFailed += 1
+        }
       }
       succeeded += 1
     } catch (error) {

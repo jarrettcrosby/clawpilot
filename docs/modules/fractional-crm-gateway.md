@@ -40,6 +40,9 @@ All paths start with `/api/integrations/fractional-crm/v1`. Each request require
 | `GET /companies/{ga}` | Pure canonical company read. |
 | `GET /companies/{ga}/contacts` | Company-scoped contact list, default 50, maximum 100, opaque scoped cursor. |
 | `GET /companies/{ga}/contacts/{gc}` | Pure contact read with exact parent validation. |
+| `GET /organization/contacts` | Paginated staff contact list for the credential's exact active organization root. |
+| `GET /organization/contacts/{gc}` | Pure staff contact read with exact root parent validation. |
+| `POST /organization/contacts` | Reuse or create a root contact by verified staff email, with an idempotent command receipt. |
 | `GET /products` | Active canonical products in the credential's exact pipeline; default 50, maximum 100, scoped cursor. |
 | `GET /products/{gp}` | Canonical product read, with exact pipeline and retired-record checks. |
 | `PATCH /companies/{ga}` | Conditional allowlisted company-field update. |
@@ -89,6 +92,8 @@ Do not provision the new grant during a mixed-version deploy. Confirm that every
 The November 3 read-only source review found Fractional's separate sender in `app/src/server/customer-folder-publication.ts`, its exact folder gateway client, and worker wiring in the canonical Fractional checkout. The sender retains an immutable publication intent, verifies the existing ready Drive folder, uses conditional PATCH plus independent GET readback, and holds manual conflicts without recreating the folder. Those source files were still untracked at inspection; their presence is not a release, test receipt, enabled connector, or provider proof. Coordinate that source's release evidence rather than implementing a duplicate sender. This ClawPilot receiver is not verified automatic cross-application synchronization until both releases and the signed-in/provider flow are confirmed. No hosted schema or connector is activated by these source changes.
 
 ## Onboarding and durable evidence
+
+Organization staff contact reads require `crm.contact.read`. Resolution or creation also requires `crm.onboarding.write`, a verified Fractional acceptance staged by the calling application, and an `Idempotency-Key`. The exact registered organization root supplies the parent. An existing same-email root contact is reused. A collision elsewhere is held for review, preserving the contact's existing parent. A new contact uses the existing canonical staging and native projection outbox. Fractional manages invitations and login permissions separately.
 
 The body contains `schemaVersion`, `sourceInstanceId`, immutable Fractional `origin` identifiers, persisted company/contact snapshots, optional explicit existing Global IDs, reviewed verified identifiers, `allowCreate`, optional `reviewDecisionToken`, and asserted actor attribution. The origin deployment and organization must match the credential. Existing source mappings take precedence; explicit IDs and administrator-accepted identifier evidence must agree. Names and websites are candidate hints, never automatic identity proof. Contact email matching is limited to the chosen company and authorized discovery scope. A matching contact under another permitted company requires relationship review and is never reparented.
 

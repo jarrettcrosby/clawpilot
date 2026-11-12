@@ -21,7 +21,7 @@ import {
   type AppUser,
   type AppUserStatus,
 } from '@/lib/users'
-import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import { requireWorkspaceAppUser, WorkspaceAccessError } from '@/lib/workspaceMemberships'
 import {
   DEMO_BOARD_ID,
   DEMO_SYSTEM_EMAIL,
@@ -175,13 +175,30 @@ function isAppUser(value: unknown): value is AppUser {
   return Boolean(value && typeof value === 'object' && typeof (value as AppUser).email === 'string')
 }
 
-async function resolveTenantActor(value: TenantActorInput): Promise<AppUser> {
+async function resolveTenantActor(
+  value: TenantActorInput,
+  options: { preferExisting?: boolean; allowProvisioning?: boolean } = {},
+): Promise<AppUser> {
   if (isAppUser(value) && value.organizationId) {
     return requireWorkspaceAppUser(value.email, value.organizationId)
   }
   const user = await requireActiveAppUser(isAppUser(value) ? value.email : value)
+  if (options.allowProvisioning === false) {
+    return requireWorkspaceAppUser(user.email, user.organizationId)
+  }
+  if (options.preferExisting && user.organizationId) {
+    try {
+      return await requireWorkspaceAppUser(user.email, user.organizationId)
+    } catch (error) {
+      if (!(error instanceof WorkspaceAccessError) || error.message !== 'Active workspace access is not available') throw error
+    }
+  }
   const organization = await ensurePrimaryWorkspaceOrganization(user.email)
   return requireWorkspaceAppUser(user.email, organization.id)
+}
+
+function canProvisionResourceDefaults(options: { ensureDefaults?: boolean } = {}) {
+  return options.ensureDefaults !== false && process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE !== '1'
 }
 
 function hostedShortLinkUrl(slug: string | null, publicDomain: string | null) {
@@ -272,15 +289,21 @@ export async function ensureDefaultResourcesForUser(emailValue: TenantActorInput
   crmBoardId: string | null
   pipelineProvisioningRequired: boolean
 }> {
-  const user = await resolveTenantActor(emailValue)
+  const allowProvisioning = canProvisionResourceDefaults()
+  const user = await resolveTenantActor(emailValue, { preferExisting: true, allowProvisioning })
   if (!user.organizationId) throw new Error('Active workspace is not configured')
-  const rootRead = await query(`SELECT 1 FROM clawpilot_crm_root_read_workspaces($1)
-    WHERE workspace_id=$2::uuid LIMIT 1`, [user.email, user.organizationId])
-  if (user.organizationAccessOrigin === 'root_crm' || rootRead.rows.length) {
+  const rootRead = allowProvisioning && user.organizationAccessOrigin !== 'root_crm'
+    ? await query(`SELECT 1 FROM clawpilot_crm_root_read_workspaces($1)
+      WHERE workspace_id=$2::uuid LIMIT 1`, [user.email, user.organizationId])
+    : null
+  if (!allowProvisioning || user.organizationAccessOrigin === 'root_crm' || rootRead?.rows.length) {
     // Root CRM access is not permission to create personal resources, change
     // sharing, or enqueue Sheet/provider provisioning as a login side effect.
-    const boards = await listProjectBoards(user, { ensureDefaults: false })
-    const pipelines = await listPipelineSpaces(user, { ensureDefaults: false })
+    // Existing resources also remain usable while CRM writes are fenced.
+    const [boards, pipelines] = await Promise.all([
+      listProjectBoards(user, { ensureDefaults: false }),
+      listPipelineSpaces(user, { ensureDefaults: false }),
+    ])
     return { boardId: boards[0]?.id ?? null, pipelineId: pipelines[0]?.id ?? null,
       crmBoardId: null, pipelineProvisioningRequired: false }
   }
@@ -542,10 +565,10 @@ export async function listProjectBoards(
   actorEmailValue: TenantActorInput,
   options: { ensureDefaults?: boolean } = {},
 ): Promise<ProjectBoard[]> {
-  const actor = await resolveTenantActor(actorEmailValue)
+  const allowProvisioning = canProvisionResourceDefaults(options)
+  const actor = await resolveTenantActor(actorEmailValue, { preferExisting: true, allowProvisioning })
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
   if (!effectiveUserPermissions(actor).viewProjects) return []
-  if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
   const result = await query<ProjectBoardRow>(
     `
       SELECT
@@ -589,17 +612,24 @@ export async function listProjectBoards(
     [actor.email, actor.organizationId, isDemoWorkspaceId(actor.organizationId), DEMO_BOARD_ID,
       actor.organizationAccessOrigin !== 'root_crm'],
   )
-  return result.rows.map(toProjectBoard)
+  const boards = result.rows.map(toProjectBoard)
+  if (allowProvisioning && actor.organizationAccessOrigin !== 'root_crm' && !isDemoWorkspaceId(actor.organizationId)
+    && !boards.some((board) => board.accessRole === 'owner' && board.isDefault)) {
+    await ensureDefaultResourcesForUser(actor)
+    return listProjectBoards(actor, { ensureDefaults: false })
+  }
+  return boards
 }
 
 export async function listPipelineSpaces(
   actorEmailValue: TenantActorInput,
   options: { ensureDefaults?: boolean } = {},
 ): Promise<PipelineSpace[]> {
-  const actor = await resolveTenantActor(actorEmailValue)
+  const allowProvisioning = canProvisionResourceDefaults(options)
+  const actor = await resolveTenantActor(actorEmailValue, { allowProvisioning })
   if (!actor.organizationId) throw new Error('Active workspace is not configured')
   if (!effectiveUserPermissions(actor).viewCrm) return []
-  if (options.ensureDefaults !== false) await ensureDefaultResourcesForUser(actor)
+  if (allowProvisioning) await ensureDefaultResourcesForUser(actor)
   const result = await query<PipelineSpaceRow>(
     `
       SELECT
@@ -745,14 +775,14 @@ export async function resolveProjectBoardAccess(input: {
 }): Promise<ProjectBoard> {
   const requested = String(input.boardId || '').trim()
   const actorInput = input.actorEmail
-  const boards = await listProjectBoards(actorInput)
+  const boards = await listProjectBoards(actorInput, { ensureDefaults: !requested })
   if (requested) {
     const board = boards.find((candidate) => candidate.id === requested)
     if (!board) throw new Error('Project board access denied')
     return board
   }
-  const actor = await resolveTenantActor(actorInput)
-  const fallback = boards.find((board) => board.ownerEmail === actor.email && board.isDefault) || boards[0]
+  const actorEmail = normalizeUserEmail(isAppUser(actorInput) ? actorInput.email : actorInput)
+  const fallback = boards.find((board) => board.ownerEmail === actorEmail && board.isDefault) || boards[0]
   if (!fallback) throw new Error('No project board is available')
   return fallback
 }

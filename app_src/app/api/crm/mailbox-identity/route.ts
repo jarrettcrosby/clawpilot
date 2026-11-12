@@ -30,6 +30,11 @@ async function owner(req: NextRequest, pipelineId: string) {
 }
 
 export async function GET(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     const { actor } = await owner(req, req.nextUrl.searchParams.get('pipelineId') || '')
     const connections = await query<{ connection_id: string; account_email: string | null }>(`SELECT connection_id,account_email
@@ -43,6 +48,11 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     if (!isBrowserSameOriginRequest({ headers: req.headers, requestOrigin: req.nextUrl.origin, trustedOrigins: [appPublicUrl()] })) {
       return response({ ok: false, error: 'A same-origin browser request is required' }, 403)

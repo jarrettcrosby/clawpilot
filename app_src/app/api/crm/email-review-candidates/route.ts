@@ -40,6 +40,11 @@ function json(body: unknown, status = 200) {
 }
 
 export async function GET(req: NextRequest) {
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+    return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+      status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+    })
+  }
   try {
     // Ordinary same-origin browser GETs omit Origin. SOP + the exact owner
     // session protects this read; reject cross-site fetches and foreign Origin

@@ -14,9 +14,20 @@ export type FractionalCrmPatch = {
   assertedFractionalActor: { userId: string; organizationId: string; customerId: string }
 }
 export type FractionalCrmFolderPatch = Omit<FractionalCrmPatch, 'fields'> & { schemaVersion: 1; folderUrl: string | null }
+export type FractionalCrmOrganizationContactCreate = {
+  schemaVersion: 1
+  deploymentId: string
+  displayName: string
+  email: string
+  jobTitle: string | null
+  actor: { userId: string; organizationId: string; targetUserId: string }
+}
 export type FractionalCrmGatewayServices = {
   readFractionalCrmCredential: (id: string) => Promise<FractionalCrmCredential | null>
   readFractionalCrmOrganization: (principal: FractionalCrmPrincipal) => Promise<unknown>
+  listFractionalCrmOrganizationContacts: (principal: FractionalCrmPrincipal, page: { limit: number; cursor?: string }) => Promise<unknown>
+  readFractionalCrmOrganizationContact: (principal: FractionalCrmPrincipal, gc: string) => Promise<unknown>
+  createFractionalCrmOrganizationContact: (principal: FractionalCrmPrincipal, input: FractionalCrmOrganizationContactCreate, idempotencyKey: string) => Promise<unknown>
   readFractionalCrmCompany: (principal: FractionalCrmPrincipal, ga: string) => Promise<unknown>
   readFractionalCrmContact: (principal: FractionalCrmPrincipal, ga: string, gc: string) => Promise<unknown>
   listFractionalCrmContacts: (principal: FractionalCrmPrincipal, ga: string, page: { limit: number; cursor?: string }) => Promise<unknown>
@@ -132,6 +143,30 @@ function onboarding(input: unknown, principal: FractionalCrmPrincipal) {
   return value
 }
 
+function organizationContact(input: unknown, principal: FractionalCrmPrincipal): FractionalCrmOrganizationContactCreate {
+  const value = object(input, ['schemaVersion', 'deploymentId', 'displayName', 'email', 'jobTitle', 'actor'])
+  const actor = object(value.actor, ['userId', 'organizationId', 'targetUserId'])
+  if (value.schemaVersion !== 1 || value.deploymentId !== principal.fractionalDeploymentId ||
+    actor.organizationId !== principal.fractionalOrganizationId) invalid(403, 'SCOPE_DENIED')
+  if (!boundedString(actor.userId) || !boundedString(actor.targetUserId) ||
+    !boundedString(value.displayName, 160) || value.displayName.trim() !== value.displayName ||
+    !boundedString(value.email, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email) ||
+    (value.jobTitle !== null && (!boundedString(value.jobTitle, 160) || value.jobTitle.trim() !== value.jobTitle))) {
+    invalid(422, 'INVALID_FIELDS')
+  }
+  return { schemaVersion: 1, deploymentId: principal.fractionalDeploymentId,
+    displayName: value.displayName, email: value.email, jobTitle: value.jobTitle,
+    actor: { userId: actor.userId, organizationId: principal.fractionalOrganizationId, targetUserId: actor.targetUserId } }
+}
+
+function page(url: URL) {
+  const limit = url.searchParams.get('limit') ?? '50'
+  const cursor = url.searchParams.get('cursor') ?? undefined
+  if (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 ||
+    (cursor !== undefined && !/^[A-Za-z0-9_-]{1,1024}$/.test(cursor))) invalid()
+  return { limit: Number(limit), ...(cursor ? { cursor } : {}) }
+}
+
 const publicErrors = new Set([
   'AUTHENTICATION_REQUIRED', 'GATEWAY_UNAVAILABLE', 'ORIGIN_DENIED', 'MACHINE_REQUEST_REQUIRED', 'CAPABILITY_DENIED',
   'INVALID_REQUEST', 'INVALID_SCOPE', 'SCOPE_DENIED', 'IDEMPOTENCY_KEY_REQUIRED', 'PRECONDITION_REQUIRED', 'INVALID_PRECONDITION',
@@ -162,23 +197,30 @@ export async function handleFractionalCrmGateway(
     if (!isFractionalCrmGatewayPath(url.pathname, request.method)) invalid(404, 'RECORD_NOT_FOUND')
     const parts = url.pathname.slice(basePath.length).split('/')
     const isOnboarding = parts[0] === 'onboarding'
+    const isOrganizationContacts = parts[0] === 'organization' && parts[1] === 'contacts'
+    const isOrganizationCreate = isOrganizationContacts && request.method === 'POST'
     const isProduct = parts[0] === 'products'
     const isFolder = parts.length === 3 && parts[2] === 'customer-folder'
     const isContact = !isFolder && parts.length >= 3
-    const isList = isProduct ? parts.length === 1 : isContact && parts.length === 3
-    const capability: FractionalCrmCapabilityRequirement = isProduct ? 'crm.product.read' : isOnboarding ? 'crm.onboarding.write'
+    const isList = isOrganizationContacts ? !isOrganizationCreate && parts.length === 2
+      : isProduct ? parts.length === 1 : isContact && parts.length === 3
+    const capability: FractionalCrmCapabilityRequirement = isProduct ? 'crm.product.read'
+      : isOnboarding || isOrganizationCreate ? 'crm.onboarding.write' : isOrganizationContacts ? 'crm.contact.read'
       : request.method === 'PATCH' ? (isFolder ? fractionalCrmFolderWriteCapabilities : isContact ? 'crm.contact.write' : 'crm.company.write')
         : isFolder ? fractionalCrmFolderReadCapabilities : isContact ? 'crm.contact.read' : 'crm.company.read'
     const principal = await authenticateFractionalCrmGateway(request, fractionalCrmGatewayConfiguration(env), services.readFractionalCrmCredential, capability)
     exactScope(url, principal, isList, isFolder)
     let result: unknown
-    if (isProduct) {
-      if (isList) {
-        const limit = url.searchParams.get('limit') ?? '50'
-        const cursor = url.searchParams.get('cursor') ?? undefined
-        if (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,1024}$/.test(cursor))) invalid()
-        result = await services.listFractionalCrmProducts(principal, { limit: Number(limit), ...(cursor ? { cursor } : {}) })
-      } else result = await services.readFractionalCrmProduct(principal, parts[1])
+    if (isOrganizationContacts) {
+      if (isOrganizationCreate) {
+        if (!principal.capabilities.includes('crm.contact.read')) invalid(403, 'CAPABILITY_DENIED')
+        const key = idempotency(request)
+        result = await services.createFractionalCrmOrganizationContact(principal, organizationContact(await readJson(request), principal), key)
+      } else if (isList) result = await services.listFractionalCrmOrganizationContacts(principal, page(url))
+      else result = await services.readFractionalCrmOrganizationContact(principal, parts[2])
+    } else if (isProduct) {
+      if (isList) result = await services.listFractionalCrmProducts(principal, page(url))
+      else result = await services.readFractionalCrmProduct(principal, parts[1])
     } else if (isOnboarding) {
       const key = idempotency(request)
       result = await services.resolveOrCreateFractionalCrmOnboarding(principal, onboarding(await readJson(request), principal), key)
@@ -197,10 +239,7 @@ export async function handleFractionalCrmGateway(
       result = isContact ? await services.updateFractionalCrmContact(principal, parts[1], parts[3], input)
         : await services.updateFractionalCrmCompany(principal, parts[1], input)
     } else if (isList) {
-      const limit = url.searchParams.get('limit') ?? '50'
-      const cursor = url.searchParams.get('cursor') ?? undefined
-      if (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100 || (cursor !== undefined && !/^[A-Za-z0-9_-]{1,1024}$/.test(cursor))) invalid()
-      result = await services.listFractionalCrmContacts(principal, parts[1], { limit: Number(limit), ...(cursor ? { cursor } : {}) })
+      result = await services.listFractionalCrmContacts(principal, parts[1], page(url))
     } else {
       result = isContact ? await services.readFractionalCrmContact(principal, parts[1], parts[3])
         : await services.readFractionalCrmCompany(principal, parts[1])

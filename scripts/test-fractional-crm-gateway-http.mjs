@@ -51,7 +51,7 @@ function harness(options = {}) {
   const lookups = [], calls = []
   let row = options.row === undefined ? fixture() : options.row
   const services = { readFractionalCrmCredential: async id => { lookups.push(id); return row } }
-  for (const name of ['readFractionalCrmOrganization', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
+  for (const name of ['readFractionalCrmOrganization', 'listFractionalCrmOrganizationContacts', 'readFractionalCrmOrganizationContact', 'createFractionalCrmOrganizationContact', 'readFractionalCrmCompany', 'readFractionalCrmContact', 'listFractionalCrmContacts',
     'updateFractionalCrmCompany', 'updateFractionalCrmContact', 'resolveOrCreateFractionalCrmOnboarding',
     'readFractionalCrmCustomerFolder', 'updateFractionalCrmCustomerFolder', 'readFractionalCrmProduct', 'listFractionalCrmProducts']) {
     services[name] = async (...args) => { calls.push({ name, args }); if (options.error) throw options.error; return options.result ?? { ok: true } }
@@ -489,4 +489,37 @@ test('product gateway bypass admits only exact bounded GET with machine authorit
   ]) assert.equal((await app.request(route, { query: new URLSearchParams({ ...scope, ...params }).toString() })).status, 400)
   assert.equal((await app.request('/products', { query: `${new URLSearchParams(scope)}&limit=10&limit=20` })).status, 400)
   assert.equal(app.calls.length, 0)
+})
+
+
+test('organization contacts use an exact root route and separate the read and create authorities', async () => {
+  const route = '/organization/contacts'
+  assert.equal(isFractionalCrmGatewayPath(base + route, 'GET'), true)
+  assert.equal(isFractionalCrmGatewayPath(base + route, 'POST'), true)
+  assert.equal(isFractionalCrmGatewayPath(base + route + '/' + contact, 'PATCH'), false)
+  const read = harness({ row: fixture({ capabilities: ['crm.contact.read'] }) })
+  const query = new URLSearchParams({ ...scope, limit: '15', cursor: 'page-two' }).toString()
+  assert.equal((await read.request(route, { query })).status, 200)
+  assert.equal(read.calls[0].name, 'listFractionalCrmOrganizationContacts')
+  assert.equal(read.calls[0].args[1].limit, 15)
+  assert.equal(read.calls[0].args[1].cursor, 'page-two')
+  assert.equal((await read.request(route + '/' + contact)).status, 200)
+  assert.equal(read.calls[1].name, 'readFractionalCrmOrganizationContact')
+  assert.equal(read.calls[1].args[1], contact)
+  assert.equal((await read.request(route, { query: query + '&company=' + company })).status, 400)
+
+  const body = { schemaVersion: 1, deploymentId: fractionalDeploymentId, displayName: 'Pat Example',
+    email: 'staff@example.invalid', jobTitle: null,
+    actor: { userId: 'actor', organizationId: 'fractional-org', targetUserId: 'staff' } }
+  const options = { method: 'POST', headers: { 'idempotency-key': 'staff-create-one' }, body }
+  assert.equal((await read.request(route, options)).status, 403)
+  const noRead = harness({ row: fixture({ capabilities: ['crm.onboarding.write'] }) })
+  assert.equal((await noRead.request(route, options)).status, 403)
+  assert.equal(noRead.calls.length, 0)
+  const write = harness()
+  assert.equal((await write.request(route, { ...options, body: { ...body, deploymentId: 'wrong' } })).status, 403)
+  assert.equal((await write.request(route, { ...options, headers: {} })).status, 400)
+  assert.equal((await write.request(route, options)).status, 200)
+  assert.equal(write.calls[0].name, 'createFractionalCrmOrganizationContact')
+  assert.equal(write.calls[0].args[2], 'staff-create-one')
 })

@@ -11,6 +11,7 @@ on:
       - 'scripts/fixtures/native-email-audience-real/bootstrap.sh'
       - 'scripts/fixtures/native-email-audience-real/native-shared-email*.php'
       - 'scripts/fixtures/suitecrm-8-10-2-oauth-smoke.php'
+      - 'scripts/fixtures/suitecrm-no-ssh-native-launch.sh'
       - '.github/workflows/suitecrm-upgrade.yml'
   push:
     branches: [main]
@@ -22,6 +23,7 @@ on:
       - 'scripts/fixtures/native-email-audience-real/bootstrap.sh'
       - 'scripts/fixtures/native-email-audience-real/native-shared-email*.php'
       - 'scripts/fixtures/suitecrm-8-10-2-oauth-smoke.php'
+      - 'scripts/fixtures/suitecrm-no-ssh-native-launch.sh'
       - '.github/workflows/suitecrm-upgrade.yml'
 
 permissions:
@@ -39,7 +41,9 @@ jobs:
         with:
           node-version: 24
       - name: Build the exact candidate on native Linux amd64
-        run: docker build --platform linux/amd64 --tag clawpilot-suitecrm:upgrade-8.10.2-local services/suitecrm
+        run: docker build --platform linux/amd64 --iidfile "$RUNNER_TEMP/suitecrm-native-launch.iid" --tag clawpilot-suitecrm:upgrade-8.10.2-local services/suitecrm
+      - name: Verify maintenance PID 1 and all child exit paths on native Linux
+        run: bash scripts/fixtures/suitecrm-no-ssh-native-launch.sh --iidfile "$RUNNER_TEMP/suitecrm-native-launch.iid"
       - name: Prepare public fixture dependencies
         shell: bash
         run: |
