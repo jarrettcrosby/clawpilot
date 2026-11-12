@@ -203,18 +203,20 @@ try {
     '--skip-log-bin', '--innodb-buffer-pool-size=64M', '--max-connections=20', '--performance-schema=OFF'])
   nativeDbStarted = true
   const deadline = Date.now() + 60_000
+  let dbVersion
+  // The image initializes grants on a temporary socket-only server and then
+  // shuts it down. Only the final server accepts TCP, which the fixture uses.
   while (true) {
     try {
-      execute('docker', ['exec', '--env', 'MYSQL_PWD=Synthetic-native-db-password-only', dbName,
-        'mariadb', '--user=fixture', '--database=suitecrm_native_test', '--batch', '--skip-column-names', '--execute=SELECT 1'])
+      dbVersion = execute('docker', ['exec', '--env', 'MYSQL_PWD=Synthetic-native-db-password-only', dbName,
+        'mariadb', '--protocol=tcp', '--host=127.0.0.1', '--connect-timeout=2', '--user=fixture',
+        '--database=suitecrm_native_test', '--batch', '--skip-column-names', '--execute=SELECT VERSION()'], { timeout: 5_000 }).trim()
       break
     } catch (error) {
       if (Date.now() > deadline) throw error
       await new Promise(resolve => setTimeout(resolve, 250))
     }
   }
-  const dbVersion = execute('docker', ['exec', '--env', 'MYSQL_PWD=Synthetic-native-db-password-only', dbName,
-    'mariadb', '--user=fixture', '--database=suitecrm_native_test', '--batch', '--skip-column-names', '--execute=SELECT VERSION()']).trim()
   assert.match(dbVersion, /^11\.4\.13-MariaDB/)
   const db = inspectContainer(dbName)
   assert.ok(db.Mounts.every(mount => mount.Type !== 'volume'), 'No anonymous database volume may exist')

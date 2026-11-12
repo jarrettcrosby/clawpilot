@@ -304,7 +304,7 @@ node scripts/build-crm-compatible-rollback.mjs --verify /PRIVATE_OUTPUT/rollback
 
 `--check-transition` exercises the working-tree SQL against a disposable fixture
 but deliberately emits no certification receipt. `--check-retained-transition`
-also rehearses the full working-tree migration chain through v22/0417 in a
+also rehearses the frozen v22 migration chain ending at 0417 in a
 second database on that same disposable instance. The rehearsal checks the
 checksum ledger, shared email identity and links across a writer reload,
 calendar occurrence claims, retained disabled native controls, and the original
@@ -319,6 +319,9 @@ pins for other majors are not evidence that their writer reload was tested.
 An older transition receipt cannot certify v22.
 Previously pinned archives remain independently verifiable and are not a
 writable fallback for the v22 schema or evidence of an attended live canary.
+The v22 rebind and rollback proof does not certify migration 0418 or authorize
+an operator to rebind or start a v22 writable rollback on the CRM-maintenance
+schema. The 0418 migration has separate forward migration and fence checks.
 
 Use the bundled Node 24 runtime or its verified equivalent. The build wrapper
 exports only committed source into a new private temporary directory, omits env

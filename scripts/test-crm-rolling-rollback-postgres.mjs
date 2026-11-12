@@ -9,7 +9,7 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { disposablePostgresDockerArgs, disposablePostgresDockerCleanupArgs } from './lib/disposable-postgres-docker.mjs'
 import { assertExternalRollbackOutput, canonicalJson, committedRollbackIdentity, LEGACY_WRITER_COMMIT,
-  REQUIRED_RETAINED_V22_CHECKS, REQUIRED_ROLLING_CHECKS, ROLLBACK_ACCEPTANCE_FORMAT, retainedV22MigrationInventory,
+  REQUIRED_RETAINED_V22_CHECKS, REQUIRED_ROLLING_CHECKS, RETAINED_V22_LAST_MIGRATION, ROLLBACK_ACCEPTANCE_FORMAT, retainedV22MigrationInventory,
   rollbackReceiptSource, sha256 } from './lib/crm-compatible-rollback-artifact.mjs'
 import { attestProductionRebindHistorySchema } from './production-rebind-history-schema-attestation.mjs'
 
@@ -207,8 +207,12 @@ try {
     console.log(`PASS ${checks.length} working-tree rolling transition checks; NON-CERTIFYING, no receipt or rollback artifact created`)
   } else {
     const { checkRetainedV22 } = await import('./lib/crm-rollback-retained-v20-fixture.mjs')
+    // This non-certifying checkout check rehearses the frozen v22 transition.
+    // Real receipts still require the complete committed inventory to end at
+    // the exact v22 floor; a post-0417 artifact cannot use this projection.
     const migrationPaths = inventory?.paths ?? readdirSync(new URL('../db/migrations/', import.meta.url))
       .filter(file => /^\d+_.+\.sql$/u.test(file)).sort().map(file => `db/migrations/${file}`)
+      .filter(path => path <= RETAINED_V22_LAST_MIGRATION)
     // Same loopback-only disposable instance. Keep the legacy bridge fixture
     // and full retained-schema fixture in separate, empty databases.
     await query('CREATE DATABASE crm_rolling_retained_v22')

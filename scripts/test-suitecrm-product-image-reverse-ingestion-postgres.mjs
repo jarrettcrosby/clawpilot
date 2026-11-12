@@ -401,7 +401,15 @@ async function verify(pool) {
        AND NOT trigger_row.tgisinternal
      ORDER BY relation.relname, trigger_row.tgname`,
   )
+  const maintenanceFence = (relname) => ({
+    relname,
+    tgname: 'clawpilot_crm_fence_write',
+    tgenabled: 'A',
+    tgtype: 62,
+    proname: 'check_relation',
+  })
   assert.deepEqual(authorityTriggers.rows, [
+    maintenanceFence('crm_suitecrm_product_image_asset_provenance'),
     {
       relname: 'crm_suitecrm_product_image_asset_provenance',
       tgname: 'guard_crm_suitecrm_product_image_provenance_write',
@@ -409,6 +417,7 @@ async function verify(pool) {
       tgtype: 31,
       proname: 'guard_crm_suitecrm_product_image_provenance',
     },
+    maintenanceFence('crm_suitecrm_product_image_observations'),
     {
       relname: 'crm_suitecrm_product_image_observations',
       tgname: 'guard_crm_suitecrm_product_image_observation_write',
@@ -416,6 +425,7 @@ async function verify(pool) {
       tgtype: 31,
       proname: 'guard_crm_suitecrm_product_image_observation',
     },
+    maintenanceFence('crm_suitecrm_product_image_snapshot_fences'),
     {
       relname: 'crm_suitecrm_product_image_snapshot_fences',
       tgname: 'guard_crm_suitecrm_image_fence_initial_revision_write',
