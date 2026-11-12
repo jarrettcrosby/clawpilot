@@ -25,14 +25,15 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Verify native host and exact SuiteCRM build inputs
+      - name: Verify native host and the exact SuiteCRM cleanup patch
         shell: bash
         run: |
           set -euo pipefail
           test "$(uname -sm)" = 'Linux x86_64'
           test "$(docker info --format '{{.OSType}} {{.Architecture}}')" = 'linux x86_64'
           test "$(git rev-parse HEAD^1)" = aeb428c1320ead40c5f45c1eb4dae68d18cfa215
-          git diff --exit-code HEAD^1 HEAD -- services/suitecrm
+          test "$(git diff --name-only HEAD^1 HEAD -- services/suitecrm)" = services/suitecrm/native-email-maintenance.py
+          echo '37a3714742f229cd483fbdf5dbe3c243ee5323fa8b4fc71e3c3fed4f4039d70f  services/suitecrm/native-email-maintenance.py' | sha256sum -c -
           bash -n scripts/fixtures/suitecrm-no-ssh-native-launch.sh
       - name: Build the exact 8.10.2 image on native Linux
         shell: bash
