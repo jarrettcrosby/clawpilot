@@ -1,0 +1,46 @@
+name: SuiteCRM native Linux launch rehearsal (CI only)
+
+on:
+  pull_request:
+    branches: [codex/suitecrm-hotfix-validation-20261112]
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/suitecrm-native-linux-launch-rehearsal.yml'
+      - 'scripts/fixtures/suitecrm-no-ssh-native-launch.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  native-linux-launch-rehearsal:
+    if: >-
+      github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/suitecrm-native-linux-launch-rehearsal-20261112' &&
+      github.event.pull_request.base.sha == 'aeb428c1320ead40c5f45c1eb4dae68d18cfa215'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify native host and exact SuiteCRM build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -sm)" = 'Linux x86_64'
+          test "$(docker info --format '{{.OSType}} {{.Architecture}}')" = 'linux x86_64'
+          test "$(git rev-parse HEAD^1)" = aeb428c1320ead40c5f45c1eb4dae68d18cfa215
+          git diff --exit-code HEAD^1 HEAD -- services/suitecrm
+          bash -n scripts/fixtures/suitecrm-no-ssh-native-launch.sh
+      - name: Build the exact 8.10.2 image on native Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --iidfile "$RUNNER_TEMP/suitecrm-no-ssh.iid" services/suitecrm
+      - name: Verify the isolated maintenance responder and child lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/fixtures/suitecrm-no-ssh-native-launch.sh --iidfile "$RUNNER_TEMP/suitecrm-no-ssh.iid"
