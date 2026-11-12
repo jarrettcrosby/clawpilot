@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Exercise the exact migration runner and custody CLI on a fresh synthetic DB.
+// Exercise the migration runner, custody CLI and release recorder on a fresh synthetic DB.
 // No inherited connection strings, application provider credentials or seed.
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -143,9 +143,52 @@ try {
   assert.equal(run('scripts/verify-integration-credential-runtime.mjs', operatorUrl, startup).status, 1)
   await denied(app.query('DELETE FROM public.operations_integration_credential_key_attestations'))
 
+  // The app may record the release but must never run migrations or change
+  // the ledger. These grants apply only to the disposable fixture.
+  await operator.query(`GRANT SELECT, INSERT, UPDATE ON public.release_entries TO ${roles.runtime}`)
+  await denied(app.query('CREATE TABLE public.fixture_forbidden_ddl (id integer)'))
+  await denied(app.query('ALTER TABLE public.schema_migrations ADD COLUMN IF NOT EXISTS checksum text'))
+  const readLedger = async () => (await operator.query(
+    'SELECT filename, checksum, applied_at FROM public.schema_migrations ORDER BY filename',
+  )).rows
+  const originalLedger = await readLedger()
+  const readReleases = async () => (await operator.query(
+    'SELECT * FROM public.release_entries WHERE environment = $1 ORDER BY release_key', ['custody-fixture'],
+  )).rows
+  const record = (connectionString, overrides = {}) => run('scripts/record-release.mjs', connectionString, {
+    ...startup, RELEASE_COMMIT: 'a'.repeat(40), RELEASE_TITLE: 'Restricted fixture release', ...overrides,
+  })
+  assert.deepEqual(await readReleases(), [])
+  const recorded = record(runtimeUrl)
+  assert.equal(recorded.status, 0, recorded.stderr)
+  const first = JSON.parse(recorded.stdout)
+  assert.equal(first.ok, true)
+  assert.equal(first.changed, true)
+  const originalReleases = await readReleases()
+  assert.equal(originalReleases.length, 1)
+  assert.equal(originalReleases[0].id, first.id)
+  assert.equal(originalReleases[0].title, 'Restricted fixture release')
+  const recordedAgain = record(runtimeUrl)
+  assert.equal(recordedAgain.status, 0, recordedAgain.stderr)
+  assert.deepEqual(JSON.parse(recordedAgain.stdout), { ...first, changed: false })
+  assert.deepEqual(await readLedger(), originalLedger)
+  const refusedRecord = async (connectionString, errorCode, overrides) => {
+    const refused = record(connectionString, overrides)
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, new RegExp(`\\b${errorCode}\\b`, 'u'))
+    assert.doesNotMatch(refused.stdout, /db:migrate|"ok"\s*:\s*true/u)
+    assert.deepEqual(await readReleases(), originalReleases)
+  }
+  await refusedRecord(operatorUrl, 'postgres_custody_unverified', { RELEASE_DEPLOYMENT_ID: 'wrong-login' })
+
   const rejectAndRestore = async (add, remove, expectedError = 'postgres_custody_unverified', actor = operator) => {
     await actor.query(add)
-    try { await rejected(verifySplitPostgresCustody(app, roles, expected), expectedError) }
+    try {
+      await rejected(verifySplitPostgresCustody(app, roles, expected), expectedError)
+      // Refuse both a new deployment and a change to an existing entry.
+      await refusedRecord(runtimeUrl, expectedError, { RELEASE_DEPLOYMENT_ID: 'unverified-custody' })
+      await refusedRecord(runtimeUrl, expectedError, { RELEASE_TITLE: 'Unverified replacement' })
+    }
     finally { await actor.query(remove) }
     await verifySplitPostgresCustody(app, roles, expected)
   }
@@ -172,7 +215,9 @@ try {
     `INSERT INTO public.schema_migrations (filename,checksum) VALUES ('${filename}','${checksum}')`, mismatch)
   await rejectAndRestore("INSERT INTO public.schema_migrations (filename,checksum) VALUES ('unexpected.sql','x')",
     "DELETE FROM public.schema_migrations WHERE filename = 'unexpected.sql'", mismatch)
-  console.log(`PostgreSQL ${major}: exact operator migration, restricted app ledger and startup proof, and denied custody drift passed`)
+  await rejectAndRestore('ALTER TABLE public.schema_migrations RENAME TO fixture_missing_ledger',
+    'ALTER TABLE public.fixture_missing_ledger RENAME TO schema_migrations')
+  console.log(`PostgreSQL ${major}: exact operator migration, restricted app ledger and startup proof, release recording, and denied custody drift passed`)
 } finally {
   await Promise.allSettled(clients.map((client) => client.end()))
   if (launched) guard.cleanup(fixture)

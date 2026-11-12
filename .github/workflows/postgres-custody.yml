@@ -9,6 +9,7 @@ on:
       - 'scripts/db-migrate.mjs'
       - 'scripts/lib/disposable-postgres-docker.mjs'
       - 'scripts/predeploy-railway.sh'
+      - 'scripts/record-release.mjs'
       - 'scripts/start-railway.sh'
       - 'scripts/test-crm-maintenance-write-fence-postgres.mjs'
       - 'scripts/test-integration-credential-runtime-*.mjs'
@@ -43,7 +44,7 @@ jobs:
       - run: npm --prefix app_src ci
       - name: Load disposable PostgreSQL image
         run: docker pull "pgvector/pgvector:pg$CUSTODY_POSTGRES"
-      - name: Verify operator migration, restricted predeploy and ledger
+      - name: Verify operator migration, restricted predeploy, ledger and release recording
         run: node scripts/test-postgres-custody.mjs "$CUSTODY_POSTGRES"
       - name: Verify fence activation, access denial, drain and reopen
         run: node scripts/test-crm-maintenance-write-fence-postgres.mjs "--postgres-major=$CUSTODY_POSTGRES"

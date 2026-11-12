@@ -342,9 +342,11 @@ production logins, grants, service variables, or CRM data.
   private operator context. The App predeploy verifies the exact applied
   migration ledger and custody read-only, retains its read-only preflights,
   and skips inline migrations and demo seeding. App startup rechecks the
-  ledger and custody before running the App. Any separately required demo
-  preparation must have its own review; do not grant the App owner rights to
-  make it pass.
+  ledger and custody before running the App. Post-readiness release recording
+  also checks the exact ledger read-only in this mode and then writes only
+  the release entry; it does not run migrations. Any separately required
+  demo preparation must have its own review; do not grant the App owner
+  rights to make it pass.
 - Inventory effective runtime grants on the exact release schema, including
   column, sequence, and function privileges. Grant only reviewed runtime
   operations, not ownership, elevation, blanket function execution, or
