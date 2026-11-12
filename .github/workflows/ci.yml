@@ -42,9 +42,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ['16', '18']
+        include:
+          # Catalog fingerprints depend on the database build, not just its
+          # major. Update these only with a reviewed catalog comparison.
+          - postgres: '16'
+            digest: sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
+          - postgres: '18'
+            digest: sha256:c29f30688a9ad961691bdf0ec1650717cc132a5814619d80f80463d6e4c42e47
     env:
       CLAWPILOT_TEST_POSTGRES_IMAGE: pgvector/pgvector:pg${{ matrix.postgres }}
+      CATALOG_POSTGRES_DIGEST: ${{ matrix.digest }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -54,10 +61,15 @@ jobs:
           cache-dependency-path: app_src/package-lock.json
       - name: Install application test dependencies
         run: npm --prefix app_src ci
-      - name: Preload the exact PostgreSQL major
+      - name: Preload the audited PostgreSQL build
         run: |
-          docker pull "$CLAWPILOT_TEST_POSTGRES_IMAGE"
-          docker image inspect "$CLAWPILOT_TEST_POSTGRES_IMAGE" --format '{{json .RepoDigests}}'
+          set -euo pipefail
+          pinned="pgvector/pgvector@$CATALOG_POSTGRES_DIGEST"
+          docker pull "$pinned"
+          docker image inspect "$pinned" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep -Fx "$pinned"
+          # The fixtures use a major-bearing image name and --pull=never.
+          docker tag "$pinned" "$CLAWPILOT_TEST_POSTGRES_IMAGE"
+          test "$(docker image inspect "$pinned" --format '{{.Id}}')" = "$(docker image inspect "$CLAWPILOT_TEST_POSTGRES_IMAGE" --format '{{.Id}}')"
       - name: CRM maintenance transaction and writer isolation
         env:
           CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
