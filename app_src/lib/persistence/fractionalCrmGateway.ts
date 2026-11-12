@@ -10,7 +10,7 @@ import {canonicalHash,exactKeys,gatewayGlobalId,gatewayObject,gatewayUuid,gatewa
 import type {GatewayEntity,GatewayFields,GatewayRecord} from '@/lib/crm/fractionalGatewayModel'
 import {fractionalFolderUrl,fractionalFolderState,isFractionalDriveFolderUrl,mergeFractionalCustomerFolder} from '@/lib/crm/fractionalCustomerFolder'
 import {lockFractionalFolderBoardCards,projectFractionalFolderBoardCards,assertFractionalFolderBoardCardsCurrent} from '@/lib/crm/fractionalFolderBoardProjection'
-import type {FractionalCrmFolderPatch} from '@/lib/fractionalCrmGatewayHttp'
+import type {FractionalCrmFolderPatch,FractionalCrmOrganizationContactCreate} from '@/lib/fractionalCrmGatewayHttp'
 
 type Row=Record<string,unknown>
 type Context={principal:FractionalCrmPrincipal;root:Row;actorEmail:string}
@@ -146,14 +146,50 @@ export async function listFractionalCrmProducts(p:FractionalCrmPrincipal,page:{l
   nextCursor:rows.length>limit?Buffer.from(JSON.stringify({scope:cursorScope,after:selected.at(-1)!.id})).toString('base64url'):null}
 })}
 export async function readFractionalCrmContact(p:FractionalCrmPrincipal,ga:string,gc:string){return withTransaction(async client=>{const ctx=await context(client,p,'crm.contact.read'),parent=await companyRow(client,ctx,ga),row=await contactRow(client,ctx,parent,gc);return envelope(ctx,'contact',row,parent,gc)})}
-export async function listFractionalCrmContacts(p:FractionalCrmPrincipal,ga:string,page:{limit?:number;cursor?:string|null}={}){return withTransaction(async client=>{
- const ctx=await context(client,p,'crm.contact.read'),parent=await companyRow(client,ctx,ga),limit=page.limit??50;if(!Number.isInteger(limit)||limit<1||limit>100)fail(422,'INVALID_PAGE')
- let after='';if(page.cursor){const value=parse(()=>JSON.parse(Buffer.from(page.cursor!,'base64url').toString('utf8'))) as Row;
- if(value.scope!==canonicalHash({credentialId:p.credentialId,scope:scope(ctx),company:parent.id})||!gatewayUuid(value.after))fail(422,'INVALID_PAGE');after=String(value.after)}
+type ContactPage = {limit?:number;cursor?:string|null}
+async function listContactPage(client:PoolClient,ctx:Context,parent:Row,page:ContactPage,organizationContacts=false){
+ const limit=page.limit??50
+ if(!Number.isInteger(limit)||limit<1||limit>100)fail(422,'INVALID_PAGE')
+ const cursorScope=canonicalHash({credentialId:ctx.principal.credentialId,scope:scope(ctx),company:parent.id})
+ let after=''
+ if(page.cursor){
+  let decoded:unknown
+  try{decoded=JSON.parse(Buffer.from(page.cursor,'base64url').toString('utf8'))}catch{fail(422,'INVALID_PAGE')}
+  if(!decoded||typeof decoded!=='object'||Array.isArray(decoded))return fail(422,'INVALID_PAGE')
+  const value=decoded as Row
+  if(value.scope!==cursorScope||!gatewayUuid(value.after))fail(422,'INVALID_PAGE')
+  after=String(value.after)
+ }
  const rows=(await client.query(`SELECT * FROM crm_contacts WHERE pipeline_id=$1::uuid AND organization_id=$2::uuid
-  AND COALESCE(lower(source_payload->>'archived'),'false') NOT IN ('true','1','yes') AND ($3='' OR id>NULLIF($3,'')::uuid) ORDER BY id LIMIT $4`,[p.pipelineId,parent.id,after,limit+1])).rows
- const selected=rows.slice(0,limit);return {schemaVersion:1,sourceInstanceId:p.sourceInstanceId,scope:scope(ctx),items:selected.map(row=>envelope(ctx,'contact',row,parent,str(row,'reference_code'))),nextCursor:rows.length>limit?Buffer.from(JSON.stringify({scope:canonicalHash({credentialId:p.credentialId,scope:scope(ctx),company:parent.id}),after:selected.at(-1)!.id})).toString('base64url'):null}
- })}
+  AND COALESCE(lower(source_payload->>'archived'),'false') NOT IN ('true','1','yes') AND ($3='' OR id>NULLIF($3,'')::uuid) ORDER BY id LIMIT $4`,
+  [ctx.principal.pipelineId,parent.id,after,limit+1])).rows
+ const selected=rows.slice(0,limit)
+ return {schemaVersion:1,sourceInstanceId:ctx.principal.sourceInstanceId,scope:scope(ctx),
+  items:selected.map(row=>{
+   const record=envelope(ctx,'contact',row,parent,str(row,'reference_code'))
+   return organizationContacts?{...record,canPush:false}:record
+  }),
+  nextCursor:rows.length>limit?Buffer.from(JSON.stringify({scope:cursorScope,after:selected.at(-1)!.id})).toString('base64url'):null}
+}
+export async function listFractionalCrmContacts(p:FractionalCrmPrincipal,ga:string,page:ContactPage={}){
+ return withTransaction(async client=>{
+  const ctx=await context(client,p,'crm.contact.read')
+  return listContactPage(client,ctx,await companyRow(client,ctx,ga),page)
+ })
+}
+export async function listFractionalCrmOrganizationContacts(p:FractionalCrmPrincipal,page:ContactPage={}){
+ return withTransaction(async client=>{
+  const ctx=await context(client,p,'crm.contact.read')
+  return listContactPage(client,ctx,ctx.root,page,true)
+ })
+}
+export async function readFractionalCrmOrganizationContact(p:FractionalCrmPrincipal,gc:string){
+ return withTransaction(async client=>{
+  const ctx=await context(client,p,'crm.contact.read')
+  const contact=await contactRow(client,ctx,ctx.root,gc)
+  return {...envelope(ctx,'contact',contact,ctx.root,gc),canPush:false}
+ })
+}
 function idempotency(value:string){if(!/^[A-Za-z0-9_-]{8,160}$/.test(value))fail(422,'INVALID_IDEMPOTENCY_KEY')}
 async function operation<T>(client:PoolClient,ctx:Context,key:string,kind:string,input:unknown,apply:(operationId:string)=>Promise<T>):Promise<T>{
  idempotency(key);const hash=canonicalHash({scope:scope(ctx),sourceInstanceId:ctx.principal.sourceInstanceId,kind,input});
@@ -162,11 +198,45 @@ async function operation<T>(client:PoolClient,ctx:Context,key:string,kind:string
  const response=prior.response as Row
  if(response.company){const old=gatewayObject(gatewayObject(response.company).record),current=await companyRow(client,ctx,String(old.globalId));if(current.id!==old.recordId)fail(409,'IDENTITY_CONFLICT')
  if(response.contact){const person=gatewayObject(gatewayObject(response.contact).record),contact=await contactRow(client,ctx,current,String(person.globalId));if(contact.id!==person.recordId)fail(409,'IDENTITY_CONFLICT')}}
+ if(kind==='organization-contact-create'){
+  const saved=gatewayObject(response.record),requested=gatewayObject(input)
+  const current=await contactRow(client,ctx,ctx.root,String(saved.globalId))
+  if(current.id!==saved.recordId||current.reference_code!==saved.globalId||normalizedEmail(current.email)!==requested.email)fail(409,'IDENTITY_CONFLICT')
+  return {...response,record:{...envelope(ctx,'contact',current,ctx.root,String(saved.globalId)),canPush:false}} as T
+ }
  if(Array.isArray(response.candidates))for(const raw of response.candidates){const candidate=gatewayObject(raw),parent=await companyRow(client,ctx,String(candidate.companyGlobalId));if(candidate.entity==='contact')await contactRow(client,ctx,parent,String(candidate.globalId))}
  return {...response,...(kind==='onboarding'?{replayed:true}:{})} as T}
  const operationId=crypto.randomUUID(),response=await apply(operationId)
  const attribution=gatewayObject(input)
  await client.query('INSERT INTO fractional_crm_gateway_operations(id,credential_id,idempotency_key,request_hash,operation,response,asserted_actor,origin) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[operationId,ctx.principal.credentialId,key,hash,kind,response,attribution.actor??{},attribution.origin??null]);return response
+}
+export async function createFractionalCrmOrganizationContact(
+ p:FractionalCrmPrincipal,input:FractionalCrmOrganizationContactCreate,key:string,
+){
+ return withTransaction(async client=>{
+  const ctx=await context(client,p,'crm.onboarding.write',true,true)
+  if(!ctx.principal.capabilities.includes('crm.contact.read'))fail(403,'CAPABILITY_DENIED')
+  if(input.schemaVersion!==1||input.deploymentId!==ctx.principal.fractionalDeploymentId||
+   input.actor.organizationId!==ctx.principal.fractionalOrganizationId)fail(403,'SCOPE_DENIED')
+  const fields=parse(()=>parseGatewayFields('contact',{displayName:input.displayName,email:normalizedEmail(input.email),jobTitle:input.jobTitle,phone:null}))
+  const email=normalizedEmail(fields.email)
+  if(!email||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!fields.displayName||
+   !input.actor.userId||input.actor.userId.length>200||!input.actor.targetUserId||input.actor.targetUserId.length>200)fail(422,'INVALID_FIELDS')
+  return operation(client,ctx,key,'organization-contact-create',{...input,email},async()=>{
+   const matches=(await client.query(`SELECT * FROM crm_contacts WHERE pipeline_id=$1::uuid AND lower(btrim(email))=$2
+    ORDER BY id LIMIT 2 FOR SHARE`,[ctx.principal.pipelineId,email])).rows
+   if(matches.length>1||matches.some(row=>row.organization_id!==ctx.root.id||!active(row)))fail(409,'CONTACT_RELATIONSHIP_REVIEW')
+   let contact=matches[0]
+   if(!contact){
+    const sourceKey='fractional-staff:'+canonicalHash([ctx.principal.fractionalDeploymentId,ctx.principal.fractionalOrganizationId,input.actor.targetUserId])
+    const staged=await stageFields(client,ctx,'contact',undefined,ctx.root,{...fields,email},input.actor,sourceKey)
+    contact=await contactRow(client,ctx,ctx.root,staged.referenceCode,true)
+   }
+   const record={...envelope(ctx,'contact',contact,ctx.root,str(contact,'reference_code')),canPush:false}
+   if(record.fields.email!==email&&!matches.length)fail(409,'CANONICAL_WRITE_MISMATCH')
+   return {record,created:matches.length===0}
+  })
+ })
 }
 function originalCompany(row:Row):StageOrganizationInput['fields']{return {parentOrganizationId:nullable(row,'parent_organization_id'),workspaceOrganizationId:nullable(row,'workspace_organization_id'),relationshipType:row.relationship_type as 'customer',
  name:str(row,'name'),priority:str(row,'priority'),accountType:str(row,'account_type'),accountManager:str(row,'account_manager'),website:str(row,'website'),linkedinUrl:str(row,'linkedin_url'),phone:str(row,'phone'),email:str(row,'email'),emailOptOut:row.email_opt_out===true,

@@ -143,6 +143,22 @@ try{
  const before=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT count(*) FROM sync_outbox) AS outbox')).rows[0]
  const company=await gateway.readFractionalCrmCompany(principal,a.referenceCode),contact=await gateway.readFractionalCrmContact(principal,a.referenceCode,ca.referenceCode)
  const after=(await pool.query('SELECT (SELECT count(*) FROM crm_organizations) AS companies,(SELECT count(*) FROM crm_contacts) AS contacts,(SELECT count(*) FROM sync_outbox) AS outbox')).rows[0];assert.deepEqual(after,before);checks++
+ const rootContact=await stageContact({id:root,suiteCrmId:root},'Existing Staff','existing.staff@example.invalid')
+ const staffPage=await gateway.listFractionalCrmOrganizationContacts(principal,{limit:50})
+ assert.deepEqual(Array.from(staffPage.items,item=>item.globalId),[rootContact.referenceCode]);checks++
+ check((await gateway.readFractionalCrmOrganizationContact(principal,rootContact.referenceCode)).companyGlobalId===ga,
+  'staff contact read is bound to the registered root')
+ await denied(()=>gateway.readFractionalCrmOrganizationContact(principal,ca.referenceCode),'RECORD_NOT_FOUND')
+ await denied(()=>gateway.listFractionalCrmContacts(principal,ga),'RECORD_NOT_FOUND')
+ const staffContact={schemaVersion:1,deploymentId:deployment,displayName:'New Staff',email:'new.staff@example.invalid',jobTitle:null,
+  actor:{userId:'fractional-operator',organizationId:'fractional-fixture',targetUserId:'fractional-staff'}}
+ const queuedStaff=await gateway.createFractionalCrmOrganizationContact(principal,staffContact,'fixture-staff-create')
+ check(queuedStaff.created&&queuedStaff.record.companyGlobalId===ga&&!queuedStaff.record.canPush,'new staff creates a contact under the exact root')
+ const replayedStaff=await gateway.createFractionalCrmOrganizationContact(principal,staffContact,'fixture-staff-create')
+ check(replayedStaff.record.recordId===queuedStaff.record.recordId,'staff create replays the same exact CRM identity')
+ const resolvedStaff=await gateway.createFractionalCrmOrganizationContact(principal,{...staffContact,email:'existing.staff@example.invalid'},'fixture-staff-resolve')
+ check(!resolvedStaff.created&&resolvedStaff.record.globalId===rootContact.referenceCode,'an exact root email resolves to the existing contact')
+ await denied(()=>gateway.createFractionalCrmOrganizationContact(principal,{...staffContact,email:'contact-a@example.invalid'},'fixture-staff-foreign'),'CONTACT_RELATIONSHIP_REVIEW')
  await denied(()=>gateway.readFractionalCrmCompany({...principal,pipelineId:randomUUID()},a.referenceCode),'CAPABILITY_DENIED')
  await denied(()=>gateway.readFractionalCrmCompany(principal,hidden.referenceCode),'RECORD_NOT_FOUND')
  await denied(()=>gateway.readFractionalCrmContact(principal,a.referenceCode,cb.referenceCode),'RECORD_NOT_FOUND')

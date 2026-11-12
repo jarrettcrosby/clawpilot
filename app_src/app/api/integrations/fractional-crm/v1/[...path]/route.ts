@@ -1,6 +1,7 @@
 import { handleFractionalCrmGateway, type FractionalCrmGatewayServices } from '@/lib/fractionalCrmGatewayHttp'
 import {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
+  listFractionalCrmOrganizationContacts, readFractionalCrmOrganizationContact, createFractionalCrmOrganizationContact,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
   readFractionalCrmCustomerFolder, updateFractionalCrmCustomerFolder,
   readFractionalCrmProduct, listFractionalCrmProducts,
@@ -12,6 +13,7 @@ export const dynamic = 'force-dynamic'
 
 const services = {
   readFractionalCrmCredential, readFractionalCrmOrganization, readFractionalCrmCompany, readFractionalCrmContact, listFractionalCrmContacts,
+  listFractionalCrmOrganizationContacts, readFractionalCrmOrganizationContact, createFractionalCrmOrganizationContact,
   updateFractionalCrmCompany, updateFractionalCrmContact, resolveOrCreateFractionalCrmOnboarding,
   readFractionalCrmProduct, listFractionalCrmProducts,
   readFractionalCrmCustomerFolder,
