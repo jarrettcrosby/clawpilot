@@ -72,11 +72,10 @@ mode; adoption mode deliberately rejects a populated sentinel.
 
 The proof is not a same-transaction database attestation for every provider
 write. The trusted infrastructure boundary therefore includes the stable
-`DATABASE_URL` routing, its database owner/runtime role, and the database
+`DATABASE_URL` routing, the approved database role custody, and the database
 identity during the proof's bounded lifetime. A routing or owner compromise
 inside that window is outside the application-layer proof. Health and the
-periodic refresh bound that exposure; a future per-operation transaction-bound
-attestation or separate least-privilege runtime role would narrow it further.
+periodic refresh bound that exposure.
 
 ## Empty database bootstrap
 
@@ -178,12 +177,22 @@ Key rotation cannot mutate this singleton. It requires an explicitly reviewed
 future schema/version transition so the old proof remains durable evidence.
 
 The table is immutable by trigger. Ambient `PUBLIC` table access and direct
-execution of its trigger functions are revoked. Railway currently runs the
-migration and application with the same `DATABASE_URL`, so that database role
-may own the table and remains part of the trusted migration/operator boundary.
+execution of its trigger functions are revoked. In the default shared-role
+configuration, Railway runs migrations and the App with the same
+`DATABASE_URL`; runtime attestation requires that login to own the table.
 The transaction-local reviewed-adoption context prevents accidental generic
 runtime or operator inserts; it is not a security boundary against a malicious
 or compromised table owner or superuser, which can alter or disable database
-objects. A future split between a schema-owner migration role and a
-least-privilege runtime role would provide that stronger infrastructure
-boundary.
+objects.
+
+In the opt-in `CLAWPILOT_POSTGRES_CUSTODY=split-v1` rehearsal, pin the distinct
+runtime and operator login names with `CLAWPILOT_POSTGRES_RUNTIME_ROLE` and
+`CLAWPILOT_POSTGRES_OPERATOR_ROLE`. The App uses a restricted `DATABASE_URL`.
+The attestation gate verifies that this is the actual runtime login, has
+read-only access to the sentinel, and is neither the sentinel's owner nor able
+to assume the pinned operator role. The operator must own the sentinel table.
+Do not give the App the operator URL, ownership, or sentinel write access to
+pass startup. Bootstrap, adoption, and migrations remain separate operator
+actions; the rehearsal does not authorize any of them in production. See
+[PostgreSQL role separation rehearsal](suitecrm.md#postgresql-role-separation-rehearsal)
+for the separate cutover and maintenance checks.

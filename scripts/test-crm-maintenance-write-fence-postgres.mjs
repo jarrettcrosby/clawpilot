@@ -16,6 +16,14 @@ const image=`pgvector/pgvector:pg${major}`
 const migration=readFileSync(new URL('../db/migrations/0418_crm_maintenance_write_fence.sql',import.meta.url),'utf8')
 const runtime=createDisposablePostgresRuntime()
 const clients=new Set()
+const fixtureDb='fixture_crm_custody'
+const bootstrapRole='postgres'
+const operatorRole='fixture_crm_operator'
+const workerRole='fixture_crm_worker'
+// These ephemeral values are used only in the no-network Docker fixture.
+const bootstrapPassword=randomUUID()
+const operatorPassword=randomUUID()
+const workerPassword=randomUUID()
 const fence='44124125-c3d0-4958-81ea-39837cb2da59'
 const wrong='bb7b5317-1b39-40d9-86cd-0b17c6915b5c'
 const schema='clawpilot_crm_maintenance'
@@ -27,14 +35,15 @@ function docker(args,input) {
 }
 // The entrypoint's temporary init server is Unix-socket-only. The final
 // fixture has loopback TCP inside --network none, never a published port.
-const psql=['exec','-i','-e','PGPASSWORD=isolated-only-no-network',name,'psql','-X','-qAt','-h','127.0.0.1','-U','postgres','-d','postgres','-v','ON_ERROR_STOP=1','-v','VERBOSITY=verbose']
-const sql=(s)=>docker(psql,s)
-const worker=(s)=>sql('SET ROLE fixture_crm_worker;\n'+s)
+const psql=(role,password,db)=>['exec','-i','-e',`PGPASSWORD=${password}`,name,'psql','-X','-qAt','-h','127.0.0.1','-U',role,'-d',db,'-v','ON_ERROR_STOP=1','-v','VERBOSITY=verbose']
+const bootstrap=(s)=>docker(psql(bootstrapRole,bootstrapPassword,'postgres'),s)
+const sql=(s)=>docker(psql(operatorRole,operatorPassword,fixtureDb),s)
+const worker=(s)=>docker(psql(workerRole,workerPassword,fixtureDb),s)
 function held(fn,state='55000') {
   assert.throws(fn,(e)=>Number.isInteger(e?.status)&&new RegExp(`ERROR:\\s+${state}:`).test(e.stderr??''))
 }
 function stream() {
-  const cp=spawn('docker',psql,{stdio:['pipe','pipe','pipe']})
+  const cp=spawn('docker',psql(workerRole,workerPassword,fixtureDb),{stdio:['pipe','pipe','pipe']})
   let stdout='',stderr=''
   cp.stdout.setEncoding('utf8').on('data',s=>stdout+=s)
   cp.stderr.setEncoding('utf8').on('data',s=>stderr+=s)
@@ -53,6 +62,7 @@ function stream() {
 }
 
 const seed=`
+  REVOKE ALL ON SCHEMA public FROM PUBLIC;
   CREATE SCHEMA crm_legacy_email_retirement;
   CREATE SCHEMA crm_legacy_email_terminal_hold;
   CREATE TABLE crm_legacy_email_retirement.receipts (id text PRIMARY KEY);
@@ -78,24 +88,36 @@ const seed=`
     permissions jsonb, organization_id text, reference_code text, crm_user_enabled boolean DEFAULT false,
     suitecrm_user_id text, suitecrm_username text);
   CREATE TABLE public.operations_fixture (id text PRIMARY KEY);
-  CREATE ROLE fixture_crm_worker;
-  GRANT USAGE ON SCHEMA public,crm_legacy_email_retirement,crm_legacy_email_terminal_hold TO fixture_crm_worker;
+  GRANT USAGE ON SCHEMA public,crm_legacy_email_retirement,crm_legacy_email_terminal_hold TO ${workerRole};
+  -- Deliberately grant TRUNCATE here to exercise its dedicated trigger, not
+  -- as a grant recommendation for the hosted runtime.
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public,
-    crm_legacy_email_retirement,crm_legacy_email_terminal_hold TO fixture_crm_worker;
+    crm_legacy_email_retirement,crm_legacy_email_terminal_hold TO ${workerRole};
 `
 let launched=false
 try {
   const args=disposablePostgresDockerArgs(['run','-d','--pull','never','--name',name,'--network','none',
-    '-e','POSTGRES_PASSWORD=isolated-only-no-network',image,'-c','max_prepared_transactions=2'],{runtime})
+    '-e',`POSTGRES_PASSWORD=${bootstrapPassword}`,image,'-c','max_prepared_transactions=2'],{runtime})
   launched=true
   docker(args)
   for(let i=0;;i++){
-    try {if(sql('SELECT 1;')==='1')break} catch { /* isolated boot */ }
+    try {if(bootstrap('SELECT 1;')==='1')break} catch { /* isolated boot */ }
     assert.ok(i<50,'PostgreSQL fixture did not start')
     await delay(150)
   }
+  bootstrap(`CREATE ROLE ${operatorRole} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${operatorPassword}';
+    CREATE ROLE ${workerRole} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${workerPassword}';
+    CREATE DATABASE ${fixtureDb} OWNER ${operatorRole};
+    REVOKE ALL ON DATABASE ${fixtureDb} FROM PUBLIC;
+    GRANT CONNECT ON DATABASE ${fixtureDb} TO ${workerRole};`)
+  const identity=`SELECT current_user,session_user,rolsuper,rolinherit,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls
+    FROM pg_roles WHERE rolname=current_user;`
+  assert.equal(sql(identity),`${operatorRole}|${operatorRole}|f|f|f|f|f|f`)
+  assert.equal(worker(identity),`${workerRole}|${workerRole}|f|f|f|f|f|f`)
   sql(seed)
   sql('BEGIN;\n'+migration+'\nCOMMIT;')
+  assert.equal(sql(`SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='${schema}';`),operatorRole)
+  assert.equal(sql(`SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='${schema}.write_fence'::regclass;`),operatorRole)
   assert.equal(sql(`SELECT ${schema}.coverage();`),'t')
   assert.equal(sql(`SELECT fence_id IS NULL FROM ${schema}.write_fence;`),'t')
   held(()=>worker(`SELECT ${schema}.transition(NULL,'${fence}');`),'42501')
@@ -108,10 +130,10 @@ try {
     INSERT INTO sync_outbox VALUES ('crm','suitecrm','app_users','sync'),
       ('normal','google_sheets','pipeline_items','ordinary');`)
   const older=stream()
-  older.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET ROLE fixture_crm_worker; SELECT count(*) FROM operations_fixture; SELECT 'snapshot-open';")
+  older.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM operations_fixture; SELECT 'snapshot-open';")
   await older.wait('snapshot-open')
   const admitted=stream()
-  admitted.write("BEGIN; SET ROLE fixture_crm_worker; INSERT INTO crm_interactions VALUES ('prior-write','fixture'); SELECT 'writer-open';")
+  admitted.write("BEGIN; INSERT INTO crm_interactions VALUES ('prior-write','fixture'); SELECT 'writer-open';")
   await admitted.wait('writer-open')
   held(()=>sql("SET lock_timeout='200ms';"+activate),'55P03')
   assert.equal(sql(`SELECT fence_id IS NULL FROM ${schema}.write_fence;`),'t')
@@ -119,9 +141,25 @@ try {
   assert.equal((await admitted.done).code,0)
   worker("BEGIN; INSERT INTO crm_interactions VALUES ('prepared-write','fixture'); PREPARE TRANSACTION 'crm-fence-fixture';")
   held(()=>sql("SET lock_timeout='200ms';"+activate),'55P03')
-  sql("ROLLBACK PREPARED 'crm-fence-fixture';")
+  worker("ROLLBACK PREPARED 'crm-fence-fixture';")
   sql(activate)
   assert.equal(sql(`SELECT fence_id FROM ${schema}.write_fence;`),fence)
+  for(const statement of [
+    `SET ROLE ${operatorRole};`,
+    `SET SESSION AUTHORIZATION ${operatorRole};`,
+    'SET ROLE pg_write_all_data;',
+    "SET session_replication_role='replica';",
+    'ALTER TABLE crm_interactions DISABLE TRIGGER clawpilot_crm_fence_write;',
+    'DROP TRIGGER clawpilot_crm_fence_write ON crm_interactions;',
+    'ALTER TABLE sync_outbox DISABLE TRIGGER clawpilot_crm_fence_truncate;',
+    `DROP SCHEMA ${schema} CASCADE;`,
+    `SELECT ${schema}.admit_write();`,
+    clear,
+    `UPDATE ${schema}.write_fence SET fence_id=NULL;`,
+    `DELETE FROM ${schema}.write_fence;`,
+  ])held(()=>worker(statement),'42501')
+  assert.equal(sql(`SELECT fence_id FROM ${schema}.write_fence;`),fence)
+  assert.equal(sql(`SELECT ${schema}.coverage();`),'t')
   older.write("INSERT INTO crm_interactions VALUES ('stale-snapshot','fixture'); COMMIT;");older.cp.stdin.end()
   const olderResult=await older.done
   assert.notEqual(olderResult.code,0)
@@ -174,7 +212,9 @@ try {
   held(()=>sql(`SELECT ${schema}.transition('${wrong}',NULL);`))
   held(()=>sql(activate))
   sql(clear)
+  assert.equal(sql(`SELECT fence_id IS NULL FROM ${schema}.write_fence;`),'t')
   worker("INSERT INTO crm_interactions VALUES ('resumed','fixture');")
+  assert.equal(worker("SELECT count(*) FROM crm_interactions WHERE id='resumed';"),'1')
 
   sql('ALTER TABLE crm_interactions DISABLE TRIGGER clawpilot_crm_fence_write;')
   assert.equal(sql(`SELECT ${schema}.coverage();`),'f')
@@ -187,7 +227,7 @@ try {
   held(()=>sql(activate))
   sql(`DELETE FROM ${schema}.write_fence;`)
   held(()=>worker("INSERT INTO crm_interactions VALUES ('missing-gate','fixture');"))
-  console.log(`PASS PostgreSQL ${major}: CRM fence scope, activation drain, stale snapshot, unchanged unrelated writes, reopening and fail-closed drift`)
+  console.log(`PASS PostgreSQL ${major}: distinct CRM app/operator logins, denied fence bypass, activation drain, unchanged unrelated writes, reopening and fail-closed drift`)
 } finally {
   for(const cp of clients){cp.stdin.destroy();cp.kill('SIGTERM')}
   if(launched)assert.ok(runtime.cleanup(),'Guarded PostgreSQL cleanup was not verified')

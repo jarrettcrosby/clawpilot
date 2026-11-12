@@ -25,6 +25,7 @@ import {
   type ProjectBoard,
 } from '@/lib/tenancy'
 import {
+  CRM_BOARD_NAME,
   CrmDescriptionConflictError,
   reconcileCrmBoardProjection,
   resolveCrmBoardBinding,
@@ -321,6 +322,16 @@ async function resolveTaskBoard(
   return board
 }
 
+function isReservedCrmBoard(board: ProjectBoard): boolean {
+  return Boolean(board.name && board.name.trim().toLowerCase() === CRM_BOARD_NAME)
+}
+
+function crmMaintenanceResponse() {
+  return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
+    status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
+  })
+}
+
 export type TaskIntent = {
   title: string
   description: string
@@ -485,14 +496,18 @@ export async function GET(req: NextRequest) {
     const includeArchived = searchParams.get('includeArchived') === 'true'
     const actor = await requireRequestUser(req)
     const canReadCrm = moduleCapabilitiesForUser(actor).crm
-    const includeCrmCards = canReadCrm && searchParams.get('includeCrmCards') === 'true'
+    const requestedCrmCards = canReadCrm && searchParams.get('includeCrmCards') === 'true'
     const board = await resolveTaskBoard(req)
+    let includeCrmCards = !board && requestedCrmCards
     if (board && canReadCrm) {
       const binding = await resolveCrmBoardBinding(board.id)
       if (binding) {
         await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
+        if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE !== '1') {
+          await reconcileCrmBoardProjection({ boardId: board.id })
+        }
+        includeCrmCards = requestedCrmCards
       }
-      await reconcileCrmBoardProjection({ boardId: board.id })
     }
     const tasks = (await readTasks(board?.id, includeCrmCards)).filter((task) => includeCrmCards || !isCrmBoardCard(task))
     return NextResponse.json(includeArchived ? tasks : tasks.filter((task) => !task.archived))
@@ -513,7 +528,7 @@ export async function POST(req: NextRequest) {
     const message = error instanceof Error ? error.message : 'Project board access denied'
     return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
   }
-  if (board && await resolveCrmBoardBinding(board.id)) {
+  if (board && (isReservedCrmBoard(board) || await resolveCrmBoardBinding(board.id))) {
     return NextResponse.json({ error: 'CRM cards are created from CRM accounts and contacts' }, { status: 409 })
   }
   const tasks = await readTasks(board?.id)
@@ -745,6 +760,7 @@ export async function PATCH(req: NextRequest) {
     const message = error instanceof Error ? error.message : 'Project board access denied'
     return NextResponse.json({ error: message }, { status: message === 'Unauthorized' ? 401 : 403 })
   }
+  let crmBoard = false
   if (board) {
     const binding = await resolveCrmBoardBinding(board.id)
     if (binding) {
@@ -756,9 +772,14 @@ export async function PATCH(req: NextRequest) {
       }
       const pipeline = await resolvePipelineSpaceAccess({ actorEmail: actor, pipelineId: binding.pipeline_id })
       requireResourceEditor(pipeline)
+      if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') return crmMaintenanceResponse()
+      crmBoard = true
+    } else if (isReservedCrmBoard(board)) {
+      if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') return crmMaintenanceResponse()
+      return NextResponse.json({ error: 'CRM board binding is not available' }, { status: 409 })
     }
   }
-  const tasks = await readTasks(board?.id, true)
+  const tasks = await readTasks(board?.id, !board || crmBoard)
   const body = await req.json() as TaskPatchBody
   const { id, crmDescription, crmDescriptionHash, _comment, _editCommentId, _editCommentText, _deleteCommentId, _restoreCommentId, _checklistAdd, _checklistToggle, _checklistDelete, _checklistUpdate, _execution, _agentDispatchState, _suggestionAction, _actor, _deleteReason, ...rawUpdates } = body
   if (_agentDispatchState && !workerContext) {
@@ -778,9 +799,7 @@ export async function PATCH(req: NextRequest) {
   )
   if (hasCrmDescriptionUpdate) {
     if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
-      return NextResponse.json({ ok: false, error: 'CRM sync is temporarily paused for maintenance' }, {
-        status: 503, headers: { 'Cache-Control': 'private, no-store', 'Retry-After': '60' },
-      })
+      return crmMaintenanceResponse()
     }
     if (!board) return NextResponse.json({ error: 'CRM board context is required' }, { status: 409 })
     try {

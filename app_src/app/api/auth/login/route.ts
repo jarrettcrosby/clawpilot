@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getLoginPassword } from '@/lib/auth'
 import { createBrowserSession, setBrowserSessionCookie } from '@/lib/authSessions'
 import { recordAuthActivity } from '@/lib/authAudit'
-import { configuredOwnerEmail, ensureOwnerUser, markAppUserSignedIn } from '@/lib/users'
+import { configuredOwnerEmail, ensureOwnerUser, getAppUser, isRootAppOwner, markAppUserSignedIn } from '@/lib/users'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 
 const WINDOW_MS = 15 * 60 * 1000
@@ -95,10 +95,28 @@ export async function POST(req: NextRequest) {
     }
 
     attemptsStore().delete(key)
-    await ensureOwnerUser()
     const ownerEmail = configuredOwnerEmail()
-    await markAppUserSignedIn(ownerEmail)
-    await ensureDefaultResourcesForUser(ownerEmail)
+    const owner = await getAppUser(ownerEmail)
+    if (owner?.status === 'disabled') {
+      return NextResponse.json({ ok: false, error: 'User access is not active' }, { status: 401 })
+    }
+    const ownerReady = owner?.status === 'active' && isRootAppOwner(owner)
+    if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') {
+      // Existing access can issue a session; owner repair and resource
+      // provisioning are intentionally deferred while CRM writes are paused.
+      if (!ownerReady) {
+        return NextResponse.json({ ok: false, error: 'Owner setup is temporarily paused' }, { status: 503 })
+      }
+    } else {
+      if (!ownerReady) {
+        const repaired = await ensureOwnerUser()
+        if (repaired.status !== 'active' || !isRootAppOwner(repaired)) {
+          return NextResponse.json({ ok: false, error: 'User access is not active' }, { status: 401 })
+        }
+      }
+      await markAppUserSignedIn(ownerEmail)
+      await ensureDefaultResourcesForUser(ownerEmail)
+    }
     const issued = await createBrowserSession({
       email: ownerEmail,
       authMethod: 'operator_password',

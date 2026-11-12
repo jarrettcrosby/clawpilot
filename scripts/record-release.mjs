@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { splitPostgresCustody, verifySplitPostgresCustody } from './verify-postgres-custody.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const root = resolve(scriptDir, '..')
@@ -202,8 +203,6 @@ const usesOneTimeDefault = Boolean(
   && envFixes === null
 )
 
-runMigrations()
-
 const sslMode = String(process.env.PGSSLMODE || process.env.DATABASE_SSL || '').toLowerCase()
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -212,16 +211,16 @@ const pool = new Pool({
   query_timeout: 10000,
 })
 
-async function main() {
+async function recordRelease(database) {
   let effectiveTitle = title
   let effectiveSummary = summary
   let effectiveFeatures = features
   let effectiveFixes = fixes
   if (usesOneTimeDefault) {
-    const prior = await pool.query(
+    const prior = await database.query(
       `
         SELECT 1
-        FROM release_entries
+        FROM public.release_entries
         WHERE environment = $1
           AND commit_hash <> $2
           AND title = $3
@@ -249,9 +248,9 @@ async function main() {
     source,
     deployedAt,
   ]
-  const result = await pool.query(
+  const result = await database.query(
     `
-      INSERT INTO release_entries (
+      INSERT INTO public.release_entries (
         release_key, commit_hash, environment, branch, deployment_id, title, summary,
         features, fixes, source, deployed_at, created_at, updated_at
       )
@@ -294,10 +293,10 @@ async function main() {
     values,
   )
 
-  const row = result.rows[0] || (await pool.query(
+  const row = result.rows[0] || (await database.query(
     `
       SELECT id, deployed_at
-      FROM release_entries
+      FROM public.release_entries
       WHERE environment = $1 AND release_key = $2
     `,
     [environment, releaseKey],
@@ -311,6 +310,24 @@ async function main() {
     deployedAt: new Date(row.deployed_at).toISOString(),
     changed: result.rowCount > 0,
   }))
+}
+
+async function main() {
+  const roles = splitPostgresCustody(process.env)
+  if (!roles) {
+    runMigrations()
+    return recordRelease(pool)
+  }
+
+  // The independent operator already ran migrations. Use the restricted
+  // login for a read-only ledger check and the ordinary release write only.
+  const client = await pool.connect()
+  try {
+    await verifySplitPostgresCustody(client, roles)
+    await recordRelease(client)
+  } finally {
+    client.release()
+  }
 }
 
 main()
