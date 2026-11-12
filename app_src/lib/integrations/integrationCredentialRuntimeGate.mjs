@@ -27,6 +27,7 @@ export const INTEGRATION_CREDENTIAL_RUNTIME_ADOPTION_DEADLINE_ENV =
   'INTEGRATION_CREDENTIAL_ATTESTATION_ADOPTION_DEADLINE'
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u
+const POSTGRES_CUSTODY_ROLE_PATTERN = /^[a-z_][a-z0-9_]{0,62}$/u
 const PROOF_PATTERN = /^[A-Za-z0-9_-]{40,4096}\.[A-Za-z0-9_-]{43}$/u
 const PROOF_CLOCK_SKEW_MS = 30 * 1000
 const ATTESTATION_MIGRATION =
@@ -61,6 +62,26 @@ function fail(code) {
 
 function value(environment, name) {
   return String(environment?.[name] || '')
+}
+
+function resolvePostgresCustody(environment, hosted, mode) {
+  const custody = value(environment, 'CLAWPILOT_POSTGRES_CUSTODY')
+  const runtimeRole = value(environment, 'CLAWPILOT_POSTGRES_RUNTIME_ROLE')
+  const operatorRole = value(environment, 'CLAWPILOT_POSTGRES_OPERATOR_ROLE')
+  if (!custody && !runtimeRole && !operatorRole) return null
+  const configuredMode = value(environment, INTEGRATION_CREDENTIAL_RUNTIME_MODE_ENV)
+  if (
+    !hosted
+    || mode !== INTEGRATION_CREDENTIAL_RUNTIME_MODE_STRICT
+    || (configuredMode && configuredMode !== INTEGRATION_CREDENTIAL_RUNTIME_MODE_STRICT)
+    || custody !== 'split-v1'
+    || !POSTGRES_CUSTODY_ROLE_PATTERN.test(runtimeRole)
+    || !POSTGRES_CUSTODY_ROLE_PATTERN.test(operatorRole)
+    || runtimeRole === operatorRole
+  ) {
+    fail('INTEGRATION_CREDENTIAL_RUNTIME_POSTGRES_CUSTODY_INVALID')
+  }
+  return Object.freeze({ custody, runtimeRole, operatorRole })
 }
 
 function vercelRuntimeDetected(environment) {
@@ -176,6 +197,7 @@ export function resolveIntegrationCredentialRuntimeConfiguration(
     fail('INTEGRATION_CREDENTIAL_RUNTIME_TIME_INVALID')
   }
   const { mode, adoptionDeadline } = runtimeMode(environment, hosted, now)
+  const postgresCustody = resolvePostgresCustody(environment, hosted, mode)
   const integrationKey = value(
     environment,
     'INTEGRATION_CREDENTIAL_ENCRYPTION_KEY',
@@ -202,6 +224,10 @@ export function resolveIntegrationCredentialRuntimeConfiguration(
   }
   const summary = { hosted, mode, keyId, adoptionDeadline }
   Object.defineProperties(summary, {
+    postgresCustody: {
+      enumerable: false,
+      value: postgresCustody,
+    },
     getKeyMaterial: {
       enumerable: false,
       value() {
@@ -273,6 +299,11 @@ function canonicalProofPayload(
     databaseIdentity,
     databaseEndpointSha256: databaseEndpointFingerprint(environment),
     deploymentIdentity: deploymentIdentity(environment),
+    ...(configuration.postgresCustody ? {
+      postgresCustodySha256: createHash('sha256')
+        .update(JSON.stringify(configuration.postgresCustody), 'utf8')
+        .digest('hex'),
+    } : {}),
     adoptionDeadline: configuration.adoptionDeadline,
     recordDigest,
     issuedAt,
@@ -425,6 +456,7 @@ export async function readIntegrationCredentialRuntimeAttestation(
     environment,
     now: options.now,
   })
+  const postgresCustody = configuration.postgresCustody
   let identityResult
   try {
     identityResult = await client.query(
@@ -585,6 +617,9 @@ export async function readIntegrationCredentialRuntimeAttestation(
                          WHERE privilege_row.grantee = 0
                            AND privilege_row.privilege_type = 'EXECUTE'
                        ))
+                   ${postgresCustody ? `
+                   AND bool_and(pg_catalog.pg_get_userbyid(procedure_row.proowner) = $7::name)
+                   ` : ''}
                 FROM pg_catalog.pg_proc procedure_row
                 WHERE procedure_row.oid IN (
                   'public.validate_integration_credential_key_attestation_insert()'::regprocedure,
@@ -592,7 +627,59 @@ export async function readIntegrationCredentialRuntimeAttestation(
                 )
               ) AS attestation_functions_valid,
               (
-                SELECT pg_catalog.pg_get_userbyid(class_row.relowner) = current_user
+                SELECT ${postgresCustody ? `
+                   pg_catalog.pg_get_userbyid(class_row.relowner) = $7::name
+                   AND EXISTS (
+                     SELECT 1
+                     FROM pg_catalog.pg_roles runtime_role
+                     CROSS JOIN pg_catalog.pg_roles operator_role
+                     JOIN pg_catalog.pg_database database_row
+                       ON database_row.datname = pg_catalog.current_database()
+                     WHERE runtime_role.rolname = $6::name
+                       AND operator_role.oid = class_row.relowner
+                       AND operator_role.rolcanlogin
+                       AND current_user = runtime_role.rolname
+                       AND session_user = runtime_role.rolname
+                       AND runtime_role.rolcanlogin
+                       AND NOT (runtime_role.rolsuper OR runtime_role.rolcreatedb
+                             OR runtime_role.rolcreaterole OR runtime_role.rolreplication
+                             OR runtime_role.rolbypassrls)
+                       -- No role membership, including SET ROLE or an inherited
+                       -- grant that could make the sentinel writable. The
+                       -- database owner also implicitly has pg_database_owner.
+                       AND database_row.datdba <> runtime_role.oid
+                       AND NOT EXISTS (
+                         SELECT 1 FROM pg_catalog.pg_auth_members membership
+                         WHERE membership.member = runtime_role.oid
+                       )
+                       AND NOT pg_catalog.has_database_privilege(
+                         runtime_role.oid, database_row.oid, 'CREATE'
+                       )
+                       AND NOT pg_catalog.has_schema_privilege(
+                         runtime_role.oid, 'public'::regnamespace::oid, 'CREATE'
+                       )
+                       AND pg_catalog.has_table_privilege(runtime_role.oid, class_row.oid, 'SELECT')
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM pg_catalog.aclexplode(class_row.relacl) privilege_row
+                         WHERE privilege_row.grantee = runtime_role.oid
+                           AND (privilege_row.privilege_type <> 'SELECT' OR privilege_row.is_grantable)
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM pg_catalog.pg_attribute attribute_row
+                         CROSS JOIN LATERAL pg_catalog.aclexplode(attribute_row.attacl) privilege_row
+                         WHERE attribute_row.attrelid = class_row.oid
+                           AND attribute_row.attnum > 0
+                           AND NOT attribute_row.attisdropped
+                           AND (
+                             privilege_row.grantee = 0
+                             OR (privilege_row.grantee = runtime_role.oid
+                               AND (privilege_row.privilege_type <> 'SELECT' OR privilege_row.is_grantable))
+                           )
+                       )
+                   )
+                 ` : 'pg_catalog.pg_get_userbyid(class_row.relowner) = current_user'}
                    AND NOT EXISTS (
                      SELECT 1
                      FROM pg_catalog.aclexplode(
@@ -614,6 +701,7 @@ export async function readIntegrationCredentialRuntimeAttestation(
         PRODUCT_IMAGE_RUNTIME_PARKING_MIGRATION,
         PRODUCT_IMAGE_RUNTIME_PARKING_MIGRATION_SHA256,
         PRODUCT_IMAGE_RUNTIME_PARKING_PROSRC_SHA256,
+        ...(postgresCustody ? [postgresCustody.runtimeRole, postgresCustody.operatorRole] : []),
       ],
     )
   } catch {

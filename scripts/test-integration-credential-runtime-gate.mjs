@@ -160,6 +160,57 @@ async function strictReady() {
 
 await strictReady()
 
+const splitPins = {
+  CLAWPILOT_POSTGRES_CUSTODY: 'split-v1',
+  CLAWPILOT_POSTGRES_RUNTIME_ROLE: 'clawpilot_runtime',
+  CLAWPILOT_POSTGRES_OPERATOR_ROLE: 'clawpilot_operator',
+}
+const splitEnvironment = environment(splitPins)
+const splitProofInput = {
+  databaseIdentity,
+  status: 'verified',
+  recordDigest: 'a'.repeat(64),
+}
+const splitProof = createIntegrationCredentialRuntimeProof(splitProofInput, {
+  environment: splitEnvironment,
+})
+assert.equal(verifyIntegrationCredentialRuntimeProof({
+  environment: splitEnvironment,
+  proof: splitProof,
+}).providerIoReady, true)
+for (const mismatchedEnvironment of [
+  environment(),
+  environment({ ...splitPins, CLAWPILOT_POSTGRES_OPERATOR_ROLE: 'other_operator' }),
+  environment({ ...splitPins, CLAWPILOT_POSTGRES_RUNTIME_ROLE: 'other_runtime' }),
+]) {
+  assert.throws(() => verifyIntegrationCredentialRuntimeProof({
+    environment: mismatchedEnvironment,
+    proof: splitProof,
+  }), /INTEGRATION_CREDENTIAL_RUNTIME_PROOF_INVALID/u)
+}
+assert.throws(() => verifyIntegrationCredentialRuntimeProof({
+  environment: splitEnvironment,
+  proof: createIntegrationCredentialRuntimeProof(splitProofInput, { environment: environment() }),
+}), /INTEGRATION_CREDENTIAL_RUNTIME_PROOF_INVALID/u)
+for (const invalidSplit of [
+  { CLAWPILOT_POSTGRES_RUNTIME_ROLE: 'clawpilot_runtime' },
+  { CLAWPILOT_POSTGRES_CUSTODY: 'split-v1' },
+  { ...splitPins, CLAWPILOT_POSTGRES_CUSTODY: 'split' },
+  { ...splitPins, CLAWPILOT_POSTGRES_OPERATOR_ROLE: splitPins.CLAWPILOT_POSTGRES_RUNTIME_ROLE },
+  { ...splitPins, CLAWPILOT_POSTGRES_OPERATOR_ROLE: 'role"unsafe' },
+  { ...splitPins, CLAWPILOT_POSTGRES_RUNTIME_ROLE: 'a'.repeat(64) },
+  { ...splitPins, INTEGRATION_CREDENTIAL_ATTESTATION_MODE: ' strict ' },
+  {
+    ...splitPins,
+    INTEGRATION_CREDENTIAL_ATTESTATION_MODE: 'adoption',
+    INTEGRATION_CREDENTIAL_ATTESTATION_ADOPTION_DEADLINE: new Date(Date.now() + 60_000).toISOString(),
+  },
+]) {
+  assert.throws(() => resolveIntegrationCredentialRuntimeConfiguration({
+    environment: environment(invalidSplit),
+  }), /INTEGRATION_CREDENTIAL_RUNTIME_POSTGRES_CUSTODY_INVALID/u)
+}
+
 assert.throws(
   () => resolveIntegrationCredentialRuntimeConfiguration({
     environment: environment({

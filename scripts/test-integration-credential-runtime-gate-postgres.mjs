@@ -275,6 +275,115 @@ try {
   assert.equal(ready.providerIoReady, true)
   assert.ok(environment.INTEGRATION_CREDENTIAL_RUNTIME_PROOF)
 
+  // Connect as a real LOGIN, not SET ROLE from a privileged connection.
+  await pool.query(`
+    CREATE ROLE fixture_runtime LOGIN PASSWORD 'fixture_runtime_test';
+    CREATE ROLE fixture_runtime_group NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO fixture_runtime;
+    GRANT SELECT ON schema_migrations, app_settings,
+      operations_integration_credential_key_attestations TO fixture_runtime;
+  `)
+  const splitUrl = new URL(databaseUrl)
+  splitUrl.username = 'fixture_runtime'
+  splitUrl.password = 'fixture_runtime_test'
+  const splitPool = new Pool({ connectionString: splitUrl.toString(), max: 1 })
+  const splitEnvironment = {
+    ...environment,
+    DATABASE_URL: splitUrl.toString(),
+    INTEGRATION_CREDENTIAL_RUNTIME_PROOF: '',
+    CLAWPILOT_POSTGRES_CUSTODY: 'split-v1',
+    CLAWPILOT_POSTGRES_RUNTIME_ROLE: 'fixture_runtime',
+    CLAWPILOT_POSTGRES_OPERATOR_ROLE: 'postgres',
+  }
+  const readSplit = (options = {}) => readIntegrationCredentialRuntimeAttestation({
+    client: splitPool,
+    environment: splitEnvironment,
+    ...options,
+  })
+  const deniedSplit = (options) => assert.rejects(
+    readSplit(options),
+    /INTEGRATION_CREDENTIAL_RUNTIME_SCHEMA_REQUIRED/u,
+  )
+  try {
+    const splitReady = await refreshIntegrationCredentialRuntimeReadiness({
+      client: splitPool,
+      environment: splitEnvironment,
+      allowMissingProof: true,
+    })
+    assert.equal(splitReady.status, 'verified')
+    assert.equal(splitReady.providerIoReady, true)
+    assert.equal(splitReady.recordDigest, ready.recordDigest)
+    assert.ok(splitEnvironment.INTEGRATION_CREDENTIAL_RUNTIME_PROOF)
+    await deniedSplit({ client: pool })
+    await deniedSplit({ environment: {
+      ...splitEnvironment, CLAWPILOT_POSTGRES_OPERATOR_ROLE: 'fixture_runtime_group',
+    } })
+    const roleSwitchClient = await pool.connect()
+    try {
+      await roleSwitchClient.query('BEGIN')
+      await roleSwitchClient.query('SET LOCAL ROLE fixture_runtime')
+      await deniedSplit({ client: roleSwitchClient })
+    } finally {
+      await roleSwitchClient.query('ROLLBACK')
+      roleSwitchClient.release()
+    }
+    for (const [drift, restore] of [
+      [
+        'ALTER ROLE fixture_runtime CREATEROLE',
+        'ALTER ROLE fixture_runtime NOCREATEROLE',
+      ],
+      [
+        'GRANT fixture_runtime_group TO fixture_runtime WITH INHERIT FALSE',
+        'REVOKE fixture_runtime_group FROM fixture_runtime',
+      ],
+      [
+        'GRANT CREATE ON SCHEMA public TO fixture_runtime',
+        'REVOKE CREATE ON SCHEMA public FROM fixture_runtime',
+      ],
+      [
+        'GRANT CREATE ON DATABASE postgres TO fixture_runtime',
+        'REVOKE CREATE ON DATABASE postgres FROM fixture_runtime',
+      ],
+      [
+        'GRANT SELECT ON operations_integration_credential_key_attestations TO fixture_runtime WITH GRANT OPTION',
+        'REVOKE GRANT OPTION FOR SELECT ON operations_integration_credential_key_attestations FROM fixture_runtime',
+      ],
+      [
+        'GRANT TRIGGER ON operations_integration_credential_key_attestations TO fixture_runtime',
+        'REVOKE TRIGGER ON operations_integration_credential_key_attestations FROM fixture_runtime',
+      ],
+      [
+        'GRANT UPDATE (key_id) ON operations_integration_credential_key_attestations TO fixture_runtime',
+        'REVOKE UPDATE (key_id) ON operations_integration_credential_key_attestations FROM fixture_runtime',
+      ],
+      [
+        'GRANT INSERT (key_id) ON operations_integration_credential_key_attestations TO PUBLIC',
+        'REVOKE INSERT (key_id) ON operations_integration_credential_key_attestations FROM PUBLIC',
+      ],
+      [
+        'REVOKE SELECT ON operations_integration_credential_key_attestations FROM fixture_runtime',
+        'GRANT SELECT ON operations_integration_credential_key_attestations TO fixture_runtime',
+      ],
+      [
+        'ALTER FUNCTION reject_integration_credential_key_attestation_mutation() OWNER TO fixture_runtime_group',
+        'ALTER FUNCTION reject_integration_credential_key_attestation_mutation() OWNER TO postgres',
+      ],
+    ]) {
+      await pool.query(drift)
+      try {
+        await deniedSplit()
+      } finally {
+        await pool.query(restore)
+      }
+      assert.equal((await readSplit()).status, 'verified')
+    }
+    await assert.rejects(splitPool.query(`
+      UPDATE operations_integration_credential_key_attestations SET key_id = 'not allowed'
+    `), { code: '42501' })
+  } finally {
+    await splitPool.end()
+  }
+
   await pool.query(
     `UPDATE schema_migrations
      SET checksum = $2

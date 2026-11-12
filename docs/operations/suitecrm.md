@@ -138,7 +138,7 @@ ClawPilot Product projections include SuiteCRM's native `currency_id`. USD resol
 5. Deploy and verify the public SuiteCRM root, private token endpoint, scheduler, Messenger logs, and persisted runtime override.
 6. Generate separate random credentials for the forward media user and reverse reader user/client. Put each complete credential group on the SuiteCRM service and deploy it. Confirm the boot log reports `SuiteCRM image service principals and exact ACLs are ready`; the container creates the two non-admin users, dedicated roles, and reverse OAuth client and fails boot if any exact postcondition is absent.
 7. Put those same exact credentials only on the Railway production ClawPilot service. Review the two managed roles in native SuiteCRM, bind every `SUITECRM_PRODUCT_IMAGE_READ_*` attestation variable to the generated reverse user/client, then explicitly set `SUITECRM_NATIVE_PRODUCT_IMAGE_PROJECTION_ENABLED=1` and `SUITECRM_PRODUCT_IMAGE_REVERSE_INGESTION_ENABLED=1` on ClawPilot.
-8. Enable the remaining CRM variables on the ClawPilot production service and let the normal Railway predeploy path apply migration `0020_crm_gateway_and_reporting.sql`.
+8. Enable the remaining CRM variables on the ClawPilot production service and verify migration `0020_crm_gateway_and_reporting.sql` is applied. The default Railway predeploy applies migrations; the opt-in custody rehearsal separates that task from the App as described below.
 9. Inspect and import the source workbook, drain the SuiteCRM and Google outboxes, then compare entity counts and pipeline totals before projecting the controlled workbook.
 
 ### Native Product-image activation and proof
@@ -171,7 +171,7 @@ Drain `/api/crm/outbox/process`, then verify an exact V8 filter on `global_id_c`
 
 ### Native activity projection
 
-Migration `0095_crm_native_activity_projection.sql` runs through the normal `npm run db:migrate` predeploy path. It adds the native activity module, status, and duration fields to `crm_interactions`; repairs imported workbook interaction timestamps from the original `source_payload.Date`; normalizes Calls and unlinked Meeting/In Person interactions; and queues one `reproject_record` operation per affected interaction.
+Migration `0095_crm_native_activity_projection.sql` runs through `npm run db:migrate` (inline in the default Railway predeploy). It adds the native activity module, status, and duration fields to `crm_interactions`; repairs imported workbook interaction timestamps from the original `source_payload.Date`; normalizes Calls and unlinked Meeting/In Person interactions; and queues one `reproject_record` operation per affected interaction.
 
 The matching worker processes each reproject in this order:
 
@@ -179,7 +179,7 @@ The matching worker processes each reproject in this order:
 2. Create the native Call or Meeting with the same permanent `gi` Global ID, business timestamp, status, duration, assignment, and verified relationships.
 3. For a companion `gi` history row already linked to a canonical `gm` Meeting, stop after deleting the duplicate Note. The `gm` Meeting remains the only native activity projection.
 
-Do not run a separate ad hoc production update for this conversion. Prove the migration and worker against a disposable PostgreSQL/SuiteCRM fixture, then deploy the SuiteCRM metadata and application worker that understand Calls and `reproject_record`. Let the normal Railway production predeploy path run the migration once and drain `/api/crm/outbox/process`. Verify:
+Do not run a separate ad hoc production update for this conversion. Prove the migration and worker against a disposable PostgreSQL/SuiteCRM fixture, then deploy the SuiteCRM metadata and application worker that understand Calls and `reproject_record`. Apply the migration once through the approved release path and drain `/api/crm/outbox/process`. Verify:
 
 - a planned Call appears under the related Account's or Contact's **Activities**;
 - held and not-held Calls appear under **History**;
@@ -299,7 +299,8 @@ or DDL/operator access. A timeout or uncertain commit is a hold until readback.
 Do not clear an attempt using a different UUID or based on health alone.
 The migration role owns the controls. If migration and runtime share a table
 owner or a superuser, this protects normal application DML but is not an ACL
-against that privileged identity; confirm role custody before live maintenance.
+against that privileged identity. Require the separate PostgreSQL custody
+checks below before treating the fence as independent of the App login.
 CRM-linked membership changes, CRM short-link resolutions that record clicks,
 and CRM-related accounting projections can also be temporarily unavailable;
 ordinary project tasks, unrelated links and accounting catalog reads are not fenced.
@@ -325,6 +326,40 @@ before starting the old image. After the intended Native version is healthy
 and the paused App and checkpoint are verified, clear the matching PostgreSQL
 fence with `transition(attempt_uuid, NULL)` and confirm the readback. Clear the
 ClawPilot CRM maintenance flag last.
+
+### PostgreSQL role separation rehearsal
+
+The proposed `split-v1` mode is opt-in. Rehearse it only against disposable
+PostgreSQL with synthetic data. A passing fixture is not approval to change
+production logins, grants, service variables, or CRM data.
+
+- Set `CLAWPILOT_POSTGRES_CUSTODY=split-v1` and pin distinct login names with
+  `CLAWPILOT_POSTGRES_RUNTIME_ROLE` and `CLAWPILOT_POSTGRES_OPERATOR_ROLE`.
+  In this mode the App's `DATABASE_URL` is the restricted runtime login. The
+  separately authenticated operator owns the migration ledger, CRM relations,
+  maintenance controls, and integration credential attestation table.
+- Run the exact release tree's normal `db:migrate` from the independent,
+  private operator context. The App predeploy verifies the exact applied
+  migration ledger and custody read-only, retains its read-only preflights,
+  and skips inline migrations and demo seeding. App startup rechecks the
+  ledger and custody before running the App. Any separately required demo
+  preparation must have its own review; do not grant the App owner rights to
+  make it pass.
+- Inventory effective runtime grants on the exact release schema, including
+  column, sequence, and function privileges. Grant only reviewed runtime
+  operations, not ownership, elevation, blanket function execution, or
+  access to manage the fence. Require separate login sessions: the operator
+  activates and clears the fence; the runtime cannot assume the operator
+  role, modify the fence, or disable a guard. Verify normal App startup and
+  unrelated operations, denied CRM writes during the fence, and resumed CRM
+  writes after the operator clears it.
+
+Production role cutover and recovery need separate approval. Before a live
+window, verify that no App service variable, including sealed variables or
+`AGENT_CREDENTIAL_DATABASE_URL`, gives privileged access to the same database
+cluster, and that old elevated App and worker sessions are gone. The role
+split does not replace the writer drain, paired Native volume and MariaDB
+checkpoint, or private Native canary above.
 
 ## Rollback
 
