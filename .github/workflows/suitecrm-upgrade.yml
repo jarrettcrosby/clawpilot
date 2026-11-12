@@ -6,12 +6,22 @@ on:
     paths:
       - 'services/suitecrm/**'
       - 'scripts/rehearse-suitecrm-8-10-2.mjs'
+      - 'scripts/test-suitecrm-native-acceptance.mjs'
+      - 'scripts/lib/native-runtime-fixture-profile.mjs'
+      - 'scripts/fixtures/native-email-audience-real/bootstrap.sh'
+      - 'scripts/fixtures/native-email-audience-real/native-shared-email*.php'
+      - 'scripts/fixtures/suitecrm-8-10-2-oauth-smoke.php'
       - '.github/workflows/suitecrm-upgrade.yml'
   push:
     branches: [main]
     paths:
       - 'services/suitecrm/**'
       - 'scripts/rehearse-suitecrm-8-10-2.mjs'
+      - 'scripts/test-suitecrm-native-acceptance.mjs'
+      - 'scripts/lib/native-runtime-fixture-profile.mjs'
+      - 'scripts/fixtures/native-email-audience-real/bootstrap.sh'
+      - 'scripts/fixtures/native-email-audience-real/native-shared-email*.php'
+      - 'scripts/fixtures/suitecrm-8-10-2-oauth-smoke.php'
       - '.github/workflows/suitecrm-upgrade.yml'
 
 permissions:
@@ -45,3 +55,19 @@ jobs:
           node scripts/rehearse-suitecrm-8-10-2.mjs
           "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.1.zip"
           "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.2.zip" --cold-boot
+      - name: Reuse the packaged PHP runtime for isolated Email fixtures
+        # Both runners override the entrypoint and use checksum-pinned source
+        # archives, not the application bundled in this PHP runtime image.
+        run: >-
+          docker image tag clawpilot-suitecrm:upgrade-8.10.2-local
+          clawpilot-suitecrm-native-acceptance:8.10.1-php83-8.3.36
+      - name: Verify stock SuiteCRM 8.10.1 shared Email publication and retry
+        run: >-
+          node scripts/test-suitecrm-native-acceptance.mjs
+          --source-zip="$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.1.zip"
+          --runtime-php=8.3.36 --shared-email-only
+      - name: Verify upgraded SuiteCRM 8.10.2 shared Email over stock OAuth
+        run: >-
+          node scripts/rehearse-suitecrm-8-10-2.mjs
+          "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.1.zip"
+          "$RUNNER_TEMP/suitecrm-archive/SuiteCRM-8.10.2.zip" --oauth-smoke

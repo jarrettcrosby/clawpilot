@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 # All writable application state and generated configuration live on /app tmpfs.
-cp -a /source/suitecrm/. /app/
+# The checkout owner on hosted Linux is not the container user. Copy without
+# preserving ownership so the capability-dropped container never needs chown.
+cp -RP /source/suitecrm/. /app/
 cd /app
 php -d memory_limit=384M bin/console suitecrm:app:install --no-interaction \
   -u fixture-admin -p Synthetic-native-admin-password-only \
