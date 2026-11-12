@@ -262,7 +262,7 @@ final class ClawPilotNativeEmailProjection
         // supplied header; omitted optional headers retain their locked value.
         // Historical settlement still requires exact evidence, including blanks.
         foreach(self::HEADERS as $field=>$_)$expected[$field]=self::header($bean,
-            $expected[$field]??($strict?'':$actual[$field]),$field);
+            $expected[$field]??($strict?'':$actual[$field]),$field,!$strict&&array_key_exists($field,$command['attributes']));
         self::need($expected['from_addr_name']!=='','from_header_unavailable');
         foreach($expected as $field=>$value)self::need(($actual[$field]??null)===$value,'shared_existing_content_changed');
         self::need($links===['accounts'=>$command['accounts'],'contacts'=>$command['contacts']]
@@ -322,7 +322,7 @@ final class ClawPilotNativeEmailProjection
             $expected=$attributes; $expected['date_sent_received']=self::utc($attributes['date_sent_received']);
             foreach (self::HEADERS as $field=>$column) {
                 $value=$attributes[$field] ?? ($before['raw']['emails_text'][0][$column] ?? '');
-                $expected[$field]=self::header($email,$value,$field);
+                $expected[$field]=self::header($email,$value,$field,$sharedWorker&&array_key_exists($field,$attributes));
                 $email->{$field === 'reply_to_addrs_names' ? 'reply_to_addr' : $field}=$expected[$field];
             }
             self::need($expected['from_addr_name'] !== '', 'from_header_unavailable');
@@ -404,7 +404,7 @@ final class ClawPilotNativeEmailProjection
         self::need($plain===''||$expected!=='','empty_derived_html');
         return $expected;
     }
-    private static function header(Email $email, string $value, string $field): string
+    private static function header(Email $email, string $value, string $field, bool $allowRedundantMailboxLabel=false): string
     {
         self::text($value,in_array($field,['from_addr_name','reply_to_addrs_names'],true) ? 255 : 8000);
         self::need(!preg_match('/[\r\n\t]/',$value),'unsupported_header');
@@ -423,7 +423,11 @@ final class ClawPilotNativeEmailProjection
             }
             self::need(strlen($address) <= 254 && preg_match('/^[A-Z0-9.!#$%&\'*+\/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/iD',$address) === 1,'unsupported_header_address');
             $address=strtolower($address); self::need(!in_array($address,$addresses,true),'duplicate_header_address'); $addresses[]=$address;
-            $canonical[]=$name === '' ? $address : $name.' <'.$address.'>';
+            // Stock splitEmailAddress strips the exact mailbox from the label.
+            // Only the shared worker accepts that presentation-equivalent form;
+            // all distinct labels still have to round-trip exactly.
+            $canonical[]=$name === '' || ($allowRedundantMailboxLabel && $name === $address)
+                ? $address : $name.' <'.$address.'>';
         }
         $result=implode(', ',$canonical);
         self::need($email->cleanEmails($result) === $result && from_html($result) === $result,'unsupported_header_normalization');
