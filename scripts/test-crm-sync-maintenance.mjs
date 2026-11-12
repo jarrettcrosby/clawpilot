@@ -223,11 +223,118 @@ test('CRM writes through Pipeline pause before storage, authorization, request b
   }
 })
 
-test('Projects blocks the CRM card description update but still saves an ordinary task during maintenance', async () => {
-  const env = { [flag]: '1' }, writes = []
+test('existing project boards keep workspace and board ACLs without default provisioning during maintenance', async () => {
+  const env = { [flag]: '1' }, reads = []
+  const actor = { email: 'fixture-owner@example.test', organizationId: 'fixture-workspace', organizationAccessOrigin: 'membership' }
+  const inaccessible = { ...actor, organizationId: 'other-workspace' }
+  const path = 'app_src/lib/tenancy.ts'
+  const deps = Object.fromEntries([...read(path).matchAll(/\bfrom ['"]([^'"]+)['"]/g)].map(([, id]) => [id, {}]))
+  const board = (id, access_role, is_default = false) => ({
+    id, access_role, is_default, owner_email: access_role === 'owner' ? actor.email : 'shared@example.test',
+    workspace_organization_id: actor.organizationId, name: id, members: [],
+  })
+  let boards = [board('owned-default', 'owner', true), board('shared-editor', 'editor'), board('shared-viewer', 'viewer')]
+  let permissions = { viewProjects: true, viewCrm: true }
+  let coldBootstrap = false
+  const unexpectedWrite = () => assert.fail('Board access must not provision existing resources')
+  Object.assign(deps, {
+    '@/lib/persistence/postgres': {
+      query: async (sql, params) => {
+        assert.match(sql, /^\s*SELECT\b/)
+        reads.push(params)
+        if (/FROM project_boards board/.test(sql)) {
+          assert.match(sql, /board\.workspace_organization_id = \$2::uuid/)
+          assert.match(sql, /membership\.user_email = \$1/)
+          return { rows: boards }
+        }
+        if (/^\s*SELECT 1 FROM clawpilot_crm_root_read_workspaces/.test(sql)) {
+          assert.ok(coldBootstrap, 'Existing resources need no provisioning eligibility probe')
+          return { rows: [] }
+        }
+        assert.match(sql, /FROM pipeline_spaces pipeline/)
+        return { rows: [] }
+      },
+      withTransaction: () => {
+        if (coldBootstrap) throw new Error('fixture cold board bootstrap')
+        unexpectedWrite()
+      },
+    },
+    '@/lib/organizations': { ensurePrimaryWorkspaceOrganization: unexpectedWrite },
+    '@/lib/users': {
+      normalizeUserEmail: value => String(value).toLowerCase(),
+      requireActiveAppUser: async email => { assert.equal(email, actor.email); return actor },
+      getAppUser: async () => actor,
+      effectiveUserPermissions: () => permissions,
+    },
+    '@/lib/workspaceMemberships': {
+      requireWorkspaceAppUser: async (email, organizationId) => {
+        assert.equal(email, actor.email)
+        if (organizationId !== actor.organizationId) throw new Error('Active workspace access is not available')
+        return actor
+      },
+    },
+    '@/lib/demoMode': { isDemoWorkspaceId: () => false },
+  })
+  const tenancy = load(path, deps, env)
+  const listed = await tenancy.listProjectBoards(actor)
+  assert.equal(listed.map(item => item.accessRole).join(','), 'owner,editor,viewer')
+  assert.equal((await tenancy.resolveProjectBoardAccess({ actorEmail: actor })).id, 'owned-default')
+  const editor = await tenancy.resolveProjectBoardAccess({ actorEmail: actor.email, boardId: 'shared-editor' })
+  const viewer = await tenancy.resolveProjectBoardAccess({ actorEmail: actor, boardId: 'shared-viewer' })
+  assert.doesNotThrow(() => tenancy.requireResourceEditor(editor))
+  assert.throws(() => tenancy.requireResourceEditor(viewer), /view-only/i)
+  await assert.rejects(tenancy.resolveProjectBoardAccess({ actorEmail: actor, boardId: 'foreign-board' }), /Project board access denied/)
+  await assert.rejects(tenancy.listProjectBoards(inaccessible), /Active workspace access is not available/)
+  const defaults = await tenancy.ensureDefaultResourcesForUser(actor)
+  assert.equal(defaults.boardId, 'owned-default')
+  assert.equal(defaults.pipelineId, null)
+  assert.equal(defaults.pipelineProvisioningRequired, false)
+  boards = [board('shared-editor', 'editor')]
+  assert.equal((await tenancy.resolveProjectBoardAccess({ actorEmail: actor })).id, 'shared-editor')
+  boards = []
+  assert.equal((await tenancy.listProjectBoards(actor)).length, 0)
+  env[flag] = '0'
+  boards = [board('owned-default', 'owner', true), board('shared-editor', 'editor')]
+  assert.equal((await tenancy.listProjectBoards(actor.email)).length, 2, 'Existing defaults stay read-only without the application flag')
+  boards = [board('shared-editor', 'editor')]
+  assert.equal((await tenancy.resolveProjectBoardAccess({ actorEmail: actor, boardId: 'shared-editor' })).id, 'shared-editor')
+  const beforeDenied = reads.length
+  permissions = { viewProjects: false, viewCrm: false }
+  assert.equal((await tenancy.listProjectBoards(actor)).length, 0)
+  assert.equal(reads.length, beforeDenied)
+  permissions = { viewProjects: true, viewCrm: true }
+  coldBootstrap = true
+  await assert.rejects(tenancy.listProjectBoards(actor), /fixture cold board bootstrap/,
+    'Outside maintenance a shared-only list still provisions a personal default')
+})
+
+test('CRM board binding lookup cannot repair a missing binding during maintenance', async () => {
+  const env = { [flag]: '1' }, path = 'app_src/lib/crm/boardProjection.ts'
+  const deps = Object.fromEntries([...read(path).matchAll(/\bfrom ['"]([^'"]+)['"]/g)].map(([, id]) => [id, {}]))
+  let row = { board_id: 'board', board_name: 'CRM board', owner_organization_id: 'workspace', pipeline_id: null }
+  let repairs = 0
+  deps['@/lib/persistence/postgres'] = {
+    query: async sql => { assert.match(sql, /^SELECT\b/); return { rows: [row] } },
+    withTransaction: () => { repairs++; throw new Error('fixture binding repair') },
+  }
+  const projection = load(path, deps, env)
+  assert.equal(await projection.resolveCrmBoardBinding('board'), null)
+  row = { ...row, pipeline_id: 'pipeline', workspace_organization_id: 'workspace' }
+  assert.equal((await projection.resolveCrmBoardBinding('board')).pipeline_id, 'pipeline')
+  env[flag] = '0'
+  assert.equal((await projection.resolveCrmBoardBinding('board')).pipeline_id, 'pipeline')
+  assert.equal(repairs, 0)
+  row = { ...row, pipeline_id: null }
+  await assert.rejects(projection.resolveCrmBoardBinding('board'), /fixture binding repair/)
+  assert.equal(repairs, 1)
+})
+
+test('Projects blocks CRM board mutations but still reads and saves ordinary tasks during maintenance', async () => {
+  const env = { [flag]: '1' }, writes = [], reads = [], reconciles = [], pipelineChecks = []
   const path = '/api/tasks', source = `app_src/app${path}/route.ts`
   const deps = Object.fromEntries([...read(source).matchAll(/\bfrom ['"]([^'"]+)['"]/g)].map(([, id]) => [id, {}]))
-  const actor = { email: 'fixture-owner@example.test' }, crmBoard = 'fixture-crm-board'
+  const actor = { email: 'fixture-owner@example.test' }, crmBoard = 'fixture-crm-board', unbound = 'fixture-crm-unbound'
+  let pipelineAccess = true
   const fixtureTask = boardId => ({ id: 'fixture-card', title: 'Fixture', status: 'backlog',
     ...(boardId === crmBoard ? { crm: { recordId: 'fixture-record' } } : {}) })
   const identity = value => value
@@ -239,19 +346,28 @@ test('Projects blocks the CRM card description update but still saves an ordinar
     '@/lib/workItemModel': { applyCanonicalWorkItem: identity, canonicalizeTasks: identity },
     '@/lib/persistence/tasks': {
       isPostgresTaskStoreEnabled: () => true,
-      readTasksFromPostgres: async ({ boardId }) => [fixtureTask(boardId)],
+      readTasksFromPostgres: async ({ boardId, includeCrmCards }) => {
+        reads.push([boardId, includeCrmCards])
+        return [fixtureTask(boardId)]
+      },
       replaceTasksInPostgres: async (tasks, { boardId }) => writes.push([boardId, tasks[0].desc]),
     },
     '@/lib/requestUser': { requireRequestUser: async () => actor },
-    '@/lib/moduleAuthorization': { requireModuleAccess: () => undefined },
+    '@/lib/moduleAuthorization': { requireModuleAccess: () => undefined, moduleCapabilitiesForUser: () => ({ crm: true }) },
     '@/lib/workerAuth': { resolveAgentDispatchWorker: async () => null },
     '@/lib/tenancy': {
       requireResourceEditor: () => undefined,
-      resolvePipelineSpaceAccess: async () => ({ id: 'fixture-pipeline' }),
-      resolveProjectBoardAccess: async ({ boardId }) => ({ id: boardId }),
+      resolvePipelineSpaceAccess: async ({ pipelineId }) => {
+        pipelineChecks.push(pipelineId)
+        if (!pipelineAccess) throw new Error('Pipeline access denied')
+        return { id: pipelineId }
+      },
+      resolveProjectBoardAccess: async ({ boardId }) => ({ id: boardId, name: boardId === crmBoard || boardId === unbound ? ' CRM board ' : 'Ordinary' }),
     },
     '@/lib/crm/boardProjection': {
+      CRM_BOARD_NAME: 'crm board',
       resolveCrmBoardBinding: async boardId => boardId === crmBoard ? { pipeline_id: 'fixture-pipeline' } : null,
+      reconcileCrmBoardProjection: async ({ boardId }) => reconciles.push(boardId),
       updateCrmBoardTaskDescription: async ({ boardId, description }) => {
         writes.push([boardId, description])
         return { description }
@@ -265,10 +381,28 @@ test('Projects blocks the CRM card description update but still saves an ordinar
   const paused = await patch(crmBoard)
   assert.equal(paused.status, 503)
   assert.equal(paused.headers.get('retry-after'), '60')
+  assert.equal((await patch(unbound)).status, 503)
+  assert.equal((await route.POST(request(`${path}?boardId=${unbound}`))).status, 409)
+  assert.deepEqual(reads, [])
   assert.deepEqual(writes, [])
+  const get = board => route.GET(request(`${path}?boardId=${board}&includeCrmCards=true`, {}, secret, 'GET'))
+  assert.equal((await get('fixture-ordinary-board')).status, 200)
+  assert.deepEqual(reads.at(-1), ['fixture-ordinary-board', false])
+  assert.equal((await get(crmBoard)).status, 200)
+  assert.deepEqual(reads.at(-1), [crmBoard, true])
+  assert.deepEqual(reconciles, [])
+  pipelineAccess = false
+  const beforeDenied = reads.length
+  assert.equal((await get(crmBoard)).status, 403)
+  assert.equal(reads.length, beforeDenied)
+  pipelineAccess = true
   assert.equal((await patch('fixture-ordinary-board')).status, 200)
+  assert.deepEqual(reads.at(-1), ['fixture-ordinary-board', false])
   env[flag] = '0'
+  assert.equal((await get(crmBoard)).status, 200)
+  assert.deepEqual(reconciles, [crmBoard])
   assert.equal((await patch(crmBoard)).status, 200)
+  assert.ok(pipelineChecks.every(pipeline => pipeline === 'fixture-pipeline'))
   assert.deepEqual(writes, [['fixture-ordinary-board', 'updated description'], [crmBoard, 'updated description']])
 })
 

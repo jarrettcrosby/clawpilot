@@ -4,7 +4,16 @@ on:
   pull_request:
     paths:
       - '.github/workflows/postgres-custody.yml'
+      - 'app_src/app/api/auth/**'
+      - 'app_src/app/api/tasks/**'
+      - 'app_src/app/api/workspaces/**'
+      - 'app_src/lib/authMagicCode.ts'
+      - 'app_src/lib/authSessions.ts'
+      - 'app_src/lib/crm/boardProjection.ts'
       - 'app_src/lib/integrations/integrationCredentialRuntimeGate.mjs'
+      - 'app_src/lib/tenancy.ts'
+      - 'app_src/lib/users.ts'
+      - 'app_src/lib/workspaceMemberships.ts'
       - 'db/migrations/**'
       - 'scripts/db-migrate.mjs'
       - 'scripts/lib/disposable-postgres-docker.mjs'
@@ -12,6 +21,8 @@ on:
       - 'scripts/record-release.mjs'
       - 'scripts/start-railway.sh'
       - 'scripts/test-crm-maintenance-write-fence-postgres.mjs'
+      - 'scripts/test-crm-maintenance-*.mjs'
+      - 'scripts/test-crm-sync-maintenance.mjs'
       - 'scripts/test-integration-credential-runtime-*.mjs'
       - 'scripts/test-postgres-custody.mjs'
       - 'scripts/verify-integration-credential-runtime.mjs'
@@ -42,6 +53,16 @@ jobs:
           cache: npm
           cache-dependency-path: app_src/package-lock.json
       - run: npm --prefix app_src ci
+      - name: Verify auth, session, and workspace contracts
+        if: matrix.postgres == '18'
+        run: |
+          node scripts/test-auth-magic-code.mjs
+          node scripts/test-google-sso.mjs
+          node scripts/test-browser-session-security.mjs
+          node scripts/test-multi-workspace-memberships.mjs
+          node scripts/test-module-access-backend.mjs
+          node scripts/test-crm-maintenance-auth.mjs
+          node scripts/test-crm-sync-maintenance.mjs
       - name: Load disposable PostgreSQL image
         run: docker pull "pgvector/pgvector:pg$CUSTODY_POSTGRES"
       - name: Verify operator migration, restricted predeploy, ledger and release recording

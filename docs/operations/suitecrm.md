@@ -354,7 +354,11 @@ production logins, grants, service variables, or CRM data.
   activates and clears the fence; the runtime cannot assume the operator
   role, modify the fence, or disable a guard. Verify normal App startup and
   unrelated operations, denied CRM writes during the fence, and resumed CRM
-  writes after the operator clears it.
+  writes after the operator clears it. With both maintenance controls active,
+  test an existing user's session and an ordinary Projects task read/write;
+  do not rely on the health endpoint or the app pause alone. New owner/CRM
+  resource provisioning is not part of routine authentication during the
+  window.
 
 Production role cutover and recovery need separate approval. Before a live
 window, verify that no App service variable, including sealed variables or

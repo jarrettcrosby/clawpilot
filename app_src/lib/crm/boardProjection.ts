@@ -13,7 +13,7 @@ import { query, withTransaction } from '@/lib/persistence/postgres'
 import { lockCrmNativeEmailAuthorityWithClient } from '@/lib/persistence/crmNativeEmailAuthority'
 import { shortLinkUrl } from '@/lib/shortlinks'
 
-const CRM_BOARD_NAME = 'crm board'
+export const CRM_BOARD_NAME = 'crm board'
 
 type CrmBoardBinding = {
   board_id: string
@@ -152,6 +152,7 @@ export async function resolveCrmBoardBinding(boardId: string): Promise<CrmBoardB
   const binding = current.rows[0]
   if (!binding || binding.board_name.trim().toLowerCase() !== CRM_BOARD_NAME || !binding.owner_organization_id) return null
   if (binding.pipeline_id && binding.workspace_organization_id === binding.owner_organization_id) return binding
+  if (process.env.CLAWPILOT_CRM_SYNC_MAINTENANCE === '1') return null
   return withTransaction(async (client) => {
     // Repairing a missing binding can also create an explicit pipeline reader.
     await lockCrmNativeEmailAuthorityWithClient(client)
