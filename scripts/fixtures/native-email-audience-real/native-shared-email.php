@@ -70,6 +70,8 @@ function sharedFixtureWorker(mysqli $db,array $profile,User $admin,bool $templat
     $worker=new ClawPilotSharedBpoEmailWorker($db,$profile,(string)$admin->id,(string)$client->id,(string)$token->access_token,$templates);
     $projection['suiteCrmId']=create_guid();$projection['attributes']['global_id_c']='gi9800008';
     $projection['attributes']['name']='Synthetic ordinary BPO worker Email';
+    $projection['attributes']['to_addrs_names']='recipient@example.test <recipient@example.test>, Distinct Recipient <other@example.test>';
+    $expectedTo='recipient@example.test, Distinct Recipient <other@example.test>';
     $command=['version'=>1,'workspaceId'=>'c6c49765-9bf6-4223-9261-7553499f5d92',
         'pipelineId'=>'587c8746-ecf6-40ae-8c50-e456f99ad555','localId'=>create_guid(),
         'sourceRevision'=>hash('sha256','synthetic routine first revision'),'projection'=>$projection];
@@ -93,10 +95,16 @@ function sharedFixtureWorker(mysqli $db,array $profile,User $admin,bool $templat
         ['contactId'=>strtoupper($binding['contactId']),'accountId'=>$binding['accountId']],$projection['contactAccounts']);
     must($caseAlias['projection']['contacts']!==$projection['contacts'],'Synthetic casing alias is distinct');
     sharedFixtureExpectHold(static fn()=>$worker->publish($caseAlias),'related_record_unavailable');
+    $duplicateRecipient=$command;
+    $duplicateRecipient['projection']['attributes']['to_addrs_names'].=', Other Label <recipient@example.test>';
+    sharedFixtureExpectHold(static fn()=>$worker->publish($duplicateRecipient),'duplicate_header_address');
+    must(rows("SELECT id FROM emails WHERE id=$idSql")===[],'A duplicate recipient must fail before creating the Email');
 
     $first=$worker->publish($command);
     must($first['suiteCrmId']===$nativeId&&$first['globalId']==='gi9800008'&&$worker->publish($command)===$first,
         'Missing-response create retry must return the same fingerprint without another Email');
+    must(rows("SELECT to_addrs FROM emails_text WHERE email_id=$idSql")===[['to_addrs'=>$expectedTo]],
+        'Stock save drops the redundant mailbox label without dropping or changing either recipient');
     $update=$command;$update['sourceRevision']=hash('sha256','synthetic routine second revision');
     $update['projection']['attributes']['description']='Synthetic exact compare-and-swap update';
     unset($update['projection']['attributes']['to_addrs_names']);
@@ -108,7 +116,7 @@ function sharedFixtureWorker(mysqli $db,array $profile,User $admin,bool $templat
     must($second['snapshotFingerprint']!==$first['snapshotFingerprint']&&$second['contacts']===$update['projection']['contacts']
         &&$worker->publish($update)===$second,'Missing-response update retry must recover the same exact projection');
     must(rows("SELECT to_addrs FROM emails_text WHERE email_id=$idSql")
-        ===[['to_addrs'=>$projection['attributes']['to_addrs_names']]],'Omitted optional header does not clear prior evidence');
+        ===[['to_addrs'=>$expectedTo]],'Omitted optional header does not clear prior evidence');
     sharedFixtureExpectHold(static fn()=>$worker->publish($command),'shared_existing_preimage_changed');
     $conflict=$update;$conflict['projection']['attributes']['description']='Synthetic delayed stale compare-and-swap';
     sharedFixtureExpectHold(static fn()=>$worker->publish($conflict),'shared_existing_preimage_changed');
@@ -328,6 +336,9 @@ try {
         hash('sha256','synthetic wrong native origin')),'shared_bpo_email_receipt_alias');
     $wrongContent=$command;$wrongContent['attributes']['description'].="\nSynthetic different content.";
     sharedFixtureExpectHold(static fn ()=>$observe($wrongContent),'shared_existing_content_changed');
+    $redundantLegacyLabel=$command;
+    $redundantLegacyLabel['attributes']['to_addrs_names']='recipient@example.test <recipient@example.test>';
+    sharedFixtureExpectHold(static fn ()=>$observe($redundantLegacyLabel),'unsupported_header_normalization');
     $wrongLinks=$command;$wrongLinks['contacts']=[$contacts['one']];$wrongLinks['contactAccounts']=[$bindings[0]];
     sharedFixtureExpectHold(static fn ()=>$observe($wrongLinks),'shared_existing_links_changed');
     $aliasSql="'".quote(create_guid())."'";$aliasGlobalSql="'".quote(strtoupper($global))."'";

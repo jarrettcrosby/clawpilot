@@ -243,6 +243,7 @@ try {
   execute('docker', ['create', '--rm', '--pull=never', '--name', appName, '--network', network, '--read-only',
     ...limits('1152m', '1'), '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
     '--tmpfs', '/app:rw,nosuid,size=640m', '--tmpfs', '/tmp:rw,nosuid,size=32m',
+    '--workdir', '/app',
     '--mount', `type=bind,source=${join(root, 'suitecrm')},target=/source/suitecrm,readonly`,
     '--mount', `type=bind,source=${fixture},target=/fixture,readonly`, '--mount', `type=bind,source=${verifier},target=/source/email-audience,readonly`,
     ...(options['shared-email-only'] ? ['--env', 'CLAWPILOT_NATIVE_FIXTURE_SHARED_EMAIL_ONLY=1',
