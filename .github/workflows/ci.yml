@@ -54,10 +54,10 @@ jobs:
           cache-dependency-path: app_src/package-lock.json
       - name: Install application test dependencies
         run: npm --prefix app_src ci
-      - name: Preload the exact PostgreSQL major
-        run: |
-          docker pull "$CLAWPILOT_TEST_POSTGRES_IMAGE"
-          docker image inspect "$CLAWPILOT_TEST_POSTGRES_IMAGE" --format '{{json .RepoDigests}}'
+      - name: Preload the audited PostgreSQL build
+        env:
+          CRM_FIXTURE_POSTGRES: ${{ matrix.postgres }}
+        run: bash scripts/preload-audited-postgres-fixture.sh "$CRM_FIXTURE_POSTGRES"
       - name: CRM maintenance transaction and writer isolation
         env:
           CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
@@ -130,15 +130,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Preload both audited PostgreSQL builds for application fixtures
+        run: bash scripts/preload-audited-postgres-fixture.sh 16 18
+
       - name: Fractional scoped gateway PostgreSQL and HTTP acceptance
         env:
           CLAWPILOT_TEST_POSTGRES_MEMORY: 512m
           CLAWPILOT_TEST_POSTGRES_TMPFS_SIZE: 256m
           CLAWPILOT_TEST_POSTGRES_CPUS: '1'
-        run: |
-          docker pull pgvector/pgvector:pg16
-          docker image inspect pgvector/pgvector:pg16 --format '{{json .RepoDigests}}'
-          npm run test:fractional-crm-gateway
+        run: npm run test:fractional-crm-gateway
 
       - name: Verify the hosted test partition
         run: node --test scripts/test-ci-app-test-plan.mjs
