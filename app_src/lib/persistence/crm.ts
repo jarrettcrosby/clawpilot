@@ -3743,6 +3743,18 @@ async function applyReviewedGmailInteractionWithClient(client: PoolClient,
       input.mailboxIdentity.mailboxId, source.sourceId])
     inboundMessageId = inserted.rows[0]?.id || ''
     if (!inboundMessageId) throw new Error('Reviewed Gmail intake was not created')
+  } else if (!cached.mailbox_id && !cached.canonical_source_id) {
+    // Enqueue reads Gmail headers through the canonical cache/source binding.
+    // Adopt this locked retained cache before staging, inside the same batch
+    // transaction, so its first outbox job includes the verified sender.
+    const bound = await client.query(`UPDATE crm_inbound_messages
+      SET mailbox_id=$5::uuid,canonical_source_id=$6::uuid
+      WHERE id=$1::uuid AND owner_email=$2 AND external_message_id=$3
+        AND external_thread_id IS NOT DISTINCT FROM $4::text
+        AND mailbox_id IS NULL AND canonical_source_id IS NULL RETURNING id`,
+    [inboundMessageId, input.ownerEmail, input.providerMessageId, input.providerThreadId,
+      input.mailboxIdentity.mailboxId, source.sourceId])
+    if (bound.rows.length !== 1) throw new Error('Reviewed Gmail cache binding changed before staging')
   }
   const metadata = { ...(current?.metadata as Record<string, unknown> || input.interaction.fields.metadata),
     canonicalSourceId: source.sourceId, inboundMessageId, reviewedGmailRecovery: { targetFingerprint } }
