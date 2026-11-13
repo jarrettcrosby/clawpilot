@@ -824,11 +824,20 @@ try {
   const caseyIdentity = await persistence.readVerifiedGmailMailboxIdentityInPostgres({ ownerEmail: CASEY.owner,
     connectionId: CASEY.connection, accountEmail: caseyMailboxEmail })
   assert.ok(caseyIdentity)
-  const caseyEvidence = message => emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: message,
+  const caseyEvidence = (message, extraHeaders = {}) => emailIdentity.normalizeGmailMessageEvidence({ externalMessageId: message,
     externalThreadId: CASEY.thread, senderEmail: caseyTargets[1].email, recipientEmails: [CASEY.owner, caseyTargets[0].email],
     subject: `Synthetic exact-two ${message}`, receivedAt: '2026-10-27T12:00:00.123Z', snippet: 'Synthetic Casey snippet',
     bodyText: 'Synthetic exact-two retained body', markerReferences: [], emailAddressHeaders: { version: 1,
-      from: [{ address: caseyTargets[1].email }], to: [{ address: CASEY.owner }, { address: caseyTargets[0].email }], cc: [], bcc: [] } })
+      from: [{ address: caseyTargets[1].email }], to: [{ address: CASEY.owner }, { address: caseyTargets[0].email }], cc: [], bcc: [], ...extraHeaders } })
+  const retainedEvidence = message => caseyEvidence(message, {
+    cc: [{ address: 'unmatched-cc@example.invalid' }], bcc: [{ address: 'unmatched-bcc@example.invalid' }],
+  })
+  const assertRetainedJobHeaders = job => {
+    assert.equal(job.payload.attributes.from_addr_name, caseyTargets[1].email, 'The first job carries the verified sender from the formerly unbound cache')
+    assert.equal(job.payload.attributes.to_addrs_names, `${caseyTargets[0].email}, ${CASEY.owner}`)
+    assert.equal(job.payload.attributes.cc_addrs_names, 'unmatched-cc@example.invalid')
+    assert.equal(job.payload.attributes.bcc_addrs_names, 'unmatched-bcc@example.invalid')
+  }
 
   await check('ordinary shared Gmail stages one canonical Email and job, preserving all verified companies and contacts', async () => {
     const client = await pool.connect()
@@ -950,24 +959,16 @@ try {
     } finally { await client.query('ROLLBACK'); client.release() }
   })
 
-  for (const row of CASEY.messages) {
-    const current = caseyEvidence(row.message)
-    await query(`INSERT INTO crm_inbound_messages(id,owner_email,pipeline_id,external_message_id,external_thread_id,
+  async function insertUnboundRetainedCache(clientQuery, cache, current) {
+    await clientQuery(`INSERT INTO crm_inbound_messages(id,owner_email,pipeline_id,external_message_id,external_thread_id,
       sender_email,recipient_emails,subject,received_at,snippet,body_text,marker_references,raw_metadata)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)`, [row.cache, CASEY.owner, CASEY.intake, current.messageId,
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)`, [cache, CASEY.owner, CASEY.intake, current.messageId,
       current.threadId, current.senderEmail, current.recipientEmails, current.subject, current.receivedAt, current.snippet,
       current.bodyText, current.markerReferences, JSON.stringify({ provider: 'gmail', originalMailboxProvenance: 'unknown',
         labelIds: ['INBOX'], emailAddressHeaders: current.emailAddressHeaders })])
   }
-  const caseyOriginalCache = (await query('SELECT * FROM crm_inbound_messages WHERE id=ANY($1::uuid[]) ORDER BY id', [CASEY.messages.map(row => row.cache)])).rows
-  const caseyMessages = CASEY.messages.map(row => {
-    const current = caseyEvidence(row.message)
-    const legacyAdoption = caseyReconcile.prepareCaseyGmailAdoption({ scope: {
-      ownerEmail: CASEY.owner, connectionId: CASEY.connection, inboundMessageId: row.cache, intakePipelineId: CASEY.intake,
-      pipelineId: CASEY.pipeline, messageIds: CASEY.messages.map(item => item.message), threadId: CASEY.thread,
-      primaryOrganization: caseyCompanies[0], organizations: caseyCompanies,
-    }, identity: caseyIdentity, adoptedAt: new Date().toISOString(), cached: current, current })
-    return { admissionScope: 'casey-reviewed-two-v1', ownerEmail: CASEY.owner, connectionId: CASEY.connection,
+  function retainedMessage(current, legacyAdoption, admissionScope) {
+    return { ...(admissionScope ? { admissionScope } : {}), ownerEmail: CASEY.owner, connectionId: CASEY.connection,
       pipelineId: CASEY.pipeline, mailboxIdentity: caseyIdentity, messageEvidence: current, legacyAdoption,
       providerMessageId: current.messageId, providerThreadId: current.threadId, primaryOrganization: caseyCompanies[0],
       contactTargets: caseyTargets, participantEmails: caseyTargets.map(target => target.email), interaction: {
@@ -977,6 +978,17 @@ try {
           direction: 'inbound', deliveryStatus: 'received', providerMessageId: current.messageId,
           providerThreadId: current.threadId, metadata: { source: 'gmail-inbound' } },
       } }
+  }
+  for (const row of CASEY.messages) await insertUnboundRetainedCache(query, row.cache, retainedEvidence(row.message))
+  const caseyOriginalCache = (await query('SELECT * FROM crm_inbound_messages WHERE id=ANY($1::uuid[]) ORDER BY id', [CASEY.messages.map(row => row.cache)])).rows
+  const caseyMessages = CASEY.messages.map(row => {
+    const current = retainedEvidence(row.message)
+    const legacyAdoption = caseyReconcile.prepareCaseyGmailAdoption({ scope: {
+      ownerEmail: CASEY.owner, connectionId: CASEY.connection, inboundMessageId: row.cache, intakePipelineId: CASEY.intake,
+      pipelineId: CASEY.pipeline, messageIds: CASEY.messages.map(item => item.message), threadId: CASEY.thread,
+      primaryOrganization: caseyCompanies[0], organizations: caseyCompanies,
+    }, identity: caseyIdentity, adoptedAt: new Date().toISOString(), cached: current, current })
+    return retainedMessage(current, legacyAdoption, 'casey-reviewed-two-v1')
   })
   const caseyCopy = value => JSON.parse(JSON.stringify(value))
   const caseyRejectUnchanged = async messages => {
@@ -1230,6 +1242,7 @@ try {
         const decision = queued.decisions.find(value => value.interaction_id === row.id)
         const job = queued.jobs.find(value => value.aggregate_id === row.id)
         assert.equal(decision.kind, 'legacy-adoption'); assert.equal(decision.provenance.legacyAdoption.originalMailboxProvenance, 'unknown')
+        assertRetainedJobHeaders(job)
         if (mode === 'shared') {
           assert.deepEqual(decision.audience, { policy: 'suitecrm-shared-login', workspaceId: CASEY.workspace, pipelineId: CASEY.pipeline })
           assert.equal(job.payload.emailProjection, undefined)
@@ -1279,6 +1292,63 @@ try {
       assert.deepEqual(await snapshot(), claimed, 'Exact active leases cannot be claimed a second time')
       assert.deepEqual(await outsideJobs(), unrelated, 'No unrelated outbox work is claimed or changed')
       assert.equal((await client.query(`SELECT count(*)::int AS count FROM pipeline_space_members WHERE pipeline_id=$1 AND user_email=$2`, [CASEY.pipeline, appOnly])).rows[0].count, 1)
+    } finally { await client.query('ROLLBACK'); client.release() }
+  })
+  await check('the original retained trio queues all typed headers from its bound cache on first shared staging', async () => {
+    const client = await pool.connect()
+    let sequence = 0
+    const scopedQuery = (sql, values) => client.query(sql, values)
+    const scopedTransaction = async callback => {
+      const name = `retained_trio_${++sequence}`
+      await client.query(`SAVEPOINT ${name}`)
+      try { const result = await callback(client); await client.query(`RELEASE SAVEPOINT ${name}`); return result }
+      catch (error) { await client.query(`ROLLBACK TO SAVEPOINT ${name}`); await client.query(`RELEASE SAVEPOINT ${name}`); throw error }
+    }
+    const selected = fixtureContext.fixture.loadCrmPersistence(scopedQuery, scopedTransaction, undefined,
+      { CLAWPILOT_SUITECRM_SHARED_EMAIL_WORKSPACE_ID: CASEY.workspace, CLAWPILOT_SUITECRM_SHARED_EMAIL_PIPELINE_ID: CASEY.pipeline })
+    const ids = ['1a17e730c78d319c', '1a17f5004f29592c', '1a17f5d46a224e0a']
+    const cacheIds = ids.map((_, i) => id(750 + i))
+    try {
+      await client.query('BEGIN')
+      const messages = []
+      for (const [i, messageId] of ids.entries()) {
+        const evidence = retainedEvidence(messageId)
+        await insertUnboundRetainedCache(scopedQuery, cacheIds[i], evidence)
+        const legacyAdoption = caseyReconcile.prepareBoundedLegacyGmailAdoption({ scope: {
+          pipelineId: CASEY.pipeline, messageIds: ids, threadId: CASEY.thread,
+          primaryOrganization: caseyCompanies[0], organizations: caseyCompanies,
+        }, identity: caseyIdentity, adoptedAt: new Date().toISOString(), cached: evidence, current: evidence })
+        messages.push(retainedMessage(evidence, legacyAdoption))
+      }
+      const before = await durableState(scopedQuery)
+      const preview = await selected.stageReviewedGmailInteractionsInPostgres({ messages })
+      assert.deepEqual(await durableState(scopedQuery), before)
+      const apply = messages.map((row, i) => ({ ...row, expectedExistingInteractionId: null, expectedTargetFingerprint: preview[i].targetFingerprint }))
+      await assert.rejects(selected.stageReviewedGmailInteractionsInPostgres({ apply: true,
+        messages: [...apply.slice(0, 2), { ...apply[2], expectedTargetFingerprint: 'f'.repeat(64) }] }), /evidence changed or conflicts/)
+      assert.deepEqual(await durableState(scopedQuery), before)
+      const staged = await selected.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(staged.every(row => row.applied && row.linksAdded === 4))
+      assert.equal(new Set(staged.map(row => row.interactionId)).size, 3)
+      const rows = (await scopedQuery(`SELECT m.id AS cache_id,m.external_message_id,m.raw_metadata,m.canonical_source_id,
+          i.organization_id,i.suitecrm_id,o.status,o.payload
+        FROM crm_inbound_messages m JOIN crm_interactions i ON i.id=m.interaction_id AND i.canonical_source_id=m.canonical_source_id
+        JOIN sync_outbox o ON o.aggregate_id=i.id::text WHERE m.id=ANY($1::uuid[]) ORDER BY m.external_message_id`, [cacheIds])).rows
+      assert.deepEqual(rows.map(row => row.external_message_id), ids)
+      assert.equal(new Set(rows.map(row => row.suitecrm_id)).size, 3)
+      for (const [i, row] of rows.entries()) {
+        assert.equal(row.cache_id, cacheIds[i]); assert.ok(row.canonical_source_id)
+        assert.equal(row.raw_metadata.originalMailboxProvenance, 'unknown')
+        assert.equal(row.organization_id, CASEY.globus); assert.equal(row.status, 'queued')
+        assert.equal(row.payload.attributes.parent_id, 'native-casey-globus')
+        assert.deepEqual(row.payload.sharedEmailProjection.accounts, ['native-casey-airspace', 'native-casey-globus'])
+        assert.equal(row.payload.sharedEmailProjection.contacts.length, 2)
+        assertRetainedJobHeaders(row)
+      }
+      const queued = await durableState(scopedQuery)
+      const replay = await selected.stageReviewedGmailInteractionsInPostgres({ messages: apply, apply: true })
+      assert.ok(replay.every((row, i) => !row.applied && row.interactionId === staged[i].interactionId))
+      assert.deepEqual(await durableState(scopedQuery), queued)
     } finally { await client.query('ROLLBACK'); client.release() }
   })
   await check('Casey exact-two stages one Email per message, both companies, original-unknown proof and current audience', async () => {
