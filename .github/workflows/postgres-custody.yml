@@ -17,6 +17,7 @@ on:
       - 'db/migrations/**'
       - 'scripts/db-migrate.mjs'
       - 'scripts/lib/disposable-postgres-docker.mjs'
+      - 'scripts/preload-audited-postgres-fixture.sh'
       - 'scripts/predeploy-railway.sh'
       - 'scripts/record-release.mjs'
       - 'scripts/start-railway.sh'
@@ -64,7 +65,7 @@ jobs:
           node scripts/test-crm-maintenance-auth.mjs
           node scripts/test-crm-sync-maintenance.mjs
       - name: Load disposable PostgreSQL image
-        run: docker pull "pgvector/pgvector:pg$CUSTODY_POSTGRES"
+        run: bash scripts/preload-audited-postgres-fixture.sh "$CUSTODY_POSTGRES"
       - name: Verify operator migration, restricted predeploy, ledger and release recording
         run: node scripts/test-postgres-custody.mjs "$CUSTODY_POSTGRES"
       - name: Verify fence activation, access denial, drain and reopen
