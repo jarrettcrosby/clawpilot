@@ -1548,6 +1548,17 @@ function caseyProducerFixture({ firstSeen = false, historicalTrio = false, subje
   return { h, pins, identity, contacts, organizations, activePipelines, selectedMailboxes, raws, associations, selection }
 }
 
+function addHistoricalAttachment(raw) {
+  raw.payload.parts ||= []
+  raw.payload.parts.push({ partId: '1', mimeType: 'image/png', filename: 'fixture.png',
+    headers: [header('Content-Disposition', 'attachment; filename="fixture.png"')],
+    body: { attachmentId: 'opaque-locator-from-preview', size: 42 } })
+  raw.payload.parts.push({ partId: '2', mimeType: 'multipart/mixed', parts: [
+    { partId: '2.1', mimeType: 'application/pdf', filename: 'nested.pdf',
+      body: { attachmentId: 'nested-locator-from-preview', size: 64 } },
+  ] })
+}
+
 await check('exact historical trio and retained Casey pair tolerate non-semantic Gmail drift in separate reviewed batches', async () => {
   for (const historicalTrio of [true, false]) {
     const batch = historicalTrio ? 'original trio' : 'retained Casey pair'
@@ -1557,6 +1568,8 @@ await check('exact historical trio and retained Casey pair tolerate non-semantic
       ['size estimate', raw => { raw.sizeEstimate = 101 }],
       ['unknown gateway keys', raw => { raw.gatewayMetadata = { requestTag: 'changed-on-fetch' } }],
       ['order of distinct headers', raw => { raw.payload.headers.reverse() }],
+      ['a refetched external attachment locator', raw => { raw.payload.parts[0].body.attachmentId = 'opaque-locator-from-apply' }],
+      ['a nested refetched attachment locator', raw => { raw.payload.parts[1].parts[0].body.attachmentId = 'nested-locator-from-apply' }],
     ]) {
       const label = `${batch}: ${change}`
       const f = caseyProducerFixture({ historicalTrio })
@@ -1565,6 +1578,7 @@ await check('exact historical trio and retained Casey pair tolerate non-semantic
       raw.historyId = '101'
       raw.sizeEstimate = 100
       raw.payload.headers.push(header('Reply-To', 'review-reply@example.invalid'))
+      addHistoricalAttachment(raw)
       const preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
       assert.equal(preview.messages.length, f.pins.messages.length, label)
       assert.equal(f.h.reviewedStages.length, 0, label)
@@ -1596,6 +1610,14 @@ await check('exact historical batches still reject content, meaningful header, e
     for (const [change, mutate, expected] of [
       ['message body', raw => { raw.payload.body.data = Buffer.from('Changed content.').toString('base64url') }, /Retained Gmail content|changed after preview/],
       ['Reply-To value', raw => { raw.payload.headers.find(entry => entry.name === 'Reply-To').value = 'different-reply@example.invalid' }, /changed after preview/],
+      ['attachment presence', raw => { delete raw.payload.parts[0].body.attachmentId }, /changed after preview/],
+      ['malformed attachment locator', raw => { raw.payload.parts[0].body.attachmentId = 42 }, /invalid attachment evidence/],
+      ['blank attachment locator', raw => { raw.payload.parts[0].body.attachmentId = ' ' }, /invalid attachment evidence/],
+      ['attachment byte count', raw => { raw.payload.parts[0].body.size = 43 }, /changed after preview/],
+      ['attachment inline bytes', raw => { raw.payload.parts[0].body.data = 'Zm9v' }, /changed after preview/],
+      ['attachment filename', raw => { raw.payload.parts[0].filename = 'changed.png' }, /changed after preview/],
+      ['attachment MIME type', raw => { raw.payload.parts[0].mimeType = 'application/pdf' }, /changed after preview/],
+      ['nested attachment presence', raw => { delete raw.payload.parts[1].parts[0].body.attachmentId }, /changed after preview/],
       ['SENT membership', raw => { raw.labelIds = ['SENT'] }, /changed after preview|unambiguous current participants/],
       ...['SPAM', 'TRASH', 'DRAFT'].map(flag => [flag, raw => { raw.labelIds = [flag] }, /not eligible/]),
       ['contact email', (_raw, fixture) => { fixture.contacts[1].email = 'changed-contact@example.invalid' }, /unambiguous current participants/],
@@ -1604,6 +1626,7 @@ await check('exact historical batches still reject content, meaningful header, e
       const f = caseyProducerFixture({ historicalTrio })
       const raw = f.raws.at(-1)
       raw.payload.headers.push(header('Reply-To', 'review-reply@example.invalid'))
+      addHistoricalAttachment(raw)
       const preview = await f.h.ingestion.reconcileGmailMessages(f.selection())
       mutate(raw, f)
       await assert.rejects(f.h.ingestion.reconcileGmailMessages(f.selection({ apply: true, expectedDigest: preview.digest })), expected, label)
