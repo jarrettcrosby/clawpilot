@@ -1469,8 +1469,15 @@ function historicalReviewMimeEvidence(part: GmailMessagePart): GmailMessagePart 
     value: header?.value,
   })).sort((a, b) => (a.name || '') < (b.name || '') ? -1 : (a.name || '') > (b.name || '') ? 1 : 0) : part.headers
   const body = part.body
+  // Gmail may issue a different opaque attachment retrieval locator on each
+  // GET. CRM recovery does not fetch or store those attachments. Bind whether
+  // the part is external, its metadata and any inline bytes, not the locator.
+  const attachmentId = body?.attachmentId
+  if (attachmentId !== undefined && (typeof attachmentId !== 'string' || !attachmentId.trim())) {
+    throw new SafeEmailIngestionError('The selected Gmail message has invalid attachment evidence')
+  }
   return { partId: part.partId, mimeType: part.mimeType, filename: part.filename, headers,
-    body: body && { attachmentId: body.attachmentId, size: body.size, data: body.data },
+    body: body && { attachmentId: attachmentId === undefined ? undefined : 'external', size: body.size, data: body.data },
     parts: Array.isArray(part.parts) ? part.parts.map(historicalReviewMimeEvidence) : part.parts }
 }
 
@@ -1718,7 +1725,7 @@ async function reconcileReviewedGmailMessages(input: {
   const snapshots = await stageReviewedGmailInteractionsInPostgres({ messages: planned.map((plan) => plan.persistence), apply: false })
     .catch(() => { throw new SafeEmailIngestionError('Reviewed Gmail association evidence is unavailable or has changed') })
   const digest = crypto.createHash('sha256').update(JSON.stringify(stableEvidence({
-    version: firstSeen ? 3 : 5, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
+    version: firstSeen ? 3 : 6, ownerEmail: input.ownerEmail, connectionId: input.connectionId,
     decisionKind: input.decisionKind || 'review', correctionReason: input.correctionReason || null,
     lateContactEmail: input.lateContactEmail || null,
     ...(input.admissionScope ? { admissionScope: input.admissionScope } : {}),
